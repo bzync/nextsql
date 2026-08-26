@@ -1,6 +1,0 @@
-nextsql-btree-soak start_utc=20260826T063538Z
-repo=/home/rayan/bzync/nextsql
-ops=100000000 tmpdir=/home/rayan/bzync/nextsql/.bench-tmp/btree-100m-p16-v10 log=/home/rayan/bzync/nextsql/.bench-results/btree-100m-p16-v10.log
-GOMEMLIMIT=3GiB GOGC=25 GODEBUG=madvdontneed=1
-go version go1.26.7 linux/amd64
-=== RUN   TestRandomizedLargeInvariants

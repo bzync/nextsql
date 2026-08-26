@@ -2,6 +2,7 @@
 /nextsql
 /nextsqld
 /nextsql-bench
+/.bench-results
 /.bench-tmp
 /.slo-ext4
 /.slo-logs

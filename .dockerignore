@@ -1,0 +1,13 @@
+.git
+.agents
+.codex
+.bench-results
+.bench-tmp
+docs/web/node_modules
+docs/web/.next
+data
+*.db
+*key
+*pw
+secrets
+tmp

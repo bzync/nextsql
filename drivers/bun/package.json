@@ -1,0 +1,19 @@
+{
+  "name": "nextsql",
+  "version": "0.1.0",
+  "description": "Official NextSQL Bun driver. Keys never go in URLs.",
+  "license": "UNLICENSED",
+  "type": "module",
+  "main": "nextsql.js",
+  "types": "nextsql.d.ts",
+  "exports": {
+    ".": {
+      "types": "./nextsql.d.ts",
+      "import": "./nextsql.js",
+      "default": "./nextsql.js"
+    }
+  },
+  "scripts": {
+    "test": "bun test"
+  }
+}

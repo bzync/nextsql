@@ -1,0 +1,620 @@
+package backup
+
+import (
+	"bytes"
+	"context"
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/bzync/nextsql/internal/config"
+	"github.com/bzync/nextsql/internal/crypto"
+	"github.com/bzync/nextsql/internal/executor"
+	"github.com/bzync/nextsql/internal/nerr"
+	"github.com/bzync/nextsql/internal/storage/format"
+	"github.com/bzync/nextsql/internal/wal"
+)
+
+func setupSQL(t *testing.T, dir string) (dataDir, dbPath string, root *crypto.DEK, env *crypto.Envelope) {
+	t.Helper()
+	dataDir = filepath.Join(dir, "data")
+	if err := os.MkdirAll(dataDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	dbPath = filepath.Join(dataDir, config.DataFileName)
+	root, err := crypto.GenerateDEK(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := format.NewIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, err = crypto.CreateEnvelope(crypto.KeystorePath(dbPath), id, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := executor.CreateWithIdentity(dbPath, id, env, 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := db.Session()
+	if _, err := s.Exec(`CREATE TABLE items (id UUID PRIMARY KEY DEFAULT UUID(), sku STRING NOT NULL)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Exec(`INSERT INTO items (sku) VALUES ('alpha')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Exec(`CREATE WORKFLOW add_item(sku STRING) AS BEGIN INSERT INTO items (sku) VALUES ($sku); END`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Exec(`CREATE TABLE item_audit (sku STRING PRIMARY KEY)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Exec(`CREATE WORKFLOW audit_item(sku STRING) AS BEGIN INSERT INTO item_audit (sku) VALUES ($sku); END`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Exec(`CREATE TRIGGER audit_item_insert AFTER INSERT ON items FOR EACH ROW RUN WORKFLOW audit_item(NEW.sku)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return dataDir, dbPath, root, env
+}
+
+func execSKUs(t *testing.T, dbPath string, keys crypto.KeyProvider) []string {
+	t.Helper()
+	db, err := executor.Open(dbPath, keys, 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	res, err := db.Session().Exec(`SELECT sku FROM items`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := make([]string, 0, len(res.Rows))
+	for _, row := range res.Rows {
+		out = append(out, row[0].Str)
+	}
+	return out
+}
+
+func contains(ss []string, want string) bool {
+	for _, s := range ss {
+		if s == want {
+			return true
+		}
+	}
+	return false
+}
+
+func TestBackupRestoreRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	dataDir, _, root, env := setupSQL(t, dir)
+	dest := filepath.Join(dir, "full.nsbak")
+	res, err := Create(dataDir, dest, env, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.Verified || !res.RestoreTest || res.Members < 2 {
+		t.Fatalf("unexpected result %+v", res)
+	}
+	_ = env.Close()
+
+	restored := filepath.Join(dir, "restored")
+	env2, err := crypto.OpenEnvelope(crypto.KeystorePath(filepath.Join(dataDir, config.DataFileName)), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer env2.Close()
+	if _, err := Restore(dest, restored, env2, RestoreOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	got := execSKUs(t, filepath.Join(restored, config.DataFileName), env2)
+	if !contains(got, "alpha") {
+		t.Fatalf("restored rows %v", got)
+	}
+	restoredDB, err := executor.Open(filepath.Join(restored, config.DataFileName), env2, 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := restoredDB.Session().Exec(`RUN WORKFLOW add_item('from-backup')`); err != nil {
+		t.Fatal(err)
+	}
+	audit, err := restoredDB.Session().Exec(`SELECT sku FROM item_audit WHERE sku = 'from-backup'`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(audit.Rows) != 1 {
+		t.Fatalf("restored trigger did not fire: %v", audit.Rows)
+	}
+	if err := restoredDB.Close(); err != nil {
+		t.Fatal(err)
+	}
+	got = execSKUs(t, filepath.Join(restored, config.DataFileName), env2)
+	if !contains(got, "from-backup") {
+		t.Fatalf("restored workflow did not execute: %v", got)
+	}
+}
+
+func TestBackupRestoreWithPendingReclaimIntent(t *testing.T) {
+	dir := t.TempDir()
+	dataDir, dbPath, _, env := setupSQL(t, dir)
+	db, err := executor.Open(dbPath, env, 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := db.Session()
+	if _, err := s.Exec(`CREATE INDEX ix_items_sku ON items (sku)`); err != nil {
+		t.Fatal(err)
+	}
+	db.Eng.SetCrash(wal.PointDuringPageReclaim)
+	if _, err := s.Exec(`DROP INDEX ix_items_sku`); err != nil {
+		t.Fatal(err)
+	}
+	if !wal.IsCrash(db.LastReclaimError()) {
+		t.Fatalf("reclaim crash not recorded: %v", db.LastReclaimError())
+	}
+	if _, err := os.Stat(dbPath + ".reclaim"); err != nil {
+		t.Fatalf("pending reclaim intent missing: %v", err)
+	}
+	db.Eng.Kill()
+
+	dest := filepath.Join(dir, "pending-reclaim.nsbak")
+	if _, err := Create(dataDir, dest, env, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	restored := filepath.Join(dir, "restored")
+	if _, err := Restore(dest, restored, env, RestoreOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	restoredDB := filepath.Join(restored, config.DataFileName)
+	if _, err := os.Stat(restoredDB + ".reclaim"); err != nil {
+		t.Fatalf("restore did not preserve reclaim intent: %v", err)
+	}
+	reopened, err := executor.Open(restoredDB, env, 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if _, err := os.Stat(restoredDB + ".reclaim"); !os.IsNotExist(err) {
+		t.Fatalf("restored reclaim intent was not replayed and cleared: %v", err)
+	}
+	res, err := reopened.Session().Exec(`SELECT sku FROM items`)
+	if err != nil || len(res.Rows) != 1 || res.Rows[0][0].Str != "alpha" {
+		t.Fatalf("restored database unusable after reclaim replay: rows=%v err=%v", res.Rows, err)
+	}
+}
+
+func TestBackupWrongKeyFailsClosed(t *testing.T) {
+	dir := t.TempDir()
+	dataDir, _, _, env := setupSQL(t, dir)
+	dest := filepath.Join(dir, "full.nsbak")
+	if _, err := Create(dataDir, dest, env, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	other, err := crypto.GenerateDEK(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := format.NewIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	bad, err := crypto.CreateEnvelope(filepath.Join(dir, "other.keys"), id, other)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bad.Close()
+	if err := Verify(dest, bad, false); err == nil {
+		t.Fatal("wrong key must not verify a backup")
+	}
+}
+
+func TestBackupHasNoPlaintextRows(t *testing.T) {
+	dir := t.TempDir()
+	dataDir, _, _, env := setupSQL(t, dir)
+	dest := filepath.Join(dir, "full.nsbak")
+	if _, err := Create(dataDir, dest, env, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	marker := []byte("alpha")
+	err := filepath.Walk(dest, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() {
+			return err
+		}
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		if bytes.Contains(raw, marker) {
+			t.Errorf("plaintext %q found in %s", marker, path)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestTamperedMemberFails(t *testing.T) {
+	dir := t.TempDir()
+	dataDir, _, _, env := setupSQL(t, dir)
+	dest := filepath.Join(dir, "full.nsbak")
+	if _, err := Create(dataDir, dest, env, Options{SkipRestoreTest: true}); err != nil {
+		t.Fatal(err)
+	}
+	// Create with skip still verifies hashes; flip a byte in a member.
+	members := filepath.Join(dest, memberDirName)
+	ents, err := os.ReadDir(members)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ents) == 0 {
+		t.Fatal("no members")
+	}
+	p := filepath.Join(members, ents[0].Name())
+	raw, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw[len(raw)/2] ^= 0xFF
+	if err := os.WriteFile(p, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := Verify(dest, env, false); !nerr.HasCode(err, nerr.Corruption) && !nerr.HasCode(err, nerr.Crypto) {
+		t.Fatalf("expected corruption/crypto, got %v", err)
+	}
+}
+
+func TestCrashDuringBackupNotPublished(t *testing.T) {
+	for _, p := range []Point{PointBeforeCopy, PointDuringCopy, PointBeforeManifest, PointBeforeVerify} {
+		p := p
+		t.Run(p.String(), func(t *testing.T) {
+			dir := t.TempDir()
+			dataDir, dbPath, root, env := setupSQL(t, dir)
+			dest := filepath.Join(dir, "full.nsbak")
+			inj := NewInjector()
+			inj.Arm(p)
+			_, err := Create(dataDir, dest, env, Options{Crash: inj, SkipRestoreTest: true})
+			if !IsCrash(err) {
+				t.Fatalf("expected crash, got %v", err)
+			}
+			if _, err := os.Stat(dest); !os.IsNotExist(err) {
+				t.Fatal("incomplete backup must not be published")
+			}
+			if _, err := Restore(dest, filepath.Join(dir, "out"), env, RestoreOptions{}); err == nil {
+				t.Fatal("restore of missing backup must fail")
+			}
+			_ = env.Close()
+			re, err := crypto.OpenEnvelope(crypto.KeystorePath(dbPath), root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer re.Close()
+			got := execSKUs(t, dbPath, re)
+			if !contains(got, "alpha") {
+				t.Fatalf("source must survive crash-during-backup, got %v", got)
+			}
+		})
+	}
+}
+
+func (p Point) String() string {
+	switch p {
+	case PointBeforeCopy:
+		return "before_copy"
+	case PointDuringCopy:
+		return "during_copy"
+	case PointBeforeManifest:
+		return "before_manifest"
+	case PointBeforeVerify:
+		return "before_verify"
+	default:
+		return "none"
+	}
+}
+
+func TestUnverifiedBackupRefused(t *testing.T) {
+	dir := t.TempDir()
+	dataDir, _, _, env := setupSQL(t, dir)
+	dest := filepath.Join(dir, "full.nsbak")
+	if _, err := Create(dataDir, dest, env, Options{SkipRestoreTest: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(dest, verifiedName)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Restore(dest, filepath.Join(dir, "out"), env, RestoreOptions{}); !nerr.HasCode(err, nerr.Corruption) {
+		t.Fatalf("expected unverified refusal, got %v", err)
+	}
+}
+
+func TestPITRByLSN(t *testing.T) {
+	dir := t.TempDir()
+	dataDir, dbPath, root, env := setupSQL(t, dir)
+	base := filepath.Join(dir, "base.nsbak")
+	if _, err := Create(dataDir, base, env, Options{}); err != nil {
+		t.Fatal(err)
+	}
+
+	archDir := filepath.Join(dir, "walarch")
+	arch, err := NewDirArchiver(archDir, env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := executor.Open(dbPath, env, 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.Eng.SetArchiver(arch)
+	if _, err := db.Session().Exec(`INSERT INTO items (sku) VALUES ('beta')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Session().Exec(`CREATE WORKFLOW pitr_add(sku STRING) AS BEGIN INSERT INTO items (sku) VALUES ($sku); END`); err != nil {
+		t.Fatal(err)
+	}
+	fireAt := time.Now().UTC().Add(50 * time.Millisecond)
+	if _, err := db.Session().Exec(`CREATE SCHEDULE pitr_once AT '` + fireAt.Format(time.RFC3339Nano) + `' RUN WORKFLOW pitr_add('from-task')`); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(60 * time.Millisecond)
+	if got, err := db.DispatchDueSchedules(context.Background(), time.Now().UTC(), 1); err != nil || got != 1 {
+		t.Fatalf("dispatch task before PITR got=%d err=%v", got, err)
+	}
+	if err := db.Eng.Checkpoint(); err != nil {
+		t.Fatal(err)
+	}
+	afterBeta := db.Eng.WAL.NextLSN() - 1
+	if afterBeta == 0 {
+		t.Fatal("expected a durable LSN after beta")
+	}
+	if _, err := db.Session().Exec(`INSERT INTO items (sku) VALUES ('gamma')`); err != nil {
+		t.Fatal(err)
+	}
+	if db.Eng.WAL.NextLSN()-1 <= afterBeta {
+		t.Fatal("gamma must allocate a later LSN than beta")
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	onlyBase := filepath.Join(dir, "only-base")
+	if _, err := Restore(base, onlyBase, env, RestoreOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	got := execSKUs(t, filepath.Join(onlyBase, config.DataFileName), env)
+	if contains(got, "beta") || contains(got, "gamma") {
+		t.Fatalf("base backup must not include later rows: %v", got)
+	}
+
+	pitr := filepath.Join(dir, "pitr")
+	if _, err := Restore(base, pitr, env, RestoreOptions{ArchiveDir: archDir, UntilLSN: afterBeta}); err != nil {
+		t.Fatal(err)
+	}
+	got = execSKUs(t, filepath.Join(pitr, config.DataFileName), env)
+	if !contains(got, "alpha") || !contains(got, "beta") {
+		t.Fatalf("PITR to beta LSN: %v", got)
+	}
+	if contains(got, "gamma") {
+		t.Fatalf("PITR to beta must not include gamma: %v", got)
+	}
+	pitrDB, err := executor.Open(filepath.Join(pitr, config.DataFileName), env, 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tasks, err := pitrDB.Session().Exec(`SHOW TASKS LIMIT 1`)
+	if err != nil || len(tasks.Rows) != 1 || tasks.Rows[0][1].Str != "PENDING" || tasks.Rows[0][3].Str != "pitr_add" {
+		t.Fatalf("PITR task state rows=%+v err=%v", tasks, err)
+	}
+	if _, err := pitrDB.Session().Exec(`RUN WORKFLOW pitr_add('from-pitr')`); err != nil {
+		t.Fatal(err)
+	}
+	audit, err := pitrDB.Session().Exec(`SELECT sku FROM item_audit WHERE sku = 'from-pitr'`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(audit.Rows) != 1 {
+		t.Fatalf("PITR trigger did not fire: %v", audit.Rows)
+	}
+	if err := pitrDB.Close(); err != nil {
+		t.Fatal(err)
+	}
+	_ = root
+}
+
+func TestPITRAcrossRebuildAndDropIndex(t *testing.T) {
+	dir := t.TempDir()
+	dataDir, dbPath, _, env := setupSQL(t, dir)
+	db, err := executor.Open(dbPath, env, 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Session().Exec(`CREATE INDEX ix_items_sku ON items (sku)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	base := filepath.Join(dir, "ddl-base.nsbak")
+	if _, err := Create(dataDir, base, env, Options{}); err != nil {
+		t.Fatal(err)
+	}
+
+	archDir := filepath.Join(dir, "ddl-walarch")
+	arch, err := NewDirArchiver(archDir, env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err = executor.Open(dbPath, env, 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.Eng.SetArchiver(arch)
+	if _, err := db.Session().Exec(`REBUILD INDEX ix_items_sku`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Eng.Checkpoint(); err != nil {
+		t.Fatal(err)
+	}
+	afterRebuild := db.Eng.WAL.NextLSN() - 1
+	if _, err := db.Session().Exec(`DROP INDEX ix_items_sku`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Eng.Checkpoint(); err != nil {
+		t.Fatal(err)
+	}
+	afterDrop := db.Eng.WAL.NextLSN() - 1
+	if afterDrop <= afterRebuild {
+		t.Fatal("drop must have a later recovery LSN than rebuild")
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	rebuilt := filepath.Join(dir, "at-rebuild")
+	if _, err := Restore(base, rebuilt, env, RestoreOptions{ArchiveDir: archDir, UntilLSN: afterRebuild}); err != nil {
+		t.Fatal(err)
+	}
+	if !restoredHasIndex(t, filepath.Join(rebuilt, config.DataFileName), env, "ix_items_sku") {
+		t.Fatal("PITR at rebuild LSN lost the rebuilt index")
+	}
+	dropped := filepath.Join(dir, "after-drop")
+	if _, err := Restore(base, dropped, env, RestoreOptions{ArchiveDir: archDir, UntilLSN: afterDrop}); err != nil {
+		t.Fatal(err)
+	}
+	if restoredHasIndex(t, filepath.Join(dropped, config.DataFileName), env, "ix_items_sku") {
+		t.Fatal("PITR after drop retained the index")
+	}
+}
+
+func restoredHasIndex(t *testing.T, dbPath string, keys crypto.KeyProvider, name string) bool {
+	t.Helper()
+	db, err := executor.Open(dbPath, keys, 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	tab, ok := db.Cat.Get("items")
+	if !ok {
+		t.Fatal("restored items table missing")
+	}
+	for _, idx := range tab.Indexes {
+		if idx.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+func TestPITRByTime(t *testing.T) {
+	dir := t.TempDir()
+	dataDir, dbPath, _, env := setupSQL(t, dir)
+	base := filepath.Join(dir, "base.nsbak")
+	res, err := Create(dataDir, base, env, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mid := time.Unix(0, res.Header.CreatedNano).Add(time.Millisecond)
+
+	archDir := filepath.Join(dir, "walarch")
+	arch, err := NewDirArchiver(archDir, env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := executor.Open(dbPath, env, 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.Eng.SetArchiver(arch)
+	if _, err := db.Session().Exec(`INSERT INTO items (sku) VALUES ('later')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	out := filepath.Join(dir, "by-time")
+	if _, err := Restore(base, out, env, RestoreOptions{ArchiveDir: archDir, UntilTime: mid}); err != nil {
+		t.Fatal(err)
+	}
+	got := execSKUs(t, filepath.Join(out, config.DataFileName), env)
+	if contains(got, "later") {
+		t.Fatalf("timestamp before later archive must not include later: %v", got)
+	}
+	if !contains(got, "alpha") {
+		t.Fatalf("expected alpha, got %v", got)
+	}
+}
+
+func TestOpenKeysUnlocksSidecar(t *testing.T) {
+	dir := t.TempDir()
+	dataDir, _, root, env := setupSQL(t, dir)
+	dest := filepath.Join(dir, "full.nsbak")
+	if _, err := Create(dataDir, dest, env, Options{SkipRestoreTest: true}); err != nil {
+		t.Fatal(err)
+	}
+	keys, opened, err := OpenKeys(dest, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if opened == nil || keys == nil {
+		t.Fatal("expected envelope from keystore sidecar")
+	}
+	defer opened.Close()
+	if err := Verify(dest, keys, true); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestHeaderManifestRoundTrip(t *testing.T) {
+	id, err := format.NewUUID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ident, err := format.NewIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := Header{
+		Version:     CurrentVersion,
+		Suite:       format.CipherAES256GCM,
+		KeyVersion:  1,
+		Identity:    ident,
+		Checkpoint:  3,
+		RedoLSN:     4,
+		DurableLSN:  5,
+		CreatedNano: 6,
+		BackupID:    id,
+		NonceHigh:   7,
+		WrappedDEK:  bytes.Repeat([]byte{1}, 64),
+	}
+	raw, err := encodeHeader(h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := decodeHeader(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.DurableLSN != 5 || got.Identity != ident {
+		t.Fatalf("%+v", got)
+	}
+	mf := Manifest{Version: CurrentVersion, Members: []Member{{
+		Kind: KindData, Name: "data", PlainSize: 10, SealedSize: 20,
+	}}}
+	mraw, err := encodeManifest(mf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mgot, err := decodeManifest(mraw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(mgot.Members) != 1 || mgot.Members[0].Name != "data" {
+		t.Fatalf("%+v", mgot)
+	}
+}

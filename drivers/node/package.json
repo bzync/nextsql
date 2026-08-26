@@ -1,0 +1,15 @@
+{
+  "name": "nextsql",
+  "version": "0.1.0",
+  "description": "Official NextSQL Node.js driver. Keys never go in URLs.",
+  "license": "UNLICENSED",
+  "main": "nextsql.js",
+  "types": "nextsql.d.ts",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node --test nextsql.test.js"
+  }
+}

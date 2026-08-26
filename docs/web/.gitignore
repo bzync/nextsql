@@ -1,0 +1,5 @@
+/public/downloads/**
+!/public/downloads/.gitkeep
+.env*.local
+.next
+node_modules

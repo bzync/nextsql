@@ -1,0 +1,5 @@
+# Type Path Mode User Group Age Argument
+d /var/lib/nextsql     0750 nextsql nextsql - -
+d /var/lib/nextsql-wal 0750 nextsql nextsql - -
+d /etc/nextsql         0750 root    nextsql - -
+z /etc/nextsql/nextsql.conf 0640 root nextsql - -

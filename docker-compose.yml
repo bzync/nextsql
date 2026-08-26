@@ -1,0 +1,34 @@
+services:
+  nextsql:
+    build: .
+    image: nextsql:local
+    restart: unless-stopped
+    ports:
+      - "7210:7210"
+    environment:
+      NEXTSQL_USER: app
+      NEXTSQL_PASSWORD_FILE: /run/bootstrap/app-password
+      NEXTSQL_TLS_CERT: /run/tls/server.crt
+      NEXTSQL_TLS_KEY: /run/tls/server.key
+    volumes:
+      - nextsql-data:/var/lib/nextsql
+      - nextsql-keys:/run/secrets
+    secrets:
+      - source: app_password
+        target: /run/bootstrap/app-password
+      - source: server_crt
+        target: /run/tls/server.crt
+      - source: server_key
+        target: /run/tls/server.key
+
+volumes:
+  nextsql-data:
+  nextsql-keys:
+
+secrets:
+  app_password:
+    file: ./secrets/app-password
+  server_crt:
+    file: ./secrets/server.crt
+  server_key:
+    file: ./secrets/server.key

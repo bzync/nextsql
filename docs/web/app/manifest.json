@@ -1,0 +1,30 @@
+{
+  "name": "NextSQL",
+  "short_name": "NextSQL",
+  "description": "Encrypted-by-default multimodel database",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#040912",
+  "theme_color": "#040912",
+  "icons": [
+    {
+      "src": "/icons/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/icons/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/icons/icon-512-maskable.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    }
+  ]
+}

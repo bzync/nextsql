@@ -1,0 +1,13 @@
+#!/bin/sh
+set -e
+
+if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+	if [ "$1" = "remove" ] || [ "$1" = "deconfigure" ]; then
+		systemctl disable --now nextsql >/dev/null 2>&1 || true
+	fi
+	if [ "$1" = "upgrade" ]; then
+		systemctl stop nextsql >/dev/null 2>&1 || true
+	fi
+fi
+
+exit 0

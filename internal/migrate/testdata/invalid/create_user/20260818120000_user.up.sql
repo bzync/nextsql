@@ -1,0 +1,1 @@
+CREATE USER app IDENTIFIED BY 's3cret';

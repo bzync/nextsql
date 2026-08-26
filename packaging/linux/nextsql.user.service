@@ -1,0 +1,19 @@
+[Unit]
+Description=NextSQL database server
+Documentation=https://github.com/bzync/nextsql
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=%h/.config/nextsql/nextsql.conf
+ConditionPathExists=%h/.local/share/nextsql/nextsql.db
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/nextsqld --config %h/.config/nextsql/nextsql.conf
+Restart=on-failure
+RestartSec=3s
+TimeoutStopSec=30s
+LimitNOFILE=65536
+UMask=0077
+
+[Install]
+WantedBy=default.target

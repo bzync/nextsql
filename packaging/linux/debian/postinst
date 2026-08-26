@@ -1,0 +1,52 @@
+#!/bin/sh
+set -e
+
+if command -v systemd-sysusers >/dev/null 2>&1; then
+	systemd-sysusers /usr/lib/sysusers.d/nextsql.conf >/dev/null 2>&1 || true
+fi
+
+if ! getent group nextsql >/dev/null; then
+	groupadd --system nextsql
+fi
+if ! getent passwd nextsql >/dev/null; then
+	useradd --system --gid nextsql --home-dir /var/lib/nextsql \
+		--shell /usr/sbin/nologin --comment "NextSQL database" nextsql
+fi
+
+if command -v systemd-tmpfiles >/dev/null 2>&1; then
+	systemd-tmpfiles --create /usr/lib/tmpfiles.d/nextsql.conf >/dev/null 2>&1 || true
+fi
+
+mkdir -p /var/lib/nextsql /var/lib/nextsql-wal /etc/nextsql
+chown nextsql:nextsql /var/lib/nextsql /var/lib/nextsql-wal
+chmod 0750 /var/lib/nextsql /var/lib/nextsql-wal /etc/nextsql
+if [ -f /etc/nextsql/nextsql.conf ]; then
+	chown root:nextsql /etc/nextsql/nextsql.conf
+	chmod 0640 /etc/nextsql/nextsql.conf
+fi
+
+if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+	systemctl daemon-reload >/dev/null 2>&1 || true
+fi
+
+cat <<'EOF'
+
+NextSQL is installed. The service stays stopped until you initialize a data
+directory (and keep the root unlock key off the data volume in production):
+
+  printf 'secret\n' > /tmp/nextsql.pw && chmod 600 /tmp/nextsql.pw
+  nextsql init \
+    --data-dir /var/lib/nextsql \
+    --key-file /etc/nextsql/root.key \
+    --user app --password-file /tmp/nextsql.pw
+  chown -R nextsql:nextsql /var/lib/nextsql
+  chown nextsql:nextsql /etc/nextsql/root.key
+  chmod 600 /etc/nextsql/root.key
+  systemctl enable --now nextsql
+
+Loopback (127.0.0.1:7210) may run without TLS. Any other listen address
+requires tls_cert and tls_key in /etc/nextsql/nextsql.conf.
+
+EOF
+
+exit 0

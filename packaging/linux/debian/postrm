@@ -1,0 +1,21 @@
+#!/bin/sh
+set -e
+
+if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+	systemctl daemon-reload >/dev/null 2>&1 || true
+fi
+
+if [ "$1" = "purge" ]; then
+	# Data directory and root key are operator-owned secrets. Leave them.
+	# Remove only empty dirs we created and the system user if unused.
+	rmdir /var/lib/nextsql-wal 2>/dev/null || true
+	if getent passwd nextsql >/dev/null; then
+		userdel nextsql >/dev/null 2>&1 || true
+	fi
+	if getent group nextsql >/dev/null; then
+		groupdel nextsql >/dev/null 2>&1 || true
+	fi
+	echo "NextSQL purged. /var/lib/nextsql and /etc/nextsql/root.key were left in place."
+fi
+
+exit 0

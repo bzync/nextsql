@@ -1,0 +1,17 @@
+/bin/
+/nextsql
+/nextsqld
+/nextsql-bench
+/.bench-tmp
+/.slo-ext4
+/.slo-logs
+*.test
+*.out
+*.db
+*key
+*pw
+/data/
+/tmp/
+/installers/
+.DS_Store
+.env.local

@@ -1,0 +1,81 @@
+{
+  "releases": [
+    {
+      "version": "0.1.0-dev",
+      "title": "Engine complete",
+      "status": "published",
+      "channel": "preview",
+      "latest": true,
+      "releasedAt": "2026-08-18T00:00:00.000Z",
+      "summary": "Phases 0\u201315 of the engine ship in this tree: storage, WAL, MVCC, SQL, optimizer, protocol, JSON, full-text, vectors, hybrid plans, security, backup/PITR/export, and Raft HA.",
+      "highlights": [
+        "One WAL, one MVCC, and one optimizer for SQL, JSON, vectors, full-text, and geo",
+        "AES-256-GCM envelope encryption on by default",
+        "Native NSQL v1 protocol with official Go, JS, and PHP drivers"
+      ],
+      "changes": [
+        {
+          "id": "c1",
+          "kind": "added",
+          "area": "Engine",
+          "text": "Clustered B+Tree storage, group-commit WAL, and fsync before commit is acknowledged."
+        },
+        {
+          "id": "c2",
+          "kind": "added",
+          "area": "SQL",
+          "text": "Hybrid SELECT: filters, SEARCH (BM25), and NEAREST (ANN) in one physical plan with reciprocal rank fusion."
+        },
+        {
+          "id": "c3",
+          "kind": "added",
+          "area": "JSON",
+          "text": "Native JSON columns (NSJB) with path extract and path indexes."
+        },
+        {
+          "id": "c4",
+          "kind": "added",
+          "area": "Vectors",
+          "text": "VECTOR<F32,N> with flat and HNSW indexes."
+        },
+        {
+          "id": "c5",
+          "kind": "added",
+          "area": "Search",
+          "text": "Inverted full-text index, BM25 ranking, and phrase queries."
+        },
+        {
+          "id": "c6",
+          "kind": "added",
+          "area": "Geo",
+          "text": "WGS84 POINT, BOX, and LINESTRING types."
+        },
+        {
+          "id": "c7",
+          "kind": "added",
+          "area": "Security",
+          "text": "Envelope encryption, TLS 1.3 off loopback, password auth, and RBAC."
+        },
+        {
+          "id": "c8",
+          "kind": "added",
+          "area": "HA",
+          "text": "Three-voter Raft, quorum commits, and encrypted replication."
+        },
+        {
+          "id": "c9",
+          "kind": "added",
+          "area": "CLI",
+          "text": "nextsql init/serve/migrate and nextsqld with --key-file off the data volume."
+        },
+        {
+          "id": "c10",
+          "kind": "added",
+          "area": "Drivers",
+          "text": "Official Go, Node/Bun/Deno, and PHP drivers. Keys never go in a URL."
+        }
+      ],
+      "artifacts": []
+    }
+  ]
+}

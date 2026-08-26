@@ -1,0 +1,300 @@
+package xport
+
+import (
+	"fmt"
+	"strconv"
+	"strings"
+
+	"github.com/bzync/nextsql/internal/catalog"
+	nsjson "github.com/bzync/nextsql/internal/json"
+	"github.com/bzync/nextsql/internal/nerr"
+	"github.com/bzync/nextsql/internal/sql/types"
+)
+
+func quoteIdent(s string) string {
+	return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
+}
+
+func sqlType(t types.Type) string {
+	switch t.Kind {
+	case types.KindDecimal:
+		return fmt.Sprintf("DECIMAL(%d,%d)", t.Precision, t.Scale)
+	default:
+		return t.String()
+	}
+}
+
+func createTableSQL(t *catalog.Table) (string, error) {
+	return createTableSQLWithParents(t, nil)
+}
+
+func createTableSQLWithParents(t *catalog.Table, parents map[string]*catalog.Table) (string, error) {
+	if t == nil || t.Name == "" || len(t.Columns) == 0 {
+		return "", nerr.New(nerr.InvalidFormat, "xport.createTableSQL", "invalid table")
+	}
+	var b strings.Builder
+	b.WriteString("CREATE TABLE ")
+	b.WriteString(quoteIdent(t.Name))
+	b.WriteString(" (")
+	for i, c := range t.Columns {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		b.WriteString(quoteIdent(c.Name))
+		b.WriteByte(' ')
+		b.WriteString(sqlType(c.Type))
+		singlePK := len(t.PK) == 1 && t.PK[0] == i
+		if singlePK {
+			b.WriteString(" PRIMARY KEY")
+		} else if c.NotNull {
+			b.WriteString(" NOT NULL")
+		}
+		switch c.Default.Kind {
+		case catalog.DefUUID:
+			b.WriteString(" DEFAULT UUID()")
+		case catalog.DefNow:
+			b.WriteString(" DEFAULT NOW()")
+		case catalog.DefAI:
+			b.WriteString(" DEFAULT AI()")
+		case catalog.DefLiteral:
+			lit, err := sqlLiteral(c.Default.Literal)
+			if err != nil {
+				return "", err
+			}
+			b.WriteString(" DEFAULT ")
+			b.WriteString(lit)
+		}
+	}
+	if len(t.PK) > 1 {
+		b.WriteString(", PRIMARY KEY (")
+		for i, ord := range t.PK {
+			if i > 0 {
+				b.WriteString(", ")
+			}
+			if ord < 0 || ord >= len(t.Columns) {
+				return "", nerr.New(nerr.InvalidFormat, "xport.createTableSQL", "invalid primary key ordinal")
+			}
+			b.WriteString(quoteIdent(t.Columns[ord].Name))
+		}
+		b.WriteByte(')')
+	}
+	for _, fk := range t.ForeignKeys {
+		clause, err := foreignKeySQL(t, fk, parents)
+		if err != nil {
+			return "", err
+		}
+		b.WriteString(", ")
+		b.WriteString(clause)
+	}
+	b.WriteByte(')')
+	return b.String(), nil
+}
+
+func foreignKeySQL(child *catalog.Table, fk catalog.ForeignKey, parents map[string]*catalog.Table) (string, error) {
+	parent := child
+	if fk.RefTable != "" && fk.RefTable != child.Name {
+		if parents != nil {
+			parent = parents[fk.RefTable]
+		} else {
+			parent = nil
+		}
+	}
+	if parent == nil {
+		return "", nerr.New(nerr.InvalidFormat, "xport.createTableSQL", "referenced table missing")
+	}
+	var b strings.Builder
+	if fk.Name != "" {
+		b.WriteString("CONSTRAINT ")
+		b.WriteString(quoteIdent(fk.Name))
+		b.WriteByte(' ')
+	}
+	b.WriteString("FOREIGN KEY (")
+	for i, ord := range fk.Columns {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		if ord < 0 || ord >= len(child.Columns) {
+			return "", nerr.New(nerr.InvalidFormat, "xport.createTableSQL", "invalid foreign key ordinal")
+		}
+		b.WriteString(quoteIdent(child.Columns[ord].Name))
+	}
+	b.WriteString(") REFERENCES ")
+	b.WriteString(quoteIdent(fk.RefTable))
+	b.WriteString(" (")
+	for i, ord := range fk.RefColumns {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		if ord < 0 || ord >= len(parent.Columns) {
+			return "", nerr.New(nerr.InvalidFormat, "xport.createTableSQL", "invalid referenced column ordinal")
+		}
+		b.WriteString(quoteIdent(parent.Columns[ord].Name))
+	}
+	b.WriteByte(')')
+	del, err := fkActionSQL(fk.OnDelete)
+	if err != nil {
+		return "", err
+	}
+	up, err := fkActionSQL(fk.OnUpdate)
+	if err != nil {
+		return "", err
+	}
+	b.WriteString(" ON DELETE ")
+	b.WriteString(del)
+	b.WriteString(" ON UPDATE ")
+	b.WriteString(up)
+	return b.String(), nil
+}
+
+func fkActionSQL(a catalog.FKAction) (string, error) {
+	switch a {
+	case catalog.FKRestrict:
+		return "RESTRICT", nil
+	case catalog.FKCascade:
+		return "CASCADE", nil
+	case catalog.FKSetNull:
+		return "SET NULL", nil
+	case catalog.FKSetDefault:
+		return "SET DEFAULT", nil
+	default:
+		return "", nerr.New(nerr.InvalidFormat, "xport.createTableSQL", "unknown foreign key action")
+	}
+}
+
+func createIndexSQL(t *catalog.Table, idx catalog.Index) (string, error) {
+	if t == nil || idx.Name == "" || len(idx.Columns) == 0 {
+		return "", nerr.New(nerr.InvalidFormat, "xport.createIndexSQL", "invalid index")
+	}
+	var b strings.Builder
+	switch {
+	case idx.Vector:
+		b.WriteString("CREATE VECTOR INDEX ")
+	case idx.Fulltext:
+		b.WriteString("CREATE FULLTEXT INDEX ")
+	case idx.Spatial:
+		b.WriteString("CREATE SPATIAL INDEX ")
+	case idx.Unique:
+		b.WriteString("CREATE UNIQUE INDEX ")
+	default:
+		b.WriteString("CREATE INDEX ")
+	}
+	b.WriteString(quoteIdent(idx.Name))
+	b.WriteString(" ON ")
+	b.WriteString(quoteIdent(t.Name))
+	b.WriteString(" (")
+	for i, ord := range idx.Columns {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		if idx.KeyIsExpr(i) {
+			b.WriteByte('(')
+			b.WriteString(catalog.FormatExpr(idx.Exprs[i]))
+			b.WriteByte(')')
+			continue
+		}
+		if ord < 0 || ord >= len(t.Columns) {
+			return "", nerr.New(nerr.InvalidFormat, "xport.createIndexSQL", "invalid index column")
+		}
+		b.WriteString(quoteIdent(t.Columns[ord].Name))
+		if i == 0 && len(idx.Path) > 0 {
+			for _, p := range idx.Path {
+				b.WriteByte('.')
+				b.WriteString(quoteIdent(p))
+			}
+		}
+	}
+	b.WriteByte(')')
+	if len(idx.Include) > 0 {
+		b.WriteString(" INCLUDE (")
+		for i, ord := range idx.Include {
+			if i > 0 {
+				b.WriteString(", ")
+			}
+			if ord < 0 || ord >= len(t.Columns) {
+				return "", nerr.New(nerr.InvalidFormat, "xport.createIndexSQL", "invalid INCLUDE column")
+			}
+			b.WriteString(quoteIdent(t.Columns[ord].Name))
+		}
+		b.WriteByte(')')
+	}
+	if idx.Predicate != nil {
+		b.WriteString(" WHERE ")
+		b.WriteString(catalog.FormatExpr(idx.Predicate))
+	}
+	if idx.Vector {
+		b.WriteString(" USING HNSW")
+	}
+	return b.String(), nil
+}
+
+func insertSQL(t *catalog.Table) (string, error) {
+	if t == nil || t.Name == "" || len(t.Columns) == 0 {
+		return "", nerr.New(nerr.InvalidFormat, "xport.insertSQL", "invalid table")
+	}
+	var b strings.Builder
+	b.WriteString("INSERT INTO ")
+	b.WriteString(quoteIdent(t.Name))
+	b.WriteString(" (")
+	for i, c := range t.Columns {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		b.WriteString(quoteIdent(c.Name))
+	}
+	b.WriteString(") VALUES (")
+	for i := range t.Columns {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		b.WriteByte('$')
+		b.WriteString(strconv.Itoa(i + 1))
+	}
+	b.WriteByte(')')
+	return b.String(), nil
+}
+
+func sqlLiteral(v types.Value) (string, error) {
+	if v.Null {
+		return "NULL", nil
+	}
+	switch v.Typ.Kind {
+	case types.KindUUID:
+		return "'" + types.FormatUUID(v.UUID) + "'", nil
+	case types.KindString, types.KindText:
+		return "'" + strings.ReplaceAll(v.Str, "'", "''") + "'", nil
+	case types.KindDecimal:
+		return v.Dec.String(), nil
+	case types.KindTimestampTZ:
+		return "'" + v.String() + "'", nil
+	case types.KindBool:
+		if v.Bool {
+			return "TRUE", nil
+		}
+		return "FALSE", nil
+	case types.KindJSON:
+		txt, err := nsjson.ToText(v.JSON)
+		if err != nil {
+			return "", err
+		}
+		return "'" + strings.ReplaceAll(string(txt), "'", "''") + "'", nil
+	case types.KindVector:
+		var b strings.Builder
+		b.WriteByte('(')
+		for i, f := range v.Vec {
+			if i > 0 {
+				b.WriteString(", ")
+			}
+			b.WriteString(strconv.FormatFloat(float64(f), 'g', -1, 32))
+		}
+		b.WriteByte(')')
+		return b.String(), nil
+	case types.KindPoint:
+		return fmt.Sprintf("POINT(%g, %g)", v.Lon, v.Lat), nil
+	case types.KindBox:
+		return fmt.Sprintf("BOX(%g, %g, %g, %g)", v.Box[0], v.Box[1], v.Box[2], v.Box[3]), nil
+	case types.KindLine, types.KindPolygon:
+		return "'" + strings.ReplaceAll(v.String(), "'", "''") + "'", nil
+	default:
+		return "", nerr.New(nerr.InvalidArgument, "xport.sqlLiteral", "unsupported default type")
+	}
+}

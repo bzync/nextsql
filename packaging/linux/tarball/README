@@ -1,0 +1,34 @@
+NextSQL
+=======
+
+Encrypted-by-default multimodel database. This archive contains:
+
+  bin/nextsql         CLI (init, exec, migrate, backup, …)
+  bin/nextsqld        Server (NSQL v1 protocol, default 127.0.0.1:7210)
+  bin/nextsql-bench   Official measurements (encryption, WAL, fsync on)
+  etc/nextsql.conf    Default nextsqld --config file
+  systemd/            Unit, sysusers, tmpfiles
+  install.sh          System-wide or user-local installer
+  uninstall.sh
+
+Install (system-wide, as root):
+
+  sudo ./install.sh
+
+Install into $HOME/.local (no root):
+
+  ./install.sh --user
+
+Then initialize a data directory. Keep the root unlock key off the data
+volume in production.
+
+  printf 'secret\n' > /tmp/nextsql.pw && chmod 600 /tmp/nextsql.pw
+  nextsql init --data-dir /var/lib/nextsql --key-file /etc/nextsql/root.key \
+    --user app --password-file /tmp/nextsql.pw
+  sudo systemctl enable --now nextsql     # system install
+
+User-local data and key paths are printed by install.sh --user.
+
+Loopback may run without TLS. Any other listen address requires TLS 1.3.
+
+https://github.com/bzync/nextsql

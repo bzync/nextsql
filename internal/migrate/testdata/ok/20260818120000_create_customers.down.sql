@@ -1,0 +1,2 @@
+-- migrate:down 20260818120000 create_customers
+-- compensating DELETE is legal in v1; DROP TABLE is not

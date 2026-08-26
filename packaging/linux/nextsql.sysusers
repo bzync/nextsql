@@ -1,0 +1,2 @@
+# Type Name ID GECOS Home directory Shell
+u nextsql - "NextSQL database" /var/lib/nextsql /usr/sbin/nologin

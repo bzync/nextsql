@@ -1,0 +1,51 @@
+Name:           nextsql
+Version:        @@RPM_VERSION@@
+Release:        1%{?dist}
+Summary:        Encrypted-by-default multimodel database
+License:        Proprietary
+URL:            https://github.com/bzync/nextsql
+BuildArch:      @@RPM_ARCH@@
+
+Requires(pre):  shadow-utils
+Requires(post): systemd
+Requires(preun): systemd
+Requires(postun): systemd
+
+%description
+NextSQL is a high-performance, encrypted-by-default multimodel database.
+Relational SQL, native JSON, vector search, full-text search, and geospatial
+types share one ACID engine, one WAL, and one query optimizer.
+
+%install
+mkdir -p %{buildroot}
+cp -a @@STAGE@@/. %{buildroot}/
+
+%files
+%license usr/share/doc/nextsql/copyright
+%doc usr/share/doc/nextsql/README
+%{_bindir}/nextsql
+%{_bindir}/nextsqld
+%{_bindir}/nextsql-bench
+%config(noreplace) %{_sysconfdir}/nextsql/nextsql.conf
+%{_unitdir}/nextsql.service
+%{_prefix}/lib/sysusers.d/nextsql.conf
+%{_prefix}/lib/tmpfiles.d/nextsql.conf
+
+%pre
+getent group nextsql >/dev/null || groupadd --system nextsql
+getent passwd nextsql >/dev/null || \
+	useradd --system --gid nextsql --home-dir /var/lib/nextsql \
+		--shell /sbin/nologin --comment "NextSQL database" nextsql
+exit 0
+
+%post
+if command -v systemd-tmpfiles >/dev/null 2>&1; then
+	systemd-tmpfiles --create %{_prefix}/lib/tmpfiles.d/nextsql.conf >/dev/null 2>&1 || :
+fi
+%systemd_post nextsql.service
+
+%preun
+%systemd_preun nextsql.service
+
+%postun
+%systemd_postun_with_restart nextsql.service

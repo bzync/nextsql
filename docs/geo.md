@@ -1,0 +1,83 @@
+# Geospatial and location
+
+First-class WGS84 locations in the same ACID, encrypted, WAL-backed engine as the rest of NextSQL. This is not PostGIS and not a GIS sidecar.
+
+## Types
+
+| Type | Storage | Meaning |
+|---|---|---|
+| `POINT` | 16 bytes, two `float64` LE | longitude, latitude in degrees |
+| `LOCATION` | same as `POINT` | type alias |
+| `BOX` | 32 bytes, four `float64` LE | west, south, east, north |
+| `LINESTRING` | `u16` vertex count + lon/lat pairs | at least two vertices |
+| `POLYGON` | `u16` ring count + closed rings | exterior ring, then optional holes |
+
+Longitude must be in `[-180, 180]`, latitude in `[-90, 90]`. Invalid coordinates fail closed. A `BOX` may wrap the antimeridian when west > east. `LINESTRING` and `POLYGON` reject an antimeridian-crossing span (`max lon − min lon > 180`) rather than guessing a wrap. Each ring is closed (first vertex equals last). Total vertices are capped at 256 so a geometry still fits in a 16 KiB page.
+
+WKT text coerces into these types: `POINT(lon lat)`, `BOX(w s, e n)`, `LINESTRING(lon lat, …)`, `POLYGON((lon lat, …)[, (hole…)])`.
+
+## Functions
+
+Coordinates are **(longitude, latitude)**. `DISTANCE` is meters on the mean Earth sphere (IUGG radius 6 371 008.8 m, haversine). `DISTANCE_SPHEROID` is the Vincenty inverse on the WGS84 ellipsoid (a = 6 378 137 m, f = 1/298.257223563). Near-antipodal pairs that do not converge fall back to haversine; that fallback is not a geodesic.
+
+`DWITHIN` / `LINELENGTH` against a line or polygon edge use an equirectangular closest-point on each segment, then haversine. That residual is exact enough for the predicate; it is not a full ellipsoidal geodesic-to-polyline.
+
+`WITHIN` / `COVERS` on a polygon use exterior-minus-holes ray casting. Self-intersecting rings are not diagnosed.
+
+| Call | Result |
+|---|---|
+| `POINT(lon, lat)` | `POINT` |
+| `BOX(west, south, east, north)` | `BOX` |
+| `LINESTRING(wkt)` | `LINESTRING` |
+| `POLYGON(wkt)` | `POLYGON` |
+| `LON(p)` / `LAT(p)` | `DECIMAL` |
+| `DISTANCE(a, b)` | meters (sphere) |
+| `DISTANCE_SPHEROID(a, b)` | meters (WGS84) |
+| `LINELENGTH(line)` / `ST_Length` | meters along a `LINESTRING` |
+| `DWITHIN(a, b, meters)` | boolean (`POINT` / `LINESTRING` / `POLYGON`) |
+| `WITHIN(p, box\|polygon)` | boolean |
+| `COVERS(box\|polygon, p)` | boolean |
+
+Aliases: `ST_MakePoint`, `ST_MakeLine`, `ST_MakePolygon`, `ST_Distance`, `ST_DistanceSpheroid`, `ST_DWithin`, `ST_Within`, `ST_Covers`, `ST_Length`, `ST_X`, `ST_Y`, `LONGITUDE`, `LATITUDE`.
+
+## Spatial index
+
+```sql
+CREATE SPATIAL INDEX ix_loc ON places (loc);
+```
+
+Requires a single `POINT` column. Not `UNIQUE` (finite hash cells can collide). Keys are a 64-bit Morton (Z-order) geohash plus the primary key. The value is the primary key so the executor can fetch the heap row.
+
+`DWITHIN`, `DISTANCE(col, const) < r`, `WITHIN(col, box|polygon)`, and `COVERS(box|polygon, col)` are sargable. A `DWITHIN` against a constant `LINESTRING` or `POLYGON` expands that geometry's bounding box by the radius. The optimizer covers the query with a geohash prefix range and keeps the original predicate as a residual (the prefix can over-select; the residual is exact). A box that wraps the antimeridian falls back to a full index scan plus residual.
+
+`EXPLAIN` shows `IndexScan … spatial`.
+
+## Examples
+
+```sql
+CREATE TABLE places (
+    id   UUID PRIMARY KEY DEFAULT UUID(),
+    name STRING NOT NULL,
+    loc  POINT NOT NULL
+);
+
+INSERT INTO places (name, loc) VALUES
+    ('empire', POINT(-73.9857, 40.7484)),
+    ('jfk',    'POINT(-73.7781 40.6413)');
+
+CREATE SPATIAL INDEX ix_loc ON places (loc);
+
+SELECT name FROM places
+WHERE DWITHIN(loc, POINT(-73.9857, 40.7484), 5000);
+
+SELECT name, DISTANCE(loc, POINT(-73.9857, 40.7484))
+FROM places
+WHERE WITHIN(loc, BOX(-74.1, 40.6, -73.8, 40.9));
+
+SELECT name FROM places
+WHERE WITHIN(loc, POLYGON('((-74.1 40.6, -73.8 40.6, -73.8 40.9, -74.1 40.9, -74.1 40.6))'));
+
+SELECT DISTANCE_SPHEROID(POINT(-74.0060, 40.7128), POINT(-118.2437, 34.0522));
+```
+
+3D, geography-vs-geometry dual types, and spheroidal distance-to-polyline are not implemented.

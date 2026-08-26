@@ -1,0 +1,1 @@
+CREATE TABLE customers (id UUID PRIMARY KEY);

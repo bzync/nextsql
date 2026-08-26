@@ -1,0 +1,9 @@
+{
+  "name": "@nextsql/driver",
+  "version": "0.1.0",
+  "exports": "./mod.ts",
+  "tasks": {
+    "test": "deno test --allow-read --allow-env --allow-net nextsql_test.js",
+    "check": "deno check mod.ts usage.ts live.ts"
+  }
+}

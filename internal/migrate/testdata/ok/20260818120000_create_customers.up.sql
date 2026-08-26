@@ -1,0 +1,4 @@
+CREATE TABLE customers (
+    id UUID PRIMARY KEY DEFAULT UUID(),
+    name STRING NOT NULL
+);

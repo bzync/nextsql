@@ -205,7 +205,7 @@ func (s *Session) forEachRowInner(p planner.Logical, fn func([]types.Value) erro
 		return nil
 	case planner.Project:
 		return s.forEachRowInner(n.Input, fn)
-	case planner.Window, planner.Sort, planner.Aggregate:
+	case planner.Window, planner.Sort, planner.Aggregate, planner.Facet:
 		rows, err := s.collectPlan(n)
 		if err != nil {
 			return err
@@ -280,10 +280,10 @@ func (s *Session) scanHeapPartitions(tab *catalog.Table, partitions []uint32, lo
 func (s *Session) scanIndex(n planner.IndexScan, fn func([]types.Value) error) error {
 	tab := n.Table
 	if tab != nil && tab.Partitioning != nil {
-		if !n.PK {
-			return nerr.New(nerr.InvalidArgument, "executor.scanIndex", "secondary indexes on partitioned tables are not supported in this slice")
+		if n.PK {
+			return s.scanPartitionedPK(n, fn)
 		}
-		return s.scanPartitionedPK(n, fn)
+		return s.scanPartitionedIndex(n, fn)
 	}
 	heap, err := s.heapOf(tab)
 	if err != nil {
@@ -363,6 +363,73 @@ func (s *Session) scanIndex(n planner.IndexScan, fn func([]types.Value) error) e
 		return emitIndex(key, val)
 	}
 	return itx.Range(start, end, emitIndex)
+}
+
+func (s *Session) scanPartitionedIndex(n planner.IndexScan, fn func([]types.Value) error) error {
+	tab := n.Table
+	idx := indexByName(tab, n.IndexName)
+	var start, end []byte
+	if n.Spatial {
+		start, end = n.GeoStart, n.GeoEnd
+	} else {
+		var err error
+		start, end, err = encodeBounds(n.Low, n.High, n.LowIncl, n.HighIncl)
+		if err != nil {
+			return err
+		}
+	}
+	emit := func(row []types.Value) error {
+		ok, err := s.match(n.Residual, tab, row)
+		if err != nil || !ok {
+			return err
+		}
+		if s.trace != nil {
+			if node := optimizer.Find(s.trace, "IndexScan"); node != nil {
+				node.ActRows++
+			}
+		}
+		return fn(row)
+	}
+	pkTypes := pkTypeList(tab)
+	for _, part := range partitionSelection(tab, n.Partitions) {
+		heap, err := s.partitionHeap(tab, part.ID)
+		if err != nil {
+			return err
+		}
+		local, err := s.partitionIndex(tab, part.ID, idx)
+		if err != nil {
+			return err
+		}
+		htx := s.x.use(heap)
+		itx := s.x.use(local)
+		emitIndex := func(key, val []byte) error {
+			if n.IndexOnly {
+				row, err := rowFromIndex(tab, idx, key, val)
+				if err != nil {
+					return err
+				}
+				return emit(row)
+			}
+			return s.fetchPK(htx, tab, val, pkTypes, emit)
+		}
+		if point, key := uniquePoint(n); point {
+			val, err := itx.Lookup(key)
+			if err != nil {
+				if nerr.HasCode(err, nerr.NotFound) {
+					continue
+				}
+				return err
+			}
+			if err := emitIndex(key, val); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := itx.Range(start, end, emitIndex); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *Session) scanPartitionedPK(n planner.IndexScan, fn func([]types.Value) error) error {

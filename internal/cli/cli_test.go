@@ -16,20 +16,19 @@ import (
 func TestParseDotenv(t *testing.T) {
 	in := `
 # comment
-NEXTSQL_USER=app
+NEXTSQL_DATABASE_USER=app
 export NEXTSQL_ADDR=127.0.0.1:7210
 NEXTSQL_DATABASE="prod db"
-NEXTSQL_TENANT='acme'
 NEXTSQL_EMPTY=
 `
 	m, err := parseDotenv(strings.NewReader(in))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if m["NEXTSQL_USER"] != "app" || m["NEXTSQL_ADDR"] != "127.0.0.1:7210" {
+	if m["NEXTSQL_DATABASE_USER"] != "app" || m["NEXTSQL_ADDR"] != "127.0.0.1:7210" {
 		t.Fatalf("%v", m)
 	}
-	if m["NEXTSQL_DATABASE"] != "prod db" || m["NEXTSQL_TENANT"] != "acme" {
+	if m["NEXTSQL_DATABASE"] != "prod db" {
 		t.Fatalf("quotes: %v", m)
 	}
 	if m["NEXTSQL_EMPTY"] != "" {
@@ -49,13 +48,13 @@ func TestDiscoverWalkUpAndCwdLocal(t *testing.T) {
 	if err := os.MkdirAll(child, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(root, "proj", ".env"), []byte("NEXTSQL_USER=from-env\n"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(root, "proj", ".env"), []byte("NEXTSQL_DATABASE_USER=from-env\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(root, "proj", ".env.local"), []byte("NEXTSQL_USER=parent-local\n"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(root, "proj", ".env.local"), []byte("NEXTSQL_DATABASE_USER=parent-local\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(child, ".env.local"), []byte("NEXTSQL_PASSWORD_FILE=/tmp/pw\n"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(child, ".env.local"), []byte("NEXTSQL_DATABASE_PASSWORD_FILE=/tmp/pw\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -83,7 +82,7 @@ func TestDiscoverStopsAtMaxWalk(t *testing.T) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(root, ".env"), []byte("NEXTSQL_USER=too-far\n"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(root, ".env"), []byte("NEXTSQL_DATABASE_USER=too-far\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	base, _ := discoverEnvFiles(dir)
@@ -96,13 +95,13 @@ func TestResolvePriorityAndEmptyEnv(t *testing.T) {
 	clearClientEnv(t)
 	dir := t.TempDir()
 	chdir(t, dir)
-	if err := os.WriteFile(filepath.Join(dir, ".env"), []byte("NEXTSQL_USER=file-user\nNEXTSQL_ADDR=10.0.0.1:1\nNEXTSQL_DATABASE=from-env\n"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, ".env"), []byte("NEXTSQL_DATABASE_USER=file-user\nNEXTSQL_ADDR=10.0.0.1:1\nNEXTSQL_DATABASE=from-env\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, ".env.local"), []byte("NEXTSQL_USER=local-user\nNEXTSQL_PASSWORD_FILE=/run/pw\n"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, ".env.local"), []byte("NEXTSQL_DATABASE_USER=local-user\nNEXTSQL_DATABASE_PASSWORD_FILE=/run/pw\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv(envUser, "")
+	t.Setenv(envDatabaseUser, "")
 	t.Setenv(envAddr, "env-addr:9")
 
 	s, err := Resolve(nil, nil)
@@ -124,10 +123,10 @@ func TestResolveExplicitFlagWinsEmpty(t *testing.T) {
 	clearClientEnv(t)
 	dir := t.TempDir()
 	chdir(t, dir)
-	if err := os.WriteFile(filepath.Join(dir, ".env"), []byte("NEXTSQL_USER=file-user\n"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, ".env"), []byte("NEXTSQL_DATABASE_USER=file-user\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv(envUser, "env-user")
+	t.Setenv(envDatabaseUser, "env-user")
 	fs := testServerFlags()
 	if err := fs.Parse([]string{"--user="}); err != nil {
 		t.Fatal(err)
@@ -145,7 +144,7 @@ func TestResolveNoEnvSkipsFiles(t *testing.T) {
 	clearClientEnv(t)
 	dir := t.TempDir()
 	chdir(t, dir)
-	if err := os.WriteFile(filepath.Join(dir, ".env"), []byte("NEXTSQL_USER=file-user\n"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, ".env"), []byte("NEXTSQL_DATABASE_USER=file-user\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	fs := testServerFlags()
@@ -168,11 +167,11 @@ func TestResolveEnvFileOnly(t *testing.T) {
 	clearClientEnv(t)
 	dir := t.TempDir()
 	chdir(t, dir)
-	if err := os.WriteFile(filepath.Join(dir, ".env"), []byte("NEXTSQL_USER=ignored\n"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, ".env"), []byte("NEXTSQL_DATABASE_USER=ignored\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	other := filepath.Join(dir, "other.env")
-	if err := os.WriteFile(other, []byte("NEXTSQL_USER=only-file\nNEXTSQL_INSECURE=true\n"), 0o600); err != nil {
+	if err := os.WriteFile(other, []byte("NEXTSQL_DATABASE_USER=only-file\nNEXTSQL_INSECURE=true\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	fs := testServerFlags()
@@ -185,6 +184,111 @@ func TestResolveEnvFileOnly(t *testing.T) {
 	}
 	if s.User != "only-file" || !s.Insecure {
 		t.Fatalf("%+v", s)
+	}
+}
+
+func TestResolveNextSQLDotenvSurface(t *testing.T) {
+	clearClientEnv(t)
+	dir := t.TempDir()
+	chdir(t, dir)
+	dotenv := strings.Join([]string{
+		"NEXTSQL_ADDR=127.0.0.1:7210",
+		"NEXTSQL_DATABASE=app_db",
+		"NEXTSQL_REALM_NAME=customer_a",
+		"NEXTSQL_INSTANCE_KEY_FILE=/run/keys/instance.key",
+		"NEXTSQL_DATABASE_USER=db_user",
+		"NEXTSQL_DATABASE_PASS=db_password",
+		"NEXTSQL_INSECURE=true",
+		"NEXTSQL_TLS_SERVER_NAME=db.internal",
+		"NEXTSQL_MIGRATION_DIR=./schema/migrations",
+		"NEXTSQL_SERVER_USER=server_admin",
+		"NEXTSQL_SERVER_PASS=server_password",
+		"NEXTSQL_SERVER_PASSWORD_FILE=/run/server.pw",
+		"NEXTSQL_HOSTING_CONFIRM=true",
+		"NEXTSQL_HOSTING_MANIFEST_FILE=/etc/nextsql/hosting.yaml",
+		"",
+	}, "\n")
+	if err := os.WriteFile(filepath.Join(dir, ".env"), []byte(dotenv), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := Resolve(testServerFlags(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.Addr != "127.0.0.1:7210" || s.Database != "app_db" || s.User != "db_user" {
+		t.Fatalf("connection settings: addr=%q database=%q user=%q", s.Addr, s.Database, s.User)
+	}
+	if s.Realm != "customer_a" || s.InstanceKeyFile != "/run/keys/instance.key" || !s.HostingConfirm || s.HostingManifest != "/etc/nextsql/hosting.yaml" {
+		t.Fatalf("hosting settings: realm=%q instance_key=%q confirm=%t manifest=%q", s.Realm, s.InstanceKeyFile, s.HostingConfirm, s.HostingManifest)
+	}
+	if !s.Supplied["realm"] || !s.Supplied["database"] || !s.Supplied["instance-key-file"] || !s.Supplied["confirm"] || !s.Supplied["hosting-manifest"] {
+		t.Fatalf("hosting settings were not marked supplied: %+v", s.Supplied)
+	}
+	if s.Password != "db_password" || !s.Insecure {
+		t.Fatal("password or insecure setting was not resolved")
+	}
+	if s.TLSServerName != "db.internal" || s.MigrationsDir != "./schema/migrations" {
+		t.Fatalf("TLS/migration settings: server_name=%q migrations=%q", s.TLSServerName, s.MigrationsDir)
+	}
+	if s.User != "db_user" || s.Password != "db_password" {
+		t.Fatal("server credentials overrode the regular database account")
+	}
+	if s.ServerUser != "server_admin" || s.ServerPass != "server_password" || s.ServerPassFile != "/run/server.pw" {
+		t.Fatalf("server credentials were not resolved independently: %+v", s)
+	}
+}
+
+func TestRemovedRealmAndTenantEnvironmentNamesAreIgnored(t *testing.T) {
+	clearClientEnv(t)
+	dir := t.TempDir()
+	chdir(t, dir)
+	t.Setenv("NEXTSQL_REALM", "legacy-realm")
+	t.Setenv("NEXTSQL_TENANT", "legacy-tenant")
+
+	s, err := Resolve(testServerFlags(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.Realm != "" || s.Supplied["realm"] {
+		t.Fatalf("removed NEXTSQL_REALM was accepted: realm=%q supplied=%v", s.Realm, s.Supplied["realm"])
+	}
+}
+
+func TestResolveServerCredentialsNeverBecomeClientFallback(t *testing.T) {
+	clearClientEnv(t)
+	dir := t.TempDir()
+	chdir(t, dir)
+	if err := os.WriteFile(filepath.Join(dir, ".env"), []byte(
+		"NEXTSQL_SERVER_USER=server_admin\nNEXTSQL_SERVER_PASS=server_password\n",
+	), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Resolve(testServerFlags(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.User != "" || s.Password != "" {
+		t.Fatalf("server credentials leaked into client login: user=%q password=%t", s.User, s.Password != "")
+	}
+	if s.ServerUser != "server_admin" || s.ServerPass != "server_password" {
+		t.Fatalf("server credentials missing: %+v", s)
+	}
+}
+
+func TestResolveRejectsAmbiguousLegacyClientEnvironmentNames(t *testing.T) {
+	clearClientEnv(t)
+	dir := t.TempDir()
+	chdir(t, dir)
+	t.Setenv("NEXTSQL_USER", "legacy-user")
+	t.Setenv("NEXTSQL_PASSWORD", "legacy-password")
+	t.Setenv("NEXTSQL_PASSWORD_FILE", "/run/legacy.pw")
+	s, err := Resolve(testServerFlags(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.User != "" || s.Password != "" || s.PasswordFile != "" {
+		t.Fatalf("ambiguous legacy client variables were accepted: %+v", s)
 	}
 }
 
@@ -205,7 +309,7 @@ func TestResolveFlagBeatsEnv(t *testing.T) {
 	clearClientEnv(t)
 	dir := t.TempDir()
 	chdir(t, dir)
-	t.Setenv(envUser, "env-user")
+	t.Setenv(envDatabaseUser, "env-user")
 	t.Setenv(envInsecure, "true")
 	fs := testServerFlags()
 	if err := fs.Parse([]string{"--user", "flag-user", "--insecure=false"}); err != nil {
@@ -225,7 +329,7 @@ func TestResolveNoEnvWinsOverEnvFile(t *testing.T) {
 	dir := t.TempDir()
 	chdir(t, dir)
 	path := filepath.Join(dir, "only.env")
-	if err := os.WriteFile(path, []byte("NEXTSQL_USER=from-file\n"), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte("NEXTSQL_DATABASE_USER=from-file\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	fs := testServerFlags()
@@ -309,7 +413,7 @@ func TestServerConfigInlinePasswordWarns(t *testing.T) {
 	if cfg.Password != "inline-secret" {
 		t.Fatalf("password %q", cfg.Password)
 	}
-	if !strings.Contains(buf.String(), "using NEXTSQL_PASSWORD from the environment; prefer NEXTSQL_PASSWORD_FILE") {
+	if !strings.Contains(buf.String(), "using NEXTSQL_DATABASE_PASS from the environment; prefer NEXTSQL_DATABASE_PASSWORD_FILE") {
 		t.Fatalf("warning %q", buf.String())
 	}
 }
@@ -357,6 +461,18 @@ func TestServerConfigRejectsInsecureRemote(t *testing.T) {
 	}
 }
 
+func TestServerConfigRequiresMTLSClientKeyPair(t *testing.T) {
+	s := Defaults()
+	s.Addr = "127.0.0.1:7210"
+	s.User = "app"
+	s.Password = "secret"
+	s.Insecure = true
+	s.TLSClientCert = "/tmp/client.crt"
+	if _, err := ServerConfig(s); err == nil || !strings.Contains(err.Error(), "must be set together") {
+		t.Fatalf("err=%v", err)
+	}
+}
+
 func TestServerConfigIgnoresKeyFileFromEnv(t *testing.T) {
 	s := Defaults()
 	s.User = "app"
@@ -392,10 +508,10 @@ func TestResolveParentLocalNotInherited(t *testing.T) {
 	if err := os.MkdirAll(child, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(root, ".env"), []byte("NEXTSQL_USER=walked\n"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(root, ".env"), []byte("NEXTSQL_DATABASE_USER=walked\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(root, ".env.local"), []byte("NEXTSQL_USER=parent-local\n"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(root, ".env.local"), []byte("NEXTSQL_DATABASE_USER=parent-local\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	chdir(t, child)
@@ -459,12 +575,17 @@ func testServerFlags() *flag.FlagSet {
 	fs.String("password-file", "", "")
 	fs.String("database", "", "")
 	fs.String("tls-ca", "", "")
+	fs.String("tls-server-name", "", "")
+	fs.String("tls-client-cert", "", "")
+	fs.String("tls-client-key", "", "")
 	fs.Bool("insecure", false, "")
-	fs.String("tenant", "", "")
 	fs.String("dir", defaultMigrationsDir, "")
 	fs.String("data-dir", "", "")
 	fs.String("key-file", "", "")
+	fs.String("instance-key-file", "", "")
+	fs.String("realm", "", "")
 	fs.Int("buffer-pages", config.DefaultBufferPages, "")
+	fs.Bool("confirm", false, "")
 	fs.String("env-file", "", "")
 	fs.Bool("no-env", false, "")
 	return fs
@@ -489,9 +610,9 @@ func chdir(t *testing.T, dir string) {
 func clearClientEnv(t *testing.T) {
 	t.Helper()
 	for _, k := range []string{
-		envAddr, envUser, envPasswordFile, envPassword, envDatabase,
-		envTLSCA, envInsecure, envMigrationsDir, envTenant,
-		envDataDir, envKeyFile, envBufferPages,
+		envAddr, envDatabaseUser, envDatabasePassFile, envDatabasePass, envServerUser, envServerPass, envServerPassFile, envDatabase,
+		envTLSCA, envTLSServerName, envTLSClientCert, envTLSClientKey, envInsecure, envMigrationDir,
+		envDataDir, envKeyFile, envInstanceKey, envRealmName, envBufferPages, envHostingConfirm,
 	} {
 		t.Setenv(k, "")
 		_ = os.Unsetenv(k)

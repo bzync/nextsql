@@ -6,6 +6,8 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"runtime"
+	"runtime/debug"
 	"slices"
 	"strconv"
 	"sync"
@@ -796,20 +798,45 @@ func TestRandomizedLargeInvariants(t *testing.T) {
 		}
 		ops = n
 		pages = 4096
+		if ops >= 1_000_000 {
+			// A larger resident pool keeps most of a multi-GiB tree cached, so
+			// random-key operations stop paying a buffer miss (a page read plus
+			// a dirty-eviction write) each. That miss traffic, not CPU, is the
+			// dominant cost of the 100M soak. NEXTSQL_BTREE_POOL_PAGES overrides
+			// this for hosts with more (or less) RAM to spare.
+			pages = 12_288
+		}
 		if ops >= 10_000_000 {
-			pages = 8192
+			pages = 24_576
 		}
 	} else if testing.Short() {
 		t.Skip("short")
 	}
+	if v := os.Getenv("NEXTSQL_BTREE_POOL_PAGES"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 64 {
+			t.Fatalf("NEXTSQL_BTREE_POOL_PAGES=%q", v)
+		}
+		pages = n
+	}
 	tr, e := testTree(t, pages)
 	rng := rand.New(rand.NewSource(0x10000000))
 	space := ops / 2
+	if v := os.Getenv("NEXTSQL_BTREE_SPACE"); v != "" {
+		// Capping the key space bounds the resident tree so it fits in the pool
+		// on a RAM-constrained host. The soak still performs `ops` insert/
+		// delete/merge operations; it just churns them over fewer keys.
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 {
+			t.Fatalf("NEXTSQL_BTREE_SPACE=%q", v)
+		}
+		space = n
+	}
 	if space < 1 {
 		space = 1
 	}
 	present := make([]bool, space)
-	value := make([]int, space)
+	value := make([]int32, space) // op index fits int32; half the RAM of []int
 	live := 0
 	batchSize := 1
 	if ops >= 1_000_000 {
@@ -818,11 +845,32 @@ func TestRandomizedLargeInvariants(t *testing.T) {
 		// barriers in the official large run.
 		batchSize = 4096
 	}
+	// flushEvery is a cheap checkpoint + checkpoint-obsolete WAL discard. It
+	// bounds WAL disk footprint only (redo is full 16 KiB page images, so
+	// segments since the last checkpoint grow with the dirty-page count); the
+	// pool is self-bounding via lazy eviction once WAL is durable, so this does
+	// not govern memory. Zero on small runs, where the checkEvery checkpoint
+	// suffices. Large enough that checkpoint overhead stays negligible.
+	flushEvery := 0
+	if ops >= 1_000_000 {
+		flushEvery = 1_000_000
+	}
+	// checkEvery is the expensive, rare full structural invariant walk plus a
+	// scan count. Its map/slice transients are freed to the OS afterwards.
 	checkEvery := 1000
 	if ops > 10_000 {
-		checkEvery = ops / 50
-		if checkEvery < 10_000 {
-			checkEvery = 10_000
+		checkEvery = ops / 10
+		if checkEvery < 500_000 {
+			checkEvery = 500_000
+		}
+	}
+	flush := func(op int) {
+		t.Helper()
+		if err := e.Checkpoint(); err != nil {
+			t.Fatalf("op %d checkpoint: %v", op, err)
+		}
+		if err := e.WAL.DiscardCheckpointedSegments(); err != nil {
+			t.Fatalf("op %d discard checkpointed WAL: %v", op, err)
 		}
 	}
 	var write *WriteTxn
@@ -858,7 +906,7 @@ func TestRandomizedLargeInvariants(t *testing.T) {
 				t.Fatalf("op %d insert: %v", i, err)
 			}
 			present[k] = true
-			value[k] = i
+			value[k] = int32(i)
 			live++
 		default:
 			err := write.Delete(keyOf(k))
@@ -877,22 +925,23 @@ func TestRandomizedLargeInvariants(t *testing.T) {
 		if (i+1)%batchSize == 0 {
 			commit(i)
 		}
+		if flushEvery > 0 && (i+1)%flushEvery == 0 {
+			commit(i)
+			flush(i)
+		}
 		if (i+1)%checkEvery == 0 {
 			commit(i)
 			if err := tr.Check(); err != nil {
 				t.Fatalf("op %d check: %v", i, err)
 			}
-			// Bound WAL growth during large correctness soaks. Besides keeping
-			// the 100M run within the labeled filesystem, checkpointing here
-			// exercises durable page flush and WAL recycling only after the
-			// tree has passed a full structural invariant check.
-			if err := e.Checkpoint(); err != nil {
-				t.Fatalf("op %d checkpoint: %v", i, err)
-			}
-			if err := e.WAL.DiscardCheckpointedSegments(); err != nil {
-				t.Fatalf("op %d discard checkpointed WAL: %v", i, err)
-			}
+			// Checkpoint after a clean structural check so durable page flush
+			// and WAL recycling run against a verified tree.
+			flush(i)
 			t.Logf("op %d live=%d", i+1, live)
+			// Return the Check() walk's transient maps/slices to the OS so a
+			// RAM-constrained soak host does not drift toward the OOM killer.
+			runtime.GC()
+			debug.FreeOSMemory()
 		}
 	}
 	commit(ops - 1)
@@ -920,8 +969,8 @@ func TestRandomizedLargeInvariants(t *testing.T) {
 		if err != nil {
 			t.Fatalf("lookup %d: %v", k, err)
 		}
-		if !bytes.Equal(got, valOf(value[k])) {
-			t.Fatalf("lookup %d: got %q want %q", k, got, valOf(value[k]))
+		if !bytes.Equal(got, valOf(int(value[k]))) {
+			t.Fatalf("lookup %d: got %q want %q", k, got, valOf(int(value[k])))
 		}
 	}
 }

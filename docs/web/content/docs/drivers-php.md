@@ -8,7 +8,7 @@ require 'drivers/php/autoload.php';
 $conn = NextSQL\Client::connect([
     'address' => '127.0.0.1:7210',
     'user' => 'app',
-    'password' => getenv('NEXTSQL_PASSWORD'),
+    'password' => getenv('NEXTSQL_DATABASE_PASS'),
     'insecureNoTLS' => true,
 ]);
 
@@ -24,7 +24,7 @@ Remote TLS:
 $conn = NextSQL\Client::connect([
     'address' => 'db.example.com:7210',
     'user' => 'app',
-    'password' => getenv('NEXTSQL_PASSWORD'),
+    'password' => getenv('NEXTSQL_DATABASE_PASS'),
     'tls' => ['cafile' => '/etc/nextsql/ca.pem', 'servername' => 'db.example.com'],
 ]);
 ```

@@ -32,9 +32,15 @@ Official numbers keep encryption, WAL, `fsync`, checksums, MVCC, and authenticat
 # labeled SLO suite (hardware, filesystem, encryption, durability printed on every row)
 ./nextsql-bench --slo
 ./nextsql-bench --slo --slo-max-rows 1000000 --slo-vectors 256 --duration 2s
+
+# comparisons
+./nextsql-bench --partition --partition-rows 40000   # RANGE-partitioned vs unpartitioned
+./nextsql-bench --readscale --readscale-rows 10000   # STRONG vs STALE/BOUNDED reads across a 3-node cluster
 ```
 
 `--slo` seeds a throwaway encrypted database and measures cached PK lookup, secondary-index equality, durable single-row INSERT/UPDATE, bulk INSERT plus `COUNT(*)` / `GROUP BY` / range / join at each scale, hybrid `WHERE`+`SEARCH`+`NEAREST`, and HNSW recall@10 / recall@100.
+
+`--readscale` builds a 3-node single-leader cluster and drives PK point reads under `STRONG` on the leader, `STALE` on the leader, `STALE` over two and three members, and `BOUNDED` over three — reporting aggregate read QPS, the leader's slice, and p95/p99. It measures the Raft read-barrier cost and the leader read-offload; see [`docs/ha.md`](https://github.com/bzync/nextsql/blob/main/docs/ha.md) "Read scaling".
 
 100M rows and 1M-vector HNSW still need a longer run (`--slo-max-rows 100000000` / `--slo-vectors 1000000`). Published host numbers live in [`docs/ops.md`](https://github.com/bzync/nextsql/blob/main/docs/ops.md).
 

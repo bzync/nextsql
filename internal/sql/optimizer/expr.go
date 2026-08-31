@@ -466,6 +466,11 @@ func tableOf(p planner.Logical) *catalog.Table {
 			return n.Table
 		}
 		return tableOf(n.Input)
+	case planner.Facet:
+		if n.Table != nil {
+			return n.Table
+		}
+		return tableOf(n.Input)
 	case planner.Nearest:
 		if n.Table != nil {
 			return n.Table
@@ -593,6 +598,8 @@ func namesOf(p planner.Logical) []string {
 			return out
 		}
 		return namesOf(n.Input)
+	case planner.Facet:
+		return []string{"facet", "value", "count"}
 	case planner.Nearest:
 		if n.Table != nil {
 			out := make([]string, len(n.Table.Columns))

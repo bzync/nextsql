@@ -237,6 +237,37 @@ func TestDriverPhase5OverTLS(t *testing.T) {
 	}
 }
 
+func TestDriverIdempotentMutationOverTLS(t *testing.T) {
+	addr, tlsCfg := startTLSServer(t)
+	conn := openApp(t, addr, tlsCfg)
+	ctx := context.Background()
+	if _, err := conn.Exec(ctx, `CREATE TABLE wire_idempotency (id STRING PRIMARY KEY, note STRING NOT NULL)`); err != nil {
+		t.Fatal(err)
+	}
+	const mutation = `INSERT INTO wire_idempotency (id, note) VALUES ($1, $2) RETURNING id, note`
+	first, err := conn.ExecIdempotent(ctx, "wire-create-1", mutation, types.StringValue("1"), types.StringValue("once"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	replay, err := conn.ExecIdempotent(ctx, "wire-create-1", mutation, types.StringValue("1"), types.StringValue("once"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(first.Rows) != 1 || len(replay.Rows) != 1 || first.Rows[0][1].Str != "once" || replay.Rows[0][1].Str != "once" {
+		t.Fatalf("idempotent wire results: first=%+v replay=%+v", first.Rows, replay.Rows)
+	}
+	count, err := conn.Exec(ctx, `SELECT COUNT(*) FROM wire_idempotency`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(count.Rows) != 1 || count.Rows[0][0].Dec.String() != "1" {
+		t.Fatalf("idempotent wire duplicate: %+v", count.Rows)
+	}
+	if _, err := conn.ExecIdempotent(ctx, "wire-create-1", mutation, types.StringValue("2"), types.StringValue("different")); !nerr.HasCode(err, nerr.Conflict) {
+		t.Fatalf("idempotent wire conflict: %v", err)
+	}
+}
+
 func TestDriverP18SQLOverTLS(t *testing.T) {
 	addr, tlsCfg := startTLSServer(t)
 	conn := openApp(t, addr, tlsCfg)

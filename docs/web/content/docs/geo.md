@@ -34,7 +34,7 @@ WKT also coerces: `POINT(lon lat)`, `BOX(w s, e n)`, `LINESTRING(...)`, `POLYGON
 | `POINT` / `LOCATION` | longitude, latitude |
 | `BOX` | west, south, east, north |
 | `LINESTRING` | at least two vertices |
-| `POLYGON` | closed exterior ring, optional holes; 256-vertex cap |
+| `POLYGON` | validated simple exterior ring, optional non-overlapping holes; 256-vertex cap |
 
 `CREATE SPATIAL INDEX` requires a single `POINT` column (not `UNIQUE`). The optimizer uses a Morton geohash prefix for `DWITHIN`, `DISTANCE(col, const) < r`, `WITHIN`, and `COVERS`. The residual predicate is exact. `EXPLAIN` shows `IndexScan … spatial`.
 
@@ -42,6 +42,10 @@ WKT also coerces: `POINT(lon lat)`, `BOX(w s, e n)`, `LINESTRING(...)`, `POLYGON
 
 `DISTANCE` is haversine meters. `DISTANCE_SPHEROID` is Vincenty on the WGS84 ellipsoid; near-antipodal pairs fall back to haversine.
 
-Also available: `LON` / `LAT`, `COVERS`, `LINELENGTH`, and `ST_*` aliases.
+`DISTANCE`, `DWITHIN`, `INTERSECTS`, and `DISJOINT` accept every pair of
+`POINT`, `BOX`, `LINESTRING`, and `POLYGON`. Also available: `LON` / `LAT`,
+`COVERS`, `LINELENGTH`, polygon `AREA` / `PERIMETER`, `CENTROID`, `ENVELOPE`,
+`GEOMETRYTYPE`, `NPOINTS`, `NRINGS`, and `ST_*` aliases. Polygon construction
+rejects self-intersections and invalid hole topology.
 
 3D, geography-vs-geometry dual types, and spheroidal distance-to-polyline are not implemented. Engine note: [`docs/geo.md`](https://github.com/bzync/nextsql/blob/main/docs/geo.md).

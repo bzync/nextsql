@@ -42,8 +42,8 @@ func TestNodeDriverLiveTLS(t *testing.T) {
 	cmd.Env = append(os.Environ(),
 		"NEXTSQL_ADDR="+addr,
 		"NEXTSQL_CA="+caPath,
-		"NEXTSQL_USER=app",
-		"NEXTSQL_PASSWORD=s3cret",
+		"NEXTSQL_DATABASE_USER=app",
+		"NEXTSQL_DATABASE_PASS=s3cret",
 	)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -76,8 +76,8 @@ func TestPHPDriverLiveTLS(t *testing.T) {
 	cmd.Env = append(os.Environ(),
 		"NEXTSQL_ADDR="+addr,
 		"NEXTSQL_CA="+caPath,
-		"NEXTSQL_USER=app",
-		"NEXTSQL_PASSWORD=s3cret",
+		"NEXTSQL_DATABASE_USER=app",
+		"NEXTSQL_DATABASE_PASS=s3cret",
 	)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -110,8 +110,8 @@ func TestBunDriverLiveTLS(t *testing.T) {
 	cmd.Env = append(os.Environ(),
 		"NEXTSQL_ADDR="+addr,
 		"NEXTSQL_CA="+caPath,
-		"NEXTSQL_USER=app",
-		"NEXTSQL_PASSWORD=s3cret",
+		"NEXTSQL_DATABASE_USER=app",
+		"NEXTSQL_DATABASE_PASS=s3cret",
 	)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -144,8 +144,8 @@ func TestDenoDriverLiveTLS(t *testing.T) {
 	cmd.Env = append(os.Environ(),
 		"NEXTSQL_ADDR="+addr,
 		"NEXTSQL_CA="+caPath,
-		"NEXTSQL_USER=app",
-		"NEXTSQL_PASSWORD=s3cret",
+		"NEXTSQL_DATABASE_USER=app",
+		"NEXTSQL_DATABASE_PASS=s3cret",
 	)
 	out, err := cmd.CombinedOutput()
 	if err != nil {

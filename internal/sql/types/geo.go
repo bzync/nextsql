@@ -123,6 +123,7 @@ func validatePolygon(coords []float64, rings []int) error {
 		return nerr.New(nerr.InvalidArgument, "types.validatePolygon", "POLYGON exceeds vertex limit")
 	}
 	off := 0
+	ringViews := make([][]float64, 0, len(rings))
 	for _, n := range rings {
 		ring := coords[off : off+n*2]
 		for i := 0; i < n; i++ {
@@ -136,9 +137,66 @@ func validatePolygon(coords []float64, rings []int) error {
 		if geoLonSpan(ring) > 180 {
 			return nerr.New(nerr.InvalidArgument, "types.validatePolygon", "POLYGON ring crosses the antimeridian")
 		}
+		if ringArea2(ring) == 0 {
+			return nerr.New(nerr.InvalidArgument, "types.validatePolygon", "POLYGON ring has zero area")
+		}
+		if ringSelfIntersects(ring) {
+			return nerr.New(nerr.InvalidArgument, "types.validatePolygon", "POLYGON ring self-intersects")
+		}
+		ringViews = append(ringViews, ring)
 		off += n * 2
 	}
+	for i := 1; i < len(ringViews); i++ {
+		state := pointInRingState(ringViews[i][0], ringViews[i][1], ringViews[0])
+		if state != pointInside || ringsIntersect(ringViews[i], ringViews[0]) {
+			return nerr.New(nerr.InvalidArgument, "types.validatePolygon", "POLYGON hole is not strictly inside the exterior ring")
+		}
+		for j := 1; j < i; j++ {
+			if ringsIntersect(ringViews[i], ringViews[j]) ||
+				pointInRingState(ringViews[i][0], ringViews[i][1], ringViews[j]) != pointOutside ||
+				pointInRingState(ringViews[j][0], ringViews[j][1], ringViews[i]) != pointOutside {
+				return nerr.New(nerr.InvalidArgument, "types.validatePolygon", "POLYGON holes overlap or nest")
+			}
+		}
+	}
 	return nil
+}
+
+func ringArea2(coords []float64) float64 {
+	var area float64
+	for i := 0; i+3 < len(coords); i += 2 {
+		area += coords[i]*coords[i+3] - coords[i+2]*coords[i+1]
+	}
+	return area
+}
+
+func ringSelfIntersects(ring []float64) bool {
+	n := len(ring)/2 - 1
+	for i := 0; i < n; i++ {
+		for j := i + 1; j < n; j++ {
+			if j == i+1 || i == 0 && j == n-1 {
+				continue
+			}
+			if segmentsIntersect(
+				ring[i*2], ring[i*2+1], ring[(i+1)*2], ring[(i+1)*2+1],
+				ring[j*2], ring[j*2+1], ring[(j+1)*2], ring[(j+1)*2+1],
+			) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func ringsIntersect(a, b []float64) bool {
+	for i := 0; i+3 < len(a); i += 2 {
+		for j := 0; j+3 < len(b); j += 2 {
+			if segmentsIntersect(a[i], a[i+1], a[i+2], a[i+3], b[j], b[j+1], b[j+2], b[j+3]) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func geoLonSpan(coords []float64) float64 {
@@ -306,7 +364,8 @@ func PointInBox(p, box Value) (bool, error) {
 	return p.Lon >= w || p.Lon <= e, nil
 }
 
-// PointInPolygon is exterior-minus-holes ray casting. Rings must not cross the antimeridian.
+// PointInPolygon reports polygon coverage: exterior and ring boundaries are
+// included, while hole interiors are excluded. Rings do not cross antimeridian.
 func PointInPolygon(p, poly Value) (bool, error) {
 	if !p.IsPoint() {
 		return false, nerr.New(nerr.InvalidArgument, "types.PointInPolygon", "expected POINT")
@@ -315,33 +374,67 @@ func PointInPolygon(p, poly Value) (bool, error) {
 		return false, nerr.New(nerr.InvalidArgument, "types.PointInPolygon", "expected POLYGON")
 	}
 	off := 0
-	in := false
+	covered := false
 	for i, n := range poly.Rings {
 		end := off + n*2
 		if end > len(poly.Coords) {
 			return false, nerr.New(nerr.InvalidArgument, "types.PointInPolygon", "truncated ring")
 		}
-		hit := pointInRing(p.Lon, p.Lat, poly.Coords[off:end])
+		state := pointInRingState(p.Lon, p.Lat, poly.Coords[off:end])
 		if i == 0 {
-			in = hit
-		} else if hit {
-			in = false
+			covered = state != pointOutside
+		} else if state == pointInside {
+			covered = false
+		} else if state == pointBoundary {
+			return true, nil
 		}
 		off = end
 	}
-	return in, nil
+	return covered, nil
+}
+
+func PointWithinPolygon(p, poly Value) (bool, error) {
+	if !p.IsPoint() || !poly.IsPolygon() {
+		return false, nerr.New(nerr.InvalidArgument, "types.PointWithinPolygon", "expected POINT and POLYGON")
+	}
+	off := 0
+	for i, n := range poly.Rings {
+		end := off + n*2
+		if end > len(poly.Coords) {
+			return false, nerr.New(nerr.InvalidArgument, "types.PointWithinPolygon", "truncated ring")
+		}
+		state := pointInRingState(p.Lon, p.Lat, poly.Coords[off:end])
+		if i == 0 && state != pointInside || i > 0 && state != pointOutside {
+			return false, nil
+		}
+		off = end
+	}
+	return true, nil
 }
 
 func pointInRing(lon, lat float64, coords []float64) bool {
+	return pointInRingState(lon, lat, coords) != pointOutside
+}
+
+const (
+	pointOutside = iota
+	pointInside
+	pointBoundary
+)
+
+func pointInRingState(lon, lat float64, coords []float64) int {
 	n := len(coords) / 2
 	if n < 4 {
-		return false
+		return pointOutside
 	}
 	inside := false
 	j := n - 1
 	for i := 0; i < n; i++ {
 		xi, yi := coords[i*2], coords[i*2+1]
 		xj, yj := coords[j*2], coords[j*2+1]
+		if pointOnSegment(lon, lat, xi, yi, xj, yj) {
+			return pointBoundary
+		}
 		if (yi > lat) != (yj > lat) {
 			xint := (xj-xi)*(lat-yi)/(yj-yi) + xi
 			if lon < xint {
@@ -350,7 +443,10 @@ func pointInRing(lon, lat float64, coords []float64) bool {
 		}
 		j = i
 	}
-	return inside
+	if inside {
+		return pointInside
+	}
+	return pointOutside
 }
 
 func PointInGeom(p, geom Value) (bool, error) {
@@ -364,9 +460,37 @@ func PointInGeom(p, geom Value) (bool, error) {
 	}
 }
 
-// DistanceAny is meters between two geometries. Point-line / point-polygon
-// use an equirectangular closest-point on each segment, then haversine.
+func PointWithinGeom(p, geom Value) (bool, error) {
+	switch {
+	case geom.IsBox():
+		if !p.IsPoint() {
+			return false, nerr.New(nerr.InvalidArgument, "types.PointWithinGeom", "expected POINT")
+		}
+		w, s, e, n := geom.Box[0], geom.Box[1], geom.Box[2], geom.Box[3]
+		if p.Lat <= s || p.Lat >= n {
+			return false, nil
+		}
+		if w <= e {
+			return p.Lon > w && p.Lon < e, nil
+		}
+		return p.Lon > w || p.Lon < e, nil
+	case geom.IsPolygon():
+		return PointWithinPolygon(p, geom)
+	default:
+		return false, nerr.New(nerr.InvalidArgument, "types.PointWithinGeom", "expected BOX or POLYGON")
+	}
+}
+
+// DistanceAny is the shortest distance in meters between supported geometries.
+// Segment closest-points use a local equirectangular projection followed by
+// haversine. Topological intersections return zero before distance estimation.
 func DistanceAny(a, b Value) (float64, error) {
+	if a.IsBox() {
+		return distanceBoxToGeom(a, b)
+	}
+	if b.IsBox() {
+		return distanceBoxToGeom(b, a)
+	}
 	if a.IsPoint() && b.IsPoint() {
 		return haversine(a.Lon, a.Lat, b.Lon, b.Lat), nil
 	}
@@ -382,7 +506,80 @@ func DistanceAny(a, b Value) (float64, error) {
 	if b.IsPoint() && a.IsPolygon() {
 		return pointToPolygon(b, a)
 	}
+	if a.IsLine() && b.IsLine() {
+		return lineToLine(a.Coords, b.Coords), nil
+	}
+	if a.IsLine() && b.IsPolygon() {
+		return lineToPolygon(a, b)
+	}
+	if b.IsLine() && a.IsPolygon() {
+		return lineToPolygon(b, a)
+	}
+	if a.IsPolygon() && b.IsPolygon() {
+		return polygonToPolygon(a, b)
+	}
 	return 0, nerr.New(nerr.InvalidArgument, "types.DistanceAny", "unsupported geometry pair")
+}
+
+func distanceBoxToGeom(box, geom Value) (float64, error) {
+	polys, err := boxPolygons(box)
+	if err != nil {
+		return 0, err
+	}
+	best := math.Inf(1)
+	for _, poly := range polys {
+		d, err := DistanceAny(poly, geom)
+		if err != nil {
+			return 0, err
+		}
+		if d < best {
+			best = d
+		}
+	}
+	return best, nil
+}
+
+func boxPolygons(box Value) ([]Value, error) {
+	if !box.IsBox() {
+		return nil, nerr.New(nerr.InvalidArgument, "types.boxPolygons", "expected BOX")
+	}
+	w, s, e, n := box.Box[0], box.Box[1], box.Box[2], box.Box[3]
+	makePart := func(left, right float64) (Value, error) {
+		switch {
+		case left == right && s == n:
+			return PointValue(left, s)
+		case left == right:
+			return LineValue([]float64{left, s, left, n})
+		case s == n:
+			return LineValue([]float64{left, s, right, s})
+		default:
+			return PolygonValue([]float64{left, s, right, s, right, n, left, n, left, s}, []int{5})
+		}
+	}
+	if w <= e {
+		if e-w <= 180 {
+			p, err := makePart(w, e)
+			return []Value{p}, err
+		}
+		left, err := makePart(w, w+180)
+		if err != nil {
+			return nil, err
+		}
+		right, err := makePart(w+180, e)
+		if err != nil {
+			return nil, err
+		}
+		return []Value{left, right}, nil
+	}
+	left, err := makePart(w, 180)
+	if err != nil {
+		return nil, err
+	}
+	right, err := makePart(-180, e)
+	if err != nil {
+		return nil, err
+	}
+	return []Value{left, right}, nil
 }
 
 func pointToPolygon(p, poly Value) (float64, error) {
@@ -393,7 +590,140 @@ func pointToPolygon(p, poly Value) (float64, error) {
 	if in {
 		return 0, nil
 	}
-	return pointToLine(p.Lon, p.Lat, poly.Coords), nil
+	best := math.Inf(1)
+	off := 0
+	for _, n := range poly.Rings {
+		end := off + n*2
+		if end > len(poly.Coords) {
+			return 0, nerr.New(nerr.InvalidArgument, "types.pointToPolygon", "truncated ring")
+		}
+		if d := pointToLine(p.Lon, p.Lat, poly.Coords[off:end]); d < best {
+			best = d
+		}
+		off = end
+	}
+	return best, nil
+}
+
+func lineToLine(a, b []float64) float64 {
+	best := math.Inf(1)
+	for i := 0; i+3 < len(a); i += 2 {
+		for j := 0; j+3 < len(b); j += 2 {
+			d := segmentDistance(a[i], a[i+1], a[i+2], a[i+3], b[j], b[j+1], b[j+2], b[j+3])
+			if d == 0 {
+				return 0
+			}
+			if d < best {
+				best = d
+			}
+		}
+	}
+	return best
+}
+
+func lineToPolygon(line, poly Value) (float64, error) {
+	for i := 0; i+1 < len(line.Coords); i += 2 {
+		inside, err := PointInPolygon(MustPoint(line.Coords[i], line.Coords[i+1]), poly)
+		if err != nil {
+			return 0, err
+		}
+		if inside {
+			return 0, nil
+		}
+	}
+	best := math.Inf(1)
+	off := 0
+	for _, n := range poly.Rings {
+		end := off + n*2
+		if end > len(poly.Coords) {
+			return 0, nerr.New(nerr.InvalidArgument, "types.lineToPolygon", "truncated ring")
+		}
+		if d := lineToLine(line.Coords, poly.Coords[off:end]); d < best {
+			best = d
+		}
+		off = end
+	}
+	return best, nil
+}
+
+func polygonToPolygon(a, b Value) (float64, error) {
+	if len(a.Coords) < 2 || len(b.Coords) < 2 {
+		return 0, nerr.New(nerr.InvalidArgument, "types.polygonToPolygon", "empty POLYGON")
+	}
+	for _, pair := range [][2]Value{{MustPoint(a.Coords[0], a.Coords[1]), b}, {MustPoint(b.Coords[0], b.Coords[1]), a}} {
+		inside, err := PointInPolygon(pair[0], pair[1])
+		if err != nil {
+			return 0, err
+		}
+		if inside {
+			return 0, nil
+		}
+	}
+	best := math.Inf(1)
+	aoff := 0
+	for _, an := range a.Rings {
+		aend := aoff + an*2
+		boff := 0
+		for _, bn := range b.Rings {
+			bend := boff + bn*2
+			d := lineToLine(a.Coords[aoff:aend], b.Coords[boff:bend])
+			if d == 0 {
+				return 0, nil
+			}
+			if d < best {
+				best = d
+			}
+			boff = bend
+		}
+		aoff = aend
+	}
+	return best, nil
+}
+
+func segmentDistance(ax, ay, bx, by, cx, cy, dx, dy float64) float64 {
+	if segmentsIntersect(ax, ay, bx, by, cx, cy, dx, dy) {
+		return 0
+	}
+	return math.Min(
+		math.Min(distPointSeg(ax, ay, cx, cy, dx, dy), distPointSeg(bx, by, cx, cy, dx, dy)),
+		math.Min(distPointSeg(cx, cy, ax, ay, bx, by), distPointSeg(dx, dy, ax, ay, bx, by)),
+	)
+}
+
+func segmentsIntersect(ax, ay, bx, by, cx, cy, dx, dy float64) bool {
+	o1 := orientation(ax, ay, bx, by, cx, cy)
+	o2 := orientation(ax, ay, bx, by, dx, dy)
+	o3 := orientation(cx, cy, dx, dy, ax, ay)
+	o4 := orientation(cx, cy, dx, dy, bx, by)
+	if o1 != o2 && o3 != o4 {
+		return true
+	}
+	return o1 == 0 && pointOnSegment(cx, cy, ax, ay, bx, by) ||
+		o2 == 0 && pointOnSegment(dx, dy, ax, ay, bx, by) ||
+		o3 == 0 && pointOnSegment(ax, ay, cx, cy, dx, dy) ||
+		o4 == 0 && pointOnSegment(bx, by, cx, cy, dx, dy)
+}
+
+func orientation(ax, ay, bx, by, cx, cy float64) int {
+	v := (bx-ax)*(cy-ay) - (by-ay)*(cx-ax)
+	scale := math.Max(1, math.Abs(bx-ax)+math.Abs(by-ay)+math.Abs(cx-ax)+math.Abs(cy-ay))
+	eps := 1e-12 * scale
+	if v > eps {
+		return 1
+	}
+	if v < -eps {
+		return -1
+	}
+	return 0
+}
+
+func pointOnSegment(px, py, ax, ay, bx, by float64) bool {
+	if orientation(ax, ay, bx, by, px, py) != 0 {
+		return false
+	}
+	eps := 1e-12
+	return px >= math.Min(ax, bx)-eps && px <= math.Max(ax, bx)+eps &&
+		py >= math.Min(ay, by)-eps && py <= math.Max(ay, by)+eps
 }
 
 func pointToLine(lon, lat float64, coords []float64) float64 {
@@ -450,6 +780,193 @@ func LineLengthM(line Value) (float64, error) {
 		sum += haversine(line.Coords[i*2], line.Coords[i*2+1], line.Coords[i*2+2], line.Coords[i*2+3])
 	}
 	return sum, nil
+}
+
+// PolygonPerimeterM returns the spherical length of the exterior and every hole.
+func PolygonPerimeterM(poly Value) (float64, error) {
+	if !poly.IsPolygon() {
+		return 0, nerr.New(nerr.InvalidArgument, "types.PolygonPerimeterM", "PERIMETER requires POLYGON")
+	}
+	var sum float64
+	off := 0
+	for _, n := range poly.Rings {
+		end := off + n*2
+		if end > len(poly.Coords) {
+			return 0, nerr.New(nerr.InvalidArgument, "types.PolygonPerimeterM", "truncated ring")
+		}
+		for i := off; i+3 < end; i += 2 {
+			sum += haversine(poly.Coords[i], poly.Coords[i+1], poly.Coords[i+2], poly.Coords[i+3])
+		}
+		off = end
+	}
+	return sum, nil
+}
+
+// PolygonAreaM2 returns spherical square meters using a bounded ring integral.
+// The first ring contributes area and subsequent rings subtract their area.
+func PolygonAreaM2(poly Value) (float64, error) {
+	if !poly.IsPolygon() {
+		return 0, nerr.New(nerr.InvalidArgument, "types.PolygonAreaM2", "AREA requires POLYGON")
+	}
+	var area float64
+	off := 0
+	for ri, n := range poly.Rings {
+		end := off + n*2
+		if end > len(poly.Coords) {
+			return 0, nerr.New(nerr.InvalidArgument, "types.PolygonAreaM2", "truncated ring")
+		}
+		ringArea := sphericalRingArea(poly.Coords[off:end])
+		if ri == 0 {
+			area = ringArea
+		} else {
+			area -= ringArea
+		}
+		off = end
+	}
+	if area < 0 && area > -1e-6 {
+		area = 0
+	}
+	return math.Max(0, area), nil
+}
+
+func sphericalRingArea(ring []float64) float64 {
+	var sum float64
+	for i := 0; i+3 < len(ring); i += 2 {
+		lon1 := ring[i] * math.Pi / 180
+		lat1 := ring[i+1] * math.Pi / 180
+		lon2 := ring[i+2] * math.Pi / 180
+		lat2 := ring[i+3] * math.Pi / 180
+		dlon := lon2 - lon1
+		if dlon > math.Pi {
+			dlon -= 2 * math.Pi
+		} else if dlon < -math.Pi {
+			dlon += 2 * math.Pi
+		}
+		sum += dlon * (2 + math.Sin(lat1) + math.Sin(lat2))
+	}
+	return math.Abs(sum) * EarthRadiusM * EarthRadiusM / 2
+}
+
+// GeometriesIntersect reports whether two supported geometries share any point.
+func GeometriesIntersect(a, b Value) (bool, error) {
+	d, err := DistanceAny(a, b)
+	if err != nil {
+		return false, err
+	}
+	return d == 0, nil
+}
+
+// GeoEnvelope returns the smallest axis-aligned BOX represented by GeoBBox.
+func GeoEnvelope(v Value) (Value, error) {
+	w, s, e, n, _, ok := GeoBBox(v)
+	if !ok {
+		return Value{}, nerr.New(nerr.InvalidArgument, "types.GeoEnvelope", "expected geometry")
+	}
+	return BoxValue(w, s, e, n)
+}
+
+// GeoCentroid returns a deterministic lon/lat centroid. Polygon centroids use
+// the planar lon/lat ring centroid with holes subtracted; line centroids are
+// segment-length weighted. These types reject antimeridian-crossing lines and
+// polygons, while wrapping boxes use their wrapped longitudinal midpoint.
+func GeoCentroid(v Value) (Value, error) {
+	switch {
+	case v.IsPoint():
+		return v, nil
+	case v.IsBox():
+		w, s, e, n := v.Box[0], v.Box[1], v.Box[2], v.Box[3]
+		lon := (w + e) / 2
+		if w > e {
+			lon = w + (e+360-w)/2
+			if lon > 180 {
+				lon -= 360
+			}
+		}
+		return PointValue(lon, (s+n)/2)
+	case v.IsLine():
+		var lon, lat, total float64
+		for i := 0; i+3 < len(v.Coords); i += 2 {
+			weight := haversine(v.Coords[i], v.Coords[i+1], v.Coords[i+2], v.Coords[i+3])
+			lon += (v.Coords[i] + v.Coords[i+2]) / 2 * weight
+			lat += (v.Coords[i+1] + v.Coords[i+3]) / 2 * weight
+			total += weight
+		}
+		if total == 0 {
+			return PointValue(v.Coords[0], v.Coords[1])
+		}
+		return PointValue(lon/total, lat/total)
+	case v.IsPolygon():
+		var lon, lat, total float64
+		off := 0
+		for ri, n := range v.Rings {
+			end := off + n*2
+			if end > len(v.Coords) {
+				return Value{}, nerr.New(nerr.InvalidArgument, "types.GeoCentroid", "truncated ring")
+			}
+			x, y, area := planarRingCentroid(v.Coords[off:end])
+			if ri > 0 {
+				area = -area
+			}
+			lon += x * area
+			lat += y * area
+			total += area
+			off = end
+		}
+		if total != 0 {
+			return PointValue(lon/total, lat/total)
+		}
+		env, err := GeoEnvelope(v)
+		if err != nil {
+			return Value{}, err
+		}
+		return GeoCentroid(env)
+	default:
+		return Value{}, nerr.New(nerr.InvalidArgument, "types.GeoCentroid", "expected geometry")
+	}
+}
+
+func planarRingCentroid(ring []float64) (lon, lat, area float64) {
+	var crossSum, xsum, ysum float64
+	for i := 0; i+3 < len(ring); i += 2 {
+		cross := ring[i]*ring[i+3] - ring[i+2]*ring[i+1]
+		crossSum += cross
+		xsum += (ring[i] + ring[i+2]) * cross
+		ysum += (ring[i+1] + ring[i+3]) * cross
+	}
+	if crossSum == 0 {
+		return ring[0], ring[1], 0
+	}
+	lon = xsum / (3 * crossSum)
+	lat = ysum / (3 * crossSum)
+	return lon, lat, math.Abs(crossSum / 2)
+}
+
+func GeometryTypeName(v Value) (string, error) {
+	switch {
+	case v.IsPoint():
+		return "POINT", nil
+	case v.IsBox():
+		return "BOX", nil
+	case v.IsLine():
+		return "LINESTRING", nil
+	case v.IsPolygon():
+		return "POLYGON", nil
+	default:
+		return "", nerr.New(nerr.InvalidArgument, "types.GeometryTypeName", "expected geometry")
+	}
+}
+
+func GeometryPointCount(v Value) (int, error) {
+	switch {
+	case v.IsPoint():
+		return 1, nil
+	case v.IsBox():
+		return 4, nil
+	case v.IsLine(), v.IsPolygon():
+		return len(v.Coords) / 2, nil
+	default:
+		return 0, nerr.New(nerr.InvalidArgument, "types.GeometryPointCount", "expected geometry")
+	}
 }
 
 // GeoBBox is the axis-aligned lon/lat box of a geometry. wrap is true when the box crosses the antimeridian.
@@ -906,7 +1423,14 @@ func asPoint(v Value) (Value, error) {
 		return v, nil
 	}
 	if v.Typ.Kind == KindString || v.Typ.Kind == KindText {
-		return ParseWKT(v.Str)
+		g, err := ParseWKT(v.Str)
+		if err != nil {
+			return Value{}, err
+		}
+		if !g.IsPoint() {
+			return Value{}, nerr.New(nerr.InvalidArgument, "types.asPoint", "expected POINT")
+		}
+		return g, nil
 	}
 	return Value{}, nerr.New(nerr.InvalidArgument, "types.asPoint", "expected POINT")
 }
@@ -983,7 +1507,7 @@ func asDistanceGeom(v Value) (Value, error) {
 		return v, nil
 	}
 	switch v.Typ.Kind {
-	case KindPoint, KindLine, KindPolygon:
+	case KindPoint, KindBox, KindLine, KindPolygon:
 		return v, nil
 	case KindString, KindText:
 		g, err := ParseWKT(v.Str)
@@ -991,13 +1515,27 @@ func asDistanceGeom(v Value) (Value, error) {
 			return Value{}, err
 		}
 		switch g.Typ.Kind {
-		case KindPoint, KindLine, KindPolygon:
+		case KindPoint, KindBox, KindLine, KindPolygon:
 			return g, nil
 		default:
-			return Value{}, nerr.New(nerr.InvalidArgument, "types.asDistanceGeom", "expected POINT, LINESTRING, or POLYGON")
+			return Value{}, nerr.New(nerr.InvalidArgument, "types.asDistanceGeom", "expected POINT, BOX, LINESTRING, or POLYGON")
 		}
 	default:
-		return Value{}, nerr.New(nerr.InvalidArgument, "types.asDistanceGeom", "expected POINT, LINESTRING, or POLYGON")
+		return Value{}, nerr.New(nerr.InvalidArgument, "types.asDistanceGeom", "expected POINT, BOX, LINESTRING, or POLYGON")
+	}
+}
+
+func asGeometry(v Value) (Value, error) {
+	if v.Null {
+		return v, nil
+	}
+	switch v.Typ.Kind {
+	case KindPoint, KindBox, KindLine, KindPolygon:
+		return v, nil
+	case KindString, KindText:
+		return ParseWKT(v.Str)
+	default:
+		return Value{}, nerr.New(nerr.InvalidArgument, "types.asGeometry", "expected geometry")
 	}
 }
 
@@ -1158,6 +1696,24 @@ func CanonGeoName(name string) string {
 		return "covers"
 	case "st_length", "linelength":
 		return "linelength"
+	case "st_area":
+		return "area"
+	case "st_perimeter":
+		return "perimeter"
+	case "st_centroid":
+		return "centroid"
+	case "st_envelope", "bbox":
+		return "envelope"
+	case "st_intersects":
+		return "intersects"
+	case "st_disjoint":
+		return "disjoint"
+	case "st_geometrytype", "geometry_type":
+		return "geometrytype"
+	case "st_npoints":
+		return "npoints"
+	case "st_nrings":
+		return "nrings"
 	default:
 		return name
 	}
@@ -1235,18 +1791,18 @@ func EvalGeo(name string, args []Value) (v Value, ok bool, err error) {
 		if len(args) != 2 {
 			return Value{}, true, nerr.New(nerr.InvalidArgument, "types.EvalGeo", "DISTANCE takes 2 arguments")
 		}
-		a, err := asPoint(args[0])
+		a, err := asDistanceGeom(args[0])
 		if err != nil {
 			return Value{}, true, err
 		}
-		b, err := asPoint(args[1])
+		b, err := asDistanceGeom(args[1])
 		if err != nil {
 			return Value{}, true, err
 		}
 		if a.Null || b.Null {
 			return Null(Type{Kind: KindDecimal, Scale: 3}), true, nil
 		}
-		m, err := DistanceM(a, b)
+		m, err := DistanceAny(a, b)
 		if err != nil {
 			return Value{}, true, err
 		}
@@ -1290,6 +1846,106 @@ func EvalGeo(name string, args []Value) (v Value, ok bool, err error) {
 		}
 		d, err := metersDecimal(m)
 		return d, true, err
+	case "area":
+		if len(args) != 1 {
+			return Value{}, true, nerr.New(nerr.InvalidArgument, "types.EvalGeo", "AREA takes 1 argument")
+		}
+		poly, err := asPolygon(args[0])
+		if err != nil {
+			return Value{}, true, err
+		}
+		if poly.Null {
+			return Null(Type{Kind: KindDecimal, Scale: 3}), true, nil
+		}
+		m2, err := PolygonAreaM2(poly)
+		if err != nil {
+			return Value{}, true, err
+		}
+		d, err := metersDecimal(m2)
+		return d, true, err
+	case "perimeter":
+		if len(args) != 1 {
+			return Value{}, true, nerr.New(nerr.InvalidArgument, "types.EvalGeo", "PERIMETER takes 1 argument")
+		}
+		poly, err := asPolygon(args[0])
+		if err != nil {
+			return Value{}, true, err
+		}
+		if poly.Null {
+			return Null(Type{Kind: KindDecimal, Scale: 3}), true, nil
+		}
+		m, err := PolygonPerimeterM(poly)
+		if err != nil {
+			return Value{}, true, err
+		}
+		d, err := metersDecimal(m)
+		return d, true, err
+	case "centroid", "envelope", "geometrytype", "npoints", "nrings":
+		if len(args) != 1 {
+			return Value{}, true, nerr.New(nerr.InvalidArgument, "types.EvalGeo", strings.ToUpper(CanonGeoName(name))+" takes 1 argument")
+		}
+		geom, err := asGeometry(args[0])
+		if err != nil {
+			return Value{}, true, err
+		}
+		if geom.Null {
+			switch CanonGeoName(name) {
+			case "centroid":
+				return Null(Point()), true, nil
+			case "envelope":
+				return Null(Box()), true, nil
+			case "geometrytype":
+				return Null(String()), true, nil
+			default:
+				return Null(Type{Kind: KindDecimal}), true, nil
+			}
+		}
+		switch CanonGeoName(name) {
+		case "centroid":
+			out, err := GeoCentroid(geom)
+			return out, true, err
+		case "envelope":
+			out, err := GeoEnvelope(geom)
+			return out, true, err
+		case "geometrytype":
+			typ, err := GeometryTypeName(geom)
+			return StringValue(typ), true, err
+		case "npoints":
+			n, err := GeometryPointCount(geom)
+			if err != nil {
+				return Value{}, true, err
+			}
+			return DecimalValue(DecimalFromInt64(int64(n)), Type{Kind: KindDecimal}), true, nil
+		case "nrings":
+			if !geom.IsPolygon() {
+				return Value{}, true, nerr.New(nerr.InvalidArgument, "types.EvalGeo", "NRINGS requires POLYGON")
+			}
+			return DecimalValue(DecimalFromInt64(int64(len(geom.Rings))), Type{Kind: KindDecimal}), true, nil
+		}
+		return Value{}, true, nerr.New(nerr.Internal, "types.EvalGeo", "unhandled geometry function")
+	case "intersects", "disjoint":
+		if len(args) != 2 {
+			return Value{}, true, nerr.New(nerr.InvalidArgument, "types.EvalGeo", strings.ToUpper(CanonGeoName(name))+" takes 2 arguments")
+		}
+		a, err := asDistanceGeom(args[0])
+		if err != nil {
+			return Value{}, true, err
+		}
+		b, err := asDistanceGeom(args[1])
+		if err != nil {
+			return Value{}, true, err
+		}
+		if a.Null || b.Null {
+			return Null(Bool()), true, nil
+		}
+		intersects, err := GeometriesIntersect(a, b)
+		if err != nil {
+			return Value{}, true, err
+		}
+		if CanonGeoName(name) == "disjoint" {
+			intersects = !intersects
+		}
+		return BoolValue(intersects), true, nil
 	case "dwithin":
 		if len(args) != 3 {
 			return Value{}, true, nerr.New(nerr.InvalidArgument, "types.EvalGeo", "DWITHIN takes 3 arguments")
@@ -1332,7 +1988,7 @@ func EvalGeo(name string, args []Value) (v Value, ok bool, err error) {
 		if p.Null || reg.Null {
 			return Null(Bool()), true, nil
 		}
-		in, err := PointInGeom(p, reg)
+		in, err := PointWithinGeom(p, reg)
 		return BoolValue(in), true, err
 	case "covers":
 		if len(args) != 2 {
@@ -1358,7 +2014,7 @@ func EvalGeo(name string, args []Value) (v Value, ok bool, err error) {
 
 func IsGeoFunc(name string) bool {
 	switch CanonGeoName(name) {
-	case "point", "box", "linestring", "polygon", "lon", "lat", "distance", "distance_spheroid", "dwithin", "within", "covers", "linelength":
+	case "point", "box", "linestring", "polygon", "lon", "lat", "distance", "distance_spheroid", "dwithin", "within", "covers", "linelength", "area", "perimeter", "centroid", "envelope", "intersects", "disjoint", "geometrytype", "npoints", "nrings":
 		return true
 	default:
 		return false

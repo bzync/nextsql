@@ -50,7 +50,8 @@ Plaintext (then sealed) records:
   references
 
 Indexes are recreated on import (`CREATE INDEX` / `UNIQUE` / `SPATIAL` /
-`FULLTEXT` / `VECTOR … USING HNSW`), including JSON path keys.
+`FULLTEXT` / `VECTOR … USING HNSW`, with `WITH (QUANTIZATION = …)` preserved for
+a quantised HNSW index), including JSON path keys.
 
 `CREATE TABLE` on import emits stored `FOREIGN KEY` / `CONSTRAINT` clauses.
 Parent tables are created before children. Cyclic FK graphs fail closed.

@@ -194,30 +194,74 @@ Table descriptors live in the primary tree (key `T` + name). Magic `NSCT`.
 | 1 | Readable. Foreign-key list is empty. Extra bytes after optional `VecMeta` are ignored. |
 | 2 | Readable. v1 payload, then bounded foreign-key descriptors. CDC image policy defaults to keys. |
 | 3 | Readable. v2 payload, then validated `u8` CDC image policy (`0` keys, `1` full). |
-| 4 | Current write format. v3 payload, then a bounded physical-partition descriptor. Leftover bytes are `invalid_format`. |
+| 4 | Readable. v3 payload, then a bounded physical-partition descriptor. The next partition identity is derived as max ID + 1. |
+| 5 | Readable. v4 payload, then the durable next partition identity. |
+| 6 | Readable. v5 payload, then one `u8` HNSW traversal-quantisation tag per index (`0` none, `2` F16, `3` I8), in `Indexes` order. |
+| 7 | Readable. v6 payload, then per-index vector-ANN method + IVF `LISTS` / `PROBES`. |
+| 8 | Readable. v7 payload, then per-index IVF-PQ `SUBSPACES`. |
+| 9 | Current write format. v8 payload, then per-index full-text analyzer id (`u8`) + revision (`u16`). `0/0` is simple v1; `1/1` is english stem-only; `1/2` is english stem plus stop-word dictionary v1; `1/3` is english v2 plus synonym dictionary v1 (query-time OR expansion); `2/1` french, `3/1` german, `4/1` spanish (Snowball stemmer + stop-word dictionary v1). Unknown id/revision pairs fail closed. Leftover bytes are `invalid_format`. |
 | other | Fail closed (`unsupported catalog version`). |
 
-Compatibility window (`internal/upgrade` `FamilyCatalog`): current 4, readable 1..4. `nextsql diagnose` prints that window. Old binaries cannot open v4 rows. Any catalog rewrite upgrades a readable older descriptor to v4.
+Compatibility window (`internal/upgrade` `FamilyCatalog`): current 9, readable 1..9. `nextsql diagnose` prints that window. Old binaries cannot open v9 rows. Any catalog rewrite upgrades a readable older descriptor to v9 (older descriptors decode with every index unquantised, every vector index as HNSW unless a later trailer says otherwise, and every full-text index as the simple analyzer). v6 adds a per-index HNSW traversal-quantisation byte; v7 adds a per-index vector-ANN-method byte plus the IVF `LISTS` / `PROBES` counts; v8 adds a per-index IVF-PQ `SUBSPACES` count; v9 adds a per-index full-text analyzer id + revision.
 
-The v4 partition section begins with a kind byte (`0` none, `1` RANGE, `2`
-HASH, `3` LIST, `4` TENANT). A nonzero kind carries at most 8 column ordinals
+The v4/v5 partition section begins with a kind byte (`0` none, `1` RANGE, `2`
+HASH, `3` LIST, `4` legacy TENANT). A nonzero kind carries at most 8 column ordinals
 and 1024 partition members. Every member has a stable nonzero identity, a
 bounded name, detached heap/vector metadata roots, range flags, hash
 modulus/remainder, partition-local index roots, and typed routing tuples. The
 whole descriptor accepts at most 4096 routing tuples. Decoding rejects unknown
 kinds/flags, truncation, duplicate identities/names/rules, incomplete hash
 remainder sets, overlapping ordered ranges, NULL or mistyped values, invalid
-tenant keys, and missing partition-local index roots.
+legacy tenant descriptors, and missing partition-local index roots.
+
+For a nonzero partition kind, v5 appends a `u32` next-identity high-water
+value after the member list. It must be greater than every live member ID.
+ADD consumes and advances it transactionally; DROP never decreases it, so a
+stable identity cannot resolve to a different physical tree after removal.
+Reading v4 derives this value as max live ID + 1 before the next catalog write.
 
 This metadata is stored inside the encrypted catalog B+Tree and therefore uses
 the existing page AEAD, WAL transaction, backup/restore, PITR, and Raft page
 replication mechanisms. P21 user-facing SQL DDL and physical row routing are
-enabled only for the bounded single-column RANGE/HASH/LIST/TENANT slice;
-broader lifecycle semantics remain explicitly gated. NSCT v4 HASH routing is
+enabled only for the bounded single-column RANGE/HASH/LIST slice; kind 4 is
+decoder/runtime compatibility for recovery and offline migration only;
+bounded empty ADD/DROP lifecycle semantics are enabled; attach/detach and
+broader lifecycle semantics remain explicitly gated. NSCT v4+ HASH routing is
 SHA-256 over the canonical typed tuple key; the first 64 digest bits are read
 big-endian and reduced modulo the descriptor's complete remainder set.
 
 Each index record is `name`, flags `u8`, meta page, column ordinals, and optional JSON path. Flag bits 1/2/4/8/16 are unique / spatial / path / full-text / vector. Bits 32/64/128 add `INCLUDE` ordinals, a binary `WHERE` expression, and parallel expression keys with stored result types. Indexes without those bits keep the previous layout so older v2 rows still decode. A descriptor that sets the new bits is unreadable by binaries that do not know them (misaligned index records, then `trailing catalog bytes` or `invalid_format`).
+
+## Statistics descriptors (`NSST`)
+
+Statistics rows live in the encrypted catalog B+Tree under key `S` + table
+name. Version 1 stores global table/column/index/segment sketches. Version 2
+adds bounded vector statistics. Version 3 is the current write format and adds
+at most 1024 `(stable partition ID u32, row count u64)` entries. IDs must be
+nonzero and unique; malformed counts, truncation, duplicate IDs, unsupported
+versions, and trailing bytes fail closed. Versions 1 and 2 remain readable and
+yield no partition block. The descriptor inherits catalog page encryption,
+WAL/recovery, backup/restore, PITR, and Raft replication.
+
+Partition-local sketches use separate encrypted catalog rows under key `J` +
+stable table ID `u32` + stable partition ID `u32`. Their value is `NSPS` v1:
+the same table/partition identities, exact row count, the SHA-256 digest of the
+owning encoded `NSST` snapshot, then compact bounded
+column, index, and vector blocks. A record holds at most 64 entries of each
+class and at most 15 KiB total. Column entries contain NULL count, sampled NDV, exact min/max where the
+type is comparable, and sampled correlation; histograms and MCVs remain in the
+global `NSST` row. Index entries contain NDV/selectivity/unique metadata and
+vector entries contain population/dimension plus applicable index metadata.
+
+`NSPS` decoding rejects zero or mismatched identities, duplicate ordinals or
+index names, non-compact histogram/MCV payloads, excessive counts, unknown
+versions, truncation, and trailing bytes. Reload matches the authenticated
+value identities to the immutable key and its parent `NSST` partition list.
+An unmatched snapshot digest is stale (for example after an older writer
+refreshes only `NSST`) and is ignored in favor of global statistics; orphan or
+identity-mismatched records fail closed. `ANALYZE`, table/partition removal,
+WAL/recovery, Raft page images, backup/restore, and PITR mutate or preserve the
+records through the ordinary catalog transaction.
 
 ## P19 automation catalog
 
@@ -254,6 +298,77 @@ rotation, backup, restore, and replication behavior; they are not plaintext
 sidecar files. Task arguments remain solely in the encrypted `NSTK` descriptor
 and are excluded from task introspection and audit/error metadata.
 
+## Durable idempotency records (`NSID`)
+
+Retry fences use catalog key `I` plus a 32-byte SHA-256 scope digest; the raw
+client key is never stored. Value magic is `NSID`, current/readable version is
+1, followed by the 32-byte typed-request digest, creation/expiry Unix
+nanoseconds, and a bounded versioned replay result (`NSIR` v1). Records are in
+the encrypted catalog B+Tree and commit atomically with their mutation, so WAL,
+recovery, backup/PITR, and Raft page replication preserve the fence.
+
+Catalog reload rejects malformed keys, unsupported versions, invalid retention
+times, oversized/truncated/trailing response bytes, and more than 1,024 live or
+expired physical records. The executor replay decoder separately validates
+row/column/value lengths, type tags, vector dimensions/finiteness, and its
+256 KiB / 4,096-row limits. Decoder fuzz seeds cover both descriptor layers.
+
+## Deployment registry (`NSRE` / `NSRM`)
+
+New `nextsql init` deployments contain `nextsql.instance`, an encrypted
+deployment registry independent of the user database catalog. Its wrapped-key
+sidecar is `nextsql.instance.keys` (`NSKS` v1). The raw deployment registry
+root stays in `--instance-key-file` (default `--key-file` plus `.instance`) off
+the data volume.
+
+The outer `NSRE` v1 file contains a bounded authenticated header: magic,
+version, AES-256-GCM suite, key version, nonce generation, and plaintext
+length; then the 12-byte nonce and ciphertext/tag. The header is AEAD AAD.
+Before publishing a generation, the envelope durably advances its nonce
+high-water, so a crash may skip but cannot reuse that generation. Publication
+uses a mode-`0600` same-directory temporary file, file fsync, atomic rename,
+and directory fsync.
+
+The decrypted `NSRM` v1 manifest contains the deployment ID, generation,
+default realm/database IDs, and bounded realm/database records. Each record has
+a stable 128-bit ID, normalized bounded name, lifecycle state, storage-layout
+tag, and database file identity. DatabaseID must equal the storage identity's
+database UUID. Limits are 1,024 realms, 4,096 databases per realm, 8,192 total
+databases, 63-byte ASCII names, and a 4 MiB manifest. Decode rejects zero or
+duplicate IDs, duplicate names, invalid states/layouts, unresolved defaults,
+identity mismatch, truncation, trailing bytes, unsupported versions, and
+limit violations. The decoder has a fuzz seed.
+
+Current scope is the M1 foundation: the default database uses the legacy
+`DATA-DIR/nextsql.db` layout and `nextsqld` verifies that its identity and
+ACTIVE state match the registry. `nextsql hosting adopt --confirm` explicitly
+registers an existing default database without changing its file identity or
+discovering sibling files. Its durable `PROVISIONING` registry record is the
+restart intent and `ACTIVE` is published only after recovery-open succeeds.
+
+`nextsql.lock` contains no authoritative state. `nextsqld`, `nextsql init`, and
+offline adoption hold an OS-enforced exclusive lock on it; the file remains
+after unlock and mode is forced to `0600`. Lock ownership, not file existence,
+controls exclusion. Multi-database routing, ID-layout migration, registry
+backup/PITR, Raft replication, realm auth stores, and managed database
+directories are not implemented yet and receive no shipped claim.
+
+## Short-lived credential material (`NSTK` / `NSTR`)
+
+Sidecar files for signed short-lived credentials (`docs/security.md`), outside
+the database and its encryption envelope. `NSTK` v1 (mode `0600`, atomic
+rename) is the Ed25519 signing keyset: magic, version, key count, then per key
+an id, flag byte (`retired` / `current` / `has-private`), creation Unix
+seconds, 32-byte public key, and — only on an issuer keyset — the 32-byte
+private seed (validated against the public key on load). A server keeps a
+verify-only copy with every seed stripped. `NSTR` v1 is the revocation set:
+magic, version, revoked-id count, then `(16-byte token id, expiry Unix
+seconds)` pairs, followed by a cutoff count and `(u16-length principal, Unix
+seconds)` pairs. Both decoders bound every count and length and reject
+duplicates, trailing bytes, and more than one current key. The credential wire
+blob itself (`NSSC` v1, claims + 64-byte Ed25519 signature) is never persisted
+server-side.
+
 ## What this version does not store
 
-SQL or replication metadata as standalone files. User JSON lives inside encrypted `NSRW` row payloads as `NSJB` (`docs/json.md`). Full-text inverted indexes are detached encrypted B+Trees (`docs/fulltext.md`). Vector payloads (`NSVV`) and HNSW graphs (`NSHM`) are detached encrypted B+Trees (`docs/vector.md`). WAL records are in the sibling `*.wal/` directory (`docs/wal.md`). UNDO and MVCC headers are documented in `docs/mvcc.md`.
+SQL or replication metadata as standalone files. User JSON lives inside encrypted `NSRW` row payloads as `NSJB` (`docs/json.md`). Full-text inverted indexes are detached encrypted B+Trees (`docs/fulltext.md`). Vector payloads (`NSVV`), HNSW graphs (`NSHM`), IVF / IVF-PQ index trees (`NSIV` / `NSPQ`), and the sparse inverted-index core encodings (`NSSV` / `NSSM` / `NSSP`) are detached encrypted B+Trees (`docs/vector.md`). WAL records are in the sibling `*.wal/` directory (`docs/wal.md`). UNDO and MVCC headers are documented in `docs/mvcc.md`.

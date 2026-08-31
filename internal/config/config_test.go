@@ -9,7 +9,7 @@ import (
 func TestLoadAndValidate(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "nextsql.conf")
-	body := "data_dir=/var/lib/nextsql\nkey_file=/etc/nextsql/master.key\nbuffer_pages=64\nlog_level=debug\n# comment\nlisten_addr=127.0.0.1:9000\n"
+	body := "data_dir=/var/lib/nextsql\nkey_file=/etc/nextsql/master.key\ninstance_key_file=/etc/nextsql/instance.key\nbuffer_pages=64\nlog_level=debug\n# comment\nlisten_addr=127.0.0.1:9000\n"
 	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -20,6 +20,9 @@ func TestLoadAndValidate(t *testing.T) {
 	if cfg.DataDir != "/var/lib/nextsql" || cfg.KeyFile != "/etc/nextsql/master.key" {
 		t.Fatalf("paths: %+v", cfg)
 	}
+	if cfg.InstanceRootFile() != "/etc/nextsql/instance.key" {
+		t.Fatalf("instance key: %+v", cfg)
+	}
 	if cfg.BufferPages != 64 || cfg.ListenAddr != "127.0.0.1:9000" {
 		t.Fatalf("fields: %+v", cfg)
 	}
@@ -28,6 +31,18 @@ func TestLoadAndValidate(t *testing.T) {
 	}
 	if cfg.DataFile() != "/var/lib/nextsql/nextsql.db" {
 		t.Fatalf("data file %q", cfg.DataFile())
+	}
+}
+
+func TestDefaultInstanceRootFile(t *testing.T) {
+	cfg := Default()
+	cfg.KeyFile = "/etc/nextsql/database.key"
+	if got := cfg.InstanceRootFile(); got != "/etc/nextsql/database.key.instance" {
+		t.Fatalf("InstanceRootFile()=%q", got)
+	}
+	cfg.KeyFile = ""
+	if got := cfg.InstanceRootFile(); got != "" {
+		t.Fatalf("client-key mode default=%q", got)
 	}
 }
 
@@ -79,5 +94,61 @@ func TestLoadClusterKeys(t *testing.T) {
 	}
 	if err := cfg.Validate(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestLoadAndValidateMTLS(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "mtls.conf")
+	body := "tls_cert=/etc/nextsql/server.crt\ntls_key=/etc/nextsql/server.key\ntls_client_ca=/etc/nextsql/client-ca.pem\ntls_client_crl=/etc/nextsql/client-crl.pem\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.TLSClientCA != "/etc/nextsql/client-ca.pem" || cfg.TLSClientCRL != "/etc/nextsql/client-crl.pem" {
+		t.Fatalf("%+v", cfg)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	cfg.TLSCert = ""
+	cfg.TLSKey = ""
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("client CA accepted without server key pair")
+	}
+	cfg = Default()
+	cfg.TLSClientCRL = "/etc/nextsql/client-crl.pem"
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("client CRL accepted without client CA")
+	}
+}
+
+func TestLoadAndValidateShortLivedCredentials(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "token.conf")
+	body := "token_verify_keyset=/etc/nextsql/token.keyset\ntoken_revocations=/etc/nextsql/token.revocations\ntoken_audience=prod-eu\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.TokenKeyset != "/etc/nextsql/token.keyset" || cfg.TokenRevocations != "/etc/nextsql/token.revocations" || cfg.TokenAudience != "prod-eu" {
+		t.Fatalf("%+v", cfg)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	cfg = Default()
+	cfg.TokenAudience = "prod-eu"
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("token audience accepted without a verify keyset")
+	}
+	cfg = Default()
+	cfg.TokenRevocations = "/etc/nextsql/token.revocations"
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("token revocations accepted without a verify keyset")
 	}
 }

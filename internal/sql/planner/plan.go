@@ -92,6 +92,7 @@ type (
 	AlterTable struct {
 		Table          *catalog.Table
 		Result         *catalog.Table
+		Transfer       *catalog.Table
 		OldName        string
 		NewName        string
 		Kind           ast.AlterCmd
@@ -156,47 +157,65 @@ type (
 		Input     Logical
 		Table     *catalog.Table
 		IndexName string
-		Column    int
+		Columns   []int
+		Weights   []float64 // parallel to Columns; nil means all 1
 		Query     ast.Expr
 		Residual  ast.Expr
 		Needed    []int
 	}
+	// Facet counts independent histograms of Columns over SEARCH matches.
+	// Output is (facet STRING, value STRING, count DECIMAL). Limit is
+	// per-facet top-N (-1 = all values up to MaxFacetValues).
+	Facet struct {
+		Input   Logical
+		Table   *catalog.Table
+		Columns []int
+		Names   []string // parallel to Columns
+		Limit   int64
+	}
 	Nearest struct {
-		Input     Logical
-		Table     *catalog.Table
-		IndexName string
-		Column    int
-		Query     ast.Expr
-		Metric    string
-		Residual  ast.Expr
-		Needed    []int
-		K         int64
+		Input      Logical
+		Table      *catalog.Table
+		IndexName  string
+		Column     int
+		Query      ast.Expr
+		Metric     string
+		Residual   ast.Expr
+		Needed     []int
+		K          int64
+		Partitions []uint32 // nil means all; non-nil is the pruned stable-ID set
 	}
 	// Candidates is hybrid candidate generation (HNSW, flat ANN, or full-text).
 	Candidates struct {
-		Input     Logical
-		Table     *catalog.Table
-		Kind      string // "hnsw", "flat", "fulltext"
-		IndexName string
-		Column    int
-		Query     ast.Expr
-		Metric    string
-		Residual  ast.Expr
-		Needed    []int
-		K         int64
+		Input      Logical
+		Table      *catalog.Table
+		Kind       string // "hnsw", "flat", "fulltext"
+		IndexName  string
+		Column     int
+		Query      ast.Expr
+		Metric     string
+		Residual   ast.Expr
+		Needed     []int
+		K          int64
+		Partitions []uint32 // nil means all; non-nil is the pruned stable-ID set
 	}
 	// Rerank fuses BM25 and vector ranks over a candidate set and keeps top K.
 	Rerank struct {
-		Input        Logical
-		Table        *catalog.Table
-		SearchCol    int
-		SearchQuery  ast.Expr
-		NearestCol   int
-		NearestQuery ast.Expr
-		Metric       string
-		K            int64
-		Method       string // "bm25+vector"
-		Strategy     string // "filter-ann", "ann-filter", "search-ann"
+		Input         Logical
+		Extra         []Logical // additional retrievers; unioned with Input before scoring
+		Table         *catalog.Table
+		SearchCols    []int
+		SearchWeights []float64
+		SearchQuery   ast.Expr
+		NearestCol    int
+		NearestQuery  ast.Expr
+		Metric        string
+		SparseCol     int // -1 if absent
+		SparseQuery   ast.Expr
+		SparseMetric  string
+		K             int64
+		Method        string // "bm25+vector", "vector+sparse", "bm25+vector+sparse"
+		Strategy      string // "filter-ann", "ann-filter", "search-ann", "fusion"
 	}
 	SegmentSpan struct {
 		ID        int
@@ -358,6 +377,7 @@ func (Scan) logical()           {}
 func (SeqScan) logical()        {}
 func (IndexScan) logical()      {}
 func (Search) logical()         {}
+func (Facet) logical()          {}
 func (Nearest) logical()        {}
 func (Candidates) logical()     {}
 func (Rerank) logical()         {}
@@ -520,6 +540,7 @@ func Plan(b binder.Bound) (Logical, error) {
 		return AlterTable{
 			Table:          s.Table,
 			Result:         s.Result,
+			Transfer:       s.Transfer,
 			OldName:        s.OldName,
 			NewName:        s.NewName,
 			Kind:           s.Kind,
@@ -546,7 +567,7 @@ func Plan(b binder.Bound) (Logical, error) {
 		if schema == nil {
 			schema = s.Table
 		}
-		hasRank := (s.SearchQuery != nil && s.SearchCol >= 0) || (s.NearestQuery != nil && s.NearestCol >= 0)
+		hasRank := (s.SearchQuery != nil && len(s.SearchCols) > 0) || (s.NearestQuery != nil && s.NearestCol >= 0) || (s.Nearest2Query != nil && s.Nearest2Col >= 0)
 		rank := s.Table
 		if hasRank && len(s.Joins) > 0 {
 			rank = qualifyRankTable(s.Table, schema)
@@ -559,7 +580,7 @@ func Plan(b binder.Bound) (Logical, error) {
 				return nil, err
 			}
 		} else {
-			p = tenantScan(rank, s.TenantScanFilters)
+			p = Scan{Table: rank}
 		}
 		if s.Where != nil && len(s.Joins) == 0 {
 			p = Filter{Input: p, Pred: s.Where}
@@ -571,11 +592,28 @@ func Plan(b binder.Bound) (Logical, error) {
 				return nil, err
 			}
 		}
-		if s.SearchQuery != nil && s.SearchCol >= 0 {
-			p = Search{Input: p, Table: rank, Column: s.SearchCol, Query: s.SearchQuery}
+		if s.SearchQuery != nil && len(s.SearchCols) > 0 {
+			p = Search{Input: p, Table: rank, Columns: append([]int(nil), s.SearchCols...), Weights: append([]float64(nil), s.SearchWeights...), Query: s.SearchQuery}
+		}
+		if len(s.FacetCols) > 0 {
+			lim := int64(-1)
+			if s.Limit != nil {
+				lim = *s.Limit
+			}
+			p = Facet{
+				Input:   p,
+				Table:   rank,
+				Columns: append([]int(nil), s.FacetCols...),
+				Names:   append([]string(nil), s.FacetNames...),
+				Limit:   lim,
+			}
+			return p, nil
 		}
 		if s.NearestQuery != nil && s.NearestCol >= 0 {
 			p = Nearest{Input: p, Table: rank, Column: s.NearestCol, Query: s.NearestQuery, Metric: s.NearestMetric}
+		}
+		if s.Nearest2Query != nil && s.Nearest2Col >= 0 {
+			p = Nearest{Input: p, Table: rank, Column: s.Nearest2Col, Query: s.Nearest2Query, Metric: s.Nearest2Metric}
 		}
 		if n := len(s.Joins); n > 0 {
 			ncol := len(s.Table.Columns)
@@ -593,7 +631,7 @@ func Plan(b binder.Bound) (Logical, error) {
 						return nil, err
 					}
 				} else {
-					right = tenantScan(j.Table, s.TenantScanFilters)
+					right = Scan{Table: j.Table}
 				}
 				cross := j.Kind == ast.JoinCross || (j.On == nil && j.Kind != ast.JoinLeft && j.Kind != ast.JoinRight && j.Kind != ast.JoinFull)
 				p = Join{Left: p, Right: right, Pred: j.On, Kind: j.Kind, Cross: cross, Schema: js}
@@ -894,62 +932,6 @@ func uniqueDistinctKey(s binder.Select) (string, bool) {
 		}
 	}
 	return "", false
-}
-
-func tenantScan(tab *catalog.Table, filters []ast.TenantScanFilter) Logical {
-	var p Logical = Scan{Table: tab}
-	if pred := tenantPredFor(tab, filters); pred != nil {
-		p = Filter{Input: p, Pred: pred}
-	}
-	return p
-}
-
-func tenantPredFor(tab *catalog.Table, filters []ast.TenantScanFilter) ast.Expr {
-	if tab == nil || len(filters) == 0 {
-		return nil
-	}
-	col := tenantColName(tab)
-	if col == "" {
-		return nil
-	}
-	// FROM scans are unqualified; join scans are alias-prefixed. Adapt the ident.
-	for _, f := range filters {
-		if f.Pred == nil {
-			continue
-		}
-		if f.Table != "" && f.Table != tab.Name {
-			continue
-		}
-		return rewriteTenantIdent(f.Pred, col)
-	}
-	return nil
-}
-
-func tenantColName(tab *catalog.Table) string {
-	if tab == nil {
-		return ""
-	}
-	if _, ok := tab.ColIndex(catalog.TenantColumn); ok {
-		return catalog.TenantColumn
-	}
-	suf := "." + catalog.TenantColumn
-	for _, c := range tab.Columns {
-		if len(c.Name) > len(suf) && c.Name[len(c.Name)-len(suf):] == suf {
-			return c.Name
-		}
-	}
-	return ""
-}
-
-func rewriteTenantIdent(e ast.Expr, col string) ast.Expr {
-	switch x := e.(type) {
-	case ast.Ident:
-		return ast.Ident{Name: col}
-	case ast.Binary:
-		return ast.Binary{Op: x.Op, Left: rewriteTenantIdent(x.Left, col), Right: x.Right}
-	default:
-		return e
-	}
 }
 
 func qualifyRankTable(from, schema *catalog.Table) *catalog.Table {

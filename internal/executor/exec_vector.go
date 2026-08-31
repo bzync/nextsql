@@ -21,6 +21,7 @@ func (s *Session) execSelect(plan planner.Logical) (*Result, error) {
 	var (
 		proj   *planner.Project
 		agg    *planner.Aggregate
+		facet  *planner.Facet
 		srt    *planner.Sort
 		limit  int64 = -1
 		offset int64
@@ -82,6 +83,13 @@ func (s *Session) execSelect(plan planner.Logical) (*Result, error) {
 			a := n
 			agg = &a
 			cur = n.Input
+		case planner.Facet:
+			if peeledProject || agg != nil {
+				goto done
+			}
+			f := n
+			facet = &f
+			cur = n.Input
 		case planner.Empty:
 			names := n.Names
 			if proj != nil {
@@ -89,6 +97,9 @@ func (s *Session) execSelect(plan planner.Logical) (*Result, error) {
 			}
 			if agg != nil {
 				names = agg.Names
+			}
+			if facet != nil {
+				names = []string{"facet", "value", "count"}
 			}
 			return &Result{Columns: append([]string(nil), names...)}, nil
 		default:
@@ -104,7 +115,9 @@ done:
 		tab = agg.Schema
 	}
 	var names []string
-	if agg != nil {
+	if facet != nil {
+		names = []string{"facet", "value", "count"}
+	} else if agg != nil {
 		names = agg.Names
 	} else if proj != nil {
 		names = proj.Names
@@ -113,11 +126,36 @@ done:
 	}
 	res := &Result{Columns: append([]string(nil), names...)}
 
+	var hlPop func()
+	var hlErr error
+	if proj != nil {
+		hlPop, hlErr = s.maybePushHighlight(plan, proj.Exprs)
+	} else if agg != nil {
+		hlPop, hlErr = s.maybePushHighlight(plan, agg.Exprs)
+	}
+	if hlErr != nil {
+		return nil, hlErr
+	}
+	if hlPop != nil {
+		defer hlPop()
+	}
+
 	var (
 		rows [][]types.Value
 		err  error
 	)
-	if agg != nil {
+	if facet != nil {
+		rows, err = s.execFacet(facet, cur)
+		if err != nil {
+			return nil, err
+		}
+		if s.trace != nil {
+			if n := optimizer.Find(s.trace, "Facet"); n != nil {
+				n.ActRows = int64(len(rows))
+				n.Workers = 1
+			}
+		}
+	} else if agg != nil {
 		rows, err = s.execAggregate(agg, cur)
 		if err != nil {
 			return nil, err
@@ -675,10 +713,15 @@ func (s *Session) tryStreamHeapAggregate(a *planner.Aggregate, input planner.Log
 	case planner.Scan:
 		tab = n.Table
 	case planner.SeqScan:
-		if len(n.Segments) > 0 {
-			return nil, nil, false
-		}
 		if n.Table != nil && n.Table.Partitioning != nil {
+			// Partition-wise aggregation: aggregate each surviving partition
+			// heap independently and in parallel, then merge the partial
+			// hash tables. This removes the sequential per-partition scan
+			// penalty of the generic streaming path.
+			rows, err := s.partitionWiseHeapAggregate(a, n)
+			return rows, err, true
+		}
+		if len(n.Segments) > 0 {
 			return nil, nil, false
 		}
 		tab = n.Table
@@ -859,6 +902,112 @@ func (s *Session) parallelHeapAggregate(a *planner.Aggregate, tab *catalog.Table
 		if n := optimizer.Find(s.trace, "SeqScan"); n != nil {
 			n.ActRows = act
 			n.Workers = s.workers()
+		}
+	}
+	raw, err := merged.Finish()
+	if err != nil {
+		return nil, err
+	}
+	return orderAgg(raw, a), nil
+}
+
+// partitionWiseHeapAggregate aggregates a partitioned table by running one
+// partial hash aggregation per surviving partition heap, in parallel through
+// the query scheduler, and merging the partials. Groups that span partitions
+// are folded during the merge, so the result is identical to a single
+// aggregation over the union of the partitions.
+func (s *Session) partitionWiseHeapAggregate(a *planner.Aggregate, n planner.SeqScan) ([][]types.Value, error) {
+	tab := n.Table
+	sel := partitionSelection(tab, n.Partitions)
+	specs, outTy := aggSpecs(a)
+
+	// Segment bounds (PK ranges left by the optimizer) are encoded once and
+	// applied inside every partition heap.
+	type span struct{ start, end []byte }
+	var spans []span
+	if len(n.Segments) == 0 {
+		spans = []span{{nil, nil}}
+	} else {
+		for _, seg := range n.Segments {
+			start, end, err := encodeBounds(seg.Low, seg.High, seg.LowIncl, seg.HighIncl)
+			if err != nil {
+				return nil, err
+			}
+			spans = append(spans, span{start, end})
+		}
+	}
+
+	// Partition heap transactions are resolved serially: the session's pending
+	// map is not safe for concurrent writers. The btree.Txn values themselves
+	// support concurrent range reads.
+	htxs := make([]*btree.Txn, len(sel))
+	for i, part := range sel {
+		heap, err := s.partitionHeap(tab, part.ID)
+		if err != nil {
+			return nil, err
+		}
+		htxs[i] = s.x.use(heap)
+	}
+
+	sole := s.soleSnapshot()
+	parts := make([]*aggregate.Hash, len(sel))
+	acts := make([]int64, len(sel))
+	tasks := make([]func() error, len(sel))
+	for i := range sel {
+		i := i
+		htx := htxs[i]
+		tasks[i] = func() error {
+			h := aggregate.New(a.Groups, specs, outTy, s.budget())
+			parts[i] = h
+			var act int64
+			for _, sp := range spans {
+				sp := sp
+				got, err := s.feedHeapAggregate(h, a, tab, specs, func(fn func(key, val []byte) error) error {
+					if sole && sp.start == nil && sp.end == nil {
+						return htx.RangeLive(fn)
+					}
+					return htx.Range(sp.start, sp.end, fn)
+				})
+				act += got
+				if err != nil {
+					return err
+				}
+			}
+			acts[i] = act
+			return nil
+		}
+	}
+	w := s.workers()
+	if w < 1 {
+		w = 1
+	}
+	if err := s.pool().Run(s.budget().Context(), w, tasks); err != nil {
+		for _, h := range parts {
+			if h != nil {
+				h.Close()
+			}
+		}
+		return nil, err
+	}
+
+	merged := aggregate.New(a.Groups, specs, outTy, s.budget())
+	defer merged.Close()
+	var act int64
+	for i, h := range parts {
+		act += acts[i]
+		if h == nil {
+			continue
+		}
+		if err := merged.Merge(h); err != nil {
+			h.Close()
+			return nil, err
+		}
+		h.Close()
+	}
+	if s.trace != nil {
+		if node := optimizer.Find(s.trace, "SeqScan"); node != nil {
+			node.ActRows = act
+			node.Workers = min(w, len(sel))
 		}
 	}
 	raw, err := merged.Finish()
@@ -1097,6 +1246,22 @@ func (s *Session) collectPlan(p planner.Logical) ([][]types.Value, error) {
 		return s.scanIndexBatch(n)
 	case planner.Search:
 		return s.searchFulltext(n)
+	case planner.Facet:
+		rows, err := s.collectPlan(n.Input)
+		if err != nil {
+			return nil, err
+		}
+		out, err := s.facetRows(&n, rows)
+		if err != nil {
+			return nil, err
+		}
+		if s.trace != nil {
+			if node := optimizer.Find(s.trace, "Facet"); node != nil {
+				node.ActRows = int64(len(out))
+				node.Workers = 1
+			}
+		}
+		return out, nil
 	case planner.Nearest:
 		return s.searchNearest(n)
 	case planner.Candidates:
@@ -1106,11 +1271,19 @@ func (s *Session) collectPlan(p planner.Logical) ([][]types.Value, error) {
 	case planner.Join:
 		return s.execJoin(n)
 	case planner.Aggregate:
-		rows, err := s.collectPlan(n.Input)
-		if err != nil {
-			return nil, err
+		var (
+			rows [][]types.Value
+			err  error
+		)
+		if sc, ok := n.Input.(planner.SeqScan); ok && sc.Table != nil && sc.Table.Partitioning != nil {
+			rows, err = s.partitionWiseHeapAggregate(&n, sc)
+		} else {
+			var in [][]types.Value
+			in, err = s.collectPlan(n.Input)
+			if err == nil {
+				rows, err = s.runAggregate(&n, in)
+			}
 		}
-		rows, err = s.runAggregate(&n, rows)
 		if err != nil {
 			return nil, err
 		}
@@ -1201,6 +1374,9 @@ func (s *Session) applyFilter(rows [][]types.Value, tab *catalog.Table, pred ast
 }
 
 func (s *Session) execJoin(n planner.Join) ([][]types.Value, error) {
+	if rows, err, ok := s.tryPartitionWiseJoin(n); ok {
+		return rows, err
+	}
 	left, err := s.collectPlan(n.Left)
 	if err != nil {
 		return nil, err

@@ -14,7 +14,6 @@ import (
 	"github.com/bzync/nextsql/internal/nerr"
 	"github.com/bzync/nextsql/internal/security"
 	"github.com/bzync/nextsql/internal/sql/ast"
-	"github.com/bzync/nextsql/internal/sql/types"
 	"github.com/bzync/nextsql/internal/txn"
 )
 
@@ -29,11 +28,9 @@ func TestScheduleCatalogLifecycleRestartAndDependencies(t *testing.T) {
 	s := db.Session()
 	execOK(t, s, `CREATE TABLE sink (id STRING PRIMARY KEY)`)
 	execOK(t, s, `CREATE WORKFLOW record(id STRING) AS BEGIN INSERT INTO sink (id) VALUES ($id); END`)
-	tenant := types.StringValue("tenant-a")
-	s.tenant = &tenant
 	execOK(t, s, `CREATE SCHEDULE hourly EVERY '1h' RUN WORKFLOW record('hour')`)
 	schedule, ok := s.lookupSchedule("hourly")
-	if !ok || schedule.Kind != ast.ScheduleEvery || schedule.SpecNS != int64(time.Hour) || schedule.Tenant != "tenant-a" {
+	if !ok || schedule.Kind != ast.ScheduleEvery || schedule.SpecNS != int64(time.Hour) || schedule.Tenant != "" {
 		t.Fatalf("schedule=%+v ok=%v", schedule, ok)
 	}
 	if _, err := s.Exec(`DROP WORKFLOW record`); err == nil {

@@ -11,40 +11,70 @@ import (
 )
 
 const (
-	envAddr          = "NEXTSQL_ADDR"
-	envUser          = "NEXTSQL_USER"
-	envPasswordFile  = "NEXTSQL_PASSWORD_FILE"
-	envPassword      = "NEXTSQL_PASSWORD"
-	envDatabase      = "NEXTSQL_DATABASE"
-	envTLSCA         = "NEXTSQL_TLS_CA"
-	envInsecure      = "NEXTSQL_INSECURE"
-	envMigrationsDir = "NEXTSQL_MIGRATIONS_DIR"
-	envTenant        = "NEXTSQL_TENANT"
-	envDataDir       = "NEXTSQL_DATA_DIR"
-	envKeyFile       = "NEXTSQL_KEY_FILE"
-	envBufferPages   = "NEXTSQL_BUFFER_PAGES"
+	envAddr             = "NEXTSQL_ADDR"
+	envDatabaseUser     = "NEXTSQL_DATABASE_USER"
+	envDatabasePass     = "NEXTSQL_DATABASE_PASS"
+	envDatabasePassFile = "NEXTSQL_DATABASE_PASSWORD_FILE"
+	envServerUser       = "NEXTSQL_SERVER_USER"
+	envServerPass       = "NEXTSQL_SERVER_PASS"
+	envServerPassFile   = "NEXTSQL_SERVER_PASSWORD_FILE"
+	envDatabase         = "NEXTSQL_DATABASE"
+	envTLSCA            = "NEXTSQL_TLS_CA"
+	envTLSServerName    = "NEXTSQL_TLS_SERVER_NAME"
+	envTLSClientCert    = "NEXTSQL_TLS_CLIENT_CERT"
+	envTLSClientKey     = "NEXTSQL_TLS_CLIENT_KEY"
+	envInsecure         = "NEXTSQL_INSECURE"
+	envIdP              = "NEXTSQL_IDP"
+	envIdPConfig        = "NEXTSQL_IDP_CONFIG"
+	envMigrationDir     = "NEXTSQL_MIGRATION_DIR"
+	envDataDir          = "NEXTSQL_DATA_DIR"
+	envKeyFile          = "NEXTSQL_KEY_FILE"
+	envInstanceKey      = "NEXTSQL_INSTANCE_KEY_FILE"
+	envRealmName        = "NEXTSQL_REALM_NAME"
+	envBufferPages      = "NEXTSQL_BUFFER_PAGES"
+	envHostingConfirm   = "NEXTSQL_HOSTING_CONFIRM"
+	envHostingManifest  = "NEXTSQL_HOSTING_MANIFEST_FILE"
 
 	defaultMigrationsDir = "./migrations"
 )
 
 // Settings is the merged client configuration after flags, process env, and dotenv files.
 type Settings struct {
-	Addr          string
-	User          string
-	PasswordFile  string
-	Password      string
-	Database      string
-	TLSCA         string
-	Insecure      bool
-	MigrationsDir string
-	Tenant        string
-	DataDir       string
-	KeyFile       string
-	BufferPages   int
+	Addr            string
+	User            string
+	PasswordFile    string
+	Password        string
+	ServerUser      string
+	ServerPass      string
+	ServerPassFile  string
+	Database        string
+	TLSCA           string
+	TLSServerName   string
+	TLSClientCert   string
+	TLSClientKey    string
+	Insecure        bool
+	IdP             string
+	IdPConfig       string
+	MigrationsDir   string
+	DataDir         string
+	KeyFile         string
+	InstanceKeyFile string
+	Realm           string
+	BufferPages     int
+	HostingConfirm  bool
+	HostingManifest string
 
 	NoEnv    bool
 	EnvFile  string
 	Explicit map[string]bool
+	// Supplied reports fields provided by an explicit flag, process
+	// environment, or dotenv file rather than a built-in default.
+	Supplied map[string]bool
+
+	inlinePasswordEnv string
+	// oidcCredential, when set by an external-identity login, is the NSSC1.
+	// credential presented in place of a password.
+	oidcCredential string
 }
 
 // Defaults are built-in values used when no flag, env, or file sets a field.
@@ -54,6 +84,7 @@ func Defaults() Settings {
 		MigrationsDir: defaultMigrationsDir,
 		BufferPages:   config.DefaultBufferPages,
 		Explicit:      map[string]bool{},
+		Supplied:      map[string]bool{},
 	}
 }
 
@@ -83,16 +114,27 @@ func Resolve(fs *flag.FlagSet, args []string) (Settings, error) {
 	}
 
 	s.Addr = pickString(s.Explicit, fs, "addr", envAddr, files, s.Addr)
-	s.User = pickString(s.Explicit, fs, "user", envUser, files, s.User)
-	s.PasswordFile = pickString(s.Explicit, fs, "password-file", envPasswordFile, files, s.PasswordFile)
+	s.User = pickString(s.Explicit, fs, "user", envDatabaseUser, files, s.User)
+	s.PasswordFile = pickString(s.Explicit, fs, "password-file", envDatabasePassFile, files, s.PasswordFile)
+	s.ServerUser = pickString(s.Explicit, fs, "server-user", envServerUser, files, s.ServerUser)
+	s.ServerPass = pickSecret(envServerPass, files)
+	s.ServerPassFile = pickString(s.Explicit, fs, "server-password-file", envServerPassFile, files, s.ServerPassFile)
 	s.Database = pickString(s.Explicit, fs, "database", envDatabase, files, s.Database)
 	s.TLSCA = pickString(s.Explicit, fs, "tls-ca", envTLSCA, files, s.TLSCA)
-	s.Tenant = pickString(s.Explicit, fs, "tenant", envTenant, files, s.Tenant)
-	s.MigrationsDir = pickString(s.Explicit, fs, "dir", envMigrationsDir, files, s.MigrationsDir)
+	s.TLSServerName = pickString(s.Explicit, fs, "tls-server-name", envTLSServerName, files, s.TLSServerName)
+	s.TLSClientCert = pickString(s.Explicit, fs, "tls-client-cert", envTLSClientCert, files, s.TLSClientCert)
+	s.TLSClientKey = pickString(s.Explicit, fs, "tls-client-key", envTLSClientKey, files, s.TLSClientKey)
+	s.IdP = pickString(s.Explicit, fs, "idp", envIdP, files, s.IdP)
+	s.IdPConfig = pickString(s.Explicit, fs, "idp-config", envIdPConfig, files, s.IdPConfig)
+	s.MigrationsDir = pickString(s.Explicit, fs, "dir", envMigrationDir, files, s.MigrationsDir)
 	s.DataDir = pickString(s.Explicit, fs, "data-dir", envDataDir, files, s.DataDir)
 	s.KeyFile = pickString(s.Explicit, fs, "key-file", envKeyFile, files, s.KeyFile)
-	s.Password = pickPassword(files)
-
+	s.InstanceKeyFile = pickString(s.Explicit, fs, "instance-key-file", envInstanceKey, files, s.InstanceKeyFile)
+	s.Realm = pickString(s.Explicit, fs, "realm", envRealmName, files, s.Realm)
+	s.Password = pickSecret(envDatabasePass, files)
+	if s.Password != "" {
+		s.inlinePasswordEnv = envDatabasePass
+	}
 	insecure, err := pickBool(s.Explicit, fs, "insecure", envInsecure, files, s.Insecure)
 	if err != nil {
 		return Settings{}, err
@@ -104,7 +146,36 @@ func Resolve(fs *flag.FlagSet, args []string) (Settings, error) {
 		return Settings{}, err
 	}
 	s.BufferPages = pages
+
+	hostingConfirm, err := pickBool(s.Explicit, fs, "confirm", envHostingConfirm, files, s.HostingConfirm)
+	if err != nil {
+		return Settings{}, err
+	}
+	s.HostingConfirm = hostingConfirm
+	s.HostingManifest = pickString(s.Explicit, fs, "hosting-manifest", envHostingManifest, files, s.HostingManifest)
+	for _, field := range []struct {
+		flagName string
+		envKey   string
+	}{
+		{"addr", envAddr}, {"user", envDatabaseUser}, {"password-file", envDatabasePassFile},
+		{"server-user", envServerUser}, {"server-pass", envServerPass}, {"server-password-file", envServerPassFile},
+		{"database", envDatabase}, {"realm", envRealmName}, {"data-dir", envDataDir},
+		{"key-file", envKeyFile}, {"instance-key-file", envInstanceKey},
+		{"buffer-pages", envBufferPages}, {"confirm", envHostingConfirm}, {"hosting-manifest", envHostingManifest},
+	} {
+		s.Supplied[field.flagName] = supplied(s.Explicit, field.flagName, field.envKey, files)
+	}
 	return s, nil
+}
+
+func supplied(explicit map[string]bool, flagName, envKey string, files map[string]string) bool {
+	if explicit[flagName] {
+		return true
+	}
+	if lookupEnv(envKey) != "" {
+		return true
+	}
+	return strings.TrimSpace(files[envKey]) != ""
 }
 
 func loadSettingsFiles(s Settings) (map[string]string, error) {
@@ -168,11 +239,11 @@ func pickString(explicit map[string]bool, fs *flag.FlagSet, flagName, envKey str
 	return def
 }
 
-func pickPassword(files map[string]string) string {
-	if v, ok := os.LookupEnv(envPassword); ok && strings.TrimSpace(v) != "" {
+func pickSecret(envKey string, files map[string]string) string {
+	if v, ok := os.LookupEnv(envKey); ok && strings.TrimSpace(v) != "" {
 		return v
 	}
-	if v := files[envPassword]; strings.TrimSpace(v) != "" {
+	if v := files[envKey]; strings.TrimSpace(v) != "" {
 		return v
 	}
 	return ""

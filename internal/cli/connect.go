@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"io"
 	"net"
@@ -12,7 +13,6 @@ import (
 	"github.com/bzync/nextsql/internal/auth"
 	"github.com/bzync/nextsql/internal/nerr"
 	"github.com/bzync/nextsql/internal/security"
-	"github.com/bzync/nextsql/internal/sql/types"
 )
 
 var stderr io.Writer = os.Stderr
@@ -54,17 +54,33 @@ func ServerConfig(s Settings) (nextsql.Config, error) {
 		Password:      pw,
 		InsecureNoTLS: s.Insecure,
 	}
+	clientCert := strings.TrimSpace(s.TLSClientCert)
+	clientKey := strings.TrimSpace(s.TLSClientKey)
+	if (clientCert == "") != (clientKey == "") {
+		return nextsql.Config{}, nerr.New(nerr.InvalidArgument, "cli", "--tls-client-cert and --tls-client-key must be set together")
+	}
 	if ca := strings.TrimSpace(s.TLSCA); ca != "" {
-		host := "localhost"
-		if h, _, err := net.SplitHostPort(addr); err == nil && h != "" {
-			host = h
+		serverName := strings.TrimSpace(s.TLSServerName)
+		if serverName == "" {
+			serverName = "localhost"
+			if h, _, err := net.SplitHostPort(addr); err == nil && h != "" {
+				serverName = h
+			}
 		}
-		tlsCfg, err := security.ClientTLS(host, ca)
+		var tlsCfg *tls.Config
+		if clientCert != "" {
+			tlsCfg, err = security.ClientMTLS(serverName, ca, clientCert, clientKey)
+		} else {
+			tlsCfg, err = security.ClientTLS(serverName, ca)
+		}
 		if err != nil {
 			return nextsql.Config{}, err
 		}
 		cfg.TLS = tlsCfg
 		cfg.InsecureNoTLS = false
+	}
+	if clientCert != "" && cfg.TLS == nil {
+		return nextsql.Config{}, nerr.New(nerr.InvalidArgument, "cli", "--tls-client-cert requires --tls-ca")
 	}
 	if cfg.TLS == nil && !cfg.InsecureNoTLS {
 		return nextsql.Config{}, nerr.New(nerr.InvalidArgument, "cli", "TLS is required; pass --tls-ca or --insecure (loopback only)")
@@ -75,8 +91,15 @@ func ServerConfig(s Settings) (nextsql.Config, error) {
 	return cfg, nil
 }
 
-// Open dials nextsqld with ServerConfig and optionally issues SET TENANT.
+// Open dials nextsqld with ServerConfig.
 func Open(ctx context.Context, s Settings) (*nextsql.Conn, error) {
+	if strings.TrimSpace(s.IdP) != "" {
+		applied, err := applyOIDC(ctx, s)
+		if err != nil {
+			return nil, err
+		}
+		s = applied
+	}
 	cfg, err := ServerConfig(s)
 	if err != nil {
 		return nil, err
@@ -85,21 +108,22 @@ func Open(ctx context.Context, s Settings) (*nextsql.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	if tenant := strings.TrimSpace(s.Tenant); tenant != "" {
-		if _, err := conn.Exec(ctx, "SET TENANT = $1", types.StringValue(tenant)); err != nil {
-			_ = conn.Close()
-			return nil, err
-		}
-	}
 	return conn, nil
 }
 
 func resolvePassword(s Settings) (string, error) {
+	if s.oidcCredential != "" {
+		return s.oidcCredential, nil
+	}
 	if strings.TrimSpace(s.PasswordFile) != "" {
 		return auth.ReadPasswordFile(s.PasswordFile)
 	}
 	if strings.TrimSpace(s.Password) != "" {
-		fmt.Fprintln(stderr, "using NEXTSQL_PASSWORD from the environment; prefer NEXTSQL_PASSWORD_FILE")
+		envKey := s.inlinePasswordEnv
+		if envKey == "" {
+			envKey = envDatabasePass
+		}
+		fmt.Fprintf(stderr, "using %s from the environment; prefer NEXTSQL_DATABASE_PASSWORD_FILE\n", envKey)
 		return s.Password, nil
 	}
 	return "", nerr.New(nerr.InvalidArgument, "cli", "password is required")

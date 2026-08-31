@@ -34,11 +34,27 @@ func LessHit(a, b Hit) bool {
 	return bytes.Compare(a.PK, b.PK) < 0
 }
 
+// QuantWriter is implemented by a Graph that keeps a compact quantised copy of
+// every vector for traversal-time distance. Insert drives SaveQVec when
+// Meta.Quant is non-zero; Delete leaves the stale copy (a tombstoned node is
+// never revisited) and REBUILD replaces the whole store.
+type QuantWriter interface {
+	SaveQVec(pk []byte, v []float32) error
+}
+
+// FullVecLoader is implemented by a Graph that can return the full-precision
+// vector for a pk (the column payload). Search uses it to re-rank a
+// quantised-traversal result to exact ordering.
+type FullVecLoader interface {
+	LoadVecFull(pk []byte) ([]float32, error)
+}
+
 // Mem is an in-memory Graph used by tests and benches.
 type Mem struct {
 	Meta  Meta
 	Nodes map[string]Node
-	Vecs  map[string][]float32
+	Vecs  map[string][]float32 // traversal vectors (quantised when Meta.Quant != 0)
+	Full  map[string][]float32 // full precision; populated only when Meta.Quant != 0
 }
 
 func NewMem(dim uint16, metric Metric) *Mem {
@@ -46,6 +62,7 @@ func NewMem(dim uint16, metric Metric) *Mem {
 		Meta:  DefaultMeta(dim, metric),
 		Nodes: make(map[string]Node),
 		Vecs:  make(map[string][]float32),
+		Full:  make(map[string][]float32),
 	}
 }
 
@@ -80,11 +97,36 @@ func (m *Mem) LoadVec(pk []byte) ([]float32, error) {
 	return append([]float32(nil), v...), nil
 }
 
+// LoadVecFull returns the full-precision vector for pk, or the traversal vector
+// when the graph is not quantised.
+func (m *Mem) LoadVecFull(pk []byte) ([]float32, error) {
+	if v, ok := m.Full[string(pk)]; ok {
+		return append([]float32(nil), v...), nil
+	}
+	return m.LoadVec(pk)
+}
+
+// PutVec records a vector. When Meta.Quant is set the full-precision copy is
+// kept for re-ranking and the traversal copy is quantised to Meta.Quant.
 func (m *Mem) PutVec(pk []byte, v []float32) {
 	if m.Vecs == nil {
 		m.Vecs = make(map[string][]float32)
 	}
+	if m.Meta.Quant != 0 {
+		if m.Full == nil {
+			m.Full = make(map[string][]float32)
+		}
+		m.Full[string(pk)] = append([]float32(nil), v...)
+		m.Vecs[string(pk)] = QuantizeElem(v, m.Meta.Quant)
+		return
+	}
 	m.Vecs[string(pk)] = append([]float32(nil), v...)
+}
+
+// SaveQVec satisfies QuantWriter for the in-memory graph.
+func (m *Mem) SaveQVec(pk []byte, v []float32) error {
+	m.PutVec(pk, v)
+	return nil
 }
 
 func cloneNode(n Node) Node {
@@ -178,6 +220,24 @@ func Persist(dst Graph, src *Mem) error {
 			return err
 		}
 	}
+	if src.Meta.Quant != 0 {
+		qw, ok := dst.(QuantWriter)
+		if !ok {
+			return nerr.New(nerr.InvalidArgument, "vector.Persist", "graph does not support quantised vectors")
+		}
+		for k := range src.Nodes {
+			v, ok := src.Full[k]
+			if !ok {
+				v, ok = src.Vecs[k]
+			}
+			if !ok {
+				continue
+			}
+			if err := qw.SaveQVec([]byte(k), v); err != nil {
+				return err
+			}
+		}
+	}
 	return nil
 }
 
@@ -199,6 +259,7 @@ func LoadMem(g Graph) (*Mem, error) {
 	if mem.Nodes == nil {
 		mem.Nodes = make(map[string]Node)
 	}
+	full, _ := g.(FullVecLoader)
 	if err := ranger.RangeNodes(func(pk []byte, n Node) error {
 		mem.Nodes[string(pk)] = cloneNode(n)
 		vec, err := g.LoadVec(pk)
@@ -207,6 +268,19 @@ func LoadMem(g Graph) (*Mem, error) {
 				return nil
 			}
 			return err
+		}
+		if meta.Quant != 0 {
+			// g.LoadVec already returns the quantised traversal vector; store it
+			// directly and pull the full-precision copy for re-ranking.
+			mem.Vecs[string(pk)] = vec
+			if full != nil {
+				if fv, ferr := full.LoadVecFull(pk); ferr == nil {
+					mem.Full[string(pk)] = fv
+				} else if !nerr.HasCode(ferr, nerr.NotFound) {
+					return ferr
+				}
+			}
+			return nil
 		}
 		mem.PutVec(pk, vec)
 		return nil
@@ -227,6 +301,15 @@ func Insert(g Graph, pk []byte, vec []float32) error {
 	}
 	if err := Check(vec, int(meta.Dim)); err != nil {
 		return err
+	}
+	if meta.Quant != 0 {
+		qw, ok := g.(QuantWriter)
+		if !ok {
+			return nerr.New(nerr.InvalidArgument, "vector.Insert", "graph does not support quantised vectors")
+		}
+		if err := qw.SaveQVec(pk, vec); err != nil {
+			return err
+		}
 	}
 	if _, ok, err := g.LoadNode(pk); err != nil {
 		return err
@@ -378,10 +461,38 @@ func Search(g Graph, query []float32, k, ef int) ([]Hit, error) {
 	if err != nil {
 		return nil, err
 	}
+	if meta.Quant != 0 {
+		if full, ok := g.(FullVecLoader); ok {
+			hits, err = rerankFull(full, meta.Metric, query, hits)
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
 	if len(hits) > k {
 		hits = hits[:k]
 	}
 	return hits, nil
+}
+
+// rerankFull recomputes each hit's distance against the full-precision vector
+// and re-sorts, so a quantised traversal never changes the exact top-k order.
+// A hit whose full vector has gone missing keeps its traversal distance.
+func rerankFull(g FullVecLoader, m Metric, query []float32, hits []Hit) ([]Hit, error) {
+	out := make([]Hit, len(hits))
+	for i, h := range hits {
+		v, err := g.LoadVecFull(h.PK)
+		if err != nil {
+			if nerr.HasCode(err, nerr.NotFound) {
+				out[i] = h
+				continue
+			}
+			return nil, err
+		}
+		out[i] = Hit{PK: h.PK, Dist: Distance(m, query, v)}
+	}
+	sort.Slice(out, func(i, j int) bool { return LessHit(out[i], out[j]) })
+	return out, nil
 }
 
 type hnswItem struct {

@@ -41,7 +41,7 @@ export const docsNav: NavGroup[] = [
       {
         title: "Relational",
         slug: "relational",
-        description: "Tables, indexes, foreign keys, joins, aggregates, and DML.",
+        description: "Tables, partitioning, indexes, foreign keys, joins, aggregates, and DML.",
       },
       {
         title: "JSON",
@@ -51,7 +51,7 @@ export const docsNav: NavGroup[] = [
       {
         title: "Full-text search",
         slug: "fulltext",
-        description: "Inverted indexes, BM25 ranking, phrases, and tokenizer rules.",
+        description: "Inverted indexes, BM25 ranking, phrases, and English stemming.",
       },
       {
         title: "Vectors",
@@ -84,9 +84,9 @@ export const docsNav: NavGroup[] = [
     title: "Operate",
     items: [
       {
-        title: "Users, roles, tenants",
+        title: "Users, roles, and isolation",
         slug: "security",
-        description: "Password auth, RBAC, SET TENANT, and the honest threat model.",
+        description: "Password auth, RBAC, hosted database isolation, and the honest threat model.",
       },
       {
         title: "Command line",

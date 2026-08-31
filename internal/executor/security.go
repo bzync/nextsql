@@ -150,7 +150,17 @@ func (s *Session) authorize(stmt ast.Stmt) error {
 		return nil
 	case ast.AlterTable:
 		if err := s.require(security.PrivAlter, security.ScopeTable, st.Table); err != nil {
-			return s.require(security.PrivAlter, security.ScopeDatabase, "")
+			if err := s.require(security.PrivAlter, security.ScopeDatabase, ""); err != nil {
+				return err
+			}
+		}
+		switch cmd := st.Cmd.(type) {
+		case ast.AlterAttachPartition:
+			if err := s.require(security.PrivDrop, security.ScopeTable, cmd.Partition.Name); err != nil {
+				return s.require(security.PrivDrop, security.ScopeDatabase, "")
+			}
+		case ast.AlterDetachPartition:
+			return s.require(security.PrivCreate, security.ScopeDatabase, "")
 		}
 		return nil
 	case ast.CreateIndex:
@@ -171,14 +181,11 @@ func (s *Session) authorize(stmt ast.Stmt) error {
 		return s.authorize(st.Stmt)
 	case ast.Begin, ast.Commit, ast.Rollback:
 		return s.require(security.PrivConnect, security.ScopeDatabase, "")
-	case ast.SetTenant:
-		// Session-local. Table access is still gated by SET TENANT + RBAC.
-		return nil
 	case ast.CreateUser, ast.DropUser, ast.CreateRole, ast.DropRole:
 		return s.require(security.PrivAdmin, security.ScopeCluster, "")
 	case ast.Grant, ast.Revoke:
-		if s.acl.Allowed(user, security.PrivGrant, security.ScopeCluster, "") ||
-			s.acl.Allowed(user, security.PrivAdmin, security.ScopeCluster, "") {
+		if s.authAllowed(user, security.PrivGrant, security.ScopeCluster, "") ||
+			s.authAllowed(user, security.PrivAdmin, security.ScopeCluster, "") {
 			return nil
 		}
 		return security.Deny("executor.authorize")
@@ -278,7 +285,7 @@ func (s *Session) require(priv security.Privilege, scope security.ScopeKind, obj
 	if s.acl == nil {
 		return nil
 	}
-	if s.acl.Allowed(s.user, priv, scope, object) {
+	if s.authAllowed(s.user, priv, scope, object) {
 		return nil
 	}
 	return security.Deny("executor.authorize")

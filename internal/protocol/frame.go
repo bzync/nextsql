@@ -52,6 +52,19 @@ const (
 	TypeReady
 	TypeUnlock
 	TypeUnlockOK
+	// TypeIdempotentQuery is an additive v1 mutation request carrying a bounded
+	// idempotency key followed by the ordinary SQL+parameter payload.
+	TypeIdempotentQuery
+	// TypeSetReadConsistency is an additive v1 session-control message: it sets
+	// the connection's read-consistency mode and bounded-staleness window. The
+	// server replies TypeReady (or TypeError then TypeReady).
+	TypeSetReadConsistency
+	// TypeNodeStatus requests this server node's key-free replication health so
+	// a client can route follower reads. The reply is TypeNodeStatusResp then
+	// TypeReady.
+	TypeNodeStatus
+	// TypeNodeStatusResp carries the NodeStatus payload.
+	TypeNodeStatusResp
 )
 
 // Limits bound every untrusted length on the wire.

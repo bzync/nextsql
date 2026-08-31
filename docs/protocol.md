@@ -27,7 +27,7 @@ const conn = await connect({
   address: "db.example.com:7210",
   database: "production",
   user: "app",
-  password: process.env.NEXTSQL_PASSWORD,
+  password: process.env.NEXTSQL_DATABASE_PASS,
   key: clientRoot, // 32-byte Buffer when the server requires a client key
   tls: { ca, servername: "db.example.com" },
 });
@@ -38,7 +38,7 @@ $conn = NextSQL\Client::connect([
     'address' => 'db.example.com:7210',
     'database' => 'production',
     'user' => 'app',
-    'password' => getenv('NEXTSQL_PASSWORD'),
+    'password' => getenv('NEXTSQL_DATABASE_PASS'),
     'key' => $clientRoot, // 32-byte string when the server requires a client key
     'tls' => ['cafile' => $caPath, 'servername' => 'db.example.com'],
 ]);
@@ -50,7 +50,7 @@ const conn = await connect({
   address: "db.example.com:7210",
   database: "production",
   user: "app",
-  password: process.env.NEXTSQL_PASSWORD,
+  password: process.env.NEXTSQL_DATABASE_PASS,
   key: clientRoot, // 32-byte Uint8Array when the server requires a client key
   tls: { ca: pem, servername: "db.example.com" },
 });
@@ -62,7 +62,7 @@ const conn = await connect({
   address: "db.example.com:7210",
   database: "production",
   user: "app",
-  password: Deno.env.get("NEXTSQL_PASSWORD"),
+  password: Deno.env.get("NEXTSQL_DATABASE_PASS"),
   key: clientRoot, // 32-byte Uint8Array when the server requires a client key
   tls: { ca: pem, servername: "db.example.com" },
 });
@@ -77,7 +77,7 @@ const cfg: Config = {
   address: "db.example.com:7210",
   database: "production",
   user: "app",
-  password: process.env.NEXTSQL_PASSWORD,
+  password: process.env.NEXTSQL_DATABASE_PASS,
   key: clientRoot,
   tls: { ca: pem, servername: "db.example.com" },
 };
@@ -91,6 +91,21 @@ driver sends `TypeUnlock` (32-byte AES key + version) over TLS. Passwords
 travel in `Config.Password` (or `--password-file`), never in the address.
 
 Plaintext is allowed only on loopback. Non-loopback listeners and clients require TLS 1.3.
+
+When `nextsqld --tls-client-ca FILE` is configured, TLS additionally requires a
+client certificate chaining to that CA. The verified leaf must carry exactly
+one `nextsql://service/<principal>` URI SAN matching the Hello user. This does
+not replace native password authentication or RBAC. It adds no NSQL frame or
+version change. CLI clients load the pair with `--tls-client-cert` and
+`--tls-client-key`; Go callers set a client certificate on `Config.TLS`.
+`nextsqld` reloads its server key pair, client trust bundle, and optional
+`--tls-client-crl` PEM bundle on `SIGHUP`. Publication is atomic and a failed
+reload retains the last known-good snapshot. Configured CRLs are signature- and
+time-validated and require complete non-root chain coverage; revoked or
+uncovered clients fail the handshake. Successful mTLS reload terminates every
+accepted connection, including pre-authentication handshakes, so clients
+reauthenticate under the new snapshot. OCSP is not implemented. This adds no
+NSQL frame or wire-version change.
 
 ## Frame
 
@@ -116,6 +131,9 @@ A length field larger than `max_packet` is a protocol error. The implementation 
 | Auth | C→S | password (TLS) |
 | AuthOK | S→C | empty |
 | Query | C→S | SQL (`u32` length) + typed parameters |
+| IdempotentQuery | C→S | idempotency key (`u16`) + mutation SQL + typed parameters |
+| SetReadConsistency | C→S | mode byte (0 strong, 1 bounded, 2 stale) + `MAX STALENESS` ms (`u64`) → Ready |
+| NodeStatus / NodeStatusResp | C↔S | empty → role, `has_leader`, `healthy`, applied LSN, last-contact ms, apply backlog |
 | Prepare / PrepareOK | C↔S | SQL → statement id |
 | Execute | C→S | statement id + typed parameters |
 | CloseStmt / CloseOK | C↔S | statement id |
@@ -131,12 +149,47 @@ A length field larger than `max_packet` is a protocol error. The implementation 
 
 Strings used for names are `u16` length + bytes. SQL is `u32` length + bytes. Both reject a declared length above the matching limit or past the end of the payload.
 
+`IdempotentQuery` is an additive NSQL v1 frame; existing `Query` and `Execute`
+encodings are unchanged. The key is capped at 256 bytes. The server scopes and
+hashes it by authenticated user and tenant, then atomically commits the
+mutation and bounded replay result. Same-key/different-request reuse returns
+`conflict`. The current prepared-statement `Execute` frame has no idempotency
+field; clients use `IdempotentQuery` for retryable mutations.
+
+`SetReadConsistency` and `NodeStatus` are additive NSQL v1 frames for
+follower-read routing (`docs/ha.md`). `SetReadConsistency` sets the session's
+read-consistency mode; `STRONG` (default) is served on the leader behind a
+Raft read barrier, `BOUNDED` on any member within `MAX STALENESS` of the
+leader, `STALE` on any member with no freshness bound. `NodeStatus` returns the
+key-free replica-health snapshot — the same data as `system.replica_health` —
+so a client can route without a `STALE` SQL round trip. The server enforces
+every barrier regardless of how the client routed. Every official driver
+exposes both frames and a cluster-routing client (Go `nextsql.Cluster`,
+JS `connectCluster`, PHP `NextSQL\Cluster`).
+
 ## Authentication
 
-Passwords are stored as PBKDF2-HMAC-SHA256 (100 000 iterations, 16-byte salt, 32-byte hash) in `nextsql.users` (`NSAU` v1). The file mode is `0600`. Authentication failures use the same error for unknown user and bad password. Nothing in this file is a plaintext password.
+Passwords are stored as PBKDF2-HMAC-SHA256 (100 000 iterations, 16-byte salt, 32-byte hash) in `nextsql.users` (`NSAU` v1). The file mode is `0600`. Authentication failures use the same error for unknown user and bad password. Nothing in this file is a plaintext password. In mTLS mode the certificate identity is bound before this password check; successful sessions still pass both password authentication and RBAC.
 
 The auth file is not the storage DEK. The root stays in `--key-file` or in the
 client `KeyProvider`. HelloOK `AuthMethod` `2` means the client must unlock.
+
+**Short-lived credentials.** When `token_verify_keyset` is configured, a client
+may send a signed short-lived credential (`NSSC1.`…) in the `Auth` password
+field instead of a password. There is no new frame or auth method: the server
+recognizes the `NSSC1.` prefix, verifies the Ed25519 signature, validity
+window, audience, database scope, and revocation state, requires the claimed
+principal to match the Hello user and be a known native user, applies any role
+scope, and closes the session at the credential's expiry. See
+`docs/security.md`. Drivers pass it wherever `Config.Password` would go.
+
+For deployments containing the M1 `nextsql.instance` registry, `nextsqld`
+loads the registered default logical database name into the existing Hello
+check. A matching non-empty Hello database is accepted, a different non-empty
+name is `not_found`, and an empty v1 field selects the default for compatibility.
+This is default-database validation, not multi-database routing. An explicit
+realm field and selectable engine routing require a future negotiated protocol
+revision.
 
 ## Streaming and backpressure
 

@@ -6,6 +6,7 @@ import {
   FlagCancel,
   HEADER,
   NextSQLError,
+  ReadConsistency,
   Type,
   VERSION,
   decodeCommandComplete,
@@ -13,6 +14,7 @@ import {
   decodeError,
   decodeFrameHeader,
   decodeHelloOK,
+  decodeNodeStatus,
   decodeRowDesc,
   encodeAuth,
   encodeExecute,
@@ -20,9 +22,12 @@ import {
   encodeHello,
   encodePrepare,
   encodeQuery,
+  encodeSetReadConsistency,
   toBytes,
   u32,
 } from './protocol.mjs';
+
+export { ReadConsistency };
 
 export class ByteReader {
   constructor() {
@@ -345,6 +350,56 @@ export class Conn {
     }
   }
 
+  // readAck reads a single control acknowledgement: Ready, or Error followed by
+  // Ready (which is drained so the session stays usable).
+  async readAck() {
+    const msg = await this.wire.readFrame();
+    if (msg.type === Type.Ready) {
+      return;
+    }
+    const err = this.unexpected(msg);
+    if (msg.type === Type.Error) {
+      await this.expectReady();
+    }
+    throw err;
+  }
+
+  // setReadConsistency sets this connection's read-consistency mode for
+  // subsequent statements. maxStalenessMs applies only to Bounded (0 or omitted
+  // selects the server default window).
+  async setReadConsistency(mode, maxStalenessMs) {
+    if (!this.wire) {
+      throw new NextSQLError('unavailable', 'connection closed');
+    }
+    if (this.busy) {
+      throw new NextSQLError('conflict', 'connection is busy');
+    }
+    await this.wire.writeFrame(Type.SetReadConsistency, encodeSetReadConsistency(mode, maxStalenessMs));
+    await this.readAck();
+  }
+
+  // nodeStatus asks the connected server for its key-free replication health.
+  async nodeStatus() {
+    if (!this.wire) {
+      throw new NextSQLError('unavailable', 'connection closed');
+    }
+    if (this.busy) {
+      throw new NextSQLError('conflict', 'connection is busy');
+    }
+    await this.wire.writeFrame(Type.NodeStatus, null);
+    const msg = await this.wire.readFrame();
+    if (msg.type !== Type.NodeStatusResp) {
+      const err = this.unexpected(msg);
+      if (msg.type === Type.Error) {
+        await this.expectReady();
+      }
+      throw err;
+    }
+    const st = decodeNodeStatus(msg.payload);
+    await this.expectReady();
+    return st;
+  }
+
   async _readRows() {
     const msg = await this.wire.readFrame();
     if (msg.type === Type.RowDesc) {
@@ -484,9 +539,202 @@ export async function open(cfg, dial) {
   const conn = new Conn(cfg, wire, dial);
   try {
     await conn.handshake();
+    const mode = cfg.readConsistency;
+    if (mode !== undefined && mode !== null && mode !== ReadConsistency.Strong) {
+      await conn.setReadConsistency(mode, cfg.maxStalenessMs);
+    }
   } catch (err) {
     wire.close();
     throw err;
   }
   return conn;
+}
+
+// statusTtlMs bounds how long a cached per-node NodeStatus is trusted before the
+// Cluster re-probes it for a routing decision.
+const statusTtlMs = 500;
+
+// txnControl reports whether sql opens or closes an explicit transaction.
+export function txnControl(sql) {
+  const up = String(sql).replace(/^[\s(]+/, '').toUpperCase();
+  const begin = up.startsWith('BEGIN') || up.startsWith('START TRANSACTION');
+  const end = up.startsWith('COMMIT') || up.startsWith('ROLLBACK');
+  return { begin, end };
+}
+
+// isReadOnlySQL is a conservative check: a false negative only costs a leader
+// round trip, and a false positive on a write self-corrects (the follower
+// rejects it as not-leader and the caller retries on the leader). EXPLAIN is
+// excluded because EXPLAIN ANALYZE executes its statement.
+export function isReadOnlySQL(sql) {
+  let s = String(sql).replace(/^[\s(]+/, '');
+  while (s.startsWith('--')) {
+    const i = s.indexOf('\n');
+    if (i < 0) {
+      return false;
+    }
+    s = s.slice(i + 1).replace(/^[\s(]+/, '');
+  }
+  const up = s.toUpperCase();
+  if (up.startsWith('SELECT') || up.startsWith('SHOW')) {
+    return true;
+  }
+  if (up.startsWith('WITH')) {
+    return !up.includes('INSERT') && !up.includes('UPDATE') &&
+      !up.includes('DELETE') && !up.includes('UPSERT');
+  }
+  return false;
+}
+
+// Cluster is a routing client over every node of a NextSQL HA cluster.
+//
+// With cfg.readConsistency set to Bounded or Stale it sends eligible read-only
+// statements to a healthy follower and everything else — writes, DDL,
+// transaction control, and Strong reads — to the leader. With the default
+// Strong consistency every statement goes to the leader and Cluster is just a
+// leader-failover wrapper.
+//
+// A Cluster is for sequential use. Like Conn, an open Rows pins its connection
+// until closed.
+export class Cluster {
+  constructor(cfg, conns) {
+    this.cfg = cfg;
+    this._conns = conns; // [{ addr, conn, status, seen }]
+    this._rr = 0;
+    this._inTxn = false;
+  }
+
+  async close() {
+    let err = null;
+    for (const cc of this._conns) {
+      try {
+        await cc.conn.close();
+      } catch (e) {
+        if (!err) {
+          err = e;
+        }
+      }
+    }
+    if (err) {
+      throw err;
+    }
+  }
+
+  async nodes() {
+    await this._refresh();
+    return this._conns.map((cc) => cc.status).filter((s) => s != null);
+  }
+
+  async exec(sql, params) {
+    const rows = await this.query(sql, params);
+    return collect(rows);
+  }
+
+  async query(sql, params) {
+    const { begin, end } = txnControl(sql);
+    const routable = !this._inTxn && !begin && !end &&
+      this.cfg.readConsistency !== undefined &&
+      this.cfg.readConsistency !== null &&
+      this.cfg.readConsistency !== ReadConsistency.Strong &&
+      isReadOnlySQL(sql);
+
+    if (routable) {
+      const fc = await this._followerConn();
+      if (fc) {
+        try {
+          return await fc.query(sql, params || []);
+        } catch (err) {
+          if (!(err instanceof NextSQLError) || err.code !== 'unavailable') {
+            throw err;
+          }
+          // The follower lost the leader or fell outside the bound; the leader
+          // can always answer, so fall through.
+        }
+      }
+    }
+
+    const lc = await this._leaderConn();
+    const rows = await lc.query(sql, params || []);
+    if (begin || end) {
+      this._inTxn = begin;
+    }
+    return rows;
+  }
+
+  async _refresh() {
+    const now = Date.now();
+    const targets = this._conns.filter((cc) => now - (cc.seen || 0) >= statusTtlMs);
+    for (const cc of targets) {
+      try {
+        cc.status = await cc.conn.nodeStatus();
+        cc.seen = Date.now();
+      } catch {
+        // keep the last known status
+      }
+    }
+  }
+
+  async _leaderConn() {
+    await this._refresh();
+    for (const cc of this._conns) {
+      const role = cc.status && cc.status.role;
+      if (role === 'leader' || role === 'standalone') {
+        return cc.conn;
+      }
+    }
+    throw new NextSQLError('unavailable', 'no reachable leader');
+  }
+
+  async _followerConn() {
+    await this._refresh();
+    const followers = [];
+    const others = [];
+    for (const cc of this._conns) {
+      if (!cc.status || !cc.status.healthy) {
+        continue;
+      }
+      if (cc.status.role === 'follower') {
+        followers.push(cc);
+      } else if (cc.status.role === 'leader' || cc.status.role === 'standalone') {
+        others.push(cc);
+      }
+    }
+    const pick = followers.length > 0 ? followers : others;
+    if (pick.length === 0) {
+      return null;
+    }
+    const cc = pick[this._rr % pick.length];
+    this._rr++;
+    return cc.conn;
+  }
+}
+
+// openCluster dials every address in cfg.nodes (or cfg.address when nodes is
+// empty) and returns a routing client. It fails only when no node could be
+// reached; a partially reachable cluster is usable.
+export async function openCluster(cfg, dial) {
+  let addrs = Array.isArray(cfg.nodes) ? cfg.nodes.slice() : [];
+  if (addrs.length === 0 && cfg.address) {
+    addrs = [cfg.address];
+  }
+  if (addrs.length === 0) {
+    throw new NextSQLError('invalid_argument', 'at least one node address is required');
+  }
+  const conns = [];
+  let firstErr = null;
+  for (const a of addrs) {
+    const nc = { ...cfg, address: a, nodes: undefined };
+    try {
+      const conn = await open(nc, dial);
+      conns.push({ addr: a, conn, status: null, seen: 0 });
+    } catch (err) {
+      if (!firstErr) {
+        firstErr = err;
+      }
+    }
+  }
+  if (conns.length === 0) {
+    throw firstErr;
+  }
+  return new Cluster(cfg, conns);
 }

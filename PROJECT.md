@@ -111,7 +111,7 @@ No GUI or AI layer may bypass:
 
 - authentication
 - RBAC
-- tenant isolation
+- realm/database isolation
 - catalog authority
 - transaction rules
 - server validation
@@ -147,7 +147,7 @@ Reject any optimization that weakens:
 - checksums/integrity authentication
 - replication safety
 - crash recovery
-- tenant isolation
+- realm/database isolation
 - vector recall without disclosure
 
 NextSQL must be fast **with production safety enabled**.
@@ -186,7 +186,7 @@ unless explicitly labeled experimental and excluded from official SLO claims.
                                       │
                          Authentication / Identity
                                       │
-                              RBAC / Tenant Policy
+                         RBAC / Realm/Database Policy
                                       │
                                   SQL Parser
                                       │
@@ -355,7 +355,7 @@ Example:
 ```sql
 CREATE TABLE products (
     id          UUID PRIMARY KEY DEFAULT UUID(),
-    tenant_id   UUID NOT NULL,
+    account_id  UUID NOT NULL,
     name        STRING NOT NULL,
     description TEXT,
     price       DECIMAL(12,2),
@@ -1124,7 +1124,7 @@ Signed short-lived credentials/tokens support:
 - expiration
 - audience/database scope
 - role scope
-- tenant scope
+- realm/database scope
 - signing-key rotation
 - revocation
 - audit
@@ -1151,7 +1151,7 @@ Support tamper-evident/signed audit mechanisms where production-gated.
 
 ---
 
-# 22. RBAC and Tenant Isolation
+# 22. RBAC and Realm/Database Isolation
 
 Support:
 
@@ -1177,15 +1177,41 @@ Permission scopes include:
 
 Least privilege is the default.
 
-Tenant isolation is enforced server-side.
+Realm and database isolation are enforced server-side.
 
-Cross-tenant leakage tolerance:
+Cross-realm/database leakage tolerance:
 
 ```text
 0 known leakage
 ```
 
-Physical tenant partitioning never replaces authorization.
+Physical partitioning never replaces authorization.
+
+## 22.1 Managed multi-database hosting
+
+The final managed-service architecture supports multiple subscription realms
+and multiple databases per realm behind one bounded `nextsqld` deployment or
+HA cluster. A realm is an account/authentication/resource boundary. Row-level
+shared tenancy and `SET TENANT` are not part of the target architecture.
+
+```text
+deployment
+└── realm (principals, roles, plan, quotas, root/KMS boundary)
+    └── database (catalog, transactions, WAL, recovery, keys, backup, tasks)
+```
+
+Connections bind immutably to one realm and database. Routing never grants
+access: authentication is realm-scoped and `CONNECT` is database-scoped. Each
+database has independent identity, master/domain DEKs, WAL/recovery, backup,
+CDC/task state, and resource accounting. Cross-realm and cross-database leakage
+tolerance is zero.
+
+Shared hosting is bounded by deployment, realm, database, and user/resource-
+group ceilings. Dedicated-instance and dedicated-cluster tiers remain valid
+stronger-isolation deployments. Billing/control-plane availability is never in
+the SQL correctness or commit path. Multi-database support does not imply
+cross-database transactions, joins, multi-primary writes, or automatic
+sharding.
 
 ---
 
@@ -1326,6 +1352,11 @@ Distances:
 - L2
 - INNER_PRODUCT
 
+First-class value operations include dimension inspection, norm/normalize,
+element-wise add/subtract, scalar multiplication, dot product, cosine
+distance, and L1/Manhattan distance. All operations are dimension-strict,
+finite-only, and bounded by the vector dimension limit.
+
 Core search:
 
 - exact flat search
@@ -1405,6 +1436,10 @@ Native geospatial support includes:
 - `WITHIN`
 - `COVERS`
 - line-length operations
+- pairwise `INTERSECTS` / `DISJOINT`
+- polygon area and perimeter
+- centroid and envelope
+- geometry type, point-count, and ring-count inspection
 - spatial indexes
 
 Residual predicates remain exact.
@@ -1496,7 +1531,7 @@ Workflows support:
 - typed parameters
 - bounded multi-statement bodies
 - explicit transaction semantics
-- tenant semantics
+- database-isolation semantics
 - RBAC
 - audit
 - dependency tracking
@@ -1587,7 +1622,7 @@ Task metadata includes:
 - task ID
 - workflow/source
 - trigger source
-- tenant
+- database identity
 - attempts
 - error details
 - timeout
@@ -1637,7 +1672,7 @@ CDC requirements:
 - lag metrics
 - cancellation
 - RBAC
-- tenant filtering
+- stable realm/database filtering
 - secure transport
 - failover semantics
 
@@ -1657,7 +1692,6 @@ Partitioning modes target:
 RANGE
 HASH
 LIST
-TENANT
 ```
 
 for the production-gated subset.
@@ -1684,19 +1718,15 @@ After physical partitioning exists, enable:
 - partition-wise aggregation
 - partition-wise joins
 
-## 33.1 Tenant partitioning
+## 33.1 Legacy tenant-partition compatibility
 
-Native tenant routing may provide:
+Older TENANT partition descriptors remain decodable for recovery and explicit
+offline migration only. New SQL cannot create or extend them. Subscription
+isolation uses immutable realm/database connection identity rather than row
+partitioning.
 
-- tenant-local storage locality
-- tenant-local B+Tree indexes
-- tenant-local JSON indexes
-- tenant-local FTS indexes
-- tenant-local HNSW where beneficial
-
-Tenant partitioning is a performance/storage feature, not an authorization mechanism.
-
-No cross-tenant result may be returned.
+Physical partitioning is never an authorization mechanism. No cross-realm or
+cross-database result may be returned.
 
 Automatic distributed sharding remains deferred beyond the core roadmap.
 
@@ -1763,6 +1793,8 @@ Support:
 - result limits
 - runtime/memory/worker limits
 - capability negotiation
+- bounded SELECT result-cache semantics with explicit invalidation
+- durable database-user-scoped mutation idempotency keys
 
 Official drivers use the same protocol.
 
@@ -1795,11 +1827,12 @@ Drivers must support applicable server features such as:
 - cancellation
 - transactions
 - consistency profiles
-- tenant context
+- realm/database context when negotiated
 - workflow/task APIs
 - CDC subscriptions
 - client-side encrypted fields when production-gated
 - capability/version negotiation
+- idempotent mutation execution where supported
 
 Keys never belong in connection URLs.
 
@@ -2021,7 +2054,7 @@ It should expose authorized information about applicable objects such as:
 - users
 - roles
 - grants
-- tenants
+- realms/databases
 - replication
 - cluster nodes
 - leader/followers
@@ -2057,7 +2090,7 @@ It is authoritative for:
 
 Studio, Manager, drivers, and Intelligence must negotiate against server capabilities rather than assuming feature availability.
 
-All system views obey RBAC and tenant boundaries.
+All system views obey RBAC and realm/database boundaries.
 
 ---
 
@@ -2255,7 +2288,7 @@ Studio understands native:
 - vectors
 - hybrid search
 - geospatial
-- tenants
+- realms/databases
 - workflows/tasks
 - CDC
 - partitions
@@ -2304,7 +2337,7 @@ Connection profiles support:
 - TLS
 - CA
 - client certificate where supported
-- tenant profile
+- realm/database profile
 - read-consistency profile
 - secure saved credentials
 - environment profile
@@ -2647,7 +2680,7 @@ QueryContext
 PlanContext
 ErrorContext
 DocumentationContext
-TenantContext
+RealmContext
 SecurityPolicyContext
 ```
 
@@ -2688,7 +2721,7 @@ Never send to an external model provider:
 - private keys
 - secrets
 - unauthorized tables/columns
-- cross-tenant rows
+- cross-realm/database rows
 - fields marked with an AI-deny policy
 
 Support explicit policy such as:
@@ -2773,7 +2806,7 @@ Retrieved text must never be allowed to:
 - broaden RBAC
 - reveal secrets
 - invoke unauthorized tools
-- switch tenant
+- switch realm/database identity
 - override production safeguards
 
 Maintain a prompt-injection test corpus.
@@ -2859,7 +2892,7 @@ Studio provides:
 - dedicated chat panel/workspace
 - visible connection
 - visible database
-- visible tenant
+- visible realm/database
 - visible server version
 - context chips
 - manual add/remove context
@@ -2901,7 +2934,7 @@ Provide a wizard to configure:
 - text column
 - metadata columns
 - vector column
-- tenant column
+- optional application filter column
 - retrieval mode: FULLTEXT / VECTOR / HYBRID
 - top-K
 
@@ -2991,7 +3024,7 @@ It remains:
 - deterministic
 - transactional
 - RBAC-aware
-- tenant-aware
+- realm/database-aware
 
 LLM generation remains outside `nextsqld`.
 
@@ -3157,7 +3190,7 @@ Raft/failover
 backup/restore
 PITR
 RBAC
-tenant isolation
+realm/database isolation
 prepared statements
 wire protocol
 official drivers
@@ -3255,7 +3288,7 @@ ACID MVCC transactions
 WAL + crash recovery
 Mandatory production encryption
 Client-held key support
-RBAC + tenant isolation
+RBAC + realm/database isolation
 Backup / restore / PITR
 Raft HA
 Follower read scaling
@@ -3286,7 +3319,7 @@ Known silent corruption tolerance:
 Known critical unresolved production vulnerabilities:
 0 at a production release gate
 
-Cross-tenant leakage tolerance:
+Cross-realm/database leakage tolerance:
 0
 
 Lost acknowledged synchronous quorum commits:

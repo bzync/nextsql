@@ -18,19 +18,19 @@ import (
 	"github.com/bzync/nextsql/internal/wal"
 )
 
-func TestSQLDMLProducesCommittedTenantChanges(t *testing.T) {
+func TestSQLDMLProducesCommittedDatabaseChanges(t *testing.T) {
 	db := testDB(t)
 	s := db.Session()
-	execOK(t, s, `CREATE TABLE cdc_orders (id STRING PRIMARY KEY, tenant_id STRING NOT NULL, note STRING NOT NULL)`)
-	execOK(t, s, `INSERT INTO cdc_orders (id, tenant_id, note) VALUES ('o1', 'tenant-a', 'new')`)
+	execOK(t, s, `CREATE TABLE cdc_orders (id STRING PRIMARY KEY, account_id STRING NOT NULL, note STRING NOT NULL)`)
+	execOK(t, s, `INSERT INTO cdc_orders (id, account_id, note) VALUES ('o1', 'account-a', 'new')`)
 	execOK(t, s, `UPDATE cdc_orders SET note = 'paid' WHERE id = 'o1'`)
 	execOK(t, s, `BEGIN`)
-	execOK(t, s, `INSERT INTO cdc_orders (id, tenant_id, note) VALUES ('rolled-back', 'tenant-a', 'x')`)
+	execOK(t, s, `INSERT INTO cdc_orders (id, account_id, note) VALUES ('rolled-back', 'account-a', 'x')`)
 	execOK(t, s, `ROLLBACK`)
 	execOK(t, s, `DELETE FROM cdc_orders WHERE id = 'o1'`)
 
 	sub, err := cdc.Subscribe(db.Eng.WAL, 0, cdc.Filter{
-		Tables: map[string]struct{}{"cdc_orders": {}}, Tenant: "tenant-a",
+		Tables: map[string]struct{}{"cdc_orders": {}},
 	}, cdc.Limits{PollInterval: time.Millisecond})
 	if err != nil {
 		t.Fatal(err)
@@ -44,7 +44,7 @@ func TestSQLDMLProducesCommittedTenantChanges(t *testing.T) {
 		if err != nil {
 			t.Fatalf("event %d: %v", i, err)
 		}
-		if len(tx.Events) != 1 || tx.Events[0].Operation != op || tx.Events[0].Tenant != "tenant-a" {
+		if len(tx.Events) != 1 || tx.Events[0].Operation != op || tx.Events[0].Tenant != "" || tx.Events[0].OldTenant != "" {
 			t.Fatalf("event %d: %+v", i, tx)
 		}
 		if uint64(tx.Token) <= last {
@@ -117,7 +117,7 @@ func TestNativeSubscribeStreamsAtomicTransactionAndResumes(t *testing.T) {
 	execOK(t, s, `ROLLBACK`)
 }
 
-func TestNativeSubscribeRBACRuntimeRevocationTenantAndAudit(t *testing.T) {
+func TestNativeSubscribeRBACRuntimeRevocationAndAudit(t *testing.T) {
 	db := testDB(t)
 	acl, err := security.CreateACL(filepath.Join(t.TempDir(), "acl"))
 	if err != nil {
@@ -129,9 +129,8 @@ func TestNativeSubscribeRBACRuntimeRevocationTenantAndAudit(t *testing.T) {
 	admin := db.Session()
 	admin.SetIdentity("dba")
 	admin.SetACL(acl)
-	execOK(t, admin, `CREATE TABLE tenant_stream (id STRING PRIMARY KEY, tenant_id UUID NOT NULL, note STRING NOT NULL)`)
-	execOK(t, admin, `INSERT INTO tenant_stream (id, tenant_id, note) VALUES
-		('a', '`+tenantA+`', 'alpha'), ('b', '`+tenantB+`', 'beta')`)
+	execOK(t, admin, `CREATE TABLE event_stream (id STRING PRIMARY KEY, note STRING NOT NULL)`)
+	execOK(t, admin, `INSERT INTO event_stream (id, note) VALUES ('a', 'alpha'), ('b', 'beta')`)
 
 	auditPath := filepath.Join(t.TempDir(), "audit.log")
 	audit, err := security.OpenAudit(auditPath)
@@ -143,19 +142,15 @@ func TestNativeSubscribeRBACRuntimeRevocationTenantAndAudit(t *testing.T) {
 	app.SetIdentity("app")
 	app.SetACL(acl)
 	app.SetAudit(audit)
-	if _, err := app.Query(`SUBSCRIBE TO tenant_stream`); !nerr.HasCode(err, nerr.Forbidden) {
+	if _, err := app.Query(`SUBSCRIBE TO event_stream`); !nerr.HasCode(err, nerr.Forbidden) {
 		t.Fatalf("missing CDC grant=%v", err)
 	}
-	if err := acl.Grant("app", security.PrivCDC, security.ScopeTable, "tenant_stream"); err != nil {
+	if err := acl.Grant("app", security.PrivCDC, security.ScopeTable, "event_stream"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := app.Query(`SUBSCRIBE TO tenant_stream`); !nerr.HasCode(err, nerr.Forbidden) {
-		t.Fatalf("unbound tenant stream=%v", err)
-	}
-	execOK(t, app, `SET TENANT = '`+tenantA+`'`)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	res, err := app.QueryContext(ctx, `SUBSCRIBE TO tenant_stream`, nil)
+	res, err := app.QueryContext(ctx, `SUBSCRIBE TO event_stream`, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -163,10 +158,10 @@ func TestNativeSubscribeRBACRuntimeRevocationTenantAndAudit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if batch == nil || batch.Count != 1 || batch.Rows()[0][4].Str != tenantA {
-		t.Fatalf("tenant stream leaked or omitted rows: %+v", batch)
+	if batch == nil || batch.Count != 2 || batch.Rows()[0][4].Str != "" || batch.Rows()[1][4].Str != "" {
+		t.Fatalf("database stream omitted rows or emitted a row-tenant scope: %+v", batch)
 	}
-	if err := acl.Revoke("app", security.PrivCDC, security.ScopeTable, "tenant_stream"); err != nil {
+	if err := acl.Revoke("app", security.PrivCDC, security.ScopeTable, "event_stream"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := res.NextBatch(); !nerr.HasCode(err, nerr.Forbidden) {
@@ -176,7 +171,7 @@ func TestNativeSubscribeRBACRuntimeRevocationTenantAndAudit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(body), security.ActionCDCSubscribe) || !strings.Contains(string(body), `"object":"tenant_stream"`) {
+	if !strings.Contains(string(body), security.ActionCDCSubscribe) || !strings.Contains(string(body), `"object":"event_stream"`) {
 		t.Fatalf("missing CDC audit event: %s", body)
 	}
 }

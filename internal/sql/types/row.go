@@ -322,8 +322,23 @@ func skipScalar(raw []byte, off int, t Type) (int, error) {
 		if off+2 >= len(raw) {
 			return 0, nerr.New(nerr.InvalidFormat, "types.skipScalar", "truncated vector flags")
 		}
-		if raw[off+2]&1 != 0 {
+		flag := raw[off+2]
+		if flag&1 != 0 {
 			return off + 3, nil
+		}
+		if flag&2 != 0 {
+			nnz, err := encoding.ReadU32(raw, off+3)
+			if err != nil {
+				return 0, err
+			}
+			if nnz > MaxSparseSQLNNZ {
+				return 0, nerr.New(nerr.InvalidFormat, "types.skipScalar", "sparse vector too long")
+			}
+			end := off + 7 + int(nnz)*8
+			if end > len(raw) {
+				return 0, nerr.New(nerr.InvalidFormat, "types.skipScalar", "truncated sparse vector")
+			}
+			return end, nil
 		}
 		end := off + 3 + int(dim)*4
 		if end > len(raw) {
@@ -386,6 +401,22 @@ func encodeScalar(v Value) ([]byte, error) {
 			buf := make([]byte, 3)
 			encoding.PutU16(buf, 0, dim)
 			buf[2] = 1
+			return buf, nil
+		}
+		if v.Typ.VecElem == VecSparse || len(v.SparseIdx) > 0 {
+			dim := v.Typ.Precision
+			if err := ValidateSparse(uint32(dim), v.SparseIdx, v.SparseVal); err != nil {
+				return nil, err
+			}
+			nnz := len(v.SparseIdx)
+			buf := make([]byte, 7+8*nnz)
+			encoding.PutU16(buf, 0, dim)
+			buf[2] = 2
+			encoding.PutU32(buf, 3, uint32(nnz))
+			for i := 0; i < nnz; i++ {
+				encoding.PutU32(buf, 7+i*8, v.SparseIdx[i])
+				encoding.PutU32(buf, 11+i*8, math.Float32bits(v.SparseVal[i]))
+			}
 			return buf, nil
 		}
 		if err := ValidateVector(v.Vec); err != nil {
@@ -473,6 +504,37 @@ func decodeScalar(raw []byte, off int, t Type) (Value, int, error) {
 				out.Typ.Precision = dim
 			}
 			return out, off + 3, nil
+		}
+		if flag&2 != 0 {
+			nnz, err := encoding.ReadU32(raw, off+3)
+			if err != nil {
+				return Value{}, 0, err
+			}
+			if nnz > MaxSparseSQLNNZ {
+				return Value{}, 0, nerr.New(nerr.InvalidFormat, "types.decodeScalar", "sparse vector too long")
+			}
+			need := int(nnz) * 8
+			b, err := encoding.ReadBytes(raw, off+7, need)
+			if err != nil {
+				return Value{}, 0, err
+			}
+			idx := make([]uint32, nnz)
+			val := make([]float32, nnz)
+			for i := 0; i < int(nnz); i++ {
+				idx[i] = encoding.U32(b, i*8)
+				val[i] = math.Float32frombits(encoding.U32(b, i*8+4))
+			}
+			vt := t
+			if vt.Precision == 0 {
+				vt.Precision = dim
+			}
+			if vt.VecElem == 0 {
+				vt.VecElem = VecSparse
+			}
+			if err := ValidateSparse(uint32(vt.Precision), idx, val); err != nil {
+				return Value{}, 0, err
+			}
+			return SparseValue(idx, val, vt), off + 7 + need, nil
 		}
 		need := int(dim) * 4
 		b, err := encoding.ReadBytes(raw, off+3, need)

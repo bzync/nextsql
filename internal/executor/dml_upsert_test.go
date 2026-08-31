@@ -6,9 +6,6 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/bzync/nextsql/internal/auth"
-	"github.com/bzync/nextsql/internal/nerr"
-	"github.com/bzync/nextsql/internal/security"
 	"github.com/bzync/nextsql/internal/sql/types"
 )
 
@@ -145,56 +142,6 @@ func TestUpsertConcurrentUnique(t *testing.T) {
 	}
 	if got.Rows[0][1].Dec.String() == "0" {
 		t.Fatalf("n not updated: %+v", got.Rows)
-	}
-}
-
-func TestUpsertRBACAndTenant(t *testing.T) {
-	db := testDB(t)
-	acl, err := security.CreateACL(filepath.Join(t.TempDir(), "acl"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	users, err := auth.Create(filepath.Join(t.TempDir(), "users"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := users.Upsert("dba", "s3cret"); err != nil {
-		t.Fatal(err)
-	}
-	if err := acl.Grant("dba", security.PrivAdmin, security.ScopeCluster, ""); err != nil {
-		t.Fatal(err)
-	}
-	admin := db.Session()
-	admin.SetIdentity("dba")
-	admin.SetACL(acl)
-	admin.SetAuth(users)
-	execOK(t, admin, `CREATE TABLE t (id STRING PRIMARY KEY, tenant_id UUID NOT NULL, email STRING NOT NULL, n STRING)`)
-	execOK(t, admin, `CREATE UNIQUE INDEX ux_email ON t (email)`)
-	execOK(t, admin, `CREATE USER app IDENTIFIED BY 'pw'`)
-	execOK(t, admin, `GRANT INSERT ON TABLE t TO app`)
-
-	app := db.Session()
-	app.SetIdentity("app")
-	app.SetACL(acl)
-	if _, err := app.Exec(`UPSERT INTO t (id, tenant_id, email, n) VALUES ('1', '11111111-1111-1111-1111-111111111111', 'a@b', 'x')`); !nerr.HasCode(err, nerr.Forbidden) {
-		t.Fatalf("upsert needs UPDATE: %v", err)
-	}
-	execOK(t, admin, `GRANT UPDATE ON TABLE t TO app`)
-	if _, err := app.Exec(`UPSERT INTO t (id, tenant_id, email, n) VALUES ('1', '11111111-1111-1111-1111-111111111111', 'a@b', 'x') RETURNING n`); !nerr.HasCode(err, nerr.Forbidden) {
-		t.Fatalf("returning needs SELECT: %v", err)
-	}
-	execOK(t, admin, `GRANT SELECT ON TABLE t TO app`)
-	execOK(t, app, `SET TENANT = '11111111-1111-1111-1111-111111111111'`)
-	if _, err := app.Exec(`UPSERT INTO t (id, email, n) VALUES ('1', 'a@b', 'x') RETURNING n`); err != nil {
-		t.Fatal(err)
-	}
-
-	ten := db.Session()
-	execOK(t, ten, `SET TENANT = '11111111-1111-1111-1111-111111111111'`)
-	execOK(t, ten, `UPSERT INTO t (id, email, n) VALUES ('2', 'b@c', 'ten') ON UNIQUE (email)`)
-	got := execOK(t, ten, `SELECT email FROM t WHERE id = '2'`)
-	if len(got.Rows) != 1 {
-		t.Fatalf("tenant upsert: %+v", got.Rows)
 	}
 }
 

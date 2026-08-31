@@ -412,6 +412,7 @@ func rewriteNestedCTERefs(stmt ast.Stmt, ctes map[string]*CTE) ast.Stmt {
 		s.Having = rewriteExprCTERefs(s.Having, ctes)
 		s.SearchQuery = rewriteExprCTERefs(s.SearchQuery, ctes)
 		s.NearestQuery = rewriteExprCTERefs(s.NearestQuery, ctes)
+		s.Nearest2Query = rewriteExprCTERefs(s.Nearest2Query, ctes)
 		for i := range s.List {
 			s.List[i].Expr = rewriteExprCTERefs(s.List[i].Expr, ctes)
 		}

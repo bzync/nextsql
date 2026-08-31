@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -28,9 +29,6 @@ const (
 	// MaxStatementsPerUp is the C.3 cap for one migrate up invocation.
 	MaxStatementsPerUp = 4096
 
-	// MaxCreateAttempts is how many +1s timestamp retries create will try.
-	MaxCreateAttempts = 60
-
 	maxSlugLen     = 64
 	forcedChecksum = "forced"
 )
@@ -41,8 +39,9 @@ var (
 	// ErrChecksum is returned when an applied file no longer matches history.
 	ErrChecksum = withSentinel(nerr.New(nerr.InvalidFormat, "migrate", "migration checksum mismatch"), cli.ErrChecksum)
 
-	fileNameRE = regexp.MustCompile(`^(\d{14})_([a-z0-9_]+)\.(up|down)\.sql$`)
-	utf8BOM    = []byte{0xEF, 0xBB, 0xBF}
+	fileNameRE       = regexp.MustCompile(`^(\d{14})_([a-z0-9_]+)\.(up|down)\.sql$`)
+	utf8BOM          = []byte{0xEF, 0xBB, 0xBF}
+	maxMigrationTime = time.Date(9999, 12, 31, 23, 59, 59, 0, time.UTC)
 )
 
 type joinedError struct {
@@ -169,36 +168,176 @@ func createAt(dir, name string, now time.Time) (string, string, error) {
 		return "", "", nerr.New(nerr.InvalidArgument, "migrate", "name slugs to empty")
 	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return "", "", nerr.Wrap(nerr.IO, "migrate", "mkdir", err)
+		return "", "", nerr.Wrap(nerr.IO, "migrate create", "create migrations directory", err)
 	}
-	now = now.UTC()
-	for i := 0; i < MaxCreateAttempts; i++ {
-		ver := now.Add(time.Duration(i) * time.Second).Format(VersionLayout)
-		taken, err := versionTaken(dir, ver)
+
+	latest, found, err := latestMigrationVersion(dir)
+	if err != nil {
+		return "", "", err
+	}
+	candidate := now.UTC().Truncate(time.Second)
+	if found {
+		next, err := nextMigrationSecond(latest)
 		if err != nil {
 			return "", "", err
 		}
-		if taken {
+		if next.After(candidate) {
+			candidate = next
+		}
+	}
+
+	// A claim is keyed only by version, unlike the final slugged paths. This
+	// closes the old TOCTOU race where two creators with different names could
+	// both create distinct files carrying the same timestamp. Claims are hidden
+	// so validation ignores a short-lived claim or one left by a killed process.
+	for {
+		ver, err := formatMigrationVersion(candidate)
+		if err != nil {
+			return "", "", err
+		}
+		release, claimed, err := claimMigrationVersion(dir, ver)
+		if err != nil {
+			return "", "", err
+		}
+		if !claimed {
+			candidate, err = nextMigrationSecond(candidate)
+			if err != nil {
+				return "", "", err
+			}
 			continue
 		}
+
+		// The directory may have changed after the initial scan and before this
+		// process acquired a claim that an earlier creator already released.
+		taken, scanErr := migrationVersionTaken(dir, ver)
+		if scanErr != nil {
+			release()
+			return "", "", scanErr
+		}
+		if taken {
+			release()
+			candidate, err = nextMigrationSecond(candidate)
+			if err != nil {
+				return "", "", err
+			}
+			continue
+		}
+
 		upPath := filepath.Join(dir, ver+"_"+slug+".up.sql")
 		downPath := filepath.Join(dir, ver+"_"+slug+".down.sql")
-		if err := writeFileExcl(upPath, fileHeader("up", ver, slug)); err != nil {
-			if os.IsExist(err) {
-				continue
-			}
-			return "", "", nerr.Wrap(nerr.IO, "migrate", "write", err)
+		failedPath, collision, createErr := createMigrationPair(
+			upPath,
+			downPath,
+			fileHeader("up", ver, slug),
+			fileHeader("down", ver, slug),
+			writeFileExcl,
+			os.Remove,
+		)
+		release()
+		if createErr == nil {
+			return upPath, downPath, nil
 		}
-		if err := writeFileExcl(downPath, fileHeader("down", ver, slug)); err != nil {
-			_ = os.Remove(upPath)
-			if os.IsExist(err) {
-				continue
-			}
-			return "", "", nerr.Wrap(nerr.IO, "migrate", "write", err)
+		if !collision {
+			return "", "", nerr.Wrap(nerr.IO, "migrate create", "create "+filepath.Base(failedPath), createErr)
 		}
-		return upPath, downPath, nil
+		candidate, err = nextMigrationSecond(candidate)
+		if err != nil {
+			return "", "", err
+		}
 	}
-	return "", "", nerr.New(nerr.AlreadyExists, "migrate", "could not allocate a free timestamp")
+}
+
+func parseMigrationVersion(version string) (time.Time, error) {
+	t, err := time.ParseInLocation(VersionLayout, version, time.UTC)
+	if err != nil {
+		return time.Time{}, err
+	}
+	return t.UTC(), nil
+}
+
+func formatMigrationVersion(t time.Time) (string, error) {
+	t = t.UTC().Truncate(time.Second)
+	if t.After(maxMigrationTime) {
+		return "", nerr.New(nerr.Exhausted, "migrate create", "migration timestamp namespace exhausted")
+	}
+	version := t.Format(VersionLayout)
+	if len(version) != len(VersionLayout) {
+		return "", nerr.New(nerr.Exhausted, "migrate create", "migration timestamp is outside the supported range")
+	}
+	return version, nil
+}
+
+func nextMigrationSecond(t time.Time) (time.Time, error) {
+	t = t.UTC().Truncate(time.Second)
+	if !t.Before(maxMigrationTime) {
+		return time.Time{}, nerr.New(nerr.Exhausted, "migrate create", "migration timestamp namespace exhausted")
+	}
+	return t.Add(time.Second), nil
+}
+
+func latestMigrationVersion(dir string) (time.Time, bool, error) {
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		return time.Time{}, false, nerr.Wrap(nerr.IO, "migrate create", "scan migrations", err)
+	}
+	var latest time.Time
+	found := false
+	for _, e := range ents {
+		if e.IsDir() || strings.HasPrefix(e.Name(), ".") {
+			continue
+		}
+		f, err := ParseFileName(e.Name())
+		if err != nil {
+			continue
+		}
+		versionTime, err := parseMigrationVersion(f.Version)
+		if err != nil {
+			return time.Time{}, false, nerr.Wrap(
+				nerr.InvalidFormat,
+				"migrate create",
+				filepath.Base(e.Name())+": invalid migration timestamp",
+				err,
+			)
+		}
+		if !found || versionTime.After(latest) {
+			latest = versionTime
+			found = true
+		}
+	}
+	return latest, found, nil
+}
+
+func claimMigrationVersion(dir, version string) (release func(), claimed bool, err error) {
+	path := filepath.Join(dir, ".nextsql-migrate-create-"+version+".lock")
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		if os.IsExist(err) {
+			return nil, false, nil
+		}
+		return nil, false, nerr.Wrap(nerr.IO, "migrate create", "claim version "+version, err)
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(path)
+		return nil, false, nerr.Wrap(nerr.IO, "migrate create", "close version claim "+version, err)
+	}
+	return func() { _ = os.Remove(path) }, true, nil
+}
+
+func createMigrationPair(
+	upPath, downPath, upBody, downBody string,
+	create func(string, string) error,
+	remove func(string) error,
+) (failedPath string, collision bool, err error) {
+	if err := create(upPath, upBody); err != nil {
+		return upPath, os.IsExist(err), err
+	}
+	if err := create(downPath, downBody); err != nil {
+		if cleanupErr := remove(upPath); cleanupErr != nil && !os.IsNotExist(cleanupErr) {
+			return downPath, false, errors.Join(err, fmt.Errorf("remove newly created %s: %w", filepath.Base(upPath), cleanupErr))
+		}
+		return downPath, os.IsExist(err), err
+	}
+	return "", false, nil
 }
 
 func fileHeader(direction, ver, slug string) string {
@@ -222,10 +361,10 @@ func writeFileExcl(path, body string) error {
 	return err
 }
 
-func versionTaken(dir, ver string) (bool, error) {
+func migrationVersionTaken(dir, ver string) (bool, error) {
 	ents, err := os.ReadDir(dir)
 	if err != nil {
-		return false, nerr.Wrap(nerr.IO, "migrate", "read dir", err)
+		return false, nerr.Wrap(nerr.IO, "migrate create", "scan migrations", err)
 	}
 	for _, e := range ents {
 		if e.IsDir() || strings.HasPrefix(e.Name(), ".") {

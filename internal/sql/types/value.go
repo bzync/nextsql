@@ -11,6 +11,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/bzync/nextsql/internal/bitvec"
+	"github.com/bzync/nextsql/internal/float16"
+	"github.com/bzync/nextsql/internal/int8vec"
 	nsjson "github.com/bzync/nextsql/internal/json"
 	"github.com/bzync/nextsql/internal/nerr"
 )
@@ -24,9 +27,11 @@ type Value struct {
 	Dec    Decimal
 	Time   int64 // UTC unix nanoseconds
 	JSON   []byte
-	Vec    []float32
-	VecRef bool // payload lives in the table vector store
-	Bool   bool
+	Vec       []float32
+	VecRef    bool     // payload lives in the table vector store
+	SparseIdx []uint32 // SPARSEVECTOR non-zero indices; unused for dense vectors
+	SparseVal []float32
+	Bool      bool
 	Lon    float64    // POINT longitude
 	Lat    float64    // POINT latitude
 	Box    [4]float64 // BOX west, south, east, north
@@ -54,6 +59,17 @@ func VectorValue(v []float32, t Type) Value {
 	return Value{Typ: t, Vec: cp}
 }
 
+// SparseValue is a SPARSEVECTOR runtime value: parallel index/value lists of
+// the non-zero coordinates. Indices must be strictly ascending, below t.Precision,
+// and values finite and non-zero; use Coerce or ValidateSparse to enforce that.
+func SparseValue(idx []uint32, val []float32, t Type) Value {
+	return Value{
+		Typ:       t,
+		SparseIdx: append([]uint32(nil), idx...),
+		SparseVal: append([]float32(nil), val...),
+	}
+}
+
 // VectorRef is a heap-row placeholder: dimension is known, floats are not inline.
 func VectorRef(t Type) Value {
 	return Value{Typ: t, VecRef: true}
@@ -67,6 +83,55 @@ func ValidateVector(v []float32) error {
 		}
 	}
 	return nil
+}
+
+// ValidateSparse rejects a malformed SPARSEVECTOR: length mismatch, too many
+// non-zeros, an index at or above dim, an out-of-order or duplicate index, or a
+// zero / non-finite value.
+func ValidateSparse(dim uint32, idx []uint32, val []float32) error {
+	if dim == 0 || dim > uint32(MaxSparseSQLDim) {
+		return nerr.New(nerr.InvalidArgument, "types.ValidateSparse", "SPARSEVECTOR dimension out of range")
+	}
+	if len(idx) != len(val) {
+		return nerr.New(nerr.InvalidArgument, "types.ValidateSparse", "sparse index/value length mismatch")
+	}
+	if len(idx) > MaxSparseSQLNNZ {
+		return nerr.New(nerr.InvalidArgument, "types.ValidateSparse", "too many non-zero coordinates")
+	}
+	for i, ix := range idx {
+		if ix >= dim {
+			return nerr.New(nerr.InvalidArgument, "types.ValidateSparse", "sparse index out of range")
+		}
+		if i > 0 && idx[i-1] >= ix {
+			return nerr.New(nerr.InvalidArgument, "types.ValidateSparse", "sparse indices not strictly ascending")
+		}
+		f := val[i]
+		if f == 0 {
+			return nerr.New(nerr.InvalidArgument, "types.ValidateSparse", "sparse value is zero")
+		}
+		if math.IsNaN(float64(f)) || math.IsInf(float64(f), 0) {
+			return nerr.New(nerr.InvalidArgument, "types.ValidateSparse", "sparse value is not finite")
+		}
+	}
+	return nil
+}
+
+// DenseToSparse drops zeros from a dense vector. Non-finite values fail closed.
+func DenseToSparse(vec []float32) (idx []uint32, val []float32, err error) {
+	if err := ValidateVector(vec); err != nil {
+		return nil, nil, err
+	}
+	for i, f := range vec {
+		if f == 0 {
+			continue
+		}
+		idx = append(idx, uint32(i))
+		val = append(val, f)
+	}
+	if len(idx) > MaxSparseSQLNNZ {
+		return nil, nil, nerr.New(nerr.InvalidArgument, "types.DenseToSparse", "too many non-zero coordinates")
+	}
+	return idx, val, nil
 }
 
 // DecimalFromFloat stores f with 8 decimal places.
@@ -91,6 +156,12 @@ func (v Value) Clone() Value {
 	}
 	if v.Vec != nil {
 		v.Vec = append([]float32(nil), v.Vec...)
+	}
+	if v.SparseIdx != nil {
+		v.SparseIdx = append([]uint32(nil), v.SparseIdx...)
+	}
+	if v.SparseVal != nil {
+		v.SparseVal = append([]float32(nil), v.SparseVal...)
 	}
 	if v.Dec.Coef != nil {
 		v.Dec = v.Dec.Clone()
@@ -177,6 +248,24 @@ func (v Value) String() string {
 		}
 		return string(txt)
 	case KindVector:
+		if v.Typ.VecElem == VecSparse || len(v.SparseIdx) > 0 {
+			var b strings.Builder
+			b.WriteByte('{')
+			for i, idx := range v.SparseIdx {
+				if i > 0 {
+					b.WriteByte(',')
+				}
+				b.WriteString(strconv.FormatUint(uint64(idx), 10))
+				b.WriteByte(':')
+				var f float32
+				if i < len(v.SparseVal) {
+					f = v.SparseVal[i]
+				}
+				b.WriteString(strconv.FormatFloat(float64(f), 'g', -1, 32))
+			}
+			b.WriteByte('}')
+			return b.String()
+		}
 		var b strings.Builder
 		b.WriteByte('[')
 		for i, f := range v.Vec {
@@ -325,14 +414,42 @@ func Coerce(v Value, dest Type) (Value, error) {
 				if dest.Precision != 0 && v.Typ.Precision != dest.Precision {
 					return Value{}, nerr.New(nerr.InvalidArgument, "types.Coerce", "VECTOR dimension mismatch")
 				}
+				if dest.VecElem == VecSparse && v.Typ.VecElem != VecSparse && v.Typ.VecElem != 0 {
+					return Value{}, nerr.New(nerr.InvalidArgument, "types.Coerce", "cannot coerce a dense VECTOR reference to SPARSEVECTOR")
+				}
+				if dest.VecElem != VecSparse && v.Typ.VecElem == VecSparse {
+					return Value{}, nerr.New(nerr.InvalidArgument, "types.Coerce", "cannot widen a SPARSEVECTOR to another vector type")
+				}
 				v.Typ = dest
 				return v, nil
+			}
+			if dest.VecElem == VecSparse {
+				return coerceSparse(v, dest)
+			}
+			if v.Typ.VecElem == VecSparse || len(v.SparseIdx) > 0 {
+				return Value{}, nerr.New(nerr.InvalidArgument, "types.Coerce", "cannot widen a SPARSEVECTOR to another vector type")
 			}
 			if err := ValidateVector(v.Vec); err != nil {
 				return Value{}, err
 			}
 			if uint16(len(v.Vec)) != dest.Precision {
 				return Value{}, nerr.New(nerr.InvalidArgument, "types.Coerce", "VECTOR dimension mismatch")
+			}
+			if dest.VecElem != v.Typ.VecElem {
+				switch dest.VecElem {
+				case VecF16:
+					v.Vec = float16.Quantize(v.Vec)
+				case VecI8:
+					v.Vec = int8vec.Quantize(v.Vec)
+				case VecBit:
+					if err := bitvec.Validate(v.Vec); err != nil {
+						return Value{}, err
+					}
+				default:
+					if v.Typ.VecElem == VecBit {
+						return Value{}, nerr.New(nerr.InvalidArgument, "types.Coerce", "cannot widen a BITVECTOR to another vector type")
+					}
+				}
 			}
 			v.Typ = dest
 			return v, nil
@@ -385,6 +502,35 @@ func Coerce(v Value, dest Type) (Value, error) {
 		}
 	}
 	return Value{}, nerr.New(nerr.InvalidArgument, "types.Coerce", "cannot coerce "+v.Typ.String()+" to "+dest.String())
+}
+
+func coerceSparse(v Value, dest Type) (Value, error) {
+	if dest.VecElem != VecSparse || dest.Precision < 1 {
+		return Value{}, nerr.New(nerr.InvalidArgument, "types.coerceSparse", "destination is not a SPARSEVECTOR")
+	}
+	if v.Typ.VecElem == VecBit {
+		return Value{}, nerr.New(nerr.InvalidArgument, "types.Coerce", "cannot coerce a BITVECTOR to SPARSEVECTOR")
+	}
+	if v.Typ.VecElem == VecSparse || len(v.SparseIdx) > 0 {
+		if v.Typ.Precision != 0 && v.Typ.Precision != dest.Precision {
+			return Value{}, nerr.New(nerr.InvalidArgument, "types.Coerce", "VECTOR dimension mismatch")
+		}
+		if err := ValidateSparse(uint32(dest.Precision), v.SparseIdx, v.SparseVal); err != nil {
+			return Value{}, err
+		}
+		return SparseValue(v.SparseIdx, v.SparseVal, dest), nil
+	}
+	if uint16(len(v.Vec)) != dest.Precision {
+		return Value{}, nerr.New(nerr.InvalidArgument, "types.Coerce", "VECTOR dimension mismatch")
+	}
+	idx, val, err := DenseToSparse(v.Vec)
+	if err != nil {
+		return Value{}, err
+	}
+	if err := ValidateSparse(uint32(dest.Precision), idx, val); err != nil {
+		return Value{}, err
+	}
+	return SparseValue(idx, val, dest), nil
 }
 
 // JSONFromText parses UTF-8 JSON into the compact binary stored form.

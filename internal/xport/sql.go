@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/bzync/nextsql/internal/catalog"
+	"github.com/bzync/nextsql/internal/fulltext"
 	nsjson "github.com/bzync/nextsql/internal/json"
 	"github.com/bzync/nextsql/internal/nerr"
 	"github.com/bzync/nextsql/internal/sql/types"
@@ -221,8 +222,35 @@ func createIndexSQL(t *catalog.Table, idx catalog.Index) (string, error) {
 		b.WriteString(" WHERE ")
 		b.WriteString(catalog.FormatExpr(idx.Predicate))
 	}
+	if idx.Fulltext {
+		if name := (fulltext.Analyzer{ID: idx.FTAnalyzer, Version: idx.FTVersion}).Name(); name != "" && name != "simple" {
+			fmt.Fprintf(&b, " WITH (ANALYZER = '%s')", name)
+		}
+	}
 	if idx.Vector {
-		b.WriteString(" USING HNSW")
+		if idx.VecMethod == catalog.VecMethodIVF {
+			fmt.Fprintf(&b, " USING IVF WITH (LISTS = %d", idx.IVFLists)
+			if idx.IVFProbes > 0 {
+				fmt.Fprintf(&b, ", PROBES = %d", idx.IVFProbes)
+			}
+			b.WriteByte(')')
+		} else if idx.VecMethod == catalog.VecMethodIVFPQ {
+			fmt.Fprintf(&b, " USING IVFPQ WITH (LISTS = %d", idx.IVFLists)
+			if idx.IVFProbes > 0 {
+				fmt.Fprintf(&b, ", PROBES = %d", idx.IVFProbes)
+			}
+			fmt.Fprintf(&b, ", SUBSPACES = %d)", idx.IVFSubspaces)
+		} else if idx.VecMethod == catalog.VecMethodSPARSE {
+			b.WriteString(" USING SPARSE")
+		} else {
+			b.WriteString(" USING HNSW")
+			switch idx.VecQuant {
+			case types.VecF16:
+				b.WriteString(" WITH (QUANTIZATION = 'F16')")
+			case types.VecI8:
+				b.WriteString(" WITH (QUANTIZATION = 'I8')")
+			}
+		}
 	}
 	return b.String(), nil
 }
@@ -278,6 +306,16 @@ func sqlLiteral(v types.Value) (string, error) {
 		}
 		return "'" + strings.ReplaceAll(string(txt), "'", "''") + "'", nil
 	case types.KindVector:
+		if v.Typ.VecElem == types.VecSparse || len(v.SparseIdx) > 0 {
+			dim := int(v.Typ.Precision)
+			dense := make([]float32, dim)
+			for i, idx := range v.SparseIdx {
+				if int(idx) < dim && i < len(v.SparseVal) {
+					dense[idx] = v.SparseVal[i]
+				}
+			}
+			v.Vec = dense
+		}
 		var b strings.Builder
 		b.WriteByte('(')
 		for i, f := range v.Vec {

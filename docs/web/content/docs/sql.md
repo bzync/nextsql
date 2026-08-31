@@ -20,7 +20,9 @@ Pipeline: SQL → lexer → parser → binder / catalog → logical plan → rew
 | `DECIMAL(p,s)` | `1 ≤ p ≤ 38`, `s ≤ p`. Unscaled integer + scale. `DEFAULT AI()` when `s = 0` |
 | `TIMESTAMPTZ` | UTC nanoseconds. `DEFAULT NOW()` |
 | `JSON` | Compact binary `NSJB`. Insert a JSON text literal |
-| `VECTOR<F32,N>` | `N` in `1…8192`. Finite floats only. Stored off-row |
+| `VECTOR<F32,N>` / `<F16,N>` / `<I8,N>` | `N` in `1…8192`. Finite floats only. Stored off-row (F16 halves, I8 signed bytes + scale) |
+| `BITVECTOR<N>` | `N` single bits, `ceil(N/8)` bytes off-row. Elements are `0`/`1`. `NEAREST … USING HAMMING` |
+| `SPARSEVECTOR<N>` | Non-zero index/value pairs, `N` in `1…65535`. `NEAREST` default `COSINE`. `CREATE VECTOR INDEX … USING SPARSE` |
 | `POINT` / `LOCATION` | WGS84 longitude, latitude |
 | `BOX` | west, south, east, north |
 | `LINESTRING` | at least two vertices |
@@ -37,11 +39,11 @@ DROP TABLE [IF EXISTS]
 ALTER TABLE    ADD/DROP [COLUMN] | RENAME | ADD/DROP CONSTRAINT
 CREATE INDEX / CREATE UNIQUE INDEX
 CREATE SPATIAL INDEX
-CREATE FULLTEXT INDEX
-CREATE VECTOR INDEX … USING HNSW
+CREATE FULLTEXT INDEX [WITH (ANALYZER = 'simple' | 'english' | 'french' | 'german' | 'spanish')]
+CREATE VECTOR INDEX … USING HNSW | IVF | IVFPQ | SPARSE
 INSERT   [RETURNING]
 UPSERT   [ON UNIQUE] [SET] [RETURNING]
-SELECT   [WITH] [DISTINCT] [JOIN …] [WHERE] [GROUP BY] [HAVING] [ORDER BY] [SEARCH] [NEAREST] [LIMIT] [OFFSET]
+SELECT   [WITH] [DISTINCT] [JOIN …] [WHERE] [GROUP BY] [HAVING] [ORDER BY] [SEARCH] [NEAREST] [NEAREST] [LIMIT] [OFFSET]
 UPDATE   [WHERE] [LIMIT] [RETURNING]
 DELETE   [WHERE] [LIMIT] [RETURNING]
 BEGIN    [READ COMMITTED | SNAPSHOT | SERIALIZABLE]
@@ -49,7 +51,6 @@ COMMIT
 ROLLBACK [TRANSACTION]
 ANALYZE  [table]
 EXPLAIN  [ANALYZE] <statement>
-SET TENANT = … / RESET TENANT
 CREATE USER / DROP USER
 CREATE ROLE / DROP ROLE
 GRANT / REVOKE
@@ -70,7 +71,7 @@ See [Change streams](/docs/cdc).
 
 `ORDER BY expr [ASC|DESC] [, …]` sorts the projected result. NULLs sort last in `ASC` and first in `DESC`. Keys may be output aliases, 1-based select-list ordinals, or source columns.
 
-`SEARCH` orders by BM25 then primary key unless `ORDER BY` is present. `NEAREST` orders by distance then primary key unless `ORDER BY` is present. Hybrid results are reciprocal-rank fused, then truncated to `LIMIT` / `OFFSET` (or re-sorted when `ORDER BY` is present). `LIMIT n OFFSET m` skips `m` ordered rows then returns up to `n`. `OFFSET` may appear before `LIMIT`. `OFFSET` without `LIMIT` skips and returns the rest. `UPDATE` / `DELETE` take `LIMIT` only.
+`SEARCH` orders by BM25 then primary key unless `ORDER BY` is present. `SEARCH col [WEIGHT n] [, col [WEIGHT n] …] FOR '…'` uses a `FULLTEXT` index whose column list matches in the same order (1–8 `STRING`/`TEXT` columns; phrases do not cross fields; optional `WEIGHT` scales per-field BM25 tf in `(0, 64]`, default 1). Trailing ASCII `*` on a token is prefix search (`cat*` matches `catalog`; exact `cat` does not); trailing ASCII `~` is fuzzy matching (`cat~` matches `cot`; optional `~1` / `~2`); unadorned tokens apply typo tolerance when the term is absent from the vocabulary (`databse` matches `database`); prefix, fuzzy, and typo expansion is fail-closed. `HIGHLIGHT(col)` / `SNIPPET(col)` mark original matching tokens in the SELECT list of a SEARCH query. `SELECT * … SEARCH … FACET col [, col …]` returns independent histograms over the full match set (`facet`, `value`, `count`); `LIMIT` is per-facet top-N. `NEAREST` orders by distance then primary key unless `ORDER BY` is present. Hybrid results are reciprocal-rank fused, then truncated to `LIMIT` / `OFFSET` (or re-sorted when `ORDER BY` is present). A second `NEAREST` (dense `VECTOR` + `SPARSEVECTOR`) is dense+sparse+BM25 fusion. `LIMIT n OFFSET m` skips `m` ordered rows then returns up to `n`. `OFFSET` may appear before `LIMIT`. `OFFSET` without `LIMIT` skips and returns the rest. `UPDATE` / `DELETE` take `LIMIT` only.
 
 ## Functions
 
@@ -81,6 +82,7 @@ See [Change streams](/docs/cdc).
 | Windows | `ROW_NUMBER`, `RANK`, `DENSE_RANK`, `LAG`, `LEAD`, `FIRST_VALUE`, `LAST_VALUE`, and aggregate `OVER (...)` |
 | Vector | `COSINE(a,b)`, `L2(a,b)`, `INNER_PRODUCT(a,b)` |
 | Geo | `POINT`, `BOX`, `LON`/`LAT`, `DISTANCE`, `DISTANCE_SPHEROID`, `DWITHIN`, `WITHIN`, `COVERS`, `LINELENGTH` (and `ST_*` aliases) |
+| Search | `HIGHLIGHT(col [, pre, post])`, `SNIPPET(col [, width [, pre, post]])` (require `SEARCH`) |
 
 `UUID()`, `NOW()`, and `AI()` are evaluated at execution, not folded by the optimizer. `AI()` is a `DECIMAL(p,0)` autoincrement starting at 1. Explicit inserts bump the sequence when the value is at least the next number. Allocation is in the statement transaction (`ROLLBACK` reuses). Concurrent inserts exclusive-lock the sequence key.
 

@@ -22,6 +22,62 @@ func createDueScheduledTask(t *testing.T, db *DB, scheduleName string) (*catalog
 	return schedule, scheduledTaskID(schedule.ID, schedule.NextFireNS)
 }
 
+func TestTaskOwnerIsolationAndInvokerRights(t *testing.T) {
+	db := testDB(t)
+	acl, err := security.CreateACL(filepath.Join(t.TempDir(), "acl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := acl.Grant("dba", security.PrivAdmin, security.ScopeCluster, ""); err != nil {
+		t.Fatal(err)
+	}
+	admin := db.Session()
+	admin.SetIdentity("dba")
+	admin.SetACL(acl)
+	execOK(t, admin, `CREATE TABLE sink_acl (id STRING PRIMARY KEY)`)
+	execOK(t, admin, `CREATE WORKFLOW record_acl(id STRING) AS BEGIN INSERT INTO sink_acl (id) VALUES ($id); END`)
+	for _, grant := range []struct {
+		user   string
+		priv   security.Privilege
+		scope  security.ScopeKind
+		object string
+	}{
+		{"app", security.PrivConnect, security.ScopeDatabase, ""},
+		{"app", security.PrivCreate, security.ScopeDatabase, ""},
+		{"app", security.PrivExecute, security.ScopeFunction, "record_acl"},
+		{"app", security.PrivInsert, security.ScopeTable, "sink_acl"},
+		{"other", security.PrivConnect, security.ScopeDatabase, ""},
+	} {
+		if err := acl.Grant(grant.user, grant.priv, grant.scope, grant.object); err != nil {
+			t.Fatal(err)
+		}
+	}
+	app := db.Session()
+	app.SetIdentity("app")
+	app.SetACL(acl)
+	execOK(t, app, `CREATE SCHEDULE private_acl EVERY '1h' RUN WORKFLOW record_acl('private')`)
+	schedule, id := createDueScheduledTask(t, db, "private_acl")
+	other := db.Session()
+	other.SetIdentity("other")
+	other.SetACL(acl)
+	if rows := execOK(t, other, `SHOW TASKS`).Rows; len(rows) != 0 {
+		t.Fatalf("cross-owner rows=%+v", rows)
+	}
+	if _, err := other.Exec(`CANCEL TASK '` + id + `'`); !nerr.HasCode(err, nerr.Forbidden) {
+		t.Fatalf("cross-owner cancel=%v", err)
+	}
+	claim := claimOneTask(t, db, schedule.NextFireNS)
+	if err := acl.Revoke("app", security.PrivInsert, security.ScopeTable, "sink_acl"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.ExecuteClaimedTask(context.Background(), claim, acl, nil, scheduler.DefaultLimits()); !nerr.HasCode(err, nerr.Forbidden) {
+		t.Fatalf("revoked invoker right err=%v", err)
+	}
+	if got := execOK(t, app, `CANCEL TASK '`+id+`'`); got.Affected != 1 {
+		t.Fatalf("owner cancel affected=%d", got.Affected)
+	}
+}
+
 func makeScheduleDue(t *testing.T, db *DB, scheduleName string) *catalog.Schedule {
 	t.Helper()
 	schedule, ok := db.schedule(scheduleName)
@@ -170,75 +226,6 @@ func TestShowTasksPaginationAndSQLCancellation(t *testing.T) {
 	}
 	if got := execOK(t, s, `CANCEL TASK '`+firstID+`'`); got.Affected != 0 {
 		t.Fatalf("repeat cancel affected=%d", got.Affected)
-	}
-}
-
-func TestTaskOwnerTenantIsolationAndInvokerRights(t *testing.T) {
-	db := testDB(t)
-	acl, err := security.CreateACL(filepath.Join(t.TempDir(), "acl"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := acl.Grant("dba", security.PrivAdmin, security.ScopeCluster, ""); err != nil {
-		t.Fatal(err)
-	}
-	admin := db.Session()
-	admin.SetIdentity("dba")
-	admin.SetACL(acl)
-	execOK(t, admin, `CREATE TABLE sink (id STRING PRIMARY KEY, tenant_id UUID NOT NULL)`)
-	execOK(t, admin, `CREATE WORKFLOW record(id STRING) AS BEGIN INSERT INTO sink (id) VALUES ($id); END`)
-	for _, grant := range []struct {
-		user   string
-		priv   security.Privilege
-		scope  security.ScopeKind
-		object string
-	}{
-		{"app", security.PrivConnect, security.ScopeDatabase, ""},
-		{"app", security.PrivCreate, security.ScopeDatabase, ""},
-		{"app", security.PrivExecute, security.ScopeFunction, "record"},
-		{"app", security.PrivInsert, security.ScopeTable, "sink"},
-		{"other", security.PrivConnect, security.ScopeDatabase, ""},
-	} {
-		if err := acl.Grant(grant.user, grant.priv, grant.scope, grant.object); err != nil {
-			t.Fatal(err)
-		}
-	}
-	app := db.Session()
-	app.SetIdentity("app")
-	app.SetACL(acl)
-	execOK(t, app, `SET TENANT = '`+tenantA+`'`)
-	execOK(t, app, `CREATE SCHEDULE private EVERY '1h' RUN WORKFLOW record('private')`)
-	schedule, id := createDueScheduledTask(t, db, "private")
-	if rows := execOK(t, app, `SHOW TASKS`).Rows; len(rows) != 1 || rows[0][0].Str != id {
-		t.Fatalf("owner rows=%+v", rows)
-	}
-	other := db.Session()
-	other.SetIdentity("other")
-	other.SetACL(acl)
-	if rows := execOK(t, other, `SHOW TASKS`).Rows; len(rows) != 0 {
-		t.Fatalf("cross-owner rows=%+v", rows)
-	}
-	if _, err := other.Exec(`CANCEL TASK '` + id + `'`); !nerr.HasCode(err, nerr.Forbidden) {
-		t.Fatalf("cross-owner cancel=%v", err)
-	}
-	execOK(t, app, `RESET TENANT`)
-	if _, err := app.Exec(`CANCEL TASK '` + id + `'`); !nerr.HasCode(err, nerr.Forbidden) {
-		t.Fatalf("unbound tenant cancel=%v", err)
-	}
-	execOK(t, app, `SET TENANT = '`+tenantA+`'`)
-	claim := claimOneTask(t, db, schedule.NextFireNS)
-	if err := acl.Revoke("app", security.PrivInsert, security.ScopeTable, "sink"); err != nil {
-		t.Fatal(err)
-	}
-	if err := db.ExecuteClaimedTask(context.Background(), claim, acl, nil, scheduler.DefaultLimits()); !nerr.HasCode(err, nerr.Forbidden) {
-		t.Fatalf("revoked invoker right err=%v", err)
-	}
-	task, _, err := db.task(id)
-	if err != nil || task.State != catalog.TaskRetrying {
-		t.Fatalf("task=%+v err=%v", task, err)
-	}
-	if got := execOK(t, app, `CANCEL TASK '`+id+`'`); got.Affected != 1 {
-		t.Fatalf("owner cancel affected=%d", got.Affected)
 	}
 }
 

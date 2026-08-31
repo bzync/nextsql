@@ -377,6 +377,34 @@ func (e *Engine) PrimaryTree() (format.PageID, uint16) {
 	return e.File.PrimaryTree()
 }
 
+// SetStorageCapBytes limits how far the data file may grow. capBytes == 0
+// disables the cap. Growth (new page allocation, i.e. INSERT / row-splitting
+// UPDATE) past the cap fails with nerr.Exhausted; DELETE, rollback, and
+// in-place UPDATE keep working because they reuse freed pages. The cap covers
+// the main data file only, not WAL or UNDO. It is set out of band from the
+// hosting registry and is not persisted in the database.
+func (e *Engine) SetStorageCapBytes(capBytes uint64) {
+	if e == nil || e.Alloc == nil {
+		return
+	}
+	var pages uint64
+	if capBytes > 0 {
+		pages = capBytes / uint64(format.PhysicalPageSize)
+		if pages == 0 {
+			pages = 1
+		}
+	}
+	e.Alloc.SetCapPages(pages)
+}
+
+// StorageCapBytes reports the current data-file growth cap in bytes (0 = none).
+func (e *Engine) StorageCapBytes() uint64 {
+	if e == nil || e.Alloc == nil {
+		return 0
+	}
+	return e.Alloc.CapPages() * uint64(format.PhysicalPageSize)
+}
+
 func (e *Engine) SetPrimaryTree(root format.PageID, height uint16) error {
 	return e.NoteTree(root, height)
 }

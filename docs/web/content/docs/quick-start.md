@@ -19,12 +19,36 @@ nextsql init \
 What that does:
 
 1. Creates `/etc/nextsql/root.key` if it is missing (32-byte AES root, mode `0600`).
-2. Creates `/var/lib/nextsql/nextsql.db` and the keystore sidecar.
-3. Bootstraps user `app` with `ADMIN` on `CLUSTER` and `CONNECT` on the database.
+2. Creates a separate deployment registry root at `/etc/nextsql/root.key.instance` unless `--instance-key-file` is supplied.
+3. Creates the encrypted `nextsql.instance` registry and `/var/lib/nextsql/nextsql.db` with their wrapped-key sidecars.
+4. Bootstraps user `app` with `ADMIN` on `CLUSTER` and `CONNECT` on the default database.
 
-Printed output includes the data-file path plus database and file identity UUIDs.
+Printed output includes the data-file path, database/file/deployment identity
+UUIDs, normalized realm name/ID, and logical default database name.
 
 `--user` requires `--password-file`. The password file may end with a newline; it is stripped.
+
+All init values can come from a protected host dotenv file. In particular,
+`NEXTSQL_DATABASE=production` automatically becomes the logical database name:
+
+```dotenv
+NEXTSQL_DATA_DIR=/var/lib/nextsql
+NEXTSQL_KEY_FILE=/etc/nextsql/root.key
+NEXTSQL_INSTANCE_KEY_FILE=/etc/nextsql/root.key.instance
+NEXTSQL_REALM_NAME=customer-a
+NEXTSQL_DATABASE=production
+NEXTSQL_SERVER_USER=app
+NEXTSQL_SERVER_PASSWORD_FILE=/tmp/nextsql.pw
+```
+
+Run `nextsql init --env-file /run/nextsql/hosting.env`. Explicit flags override
+the file. Values are paths/names, never raw key bytes.
+
+Existing pre-registry deployments must not be reinitialized. Stop `nextsqld`
+and run `nextsql hosting adopt --data-dir /var/lib/nextsql --key-file
+/etc/nextsql/root.key --confirm`. The offline command validates and
+recovery-opens the existing default database, preserves its identity/files,
+and does not discover sibling database files.
 
 ## Start the server (loopback)
 
@@ -54,7 +78,7 @@ Create the product table used throughout these docs:
 "${CLI[@]}" -c "
 CREATE TABLE products (
     id          UUID PRIMARY KEY DEFAULT UUID(),
-    tenant_id   UUID NOT NULL,
+    account_id   UUID NOT NULL,
     name        STRING NOT NULL,
     description TEXT,
     price       DECIMAL(12,2),
@@ -72,7 +96,7 @@ Insert two rows. JSON is a string literal that is parsed and stored as binary `N
 
 ```bash
 "${CLI[@]}" -c "
-INSERT INTO products (tenant_id, name, description, price, metadata, embedding, location)
+INSERT INTO products (account_id, name, description, price, metadata, embedding, location)
 VALUES
   ('11111111-1111-1111-1111-111111111111',
    'Aero 2',

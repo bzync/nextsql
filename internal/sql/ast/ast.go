@@ -19,11 +19,19 @@ type (
 		Partitions []PartitionDef
 	}
 	PartitionDef struct {
-		Name      string
-		LessThan  Expr   // RANGE: nil means MAXVALUE
-		Values    []Expr // TENANT/LIST: IN values
-		Modulus   uint32 // HASH
-		Remainder uint32 // HASH
+		Name string
+		Rule string // RANGE, HASH, or VALUE; used by ALTER TABLE lifecycle DDL
+		// LessThan holds the single-column RANGE upper bound; nil means MAXVALUE.
+		// LessThanTuple holds a multi-column RANGE upper bound (VALUES LESS THAN
+		// (a, b, ...)); exactly one of the two is set for a bounded partition.
+		LessThan      Expr
+		LessThanTuple []Expr
+		// Values holds single-column LIST/TENANT membership (VALUES IN (a, b, ...)).
+		// ValueTuples holds multi-column LIST membership (VALUES IN ((a, b), ...)).
+		Values      []Expr
+		ValueTuples [][]Expr
+		Modulus     uint32 // HASH
+		Remainder   uint32 // HASH
 	}
 	CreateDatabase struct {
 		Name        string
@@ -114,18 +122,23 @@ type (
 		Cmd   AlterCmd
 	}
 	CreateIndex struct {
-		Name     string
-		Table    string
-		Unique   bool
-		Spatial  bool
-		Fulltext bool
-		Vector   bool
-		Using    string     // "hnsw" for VECTOR INDEX
-		Cols     []string   // first identifier of each key (compat)
-		Keys     [][]string // full key; one part is a column, more is a JSON path
-		Exprs    []Expr     // parallel to Keys; non-nil replaces that key with an expression
-		Include  []string   // INCLUDE columns stored in the leaf payload
-		Where    Expr       // partial-index predicate
+		Name         string
+		Table        string
+		Unique       bool
+		Spatial      bool
+		Fulltext     bool
+		Vector       bool
+		Using        string     // "hnsw", "ivf", "ivfpq", or "sparse" for VECTOR INDEX
+		VecQuant     string     // HNSW traversal quantisation: "", "none", "f16", "i8"
+		IVFLists     int        // USING IVF/IVFPQ WITH (LISTS = n); 0 when not IVF
+		IVFProbes    int        // USING IVF/IVFPQ WITH (..., PROBES = m); 0 = build default
+		IVFSubspaces int        // USING IVFPQ WITH (..., SUBSPACES = M); 0 when not IVFPQ
+		Analyzer     string     // FULLTEXT WITH (ANALYZER = 'simple' | 'english' | 'french' | 'german' | 'spanish'); empty = simple
+		Cols         []string   // first identifier of each key (compat)
+		Keys         [][]string // full key; one part is a column, more is a JSON path
+		Exprs        []Expr     // parallel to Keys; non-nil replaces that key with an expression
+		Include      []string   // INCLUDE columns stored in the leaf payload
+		Where        Expr       // partial-index predicate
 	}
 	Insert struct {
 		Table         string
@@ -145,25 +158,29 @@ type (
 		ReturningStar bool
 	}
 	Select struct {
-		List              []SelectItem
-		Star              bool
-		Distinct          bool
-		Table             string
-		Alias             string
-		FromQuery         Stmt
-		Joins             []JoinSpec
-		Where             Expr
-		Group             []Expr
-		Having            Expr
-		SearchCol         string
-		SearchQuery       Expr
-		NearestCol        string
-		NearestQuery      Expr
-		NearestMetric     string // "", "cosine", "l2", "inner_product"
-		Order             []OrderItem
-		Limit             *int64
-		Offset            *int64
-		TenantScanFilters []TenantScanFilter
+		List           []SelectItem
+		Star           bool
+		Distinct       bool
+		Table          string
+		Alias          string
+		FromQuery      Stmt
+		Joins          []JoinSpec
+		Where          Expr
+		Group          []Expr
+		Having         Expr
+		SearchCols     []string
+		SearchWeights  []float64 // parallel to SearchCols; nil means all 1
+		SearchQuery    Expr
+		FacetCols      []string // FACET col [, col …]; independent histograms over SEARCH matches
+		NearestCol     string
+		NearestQuery   Expr
+		NearestMetric  string // "", "cosine", "l2", "inner_product"
+		Nearest2Col    string
+		Nearest2Query  Expr
+		Nearest2Metric string
+		Order          []OrderItem
+		Limit          *int64
+		Offset         *int64
 	}
 	SetOperation struct {
 		Left, Right Stmt
@@ -203,13 +220,6 @@ type (
 		Cross bool // true when Kind==JoinCross (JOIN without ON, or CROSS JOIN)
 	}
 
-	// TenantScanFilter is a pre-join tenant predicate for a FULL OUTER input Scan.
-	// Never placed in ON or post-join WHERE (those leak or drop null-extended rows).
-	TenantScanFilter struct {
-		Table string
-		Alias string
-		Pred  Expr
-	}
 	SelectItem struct {
 		Expr  Expr
 		Alias string
@@ -277,10 +287,6 @@ type (
 		Scope      string
 		Object     string
 		Grantee    string
-	}
-	// SetTenant binds or clears the session tenant. A nil Value is RESET TENANT.
-	SetTenant struct {
-		Value Expr
 	}
 )
 
@@ -368,7 +374,6 @@ func (CreateRole) stmt()     {}
 func (DropRole) stmt()       {}
 func (Grant) stmt()          {}
 func (Revoke) stmt()         {}
-func (SetTenant) stmt()      {}
 
 // AlterCmd is one ALTER TABLE action.
 type AlterCmd interface{ alterCmd() }
@@ -395,15 +400,31 @@ type (
 	AlterSetCDCImages struct {
 		Mode string
 	}
+	AlterAddPartition struct {
+		Partition PartitionDef
+	}
+	AlterDropPartition struct {
+		Name string
+	}
+	AlterAttachPartition struct {
+		Partition PartitionDef
+	}
+	AlterDetachPartition struct {
+		Name string
+	}
 )
 
-func (AlterAddColumn) alterCmd()      {}
-func (AlterDropColumn) alterCmd()     {}
-func (AlterRenameColumn) alterCmd()   {}
-func (AlterRenameTable) alterCmd()    {}
-func (AlterAddConstraint) alterCmd()  {}
-func (AlterDropConstraint) alterCmd() {}
-func (AlterSetCDCImages) alterCmd()   {}
+func (AlterAddColumn) alterCmd()       {}
+func (AlterDropColumn) alterCmd()      {}
+func (AlterRenameColumn) alterCmd()    {}
+func (AlterRenameTable) alterCmd()     {}
+func (AlterAddConstraint) alterCmd()   {}
+func (AlterDropConstraint) alterCmd()  {}
+func (AlterSetCDCImages) alterCmd()    {}
+func (AlterAddPartition) alterCmd()    {}
+func (AlterDropPartition) alterCmd()   {}
+func (AlterAttachPartition) alterCmd() {}
+func (AlterDetachPartition) alterCmd() {}
 
 // FKAction is a referential action. NO ACTION is stored as FKRestrict.
 type FKAction uint8

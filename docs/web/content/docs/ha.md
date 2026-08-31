@@ -45,6 +45,16 @@ Only **one** node bootstraps. The other two use the same `--raft-join` list with
 # has_leader true
 ```
 
+## Read consistency
+
+Every read runs in one mode (session default `STRONG`):
+
+- **`STRONG`** — linearizable: observes every write acknowledged before it began, cluster-wide. Served only on the leader, behind a Raft read barrier (`VerifyLeader` quorum round trip), so a partitioned former leader cannot answer one. Read-your-writes survives a leader failover.
+- **`BOUNDED`** — served from a member within `MAX STALENESS` of the leader, or rejected. Cheap (no quorum round trip); no cross-node read-your-writes.
+- **`STALE`** — served from any member's applied state, unbounded lag. Always a consistent committed prefix, never relabelled `STRONG`.
+
+Every official driver ships a cluster routing client (`OpenCluster` / `connectCluster` / `NextSQL\Cluster::connect`) that sends eligible reads to a healthy follower and everything else to the leader. `nextsql-bench --readscale` measures the barrier cost and leader read-offload. Full argument: [`docs/ha.md`](https://github.com/bzync/nextsql/blob/main/docs/ha.md) "Consistency model and sign-off".
+
 A wiped replica is restored with `nextsql backup` / `restore` (same identity and keys), then rejoined. Raft logs are ciphertext (replication DEK). HA is not a substitute for backups.
 
 On Raft, connect migrators and writers to the **leader**.

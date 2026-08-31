@@ -1,7 +1,9 @@
 package executor
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"sort"
 	"strings"
 	"sync"
@@ -45,7 +47,9 @@ type DB struct {
 	hnswMu    sync.RWMutex
 	hnswGen   uint64
 	hnsw      map[string]*lockedMem
+	ivf       map[string]*lockedIVF // process-local committed IVF copies, same gen/lock as hnsw
 	optCache  *optimizer.Cache
+	resCache  *resultCache
 	feedback  *optimizer.Feedback
 	sched     *scheduler.Pool
 	metrics   *metrics.Registry
@@ -59,8 +63,11 @@ type DB struct {
 	reclaimMu      sync.Mutex
 	reclaimErr     error
 	reclaimPending []format.PageID
+	reclaimPartMap []string
+	reclaimIdxMap  []indexMapDrop
 	taskCancelMu   sync.Mutex
 	taskCancels    map[string]context.CancelFunc
+	idempotencyMu  sync.Mutex
 	walRetention   atomic.Uint64
 }
 
@@ -70,6 +77,42 @@ type IndexRebuildProgress struct {
 	Rows         int64
 	Entries      int64
 	Started      time.Time
+}
+
+// SetStorageCapBytes limits how far this database's data file may grow;
+// capBytes == 0 disables the cap. Once at the cap, statements that need a new
+// page (INSERT, a row-splitting UPDATE, index growth) fail with nerr.Exhausted;
+// DELETE, ROLLBACK, and in-place UPDATE keep working. The cap covers the data
+// file only (not WAL or UNDO) and is not persisted; a hosting deployment sets
+// it from the realm/database StorageCapBytes at open time.
+func (db *DB) SetStorageCapBytes(capBytes uint64) {
+	if db == nil {
+		return
+	}
+	db.Eng.SetStorageCapBytes(capBytes)
+}
+
+// StorageCapBytes reports the current data-file growth cap (0 = none).
+func (db *DB) StorageCapBytes() uint64 {
+	if db == nil {
+		return 0
+	}
+	return db.Eng.StorageCapBytes()
+}
+
+// ResultCacheStats returns process-local query-result cache diagnostics.
+func (db *DB) ResultCacheStats() ResultCacheStats {
+	if db == nil {
+		return ResultCacheStats{}
+	}
+	return db.resCache.stats()
+}
+
+func (db *DB) resultVersion() resultVersion {
+	if db == nil || db.Eng == nil || db.Eng.WAL == nil || db.Cat == nil {
+		return resultVersion{}
+	}
+	return resultVersion{lsn: db.Eng.WAL.DurableLSN(), cat: db.Cat.Generation()}
 }
 
 // CleanupDeadVersions physically removes at most limit committed MVCC
@@ -162,21 +205,66 @@ func (db *DB) cleanupTableDeadVersions(name string, limit int, budget *maintenan
 	if !ok {
 		return 0, nerr.New(nerr.NotFound, "executor.CleanupTableDeadVersions", "unknown table")
 	}
-	db.mu.RLock()
-	trees := []*btree.Tree{db.heaps[tab.Name]}
-	if tr := db.vecs[tab.Name]; tr != nil {
-		trees = append(trees, tr)
-	}
-	for _, idx := range tab.Indexes {
-		if tr := db.idxs[idxKey(tab.Name, idx.Name)]; tr != nil {
-			trees = append(trees, tr)
-		}
-	}
-	db.mu.RUnlock()
-	if trees[0] == nil {
-		return 0, nerr.New(nerr.NotFound, "executor.CleanupTableDeadVersions", "table heap not open")
+	trees, err := db.tableMaintenanceTrees(tab)
+	if err != nil {
+		return 0, err
 	}
 	return cleanupDeadTrees(trees, limit, budget)
+}
+
+// tableMaintenanceTrees resolves every physical tree owned by tab while the
+// caller holds applyMu exclusively. Catalog metadata is authoritative: a
+// missing registered tree fails closed instead of silently leaving part of a
+// partitioned table unmaintained.
+func (db *DB) tableMaintenanceTrees(tab *catalog.Table) ([]*btree.Tree, error) {
+	if tab == nil {
+		return nil, nerr.New(nerr.InvalidArgument, "executor.CleanupTableDeadVersions", "nil table")
+	}
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+
+	trees := make([]*btree.Tree, 0, 2+len(tab.Indexes))
+	appendRequired := func(tr *btree.Tree, object string) error {
+		if tr == nil {
+			return nerr.New(nerr.Corruption, "executor.CleanupTableDeadVersions", object+" is not open")
+		}
+		trees = append(trees, tr)
+		return nil
+	}
+	if err := appendRequired(db.heaps[tab.Name], "table heap"); err != nil {
+		return nil, err
+	}
+	if tab.VecMeta != 0 {
+		if err := appendRequired(db.vecs[tab.Name], "table vector store"); err != nil {
+			return nil, err
+		}
+	}
+	if tab.Partitioning == nil {
+		for _, idx := range tab.Indexes {
+			if err := appendRequired(db.idxs[idxKey(tab.Name, idx.Name)], "index "+idx.Name); err != nil {
+				return nil, err
+			}
+		}
+		return trees, nil
+	}
+	for _, part := range tab.Partitioning.Partitions {
+		base := partitionHeapKey(tab.Name, part.ID)
+		if err := appendRequired(db.partHeaps[base], "partition "+part.Name+" heap"); err != nil {
+			return nil, err
+		}
+		if part.VecMeta != 0 {
+			if err := appendRequired(db.partVecs[base], "partition "+part.Name+" vector store"); err != nil {
+				return nil, err
+			}
+		}
+		for _, idx := range part.Indexes {
+			key := partitionIndexKey(tab.Name, part.ID, idx.Name)
+			if err := appendRequired(db.partIdxs[key], "partition "+part.Name+" index "+idx.Name); err != nil {
+				return nil, err
+			}
+		}
+	}
+	return trees, nil
 }
 
 // CleanupIndexDeadVersions scopes physical cleanup to one resolved index.
@@ -194,11 +282,15 @@ func (db *DB) CleanupIndexDeadVersions(table, index string, limit int) (int, err
 		}
 		db.applyMu.Lock()
 		defer db.applyMu.Unlock()
-		tr, err := db.index(table, index)
+		tab, ok := db.Cat.Get(table)
+		if !ok {
+			return 0, nerr.New(nerr.NotFound, "executor.CleanupIndexDeadVersions", "unknown table")
+		}
+		trees, err := db.indexMaintenanceTrees(tab, index)
 		if err != nil {
 			return 0, err
 		}
-		return cleanupDeadTrees([]*btree.Tree{tr}, limit, budget)
+		return cleanupDeadTrees(trees, limit, budget)
 	})
 	if db.metrics != nil {
 		db.metrics.ObserveMaintenance(int64(n), time.Since(started), err)
@@ -206,7 +298,72 @@ func (db *DB) CleanupIndexDeadVersions(table, index string, limit int) (int, err
 	return n, err
 }
 
-func (db *DB) MaintenanceStatus() maintenance.Status           { return db.maint.Status() }
+func (db *DB) indexMaintenanceTrees(tab *catalog.Table, index string) ([]*btree.Tree, error) {
+	if tab == nil || index == "" {
+		return nil, nerr.New(nerr.InvalidArgument, "executor.CleanupIndexDeadVersions", "table and index are required")
+	}
+	found := false
+	for _, idx := range tab.Indexes {
+		if idx.Name == index {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return nil, nerr.New(nerr.NotFound, "executor.CleanupIndexDeadVersions", "unknown index")
+	}
+
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	if tab.Partitioning == nil {
+		tr := db.idxs[idxKey(tab.Name, index)]
+		if tr == nil {
+			return nil, nerr.New(nerr.Corruption, "executor.CleanupIndexDeadVersions", "index is not open")
+		}
+		return []*btree.Tree{tr}, nil
+	}
+	trees := make([]*btree.Tree, 0, len(tab.Partitioning.Partitions))
+	for _, part := range tab.Partitioning.Partitions {
+		key := partitionIndexKey(tab.Name, part.ID, index)
+		tr := db.partIdxs[key]
+		if tr == nil {
+			return nil, nerr.New(nerr.Corruption, "executor.CleanupIndexDeadVersions", "partition "+part.Name+" index is not open")
+		}
+		trees = append(trees, tr)
+	}
+	return trees, nil
+}
+
+func (db *DB) MaintenanceStatus() maintenance.Status { return db.maint.Status() }
+
+// cluster returns the attached Raft cluster, or nil for a single-node
+// deployment.
+func (db *DB) cluster() *replication.Cluster {
+	if db == nil {
+		return nil
+	}
+	c, _ := db.gate.(*replication.Cluster)
+	return c
+}
+
+// ClusterStatus returns the live Raft status when a cluster is attached.
+func (db *DB) ClusterStatus() (replication.Status, bool) {
+	c := db.cluster()
+	if c == nil {
+		return replication.Status{}, false
+	}
+	return c.Status(), true
+}
+
+// ClusterHealth returns this node's replication health snapshot when a cluster
+// is attached.
+func (db *DB) ClusterHealth() (replication.ReplicaHealth, bool) {
+	c := db.cluster()
+	if c == nil {
+		return replication.ReplicaHealth{}, false
+	}
+	return c.ReplicaHealth(), true
+}
 func (db *DB) PauseMaintenance()                               { db.maint.Pause() }
 func (db *DB) ResumeMaintenance()                              { db.maint.Resume() }
 func (db *DB) SetMaintenanceLimits(l maintenance.Limits) error { return db.maint.SetLimits(l) }
@@ -242,6 +399,37 @@ type rebuildProgress struct {
 type WriteGate interface {
 	AllowWrite() error
 }
+
+// ReadGate rejects a strongly consistent read when this process cannot prove
+// it is still the Raft leader. A nil gate (single-node deployment) permits the
+// read. The gate installed by AttachCluster satisfies both interfaces.
+type ReadGate interface {
+	StrongReadBarrier() error
+}
+
+// FollowerReadGate reports whether this node may serve a bounded-staleness
+// ("BOUNDED") read now, given the caller's freshness bound. The leader always
+// passes; a follower passes only while it still sees a leader and was contacted
+// within the bound. A rejected node returns an unavailable error so the caller
+// routes elsewhere. The gate installed by AttachCluster satisfies it.
+type FollowerReadGate interface {
+	FollowerReadHealthy(maxStaleness time.Duration) error
+}
+
+// DefaultMaxStaleness is the freshness bound a BOUNDED read uses when the
+// session sets no explicit MAX STALENESS.
+const DefaultMaxStaleness = replication.HealthyContactWindow
+
+// ReadConsistency selects how a read observes replicated state. See the
+// replication package for the full contract. STRONG (the zero value) is the
+// default; STALE serves a follower's locally applied state without a barrier.
+type ReadConsistency = replication.ReadConsistency
+
+const (
+	ReadStrong  = replication.ReadStrong
+	ReadBounded = replication.ReadBounded
+	ReadStale   = replication.ReadStale
+)
 
 func Create(path string, keys crypto.KeyProvider, bufferPages int) (*DB, error) {
 	e, err := storage.Create(path, keys, bufferPages)
@@ -286,9 +474,9 @@ func newDB(e *storage.Engine) (*DB, error) {
 		Cat:         catalog.New(),
 		CatTree:     tr,
 		heaps:       make(map[string]*btree.Tree),
-	partHeaps:   make(map[string]*btree.Tree),
-	partVecs:    make(map[string]*btree.Tree),
-	partIdxs:    make(map[string]*btree.Tree),
+		partHeaps:   make(map[string]*btree.Tree),
+		partVecs:    make(map[string]*btree.Tree),
+		partIdxs:    make(map[string]*btree.Tree),
 		idxs:        make(map[string]*btree.Tree),
 		vecs:        make(map[string]*btree.Tree),
 		workflows:   make(map[string]*catalog.Workflow),
@@ -296,6 +484,7 @@ func newDB(e *storage.Engine) (*DB, error) {
 		schedules:   make(map[string]*catalog.Schedule),
 		hnsw:        make(map[string]*lockedMem),
 		optCache:    optimizer.NewCache(),
+		resCache:    newResultCache(),
 		feedback:    optimizer.NewFeedback(),
 		sched:       scheduler.DefaultPool,
 		metrics:     metrics.New(),
@@ -373,12 +562,14 @@ func (db *DB) finishIndexRebuild(p *rebuildProgress) {
 	db.rebuildMu.Unlock()
 }
 
-func (db *DB) queueCommittedReclaims(ids []format.PageID) {
-	if db == nil || db.Eng == nil || len(ids) == 0 {
+func (db *DB) queueCommittedReclaims(ids []format.PageID, partitionMaps []string, indexMaps []indexMapDrop) {
+	if db == nil || db.Eng == nil || (len(ids) == 0 && len(partitionMaps) == 0 && len(indexMaps) == 0) {
 		return
 	}
 	db.reclaimMu.Lock()
 	db.reclaimPending = append(db.reclaimPending, ids...)
+	db.reclaimPartMap = append(db.reclaimPartMap, partitionMaps...)
+	db.reclaimIdxMap = append(db.reclaimIdxMap, indexMaps...)
 	db.reclaimMu.Unlock()
 }
 
@@ -388,9 +579,13 @@ func (db *DB) drainCommittedReclaims() {
 	}
 	db.reclaimMu.Lock()
 	ids := append([]format.PageID(nil), db.reclaimPending...)
+	partitionMaps := append([]string(nil), db.reclaimPartMap...)
+	indexMaps := append([]indexMapDrop(nil), db.reclaimIdxMap...)
 	db.reclaimPending = nil
+	db.reclaimPartMap = nil
+	db.reclaimIdxMap = nil
 	db.reclaimMu.Unlock()
-	if len(ids) == 0 {
+	if len(ids) == 0 && len(partitionMaps) == 0 && len(indexMaps) == 0 {
 		return
 	}
 	db.applyMu.Lock()
@@ -407,11 +602,19 @@ func (db *DB) drainCommittedReclaims() {
 	if err == nil {
 		err = db.clearReclaimIntent()
 	}
+	if err == nil && len(partitionMaps) > 0 {
+		db.dropPartitionMaps(partitionMaps)
+	}
+	if err == nil && len(indexMaps) > 0 {
+		db.dropReclaimedIndexMaps(indexMaps)
+	}
 	db.applyMu.Unlock()
 	db.reclaimMu.Lock()
 	db.reclaimErr = err
 	if err != nil {
 		db.reclaimPending = append(ids, db.reclaimPending...)
+		db.reclaimPartMap = append(partitionMaps, db.reclaimPartMap...)
+		db.reclaimIdxMap = append(indexMaps, db.reclaimIdxMap...)
 	}
 	db.reclaimMu.Unlock()
 }
@@ -517,9 +720,9 @@ func OpenWith(path string, keys crypto.KeyProvider, bufferPages int, opt storage
 		Cat:         catalog.New(),
 		CatTree:     tr,
 		heaps:       make(map[string]*btree.Tree),
-	partHeaps:   make(map[string]*btree.Tree),
-	partVecs:    make(map[string]*btree.Tree),
-	partIdxs:    make(map[string]*btree.Tree),
+		partHeaps:   make(map[string]*btree.Tree),
+		partVecs:    make(map[string]*btree.Tree),
+		partIdxs:    make(map[string]*btree.Tree),
 		idxs:        make(map[string]*btree.Tree),
 		vecs:        make(map[string]*btree.Tree),
 		workflows:   make(map[string]*catalog.Workflow),
@@ -527,6 +730,7 @@ func OpenWith(path string, keys crypto.KeyProvider, bufferPages int, opt storage
 		schedules:   make(map[string]*catalog.Schedule),
 		hnsw:        make(map[string]*lockedMem),
 		optCache:    optimizer.NewCache(),
+		resCache:    newResultCache(),
 		feedback:    optimizer.NewFeedback(),
 		sched:       scheduler.DefaultPool,
 		metrics:     metrics.New(),
@@ -634,6 +838,24 @@ func (db *DB) reloadCatalog() error {
 			return err
 		}
 		tables = append(tables, t)
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	idempotencyCount := 0
+	start, end = catalog.IdempotencyBounds()
+	err = db.CatTree.Range(start, end, func(k, v []byte) error {
+		if len(k) != 33 || k[0] != catalog.KeyIdempotency {
+			return nerr.New(nerr.InvalidFormat, "executor.reloadCatalog", "invalid idempotency catalog key")
+		}
+		if _, err := catalog.DecodeIdempotency(v); err != nil {
+			return err
+		}
+		idempotencyCount++
+		if idempotencyCount > catalog.MaxIdempotencyRecords {
+			return nerr.New(nerr.InvalidFormat, "executor.reloadCatalog", "idempotency record capacity exceeded")
+		}
 		return nil
 	})
 	if err != nil {
@@ -811,6 +1033,10 @@ func (db *DB) reloadCatalog() error {
 			db.vecs[t.Name] = vs
 		}
 		for _, idx := range t.Indexes {
+			if t.Partitioning != nil {
+				// Partitioned logical indexes have no global physical root.
+				continue
+			}
 			ix, err := btree.OpenDetached(db.Eng, idx.Meta)
 			if err != nil {
 				return err
@@ -986,9 +1212,14 @@ func (db *DB) removeWorkflow(name string) {
 }
 
 func (db *DB) reloadStats() error {
+	type tableSnapshot struct {
+		stats  *catalog.TableStats
+		digest [32]byte
+	}
+	byTableID := make(map[uint32]tableSnapshot)
 	start := catalog.StatsKey("")
 	end := []byte{catalog.KeyStats + 1}
-	return db.CatTree.Range(start, end, func(k, v []byte) error {
+	if err := db.CatTree.Range(start, end, func(k, v []byte) error {
 		if len(k) == 0 || k[0] != catalog.KeyStats {
 			return nil
 		}
@@ -996,9 +1227,62 @@ func (db *DB) reloadStats() error {
 		if err != nil {
 			return err
 		}
-		db.Cat.SetStats(st)
+		if st.TableID == 0 {
+			return nerr.New(nerr.Corruption, "executor.reloadStats", "zero statistics table identity")
+		}
+		if _, exists := byTableID[st.TableID]; exists {
+			return nerr.New(nerr.Corruption, "executor.reloadStats", "duplicate statistics table identity")
+		}
+		byTableID[st.TableID] = tableSnapshot{stats: st, digest: sha256.Sum256(v)}
 		return nil
-	})
+	}); err != nil {
+		return err
+	}
+	start = []byte{catalog.KeyPartitionStats}
+	end = []byte{catalog.KeyPartitionStats + 1}
+	if err := db.CatTree.Range(start, end, func(k, v []byte) error {
+		if len(k) != 9 || k[0] != catalog.KeyPartitionStats {
+			return nerr.New(nerr.Corruption, "executor.reloadStats", "invalid partition statistics key")
+		}
+		tableID, snapshot, part, err := catalog.DecodePartitionStats(v)
+		if err != nil {
+			return err
+		}
+		if !bytes.Equal(k, catalog.PartitionStatsKey(tableID, part.ID)) {
+			return nerr.New(nerr.Corruption, "executor.reloadStats", "partition statistics identity mismatch")
+		}
+		table, exists := byTableID[tableID]
+		if !exists || table.stats == nil {
+			return nerr.New(nerr.Corruption, "executor.reloadStats", "orphan partition statistics")
+		}
+		if snapshot != table.digest {
+			// An older writer may have refreshed NSST without knowing NSPS.
+			// Treat the side record as stale and retain conservative globals.
+			return nil
+		}
+		st := table.stats
+		found := false
+		for i := range st.Partitions {
+			if st.Partitions[i].ID != part.ID {
+				continue
+			}
+			if found {
+				return nerr.New(nerr.Corruption, "executor.reloadStats", "duplicate partition statistics identity")
+			}
+			st.Partitions[i] = part
+			found = true
+		}
+		if !found {
+			return nerr.New(nerr.Corruption, "executor.reloadStats", "partition statistics missing from table snapshot")
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	for _, table := range byTableID {
+		db.Cat.SetStats(table.stats)
+	}
+	return nil
 }
 
 func (db *DB) heap(name string) (*btree.Tree, error) {
@@ -1095,6 +1379,51 @@ func (db *DB) dropTableMaps(name string) {
 	for k := range db.partIdxs {
 		if strings.HasPrefix(k, prefixHash) {
 			delete(db.partIdxs, k)
+			dropHNSW = append(dropHNSW, k)
+		}
+	}
+	db.mu.Unlock()
+	for _, k := range dropHNSW {
+		db.dropHNSW(k)
+	}
+}
+
+// dropPartitionMaps runs only while reclamation holds applyMu exclusively, so
+// no snapshot can still resolve the removed stable partition identity.
+func (db *DB) dropPartitionMaps(keys []string) {
+	db.mu.Lock()
+	var dropHNSW []string
+	for _, base := range keys {
+		delete(db.partHeaps, base)
+		delete(db.partVecs, base)
+		prefix := base + "/"
+		for key := range db.partIdxs {
+			if strings.HasPrefix(key, prefix) {
+				delete(db.partIdxs, key)
+				dropHNSW = append(dropHNSW, key)
+			}
+		}
+	}
+	db.mu.Unlock()
+	for _, k := range dropHNSW {
+		db.dropHNSW(k)
+	}
+}
+
+func (db *DB) dropReclaimedIndexMaps(drops []indexMapDrop) {
+	db.mu.Lock()
+	var dropHNSW []string
+	for _, drop := range drops {
+		if drop.partition {
+			if db.partIdxs[drop.key] == drop.tree {
+				delete(db.partIdxs, drop.key)
+				dropHNSW = append(dropHNSW, drop.key)
+			}
+			continue
+		}
+		if db.idxs[drop.key] == drop.tree {
+			delete(db.idxs, drop.key)
+			dropHNSW = append(dropHNSW, drop.key)
 		}
 	}
 	db.mu.Unlock()
@@ -1157,6 +1486,7 @@ func (db *DB) renameTableMaps(old, neu string) {
 		if strings.HasPrefix(k, oldHash) {
 			movedPi[neuHash+k[len(oldHash):]] = tr
 			delete(db.partIdxs, k)
+			dropHNSW = append(dropHNSW, k)
 		}
 	}
 	for k, tr := range movedPi {

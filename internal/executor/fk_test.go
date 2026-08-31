@@ -182,75 +182,6 @@ func TestFKSnapshotOverlappingLocks(t *testing.T) {
 	_ = t1.abort()
 }
 
-func TestFKTenantCases(t *testing.T) {
-	db := testDB(t)
-	s := db.Session()
-	execOK(t, s, `CREATE TABLE customers (
-		tenant_id UUID NOT NULL,
-		id STRING NOT NULL,
-		PRIMARY KEY (tenant_id, id)
-	)`)
-	execOK(t, s, `CREATE TABLE orders (
-		tenant_id UUID NOT NULL,
-		id STRING NOT NULL,
-		customer_id STRING NOT NULL,
-		PRIMARY KEY (tenant_id, id),
-		FOREIGN KEY (tenant_id, customer_id) REFERENCES customers (tenant_id, id)
-	)`)
-	execOK(t, s, `SET TENANT = '`+tenantA+`'`)
-	execOK(t, s, `INSERT INTO customers (id) VALUES ('cust')`)
-	execOK(t, s, `INSERT INTO orders (id, customer_id) VALUES ('o1', 'cust')`)
-	if _, err := s.Exec(`INSERT INTO orders (id, customer_id) VALUES ('o2', 'nope')`); !nerr.HasCode(err, nerr.ForeignKey) {
-		t.Fatalf("missing parent: %v", err)
-	}
-	if _, err := s.Exec(`DELETE FROM customers WHERE id = 'cust'`); !nerr.HasCode(err, nerr.ForeignKey) {
-		t.Fatalf("same-tenant child: %v", err)
-	}
-
-	execOK(t, s, `SET TENANT = '`+tenantB+`'`)
-	if _, err := s.Exec(`INSERT INTO orders (id, customer_id) VALUES ('o3', 'cust')`); !nerr.HasCode(err, nerr.ForeignKey) {
-		t.Fatalf("other-tenant parent: %v", err)
-	}
-	execOK(t, s, `INSERT INTO customers (id) VALUES ('cust')`)
-	execOK(t, s, `INSERT INTO orders (id, customer_id) VALUES ('o3', 'cust')`)
-
-	execOK(t, s, `RESET TENANT`)
-	if _, err := s.Exec(`DELETE FROM customers WHERE id = 'cust'`); !nerr.HasCode(err, nerr.ForeignKey) {
-		t.Fatalf("unbound delete with children: %v", err)
-	}
-	res := execOK(t, s, `SELECT tenant_id, id FROM customers`)
-	if len(res.Rows) != 2 {
-		t.Fatalf("customers %d", len(res.Rows))
-	}
-}
-
-func TestFKBoundDeleteGlobalParentOtherTenantChild(t *testing.T) {
-	db := testDB(t)
-	s := db.Session()
-	execOK(t, s, `CREATE TABLE parents (id STRING PRIMARY KEY)`)
-	execOK(t, s, `CREATE TABLE children (
-		id STRING PRIMARY KEY,
-		tenant_id UUID NOT NULL,
-		parent_id STRING NOT NULL REFERENCES parents (id)
-	)`)
-	execOK(t, s, `INSERT INTO parents (id) VALUES ('p1')`)
-	execOK(t, s, `SET TENANT = '`+tenantA+`'`)
-	execOK(t, s, `INSERT INTO children (id, parent_id) VALUES ('c1', 'p1')`)
-	execOK(t, s, `SET TENANT = '`+tenantB+`'`)
-	if _, err := s.Exec(`DELETE FROM parents WHERE id = 'p1'`); !nerr.HasCode(err, nerr.ForeignKey) {
-		t.Fatalf("bound delete of global parent with other-tenant child: %v", err)
-	}
-	execOK(t, s, `RESET TENANT`)
-	got := execOK(t, s, `SELECT id FROM parents`)
-	if len(got.Rows) != 1 {
-		t.Fatalf("parent must survive: %d", len(got.Rows))
-	}
-	kids := execOK(t, s, `SELECT id FROM children`)
-	if len(kids.Rows) != 1 {
-		t.Fatalf("child must survive: %d", len(kids.Rows))
-	}
-}
-
 func TestFKDeleteCascade(t *testing.T) {
 	db := testDB(t)
 	s := db.Session()
@@ -461,63 +392,6 @@ func TestFKCascadeRowCap(t *testing.T) {
 	}
 	if got := execOK(t, s, `SELECT id FROM children`); len(got.Rows) != 3 {
 		t.Fatalf("row reject must roll back children: %d", len(got.Rows))
-	}
-}
-
-func TestFKCascadeTenantCheck(t *testing.T) {
-	db := testDB(t)
-	s := db.Session()
-	execOK(t, s, `CREATE TABLE customers (
-		tenant_id UUID NOT NULL,
-		id STRING NOT NULL,
-		PRIMARY KEY (tenant_id, id)
-	)`)
-	execOK(t, s, `CREATE TABLE orders (
-		tenant_id UUID NOT NULL,
-		id STRING NOT NULL,
-		customer_id STRING NOT NULL,
-		PRIMARY KEY (tenant_id, id),
-		FOREIGN KEY (tenant_id, customer_id) REFERENCES customers (tenant_id, id) ON DELETE CASCADE
-	)`)
-	execOK(t, s, `SET TENANT = '`+tenantA+`'`)
-	execOK(t, s, `INSERT INTO customers (id) VALUES ('cust')`)
-	execOK(t, s, `INSERT INTO orders (id, customer_id) VALUES ('o1', 'cust')`)
-	execOK(t, s, `SET TENANT = '`+tenantB+`'`)
-	execOK(t, s, `INSERT INTO customers (id) VALUES ('cust')`)
-	execOK(t, s, `INSERT INTO orders (id, customer_id) VALUES ('o2', 'cust')`)
-	execOK(t, s, `SET TENANT = '`+tenantA+`'`)
-	execOK(t, s, `DELETE FROM customers WHERE id = 'cust'`)
-	if got := execOK(t, s, `SELECT id FROM orders`); len(got.Rows) != 0 {
-		t.Fatalf("tenant A orders leftover %d", len(got.Rows))
-	}
-	execOK(t, s, `SET TENANT = '`+tenantB+`'`)
-	if got := execOK(t, s, `SELECT id FROM orders`); len(got.Rows) != 1 {
-		t.Fatalf("tenant B order must survive %d", len(got.Rows))
-	}
-}
-
-func TestFKCascadeBoundCannotTouchOtherTenant(t *testing.T) {
-	db := testDB(t)
-	s := db.Session()
-	execOK(t, s, `CREATE TABLE parents (id STRING PRIMARY KEY)`)
-	execOK(t, s, `CREATE TABLE children (
-		id STRING PRIMARY KEY,
-		tenant_id UUID NOT NULL,
-		parent_id STRING NOT NULL REFERENCES parents (id) ON DELETE CASCADE
-	)`)
-	execOK(t, s, `INSERT INTO parents (id) VALUES ('p1')`)
-	execOK(t, s, `SET TENANT = '`+tenantA+`'`)
-	execOK(t, s, `INSERT INTO children (id, parent_id) VALUES ('c1', 'p1')`)
-	execOK(t, s, `SET TENANT = '`+tenantB+`'`)
-	if _, err := s.Exec(`DELETE FROM parents WHERE id = 'p1'`); err == nil {
-		t.Fatal("bound session must not cascade into another tenant")
-	}
-	execOK(t, s, `RESET TENANT`)
-	if got := execOK(t, s, `SELECT id FROM parents`); len(got.Rows) != 1 {
-		t.Fatalf("parent must survive: %d", len(got.Rows))
-	}
-	if got := execOK(t, s, `SELECT id FROM children`); len(got.Rows) != 1 {
-		t.Fatalf("other-tenant child must survive: %d", len(got.Rows))
 	}
 }
 

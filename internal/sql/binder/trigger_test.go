@@ -32,7 +32,7 @@ func TestBindTriggerLifecycleAndDependencies(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	bound, err := BindAutomation(stmt, tables, workflows, workflowList, triggers, triggerList, func(string) (*catalog.Schedule, bool) { return nil, false }, nil, 3, "alice", "")
+	bound, err := BindAutomation(stmt, tables, workflows, workflowList, triggers, triggerList, func(string) (*catalog.Schedule, bool) { return nil, false }, nil, 3, "alice")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -46,16 +46,16 @@ func TestBindTriggerLifecycleAndDependencies(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := BindAutomation(candidate, tables, workflows, workflowList, triggers, triggerList, func(string) (*catalog.Schedule, bool) { return nil, false }, nil, 4, "alice", ""); err == nil {
+		if _, err := BindAutomation(candidate, tables, workflows, workflowList, triggers, triggerList, func(string) (*catalog.Schedule, bool) { return nil, false }, nil, 4, "alice"); err == nil {
 			t.Fatalf("expected trigger dependency rejection: %s", sql)
 		}
 	}
 	rename, _ := parser.Parse(`ALTER TRIGGER audit RENAME TO audit2`)
-	if _, err := BindAutomation(rename, tables, workflows, workflowList, triggers, triggerList, func(string) (*catalog.Schedule, bool) { return nil, false }, nil, 4, "alice", ""); err != nil {
+	if _, err := BindAutomation(rename, tables, workflows, workflowList, triggers, triggerList, func(string) (*catalog.Schedule, bool) { return nil, false }, nil, 4, "alice"); err != nil {
 		t.Fatal(err)
 	}
 	drop, _ := parser.Parse(`DROP TRIGGER audit`)
-	if _, err := BindAutomation(drop, tables, workflows, workflowList, triggers, triggerList, func(string) (*catalog.Schedule, bool) { return nil, false }, nil, 4, "alice", ""); err != nil {
+	if _, err := BindAutomation(drop, tables, workflows, workflowList, triggers, triggerList, func(string) (*catalog.Schedule, bool) { return nil, false }, nil, 4, "alice"); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -73,7 +73,7 @@ func TestBindTriggerRejectsUnknownColumnAndArity(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := BindAutomation(stmt, tables, workflows, nil, func(string) (*catalog.Trigger, bool) { return nil, false }, nil, func(string) (*catalog.Schedule, bool) { return nil, false }, nil, 3, "alice", ""); err == nil {
+		if _, err := BindAutomation(stmt, tables, workflows, nil, func(string) (*catalog.Trigger, bool) { return nil, false }, nil, func(string) (*catalog.Schedule, bool) { return nil, false }, nil, 3, "alice"); err == nil {
 			t.Fatalf("accepted %s", sql)
 		}
 	}

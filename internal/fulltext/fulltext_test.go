@@ -37,6 +37,68 @@ func TestAnalyzePositions(t *testing.T) {
 	}
 }
 
+func TestAnalyzeFieldsPositions(t *testing.T) {
+	doc, err := AnalyzeFields([]string{"database", "performance tuning"}, Simple)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if doc.Len != 3 {
+		t.Fatalf("len %+v", doc)
+	}
+	pos := map[string][]uint32{}
+	tf := map[string]uint32{}
+	for _, tp := range doc.Terms {
+		pos[tp.Term] = tp.Pos
+		tf[tp.Term] = tp.TF
+	}
+	if tf["database"] != 1 || tf["performance"] != 1 || tf["tuning"] != 1 {
+		t.Fatalf("tf %v", tf)
+	}
+	if pos["database"][0] != 0 || pos["performance"][0] != FieldPositionGap || pos["tuning"][0] != FieldPositionGap+1 {
+		t.Fatalf("pos %v", pos)
+	}
+	if PhraseMatch([]string{"database", "performance"}, pos) {
+		t.Fatal("phrase must not cross fields")
+	}
+	if !PhraseMatch([]string{"performance", "tuning"}, pos) {
+		t.Fatal("in-field phrase")
+	}
+	empty, err := AnalyzeFields([]string{"", "cat sat"}, Simple)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if empty.Len != 2 || empty.Terms[0].Pos[0] != FieldPositionGap {
+		t.Fatalf("empty field band %+v", empty)
+	}
+	merged, err := AnalyzeFields([]string{"cat sat", "the cat"}, Simple)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cat TermPosting
+	for _, tp := range merged.Terms {
+		if tp.Term == "cat" {
+			cat = tp
+		}
+	}
+	if cat.TF != 2 || len(cat.Pos) != 2 || cat.Pos[0] != 0 || cat.Pos[1] != FieldPositionGap+1 {
+		t.Fatalf("merged cat %+v", cat)
+	}
+	if _, err := AnalyzeFields(make([]string, MaxFields+1), Simple); err == nil {
+		t.Fatal("expected too many fields")
+	}
+	one, err := AnalyzeFields([]string{"cat sat cat"}, Simple)
+	if err != nil {
+		t.Fatal(err)
+	}
+	single, err := Analyze("cat sat cat")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if one.Len != single.Len || len(one.Terms) != len(single.Terms) {
+		t.Fatalf("single-field shortcut %+v vs %+v", one, single)
+	}
+}
+
 func TestParseQueryPhrase(t *testing.T) {
 	q, err := ParseQuery(`wireless "noise cancelling" headphones`)
 	if err != nil {
@@ -137,6 +199,66 @@ func TestBM25Fixture(t *testing.T) {
 	}
 	if Score(0, 3, avg, idf) != 0 {
 		t.Fatal("zero tf")
+	}
+}
+
+func TestWeightedTF(t *testing.T) {
+	pos := []uint32{0, FieldPositionGap, FieldPositionGap + 1}
+	if got := WeightedTF(pos, nil); got != 3 {
+		t.Fatalf("unweighted %v", got)
+	}
+	if got := WeightedTF(pos, []float64{1, 1}); got != 3 {
+		t.Fatalf("uniform %v", got)
+	}
+	if got := WeightedTF(pos, []float64{3, 1}); got != 5 {
+		t.Fatalf("title×3 %v", got)
+	}
+	if got := WeightedTF(nil, []float64{3, 1}); got != 0 {
+		t.Fatal("empty")
+	}
+	if !UniformWeights(nil) || !UniformWeights([]float64{1, 1}) || UniformWeights([]float64{3, 1}) {
+		t.Fatal("uniform")
+	}
+}
+
+func TestCheckFieldWeight(t *testing.T) {
+	for _, w := range []float64{0.5, 1, 3, 64} {
+		if err := CheckFieldWeight(w); err != nil {
+			t.Fatalf("%v: %v", w, err)
+		}
+	}
+	for _, w := range []float64{0, -1, 64.1, math.Inf(1), math.NaN()} {
+		if err := CheckFieldWeight(w); err == nil {
+			t.Fatalf("expected reject %v", w)
+		}
+	}
+}
+
+func TestQueryScoreWeighted(t *testing.T) {
+	q, err := ParseQuery("database")
+	if err != nil {
+		t.Fatal(err)
+	}
+	df := map[string]uint64{"database": 2}
+	titlePos := map[string][]uint32{"database": {0}}
+	bodyPos := map[string][]uint32{"database": {FieldPositionGap}}
+	tf := map[string]uint32{"database": 1}
+	const n uint64 = 2
+	avg := AvgDL(Stats{Docs: 2, Tokens: 12})
+	unweightedTitle := QueryScore(q, tf, df, 9, avg, n)
+	unweightedBody := QueryScore(q, tf, df, 3, avg, n)
+	if unweightedBody <= unweightedTitle {
+		t.Fatalf("shorter body should win unweighted: title=%v body=%v", unweightedTitle, unweightedBody)
+	}
+	w := []float64{3, 1}
+	weightedTitle := QueryScoreWeighted(q, tf, titlePos, w, df, 9, avg, n)
+	weightedBody := QueryScoreWeighted(q, tf, bodyPos, w, df, 3, avg, n)
+	if weightedTitle <= weightedBody {
+		t.Fatalf("title WEIGHT 3 should win: title=%v body=%v", weightedTitle, weightedBody)
+	}
+	same := QueryScoreWeighted(q, tf, titlePos, nil, df, 9, avg, n)
+	if same != unweightedTitle {
+		t.Fatalf("nil weights %v want %v", same, unweightedTitle)
 	}
 }
 

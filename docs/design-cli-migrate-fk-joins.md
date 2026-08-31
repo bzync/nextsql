@@ -4,11 +4,19 @@
 |---|---|
 | **Author** | NextSQL design (via Grok) |
 | **Date** | 2026-08-18 |
-| **Status** | Draft |
+| **Status** | Historical design record; shared-tenancy sections superseded 2026-08-28 |
 | **Product** | NextSQL 0.1.0-dev (phases 0–15 implemented; Phase 16 correctness / SLO closure is open) |
 | **Module** | `github.com/bzync/nextsql` |
 
 ---
+
+> **Supersession notice:** `SET TENANT`, `RESET TENANT`, the `--tenant` /
+> `NEXTSQL_TENANT` client surface, implicit `tenant_id` rewriting, and
+> `PARTITION BY TENANT` have been removed. Those passages below document the
+> old implementation and are not current product behavior. Current isolation
+> is defined by hosted realm/database binding in
+> [`design-multidatabase-dbaas.md`](design-multidatabase-dbaas.md) and
+> [`security.md`](security.md).
 
 ## Overview
 
@@ -89,7 +97,7 @@ These are closed for this design. Rationale is short; details live in the matchi
 1. **CLI-first version control, files in Git.** In-database branching (Dolt) is a different product. NextSQL’s advantage is one encrypted ACID engine; schema history should be reviewable in PRs.
 2. **Two CLI modes: server and local.** `exec`, `migrate`, and default `status` always use NSQL v1 against a running `nextsqld`. `init` / `backup` / `restore` / `verify` / `export` / `import` / `diagnose` / `status --local` / `cluster status` are the only commands that touch `NEXTSQL_DATA_DIR` / `NEXTSQL_KEY_FILE`.
 3. **Config priority: flags > process environment > `.env.local` > `.env` > defaults.** Existing `internal/config` stays the **server** `key=value` loader. Client loading is a new `internal/cli` package so unknown server keys and client dotenv never share a parser.
-4. **Password file wins over inline password.** If both `NEXTSQL_PASSWORD_FILE` and `NEXTSQL_PASSWORD` are set, the file is used. Inline password is allowed for CI convenience and is a documented tradeoff.
+4. **Password file wins over inline password.** If both `NEXTSQL_DATABASE_PASSWORD_FILE` and `NEXTSQL_DATABASE_PASS` are set, the file is used. Inline password is allowed for CI convenience and is a documented tradeoff.
 5. **Root key is never a migrate/exec input.** Even if `.env` contains `NEXTSQL_KEY_FILE`, server-mode commands ignore it.
 6. **One official migrator, over a persistent Go-driver session.** `nextsql exec` stays one-shot. `nextsql migrate` opens `drivers/go` `Conn` and sends one statement per `Exec`, wrapping each file in `BEGIN`/`COMMIT`.
 7. **History table name `nsql_schema_migrations`.** User-visible SQL table, required `PRIMARY KEY`, no `tenant_id` (so `SET TENANT` cannot hide it). Prefix `nsql_` is reserved.
@@ -149,7 +157,7 @@ Mixing modes on one invocation is an error: if a server-mode command is given `-
 
 #### A.2 New package `internal/cli`
 
-Do **not** extend `internal/config.Load`. That parser rejects unknown keys and is bound to `nextsqld` (`data_dir`, `key_file`, `listen_addr`, Raft, admission). Client dotenv will contain `NEXTSQL_USER` and similar names that would be illegal there.
+Do **not** extend `internal/config.Load`. That parser rejects unknown keys and is bound to `nextsqld` (`data_dir`, `key_file`, `listen_addr`, Raft, admission). Client dotenv will contain `NEXTSQL_DATABASE_USER` and similar names that would be illegal there.
 
 ```
 internal/cli/
@@ -180,7 +188,7 @@ flowchart TD
   F --> V[Validate for command mode]
 ```
 
-A value is “set” when it is non-empty after trim. Empty environment variables do not override a file value (avoids `NEXTSQL_USER=` in a systemd unit wiping `.env`). Explicit flags, including empty strings where the flag is present, override everything.
+A value is “set” when it is non-empty after trim. Empty environment variables do not override a file value (avoids `NEXTSQL_DATABASE_USER=` in a systemd unit wiping `.env`). Explicit flags, including empty strings where the flag is present, override everything.
 
 `flag` visited-set (already used in `cmd/nextsqld/main.go` via `fs.Visit`) is the source of “explicit flag.”
 
@@ -191,13 +199,17 @@ A value is “set” when it is non-empty after trim. Empty environment variable
 | Variable | Meaning | Default |
 |---|---|---|
 | `NEXTSQL_ADDR` | `host:port` | `127.0.0.1:7210` (`config.DefaultListenAddr`) |
-| `NEXTSQL_USER` | Auth user | none (required) |
-| `NEXTSQL_PASSWORD_FILE` | Path to password file (newline stripped, same as `auth.ReadPasswordFile`) | none |
-| `NEXTSQL_PASSWORD` | Inline password | none |
+| `NEXTSQL_DATABASE_USER` | Database/client auth user | none (required) |
+| `NEXTSQL_DATABASE_PASSWORD_FILE` | Path to database/client password file (newline stripped, same as `auth.ReadPasswordFile`) | none |
+| `NEXTSQL_DATABASE_PASS` | Inline database/client password | none |
+| `NEXTSQL_SERVER_USER` | Server/bootstrap principal; never a client fallback | none |
+| `NEXTSQL_SERVER_PASSWORD_FILE` | Preferred server/bootstrap password-file path | none |
+| `NEXTSQL_SERVER_PASS` | Inline server/bootstrap password for automation | none |
 | `NEXTSQL_DATABASE` | Hello `database` field | empty (optional; server compares only if both sides set — `protocol/server.go`) |
 | `NEXTSQL_TLS_CA` | PEM CA / server cert | none |
+| `NEXTSQL_TLS_SERVER_NAME` | TLS certificate/SNI server name | host from `NEXTSQL_ADDR` |
 | `NEXTSQL_INSECURE` | `true`/`1`/`yes` → `InsecureNoTLS` | false |
-| `NEXTSQL_MIGRATIONS_DIR` | Migration directory | `./migrations` |
+| `NEXTSQL_MIGRATION_DIR` | Migration directory | `./migrations` |
 | `NEXTSQL_TENANT` | Optional `SET TENANT` after connect (migrate/exec) | unset |
 
 **Local-mode only**
@@ -213,16 +225,16 @@ A value is “set” when it is non-empty after trim. Empty environment variable
 #### A.6 Password resolution
 
 ```
-if password-file flag or NEXTSQL_PASSWORD_FILE is set:
+if password-file flag or NEXTSQL_DATABASE_PASSWORD_FILE is set:
     password = auth.ReadPasswordFile(path)
-else if NEXTSQL_PASSWORD is set:
+else if NEXTSQL_DATABASE_PASS is set:
     password = that value
-    print one-line stderr warning: "using NEXTSQL_PASSWORD from the environment; prefer NEXTSQL_PASSWORD_FILE"
+    print one-line stderr warning: "using NEXTSQL_DATABASE_PASS from the environment; prefer NEXTSQL_DATABASE_PASSWORD_FILE"
 else:
     error: password required
 ```
 
-**Security tradeoff (inline password):** process listings, systemd `Environment=`, CI logs, and crash dumps can leak `NEXTSQL_PASSWORD`. A mode-`0600` file cannot be stolen from `ps`. Official docs and examples use the file. Inline is permitted so GitHub Actions can pass `secrets.NEXTSQL_PASSWORD` without writing a workspace file; the Action example still prefers a file in `/run` when practical.
+**Security tradeoff (inline password):** process listings, systemd `Environment=`, CI logs, and crash dumps can leak `NEXTSQL_DATABASE_PASS`. A mode-`0600` file cannot be stolen from `ps`. Official docs and examples use the file. Inline is permitted so GitHub Actions can pass a database-password secret without writing a workspace file; the Action example still prefers a file in `/run` when practical.
 
 Do **not** add `NEXTSQL_ROOT_KEY` or accept raw key bytes in the environment.
 
@@ -285,7 +297,7 @@ nextsql migrate repair --confirm
 Global migrate flags (all subcommands):
 
 ```
---dir DIR            migrations directory (default NEXTSQL_MIGRATIONS_DIR or ./migrations)
+--dir DIR            migrations directory (default NEXTSQL_MIGRATION_DIR or ./migrations)
 --addr --user --password-file --database --tls-ca --insecure
 --env-file --no-env
 --tenant VALUE       optional SET TENANT after connect (also NEXTSQL_TENANT)
@@ -453,7 +465,7 @@ Advisory locks do not exist. The history PK insert **is** the lock (B.3). Two CI
 
 #### C.1 Directory and naming
 
-Default directory: `./migrations` (override `--dir` / `NEXTSQL_MIGRATIONS_DIR`).
+Default directory: `./migrations` (override `--dir` / `NEXTSQL_MIGRATION_DIR`).
 
 ```
 migrations/
@@ -469,7 +481,7 @@ Pattern:
 ^(\d{14})_([a-z0-9_]+)\.(up|down)\.sql$
 ```
 
-- Version is a 14-digit UTC timestamp `YYYYMMDDHHMMSS`. `migrate create NAME` starts from `time.Now().UTC()` and, if `<version>_<slug>.up.sql` already exists in `--dir`, retries with that timestamp **plus one second** (repeat until free, cap 60 attempts then error). Same-second scripted creates therefore get distinct versions instead of a validate collision.
+- Version is a 14-digit UTC timestamp `YYYYMMDDHHMMSS` used as a monotonically increasing identifier. `migrate create NAME` starts at the later of `time.Now().UTC()` or one second after the latest existing version, then advances only on an atomic version-claim collision. There is no fixed retry window: same-second and bulk scripted creates continue into future-formatted versions without waiting for wall-clock time.
 - `NAME` is slugged: lowercase, non-`[a-z0-9]+` → `_`, trim, max 64 chars.
 - Pairing: a version may have up only (forward-only). Down without up is a validate error.
 - Versions must be unique. Two files with the same timestamp fail `validate`.
@@ -1173,31 +1185,31 @@ NextSQL’s advantage is **one CLI** (`nextsql`) that already does backup/HA/exe
 ```bash
 # .env  — safe to commit if it contains no secrets
 NEXTSQL_ADDR=127.0.0.1:7210
-NEXTSQL_USER=app
+NEXTSQL_DATABASE_USER=app
 NEXTSQL_INSECURE=true
-NEXTSQL_MIGRATIONS_DIR=./migrations
+NEXTSQL_MIGRATION_DIR=./migrations
 # NEXTSQL_DATABASE is optional; leave unset on 0.1.0-dev
 ```
 
 ```bash
 # .env.local  — gitignored
-NEXTSQL_PASSWORD_FILE=/home/dev/secrets/nextsql.pw
+NEXTSQL_DATABASE_PASSWORD_FILE=/home/dev/secrets/nextsql.pw
 # Optional local-only operator vars; ignored by exec/migrate:
 # NEXTSQL_DATA_DIR=/var/lib/nextsql
 # NEXTSQL_KEY_FILE=/etc/nextsql/root.key
 ```
 
-Do **not** put the root key path in the committed `.env`. Do **not** put `NEXTSQL_PASSWORD=...` in a committed file.
+Do **not** put the root key path in the committed `.env`. Do **not** put `NEXTSQL_DATABASE_PASS=...` in a committed file.
 
 #### G.2 Example `.env` — remote VPS
 
 ```bash
 # .env.production  — loaded with --env-file on the migrate runner, not on the DB host
 NEXTSQL_ADDR=db.example.com:7210
-NEXTSQL_USER=migrator
-NEXTSQL_PASSWORD_FILE=/run/secrets/nextsql-migrator.pw
+NEXTSQL_DATABASE_USER=migrator
+NEXTSQL_DATABASE_PASSWORD_FILE=/run/secrets/nextsql-migrator.pw
 NEXTSQL_TLS_CA=/etc/nextsql/ca.pem
-NEXTSQL_MIGRATIONS_DIR=./migrations
+NEXTSQL_MIGRATION_DIR=./migrations
 # no NEXTSQL_KEY_FILE — the VPS nextsqld has the key; CI must not
 ```
 
@@ -1345,10 +1357,10 @@ jobs:
     runs-on: ubuntu-latest
     env:
       NEXTSQL_ADDR: 127.0.0.1:7210
-      NEXTSQL_USER: ci
-      NEXTSQL_PASSWORD_FILE: /tmp/nextsql.pw
+      NEXTSQL_DATABASE_USER: ci
+      NEXTSQL_DATABASE_PASSWORD_FILE: /tmp/nextsql.pw
       NEXTSQL_INSECURE: "true"
-      NEXTSQL_MIGRATIONS_DIR: migrations
+      NEXTSQL_MIGRATION_DIR: migrations
     steps:
       - uses: actions/checkout@v4
 
@@ -1401,7 +1413,7 @@ Notes:
 - The Action builds from this repo (drivers are not published).
 - Root key lives in `/tmp/nsql-keys`, **not** in `env:`.
 - `migrate` never sees `--key-file`.
-- Prefer `NEXTSQL_PASSWORD_FILE` over `NEXTSQL_PASSWORD: ${{ secrets.X }}`. If a hosted server is used instead of a job-local `nextsqld`, write the secret to a `0600` file in `$RUNNER_TEMP` and point `NEXTSQL_PASSWORD_FILE` at it.
+- Prefer `NEXTSQL_DATABASE_PASSWORD_FILE` over `NEXTSQL_DATABASE_PASS: ${{ secrets.X }}`. If a hosted server is used instead of a job-local `nextsqld`, write the secret to a `0600` file in `$RUNNER_TEMP` and point `NEXTSQL_DATABASE_PASSWORD_FILE` at it.
 
 ---
 
@@ -1526,7 +1538,7 @@ Scan overlay ∪ `Cat.List()` via `Session.lookup` (chosen) avoids dual catalog 
 
 | Attacker | New surface | Control |
 |---|---|---|
-| CI log scraper | `NEXTSQL_PASSWORD` | Prefer password file; warn; never print password; `nerr` messages stay secret-free |
+| CI log scraper | `NEXTSQL_DATABASE_PASS` | Prefer password file; warn; never print password; `nerr` messages stay secret-free |
 | Stolen laptop `.env.local` | Password file path, maybe key path | `.env.local` gitignored; key file unused by migrate; mode 0600 |
 | Malicious migration in a PR | Arbitrary SQL as migrator user | Code review; least-privilege `migrator` role; dry-run + validate in CI |
 | Query abuse via 32-way join | CPU/memory | `MaxJoinTables` ≤ 8; existing budgets |
@@ -1554,7 +1566,7 @@ Scan overlay ∪ `Cat.List()` via `Session.lookup` (chosen) avoids dual catalog 
 
 ### Logging
 
-- CLI: stdout is user-facing tables / migrate progress (`applied 20260818120100 create_orders`); stderr is warnings (`using NEXTSQL_PASSWORD`).
+- CLI: stdout is user-facing tables / migrate progress (`applied 20260818120100 create_orders`); stderr is warnings (`using NEXTSQL_DATABASE_PASS`).
 - Server: existing structured logger; add `fk_violation` and `fk_cascade` debug fields (`table`, `constraint`, `rows`) — never row payloads or keys.
 - Never log passwords, key paths in production info logs, or unlock material.
 
@@ -1609,7 +1621,7 @@ Genuine forks. Each has a **recommended default** for implementation to proceed.
    History uses `DECIMAL(1,0)` to avoid a type project. A real `BOOL` column would be nicer.  
    **Recommend:** do not add BOOL in these PRs.
 
-3. **`NEXTSQL_PASSWORD` allowed at all?**  
+3. **`NEXTSQL_DATABASE_PASS` allowed at all?**
    Some teams ban inline secrets.  
    **Recommend:** allow with a stderr warning; file wins. Revisit if audit requires a `--strict-secrets` flag.
 
@@ -1691,7 +1703,7 @@ Each PR is independently reviewable and mergeable. Align with existing package b
 - **Title:** `migrate: timestamp files, checksums, validate, and create`
 - **Files:** `internal/migrate/files.go`, `split.go`, `validate.go`, `cmd/nextsql` dispatch, tests with fixture dirs
 - **Depends on:** PR 1
-- **Changes:** No server required. `migrate create`, `migrate validate`. Splitter + `parser.Parse` per statement. Reject `BEGIN`/`COMMIT`/`ROLLBACK` and security-catalog stmts (`GRANT`/`REVOKE`/`CREATE|DROP USER|ROLE`). `create` retries `+1s` until the timestamp filename is free in `--dir`.
+- **Changes:** No server required. `migrate create`, `migrate validate`. Splitter + `parser.Parse` per statement. Reject `BEGIN`/`COMMIT`/`ROLLBACK` and security-catalog stmts (`GRANT`/`REVOKE`/`CREATE|DROP USER|ROLE`). `create` allocates after the maximum of the current UTC second and latest existing version, using atomic version claims for concurrent creators.
 
 ### PR 4 — History table and `migrate status` / `up` / `force` / `repair`
 

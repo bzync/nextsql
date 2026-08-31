@@ -140,6 +140,153 @@ func TestBackupRestoreRoundTrip(t *testing.T) {
 	}
 }
 
+func TestPartitionBackupRestoreAndPITR(t *testing.T) {
+	dir := t.TempDir()
+	dataDir, dbPath, _, env := setupSQL(t, dir)
+	db, err := executor.Open(dbPath, env, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := db.Session()
+	for _, sql := range []string{
+		`CREATE TABLE partition_orders (
+			region STRING NOT NULL,
+			id STRING NOT NULL,
+			sku STRING NOT NULL,
+			PRIMARY KEY (region, id)
+		) PARTITION BY LIST (region) (
+			PARTITION americas VALUES IN ('us'),
+			PARTITION europe VALUES IN ('eu')
+		)`,
+		`INSERT INTO partition_orders (region, id, sku) VALUES
+			('us', '1', 'alpha'),
+			('eu', '2', 'beta')`,
+		`CREATE INDEX ix_partition_orders_sku ON partition_orders (sku)`,
+		`ANALYZE partition_orders`,
+	} {
+		if _, err := s.Exec(sql); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	base := filepath.Join(dir, "partition-base.nsbak")
+	if _, err := Create(dataDir, base, env, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	baseOut := filepath.Join(dir, "partition-base-restore")
+	if _, err := Restore(base, baseOut, env, RestoreOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	assertPartitionBackupState(t, filepath.Join(baseOut, config.DataFileName), env, 2, 2, "beta", "europe")
+
+	archDir := filepath.Join(dir, "partition-walarch")
+	arch, err := NewDirArchiver(archDir, env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err = executor.Open(dbPath, env, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.Eng.SetArchiver(arch)
+	s = db.Session()
+	for _, sql := range []string{
+		`ALTER TABLE partition_orders ADD PARTITION asia VALUES IN ('ap')`,
+		`INSERT INTO partition_orders (region, id, sku) VALUES ('ap', '3', 'gamma')`,
+		`ANALYZE partition_orders`,
+	} {
+		if _, err := s.Exec(sql); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.Eng.Checkpoint(); err != nil {
+		t.Fatal(err)
+	}
+	partitionLSN := db.Eng.WAL.NextLSN() - 1
+	if partitionLSN == 0 {
+		t.Fatal("partition lifecycle did not allocate a recovery LSN")
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	pitrOut := filepath.Join(dir, "partition-pitr")
+	if _, err := Restore(base, pitrOut, env, RestoreOptions{ArchiveDir: archDir, UntilLSN: partitionLSN}); err != nil {
+		t.Fatal(err)
+	}
+	assertPartitionBackupState(t, filepath.Join(pitrOut, config.DataFileName), env, 3, 3, "gamma", "asia")
+}
+
+func assertPartitionBackupState(t *testing.T, dbPath string, keys crypto.KeyProvider, wantPartitions int, wantRows uint64, sku, partition string) {
+	t.Helper()
+	db, err := executor.Open(dbPath, keys, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	tab, ok := db.Cat.Get("partition_orders")
+	if !ok || tab.Partitioning == nil || len(tab.Partitioning.Partitions) != wantPartitions || len(tab.Indexes) != 1 {
+		t.Fatalf("restored partition catalog: ok=%v table=%+v", ok, tab)
+	}
+	for _, part := range tab.Partitioning.Partitions {
+		if len(part.Indexes) != 1 || part.Indexes[0].Name != "ix_partition_orders_sku" || part.Indexes[0].Meta == 0 {
+			t.Fatalf("restored partition-local index root: %+v", part)
+		}
+	}
+	stats, ok := db.Cat.Stats("partition_orders")
+	if !ok || stats.Rows != wantRows || len(stats.Partitions) != wantPartitions {
+		t.Fatalf("restored partition statistics: ok=%v stats=%+v", ok, stats)
+	}
+	statsByID := make(map[uint32]uint64, len(stats.Partitions))
+	var partitionRows uint64
+	for _, part := range stats.Partitions {
+		if len(part.Columns) != 3 || len(part.Indexes) != 1 || part.Indexes[0].Name != "ix_partition_orders_sku" {
+			t.Fatalf("restored partition sketches: %+v", part)
+		}
+		statsByID[part.ID] = part.Rows
+		partitionRows += part.Rows
+	}
+	for _, part := range tab.Partitioning.Partitions {
+		if _, ok := statsByID[part.ID]; !ok {
+			t.Fatalf("restored statistics lost stable partition ID %d: %+v", part.ID, stats.Partitions)
+		}
+	}
+	if partitionRows != wantRows {
+		t.Fatalf("restored partition row-count sum=%d want=%d", partitionRows, wantRows)
+	}
+	res, err := db.Session().Exec(`SELECT region, id FROM partition_orders WHERE sku = '` + sku + `'`)
+	if err != nil || len(res.Rows) != 1 || res.Rows[0][0].Str == "" {
+		t.Fatalf("restored partition-local index query: rows=%+v err=%v", res.Rows, err)
+	}
+	plan, err := db.Session().Exec(`EXPLAIN SELECT id FROM partition_orders WHERE region = '` + res.Rows[0][0].Str + `' AND sku = '` + sku + `'`)
+	if err != nil || len(plan.Rows) == 0 {
+		t.Fatalf("restored partition plan: rows=%+v err=%v", plan.Rows, err)
+	}
+	want := "partitions=[" + partition + "]"
+	foundPartition := false
+	foundIndex := false
+	for _, row := range plan.Rows {
+		if len(row) == 0 {
+			continue
+		}
+		if bytes.Contains([]byte(row[0].Str), []byte(want)) {
+			foundPartition = true
+		}
+		if bytes.Contains([]byte(row[0].Str), []byte("IndexScan")) && bytes.Contains([]byte(row[0].Str), []byte("ix_partition_orders_sku")) {
+			foundIndex = true
+		}
+	}
+	if !foundPartition {
+		t.Fatalf("restored partition pruning missing %q: %+v", want, plan.Rows)
+	}
+	if !foundIndex {
+		t.Fatalf("restored partition-local index plan missing: %+v", plan.Rows)
+	}
+}
+
 func TestBackupRestoreWithPendingReclaimIntent(t *testing.T) {
 	dir := t.TempDir()
 	dataDir, dbPath, _, env := setupSQL(t, dir)

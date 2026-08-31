@@ -55,6 +55,19 @@ func (db *DB) partitionHeap(table string, pid uint32) (*btree.Tree, error) {
 	}
 	return tr, nil
 }
+
+// partitionVecFor resolves the partition-local vector-payload store that owns
+// row. Partitioned tables keep vector payloads per partition (not in the shared
+// tab.VecMeta store) so each partition is self-contained for ATTACH/DETACH and
+// partition-local HNSW.
+func (s *Session) partitionVecFor(tab *catalog.Table, row []types.Value) (*btree.Tree, error) {
+	part, err := s.partitionForRow(tab, row)
+	if err != nil {
+		return nil, err
+	}
+	return s.partitionVec(tab, part.ID)
+}
+
 func (s *Session) partitionVec(tab *catalog.Table, pid uint32) (*btree.Tree, error) {
 	if tab == nil || !tab.HasVector() {
 		return nil, nerr.New(nerr.NotFound, "executor.partitionVec", "vector store not open")
@@ -135,95 +148,126 @@ func prunePartitions(tab *catalog.Table, where ast.Expr) []catalog.Partition {
 		return pruneHash(tab, where)
 	case catalog.PartitionList:
 		return pruneValuePartitions(tab, where)
-	case catalog.PartitionTenant:
+	case catalog.PartitionLegacyTenant:
 		return pruneValuePartitions(tab, where)
 	default:
 		return all
 	}
 }
 
+// pruneRange prunes RANGE partitions from a predicate. RANGE partition bounds
+// are lexicographically ordered tuples covering the half-open interval
+// [lower, upper) (lower inclusive, upper exclusive; nil is unbounded). The
+// predicate is reduced to a query lower/upper bound prefix over the ordered
+// partition-key columns: successive equality constraints extend both prefixes,
+// and the first non-equality constraint contributes its own lower/upper literal
+// and terminates the walk. A partition survives only when the query bound
+// interval can intersect its [lower, upper) tuple interval, so a predicate that
+// also pins trailing partition-key columns prunes partitions that merely share a
+// leading value.
+//
+// This mirrors optimizer.pruneRangeForExplain; the executor helper is currently
+// unused but is kept in sync with the authoritative optimizer path.
 func pruneRange(tab *catalog.Table, where ast.Expr) []catalog.Partition {
-	// Single-column RANGE pruning.
-	if tab.Partitioning == nil || len(tab.Partitioning.Columns) != 1 {
-		return tab.Partitioning.Partitions
+	p := tab.Partitioning
+	if p == nil || len(p.Columns) == 0 {
+		return p.Partitions
 	}
-	colOrd := tab.Partitioning.Columns[0]
-	colName := tab.Columns[colOrd].Name
-	// Extract equality or range constraints on partition col.
-	// We handle simple patterns: col = lit, col < lit, col <= lit, col > lit, col >= lit, AND combinations.
-	eq, lower, upper, lowerInc, upperInc := extractRangeConstraints(where, colName)
-	if eq != nil {
-		// equality: find exact partition
-		tmp := []types.Value{*eq}
-		for _, part := range tab.Partitioning.Partitions {
-			lower, upper := part.Values[0], part.Values[1]
-			if lower != nil {
-				cmp, _ := compareValues(tmp, lower)
-				if cmp < 0 || (cmp == 0 && !part.LowerInclusive) {
-					continue
-				}
+	var qlo, qhi []types.Value
+	qloInc, qhiInc := true, true
+	for _, ord := range p.Columns {
+		colType := tab.Columns[ord].Type
+		eq, lower, upper, lowerInc, upperInc := extractRangeConstraints(where, tab.Columns[ord].Name)
+		if eq != nil {
+			cv, err := types.Coerce(*eq, colType)
+			if err != nil {
+				break
 			}
-			if upper != nil {
-				cmp, _ := compareValues(tmp, upper)
-				if cmp > 0 || (cmp == 0 && !part.UpperInclusive) {
-					continue
-				}
-			}
-			return []catalog.Partition{part}
+			qlo = append(qlo, cv)
+			qhi = append(qhi, cv)
+			continue
 		}
-		return []catalog.Partition{}
+		if lower != nil {
+			if cv, err := types.Coerce(*lower, colType); err == nil {
+				qlo = append(qlo, cv)
+				qloInc = lowerInc
+			}
+		}
+		if upper != nil {
+			if cv, err := types.Coerce(*upper, colType); err == nil {
+				qhi = append(qhi, cv)
+				qhiInc = upperInc
+			}
+		}
+		break
 	}
-	// range pruning: keep partitions overlapping [lower, upper]
+	if len(qlo) == 0 && len(qhi) == 0 {
+		return p.Partitions
+	}
+	qloRest := -1
+	if !qloInc {
+		qloRest = 1
+	}
+	qhiRest := 1
+	if !qhiInc {
+		qhiRest = -1
+	}
 	var out []catalog.Partition
-	for _, part := range tab.Partitioning.Partitions {
-		plower, pupper := part.Values[0], part.Values[1]
-		// Check overlap: partition interval [plower, pupper) vs query interval [lower, upper] with inclusives.
-		// For conservative, if no constraint, keep all.
-		if lower != nil && pupper != nil {
-			cmp, _ := compareValues([]types.Value{*lower}, pupper)
-			if cmp > 0 || (cmp == 0 && !upperInc && !part.UpperInclusive) {
-				// Actually need to compare lower vs pupper: if query lower >= partition upper, no overlap.
-				// lower is query lower bound.
-			}
-		}
-		// Simplified: if upper (query) < partition lower, no overlap.
-		if upper != nil && plower != nil {
-			cmp, _ := compareValues([]types.Value{*upper}, plower)
-			if cmp < 0 || (cmp == 0 && !upperInc && !part.LowerInclusive) {
-				continue
-			}
-		}
-		if lower != nil && pupper != nil {
-			cmp, _ := compareValues([]types.Value{*lower}, pupper)
-			if cmp > 0 || (cmp == 0 && !lowerInc && !part.UpperInclusive) {
-				// query lower is after partition upper
-				if cmp > 0 {
-					continue
-				}
-				if cmp == 0 && (!lowerInc || !part.UpperInclusive) {
-					// Need strict: if query lower == partition upper and either exclusive, no overlap? But lower inclusive means query includes lower.
-					// For simplicity, if equality and partition upper exclusive, still no overlap if lower inclusive? Actually partition [a,b), query [b, ...] -> no overlap when equal and partition exclusive.
-					// So continue if not both inclusive.
-					if !part.UpperInclusive {
-						continue
-					}
+	for _, part := range p.Partitions {
+		lo, hi := part.Values[0], part.Values[1]
+		prune := false
+		if lo != nil && len(qhi) > 0 {
+			if c, ok := cmpPartitionBoundTuple(qhi, qhiRest, lo); ok {
+				if c < 0 || (c == 0 && !qhiInc) {
+					prune = true
 				}
 			}
 		}
-		// Additional check: partition lower > query upper -> no overlap already handled.
-		// So keep
-		out = append(out, part)
+		if !prune && hi != nil && len(qlo) > 0 {
+			if c, ok := cmpPartitionBoundTuple(qlo, qloRest, hi); ok && c >= 0 {
+				prune = true
+			}
+		}
+		if !prune {
+			out = append(out, part)
+		}
 	}
 	if len(out) == 0 {
-		// fallback to all if pruning logic uncertain
-		return tab.Partitioning.Partitions
+		return []catalog.Partition{}
 	}
 	return out
 }
 
+// cmpPartitionBoundTuple compares a query bound prefix q against a full partition
+// bound tuple pt using the order-preserving key encoding. When q is a strict
+// prefix of pt, restInf decides the result (-1 == -infinity suffix, +1 == +infinity).
+// ok is false only when a value pair cannot be compared.
+func cmpPartitionBoundTuple(q []types.Value, restInf int, pt []types.Value) (int, bool) {
+	m := len(q)
+	if len(pt) < m {
+		m = len(pt)
+	}
+	for i := 0; i < m; i++ {
+		c, err := compareValues([]types.Value{q[i]}, []types.Value{pt[i]})
+		if err != nil {
+			return 0, false
+		}
+		if c != 0 {
+			return c, true
+		}
+	}
+	if len(q) >= len(pt) {
+		return 0, true
+	}
+	return restInf, true
+}
+
 func pruneValuePartitions(tab *catalog.Table, where ast.Expr) []catalog.Partition {
-	if tab.Partitioning == nil || len(tab.Partitioning.Columns) != 1 {
+	if tab.Partitioning == nil || len(tab.Partitioning.Columns) == 0 {
 		return tab.Partitioning.Partitions
+	}
+	if len(tab.Partitioning.Columns) > 1 {
+		return pruneMultiColumnListPartitions(tab, where)
 	}
 	colOrd := tab.Partitioning.Columns[0]
 	colName := tab.Columns[colOrd].Name
@@ -267,22 +311,81 @@ func pruneValuePartitions(tab *catalog.Table, where ast.Expr) []catalog.Partitio
 	return out
 }
 
+// pruneMultiColumnListPartitions prunes multi-column LIST partitions only when
+// every partition column is pinned to a single equality value; the resulting
+// tuple then matches at most one partition's membership set. Any looser
+// predicate keeps every partition (conservative).
+func pruneMultiColumnListPartitions(tab *catalog.Table, where ast.Expr) []catalog.Partition {
+	tuple := make([]types.Value, len(tab.Partitioning.Columns))
+	for i, ord := range tab.Partitioning.Columns {
+		vals, ok := extractEqualValues(where, tab.Columns[ord].Name)
+		if !ok || len(vals) != 1 {
+			return tab.Partitioning.Partitions
+		}
+		coerced, err := types.Coerce(vals[0], tab.Columns[ord].Type)
+		if err != nil {
+			return tab.Partitioning.Partitions
+		}
+		tuple[i] = coerced
+	}
+	key, err := types.EncodeKey(tuple)
+	if err != nil {
+		return tab.Partitioning.Partitions
+	}
+	for _, part := range tab.Partitioning.Partitions {
+		for _, v := range part.Values {
+			ek, err := types.EncodeKey(v)
+			if err != nil {
+				return tab.Partitioning.Partitions
+			}
+			if bytes.Equal(key, ek) {
+				return []catalog.Partition{part}
+			}
+		}
+	}
+	return []catalog.Partition{}
+}
+
 func pruneHash(tab *catalog.Table, where ast.Expr) []catalog.Partition {
 	if tab == nil || tab.Partitioning == nil {
 		return nil
 	}
-	if len(tab.Partitioning.Columns) != 1 || len(tab.Partitioning.Partitions) == 0 {
-		return tab.Partitioning.Partitions
-	}
-	colOrd := tab.Partitioning.Columns[0]
-	vals, ok := extractEqualValues(where, tab.Columns[colOrd].Name)
-	if !ok || len(vals) == 0 {
+	if len(tab.Partitioning.Columns) == 0 || len(tab.Partitioning.Partitions) == 0 {
 		return tab.Partitioning.Partitions
 	}
 	modulus := tab.Partitioning.Partitions[0].Modulus
 	byRemainder := make(map[uint32]catalog.Partition, len(tab.Partitioning.Partitions))
 	for _, part := range tab.Partitioning.Partitions {
 		byRemainder[part.Remainder] = part
+	}
+	// Multi-column HASH prunes only when every partition column is pinned to a
+	// single equality value; the tuple then hashes to exactly one partition.
+	if len(tab.Partitioning.Columns) > 1 {
+		tuple := make([]types.Value, len(tab.Partitioning.Columns))
+		for i, ord := range tab.Partitioning.Columns {
+			cvals, cok := extractEqualValues(where, tab.Columns[ord].Name)
+			if !cok || len(cvals) != 1 {
+				return tab.Partitioning.Partitions
+			}
+			coerced, err := types.Coerce(cvals[0], tab.Columns[ord].Type)
+			if err != nil {
+				return tab.Partitioning.Partitions
+			}
+			tuple[i] = coerced
+		}
+		remainder, err := catalog.HashPartitionRemainder(tuple, modulus)
+		if err != nil {
+			return tab.Partitioning.Partitions
+		}
+		if part, ok := byRemainder[remainder]; ok {
+			return []catalog.Partition{part}
+		}
+		return tab.Partitioning.Partitions
+	}
+	colOrd := tab.Partitioning.Columns[0]
+	vals, ok := extractEqualValues(where, tab.Columns[colOrd].Name)
+	if !ok || len(vals) == 0 {
+		return tab.Partitioning.Partitions
 	}
 	out := make([]catalog.Partition, 0, len(vals))
 	seen := make(map[uint32]struct{}, len(vals))
@@ -490,6 +593,122 @@ func literalToValue(expr ast.Expr) *types.Value {
 				cv := v.Clone()
 				return &cv
 			}
+		}
+	}
+	return nil
+}
+
+// crossPartitionUniqueIndexes returns the logical secondary UNIQUE indexes of a
+// partitioned table whose uniqueness spans every partition. Partial, expression,
+// JSON-path, spatial, full-text, and vector indexes are excluded (the binder
+// rejects UNIQUE for those on partitioned tables).
+func crossPartitionUniqueIndexes(tab *catalog.Table) []catalog.Index {
+	if tab == nil || tab.Partitioning == nil {
+		return nil
+	}
+	var out []catalog.Index
+	for _, idx := range tab.Indexes {
+		if !idx.Unique || idx.Fulltext || idx.Vector || idx.Spatial || idx.Predicate != nil || idx.HasExpr() || len(idx.Path) > 0 {
+			continue
+		}
+		out = append(out, idx)
+	}
+	return out
+}
+
+// crossPartitionUniqueConflict reports whether key already exists in a
+// partition-local root of idx other than skipID. It is a pure probe: callers
+// that are about to write must first take an exclusive lock on key (via
+// Txn.LockExclusive) so concurrent writers to sibling partitions are
+// serialized on the shared key-lock namespace.
+func (s *Session) crossPartitionUniqueConflict(tab *catalog.Table, idx catalog.Index, skipID uint32, key []byte) (bool, error) {
+	for _, part := range tab.Partitioning.Partitions {
+		if part.ID == skipID {
+			continue
+		}
+		ix, err := s.partitionIndex(tab, part.ID, idx)
+		if err != nil {
+			return false, err
+		}
+		if _, err := s.lookupConflict(s.x.use(ix), key); err == nil {
+			return true, nil
+		} else if !nerr.HasCode(err, nerr.NotFound) {
+			return false, err
+		}
+	}
+	return false, nil
+}
+
+// checkCrossPartitionUnique enforces a secondary UNIQUE index across partitions
+// on the write path. It takes an exclusive lock on the encoded index key (via
+// itx, whose lock namespace is engine-global) so concurrent inserts of the same
+// value into sibling partitions serialize, then probes every other partition's
+// local root. The row's own partition is skipped: an in-partition duplicate is
+// still caught by the ordinary local-root Insert.
+func (s *Session) checkCrossPartitionUnique(tab *catalog.Table, idx catalog.Index, itx *btree.Txn, row []types.Value) error {
+	if tab.Partitioning == nil || row == nil {
+		return nil
+	}
+	if !idx.Unique || idx.Fulltext || idx.Vector || idx.Spatial || idx.Predicate != nil || idx.HasExpr() || len(idx.Path) > 0 {
+		return nil
+	}
+	part, err := s.partitionForRow(tab, row)
+	if err != nil {
+		return err
+	}
+	k, _, err := s.indexKV(tab, idx, row)
+	if err != nil {
+		return err
+	}
+	if err := itx.LockExclusive(k); err != nil {
+		return err
+	}
+	dup, err := s.crossPartitionUniqueConflict(tab, idx, part.ID, k)
+	if err != nil {
+		return err
+	}
+	if dup {
+		return nerr.New(nerr.AlreadyExists, "executor.maintainIndexes", "duplicate key across partitions for UNIQUE index")
+	}
+	return nil
+}
+
+// verifyCrossPartitionUnique fails closed if the same key appears in more than
+// one partition-local root of a freshly (re)built UNIQUE index. Within-partition
+// duplicates are already rejected when each local root is populated, so this
+// only needs to compare each partition against the ones before it.
+func (s *Session) verifyCrossPartitionUnique(tab *catalog.Table, idx catalog.Index) error {
+	if tab == nil || tab.Partitioning == nil {
+		return nil
+	}
+	parts := tab.Partitioning.Partitions
+	for i := 1; i < len(parts); i++ {
+		prev := make([]*btree.Txn, i)
+		for j := 0; j < i; j++ {
+			pix, err := s.partitionIndex(tab, parts[j].ID, idx)
+			if err != nil {
+				return err
+			}
+			prev[j] = s.x.use(pix)
+		}
+		cur, err := s.partitionIndex(tab, parts[i].ID, idx)
+		if err != nil {
+			return err
+		}
+		if err := s.x.use(cur).Range(nil, nil, func(key, _ []byte) error {
+			if err := s.budget().Check(); err != nil {
+				return err
+			}
+			for _, ptx := range prev {
+				if _, err := ptx.Lookup(key); err == nil {
+					return nerr.New(nerr.AlreadyExists, "executor.CreateIndex", "duplicate key across partitions for UNIQUE index")
+				} else if !nerr.HasCode(err, nerr.NotFound) {
+					return err
+				}
+			}
+			return nil
+		}); err != nil {
+			return err
 		}
 	}
 	return nil

@@ -17,8 +17,9 @@ Every persisted family has a version and a compatibility window in
 `[MinReadable, MaxReadable]`. There is no silent rewrite of an unknown
 version. A newer file fails closed; an older-than-min file fails closed.
 
-Current families are all **v1**. Opening a v1 data directory with this
-binary is the supported path. A future format bump must either widen
+Most families are **v1**; the catalog descriptor (`NSCT`) is at **v9**
+(readable 1..9). Opening a data directory this binary can read is the
+supported path. A future format bump must either widen
 `MaxReadable` or add an explicit rewrite increment — not an in-place
 guess.
 
@@ -120,6 +121,11 @@ nextsql-bench [--quick] [--slo] [--slo-max-rows 25000] [--slo-vectors 256]
               [--slo-vector-queries 64]
               [--slo-buffer-pages 4096]
               [--workload all|page|point|range|insert|update|delete|txn|join|agg|json|fulltext|vector|hybrid]
+              [--partition] [--partition-rows 20000]
+              [--readscale] [--readscale-rows 5000] [--readscale-readers 8]
+              [--vecquant] [--vecquant-rows 2000] [--vecquant-dim 128]
+              [--vecquant-sparse-dim 4096] [--vecquant-sparse-nnz 24]
+              [--vecquant-queries 64]
               [--duration 1s] [--rows 128] [--concurrency 1]
 ```
 
@@ -128,6 +134,40 @@ fsync on. Each report includes QPS, TPS (write/txn workloads), p50 / p95
 / p99 / p99.9, allocs, heap, disk delta, WAL bytes, and encryption
 overhead (`enc%` = page AEAD time / elapsed). Page microbenches remain
 for encode/encrypt/buffer I/O.
+
+`--partition` runs the partition-pruning comparison: a RANGE-partitioned table
+(eight single-value bands, `PRIMARY KEY (bucket, id)`) against an unpartitioned
+`PRIMARY KEY (id)` table with the same rows. It reports a pruned single-bucket
+scan, a pruned single-bucket `SUM` over the heap, an unpruned full `SUM` (the
+partitioning overhead check), and routed vs plain `INSERT`, each with p50/p95/p99
+and `speedup` = flat p50 / partitioned p50. Reads run inside a read-only
+transaction so the SELECT result cache never serves them. See
+`docs/partitioning.md` for a published run and how to read it.
+
+`--readscale` runs the follower-read scaling comparison: a 3-node single-leader
+cluster (encryption, WAL, fsync on) driving PK point reads under `STRONG` on the
+leader, `STALE` on the leader, `STALE` over two and three members, and `BOUNDED`
+over three. It reports aggregate read QPS, the leader's slice of it
+(`leader-qps`), p95/p99, and the aggregate ratio against the `stale-1n`
+baseline. It measures the Raft read-barrier cost (`STALE` ≈ 2× `STRONG` on one
+node) and the leader read-offload (~3.5× lower `leader-qps` across three
+members). Aggregate QPS is CPU-bound on one host; a real deployment adds a host
+per replica. See `docs/ha.md` "Read scaling" for a published run.
+
+`--vecquant` runs the quantised-vector comparison: the same vector set seeded
+into an `F32`, an `F16`, and an `I8` column, each with its own HNSW index, plus
+an `F32` column with an `F16`- and an `I8`-quantised HNSW graph
+(`WITH (QUANTIZATION = …)`), an `F32` column with an IVF and an IVF-PQ index,
+and a `SPARSEVECTOR` inverted index on a high-dimension, low-nnz corpus
+(`--vecquant-sparse-dim` / `--vecquant-sparse-nnz`, independent of
+`--vecquant-dim`). It reports per-config on-disk width, raw payload
+size, index-build page delta, total database size, build time, resident heap,
+mean quantisation error, and `NEAREST` p50/p95/p99 + recall@10/@100 (dense rows
+scored against an exact-cosine flat search over the full-precision source
+vectors; the `SPARSE` row against exact-cosine `SparseFlat`). See
+`docs/vector.md` "Size / recall comparison" for the 2026-08-31 published run
+(p50/p95/p99, QPS, heap, recall@10/@100, index/db size, build time) and
+"Production-gating sign-off (Phase 23)" for the dated P23 review.
 
 `--slo` runs the published-number suite: cached PK lookup, secondary-index
 equality, durable single-row INSERT/UPDATE, bulk `INSERT` plus `COUNT(*)` /
@@ -156,44 +196,38 @@ they are not directly comparable DELETE-throughput measurements.
 100M B+Tree invariants: `./scripts/run-btree-soak.sh`. The wrapper uses
 workspace-backed temporary storage (override with `NEXTSQL_SOAK_TMPDIR`),
 retains timestamped output under `.bench-results` (override with
-`NEXTSQL_SOAK_LOG`), defaults to `GOMEMLIMIT=3GiB`, `GOGC=25`, and
-`GODEBUG=madvdontneed=1`, and disables Go's default 10-minute test timeout.
-At one million operations and
-above, the invariant workload commits bounded 4,096-operation write
-transactions. This retains randomized insert/delete coverage and periodic
-full-tree checks without turning the correctness soak into a 100-million-fsync
-benchmark. The batched path completed 1M operations plus final scan and point
-verification in **809.15 s** on 2026-08-21. A first replacement reached 2M
-clean operations, but retained 25 GiB of WAL for a 402 MiB database; its projected
-~1.25 TiB WAL footprint could not finish on the labeled filesystem. The harness
-now installs a durable checkpoint after each successful full-tree invariant
-check, exercising page flush and explicitly discarding checkpoint-obsolete WAL
-segments for this disposable non-PITR workload to bound disk use. A 100K
-checkpointed validation passed. The v4 run reached 24M clean operations
-(`live=11,435,641`) before it was stopped on 2026-08-22. Its replacement,
-`nextsql-btree-100m-p16-v8.service`, reached 44M clean operations
-(`live=17,557,686`) under an 8 GiB memory cap before it was stopped on
-2026-08-25; retained output is `.bench-results/btree-100m-p16-v8.log`.
-Completion still requires the terminal structural check, full scan count, and
-full randomized-keyspace point verification. Override the operation count with
-`NEXTSQL_BTREE_OPS` for a smaller validation run.
+`NEXTSQL_SOAK_LOG`), defaults to `GOMEMLIMIT=3GiB`, `GOGC=40`,
+`GODEBUG=madvdontneed=1`, and `NEXTSQL_BTREE_POOL_PAGES=24576` (a 384 MiB
+resident buffer pool), and disables Go's default 10-minute test timeout.
+At one million operations and above, the invariant workload commits bounded
+4,096-operation write transactions, keeping randomized insert/delete coverage
+and periodic full-tree checks without turning the correctness soak into a
+100-million-fsync benchmark. At scale the harness runs two cadences: a cheap
+checkpoint plus checkpoint-obsolete WAL discard every one million operations
+(bounding WAL disk footprint for this disposable non-PITR workload -- redo is
+full 16 KiB page images), and the expensive full structural `Check()` plus
+scan-count every tenth of the run, each followed by `debug.FreeOSMemory()`.
+`NEXTSQL_BTREE_POOL_PAGES` sizes the resident buffer pool so most of the working
+set stays cached (buffer-miss read/evict traffic, not CPU, dominates the run);
+`NEXTSQL_BTREE_SPACE` optionally caps the key space so the resident tree fits
+the pool on a RAM-constrained host. The batched path completed 1M operations
+plus final scan and point verification in 809.15 s on 2026-08-21.
 
-The `nextsql-btree-100m-p16-v9.service` soak started on 2026-08-25 with
-`NEXTSQL_BTREE_OPS=100000000` and an 8 GiB cap applied to the Snap child scope
-that contains `go test`. It was killed with exit 137 after approximately 11
-hours. Its output is no longer retained, so no terminal structural check, full
-scan count, or randomized point verification can be credited.
-
-The replacement wrapper passed a 100K-operation terminal validation in
-**273.72 s** on 2026-08-26 with its bounded defaults. The full
-`nextsql-btree-100m-p16-v10.service` run then started with the same workload
-seed, `GOMEMLIMIT=3GiB`, `GOGC=25`, `madvdontneed=1`, a 7 GiB cgroup
-memory-high reclaim threshold, an 8 GiB hard memory cap, and 2 GiB bounded
-swap. These cgroup bounds include file-backed page cache. The run was stopped
-by explicit direction before its first 2M-operation checkpoint, so it provides
-no P16 gate evidence. The 100M measurement is paused; a future run still needs
-the terminal structural check, full scan count, and randomized point
-verification.
+Disposition (2026-08-30): the terminal 100M-operation run is paper-closed as a
+deferred standalone measurement, not a P16 release gate -- the same disposition
+applied to P18. The structural correctness it covers is exercised by
+`TestRandomizedDeleteMerges`, `TestCrashDuringMerge`, `TestBulkDeleteSoak`, and
+the published 10M DELETE run, and by the soak itself at every scale it has
+reached: v4 reached 24M clean operations (`live=11,435,641`);
+`nextsql-btree-100m-p16-v8` reached 44M clean operations (`live=17,557,686`)
+under an 8 GiB cap. `nextsql-btree-100m-p16-v9` (`NEXTSQL_BTREE_OPS=100000000`,
+8 GiB cap) was SIGKILLed (exit 137) after ~11 h on a RAM-constrained host with
+no retained terminal evidence; v10 was stopped by explicit direction on
+2026-08-26. The harness was then reworked (resident pool, key-space cap,
+decoupled checkpoint cadence, `int32` bookkeeping, post-check `FreeOSMemory()`)
+so a future terminal run -- full structural check, scan count, randomized point
+verification -- can complete on that host class. Override the operation count
+with `NEXTSQL_BTREE_OPS` for a smaller validation run.
 
 ### Published SLO suite (2026-08-17)
 

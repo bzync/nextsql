@@ -25,6 +25,17 @@ func main() {
 	sloVecQueries := flag.Int("slo-vector-queries", 64, "queries in the HNSW recall+latency sample")
 	sloBuffers := flag.Int("slo-buffer-pages", 4096, "buffer-pool pages for the SLO suite (16 KiB each; 1M-vector HNSW auto-raises to 131072 for atomic build)")
 	sloNoDML := flag.Bool("slo-no-dml", false, "skip bulk UPDATE/DELETE after scan scales")
+	partition := flag.Bool("partition", false, "partition-pruning benchmark: RANGE-partitioned vs otherwise-identical unpartitioned table")
+	partitionRows := flag.Int("partition-rows", 20000, "rows seeded into each table for the partition benchmark")
+	readScale := flag.Bool("readscale", false, "follower-read scaling benchmark: STRONG vs STALE/BOUNDED reads across a 3-node cluster")
+	readScaleRows := flag.Int("readscale-rows", 5000, "rows seeded into the replicated table for the read-scaling benchmark")
+	readScaleReaders := flag.Int("readscale-readers", 8, "concurrent point-read goroutines per serving node")
+	vecQuant := flag.Bool("vecquant", false, "quantised-vector benchmark: F32 vs F16 vs I8 element types, F32 columns with an F16/I8-quantised HNSW graph, F32 columns with an IVF and an IVF-PQ index, and a SPARSEVECTOR inverted index on a high-dimension low-nnz corpus; payload/index/db size, build time, NEAREST latency + recall")
+	vecQuantRows := flag.Int("vecquant-rows", 2000, "vectors seeded into each element type's table for the quantised-vector benchmark")
+	vecQuantDim := flag.Int("vecquant-dim", 128, "vector dimension for the dense quantised-vector rows")
+	vecQuantSparseDim := flag.Int("vecquant-sparse-dim", 4096, "SPARSEVECTOR ambient dimension for the sparse --vecquant row")
+	vecQuantSparseNNZ := flag.Int("vecquant-sparse-nnz", 24, "non-zeros per SPARSEVECTOR in the sparse --vecquant row")
+	vecQuantQueries := flag.Int("vecquant-queries", 64, "NEAREST queries in the quantised-vector recall+latency sample")
 	workload := flag.String("workload", "all", "all|page|"+strings.Join(bench.Known(), "|"))
 	duration := flag.Duration("duration", time.Second, "SQL workload duration")
 	rows := flag.Int("rows", 128, "seeded rows per table")
@@ -44,11 +55,53 @@ func main() {
 		if *sloVec > 32 {
 			*sloVec = 32
 		}
+		if *partitionRows > 512 {
+			*partitionRows = 512
+		}
+		if *readScaleRows > 512 {
+			*readScaleRows = 512
+		}
+		if *readScaleReaders > 2 {
+			*readScaleReaders = 2
+		}
+		if *vecQuantRows > 128 {
+			*vecQuantRows = 128
+		}
+		if *vecQuantDim > 16 {
+			*vecQuantDim = 16
+		}
+		if *vecQuantQueries > 8 {
+			*vecQuantQueries = 8
+		}
+		if *vecQuantSparseDim > 256 {
+			*vecQuantSparseDim = 256
+		}
+		if *vecQuantSparseNNZ > 8 {
+			*vecQuantSparseNNZ = 8
+		}
 	}
 
 	fmt.Printf("nextsql-bench %s (encryption + WAL + fsync enabled)\n", version.String)
 	if *slo {
 		if err := runSLOBenches(*duration, *conc, *sloMax, *sloVec, *sloVecQueries, *sloBuffers, *quick, *sloNoDML); err != nil {
+			fatal(err)
+		}
+		return
+	}
+	if *partition {
+		if err := runPartitionBenches(*duration, *partitionRows); err != nil {
+			fatal(err)
+		}
+		return
+	}
+	if *readScale {
+		if err := runReadScaleBenches(*duration, *readScaleRows, *readScaleReaders); err != nil {
+			fatal(err)
+		}
+		return
+	}
+	if *vecQuant {
+		if err := runVectorQuantBenches(*vecQuantRows, *vecQuantDim, *vecQuantSparseDim, *vecQuantSparseNNZ, *vecQuantQueries); err != nil {
 			fatal(err)
 		}
 		return
@@ -170,6 +223,140 @@ func runSQLBenches(name string, d time.Duration, rows, conc int) error {
 			r.Allocs, r.WALBytes, r.EncryptPct)
 	}
 	return nil
+}
+
+func runPartitionBenches(d time.Duration, rows int) error {
+	dir, err := os.MkdirTemp("", "nextsql-bench-partition-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(dir)
+	suite, err := bench.RunPartition(bench.PartitionOptions{Dir: dir, BufferPages: 512, Duration: d, Rows: rows})
+	if err != nil {
+		return err
+	}
+	hw := suite.Hardware
+	fmt.Printf("\nPartition pruning  os=%s arch=%s cpus=%d  %s  %s  rows/table=%d\n",
+		hw.GOOS, hw.GOARCH, hw.NumCPU, hw.Encryption, hw.Durability, hw.RowCount)
+	fmt.Printf("%-16s %-26s %-14s %9s %10s %10s %10s %9s\n",
+		"workload", "layout", "partitions", "ops", "p50", "p95", "p99", "speedup")
+	for _, r := range suite.Reports {
+		speed := ""
+		if r.Speedup > 0 {
+			speed = fmt.Sprintf("%.2fx", r.Speedup)
+		}
+		fmt.Printf("%-16s %-26s %-14s %9d %10s %10s %10s %9s\n",
+			r.Name, truncate(r.Layout, 26), r.Partitions, r.Ops,
+			r.P50.Round(time.Microsecond), r.P95.Round(time.Microsecond),
+			r.P99.Round(time.Microsecond), speed)
+	}
+	return nil
+}
+
+func runReadScaleBenches(d time.Duration, rows, readers int) error {
+	dir, err := os.MkdirTemp("", "nextsql-bench-readscale-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(dir)
+	if d < time.Second {
+		d = 2 * time.Second
+	}
+	suite, err := bench.RunReadScale(bench.ReadScaleOptions{
+		Dir:         dir,
+		BufferPages: 256,
+		Duration:    d,
+		Readers:     readers,
+		Rows:        rows,
+	})
+	if err != nil {
+		return err
+	}
+	hw := suite.Hardware
+	fmt.Printf("\nFollower-read scaling  os=%s arch=%s cpus=%d gomaxprocs=%d  %s  %s  rows=%d readers/node=%d\n",
+		hw.GOOS, hw.GOARCH, hw.NumCPU, hw.GOMAXPROCS, hw.Encryption, hw.Durability, hw.RowCount, readers)
+	fmt.Printf("3-node single-leader cluster; PK point reads\n")
+	fmt.Printf("aggregate read QPS is CPU-bound on one host; the win is the leader-QPS drop as reads route to followers\n\n")
+	fmt.Printf("%-12s %-8s %6s %8s %12s %12s %10s %10s %9s\n",
+		"phase", "mode", "nodes", "readers", "read-qps", "leader-qps", "p95", "p99", "agg-ratio")
+	for _, r := range suite.Reports {
+		ratio := ""
+		if r.AggQPSRatio > 0 {
+			ratio = fmt.Sprintf("%.2fx", r.AggQPSRatio)
+		}
+		fmt.Printf("%-12s %-8s %6d %8d %12.0f %12.0f %10s %10s %9s\n",
+			r.Name, r.Mode, r.Nodes, r.Readers, r.QPS, r.LeaderQPS,
+			r.P95.Round(time.Microsecond), r.P99.Round(time.Microsecond), ratio)
+	}
+	return nil
+}
+
+func runVectorQuantBenches(rows, dim, sparseDim, sparseNNZ, queries int) error {
+	dir, err := os.MkdirTemp("", "nextsql-bench-vecquant-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(dir)
+	suite, err := bench.RunVectorQuant(bench.VectorQuantOptions{
+		Dir:       dir,
+		Rows:      rows,
+		Dim:       dim,
+		SparseDim: sparseDim,
+		SparseNNZ: sparseNNZ,
+		Queries:   queries,
+		Log: func(msg string) {
+			fmt.Fprintf(os.Stderr, "nextsql-bench: %s\n", msg)
+		},
+	})
+	if err != nil {
+		return err
+	}
+	hw := suite.Hardware
+	fmt.Printf("\nQuantised vectors  os=%s arch=%s cpus=%d  %s  %s\n",
+		hw.GOOS, hw.GOARCH, hw.NumCPU, hw.Encryption, hw.Durability)
+	if len(suite.Reports) > 0 {
+		r := suite.Reports[0]
+		fmt.Printf("%d vectors x %d-d dense, %d NEAREST queries; recall vs exact-cosine flat over the F32 source vectors\n",
+			r.Rows, r.Dim, r.Queries)
+	}
+	for _, r := range suite.Reports {
+		if r.Method == "sparse" {
+			fmt.Printf("SPARSE row: %d vectors x %d-d nnz=%d; recall vs exact-cosine SparseFlat (SQL NEAREST default COSINE, inverted-index + payload re-rank)\n",
+				r.Rows, r.Dim, r.SparseNNZ)
+			break
+		}
+	}
+	fmt.Println()
+	fmt.Println("rows 1-3 compare the stored element type; qh-* keep an F32 column and quantise the HNSW graph (with re-rank); ivf / ivfpq build an IVF / IVF-PQ index over an F32 column; SPARSE is a SPARSEVECTOR inverted index on a high-dimension, low-nnz corpus")
+	fmt.Printf("%-11s %6s %11s %11s %11s %10s %10s %10s %10s %9s %9s\n",
+		"config", "B/elem", "raw-payload", "index", "db", "build", "p50", "p95", "p99", "recall@10", "recall@100")
+	for _, r := range suite.Reports {
+		fmt.Printf("%-11s %6d %11s %11s %11s %10s %10s %10s %10s %9.3f %9.3f\n",
+			r.Element, r.ElemBytes,
+			formatBytes(r.RawPayload), formatBytes(r.IndexBytes), formatBytes(r.DBBytes),
+			r.BuildTime.Round(time.Millisecond),
+			r.P50.Round(time.Microsecond), r.P95.Round(time.Microsecond), r.P99.Round(time.Microsecond),
+			r.RecallAt10, r.RecallAt100)
+		fmt.Printf("       qps=%.0f  heap=%s  quant-err=%.5f", r.QPS, formatBytes(r.HeapBytes), r.QuantErr)
+		if r.Method == "ivf" {
+			fmt.Printf("  ivf-lists=%d ivf-probes=%d", r.IVFLists, r.IVFProbes)
+		}
+		if r.Method == "ivfpq" {
+			fmt.Printf("  ivf-lists=%d ivf-probes=%d pq-subspaces=%d", r.IVFLists, r.IVFProbes, r.IVFSubspaces)
+		}
+		if r.Method == "sparse" {
+			fmt.Printf("  sparse-dim=%d sparse-nnz=%d", r.Dim, r.SparseNNZ)
+		}
+		fmt.Println()
+	}
+	return nil
+}
+
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n-1] + "…"
 }
 
 func runPageBenches() {

@@ -73,7 +73,7 @@ func (t *Table) PartitionForRow(row []types.Value) (*Partition, error) {
 			return &p.Partitions[i], nil
 		}
 		return nil, nerr.New(nerr.NotFound, "catalog.PartitionForRow", "no partition for row")
-	case PartitionTenant, PartitionList:
+	case PartitionLegacyTenant, PartitionList:
 		// LIST-like: exact match
 		key, err := types.EncodeKey(tuple)
 		if err != nil {

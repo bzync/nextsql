@@ -373,6 +373,8 @@ func containsRank(p planner.Logical) bool {
 	switch n := p.(type) {
 	case planner.Search, planner.Nearest, planner.Rerank, planner.Candidates:
 		return true
+	case planner.Facet:
+		return containsRank(n.Input)
 	case planner.Filter:
 		return containsRank(n.Input)
 	case planner.Limit:

@@ -36,8 +36,12 @@ type Result struct {
 	Columns  []string
 	Rows     [][]types.Value
 	Affected int64
-	next     func() (*vector.Batch, error)
-	close    func()
+	Cached   bool // true when Rows came from the bounded query-result cache
+	// IdempotentReplay is true when ExecIdempotent returned a previously
+	// committed mutation result instead of executing the mutation again.
+	IdempotentReplay bool
+	next             func() (*vector.Batch, error)
+	close            func()
 }
 
 // NextBatch returns the next result batch, or nil at end of stream.
@@ -74,23 +78,26 @@ type Session struct {
 	trace                *optimizer.Node
 	limits               scheduler.Limits
 	qbudget              *scheduler.Budget
+	ftHL                 *ftHighlightState
 	params               []Param
 	subqueryResults      map[uint64]*Result
 	cteRows              map[uint64][][]types.Value
 	cteNames             map[string]struct{}
 	automaticMaintenance map[string]uint64
 
-	user     string
-	acl      *security.ACL
-	audit    *security.Log
-	users    *auth.Store
-	registry *security.Registry
-	remote   string
-	tenant   *types.Value
-	execSQL  string // current statement text; reserved history DDL matching
+	user      string
+	authRoles []string
+	acl       *security.ACL
+	audit     *security.Log
+	users     *auth.Store
+	registry  *security.Registry
+	remote    string
+	execSQL   string // current statement text; reserved history DDL matching
 
 	dirtyHNSW       bool
 	pendingHNSW     map[string]*lockedMem
+	dirtyIVF        bool
+	pendingIVF      map[string]*lockedIVF
 	fkProbes        int
 	fkDepth         int
 	fkTouched       int
@@ -108,9 +115,67 @@ type Session struct {
 	// a unique key occupied after this transaction's begin snapshot.
 	conflictWrite bool
 	txnGuard      bool
+	// readConsistency selects how non-mutating statements observe replicated
+	// state. The zero value is ReadStrong.
+	readConsistency ReadConsistency
+	// readStaleness bounds a BOUNDED read. Zero selects DefaultMaxStaleness.
+	readStaleness time.Duration
 }
 
-func (s *Session) SetIdentity(user string)          { s.user = user }
+// SetReadConsistency selects how this session's reads observe replicated
+// state. STRONG (the default) serves every read on the leader behind a
+// verified Raft read barrier. BOUNDED serves any node — leader or a follower
+// still within MaxStaleness of the leader — from local applied state, and
+// rejects a node that has fallen further behind. STALE serves the local
+// node's applied state with no freshness bound.
+func (s *Session) SetReadConsistency(mode ReadConsistency) error {
+	switch mode {
+	case ReadStrong, ReadBounded, ReadStale:
+		s.readConsistency = mode
+		return nil
+	default:
+		return nerr.New(nerr.InvalidArgument, "executor.SetReadConsistency", "unknown read consistency mode")
+	}
+}
+
+// ReadConsistency reports the session read-consistency mode.
+func (s *Session) ReadConsistency() ReadConsistency { return s.readConsistency }
+
+// SetMaxStaleness sets the freshness bound for BOUNDED reads. Zero (the
+// default) selects DefaultMaxStaleness. A negative value is clamped to zero.
+// It has no effect in STRONG or STALE mode.
+func (s *Session) SetMaxStaleness(d time.Duration) {
+	if d < 0 {
+		d = 0
+	}
+	s.readStaleness = d
+}
+
+// MaxStaleness reports the configured BOUNDED-read freshness bound (0 = default).
+func (s *Session) MaxStaleness() time.Duration { return s.readStaleness }
+
+func (s *Session) boundedStaleness() time.Duration {
+	if s.readStaleness > 0 {
+		return s.readStaleness
+	}
+	return DefaultMaxStaleness
+}
+
+func (s *Session) SetIdentity(user string) { s.user = user }
+
+// SetAuthRoles narrows this session's effective privileges to those reachable
+// through the named roles, as carried by a short-lived credential's role
+// scope. An empty slice imposes no narrowing.
+func (s *Session) SetAuthRoles(roles []string) { s.authRoles = roles }
+
+// authAllowed is the single authorization check for this session. It applies
+// the credential's role scope when one is set.
+func (s *Session) authAllowed(user string, priv security.Privilege, scope security.ScopeKind, object string) bool {
+	if s.acl == nil {
+		return true
+	}
+	return s.acl.AllowedScoped(user, s.authRoles, priv, scope, object)
+}
 func (s *Session) User() string                     { return s.user }
 func (s *Session) SetACL(a *security.ACL)           { s.acl = a }
 func (s *Session) SetAudit(l *security.Log)         { s.audit = l }
@@ -131,7 +196,15 @@ type pending struct {
 	dropped            map[string]struct{}
 	renames            map[string]string
 	reclaims           []format.PageID
+	partitionDrops     []string
+	indexDrops         []indexMapDrop
 	taskCancels        []string
+}
+
+type indexMapDrop struct {
+	key       string
+	tree      *btree.Tree
+	partition bool
 }
 
 func newPending() *pending {
@@ -398,13 +471,6 @@ func (s *Session) execAdmitted(ctx context.Context, sql string, params []Param) 
 		}
 		return s.execSecurity(stmt)
 	}
-	if st, ok := stmt.(ast.SetTenant); ok {
-		if err := s.authorize(st); err != nil {
-			s.auditRecord(security.ActionTenant, "", err)
-			return nil, err
-		}
-		return s.execTenant(st)
-	}
 	if st, ok := stmt.(ast.CreateDatabase); ok {
 		if err := s.authorize(st); err != nil {
 			s.auditRecord(security.ActionDDL, st.Name, err)
@@ -418,7 +484,7 @@ func (s *Session) execAdmitted(ctx context.Context, sql string, params []Param) 
 		}
 		return s.execCreateDatabase(planner.CreateDatabase{Name: st.Name, IfNotExists: st.IfNotExists})
 	}
-	stmt, err = s.applyTenant(stmt)
+	stmt, err = s.guardLegacyTenancy(stmt)
 	if err != nil {
 		return nil, err
 	}
@@ -431,6 +497,11 @@ func (s *Session) execAdmitted(ctx context.Context, sql string, params []Param) 
 	if rebuild, ok := stmt.(ast.RebuildIndex); ok {
 		stmt, err = s.resolveRebuildIndex(rebuild)
 		if err != nil {
+			return nil, err
+		}
+	}
+	if isReadStmt(stmt) {
+		if err := s.requireReadConsistency(); err != nil {
 			return nil, err
 		}
 	}
@@ -452,17 +523,19 @@ func (s *Session) execAdmitted(ctx context.Context, sql string, params []Param) 
 		owner = "local"
 	}
 	nextID := s.db.Cat.PeekNext()
-	switch stmt.(type) {
+	switch st := stmt.(type) {
 	case ast.CreateTable, ast.CreateWorkflow, ast.CreateTrigger, ast.CreateSchedule:
 		// Reserve a catalog identity atomically. Gaps after failed DDL are
 		// harmless; duplicate stable identities under concurrent DDL are not.
 		nextID = s.db.Cat.NextID()
+	case ast.AlterTable:
+		if _, ok := st.Cmd.(ast.AlterDetachPartition); ok {
+			// DETACH publishes a new standalone catalog object and therefore
+			// consumes the same non-reusing identity stream as CREATE TABLE.
+			nextID = s.db.Cat.NextID()
+		}
 	}
-	tenant := ""
-	if s.tenant != nil {
-		tenant = s.tenant.String()
-	}
-	bound, err := binder.BindAutomation(stmt, s.lookup, s.lookupWorkflow, s.listWorkflows, s.lookupTrigger, s.listTriggers, s.lookupSchedule, s.listSchedules, nextID, owner, tenant)
+	bound, err := binder.BindAutomation(stmt, s.lookup, s.lookupWorkflow, s.listWorkflows, s.lookupTrigger, s.listTriggers, s.lookupSchedule, s.listSchedules, nextID, owner)
 	if err != nil {
 		return nil, err
 	}
@@ -484,6 +557,21 @@ func (s *Session) execAdmitted(ctx context.Context, sql string, params []Param) 
 	if err != nil {
 		return nil, err
 	}
+	cacheableResult := !s.InTxn() && resultCacheable(stmt) && s.db != nil && s.db.resCache != nil
+	var cacheKey [32]byte
+	var cacheVersion resultVersion
+	if cacheableResult {
+		cacheKey, err = resultCacheKey(sql, s.user, params)
+		if err != nil {
+			return nil, err
+		}
+		cacheVersion = s.db.resultVersion()
+		if cacheVersion.lsn == 0 {
+			cacheableResult = false
+		} else if cached, ok := s.db.resCache.get(cacheKey, cacheVersion); ok {
+			return cached, nil
+		}
+	}
 	s.qbudget = scheduler.NewBudget(ctx, s.limitsOrDefault())
 	defer func() {
 		s.qbudget.Close()
@@ -493,6 +581,9 @@ func (s *Session) execAdmitted(ctx context.Context, sql string, params []Param) 
 		return nil, err
 	}
 	res, runErr := s.run(ctx, out.Plan, out.Trace, sql)
+	if runErr == nil && cacheableResult && s.db.resultVersion() == cacheVersion {
+		s.db.resCache.put(cacheKey, cacheVersion, res)
+	}
 	switch stmt.(type) {
 	case ast.CreateWorkflow, ast.RunWorkflow, ast.AlterWorkflow, ast.DropWorkflow, ast.CreateTrigger, ast.AlterTrigger, ast.DropTrigger, ast.CreateSchedule, ast.AlterSchedule, ast.DropSchedule, ast.CancelTask:
 		s.auditRecord(workflowAuditAction(stmt), sqlObject(stmt), runErr)
@@ -509,6 +600,52 @@ func (s *Session) requireLeader(write bool) error {
 		return nil
 	}
 	return s.db.gate.AllowWrite()
+}
+
+// requireReadConsistency enforces the session read-consistency mode for a
+// non-mutating statement. A single-node deployment has no gate and is
+// unaffected.
+//
+//   - STRONG: served on the leader behind a verified Raft read barrier, so it
+//     observes every previously acknowledged write. A follower — or a leader
+//     that can no longer reach a quorum — is rejected with leader-routing
+//     guidance rather than served stale.
+//   - BOUNDED: served from this node's locally applied state, but only while
+//     the node is the leader or a follower still within MaxStaleness of the
+//     leader. A node that has fallen further behind is rejected so the caller
+//     routes elsewhere.
+//   - STALE: served from local applied state with no freshness check.
+func (s *Session) requireReadConsistency() error {
+	if s == nil || s.db == nil || s.db.gate == nil {
+		return nil
+	}
+	switch s.readConsistency {
+	case ReadStale:
+		return nil
+	case ReadBounded:
+		fg, ok := s.db.gate.(FollowerReadGate)
+		if !ok {
+			return nil
+		}
+		return fg.FollowerReadHealthy(s.boundedStaleness())
+	default:
+		rg, ok := s.db.gate.(ReadGate)
+		if !ok {
+			return nil
+		}
+		return rg.StrongReadBarrier()
+	}
+}
+
+// isReadStmt reports whether a statement only reads user data and is therefore
+// subject to the session read-consistency barrier.
+func isReadStmt(stmt ast.Stmt) bool {
+	switch stmt.(type) {
+	case ast.Select, ast.SetOperation, ast.With:
+		return true
+	default:
+		return false
+	}
 }
 
 func isMutating(plan planner.Logical) bool {
@@ -886,6 +1023,8 @@ func (s *Session) commit() (*Result, error) {
 		s.pending = nil
 		s.dirtyHNSW = false
 		s.pendingHNSW = nil
+		s.dirtyIVF = false
+		s.pendingIVF = nil
 		s.releaseTxnGuard()
 		return nil, err
 	}
@@ -1007,10 +1146,14 @@ func (s *Session) commit() (*Result, error) {
 	}
 	s.installPendingHNSW()
 	var reclaims []format.PageID
+	var partitionDrops []string
+	var indexDrops []indexMapDrop
 	maintenanceChanges := make(map[string]uint64)
 	var taskCancels []string
 	if s.pending != nil {
 		reclaims = append(reclaims, s.pending.reclaims...)
+		partitionDrops = append(partitionDrops, s.pending.partitionDrops...)
+		indexDrops = append(indexDrops, s.pending.indexDrops...)
 		for name, changed := range s.pending.maintenanceChanges {
 			maintenanceChanges[name] = changed
 		}
@@ -1024,12 +1167,14 @@ func (s *Session) commit() (*Result, error) {
 	s.pending = nil
 	s.dirtyHNSW = false
 	s.pendingHNSW = nil
+	s.dirtyIVF = false
+	s.pendingIVF = nil
 	if s.db != nil && s.db.metrics != nil {
 		s.db.metrics.AddCommit()
 	}
 	s.releaseTxnGuard()
-	if len(reclaims) > 0 {
-		s.db.queueCommittedReclaims(reclaims)
+	if len(reclaims) > 0 || len(partitionDrops) > 0 || len(indexDrops) > 0 {
+		s.db.queueCommittedReclaims(reclaims, partitionDrops, indexDrops)
 	}
 	if len(maintenanceChanges) > 0 {
 		if s.automaticMaintenance == nil {
@@ -1071,6 +1216,8 @@ func (s *Session) abort() error {
 	s.pending = nil
 	s.dirtyHNSW = false
 	s.pendingHNSW = nil
+	s.dirtyIVF = false
+	s.pendingIVF = nil
 	s.releaseTxnGuard()
 	return err
 }

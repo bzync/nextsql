@@ -11,6 +11,16 @@ import (
 	nsvec "github.com/bzync/nextsql/internal/vector"
 )
 
+// graphMetric is the HNSW graph distance for a vector column: HAMMING for a
+// BITVECTOR column, COSINE otherwise. (SQL has no per-index metric clause yet;
+// search-time USING falls back to exact flat when it differs from the graph.)
+func graphMetric(colType types.Type) nsvec.Metric {
+	if colType.VecElem == types.VecBit {
+		return nsvec.MetricHamming
+	}
+	return nsvec.MetricCosine
+}
+
 func (s *Session) vecOf(t *catalog.Table) (*btree.Tree, error) {
 	if t == nil || t.VecMeta == 0 {
 		return nil, nerr.New(nerr.NotFound, "executor.vecOf", "vector store not open")
@@ -73,11 +83,20 @@ func (s *Session) putVectors(tab *catalog.Table, pk []byte, row []types.Value) e
 	if tab == nil || !tab.HasVector() {
 		return nil
 	}
-	vs, err := s.ensureVec(tab)
-	if err != nil {
-		return err
+	var vtx *btree.Txn
+	if tab.Partitioning != nil {
+		vt, err := s.partitionVecFor(tab, row)
+		if err != nil {
+			return err
+		}
+		vtx = s.x.use(vt)
+	} else {
+		vs, err := s.ensureVec(tab)
+		if err != nil {
+			return err
+		}
+		vtx = s.x.use(vs)
 	}
-	vtx := s.x.use(vs)
 	for i, c := range tab.Columns {
 		if c.Type.Kind != types.KindVector {
 			continue
@@ -89,12 +108,25 @@ func (s *Session) putVectors(tab *catalog.Table, pk []byte, row []types.Value) e
 			}
 			continue
 		}
-		if err := nsvec.Check(row[i].Vec, int(c.Type.Precision)); err != nil {
-			return err
-		}
-		raw, err := nsvec.EncodePayload(row[i].Vec)
-		if err != nil {
-			return err
+		var raw []byte
+		if c.Type.VecElem == types.VecSparse {
+			sv, err := valueSparse(row[i], uint32(c.Type.Precision))
+			if err != nil {
+				return err
+			}
+			raw, err = nsvec.EncodeSparse(sv)
+			if err != nil {
+				return err
+			}
+		} else {
+			if err := nsvec.Check(row[i].Vec, int(c.Type.Precision)); err != nil {
+				return err
+			}
+			var err error
+			raw, err = nsvec.EncodePayloadElem(row[i].Vec, c.Type.VecElem)
+			if err != nil {
+				return err
+			}
 		}
 		if err := s.upsert(vtx, key, raw); err != nil {
 			return err
@@ -103,15 +135,27 @@ func (s *Session) putVectors(tab *catalog.Table, pk []byte, row []types.Value) e
 	return nil
 }
 
-func (s *Session) deleteVectors(tab *catalog.Table, pk []byte) error {
-	if tab == nil || !tab.HasVector() || tab.VecMeta == 0 {
+func (s *Session) deleteVectors(tab *catalog.Table, pk []byte, row []types.Value) error {
+	if tab == nil || !tab.HasVector() {
 		return nil
 	}
-	vs, err := s.vecOf(tab)
-	if err != nil {
-		return err
+	var vtx *btree.Txn
+	if tab.Partitioning != nil {
+		vt, err := s.partitionVecFor(tab, row)
+		if err != nil {
+			return err
+		}
+		vtx = s.x.use(vt)
+	} else {
+		if tab.VecMeta == 0 {
+			return nil
+		}
+		vs, err := s.vecOf(tab)
+		if err != nil {
+			return err
+		}
+		vtx = s.x.use(vs)
 	}
-	vtx := s.x.use(vs)
 	for i, c := range tab.Columns {
 		if c.Type.Kind != types.KindVector {
 			continue
@@ -124,12 +168,22 @@ func (s *Session) deleteVectors(tab *catalog.Table, pk []byte) error {
 }
 
 func (s *Session) hydrate(tab *catalog.Table, row []types.Value) error {
-	if tab == nil || !tab.HasVector() || tab.VecMeta == 0 {
+	if tab == nil || !tab.HasVector() {
+		return nil
+	}
+	if tab.Partitioning == nil && tab.VecMeta == 0 {
 		return nil
 	}
 	need := false
 	for i, c := range tab.Columns {
-		if c.Type.Kind == types.KindVector && i < len(row) && !row[i].Null && (row[i].VecRef || len(row[i].Vec) == 0) {
+		if c.Type.Kind != types.KindVector || i >= len(row) || row[i].Null {
+			continue
+		}
+		if row[i].VecRef {
+			need = true
+			break
+		}
+		if c.Type.VecElem != types.VecSparse && len(row[i].Vec) == 0 {
 			need = true
 			break
 		}
@@ -137,20 +191,33 @@ func (s *Session) hydrate(tab *catalog.Table, row []types.Value) error {
 	if !need {
 		return nil
 	}
-	vs, err := s.vecOf(tab)
-	if err != nil {
-		return err
+	var vtx *btree.Txn
+	if tab.Partitioning != nil {
+		vt, err := s.partitionVecFor(tab, row)
+		if err != nil {
+			return err
+		}
+		vtx = s.x.use(vt)
+	} else {
+		vs, err := s.vecOf(tab)
+		if err != nil {
+			return err
+		}
+		vtx = s.x.use(vs)
 	}
 	pk, err := types.EncodeKey(tab.PKValues(row))
 	if err != nil {
 		return err
 	}
-	vtx := s.x.use(vs)
 	for i, c := range tab.Columns {
 		if c.Type.Kind != types.KindVector || i >= len(row) || row[i].Null {
 			continue
 		}
-		if !row[i].VecRef && len(row[i].Vec) > 0 {
+		if c.Type.VecElem == types.VecSparse {
+			if !row[i].VecRef {
+				continue
+			}
+		} else if !row[i].VecRef && len(row[i].Vec) > 0 {
 			continue
 		}
 		raw, err := vtx.Lookup(nsvec.PayloadKey(uint16(i), pk))
@@ -159,6 +226,14 @@ func (s *Session) hydrate(tab *catalog.Table, row []types.Value) error {
 				return nerr.New(nerr.Corruption, "executor.hydrate", "missing vector payload")
 			}
 			return err
+		}
+		if c.Type.VecElem == types.VecSparse {
+			sv, err := nsvec.DecodeSparse(raw)
+			if err != nil {
+				return err
+			}
+			row[i] = types.SparseValue(sv.Indices, sv.Values, c.Type)
+			continue
 		}
 		vec, err := nsvec.DecodePayload(raw)
 		if err != nil {
@@ -214,6 +289,7 @@ func (s *Session) upsert(tx *btree.Txn, k, v []byte) error {
 type sqlGraph struct {
 	itx, vtx *btree.Txn
 	col      uint16
+	quant    uint8 // traversal quantisation (0 / VecF16 / VecI8) from the index def
 	snap     txn.Snapshot
 	useSnap  bool
 }
@@ -279,11 +355,45 @@ func (g *sqlGraph) SaveNode(pk []byte, n nsvec.Node) error {
 }
 
 func (g *sqlGraph) LoadVec(pk []byte) ([]float32, error) {
+	if g.quant != 0 {
+		raw, err := g.lookup(g.itx, nsvec.QVecKey(pk))
+		if err == nil {
+			return nsvec.DecodePayload(raw)
+		}
+		if !nerr.HasCode(err, nerr.NotFound) {
+			return nil, err
+		}
+		// No quantised copy yet (mid-rebuild / legacy row): fall back to the
+		// column payload, quantised on the fly so traversal stays consistent.
+		full, ferr := g.LoadVecFull(pk)
+		if ferr != nil {
+			return nil, ferr
+		}
+		return nsvec.QuantizeElem(full, g.quant), nil
+	}
+	return g.LoadVecFull(pk)
+}
+
+// LoadVecFull returns the full-precision column payload, independent of any
+// index-level traversal quantisation.
+func (g *sqlGraph) LoadVecFull(pk []byte) ([]float32, error) {
 	raw, err := g.lookup(g.vtx, nsvec.PayloadKey(g.col, pk))
 	if err != nil {
 		return nil, err
 	}
 	return nsvec.DecodePayload(raw)
+}
+
+// SaveQVec writes the traversal-quantised copy of v into the graph tree.
+func (g *sqlGraph) SaveQVec(pk []byte, v []float32) error {
+	if g.quant == 0 {
+		return nil
+	}
+	raw, err := nsvec.EncodePayloadElem(v, g.quant)
+	if err != nil {
+		return err
+	}
+	return g.store(g.itx, nsvec.QVecKey(pk), raw)
 }
 
 func (g *sqlGraph) RangeNodes(fn func(pk []byte, n nsvec.Node) error) error {
@@ -354,6 +464,18 @@ func (m *lockedMem) LoadVec(pk []byte) ([]float32, error) {
 	return m.mem.LoadVec(pk)
 }
 
+func (m *lockedMem) LoadVecFull(pk []byte) ([]float32, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.mem.LoadVecFull(pk)
+}
+
+func (m *lockedMem) SaveQVec(pk []byte, v []float32) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.mem.SaveQVec(pk, v)
+}
+
 func (m *lockedMem) PutVec(pk []byte, v []float32) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -381,15 +503,20 @@ func (db *DB) setHNSW(key string, m *lockedMem) {
 	db.hnswMu.Unlock()
 }
 
+// dropHNSW evicts the process-local committed copy of one vector index — both
+// the HNSW graph and the IVF quantiser share this keyspace and generation.
 func (db *DB) dropHNSW(key string) {
 	if db == nil {
 		return
 	}
 	db.hnswMu.Lock()
 	delete(db.hnsw, key)
+	delete(db.ivf, key)
 	db.hnswMu.Unlock()
 }
 
+// dropAllHNSW invalidates every process-local committed vector-index copy (HNSW
+// and IVF) by bumping the shared generation and clearing both maps.
 func (db *DB) dropAllHNSW() {
 	if db == nil {
 		return
@@ -397,6 +524,28 @@ func (db *DB) dropAllHNSW() {
 	db.hnswMu.Lock()
 	db.hnswGen++
 	db.hnsw = make(map[string]*lockedMem)
+	db.ivf = make(map[string]*lockedIVF)
+	db.hnswMu.Unlock()
+}
+
+func (db *DB) getIVF(key string) *lockedIVF {
+	if db == nil {
+		return nil
+	}
+	db.hnswMu.RLock()
+	defer db.hnswMu.RUnlock()
+	return db.ivf[key]
+}
+
+func (db *DB) setIVF(key string, m *lockedIVF) {
+	if db == nil || m == nil {
+		return
+	}
+	db.hnswMu.Lock()
+	if db.ivf == nil {
+		db.ivf = make(map[string]*lockedIVF)
+	}
+	db.ivf[key] = m
 	db.hnswMu.Unlock()
 }
 
@@ -413,7 +562,7 @@ func (s *Session) installPendingHNSW() {
 	if s == nil || s.db == nil {
 		return
 	}
-	if s.dirtyHNSW {
+	if s.dirtyHNSW || s.dirtyIVF {
 		s.db.dropAllHNSW()
 	}
 	gen := s.db.hnswGeneration()
@@ -421,6 +570,12 @@ func (s *Session) installPendingHNSW() {
 		if m != nil {
 			m.gen = gen
 			s.db.setHNSW(k, m)
+		}
+	}
+	for k, m := range s.pendingIVF {
+		if m != nil {
+			m.gen = gen
+			s.db.setIVF(k, m)
 		}
 	}
 }
@@ -461,7 +616,8 @@ func (s *Session) buildVectorIndex(tab *catalog.Table, idx catalog.Index, htx *b
 	}
 	col := idx.Columns[0]
 	dim := tab.Columns[col].Type.Precision
-	mem := nsvec.NewMem(dim, nsvec.MetricCosine)
+	mem := nsvec.NewMem(dim, graphMetric(tab.Columns[col].Type))
+	mem.Meta.Quant = idx.VecQuant
 	if err := htx.Range(nil, nil, func(_, val []byte) error {
 		if err := s.budget().Check(); err != nil {
 			return err
@@ -528,6 +684,195 @@ func (s *Session) maintainVectorIndex(tab *catalog.Table, idx catalog.Index, old
 	return nil
 }
 
+// graphOfPartition binds one partition-local HNSW graph: the partition's index
+// root holds the graph nodes, the partition's vector store holds the payloads.
+func (s *Session) graphOfPartition(tab *catalog.Table, part catalog.Partition, idx catalog.Index) (*sqlGraph, error) {
+	if len(idx.Columns) != 1 {
+		return nil, nerr.New(nerr.Internal, "executor.graphOfPartition", "VECTOR INDEX column count")
+	}
+	ix, err := s.partitionIndex(tab, part.ID, idx)
+	if err != nil {
+		return nil, err
+	}
+	vs, err := s.partitionVec(tab, part.ID)
+	if err != nil {
+		return nil, err
+	}
+	g := &sqlGraph{itx: s.x.use(ix), vtx: s.x.use(vs), col: uint16(idx.Columns[0]), quant: idx.VecQuant}
+	if snap, ok, err := s.fkWriteSnap(); err != nil {
+		return nil, err
+	} else if ok {
+		g.snap = snap
+		g.useSnap = true
+	}
+	return g, nil
+}
+
+// hnswGraphPartition returns a searchable partition-local HNSW graph, preferring
+// the process-local committed mem copy keyed by partitionIndexKey.
+func (s *Session) hnswGraphPartition(tab *catalog.Table, part catalog.Partition, idx catalog.Index) (nsvec.Graph, error) {
+	if s.dirtyHNSW {
+		return s.graphOfPartition(tab, part, idx)
+	}
+	key := partitionIndexKey(tab.Name, part.ID, idx.Name)
+	gen := uint64(0)
+	if s.db != nil {
+		gen = s.db.hnswGeneration()
+		if m := s.db.getHNSW(key); m != nil && m.gen == gen {
+			return m, nil
+		}
+	}
+	g, err := s.graphOfPartition(tab, part, idx)
+	if err != nil {
+		return nil, err
+	}
+	mem, err := nsvec.LoadMem(g)
+	if err != nil {
+		if nerr.HasCode(err, nerr.NotFound) {
+			return g, nil
+		}
+		return nil, err
+	}
+	locked := newLockedMem(mem, gen)
+	if s.db != nil {
+		s.db.setHNSW(key, locked)
+	}
+	return locked, nil
+}
+
+// buildPartitionVectorIndex streams one partition heap into one partition-local
+// HNSW graph. Vector payloads are already in the partition's vector store.
+func (s *Session) buildPartitionVectorIndex(tab *catalog.Table, idx catalog.Index, part catalog.Partition, htx *btree.Txn, progress *rebuildProgress) error {
+	if len(idx.Columns) != 1 {
+		return nerr.New(nerr.InvalidArgument, "executor.buildPartitionVectorIndex", "VECTOR INDEX column count")
+	}
+	col := idx.Columns[0]
+	dim := tab.Columns[col].Type.Precision
+	mem := nsvec.NewMem(dim, graphMetric(tab.Columns[col].Type))
+	mem.Meta.Quant = idx.VecQuant
+	if err := htx.Range(nil, nil, func(_, val []byte) error {
+		if err := s.budget().Check(); err != nil {
+			return err
+		}
+		row, err := s.decodeHeapRow(tab, val)
+		if err != nil {
+			return err
+		}
+		v := row[col]
+		if v.Null {
+			progress.add(1, 0)
+			return nil
+		}
+		pk, err := types.EncodeKey(tab.PKValues(row))
+		if err != nil {
+			return err
+		}
+		mem.PutVec(pk, v.Vec)
+		progress.add(1, 1)
+		return nsvec.Insert(mem, pk, v.Vec)
+	}); err != nil {
+		return err
+	}
+	g, err := s.graphOfPartition(tab, part, idx)
+	if err != nil {
+		return err
+	}
+	if err := nsvec.Persist(g, mem); err != nil {
+		return err
+	}
+	if s.pendingHNSW == nil {
+		s.pendingHNSW = make(map[string]*lockedMem)
+	}
+	s.pendingHNSW[partitionIndexKey(tab.Name, part.ID, idx.Name)] = newLockedMem(mem, 0)
+	return nil
+}
+
+// initPartitionVectorIndex persists an empty HNSW graph for a freshly created
+// partition-local vector root (ADD PARTITION on a table that already has a
+// vector index).
+func (s *Session) initPartitionVectorIndex(tab *catalog.Table, idx catalog.Index, part catalog.Partition) error {
+	if len(idx.Columns) != 1 {
+		return nerr.New(nerr.InvalidArgument, "executor.initPartitionVectorIndex", "VECTOR INDEX column count")
+	}
+	s.dirtyHNSW = true
+	mem := nsvec.NewMem(tab.Columns[idx.Columns[0]].Type.Precision, graphMetric(tab.Columns[idx.Columns[0]].Type))
+	mem.Meta.Quant = idx.VecQuant
+	g, err := s.graphOfPartition(tab, part, idx)
+	if err != nil {
+		return err
+	}
+	if err := nsvec.Persist(g, mem); err != nil {
+		return err
+	}
+	if s.pendingHNSW == nil {
+		s.pendingHNSW = make(map[string]*lockedMem)
+	}
+	s.pendingHNSW[partitionIndexKey(tab.Name, part.ID, idx.Name)] = newLockedMem(mem, 0)
+	return nil
+}
+
+// maintainPartitionVectorIndex applies one row change to a partition-local HNSW
+// graph. It marks the process-local mem copies dirty so search reloads from disk.
+func (s *Session) maintainPartitionVectorIndex(tab *catalog.Table, idx catalog.Index, part catalog.Partition, old, neu []types.Value) error {
+	s.dirtyHNSW = true
+	g, err := s.graphOfPartition(tab, part, idx)
+	if err != nil {
+		return err
+	}
+	if old != nil {
+		pk, err := types.EncodeKey(tab.PKValues(old))
+		if err != nil {
+			return err
+		}
+		if err := nsvec.Delete(g, pk); err != nil {
+			return err
+		}
+	}
+	if neu != nil {
+		col := idx.Columns[0]
+		if col >= len(neu) || neu[col].Null {
+			return nil
+		}
+		pk, err := types.EncodeKey(tab.PKValues(neu))
+		if err != nil {
+			return err
+		}
+		return nsvec.Insert(g, pk, neu[col].Vec)
+	}
+	return nil
+}
+
+// maintainCrossPartitionVectorIndex moves one row's HNSW entry between two
+// partition-local graphs. Payloads have already been re-homed by putVectors /
+// deleteVectors.
+func (s *Session) maintainCrossPartitionVectorIndex(tab *catalog.Table, idx catalog.Index, oldPart, newPart catalog.Partition, old, neu []types.Value) error {
+	s.dirtyHNSW = true
+	og, err := s.graphOfPartition(tab, oldPart, idx)
+	if err != nil {
+		return err
+	}
+	oldPK, err := types.EncodeKey(tab.PKValues(old))
+	if err != nil {
+		return err
+	}
+	if err := nsvec.Delete(og, oldPK); err != nil {
+		return err
+	}
+	col := idx.Columns[0]
+	if col >= len(neu) || neu[col].Null {
+		return nil
+	}
+	ng, err := s.graphOfPartition(tab, newPart, idx)
+	if err != nil {
+		return err
+	}
+	newPK, err := types.EncodeKey(tab.PKValues(neu))
+	if err != nil {
+		return err
+	}
+	return nsvec.Insert(ng, newPK, neu[col].Vec)
+}
+
 func (s *Session) graphOf(tab *catalog.Table, idx catalog.Index) (*sqlGraph, error) {
 	ix, err := s.indexOf(tab, idx)
 	if err != nil {
@@ -540,7 +885,7 @@ func (s *Session) graphOf(tab *catalog.Table, idx catalog.Index) (*sqlGraph, err
 	if len(idx.Columns) != 1 {
 		return nil, nerr.New(nerr.Internal, "executor.graphOf", "VECTOR INDEX column count")
 	}
-	g := &sqlGraph{itx: s.x.use(ix), vtx: s.x.use(vs), col: uint16(idx.Columns[0])}
+	g := &sqlGraph{itx: s.x.use(ix), vtx: s.x.use(vs), col: uint16(idx.Columns[0]), quant: idx.VecQuant}
 	if snap, ok, err := s.fkWriteSnap(); err != nil {
 		return nil, err
 	} else if ok {

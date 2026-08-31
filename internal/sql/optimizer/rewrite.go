@@ -61,6 +61,17 @@ func rewriteOnce(p planner.Logical) planner.Logical {
 		}
 		n.Input = in
 		return n
+	case planner.Facet:
+		in := rewriteOnce(n.Input)
+		if n.Limit == 0 {
+			return planner.Empty{Names: []string{"facet", "value", "count"}}
+		}
+		if e, ok := in.(planner.Empty); ok {
+			e.Names = []string{"facet", "value", "count"}
+			return e
+		}
+		n.Input = in
+		return n
 	case planner.Nearest:
 		in := rewriteOnce(n.Input)
 		if e, ok := in.(planner.Empty); ok {
@@ -76,11 +87,28 @@ func rewriteOnce(p planner.Logical) planner.Logical {
 		n.Input = in
 		return n
 	case planner.Rerank:
-		in := rewriteOnce(n.Input)
-		if e, ok := in.(planner.Empty); ok {
-			return e
+		n = mapRerankInputs(n, rewriteOnce)
+		if _, ok := n.Input.(planner.Empty); ok {
+			kept := n.Extra[:0]
+			for _, e := range n.Extra {
+				if _, empty := e.(planner.Empty); !empty && e != nil {
+					kept = append(kept, e)
+				}
+			}
+			if len(kept) == 0 {
+				return planner.Empty{Names: namesOf(n)}
+			}
+			n.Input = kept[0]
+			n.Extra = kept[1:]
+		} else if len(n.Extra) > 0 {
+			kept := n.Extra[:0]
+			for _, e := range n.Extra {
+				if _, empty := e.(planner.Empty); !empty && e != nil {
+					kept = append(kept, e)
+				}
+			}
+			n.Extra = kept
 		}
-		n.Input = in
 		return n
 	case planner.Join:
 		return rewriteJoin(n)
@@ -447,8 +475,11 @@ func usedByProject(n planner.Project) []int {
 		need = unionOrds(need, colOrds(f.Pred, tab))
 	}
 	if s, ok := n.Input.(planner.Search); ok {
-		need = unionOrds(need, []int{s.Column})
+		need = unionOrds(need, s.Columns)
 		need = unionOrds(need, colOrds(s.Residual, tab))
+	}
+	if f, ok := n.Input.(planner.Facet); ok {
+		need = unionOrds(need, f.Columns)
 	}
 	if nr, ok := n.Input.(planner.Nearest); ok {
 		need = unionOrds(need, []int{nr.Column})
@@ -459,7 +490,8 @@ func usedByProject(n planner.Project) []int {
 		need = unionOrds(need, colOrds(c.Residual, tab))
 	}
 	if r, ok := n.Input.(planner.Rerank); ok {
-		need = unionOrds(need, []int{r.SearchCol, r.NearestCol})
+		need = unionOrds(need, r.SearchCols)
+		need = unionOrds(need, []int{r.NearestCol, r.SparseCol})
 	}
 	return need
 }
@@ -473,8 +505,11 @@ func pruneInput(p planner.Logical, need []int) planner.Logical {
 		n.Input = pruneInput(n.Input, unionOrds(need, colOrds(n.Pred, tableOf(n.Input))))
 		return n
 	case planner.Search:
-		n.Needed = unionOrds(need, []int{n.Column})
+		n.Needed = unionOrds(need, n.Columns)
 		n.Input = pruneInput(n.Input, n.Needed)
+		return n
+	case planner.Facet:
+		n.Input = pruneInput(n.Input, n.Columns)
 		return n
 	case planner.Nearest:
 		n.Needed = unionOrds(need, []int{n.Column})
@@ -485,8 +520,9 @@ func pruneInput(p planner.Logical, need []int) planner.Logical {
 		n.Input = pruneInput(n.Input, n.Needed)
 		return n
 	case planner.Rerank:
-		n.Input = pruneInput(n.Input, unionOrds(need, []int{n.SearchCol, n.NearestCol}))
-		return n
+		need = unionOrds(need, n.SearchCols)
+		need = unionOrds(need, []int{n.NearestCol, n.SparseCol})
+		return mapRerankInputs(n, func(p planner.Logical) planner.Logical { return pruneInput(p, need) })
 	case planner.Limit:
 		n.Input = pruneInput(n.Input, need)
 		return n
@@ -589,6 +625,7 @@ func formatPlan(p planner.Logical) string {
 		} else {
 			s += " seq"
 		}
+		s += formatSearchWeights(n.Weights)
 		if n.Residual != nil {
 			s += " residual=" + formatExpr(n.Residual)
 		}
@@ -596,10 +633,35 @@ func formatPlan(p planner.Logical) string {
 			return s + "\n" + indent(formatPlan(n.Input))
 		}
 		return s
+	case planner.Facet:
+		s := "Facet"
+		for i, name := range n.Names {
+			if i == 0 {
+				s += " "
+			} else {
+				s += ","
+			}
+			s += name
+		}
+		if n.Limit >= 0 {
+			s += " limit=" + itoa64(n.Limit)
+		}
+		return s + "\n" + indent(formatPlan(n.Input))
 	case planner.Nearest:
 		s := "Nearest " + tableName(n.Table)
 		if n.IndexName != "" {
-			s += " " + n.IndexName + " hnsw"
+			method := "hnsw"
+			if idx := indexByName(n.Table, n.IndexName); idx != nil {
+				switch idx.VecMethod {
+				case catalog.VecMethodIVF:
+					method = "ivf"
+				case catalog.VecMethodIVFPQ:
+					method = "ivfpq"
+				case catalog.VecMethodSPARSE:
+					method = "sparse"
+				}
+			}
+			s += " " + n.IndexName + " " + method
 		} else {
 			s += " flat"
 		}
@@ -620,7 +682,11 @@ func formatPlan(p planner.Logical) string {
 		}
 		return s
 	case planner.Rerank:
-		return "Rerank " + rerankDetail(n) + "\n" + indent(formatPlan(n.Input))
+		s := "Rerank " + rerankDetail(n) + "\n" + indent(formatPlan(n.Input))
+		for _, e := range n.Extra {
+			s += "\n" + indent(formatPlan(e))
+		}
+		return s
 	case planner.IndexScan:
 		s := "IndexScan " + tableName(n.Table)
 		if n.PK {

@@ -337,7 +337,7 @@ func TestBindForeignKeyCascadeCycle(t *testing.T) {
 	}
 }
 
-func TestBindForeignKeyTenantRule(t *testing.T) {
+func TestBindForeignKeyTenantIDIsNotSpecial(t *testing.T) {
 	parentStmt, err := parser.Parse(`CREATE TABLE customers (
 		tenant_id UUID NOT NULL,
 		id UUID PRIMARY KEY
@@ -356,15 +356,15 @@ func TestBindForeignKeyTenantRule(t *testing.T) {
 		}
 		return nil, false
 	}
-	// tenant parent <- global child
+	// A legacy marker name no longer changes foreign-key validation.
 	global, err := parser.Parse(`CREATE TABLE notes (id UUID PRIMARY KEY, customer_id UUID REFERENCES customers (id))`)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Bind(global, lookup, 2); err == nil {
-		t.Fatal("expected tenant parent / global child error")
+	if _, err := Bind(global, lookup, 2); err != nil {
+		t.Fatal(err)
 	}
-	// both tenant-keyed without tenant_id in FK
+	// An ordinary FK does not need to include the legacy marker column.
 	both, err := parser.Parse(`CREATE TABLE orders (
 		tenant_id UUID NOT NULL,
 		id UUID PRIMARY KEY,
@@ -373,8 +373,8 @@ func TestBindForeignKeyTenantRule(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Bind(both, lookup, 3); err == nil {
-		t.Fatal("expected tenant_id-in-FK error")
+	if _, err := Bind(both, lookup, 3); err != nil {
+		t.Fatal(err)
 	}
 
 	acctStmt, err := parser.Parse(`CREATE TABLE accounts (
@@ -396,7 +396,7 @@ func TestBindForeignKeyTenantRule(t *testing.T) {
 		}
 		return nil, false
 	}
-	// tenant_id present on both sides but not the same FK position
+	// Column order follows the declared FK mapping without a hidden pairing rule.
 	mispair, err := parser.Parse(`CREATE TABLE orders (
 		tenant_id UUID NOT NULL,
 		id UUID PRIMARY KEY,
@@ -406,8 +406,8 @@ func TestBindForeignKeyTenantRule(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := bindErr(mispair, lookupAcct, 5); err == nil || !strings.Contains(err.Error(), "tenant_id") {
-		t.Fatalf("expected tenant pairing error, got %v", err)
+	if _, err := Bind(mispair, lookupAcct, 5); err != nil {
+		t.Fatal(err)
 	}
 	// same set, tenant columns aligned
 	aligned, err := parser.Parse(`CREATE TABLE orders (
@@ -454,6 +454,46 @@ func TestBindFulltextIndexRequiresText(t *testing.T) {
 	}
 }
 
+func TestBindHighlightRequiresSearch(t *testing.T) {
+	st, err := parser.Parse(`CREATE TABLE t (id UUID PRIMARY KEY, body TEXT)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := Bind(st, func(string) (*catalog.Table, bool) { return nil, false }, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tab := b.(CreateTable).Table
+	ok, err := parser.Parse(`SELECT HIGHLIGHT(body) FROM t SEARCH body FOR 'cat'`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Bind(ok, func(string) (*catalog.Table, bool) { return tab, true }, 1); err != nil {
+		t.Fatal(err)
+	}
+	snip, err := parser.Parse(`SELECT SNIPPET(body, 64) FROM t SEARCH body FOR 'cat'`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Bind(snip, func(string) (*catalog.Table, bool) { return tab, true }, 1); err != nil {
+		t.Fatal(err)
+	}
+	noSearch, err := parser.Parse(`SELECT HIGHLIGHT(body) FROM t`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Bind(noSearch, func(string) (*catalog.Table, bool) { return tab, true }, 1); err == nil {
+		t.Fatal("expected HIGHLIGHT without SEARCH to fail")
+	}
+	inWhere, err := parser.Parse(`SELECT id FROM t WHERE HIGHLIGHT(body) = 'x' SEARCH body FOR 'cat'`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Bind(inWhere, func(string) (*catalog.Table, bool) { return tab, true }, 1); err == nil {
+		t.Fatal("expected HIGHLIGHT in WHERE to fail")
+	}
+}
+
 func TestBindSearch(t *testing.T) {
 	st, err := parser.Parse(`CREATE TABLE t (id UUID PRIMARY KEY, body TEXT)`)
 	if err != nil {
@@ -472,7 +512,7 @@ func TestBindSearch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if bs.(Select).SearchCol != 1 {
+	if len(bs.(Select).SearchCols) != 1 || bs.(Select).SearchCols[0] != 1 {
 		t.Fatalf("%+v", bs)
 	}
 	ix, err := parser.Parse(`CREATE FULLTEXT INDEX ix ON t (body)`)
@@ -485,6 +525,203 @@ func TestBindSearch(t *testing.T) {
 	}
 	if !bi.(CreateIndex).Index.Fulltext {
 		t.Fatal("expected fulltext")
+	}
+	if bi.(CreateIndex).Index.FTAnalyzer != 0 {
+		t.Fatal("default analyzer must be simple")
+	}
+	en, err := parser.Parse(`CREATE FULLTEXT INDEX ix_en ON t (body) WITH (ANALYZER = 'english')`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	be, err := Bind(en, func(string) (*catalog.Table, bool) { return tab, true }, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if idx := be.(CreateIndex).Index; idx.FTAnalyzer != catalog.FTAnalyzerEnglish || idx.FTVersion != catalog.FTAnalyzerEnglishV3 {
+		t.Fatalf("english analyzer %+v", idx)
+	}
+	sm, err := parser.Parse(`CREATE FULLTEXT INDEX ix_s ON t (body) WITH (ANALYZER = 'simple')`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bsm, err := Bind(sm, func(string) (*catalog.Table, bool) { return tab, true }, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bsm.(CreateIndex).Index.FTAnalyzer != catalog.FTAnalyzerSimple {
+		t.Fatal("simple analyzer")
+	}
+	bad, err := parser.Parse(`CREATE FULLTEXT INDEX ix_bad ON t (body) WITH (ANALYZER = 'klingon')`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Bind(bad, func(string) (*catalog.Table, bool) { return tab, true }, 1); err == nil {
+		t.Fatal("expected unknown analyzer")
+	}
+	fr, err := parser.Parse(`CREATE FULLTEXT INDEX ix_fr ON t (body) WITH (ANALYZER = 'french')`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bfr, err := Bind(fr, func(string) (*catalog.Table, bool) { return tab, true }, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if idx := bfr.(CreateIndex).Index; idx.FTAnalyzer != catalog.FTAnalyzerFrench || idx.FTVersion != catalog.FTAnalyzerFrenchV1 {
+		t.Fatalf("french analyzer %+v", idx)
+	}
+	de, err := parser.Parse(`CREATE FULLTEXT INDEX ix_de ON t (body) WITH (ANALYZER = 'german')`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bde, err := Bind(de, func(string) (*catalog.Table, bool) { return tab, true }, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if idx := bde.(CreateIndex).Index; idx.FTAnalyzer != catalog.FTAnalyzerGerman {
+		t.Fatalf("german analyzer %+v", idx)
+	}
+	es, err := parser.Parse(`CREATE FULLTEXT INDEX ix_es ON t (body) WITH (ANALYZER = 'spanish')`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bes, err := Bind(es, func(string) (*catalog.Table, bool) { return tab, true }, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if idx := bes.(CreateIndex).Index; idx.FTAnalyzer != catalog.FTAnalyzerSpanish {
+		t.Fatalf("spanish analyzer %+v", idx)
+	}
+}
+
+func TestBindFulltextMultiField(t *testing.T) {
+	st, err := parser.Parse(`CREATE TABLE t (id UUID PRIMARY KEY, title STRING, body TEXT, n DECIMAL(4,0))`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := Bind(st, func(string) (*catalog.Table, bool) { return nil, false }, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tab := b.(CreateTable).Table
+	ix, err := parser.Parse(`CREATE FULLTEXT INDEX ix ON t (title, body)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bi, err := Bind(ix, func(string) (*catalog.Table, bool) { return tab, true }, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := bi.(CreateIndex).Index
+	if !got.Fulltext || len(got.Columns) != 2 || got.Columns[0] != 1 || got.Columns[1] != 2 {
+		t.Fatalf("multi-field index %+v", got)
+	}
+	sel, err := parser.Parse(`SELECT id FROM t SEARCH title, body FOR 'x'`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bs, err := Bind(sel, func(string) (*catalog.Table, bool) { return tab, true }, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cols := bs.(Select).SearchCols; len(cols) != 2 || cols[0] != 1 || cols[1] != 2 {
+		t.Fatalf("search cols %v", cols)
+	}
+	if bs.(Select).SearchWeights != nil {
+		t.Fatalf("unweighted %v", bs.(Select).SearchWeights)
+	}
+	wsel, err := parser.Parse(`SELECT id FROM t SEARCH title WEIGHT 3, body FOR 'x'`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bsw, err := Bind(wsel, func(string) (*catalog.Table, bool) { return tab, true }, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w := bsw.(Select).SearchWeights; len(w) != 2 || w[0] != 3 || w[1] != 1 {
+		t.Fatalf("search weights %v", w)
+	}
+	one, err := parser.Parse(`SELECT id FROM t SEARCH title WEIGHT 1 FOR 'x'`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bo, err := Bind(one, func(string) (*catalog.Table, bool) { return tab, true }, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bo.(Select).SearchWeights != nil {
+		t.Fatalf("WEIGHT 1 is a no-op: %v", bo.(Select).SearchWeights)
+	}
+	dup, err := parser.Parse(`CREATE FULLTEXT INDEX ix_dup ON t (title, title)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Bind(dup, func(string) (*catalog.Table, bool) { return tab, true }, 1); err == nil {
+		t.Fatal("expected duplicate FULLTEXT column")
+	}
+	mixed, err := parser.Parse(`CREATE FULLTEXT INDEX ix_mix ON t (title, n)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Bind(mixed, func(string) (*catalog.Table, bool) { return tab, true }, 1); err == nil {
+		t.Fatal("expected non-text FULLTEXT column")
+	}
+	dupSearch, err := parser.Parse(`SELECT id FROM t SEARCH title, title FOR 'x'`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Bind(dupSearch, func(string) (*catalog.Table, bool) { return tab, true }, 1); err == nil {
+		t.Fatal("expected duplicate SEARCH column")
+	}
+}
+
+func TestBindFulltextFacet(t *testing.T) {
+	st, err := parser.Parse(`CREATE TABLE t (id UUID PRIMARY KEY, title STRING, body TEXT, category STRING, n DECIMAL(4,0), payload JSON)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := Bind(st, func(string) (*catalog.Table, bool) { return nil, false }, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tab := b.(CreateTable).Table
+	ok, err := parser.Parse(`SELECT * FROM t SEARCH body FOR 'x' FACET category`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bs, err := Bind(ok, func(string) (*catalog.Table, bool) { return tab, true }, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := bs.(Select)
+	if len(got.FacetCols) != 1 || got.FacetCols[0] != 3 {
+		t.Fatalf("facet cols %v", got.FacetCols)
+	}
+	if len(got.OutNames) != 3 || got.OutNames[0] != "facet" || got.OutNames[1] != "value" || got.OutNames[2] != "count" {
+		t.Fatalf("facet output %v", got.OutNames)
+	}
+	num, err := parser.Parse(`SELECT * FROM t SEARCH body FOR 'x' FACET n`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Bind(num, func(string) (*catalog.Table, bool) { return tab, true }, 1); err != nil {
+		t.Fatalf("DECIMAL facet: %v", err)
+	}
+	for _, q := range []string{
+		`SELECT title FROM t SEARCH body FOR 'x' FACET category`,
+		`SELECT * FROM t WHERE true FACET category`,
+		`SELECT * FROM t SEARCH body FOR 'x' FACET title, title`,
+		`SELECT * FROM t SEARCH body FOR 'x' FACET payload`,
+		`SELECT * FROM t SEARCH body FOR 'x' FACET category ORDER BY count`,
+		`SELECT DISTINCT * FROM t SEARCH body FOR 'x' FACET category`,
+		`SELECT * FROM t SEARCH body FOR 'x' FACET category OFFSET 1`,
+	} {
+		stmt, err := parser.Parse(q)
+		if err != nil {
+			t.Fatalf("parse %s: %v", q, err)
+		}
+		if _, err := Bind(stmt, func(string) (*catalog.Table, bool) { return tab, true }, 1); err == nil {
+			t.Fatalf("expected fail-closed: %s", q)
+		}
 	}
 }
 
@@ -516,6 +753,27 @@ func TestBindVectorIndexAndNearest(t *testing.T) {
 	if !bi.(CreateIndex).Index.Vector {
 		t.Fatal("expected vector index")
 	}
+	if bi.(CreateIndex).Index.VecQuant != 0 {
+		t.Fatalf("default quantisation = %d, want 0", bi.(CreateIndex).Index.VecQuant)
+	}
+	qix, err := parser.Parse(`CREATE VECTOR INDEX ixq ON t (emb) USING HNSW WITH (QUANTIZATION = 'I8')`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	qbi, err := Bind(qix, func(string) (*catalog.Table, bool) { return tab, true }, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if qbi.(CreateIndex).Index.VecQuant != types.VecI8 {
+		t.Fatalf("quantised index VecQuant = %d, want %d", qbi.(CreateIndex).Index.VecQuant, types.VecI8)
+	}
+	badQ, err := parser.Parse(`CREATE VECTOR INDEX ixb ON t (emb) USING HNSW WITH (QUANTIZATION = 'f64')`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Bind(badQ, func(string) (*catalog.Table, bool) { return tab, true }, 1); err == nil {
+		t.Fatal("expected unknown quantisation to be rejected")
+	}
 	sel, err := parser.Parse(`SELECT id FROM t NEAREST emb TO (1, 0, 0) LIMIT 3`)
 	if err != nil {
 		t.Fatal(err)
@@ -526,6 +784,181 @@ func TestBindVectorIndexAndNearest(t *testing.T) {
 	}
 	if bs.(Select).NearestCol != 1 {
 		t.Fatalf("%+v", bs)
+	}
+
+	// IVF method: LISTS is required, PROBES cannot exceed it, and the params
+	// round-trip onto the catalog index.
+	ivf, err := parser.Parse(`CREATE VECTOR INDEX ivx ON t (emb) USING IVF WITH (LISTS = 16, PROBES = 4)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ivbi, err := Bind(ivf, func(string) (*catalog.Table, bool) { return tab, true }, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if idx := ivbi.(CreateIndex).Index; idx.VecMethod != catalog.VecMethodIVF || idx.IVFLists != 16 || idx.IVFProbes != 4 {
+		t.Fatalf("ivf index %+v", idx)
+	}
+	noLists, _ := parser.Parse(`CREATE VECTOR INDEX ivx ON t (emb) USING IVF`)
+	if _, err := Bind(noLists, func(string) (*catalog.Table, bool) { return tab, true }, 1); err == nil {
+		t.Fatal("expected USING IVF without LISTS to be rejected")
+	}
+	tooMany, _ := parser.Parse(`CREATE VECTOR INDEX ivx ON t (emb) USING IVF WITH (LISTS = 4, PROBES = 9)`)
+	if _, err := Bind(tooMany, func(string) (*catalog.Table, bool) { return tab, true }, 1); err == nil {
+		t.Fatal("expected PROBES > LISTS to be rejected")
+	}
+
+	// IVF-PQ method: SUBSPACES is required and must divide the vector dimension.
+	pq, _ := parser.Parse(`CREATE VECTOR INDEX pqx ON t (emb) USING IVFPQ WITH (LISTS = 8, PROBES = 2, SUBSPACES = 3)`)
+	pqbi, err := Bind(pq, func(string) (*catalog.Table, bool) { return tab, true }, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if idx := pqbi.(CreateIndex).Index; idx.VecMethod != catalog.VecMethodIVFPQ || idx.IVFLists != 8 || idx.IVFProbes != 2 || idx.IVFSubspaces != 3 {
+		t.Fatalf("ivfpq index %+v", idx)
+	}
+	noSub, _ := parser.Parse(`CREATE VECTOR INDEX pqx ON t (emb) USING IVFPQ WITH (LISTS = 8)`)
+	if _, err := Bind(noSub, func(string) (*catalog.Table, bool) { return tab, true }, 1); err == nil {
+		t.Fatal("expected USING IVFPQ without SUBSPACES to be rejected")
+	}
+	badSub, _ := parser.Parse(`CREATE VECTOR INDEX pqx ON t (emb) USING IVFPQ WITH (LISTS = 8, SUBSPACES = 2)`)
+	if _, err := Bind(badSub, func(string) (*catalog.Table, bool) { return tab, true }, 1); err == nil {
+		t.Fatal("expected SUBSPACES not dividing the dimension to be rejected")
+	}
+	subOnIVF, _ := parser.Parse(`CREATE VECTOR INDEX pqx ON t (emb) USING IVF WITH (LISTS = 8, SUBSPACES = 3)`)
+	if _, err := Bind(subOnIVF, func(string) (*catalog.Table, bool) { return tab, true }, 1); err == nil {
+		t.Fatal("expected SUBSPACES on USING IVF to be rejected")
+	}
+
+	// A centroid at a very high dimension does not fit one B+Tree record, so IVF
+	// is rejected up front (HNSW on the same column is fine).
+	wideDDL, err := parser.Parse(`CREATE TABLE w (id UUID PRIMARY KEY, emb VECTOR<F32,4096>)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wb, err := Bind(wideDDL, func(string) (*catalog.Table, bool) { return nil, false }, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wtab := wb.(CreateTable).Table
+	wideIVF, _ := parser.Parse(`CREATE VECTOR INDEX wx ON w (emb) USING IVF WITH (LISTS = 8)`)
+	if _, err := Bind(wideIVF, func(string) (*catalog.Table, bool) { return wtab, true }, 1); err == nil {
+		t.Fatal("expected IVF at dimension 4096 to be rejected")
+	}
+	wideHNSW, _ := parser.Parse(`CREATE VECTOR INDEX wx ON w (emb) USING HNSW`)
+	if _, err := Bind(wideHNSW, func(string) (*catalog.Table, bool) { return wtab, true }, 1); err != nil {
+		t.Fatalf("HNSW at dimension 4096 should be allowed: %v", err)
+	}
+}
+
+func TestBindBitvector(t *testing.T) {
+	st, err := parser.Parse(`CREATE TABLE t (id UUID PRIMARY KEY, sig BITVECTOR<16>, emb VECTOR<F32,4>)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := Bind(st, func(string) (*catalog.Table, bool) { return nil, false }, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tab := b.(CreateTable).Table
+	if tab.Columns[1].Type.VecElem != types.VecBit || tab.Columns[1].Type.String() != "BITVECTOR<16>" {
+		t.Fatalf("bitvector column type: %+v", tab.Columns[1].Type)
+	}
+	lookup := func(string) (*catalog.Table, bool) { return tab, true }
+
+	// HAMMING requires a BITVECTOR column; a BITVECTOR requires HAMMING.
+	mustBindErr(t, lookup, `SELECT id FROM t NEAREST emb TO (1,0,0,0) USING HAMMING LIMIT 1`)
+	mustBindErr(t, lookup, `SELECT id FROM t NEAREST sig TO (1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0) USING COSINE LIMIT 1`)
+
+	// Default (no USING) and explicit HAMMING both bind on a BITVECTOR column.
+	for _, q := range []string{
+		`SELECT id FROM t NEAREST sig TO (1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0) LIMIT 1`,
+		`SELECT id FROM t NEAREST sig TO (1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0) USING HAMMING LIMIT 1`,
+	} {
+		ps, err := parser.Parse(q)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Bind(ps, lookup, 1); err != nil {
+			t.Fatalf("bind %q: %v", q, err)
+		}
+	}
+
+	// QUANTIZATION on a BITVECTOR index is rejected.
+	mustBindErr(t, lookup, `CREATE VECTOR INDEX ix ON t (sig) USING HNSW WITH (QUANTIZATION = 'I8')`)
+}
+
+func TestBindSparsevector(t *testing.T) {
+	st, err := parser.Parse(`CREATE TABLE t (id UUID PRIMARY KEY, emb SPARSEVECTOR<64>, dense VECTOR<F32,4>)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := Bind(st, func(string) (*catalog.Table, bool) { return nil, false }, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tab := b.(CreateTable).Table
+	if tab.Columns[1].Type.VecElem != types.VecSparse || tab.Columns[1].Type.String() != "SPARSEVECTOR<64>" {
+		t.Fatalf("sparse column type: %+v", tab.Columns[1].Type)
+	}
+	lookup := func(string) (*catalog.Table, bool) { return tab, true }
+
+	sp, err := parser.Parse(`CREATE VECTOR INDEX ix ON t (emb) USING SPARSE`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bi, err := Bind(sp, lookup, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if idx := bi.(CreateIndex).Index; idx.VecMethod != catalog.VecMethodSPARSE || !idx.Vector {
+		t.Fatalf("sparse index %+v", idx)
+	}
+
+	mustBindErr(t, lookup, `CREATE VECTOR INDEX ix ON t (emb) USING HNSW`)
+	mustBindErr(t, lookup, `CREATE VECTOR INDEX ix ON t (emb) USING IVF WITH (LISTS = 4)`)
+	mustBindErr(t, lookup, `CREATE VECTOR INDEX ix ON t (dense) USING SPARSE`)
+	mustBindErr(t, lookup, `SELECT id FROM t NEAREST emb TO (1,0,0,0) USING L2 LIMIT 1`)
+	mustBindErr(t, lookup, `SELECT id FROM t NEAREST emb TO (1,0,0,0) USING HAMMING LIMIT 1`)
+	mustBindErr(t, lookup, `SELECT id FROM t NEAREST dense TO $d NEAREST dense TO $s LIMIT 1`)
+
+	ps, err := parser.Parse(`SELECT id FROM t NEAREST dense TO $d NEAREST emb TO $s LIMIT 1`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := Bind(ps, lookup, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sel := got.(Select)
+	if sel.NearestCol != 2 || sel.Nearest2Col != 1 {
+		t.Fatalf("fusion bind cols nearest=%d nearest2=%d", sel.NearestCol, sel.Nearest2Col)
+	}
+
+	for _, q := range []string{
+		`SELECT id FROM t NEAREST emb TO $q LIMIT 1`,
+		`SELECT id FROM t NEAREST emb TO $q USING COSINE LIMIT 1`,
+		`SELECT id FROM t NEAREST emb TO $q USING INNER_PRODUCT LIMIT 1`,
+		`SELECT id FROM t NEAREST dense TO $d NEAREST emb TO $s LIMIT 1`,
+	} {
+		ps, err := parser.Parse(q)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Bind(ps, lookup, 1); err != nil {
+			t.Fatalf("bind %q: %v", q, err)
+		}
+	}
+}
+
+func mustBindErr(t *testing.T, lookup func(string) (*catalog.Table, bool), q string) {
+	t.Helper()
+	ps, err := parser.Parse(q)
+	if err != nil {
+		return // a parse error is also an acceptable rejection
+	}
+	if _, err := Bind(ps, lookup, 1); err == nil {
+		t.Fatalf("expected %q to be rejected", q)
 	}
 }
 
@@ -548,7 +981,7 @@ func TestBindHybridSearchAndNearest(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := bs.(Select)
-	if got.SearchCol != 1 || got.NearestCol != 2 || got.Where == nil {
+	if len(got.SearchCols) != 1 || got.SearchCols[0] != 1 || got.NearestCol != 2 || got.Where == nil {
 		t.Fatalf("%+v", got)
 	}
 }
@@ -791,7 +1224,7 @@ func TestBindSearchAndNearestJoinFromTable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if bs.(Select).SearchCol != 1 {
+	if len(bs.(Select).SearchCols) != 1 || bs.(Select).SearchCols[0] != 1 {
 		t.Fatalf("SEARCH col %+v", bs)
 	}
 	sel, err = parser.Parse(`SELECT t.id FROM t JOIN u ON t.k = u.k NEAREST emb TO (1, 0, 0)`)
@@ -814,7 +1247,7 @@ func TestBindSearchAndNearestJoinFromTable(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := bs.(Select)
-	if got.SearchCol != 1 || got.NearestCol != 2 || got.Where == nil {
+	if len(got.SearchCols) != 1 || got.SearchCols[0] != 1 || got.NearestCol != 2 || got.Where == nil {
 		t.Fatalf("hybrid join %+v", got)
 	}
 	sel, err = parser.Parse(`SELECT t.id FROM t JOIN u ON t.k = u.k SEARCH note FOR 'x'`)

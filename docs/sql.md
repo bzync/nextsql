@@ -20,19 +20,18 @@ See `docs/optimizer.md` for rewrites, statistics, costing, and EXPLAIN.
 
 The native P19 `WORKFLOW` / `TRIGGER` / `SCHEDULE` / `TASK` contract is
 specified in `docs/workflows.md`. The native v1 implementation and its targeted
-workflow, trigger, schedule, durable-task, failover, PITR, and driver gates are
-complete; P19 remains open for the clean repository-wide functional gate in
-`TODO.md`.
+workflow, trigger, schedule, durable-task, failover, PITR, driver, and clean
+repository-wide functional gates are complete as recorded in `TODO.md`.
 
 ## Statements
 
-`CREATE TABLE` (including `FOREIGN KEY` / column `REFERENCES`), `CREATE DATABASE` [`IF NOT EXISTS`], `DROP TABLE` [`IF EXISTS`], `ALTER TABLE` (`ADD`/`DROP` `[COLUMN]`, `RENAME` `[COLUMN]`/`TO`, `ADD`/`DROP CONSTRAINT`), `CREATE INDEX` / `CREATE UNIQUE INDEX` (including JSON paths such as `metadata.category`, `INCLUDE`, `WHERE`, and expression keys), `CREATE SPATIAL INDEX`, `CREATE FULLTEXT INDEX`, `CREATE VECTOR INDEX … USING HNSW`, `DROP INDEX` [`IF EXISTS`], `REBUILD INDEX`, `CREATE` / `ALTER` / `DROP WORKFLOW`, `RUN WORKFLOW`, `CREATE` / `ALTER` / `DROP TRIGGER`, `CREATE` / `ALTER` / `DROP SCHEDULE`, `SHOW TASKS`, `CANCEL TASK`, `MAINTAIN DATABASE` / `MAINTAIN TABLE` / `MAINTAIN INDEX`, `INSERT` [`RETURNING`], `UPSERT` [`ON UNIQUE`] [`SET`] [`RETURNING`], `SELECT` (including `WITH` / `WITH RECURSIVE`, `DISTINCT`, `JOIN` / `GROUP BY` / `ORDER BY` / `LIMIT` / `OFFSET` / `COUNT` `SUM` `AVG` `MIN` `MAX`, window functions with `OVER`, JSON path extract, `SEARCH col FOR '…'`, and `NEAREST col TO …`), `UPDATE` [`RETURNING`], `DELETE` [`RETURNING`], `BEGIN` [`READ COMMITTED` | `SNAPSHOT` | `SERIALIZABLE`], `COMMIT`, `ROLLBACK`, `SET TENANT` / `RESET TENANT` (`docs/security.md`), `ANALYZE` [`table`], `EXPLAIN` [`ANALYZE`] `<statement>`, `CREATE USER` / `DROP USER`, `CREATE ROLE` / `DROP ROLE`, `GRANT` / `REVOKE` (`docs/security.md`).
+`CREATE TABLE` (including `FOREIGN KEY` / column `REFERENCES`), `CREATE DATABASE` [`IF NOT EXISTS`], `DROP TABLE` [`IF EXISTS`], `ALTER TABLE` (`ADD`/`DROP` `[COLUMN]`, bounded `ADD`/`DROP`/`ATTACH`/`DETACH PARTITION`, `RENAME` `[COLUMN]`/`TO`, `ADD`/`DROP CONSTRAINT`), `CREATE INDEX` / `CREATE UNIQUE INDEX` (including JSON paths such as `metadata.category`, `INCLUDE`, `WHERE`, and expression keys), `CREATE SPATIAL INDEX`, `CREATE FULLTEXT INDEX` [`WITH (ANALYZER = 'simple' | 'english' | 'french' | 'german' | 'spanish')`] (one to eight `STRING`/`TEXT` columns), `CREATE VECTOR INDEX … USING HNSW | IVF | IVFPQ | SPARSE`, `DROP INDEX` [`IF EXISTS`], `REBUILD INDEX`, `CREATE` / `ALTER` / `DROP WORKFLOW`, `RUN WORKFLOW`, `CREATE` / `ALTER` / `DROP TRIGGER`, `CREATE` / `ALTER` / `DROP SCHEDULE`, `SHOW TASKS`, `CANCEL TASK`, `MAINTAIN DATABASE` / `MAINTAIN TABLE` / `MAINTAIN INDEX`, `INSERT` [`RETURNING`], `UPSERT` [`ON UNIQUE`] [`SET`] [`RETURNING`], `SELECT` (including `WITH` / `WITH RECURSIVE`, `DISTINCT`, `JOIN` / `GROUP BY` / `ORDER BY` / `LIMIT` / `OFFSET` / `COUNT` `SUM` `AVG` `MIN` `MAX`, window functions with `OVER`, JSON path extract, `SEARCH col [WEIGHT n] [, col [WEIGHT n] …] FOR '…'`, `FACET col [, col …]`, and `NEAREST col TO …`), `UPDATE` [`RETURNING`], `DELETE` [`RETURNING`], `BEGIN` [`READ COMMITTED` | `SNAPSHOT` | `SERIALIZABLE`], `COMMIT`, `ROLLBACK`, `ANALYZE` [`table`], `EXPLAIN` [`ANALYZE`] `<statement>`, `CREATE USER` / `DROP USER`, `CREATE ROLE` / `DROP ROLE`, `GRANT` / `REVOKE` (`docs/security.md`). `SET TENANT`, `RESET TENANT`, and `PARTITION BY TENANT` are rejected; provision a hosted database instead.
 
 Unquoted identifiers fold to lowercase. Quoted `"ident"` is preserved.
 
 Table names that start with `nsql_` (case-folded) are reserved. The only exception is `CREATE TABLE nsql_schema_migrations` with the exact history DDL (`docs/design-cli-migrate-fk-joins.md` C.2) when that table is absent. Any other `nsql_*` name, or a different column list for `nsql_schema_migrations`, is `invalid_argument`. After that reserved DDL is accepted, the executor grants `SELECT`/`INSERT`/`UPDATE`/`DELETE` on the table to the session user (no `GRANT` SQL, no `PrivGrant`).
 
-Reserved words include `FOREIGN`, `REFERENCES`, `CONSTRAINT`, `CASCADE`, `RESTRICT`, `ACTION`, `MATCH`, `ALTER`, `ADD`, `RENAME`, `ORDER`, `ASC`, `DESC`, `IF`, `EXISTS`, `WITH`, `OVER`, `UPSERT`, and `RETURNING` (same rule as `USER`, `KEY`, `TO`): unquoted they are keywords; quoted `"foreign"` is an identifier. `RECURSIVE`, `MATERIALIZED`, `PARTITION`, `ROWS`, `RANGE`, `UNBOUNDED`, `PRECEDING`, `FOLLOWING`, `CURRENT`, `ROW`, `EXCLUDED`, and `INCLUDE` are contextual identifiers, not reserved words.
+Reserved words include `FOREIGN`, `REFERENCES`, `CONSTRAINT`, `CASCADE`, `RESTRICT`, `ACTION`, `MATCH`, `ALTER`, `ADD`, `RENAME`, `ORDER`, `ASC`, `DESC`, `IF`, `EXISTS`, `WITH`, `OVER`, `UPSERT`, and `RETURNING` (same rule as `USER`, `KEY`, `TO`): unquoted they are keywords; quoted `"foreign"` is an identifier. `RECURSIVE`, `MATERIALIZED`, `PARTITION`, `ROWS`, `RANGE`, `UNBOUNDED`, `PRECEDING`, `FOLLOWING`, `CURRENT`, `ROW`, `EXCLUDED`, `INCLUDE`, and `FACET` are contextual identifiers, not reserved words.
 
 ## Foreign keys
 
@@ -49,13 +48,11 @@ A cascade that would exceed depth 8 or 100 000 touched child rows fails with `
 
 ```sql
 CREATE TABLE orders (
-    tenant_id   UUID NOT NULL,
-    id          UUID NOT NULL DEFAULT UUID(),
+    id          UUID PRIMARY KEY DEFAULT UUID(),
     customer_id UUID NOT NULL,
-    PRIMARY KEY (tenant_id, id),
     CONSTRAINT fk_orders_customer
-        FOREIGN KEY (tenant_id, customer_id)
-        REFERENCES customers (tenant_id, id)
+        FOREIGN KEY (customer_id)
+        REFERENCES customers (id)
         ON DELETE RESTRICT
         ON UPDATE RESTRICT
 );
@@ -71,13 +68,12 @@ CREATE TABLE lines (
 - Referenced columns must be exactly the parent `PRIMARY KEY` or a `UNIQUE` btree index as a set (order may differ; no superkeys). `VECTOR` and `JSON` cannot be FK columns. `DECIMAL` precision and scale must match.
 - Unnamed constraints are named `fk_<child>_<cols>`, truncated to 63 characters, uniqued with a numeric suffix.
 - At most 16 foreign keys per table and 8 columns per key.
-- If both tables are tenant-keyed, the FK must include `tenant_id` on both sides at the **same position**. A tenant-keyed parent cannot be referenced by a global child. Cascades call `checkTenantRow` on every child; a bound session cannot cascade into another tenant.
 - Cyclic `CASCADE` graphs are rejected at DDL time. Self-referential FKs and cyclic `RESTRICT` graphs are allowed.
 - A child `CREATE TABLE` in the same transaction can reference a parent created earlier in that transaction (session overlay). `CREATE TABLE` bind and parent `DELETE` inbound probes both use overlay ∪ catalog lookup, so an uncommitted child table is visible to the same-txn parent delete.
 - `MATCH SIMPLE`: if any foreign-key column is NULL, the existence check and parent-delete probe for that constraint are skipped.
 
-Do not revert this binary after a catalog rewrite has written `NSCT` v4.
-Restore a pre-v4 backup or use an explicit format-aware migration first.
+Do not revert this binary after a catalog rewrite has written `NSCT` v9.
+Restore a pre-v5 backup or use an explicit format-aware migration first.
 
 ## Types
 
@@ -88,7 +84,9 @@ Restore a pre-v4 backup or use an explicit format-aware migration first.
 | `DECIMAL(p,s)` | `1 <= p <= 38`, `s <= p` | unscaled integer + scale; `DEFAULT AI()` when `s = 0` |
 | `TIMESTAMPTZ` | `int64` UTC nanos | `DEFAULT NOW()` |
 | `JSON` | compact binary `NSJB` | path extract and path indexes; see `docs/json.md` |
-| `VECTOR<F32,N>` | heap reference; payload in vector store | `NEAREST`, `COSINE` / `L2` / `INNER_PRODUCT`; see `docs/vector.md` |
+| `VECTOR<F32,N>` / `<F16,N>` / `<I8,N>` | heap reference; payload in vector store (F16 halves, I8 signed bytes + scale) | `NEAREST`, `COSINE` / `L2` / `INNER_PRODUCT`; see `docs/vector.md` |
+| `BITVECTOR<N>` | heap reference; payload is `ceil(N/8)` packed bits | `NEAREST … USING HAMMING` (default and only metric); elements must be 0 or 1; see `docs/vector.md` |
+| `SPARSEVECTOR<N>` | heap reference; payload is `NSSV` (non-zero index/value pairs) | `NEAREST` default `COSINE` (also `INNER_PRODUCT`); `CREATE VECTOR INDEX … USING SPARSE`; dense literals drop zeros; see `docs/vector.md` |
 | `POINT` / `LOCATION` | lon, lat `float64` | WGS84; see `docs/geo.md` |
 | `BOX` | west, south, east, north | axis-aligned lon/lat box |
 | `LINESTRING` | `u16` count + lon/lat pairs | at least two vertices; see `docs/geo.md` |
@@ -139,9 +137,12 @@ until concurrent-write handling is proven safe.
 `MAINTAIN DATABASE` perform a leader-only,
 blocking maintenance pass capped at 10,000 physical tombstones per statement.
 They cannot run inside a transaction. Table scope covers its heap, vector store,
-and indexes; index scope touches only the resolved physical index, and database
-scope also covers the catalog and all tables. Index names are resolved across
-the database and ambiguous names are rejected. The result's
+and indexes; for a partitioned table this includes every partition-local heap,
+vector store, and index root. Index scope touches only the resolved physical
+index, or every local root of a partitioned logical index, and database scope
+also covers the catalog and all tables. Missing catalog-owned physical roots
+fail closed as corruption. Index names are resolved across the database and
+ambiguous names are rejected. The result's
 affected count is the number of physical tombstones removed. With ACLs enabled,
 cluster `ADMIN` is required because maintenance crosses tenant boundaries.
 
@@ -151,7 +152,7 @@ cluster `ADMIN` is required because maintenance crosses tenant boundaries.
 
 ## Catalog
 
-The superblock primary tree holds catalog rows. Key `T` + table name. Value is a versioned `NSCT` descriptor (columns, PK, index list, heap meta page, foreign keys, CDC image policy, and the bounded P21 physical-partition metadata foundation). `EncodeTable` writes version 4. `DecodeTable` accepts v1 (empty FK list), v2 (key-only CDC), v3 (CDC image policy), and v4; any other version fails closed. Key `S` + table name holds a versioned `NSST` statistics snapshot from `ANALYZE`. Key `A` + table ID + column name holds the next `AI()` value for that column (same transaction as the insert). Each user table and secondary index is a detached B+Tree whose root/height live on a slotted meta page (`NSTM`) so splits do not rewrite the catalog row. Any catalog rewrite upgrades an older descriptor to v4. `PARTITION BY RANGE`, `PARTITION BY HASH`, `PARTITION BY LIST`, and `PARTITION BY TENANT(tenant_id)` are available as a bounded slice (single column, partition-local heaps, secondary indexes deferred); see `docs/partitioning.md` for the shipped syntax and physical/`EXPLAIN` pruning. Multi-column partition keys remain reserved and fail closed.
+The superblock primary tree holds catalog rows. Key `T` + table name. Value is a versioned `NSCT` descriptor (columns, PK, index list, heap meta page, foreign keys, CDC image policy, and bounded P21 physical-partition metadata). `EncodeTable` writes version 9. `DecodeTable` accepts v1 (empty FK list), v2 (key-only CDC), v3 (CDC image policy), v4 (partition metadata), v5 (non-reusing partition identity allocator), v6 (per-index HNSW traversal-quantisation tag), v7 (per-index vector-ANN method + IVF `LISTS` / `PROBES`), v8 (per-index IVF-PQ `SUBSPACES`), and v9 (per-index full-text analyzer id + revision); any other version fails closed. Key `S` + table name holds a versioned `NSST` statistics snapshot from `ANALYZE`; key `J` + stable table ID + stable partition ID holds its bounded `NSPS` local sketch. Key `A` + table ID + column name holds the next `AI()` value for that column (same transaction as the insert). Each user table and secondary index is a detached B+Tree whose root/height live on a slotted meta page (`NSTM`) so splits do not rewrite the catalog row. Any catalog rewrite upgrades an older descriptor to v9. `PARTITION BY RANGE`, `PARTITION BY HASH`, and `PARTITION BY LIST` are available with one-to-eight-column keys: RANGE uses lexicographically ordered tuple bounds (`VALUES LESS THAN (a, b, ...)`), LIST uses tuple membership (`VALUES IN ((a, b), ...)`), and HASH routes on the SHA-256 digest of the canonical typed tuple. Legacy TENANT descriptors remain decodable but cannot be created or extended through SQL. Plain/covering/partial/expression/JSON-path/spatial/FULLTEXT/HNSW indexes use partition-local roots. A plain-column secondary `UNIQUE` index (optionally with `INCLUDE`) is enforced across every partition by an exclusive key lock plus a probe of every other partition's local root on write, and an ordered cross-partition scan on CREATE/REBUILD/ATTACH; partial, expression, and JSON-path `UNIQUE`, and `UNIQUE` on legacy TENANT tables, remain rejected. `UPSERT` on a RANGE/HASH/LIST table resolves its conflict against the partition-local heap (PK target) or every partition-local root (secondary `UNIQUE` target) and stays rejected only on legacy TENANT tables. Bounded ADD/DROP plus validated ownership-transfer ATTACH/DETACH lifecycle DDL is described in `docs/partitioning.md`.
 
 Catalog mutations use the same WAL + MVCC transaction as user data. Recovery replays WAL, applies UNDO, then the executor reloads the catalog from the primary tree.
 
@@ -217,6 +218,13 @@ literal all-occurrence replacement; `CONCAT` accepts one or more strings and
 widens to TEXT when any input is TEXT. `STARTS_WITH`, `ENDS_WITH`, and
 `CONTAINS` are case-sensitive literal predicates. These functions propagate
 NULL.
+
+`HIGHLIGHT(value)` and `SNIPPET(value)` require a `SEARCH` clause on the same
+`SELECT`. They wrap original document tokens whose analyzed form participates
+in the SEARCH query. Optional `HIGHLIGHT(value, pre, post)` and
+`SNIPPET(value, width [, pre, post])` override the default `<mark>` markers;
+snippet width is 16–4096 Unicode code points (default 160). Both fail closed
+in `WHERE` / `JOIN` / `GROUP BY` / `HAVING` / DML.
 
 `COALESCE` evaluates arguments left-to-right and stops at the first non-NULL
 value. `NULLIF(a, b)` returns a typed NULL when the coercible values compare
@@ -438,9 +446,15 @@ UPSERT INTO items (id, email, name) VALUES ('2', 'a@b', 'Bea')
   key. A committed occupant is updated even when this statement's snapshot
   would not see it. WAL records are ordinary insert/update; followers apply
   those records and do not re-run UPSERT.
+- On a RANGE/HASH/LIST partitioned table, a PK-target `UPSERT` resolves its
+  conflict against the proposed row's partition-local heap (the primary key
+  includes every partition column), and a secondary-`UNIQUE`-target `UPSERT`
+  probes every partition-local root so the occupant is found in whichever
+  partition holds it. `SET` that changes a partition-key column moves the row
+  between partition heaps, and a no-conflict `UPSERT` is still checked against
+  the cross-partition `UNIQUE` probe. `UPSERT` on legacy TENANT tables is
+  rejected.
 - Privileges: `INSERT` and `UPDATE`. `RETURNING` also requires `SELECT`.
-  A bound tenant session injects `tenant_id` as for `INSERT` and cannot
-  `SET tenant_id`.
 
 `INSERT`, `UPDATE`, `DELETE`, and `UPSERT` accept `RETURNING` items or
 `RETURNING *` after `LIMIT` (when present). The list sees the row after the
@@ -449,7 +463,13 @@ write: inserted/updated values, or the deleted row. Expressions, aliases, and
 Results stream over NSQL as `RowDesc` plus `DataBatch` frames, then
 `CommandComplete` with `Affected`. `EXPLAIN` shows `Upsert` for `UPSERT`.
 
-`ANALYZE [table]` writes `NSST` statistics into the catalog tree (key `S` + name). They survive restart. `EXPLAIN` / `EXPLAIN ANALYZE` return one row per operator with estimates (and actuals / time / CPU / memory / disk / cache / spill / workers / index).
+Retryable application mutations use the engine/NSQL idempotency API rather
+than alternate SQL syntax: local callers use `Session.ExecIdempotent`, and the
+official Go driver uses `Conn.ExecIdempotent`. The key and typed request are
+fenced in the same transaction as the mutation. See `docs/execution.md` and
+`docs/protocol.md`.
+
+`ANALYZE [table]` writes `NSST` statistics into the catalog tree (key `S` + name). They survive restart. Version 3 adds bounded exact row counts keyed by stable physical-partition ID. Partitioned tables also receive bounded `NSPS` v1 column/index/vector sketches under immutable table/partition-ID keys. Pruning-aware plans merge them only when every selected stable ID is covered; missing or stale local data falls back to global `NSST`. Local sampling is capped at 4,096 rows per member and each record caps column/index/vector entries at 64 plus 15 KiB total. `EXPLAIN` / `EXPLAIN ANALYZE` return one row per operator with estimates (and actuals / time / CPU / memory / disk / cache / spill / workers / index).
 
 Statistics also refresh automatically inside a modifying transaction once a
 table accumulates at least 1,000 changed rows. For an already analyzed table,
@@ -471,8 +491,8 @@ ALTER TABLE orders SET CDC IMAGES FULL;
 
 `SUBSCRIBE` is a continuous, table-scoped result stream sourced from committed
 WAL changes. `AFTER` is an unsigned decimal commit-LSN resume token. The
-statement is rejected inside an explicit transaction. Tenant scope is taken
-only from `SET TENANT`; it cannot be supplied by the statement. See
+statement is rejected inside an explicit transaction. The stream is scoped to
+the connection's selected database; there is no row-tenant selector. See
 [`docs/cdc.md`](cdc.md) for ordering, result columns, cancellation, retention,
 and the opt-in bounded image policy.
 
@@ -488,8 +508,8 @@ reclamation creates freelist pages after the base backup.
 
 JSON path extract (`SELECT metadata.category`) and `CREATE INDEX … ON t(metadata.category)` are implemented. See `docs/json.md`.
 
-`CREATE FULLTEXT INDEX` and `SEARCH col FOR '…'` are implemented. See `docs/fulltext.md`.
+`CREATE FULLTEXT INDEX` and `SEARCH col [WEIGHT n] [, col [WEIGHT n] …] FOR '…'` are implemented, including `WITH (ANALYZER = 'simple' | 'english' | 'french' | 'german' | 'spanish')` and multi-column indexes (1–8 `STRING`/`TEXT` columns; `SEARCH` uses an index whose column list matches in the same order; phrases do not cross fields; optional `WEIGHT` scales per-field BM25 tf in `(0, 64]`, default 1). Default `simple` preserves Phase 10 BM25/phrase behaviour (no stemming, no stop list); `english` is Snowball English (Porter2) plus stop-word dictionary v1 plus synonym dictionary v1 at query time (catalog revision 3; revision 1 stem-only and revision 2 stem+stops indexes still decode). `french` / `german` / `spanish` are Snowball 3.x stemmers plus that language's Snowball stop-word dictionary v1 (catalog revision 1). Trailing ASCII `*` on a SEARCH token is prefix search (`cat*` matches `catalog`; exact `cat` does not); trailing ASCII `~` is fuzzy matching (`cat~` matches `cot`; optional `~1` / `~2`; AUTO distance by token length). Unadorned tokens apply typo tolerance only when the analyzed term is absent from the vocabulary (`databse` matches `database`; exact `cat` does not match `cot` when `cat` is indexed; AUTO typo is 0/1/2 for 1–4 / 5–8 / 9+ runes). Prefix, fuzzy, and typo expansion is fail-closed against the query-expansion caps. `HIGHLIGHT(col)` and `SNIPPET(col)` are SELECT-list functions that require `SEARCH`: they wrap original matching tokens (exact/synonym/prefix/fuzzy/typo, same analyzer) with `<mark>` / `</mark>` (override with `HIGHLIGHT(col, pre, post)`); `SNIPPET` is a 16–4096 rune window (default 160) around the densest match cluster. `SELECT * … SEARCH … FACET col [, col …]` returns independent histograms over the full match set (`facet`, `value`, `count`); `LIMIT` is per-facet top-N; `NULL` is skipped; 1–8 discrete columns and 1024 distinct values fail closed. See `docs/fulltext.md`.
 
-`CREATE VECTOR INDEX … USING HNSW` and `NEAREST col TO …` are implemented. See `docs/vector.md`.
+`CREATE VECTOR INDEX … USING HNSW` and `NEAREST col TO …` are implemented, including `WITH (QUANTIZATION = 'F16' | 'I8' | 'NONE')` for a quantised-traversal HNSW graph with exact re-rank. `CREATE VECTOR INDEX … USING IVF WITH (LISTS = n [, PROBES = m])` builds an inverted-file (coarse-quantiser) index, and `CREATE VECTOR INDEX … USING IVFPQ WITH (LISTS = n, SUBSPACES = M [, PROBES = m])` an inverted-file index with product-quantised residual codes and an exact re-rank — real-valued metrics only, not on partitioned tables. `BITVECTOR<N>` columns rank by `USING HAMMING` (the default and only metric for a bit column) over an exact flat search or a Hamming HNSW graph. `SPARSEVECTOR<N>` stores only non-zero coordinates (`NSSV`); `CREATE VECTOR INDEX … USING SPARSE` builds an inverted index (`NSSM` / `NSSP`) and ranks by `COSINE` (default) or `INNER_PRODUCT` — not on partitioned tables, not on dense/`BITVECTOR` columns. See `docs/vector.md`.
 
-`WHERE` + `SEARCH` + `NEAREST` is one hybrid plan (`docs/optimizer.md`). `EXPLAIN` shows `Candidates` and `Rerank`.
+`WHERE` + `SEARCH` + `NEAREST` is one hybrid plan (`docs/optimizer.md`). `EXPLAIN` shows `Candidates` and `Rerank`. A second `NEAREST` (dense `VECTOR` + `SPARSEVECTOR`) is dense+sparse+BM25 fusion (`docs/vector.md`); `EXPLAIN` shows `Rerank bm25+vector+sparse fusion`.

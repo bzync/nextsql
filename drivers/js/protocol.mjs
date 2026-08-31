@@ -34,6 +34,18 @@ export const Type = {
   Ready: 18,
   Unlock: 19,
   UnlockOK: 20,
+  IdempotentQuery: 21,
+  SetReadConsistency: 22,
+  NodeStatus: 23,
+  NodeStatusResp: 24,
+};
+
+// Read-consistency mode bytes on the wire. They match the server's
+// executor.ReadConsistency / replication.ReadConsistency ordering.
+export const ReadConsistency = {
+  Strong: 0,
+  Bounded: 1,
+  Stale: 2,
 };
 
 export const AuthPassword = 1;
@@ -581,6 +593,16 @@ export function decodeValue(buf, off) {
       if (flag & 1) {
         return { value: { ref: true, dim }, next: off + 3, kind };
       }
+      if (flag & 2) {
+        const nnz = view(buf, off + 3, 4).getUint32(0, true);
+        const indices = [];
+        const values = [];
+        for (let i = 0; i < nnz; i++) {
+          indices.push(view(buf, off + 7 + i * 8, 4).getUint32(0, true));
+          values.push(view(buf, off + 11 + i * 8, 4).getFloat32(0, true));
+        }
+        return { value: { dim, indices, values }, next: off + 7 + nnz * 8, kind };
+      }
       const need = dim * 4;
       const out = [];
       for (let i = 0; i < dim; i++) {
@@ -744,6 +766,43 @@ export function decodeCommandComplete(b) {
     throw new NextSQLError('protocol', 'bad command-complete length');
   }
   return Number(view(b, 0, 8).getBigUint64(0, true));
+}
+
+export function encodeSetReadConsistency(mode, maxStalenessMs) {
+  if (mode !== ReadConsistency.Strong && mode !== ReadConsistency.Bounded && mode !== ReadConsistency.Stale) {
+    throw new NextSQLError('invalid_argument', 'unknown read consistency mode');
+  }
+  let ms = 0;
+  if (maxStalenessMs && maxStalenessMs > 0) {
+    // Keep a sub-millisecond bound positive so the server does not read it as
+    // "use the default window" (0). Real staleness bounds are seconds.
+    ms = Math.floor(maxStalenessMs);
+    if (ms === 0) {
+      ms = 1;
+    }
+  }
+  const buf = new Uint8Array(9);
+  buf[0] = mode;
+  new DataView(buf.buffer).setBigUint64(1, BigInt(ms), true);
+  return buf;
+}
+
+export function decodeNodeStatus(b) {
+  const role = readU16String(b, 0, MAX_NAME);
+  const off = role.next;
+  if (b.length - off !== 25) {
+    throw new NextSQLError('protocol', 'bad node-status length');
+  }
+  const flags = b[off];
+  const dv = view(b, off + 1, 24);
+  return {
+    role: role.value,
+    hasLeader: (flags & 1) !== 0,
+    healthy: (flags & 2) !== 0,
+    appliedLSN: dv.getBigUint64(0, true),
+    lastContactMs: dv.getBigInt64(8, true),
+    applyBacklog: dv.getBigUint64(16, true),
+  };
 }
 
 export function encodeFrame(typ, payload) {

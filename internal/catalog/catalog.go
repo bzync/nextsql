@@ -43,7 +43,76 @@ type Index struct {
 	Predicate ast.Expr   // partial-index WHERE; nil indexes every row
 	Exprs     []ast.Expr // parallel to Columns; non-nil entries are expression keys
 	ExprTypes []types.Type
+	// VecQuant is the HNSW traversal-quantisation encoding for a vector index
+	// (0 none, types.VecF16, types.VecI8). The graph keeps a compact quantised
+	// copy of each vector for search and re-ranks against the column payloads.
+	VecQuant uint8
+	// VecMethod selects the ANN structure for a Vector index: VecMethodHNSW
+	// (graph, default), VecMethodIVF (inverted file / coarse quantiser),
+	// VecMethodIVFPQ (inverted file with product-quantised residual codes),
+	// or VecMethodSPARSE (inverted index over a SPARSEVECTOR column).
+	// IVFLists is the coarse-quantiser cell count; IVFProbes is the default
+	// number of cells a search scans (0 = ~10% of IVFLists, at least 1).
+	// IVFSubspaces is the product-quantisation subspace count M (IVFPQ only;
+	// divides the vector dimension).
+	VecMethod    uint8
+	IVFLists     uint32
+	IVFProbes    uint32
+	IVFSubspaces uint32
+	// FTAnalyzer / FTVersion are the versioned full-text analyzer stored
+	// with a FULLTEXT index (0/0 = simple v1, matching pre-v9 catalogs;
+	// english v1 = stem only, english v2 = stem + stop-word dictionary v1,
+	// english v3 = v2 + synonym dictionary v1 (query-time OR expansion);
+	// french/german/spanish v1 = Snowball stemmer + stop-word dictionary v1).
+	// Non-fulltext indexes must leave both zero.
+	FTAnalyzer uint8
+	FTVersion  uint16
 }
+
+const (
+	// FTAnalyzerSimple is Unicode-lowercase tokenization with no stemmer
+	// and no stop-word list.
+	FTAnalyzerSimple uint8 = 0
+	// FTAnalyzerEnglish is simple tokenization plus Snowball English (Porter2).
+	FTAnalyzerEnglish uint8 = 1
+	// FTAnalyzerFrench is Snowball French plus stop-word dictionary v1.
+	FTAnalyzerFrench uint8 = 2
+	// FTAnalyzerGerman is Snowball German plus stop-word dictionary v1.
+	FTAnalyzerGerman uint8 = 3
+	// FTAnalyzerSpanish is Snowball Spanish plus stop-word dictionary v1.
+	FTAnalyzerSpanish uint8 = 4
+	// FTAnalyzerEnglishV1 is English stemming without stop-word filtering.
+	FTAnalyzerEnglishV1 uint16 = 1
+	// FTAnalyzerEnglishV2 is English stemming plus stop-word dictionary v1.
+	FTAnalyzerEnglishV2 uint16 = 2
+	// FTAnalyzerEnglishV3 is English v2 plus synonym dictionary v1.
+	// CREATE FULLTEXT INDEX … ANALYZER = 'english' writes this revision.
+	FTAnalyzerEnglishV3 uint16 = 3
+	// FTAnalyzerFrenchV1 is the first shipped French analyzer revision.
+	FTAnalyzerFrenchV1 uint16 = 1
+	// FTAnalyzerGermanV1 is the first shipped German analyzer revision.
+	FTAnalyzerGermanV1 uint16 = 1
+	// FTAnalyzerSpanishV1 is the first shipped Spanish analyzer revision.
+	FTAnalyzerSpanishV1 uint16 = 1
+)
+
+const (
+	// VecMethodHNSW is the default navigable-small-world graph vector index.
+	VecMethodHNSW uint8 = 0
+	// VecMethodIVF is the inverted-file (coarse-quantiser) vector index.
+	VecMethodIVF uint8 = 1
+	// VecMethodIVFPQ is the inverted-file index with product-quantised residual
+	// codes (IVF-PQ).
+	VecMethodIVFPQ uint8 = 2
+	// VecMethodSPARSE is the inverted-index over a SPARSEVECTOR column.
+	VecMethodSPARSE uint8 = 3
+	// MaxVectorIndexLists bounds USING IVF WITH (LISTS = n) (abuse limit;
+	// matches vector.MaxIVFLists).
+	MaxVectorIndexLists = 1 << 16
+	// MaxVectorIndexSubspaces bounds USING IVFPQ WITH (SUBSPACES = M) (abuse
+	// limit; matches vector.MaxIVFPQSubspaces).
+	MaxVectorIndexSubspaces = 128
+)
 
 type Table struct {
 	ID           uint32
@@ -69,7 +138,9 @@ const (
 	PartitionRange
 	PartitionHash
 	PartitionList
-	PartitionTenant
+	// PartitionLegacyTenant is decoder/runtime compatibility for databases
+	// created before shared row tenancy was removed. SQL cannot create it.
+	PartitionLegacyTenant
 )
 
 const (
@@ -85,6 +156,7 @@ const (
 // and Raft durability for the descriptor itself.
 type Partitioning struct {
 	Kind       PartitionKind
+	NextID     uint32 // durable high-water allocator; partition identities are never reused
 	Columns    []int
 	Partitions []Partition
 }
@@ -129,6 +201,19 @@ const (
 	maxFKNameLen           = 63
 )
 
+// IntsEqual reports whether a and b have the same length and values in order.
+func IntsEqual(a, b []int) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
 // FKAction is a referential action. NO ACTION is stored as FKRestrict.
 type FKAction uint8
 
@@ -150,15 +235,17 @@ type ForeignKey struct {
 	refNames   []string // referenced column names until ValidateForeignKeys
 }
 
-// TenantColumn is the reserved row-isolation column.
-const TenantColumn = "tenant_id"
+// LegacyTenantColumn marks a table that used the removed shared-tenancy model.
+// It is retained only so upgraded databases can fail closed during migration.
+const LegacyTenantColumn = "tenant_id"
 
-// TenantCol is the tenant_id column when it is UUID, STRING, or TEXT.
-func (t *Table) TenantCol() (int, bool) {
+// LegacyTenantCol returns the removed shared-tenancy marker column when its
+// historical type is UUID, STRING, or TEXT.
+func (t *Table) LegacyTenantCol() (int, bool) {
 	if t == nil {
 		return -1, false
 	}
-	i, ok := t.ColIndex(TenantColumn)
+	i, ok := t.ColIndex(LegacyTenantColumn)
 	if !ok {
 		return -1, false
 	}

@@ -1,16 +1,22 @@
 import {
   Kind,
   NextSQLError,
+  ReadConsistency,
   connect,
+  connectCluster,
   decodeDecimal,
   decodeHelloOK,
   decodeNSJB,
+  decodeNodeStatus,
   decodeValue,
   encodeDecimalString,
   encodeHello,
   encodeParam,
+  encodeSetReadConsistency,
   formatUUID,
   isLoopback,
+  isReadOnlySQL,
+  txnControl,
   validateConfig,
 } from './mod.js';
 
@@ -127,4 +133,44 @@ Deno.test('point param', () => {
   assert(got.kind === Kind.Point);
   assert(Math.abs(got.value.lon + 73.98) < 1e-9);
   assert(Math.abs(got.value.lat - 40.75) < 1e-9);
+});
+
+Deno.test('follower-read routing classifiers', () => {
+  for (const s of ['SELECT 1', '  select n from t', 'SHOW TASKS', 'WITH c AS (SELECT n FROM t) SELECT n FROM c']) {
+    assert(isReadOnlySQL(s), s);
+  }
+  for (const s of ["INSERT INTO t (n) VALUES ('x')", 'UPDATE t SET n = 1', 'DELETE FROM t', 'EXPLAIN ANALYZE SELECT n FROM t', 'BEGIN']) {
+    assert(!isReadOnlySQL(s), s);
+  }
+  const t = txnControl('  begin transaction ');
+  assert(t.begin && !t.end);
+  const c = txnControl('COMMIT');
+  assert(!c.begin && c.end);
+});
+
+Deno.test('SetReadConsistency / NodeStatus wire codec', () => {
+  const b = encodeSetReadConsistency(ReadConsistency.Bounded, 2500);
+  assert(b.length === 9);
+  assert(b[0] === 1);
+  assert(new DataView(b.buffer, b.byteOffset).getBigUint64(1, true) === 2500n);
+  assertThrows(() => encodeSetReadConsistency(9, 0));
+
+  const role = new TextEncoder().encode('leader');
+  const buf = new Uint8Array(2 + role.length + 25);
+  const dv = new DataView(buf.buffer);
+  dv.setUint16(0, role.length, true);
+  buf.set(role, 2);
+  const off = 2 + role.length;
+  buf[off] = 0x03;
+  dv.setBigUint64(off + 1, 7n, true);
+  dv.setBigInt64(off + 9, 0n, true);
+  dv.setBigUint64(off + 17, 0n, true);
+  const st = decodeNodeStatus(buf);
+  assert(st.role === 'leader');
+  assert(st.healthy && st.hasLeader);
+  assert(st.appliedLSN === 7n);
+});
+
+Deno.test('connectCluster requires an address', async () => {
+  await assertRejects(() => connectCluster({ user: 'app', tls: {} }));
 });

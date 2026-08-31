@@ -6,7 +6,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bzync/nextsql/internal/auth"
 	"github.com/bzync/nextsql/internal/nerr"
 	"github.com/bzync/nextsql/internal/scheduler"
 	"github.com/bzync/nextsql/internal/security"
@@ -61,6 +60,44 @@ func TestWindowRanking(t *testing.T) {
 		t.Fatalf("window in txn: %+v", got.Rows)
 	}
 	execOK(t, s, `ROLLBACK`)
+}
+
+func TestWindowRBACRestart(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "nextsql.db")
+	keys := testKeys(t)
+	db, err := Create(path, keys, 32)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := db.Session()
+	execOK(t, s, `CREATE TABLE window_acl (id STRING PRIMARY KEY, k STRING NOT NULL)`)
+	execOK(t, s, `INSERT INTO window_acl (id, k) VALUES ('a', 'x'), ('b', 'x')`)
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err = Open(path, keys, 32)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	acl, err := security.CreateACL(filepath.Join(t.TempDir(), "acl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := db.Session()
+	app.SetIdentity("app")
+	app.SetACL(acl)
+	if _, err := app.Exec(`SELECT ROW_NUMBER() OVER (ORDER BY id) FROM window_acl`); !nerr.HasCode(err, nerr.Forbidden) {
+		t.Fatalf("window must require SELECT: %v", err)
+	}
+	if err := acl.Grant("app", security.PrivSelect, security.ScopeTable, "window_acl"); err != nil {
+		t.Fatal(err)
+	}
+	got := execOK(t, app, `SELECT id, ROW_NUMBER() OVER (ORDER BY id) FROM window_acl ORDER BY id`)
+	if len(got.Rows) != 2 {
+		t.Fatalf("granted window rows: %+v", got.Rows)
+	}
 }
 
 func TestWindowLagLeadValues(t *testing.T) {
@@ -155,70 +192,6 @@ func TestWindowRejects(t *testing.T) {
 	}
 	if _, err := s.Exec(`SELECT SUM(v) OVER (ORDER BY k RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM w`); !nerr.HasCode(err, nerr.InvalidArgument) {
 		t.Fatalf("RANGE offset: %v", err)
-	}
-}
-
-func TestWindowTenantRBACRestart(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "nextsql.db")
-	keys := testKeys(t)
-	db, err := Create(path, keys, 32)
-	if err != nil {
-		t.Fatal(err)
-	}
-	s := db.Session()
-	execOK(t, s, `CREATE TABLE wten (id STRING PRIMARY KEY, tenant_id UUID NOT NULL, k STRING NOT NULL)`)
-	execOK(t, s, `INSERT INTO wten (id, tenant_id, k) VALUES ('a1', '`+tenantA+`', 'x'), ('b1', '`+tenantB+`', 'x')`)
-	execOK(t, s, `SET TENANT = '`+tenantA+`'`)
-	got := execOK(t, s, `SELECT id, ROW_NUMBER() OVER (ORDER BY id) FROM wten`)
-	if len(got.Rows) != 1 || got.Rows[0][0].Str != "a1" {
-		t.Fatalf("tenant leaked: %+v", got.Rows)
-	}
-	execOK(t, s, `RESET TENANT`)
-	if err := db.Close(); err != nil {
-		t.Fatal(err)
-	}
-	db, err = Open(path, keys, 32)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
-	s = db.Session()
-	got = execOK(t, s, `SELECT id, ROW_NUMBER() OVER (ORDER BY id) FROM wten ORDER BY id`)
-	if len(got.Rows) != 2 {
-		t.Fatalf("after restart: %+v", got.Rows)
-	}
-
-	acl, err := security.CreateACL(filepath.Join(t.TempDir(), "acl"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	users, err := auth.Create(filepath.Join(t.TempDir(), "users"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := users.Upsert("dba", "s3cret"); err != nil {
-		t.Fatal(err)
-	}
-	if err := acl.Grant("dba", security.PrivAdmin, security.ScopeCluster, ""); err != nil {
-		t.Fatal(err)
-	}
-	admin := db.Session()
-	admin.SetIdentity("dba")
-	admin.SetACL(acl)
-	admin.SetAuth(users)
-	execOK(t, admin, `CREATE USER app IDENTIFIED BY 'pw'`)
-	app := db.Session()
-	app.SetIdentity("app")
-	app.SetACL(acl)
-	if _, err := app.Exec(`SELECT ROW_NUMBER() OVER (ORDER BY id) FROM wten`); !nerr.HasCode(err, nerr.Forbidden) {
-		t.Fatalf("window must require SELECT: %v", err)
-	}
-	execOK(t, admin, `GRANT SELECT ON TABLE wten TO app`)
-	execOK(t, app, `SET TENANT = '`+tenantA+`'`)
-	got = execOK(t, app, `SELECT id, ROW_NUMBER() OVER (ORDER BY id) FROM wten`)
-	if len(got.Rows) != 1 || got.Rows[0][0].Str != "a1" {
-		t.Fatalf("granted window: %+v", got.Rows)
 	}
 }
 

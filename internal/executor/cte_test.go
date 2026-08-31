@@ -4,7 +4,6 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/bzync/nextsql/internal/auth"
 	"github.com/bzync/nextsql/internal/nerr"
 	"github.com/bzync/nextsql/internal/security"
 )
@@ -43,6 +42,30 @@ func TestCTEBasic(t *testing.T) {
 	got = execOK(t, s, `WITH c AS (SELECT value FROM cte_src) SELECT id FROM cte_src WHERE value IN (SELECT value FROM c) ORDER BY id`)
 	if len(got.Rows) != 3 {
 		t.Fatalf("IN subquery CTE: %+v", got.Rows)
+	}
+}
+
+func TestCTERBAC(t *testing.T) {
+	db := testDB(t)
+	local := db.Session()
+	execOK(t, local, `CREATE TABLE cte_acl (id STRING PRIMARY KEY, value STRING NOT NULL)`)
+	execOK(t, local, `INSERT INTO cte_acl (id, value) VALUES ('1', 'a'), ('2', 'b')`)
+	acl, err := security.CreateACL(filepath.Join(t.TempDir(), "acl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := db.Session()
+	app.SetIdentity("app")
+	app.SetACL(acl)
+	if _, err := app.Exec(`WITH c AS (SELECT id FROM cte_acl) SELECT id FROM c`); !nerr.HasCode(err, nerr.Forbidden) {
+		t.Fatalf("CTE must require underlying SELECT: %v", err)
+	}
+	if err := acl.Grant("app", security.PrivSelect, security.ScopeTable, "cte_acl"); err != nil {
+		t.Fatal(err)
+	}
+	got := execOK(t, app, `WITH c AS (SELECT id FROM cte_acl) SELECT id FROM c ORDER BY id`)
+	if len(got.Rows) != 2 {
+		t.Fatalf("granted CTE rows: %+v", got.Rows)
 	}
 }
 
@@ -113,55 +136,6 @@ func TestCTEJoinAndRecursive(t *testing.T) {
 
 	if _, err := s.Exec(`WITH RECURSIVE t AS (SELECT id FROM org WHERE id = 'root' UNION ALL SELECT t.id FROM t) SELECT id FROM t`); !nerr.HasCode(err, nerr.Exhausted) {
 		t.Fatalf("recursive depth must be bounded: %v", err)
-	}
-}
-
-func TestCTETenantAndRBAC(t *testing.T) {
-	db := testDB(t)
-	s := db.Session()
-	execOK(t, s, `CREATE TABLE cte_ten (id STRING PRIMARY KEY, tenant_id UUID NOT NULL, k STRING NOT NULL)`)
-	execOK(t, s, `INSERT INTO cte_ten (id, tenant_id, k) VALUES ('a1', '`+tenantA+`', 'x'), ('b1', '`+tenantB+`', 'x')`)
-	execOK(t, s, `SET TENANT = '`+tenantA+`'`)
-	got := execOK(t, s, `WITH c AS (SELECT id, k FROM cte_ten) SELECT id FROM c`)
-	if len(got.Rows) != 1 || got.Rows[0][0].Str != "a1" {
-		t.Fatalf("CTE leaked tenant rows: %+v", got.Rows)
-	}
-	got = execOK(t, s, `WITH c AS (SELECT id, k FROM cte_ten) SELECT id FROM cte_ten WHERE k IN (SELECT k FROM c)`)
-	if len(got.Rows) != 1 || got.Rows[0][0].Str != "a1" {
-		t.Fatalf("CTE IN leaked tenant rows: %+v", got.Rows)
-	}
-	execOK(t, s, `RESET TENANT`)
-
-	acl, err := security.CreateACL(filepath.Join(t.TempDir(), "acl"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	users, err := auth.Create(filepath.Join(t.TempDir(), "users"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := users.Upsert("dba", "s3cret"); err != nil {
-		t.Fatal(err)
-	}
-	if err := acl.Grant("dba", security.PrivAdmin, security.ScopeCluster, ""); err != nil {
-		t.Fatal(err)
-	}
-	admin := db.Session()
-	admin.SetIdentity("dba")
-	admin.SetACL(acl)
-	admin.SetAuth(users)
-	execOK(t, admin, `CREATE USER app IDENTIFIED BY 'pw'`)
-	app := db.Session()
-	app.SetIdentity("app")
-	app.SetACL(acl)
-	if _, err := app.Exec(`WITH c AS (SELECT id FROM cte_ten) SELECT id FROM c`); !nerr.HasCode(err, nerr.Forbidden) {
-		t.Fatalf("CTE must require underlying SELECT: %v", err)
-	}
-	execOK(t, admin, `GRANT SELECT ON TABLE cte_ten TO app`)
-	execOK(t, app, `SET TENANT = '`+tenantA+`'`)
-	got = execOK(t, app, `WITH c AS (SELECT id FROM cte_ten) SELECT id FROM c`)
-	if len(got.Rows) != 1 || got.Rows[0][0].Str != "a1" {
-		t.Fatalf("granted CTE: %+v", got.Rows)
 	}
 }
 

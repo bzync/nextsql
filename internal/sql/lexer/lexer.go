@@ -63,6 +63,10 @@ const (
 	KwJson
 	KwVector
 	KwF32
+	KwF16
+	KwI8
+	KwBitvector
+	KwSparsevector
 	KwExplain
 	KwAnalyze
 	KwMaintain
@@ -82,6 +86,7 @@ const (
 	KwCosine
 	KwL2
 	KwInnerProduct
+	KwHamming
 	KwJoin
 	KwInner
 	KwLeft
@@ -439,12 +444,12 @@ var keywords = map[string]Kind{
 	"false": KwFalse, "transaction": KwTransaction, "read": KwRead, "committed": KwCommitted,
 	"snapshot": KwSnapshot, "serializable": KwSerializable, "uuid": KwUuid, "string": KwString,
 	"text": KwText, "decimal": KwDecimal, "timestamptz": KwTimestamptz, "json": KwJson,
-	"vector": KwVector, "f32": KwF32, "explain": KwExplain, "analyze": KwAnalyze, "maintain": KwMaintain,
+	"vector": KwVector, "bitvector": KwBitvector, "sparsevector": KwSparsevector, "f32": KwF32, "f16": KwF16, "i8": KwI8, "explain": KwExplain, "analyze": KwAnalyze, "maintain": KwMaintain,
 	"point": KwPoint, "box": KwBox, "location": KwLocation,
 	"linestring": KwLineString, "polygon": KwPolygon, "spatial": KwSpatial,
 	"fulltext": KwFulltext, "search": KwSearch, "for": KwFor,
 	"nearest": KwNearest, "to": KwTo, "using": KwUsing, "hnsw": KwHnsw,
-	"cosine": KwCosine, "l2": KwL2, "inner_product": KwInnerProduct,
+	"cosine": KwCosine, "l2": KwL2, "inner_product": KwInnerProduct, "hamming": KwHamming,
 	"join": KwJoin, "inner": KwInner, "left": KwLeft, "right": KwRight, "full": KwFull, "cross": KwCross, "outer": KwOuter, "group": KwGroup, "having": KwHaving, "by": KwBy,
 	"drop": KwDrop, "user": KwUser, "role": KwRole, "grant": KwGrant, "revoke": KwRevoke,
 	"identified": KwIdentified, "cluster": KwCluster, "database": KwDatabase,

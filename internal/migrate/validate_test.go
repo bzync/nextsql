@@ -46,7 +46,7 @@ func TestValidateFixtureRejects(t *testing.T) {
 		{"testdata/invalid/bad_name", "invalid filename", nerr.InvalidArgument},
 		{"testdata/invalid/begin", "BEGIN/COMMIT/ROLLBACK", nerr.InvalidArgument},
 		{"testdata/invalid/grant", "GRANT/REVOKE", nerr.InvalidArgument},
-		{"testdata/invalid/set_tenant", "SET TENANT", nerr.InvalidArgument},
+		{"testdata/invalid/set_tenant", "parse", nerr.Syntax},
 		{"testdata/invalid/create_user", "CREATE/DROP USER", nerr.InvalidArgument},
 		{"testdata/invalid/syntax", "parse", nerr.Syntax},
 	}

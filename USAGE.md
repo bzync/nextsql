@@ -4,7 +4,7 @@ End-to-end user documentation for **NextSQL 0.1.0-dev**. This manual documents t
 
 NextSQL is a new database. It is not PostgreSQL, MySQL, MongoDB, Elasticsearch, or a vector-store compatibility layer. It has its own storage format, SQL dialect, wire protocol (NSQL v1), and official drivers.
 
-**Implementation status (2026-08-24):** phases 0–15 are complete. P16 correctness/SLO closure remains open. P17 schema lifecycle + storage maintenance is shipped except `REBUILD INDEX ... ONLINE`, which remains deliberately rejected/deferred. P18's implementable SQL-completeness scope is shipped; partition-wise aggregation/join waits for P21 physical partitioning. P19–P30 remain planned/open and must not be presented as installed functionality until their `TODO.md` exit gates are green.
+**Implementation status (2026-08-29):** phases 0–15 and P19 are complete. P16 correctness/SLO closure remains open. P17 schema lifecycle + storage maintenance is shipped except `REBUILD INDEX ... ONLINE`, which remains deliberately rejected/deferred. P18's implementable SQL-completeness scope is shipped; partition-wise aggregation/join waits for broader P21 work. P20 is complete. P21 has a bounded RANGE/HASH/LIST physical-partitioning slice with ADD/DROP and validated ATTACH/DETACH ownership-transfer DDL, local non-unique B+Tree-family indexes, and stable-ID row statistics; broader P21 gates and P22–P30 remain open.
 
 Treat 0.1.0-dev as an engine under measurement, not a drop-in production replacement, until you have run `nextsql-bench --slo` plus the relevant crash, recovery, security, and HA suites on your hardware.
 
@@ -87,6 +87,8 @@ Internal format and design notes live in [`docs/`](docs/). This file is the oper
 
 | `nextsql-bench` | Official measurements. Encryption, WAL, and fsync stay on |
 
+| `nextsql-auth-broker` | Optional. OIDC token-exchange broker: validates an external ID token and mints an `NSSC1.` short-lived credential. `nextsqld` never talks to it |
+
 ### Files that matter
 
 A data directory is **not** a single file. After `nextsql init` and the first server start you typically have:
@@ -94,6 +96,10 @@ A data directory is **not** a single file. After `nextsql init` and the first se
 ```text
 
 DATA-DIR/
+
+  nextsql.instance      encrypted deployment/default realm/database registry
+
+  nextsql.instance.keys wrapped registry keys — never the registry root
 
   nextsql.db            encrypted pages (16 KiB logical)
 
@@ -287,7 +293,7 @@ CREATE TABLE products (
 
     id          UUID PRIMARY KEY DEFAULT UUID(),
 
-    tenant_id   UUID NOT NULL,
+    account_id   UUID NOT NULL,
 
     name        STRING NOT NULL,
 
@@ -309,7 +315,7 @@ CREATE TABLE products (
 
 ```
 
-`VECTOR<F32,1536>` is the production-shaped type. The walkthrough uses dimension **8** so you can type literals by hand. Dimension must match between the column, inserts, and `NEAREST`.
+`VECTOR<F32,1536>` is the production-shaped type. The walkthrough uses dimension **8** so you can type literals by hand. Dimension must match between the column, inserts, and `NEAREST`. `VECTOR<F16,N>` is the same type with half-precision on-disk storage — half the payload-store size, ~0.1% per-element quantisation error, and no change to queries or HNSW. `VECTOR<I8,N>` goes further — signed bytes plus a per-vector scale, ~¼ the payload-store size at high dimension, but a larger quantisation error, so validate recall for your embedding model. `BITVECTOR<N>` packs one bit per element (1/32 the size) and ranks by `HAMMING`; every element must be `0` or `1`.
 
 Insert two rows (JSON is a string literal that is parsed and stored as binary `NSJB`; vectors are parenthesized floats; points are `POINT(lon, lat)`):
 
@@ -317,7 +323,7 @@ Insert two rows (JSON is a string literal that is parsed and stored as binary `N
 
 "${CLI[@]}" -c "
 
-INSERT INTO products (tenant_id, name, description, price, metadata, embedding, location)
+INSERT INTO products (account_id, name, description, price, metadata, embedding, location)
 
 VALUES
 
@@ -527,6 +533,12 @@ See [`docs/sql.md`](docs/sql.md) for catalog internals.
 
 | `VECTOR<F32,N>` | `N` in `1…8192`. Finite floats only. Stored off-row |
 
+| `VECTOR<F16,N>` | Same, stored as IEEE 754 halves (half the payload size); values quantised on write, widened to `float32` for all math and `NEAREST` |
+
+| `VECTOR<I8,N>` | Same, stored as signed bytes with a per-vector scale (~¼ the payload size at high `N`); larger quantisation error than `F16` — validate recall; widened to `float32` for all math and `NEAREST` |
+
+| `BITVECTOR<N>` | `N` single-bit elements packed into `ceil(N/8)` bytes (1/32 of `VECTOR<F32,N>`). Each element must be `0` or `1` on write. Ranks by `HAMMING` (default and only metric); widened to `float32` `0`/`1` for all math and `NEAREST` |
+
 | `POINT` / `LOCATION` | WGS84 longitude, latitude |
 
 | `BOX` | west, south, east, north |
@@ -547,9 +559,13 @@ CREATE INDEX / CREATE UNIQUE INDEX
 
 CREATE SPATIAL INDEX
 
-CREATE FULLTEXT INDEX
+CREATE FULLTEXT INDEX [WITH (ANALYZER = 'simple' | 'english' | 'french' | 'german' | 'spanish')]
 
-CREATE VECTOR INDEX … USING HNSW
+CREATE VECTOR INDEX … USING HNSW [WITH (QUANTIZATION = 'F16' | 'I8' | 'NONE')]
+
+CREATE VECTOR INDEX … USING IVF WITH (LISTS = n [, PROBES = m])
+
+CREATE VECTOR INDEX … USING IVFPQ WITH (LISTS = n, SUBSPACES = M [, PROBES = m])
 
 DROP INDEX [IF EXISTS] name
 
@@ -581,7 +597,6 @@ ANALYZE  [table]
 
 EXPLAIN  [ANALYZE] <statement>
 
-SET TENANT = … / RESET TENANT
 
 CREATE USER / DROP USER
 
@@ -686,37 +701,37 @@ SELECT sku, SUM(qty) FROM items GROUP BY sku;
 
 ```
 
-Foreign keys may be declared on `CREATE TABLE`. The referenced columns must be exactly a `PRIMARY KEY` or `UNIQUE` btree index (same columns, any order). `DECIMAL` precision and scale must match. `NO ACTION` is stored as `RESTRICT`. Recommended tenant pattern is a composite `PRIMARY KEY (tenant_id, id)` so the FK can include `tenant_id` on both sides at the same position.
+Foreign keys may be declared on `CREATE TABLE`. The referenced columns must be exactly a `PRIMARY KEY` or `UNIQUE` btree index (same columns, any order). `DECIMAL` precision and scale must match. `NO ACTION` is stored as `RESTRICT`. Recommended account-scoped key pattern is a composite `PRIMARY KEY (account_id, id)` so the FK can include `account_id` on both sides at the same position.
 
 ```sql
 
 CREATE TABLE customers (
 
-    tenant_id UUID NOT NULL,
+    account_id UUID NOT NULL,
 
     id        UUID NOT NULL DEFAULT UUID(),
 
     email     STRING NOT NULL,
 
-    PRIMARY KEY (tenant_id, id)
+    PRIMARY KEY (account_id, id)
 
 );
 
 CREATE TABLE orders (
 
-    tenant_id   UUID NOT NULL,
+    account_id   UUID NOT NULL,
 
     id          UUID NOT NULL DEFAULT UUID(),
 
     customer_id UUID NOT NULL,
 
-    PRIMARY KEY (tenant_id, id),
+    PRIMARY KEY (account_id, id),
 
     CONSTRAINT fk_orders_customer
 
-        FOREIGN KEY (tenant_id, customer_id)
+        FOREIGN KEY (account_id, customer_id)
 
-        REFERENCES customers (tenant_id, id)
+        REFERENCES customers (account_id, id)
 
         ON DELETE RESTRICT
 
@@ -833,22 +848,49 @@ CREATE TABLE articles (
 );
 
 CREATE FULLTEXT INDEX ix_body ON articles (body);
+CREATE FULLTEXT INDEX ix_tb ON articles (title, body);
 
 SELECT title FROM articles SEARCH body FOR 'database performance' LIMIT 20;
+SELECT title FROM articles SEARCH title, body FOR 'database performance' LIMIT 20;
+SELECT title FROM articles SEARCH title WEIGHT 3, body FOR 'database performance' LIMIT 20;
 
 SELECT title FROM articles SEARCH body FOR '"database performance"';
 
+SELECT title FROM articles SEARCH body FOR 'cat*';
+
+SELECT title FROM articles SEARCH body FOR '"data* performance"';
+
+SELECT title FROM articles SEARCH body FOR 'cat~';
+
+SELECT title FROM articles SEARCH body FOR '"databas~ performance"';
+
+SELECT title FROM articles SEARCH body FOR 'databse';
+
+SELECT title FROM articles SEARCH body FOR '"databse performance"';
+
+SELECT title, HIGHLIGHT(body) FROM articles SEARCH body FOR 'database performance';
+
+SELECT title, SNIPPET(body) FROM articles SEARCH body FOR 'cat';
+
+SELECT * FROM articles SEARCH body FOR 'database performance' FACET category;
+
+SELECT * FROM articles SEARCH title WEIGHT 3, body FOR 'database' FACET category, year LIMIT 5;
+
 ```
 
-`SEARCH col FOR <string>` sits after `WHERE` / `GROUP BY` and before `LIMIT`. Unquoted tokens are required (AND) and ranked with BM25. Double-quoted groups are phrases (consecutive positions). Results are score descending, then primary key.
+`SEARCH col [, col …] FOR <string>` sits after `WHERE` / `GROUP BY` and before `FACET` / `LIMIT`. Unquoted tokens are required (AND) and ranked with BM25. A multi-column `SEARCH` uses a `FULLTEXT` index whose column list matches in the same order; phrases do not cross fields. Optional `WEIGHT <number>` after a column scales that field's BM25 term frequency (`SEARCH title WEIGHT 3, body FOR '…'`; omitted = 1; range `(0, 64]`; query-time only, no catalog bump). A trailing ASCII `*` is prefix search (`cat*` matches `catalog`; exact `cat` does not). A trailing ASCII `~` is fuzzy matching (`cat~` matches `cot`; optional `~1` / `~2`; AUTO distance by token length). Prefix and fuzzy tokens skip stemming, stop words, and synonyms; matching terms are a disjunction at that position and consume the query-expansion caps (fail closed). Unadorned tokens apply typo tolerance only when the analyzed term is absent from the vocabulary (`databse` matches `database`; `cat` does not match `cot` when `cat` is indexed; AUTO typo is 0/1/2 for 1–4 / 5–8 / 9+ runes). Fuzzy/typo edit-distance work inspects at most 4096 distinct vocabulary terms. Double-quoted groups are phrases (consecutive positions). Results are score descending, then primary key.
 
-Tokenizer: letters and digits; Unicode lowercase; hyphens split tokens; apostrophes inside a token are kept. **No stemmer and no stop-word list** — `cat` does not match `cats`.
+Tokenizer: letters and digits; Unicode lowercase; hyphens split tokens; apostrophes inside a token are kept. Default analyzer `simple` does not stem and has no stop-word list — `cat` does not match `cats`, and `the` is searchable. `CREATE FULLTEXT INDEX … WITH (ANALYZER = 'english')` drops stop-word dictionary v1 then stems with Snowball English (Porter2) at index and query time, and expands synonym dictionary v1 at query time (`car` matches `automobile`; `"red car"` matches `red automobile`). Remaining terms are consecutive, so `"the running cats"` matches `running cats`. Prefix queries do not stem (`run*` matches indexed `run` from `running`; `running*` does not). Fuzzy queries also skip stem/stop/synonym (`cat~` matches `cot`; `running~` does not stem). Typo tolerance rewrites a missing unadorned token to AUTO fuzzy after analysis (`databse` matches `database`; `cats` does not match `cat`). `french` / `german` / `spanish` apply that language's Snowball stemmer and stop list (French also elides `l'` / `qu'` / …). A SEARCH of only stop words returns no rows.
 
-`CREATE FULLTEXT INDEX` takes one `STRING`/`TEXT` column. It cannot be `UNIQUE` and cannot use a JSON path.
+`CREATE FULLTEXT INDEX` takes one to eight `STRING`/`TEXT` columns. It cannot be `UNIQUE`, cannot use a JSON path, and cannot list a column twice. Optional `WITH (ANALYZER = 'simple' | 'english' | 'french' | 'german' | 'spanish')`; omit for `simple`.
 
 Without an index, `SEARCH` still runs over the heap (or a sargable `WHERE` path). `EXPLAIN` shows `Search … fulltext` or `Search … seq`.
 
-Limits: term 128 runes, document 100 000 tokens, query 64 tokens. Details: [`docs/fulltext.md`](docs/fulltext.md).
+`HIGHLIGHT(col)` wraps original matching tokens in the full field (default `<mark>` / `</mark>`). `SNIPPET(col)` returns a window around the densest match cluster (default 160 Unicode code points, range 16–4096, `…` on a truncated edge). Both require `SEARCH` and use the same analyzer as ranking, so stems, synonyms, prefix, fuzzy, and typo matches are marked in the original text (`runs` marks `running`). `HIGHLIGHT(col, pre, post)` and `SNIPPET(col, width [, pre, post])` override markers (max 32 runes). They fail closed outside the SELECT list of a SEARCH query.
+
+`SELECT * … SEARCH … FACET col [, col …]` returns independent histograms over the full match set (`facet`, `value`, `count`); `LIMIT` is per-facet top-N; `NULL` is skipped; 1–8 discrete columns (`STRING` / `TEXT` / `DECIMAL` / `BOOL` / `UUID` / `TIMESTAMPTZ`) and 1024 distinct values fail closed. Requires `SELECT *` and `SEARCH`. `FACET` is not a reserved keyword.
+
+Limits: term 128 runes, document 100 000 tokens (combined across SEARCH fields), 8 FULLTEXT/SEARCH fields, field weight `(0, 64]`, 8 FACET columns, 1024 distinct values per facet, query 64 tokens, query expansion 256 terms / 8192 bytes / 4096 work units, fuzzy vocabulary scan 4096 distinct terms, highlight marker 32 runes, snippet width 16–4096. Details: [`docs/fulltext.md`](docs/fulltext.md).
 
 ---
 
@@ -869,6 +911,12 @@ CREATE TABLE documents (
 INSERT INTO documents (name, embedding) VALUES ('one', (1, 0, 0 /* … dim must match */));
 
 CREATE VECTOR INDEX docs_embedding ON documents (embedding) USING HNSW;
+-- or a coarse-quantiser (inverted-file) index:
+CREATE VECTOR INDEX docs_embedding ON documents (embedding)
+    USING IVF WITH (LISTS = 256, PROBES = 16);
+-- or IVF with product-quantised residual codes:
+CREATE VECTOR INDEX docs_embedding ON documents (embedding)
+    USING IVFPQ WITH (LISTS = 256, PROBES = 16, SUBSPACES = 8);
 
 SELECT name FROM documents NEAREST embedding TO $1 LIMIT 20;
 
@@ -878,11 +926,17 @@ SELECT name, COSINE(embedding, (1, 0, 0)) FROM documents;
 
 ```
 
-`NEAREST col TO <vector>` sits after `WHERE` / `GROUP BY` / `SEARCH` and before `LIMIT`. Optional `USING COSINE | L2 | INNER_PRODUCT` (default `COSINE`).
+`NEAREST col TO <vector>` sits after `WHERE` / `GROUP BY` / `SEARCH` and before `LIMIT`. Optional `USING COSINE | L2 | INNER_PRODUCT | HAMMING` (default `COSINE`, or `HAMMING` for a `BITVECTOR` column — the only metric a bit column accepts).
 
-`NEAREST` ranks by lower-is-closer distance: cosine distance `1 − similarity`, L2, and `−dot` for inner product.
+`NEAREST` ranks by lower-is-closer distance: cosine distance `1 − similarity`, L2, `−dot` for inner product, and the differing-bit count for Hamming.
 
-Without a vector index, search is exact flat. With `USING HNSW`, `EXPLAIN` shows `Nearest … hnsw`. Default construction: `M = 16`, `efConstruction = 64`. Search never silently lowers `k` to improve latency.
+Without a vector index, search is exact flat. With `USING HNSW`, `EXPLAIN` shows `Nearest … hnsw`. Default construction: `M = 16`, `efConstruction = 64`. Search never silently lowers `k` to improve latency. The HNSW graph is stored with front-coded neighbour lists (node format v2) — roughly a third smaller on disk than the earlier fixed-width encoding, with no effect on results, recall, or latency; older v1 graphs still load.
+
+With `USING IVF WITH (LISTS = n [, PROBES = m])`, `EXPLAIN` shows `Nearest … ivf`. `LISTS` centroids are trained by deterministic k-means over a heap sample; a query probes the `PROBES` nearest posting lists (default ≈ 10 % of `LISTS`) and scores their vectors exactly, so recall rises with `PROBES` and is exact at `PROBES = LISTS`. Real-valued metrics only; not available on partitioned tables or `BITVECTOR` columns. `REBUILD INDEX` retrains the quantiser. A committed query is served from a process-local in-memory copy of the quantiser (shared across sessions, evicted on any write to the index), the same cache the HNSW graph uses.
+
+Optional `WITH (QUANTIZATION = 'F16' | 'I8' | 'NONE')` on `CREATE VECTOR INDEX` builds a graph that traverses on a compact quantised copy of each vector and re-ranks the final candidates against the full-precision payloads — recall tracks an unquantised graph, traversal reads are smaller, and the column stays whatever element type it was declared. `NONE` is the default.
+
+With `USING IVFPQ WITH (LISTS = n, SUBSPACES = M [, PROBES = m])`, `EXPLAIN` shows `Nearest … ivfpq`. IVF-PQ (product quantisation over IVF residuals) stores an `M`-byte code per vector in its posting lists instead of a pointer to a full vector: `SUBSPACES` is required and must divide the vector dimension (≤ 128). A query ADC-scores the codes in the `PROBES` nearest lists, then re-ranks the top candidates exactly against the full-precision payload store, so recall tracks an unquantised IVF. `COSINE` / `L2` only; not available on partitioned tables or `BITVECTOR` columns; `WITH (QUANTIZATION = …)` is not an IVFPQ option. `REBUILD INDEX` retrains the quantiser and codebook. There is no process-local cached copy yet — a committed query reloads the quantiser from the index tree. The portable core lives in `internal/vector` (`TrainIVFPQ` / `AddIVFPQ` / `RemoveIVFPQ` / `SearchIVFPQ`, `IVFPQStore`, the `NSPQ` / `NSPC` / `NSPL` encodings).
 
 Limits: dimension `1…8192`; elements must be finite (`NaN` / `Inf` fail closed). Query dimension must match the column. Details: [`docs/vector.md`](docs/vector.md).
 
@@ -891,6 +945,18 @@ Limits: dimension `1…8192`; elements must be finite (`NaN` / `Inf` fail closed
 ## 9. Hybrid queries
 
 Structured filters, JSON paths, BM25, and ANN are **one** planning problem. The optimizer chooses filter-then-ANN or ANN-then-filter from the cost model. Candidates are fused with reciprocal rank fusion (`k = 60`) and truncated to `LIMIT`.
+
+A second `NEAREST` clause fuses a dense `VECTOR` column with a `SPARSEVECTOR` column (optional `SEARCH` for BM25). The engine unions candidates from each retriever and reciprocal-rank fuses them:
+
+```sql
+SELECT id, title FROM documents
+SEARCH body FOR 'wireless headphones'
+NEAREST embedding TO $dense
+NEAREST sparse TO $sparse
+LIMIT 20;
+```
+
+`EXPLAIN` shows `Rerank bm25+vector+sparse fusion`. At most two `NEAREST` clauses; they must be one dense vector and one sparse vector.
 
 ```sql
 
@@ -1032,31 +1098,103 @@ Scopes: `CLUSTER`, `DATABASE`, `SCHEMA`, `TABLE`, `COLUMN`, `FUNCTION`, `BACKUP`
 
 `DROP USER` deletes the password hash and disconnects that user's sessions.
 
-### Tenants
+### Hosted isolation
 
-Tables with a `tenant_id` column (`UUID`, `STRING`, or `TEXT`) are tenant-keyed. Cross-tenant leakage tolerance is 0.
+Shared row tenancy is removed. `SET TENANT`, `RESET TENANT`, and
+`PARTITION BY TENANT` are rejected. Connections select one registered database;
+non-`ADMIN` access to a legacy table containing the old `tenant_id` marker
+fails closed so an administrator can migrate each former tenant into a separate
+hosted database. See [`docs/security.md`](docs/security.md).
 
-```sql
+`nextsql hosting migrate-tenant` is the offline path that copies one historical
+tenant out of a legacy `tenant_id` / `PARTITION BY TENANT` database into a freshly
+provisioned isolated deployment:
 
-SET TENANT = '11111111-1111-1111-1111-111111111111';
-
-SET TENANT = $1;
-
-RESET TENANT;
-
+```text
+nextsql hosting migrate-tenant
+    --source-data-dir DIR --source-key-file FILE
+    --tenant VALUE
+    --data-dir DIR --key-file FILE [--instance-key-file FILE]
+    [--realm NAME] [--database NAME] [--batch-rows N] [--buffer-pages N]
+    --confirm
 ```
 
-- `SET TENANT` is session-local. It is not stored in the catalog.
+Both deployments are exclusively locked for the whole run. The destination stays
+`PROVISIONING` while tables and matching rows are copied in bounded batches
+(`--batch-rows`, 1–4096, default 256) and every row is point-verified against the
+source; only then is it published `ACTIVE`. An exact rerun resumes safely — copied
+batches replay through `UPSERT`, and once the destination is `ACTIVE` the command
+re-verifies without touching data. The legacy tenant column is renamed to
+`legacy_tenant_id` (ordinary data in the isolated database); physical TENANT
+partitioning, foreign keys to unmigrated tables, and a pre-existing
+`legacy_tenant_id` column all fail closed.
 
-- Bound `SELECT` / `UPDATE` / `DELETE` / `SEARCH` / `NEAREST` / export get an implicit `tenant_id = <bound>` predicate.
+### Storage caps
 
-- `INSERT` injects the bound value and rejects a mismatched `tenant_id`. `UPDATE` cannot reassign `tenant_id`.
+The deployment/hosting administrator records durable storage caps in the
+encrypted registry:
 
-- Production sessions (ACL attached, not cluster `ADMIN`) **must** `SET TENANT` before they touch a tenant-keyed table. Unbound access is `forbidden`.
+```bash
+# realm-wide cap (sum of every database in the realm)
+nextsql hosting set-realm-cap --data-dir DIR --key-file FILE \
+    --realm customer-a --cap-bytes 53687091200 --confirm
 
-- Cluster `ADMIN` may omit `SET TENANT` and see every tenant.
+# per-database cap
+nextsql hosting set-database-cap --data-dir DIR --key-file FILE \
+    --realm customer-a --database production --cap-bytes 10737418240 --confirm
 
-This is row isolation by `tenant_id`, not a separate catalog or encryption domain. Details: [`docs/security.md`](docs/security.md).
+# inspect
+nextsql hosting show --data-dir DIR --key-file FILE
+```
+
+`--cap-bytes 0` clears a cap (no limit). Setting a cap **overwrites** the
+previous value; setting the same value is a no-op. A per-database cap may not
+exceed a non-zero realm cap, and a realm cap may not be lowered below a
+per-database cap already set in the realm. The registry root key is
+`KEY-FILE.instance` unless `--instance-key-file` overrides it.
+
+**Enforcement.** `nextsqld` applies the smaller non-zero of the realm and
+database cap to the data file at start. Once the file reaches the ceiling, any
+statement that needs a new page (`INSERT`, a row-splitting `UPDATE`, index
+growth) fails with `storage cap exceeded`; `DELETE`, `ROLLBACK`, and in-place
+`UPDATE` keep working, and freeing space (then dead-version cleanup) lets
+inserts resume. The cap covers the data file only, not WAL/UNDO.
+
+**Updating a cap requires a restart.** `set-realm-cap` / `set-database-cap` /
+`set-realm-root` take the exclusive data-directory lock, so a running `nextsqld`
+blocks them (`unavailable`). Stop the server, run the command, start it again —
+the new ceiling is applied at open. Live cap changes without a restart are a
+follow-on.
+
+#### Realm-root delegation
+
+The administrator can delegate **per-database** cap management for one realm to a
+realm-root secret holder. The realm root can then adjust its own databases' caps
+(bounded by the realm cap) but has no path to the realm cap or any other realm.
+
+```bash
+# admin: delegate realm-root cap management (secret file >= 16 bytes)
+nextsql hosting set-realm-root --data-dir DIR --key-file FILE \
+    --realm customer-a --secret-file /run/keys/customer-a.realmroot --confirm
+
+# realm root: set one of its databases' caps, authorising with the secret
+nextsql hosting set-database-cap --data-dir DIR --key-file FILE \
+    --realm customer-a --database production \
+    --realm-secret-file /run/keys/customer-a.realmroot \
+    --cap-bytes 8589934592 --confirm
+
+# admin: revoke the delegation
+nextsql hosting set-realm-root --data-dir DIR --key-file FILE \
+    --realm customer-a --clear --confirm
+```
+
+The secret is stored only as a SHA-256 hash in the registry. Offline the CLI
+still opens the registry with the deployment root; the realm-root secret is the
+authorisation seam a future server/reseller control path uses to let a realm
+owner manage its own quotas without deployment-level access. Reseller tiers:
+**Daemon** = a whole standalone `nextsqld`; **Realm** = one `nextsql hosting`
+realm (many databases, a realm-root secret, no registry root); **Nano** = a
+single database, connection only (its own SQL users, no realm/registry access).
 
 ---
 
@@ -1064,15 +1202,51 @@ This is row isolation by `tenant_id`, not a separate catalog or encryption domai
 
 ```text
 
-nextsql init     --data-dir DIR --key-file FILE [--user NAME --password-file FILE]
+nextsql init     --data-dir DIR --key-file FILE [--instance-key-file FILE]
+
+                 [--realm NAME --database NAME] [--user NAME --password-file FILE]
 
                  [--buffer-pages N]
+
+                 [--env-file PATH | --no-env]
+
+nextsql hosting  adopt --data-dir DIR --key-file FILE [--instance-key-file FILE]
+
+                 [--realm NAME --database NAME] --confirm
+
+                 [--env-file PATH | --no-env]
+
+nextsql hosting  migrate-tenant --source-data-dir DIR --source-key-file FILE
+
+                 --tenant VALUE --data-dir DIR --key-file FILE
+
+                 [--instance-key-file FILE] [--realm NAME] [--database NAME]
+
+                 [--batch-rows N] [--buffer-pages N] --confirm
+
+nextsql hosting  set-realm-cap --data-dir DIR --key-file FILE
+
+                 [--instance-key-file FILE] --realm NAME --cap-bytes N --confirm
+
+nextsql hosting  set-realm-root --data-dir DIR --key-file FILE
+
+                 [--instance-key-file FILE] --realm NAME
+
+                 (--secret-file FILE | --clear) --confirm
+
+nextsql hosting  set-database-cap --data-dir DIR --key-file FILE
+
+                 [--instance-key-file FILE] --realm NAME --database NAME
+
+                 [--realm-secret-file FILE] --cap-bytes N --confirm
+
+nextsql hosting  show --data-dir DIR --key-file FILE [--instance-key-file FILE]
 
 nextsql exec     [--addr HOST:PORT] [--user NAME] [--password-file FILE]
 
                  [--database NAME] [--tls-ca FILE | --insecure]
 
-                 [--env-file PATH | --no-env] [--tenant VALUE]
+                 [--env-file PATH | --no-env]
 
                  [-c SQL | SQL]
 
@@ -1082,7 +1256,7 @@ nextsql migrate  status|pending|version|validate|create|up|down|force|repair
 
                  [--password-file FILE] [--tls-ca FILE | --insecure]
 
-                 [--env-file PATH | --no-env] [--tenant VALUE]
+                 [--env-file PATH | --no-env]
 
 nextsql backup   --data-dir DIR --key-file FILE --out DIR
 
@@ -1108,6 +1282,20 @@ nextsql status --local [--data-dir DIR] [--key-file FILE]
 
 nextsql cluster status --data-dir DIR
 
+nextsql token    keygen --keyset FILE
+
+                 rotate --keyset FILE | retire --keyset FILE --key-id N
+
+                 list-keys --keyset FILE | export-public --keyset FILE --out FILE
+
+                 mint --keyset FILE --principal NAME [--audience S] [--database S]
+
+                      [--realm S] [--role NAME ...] [--ttl DUR] [--not-before RFC3339]
+
+                 revoke --revocations FILE (--token-id HEX | --principal NAME [--before RFC3339])
+
+                 verify --keyset FILE [--revocations FILE] [--audience S] TOKEN
+
 nextsql version
 
 nextsql help
@@ -1116,11 +1304,87 @@ nextsql help
 
 `--out` for backup and export must not already exist. The tool writes a temporary directory, verifies, then publishes atomically.
 
+### External identity (OIDC) broker
+
+`nextsql-auth-broker` is an optional standalone service that lets an operator delegate *who a person is* to an OpenID Connect provider while NextSQL keeps full control of *what they may do*. It runs the OIDC flow, validates the IdP ID token against a cached JWKS, maps the verified claims to a native principal and role set through an `NSIP` identity policy, and mints an ordinary `NSSC1.` short-lived credential. `nextsqld` gains **no** OIDC parsing and makes **no** outbound calls — it just needs the broker's public issuing key in `token_verify_keyset`.
+
+```text
+
+nextsql-auth-broker --config PATH        # POST /v1/exchange, /healthz; SIGHUP reloads policy + keyset
+
+```
+
+Minimal `auth-broker.conf`:
+
+```text
+
+listen              = 127.0.0.1:8645
+tls_cert            = /etc/nextsql/broker.crt
+tls_key             = /etc/nextsql/broker.key
+identity_policy     = /etc/nextsql/idp-policy.nsip
+issuing_keyset      = /etc/nextsql/broker-issuing.nstk   # a private NSTK key
+deployment_audience = prod-eu
+oidc_credential_ttl = 1h
+
+[idp "corp"]
+issuer     = https://corp.okta.com/oauth2/abc
+client_id  = 0oa...
+jwks_uri   = https://corp.okta.com/oauth2/abc/v1/keys
+group_claim = groups
+
+```
+
+Create the issuing keyset with `nextsql token keygen --keyset broker-issuing.nstk`, then `nextsql token export-public --keyset broker-issuing.nstk --out verify.nstk` and point every server's `token_verify_keyset` at `verify.nstk`. The minted credential's lifetime is `min(oidc_credential_ttl, time until the IdP token expires)`; its roles are the policy-mapped set, and the server's `ACL.AllowedScoped` still drops any role the principal does not actually hold.
+
+The client-side `nextsql login` flow, the `oidc` audit `identity_source`, the OAuth2 client-credentials grant, and the embedded-in-`nextsqld` broker mode are not built yet.
+
+### Hosting dotenv configuration
+
+`nextsql init`, `nextsql hosting adopt`, and `nextsqld` support process env,
+`.env.local`, `.env`, `--env-file PATH`, and `--no-env`. Priority is explicit
+flags > non-empty process env > `.env.local` > `.env`; for `nextsqld`, those
+sources also override `--config` field values.
+
+| Variable | Hosting use |
+
+|---|---|
+
+| `NEXTSQL_DATA_DIR` | Deployment data directory |
+
+| `NEXTSQL_KEY_FILE` | Database root **file path**, never key bytes |
+
+| `NEXTSQL_INSTANCE_KEY_FILE` | Deployment registry root **file path**, never key bytes |
+
+| `NEXTSQL_REALM_NAME` | Realm name created/adopted by local hosting commands |
+
+| `NEXTSQL_DATABASE` | Logical name created/adopted and client Hello database |
+
+| `NEXTSQL_BUFFER_PAGES` | Init/adoption recovery and server buffer pages |
+
+| `NEXTSQL_SERVER_USER` | Server/bootstrap principal; never a client fallback |
+
+| `NEXTSQL_SERVER_PASSWORD_FILE` | Preferred server/bootstrap password-file path |
+
+| `NEXTSQL_SERVER_PASS` | Inline server/bootstrap password; automation fallback only |
+
+| `NEXTSQL_HOSTING_CONFIRM` | `true` for non-interactive explicit adoption |
+
+| `NEXTSQL_ADDR` | Client address; also the `nextsqld` listen address |
+
+Use a host-only mode-`0600` provisioning env file. Never commit it or expose
+database/instance root paths to an application or migration-runner env that
+does not operate the deployment. Raw key bytes are never valid env values.
+
 `nextsql exec` talks to a running `nextsqld`. `--user`, `--password-file`, and `-c` are optional as flags when the environment or a dotenv file supplies them. After resolve, user, password, and SQL must be present. `-c` wins over a positional SQL argument. Mixing `--data-dir` / `--key-file` onto `exec` is an error. `NEXTSQL_KEY_FILE` in the environment or `.env` is ignored (the root key is not an exec input).
 
 Address is `host:port` only. Values containing `://`, `key=`, or `password=` are rejected. Keys are never accepted in connection URLs.
 
-Every server-mode connect must set TLS (`--tls-ca` / `NEXTSQL_TLS_CA`) or `--insecure` / `NEXTSQL_INSECURE=true`, including `127.0.0.1`. `--insecure` is rejected unless the address is loopback. `--tls-ca` is a PEM CA / server certificate; SNI is taken from the host in `--addr`.
+Every server-mode connect must set TLS (`--tls-ca` / `NEXTSQL_TLS_CA`) or `--insecure` / `NEXTSQL_INSECURE=true`, including `127.0.0.1`. `--insecure` is rejected unless the address is loopback. `--tls-ca` is a PEM CA / server certificate; SNI defaults to the host in `--addr` and can be overridden by `--tls-server-name` / `NEXTSQL_TLS_SERVER_NAME`.
+
+For an mTLS server, pass `--tls-client-cert FILE --tls-client-key FILE` (or
+`NEXTSQL_TLS_CLIENT_CERT` / `NEXTSQL_TLS_CLIENT_KEY`). The certificate needs a
+`nextsql://service/<principal>` URI matching the database user. Both files are
+required together and `--tls-ca` remains required.
 
 ### Client configuration (`exec`)
 
@@ -1134,27 +1398,44 @@ Priority, highest wins: explicit flags (including empty strings) > non-empty pro
 
 | `NEXTSQL_ADDR` | `host:port` | `127.0.0.1:7210` |
 
-| `NEXTSQL_USER` | Auth user | none (required) |
+| `NEXTSQL_DATABASE_USER` | Database/client auth user | none (required) |
 
-| `NEXTSQL_PASSWORD_FILE` | Password file (newline stripped) | none |
+| `NEXTSQL_DATABASE_PASSWORD_FILE` | Database/client password file (newline stripped) | none |
 
-| `NEXTSQL_PASSWORD` | Inline password (CI convenience) | none |
+| `NEXTSQL_DATABASE_PASS` | Inline database/client password (CI convenience) | none |
 
-| `NEXTSQL_DATABASE` | Hello `database` field | empty (optional) |
+| `NEXTSQL_DATABASE` | Hello database; validated against registered default when present | empty (select default) |
 
 | `NEXTSQL_TLS_CA` | PEM CA / server cert | none |
 
+| `NEXTSQL_TLS_SERVER_NAME` | TLS certificate/SNI server name | host from `NEXTSQL_ADDR` |
+
+| `NEXTSQL_TLS_CLIENT_CERT` | mTLS client certificate path | none |
+
+| `NEXTSQL_TLS_CLIENT_KEY` | mTLS client private-key path | none |
+
 | `NEXTSQL_INSECURE` | `true` / `1` / `yes` → plaintext, loopback only | false |
 
-| `NEXTSQL_TENANT` | Optional `SET TENANT` after connect | unset |
 
-| `NEXTSQL_MIGRATIONS_DIR` | Migration file directory | `./migrations` |
+| `NEXTSQL_MIGRATION_DIR` | Migration file directory | `./migrations` |
 
-If both a password file and `NEXTSQL_PASSWORD` are set, the file wins. Using the inline password prints a one-line stderr warning: prefer `NEXTSQL_PASSWORD_FILE`. Do not put `NEXTSQL_PASSWORD` in a committed file.
+If both a password file and an inline password are set, the file wins. Server
+credentials use `NEXTSQL_SERVER_*` and never become a client-login fallback.
+Using an inline password prints a one-line stderr warning: prefer
+`NEXTSQL_DATABASE_PASSWORD_FILE` for clients and `NEXTSQL_SERVER_PASSWORD_FILE` for
+server bootstrap. Do not put passwords in a committed file.
+
+Ambiguous `NEXTSQL_USER`, `NEXTSQL_PASSWORD_FILE`, and `NEXTSQL_PASSWORD`
+variables are not accepted. Database clients use `NEXTSQL_DATABASE_*`; server
+bootstrap uses `NEXTSQL_SERVER_*`.
 
 `.env.local` is the recommended gitignored overlay. A parent directory’s `.env.local` is not loaded.
 
-This client loader is not `nextsqld --config`. Do not put the root unlock key in the application `.env`. Local and remote `.env` examples: [§14](#14-schema-migrations).
+The same dotenv loader supplies common hosting fields to init, adoption, and
+`nextsqld`; the server's `--config` remains a separate lower-priority
+`key=value` source. Do not put root key bytes in any env file, and do not expose
+root key paths to an application/CI env. Local and remote `.env` examples:
+[§14](#14-schema-migrations).
 
 ### Schema migrations
 
@@ -1184,7 +1465,7 @@ Keep schema in Git. `nextsql migrate` applies timestamped SQL files to a running
 
 Prefer a password file. Never put the root unlock key in the application `.env`.
 
-Default directory is `./migrations` (`--dir` / `NEXTSQL_MIGRATIONS_DIR`). Connection flags and dotenv match `exec` ([§13](#13-command-line-reference)).
+Default directory is `./migrations` (`--dir` / `NEXTSQL_MIGRATION_DIR`). Connection flags and dotenv match `exec` ([§13](#13-command-line-reference)).
 
 ### Commands
 
@@ -1234,7 +1515,7 @@ nextsql migrate repair --confirm
 
 `validate` / `create` do not connect. `status` / `up` / `down` / `force` / `repair` create `nsql_schema_migrations` if it is missing. The CLI never sends `GRANT` SQL: creating that table grants `SELECT`/`INSERT`/`UPDATE`/`DELETE` on it to the handshake user.
 
-Each up file is one transaction: `BEGIN`, dirty history insert, each statement, finalize (`dirty=0`), `COMMIT`. On error the file is rolled back. Files must not contain `BEGIN`/`COMMIT`/`ROLLBACK`, `SET TENANT`, or `GRANT`/`REVOKE`/`CREATE`/`DROP` `USER`/`ROLE` (those persist outside WAL). Pass `--tenant` on the CLI instead.
+Each up file is one transaction: `BEGIN`, dirty history insert, each statement, finalize (`dirty=0`), `COMMIT`. On error the file is rolled back. Files must not contain `BEGIN`/`COMMIT`/`ROLLBACK` or `GRANT`/`REVOKE`/`CREATE`/`DROP` `USER`/`ROLE` (those persist outside WAL). Removed shared-tenancy syntax is rejected by the parser.
 
 `--dry-run` connects, lists the files that would run, checksums them, and parses every statement. It does not `BEGIN` and does not execute user SQL.
 
@@ -1248,11 +1529,11 @@ Each up file is one transaction: `BEGIN`, dirty history insert, each statement, 
 
 NEXTSQL_ADDR=127.0.0.1:7210
 
-NEXTSQL_USER=app
+NEXTSQL_DATABASE_USER=app
 
 NEXTSQL_INSECURE=true
 
-NEXTSQL_MIGRATIONS_DIR=./migrations
+NEXTSQL_MIGRATION_DIR=./migrations
 
 # NEXTSQL_DATABASE is optional; leave unset on 0.1.0-dev
 
@@ -1262,7 +1543,7 @@ NEXTSQL_MIGRATIONS_DIR=./migrations
 
 # .env.local  — gitignored
 
-NEXTSQL_PASSWORD_FILE=/home/dev/secrets/nextsql.pw
+NEXTSQL_DATABASE_PASSWORD_FILE=/home/dev/secrets/nextsql.pw
 
 # Optional local-only operator vars; ignored by exec/migrate:
 
@@ -1272,7 +1553,7 @@ NEXTSQL_PASSWORD_FILE=/home/dev/secrets/nextsql.pw
 
 ```
 
-Do **not** put the root key path in the committed `.env`. Do **not** put `NEXTSQL_PASSWORD=...` in a committed file. The password file is preferred over an inline password.
+Do **not** put the root key path in the committed `.env`. Do **not** put `NEXTSQL_DATABASE_PASS=...` in a committed file. The password file is preferred over an inline password.
 
 `NEXTSQL_INSECURE=true` is loopback-only. A laptop that omits both `--insecure` and `--tls-ca` fails at resolve, including `127.0.0.1`.
 
@@ -1286,13 +1567,13 @@ Load this on the migrate runner, not on the database host. The VPS `nextsqld` al
 
 NEXTSQL_ADDR=db.example.com:7210
 
-NEXTSQL_USER=migrator
+NEXTSQL_DATABASE_USER=migrator
 
-NEXTSQL_PASSWORD_FILE=/run/secrets/nextsql-migrator.pw
+NEXTSQL_DATABASE_PASSWORD_FILE=/run/secrets/nextsql-migrator.pw
 
 NEXTSQL_TLS_CA=/etc/nextsql/ca.pem
 
-NEXTSQL_MIGRATIONS_DIR=./migrations
+NEXTSQL_MIGRATION_DIR=./migrations
 
 # no NEXTSQL_KEY_FILE — the VPS nextsqld has the key; CI must not
 
@@ -1326,7 +1607,7 @@ migrations/
 
 ```
 
-Pattern: `YYYYMMDDHHMMSS_slug.up.sql` (optional matching `.down.sql`). Version is a 14-digit UTC timestamp. `migrate create NAME` slugs the name (lowercase, non-alphanumerics to `_`, max 64 characters) and retries `+1s` if that timestamp already exists.
+Pattern: `YYYYMMDDHHMMSS_slug.up.sql` (optional matching `.down.sql`). Migration versions are timestamp-formatted, monotonically increasing identifiers. `migrate create NAME` slugs the name (lowercase, non-alphanumerics to `_`, max 64 characters) and allocates the later of the current UTC second or one second after the latest existing version. When multiple migrations are created within the same wall-clock second, NextSQL continues allocating subsequent versions without waiting, including when existing versions are ahead of the wall clock. This supports bulk and programmatic migration generation while preserving the 14-digit format.
 
 A version may have up only (forward-only). Down without up fails `validate`. Integer prefixes such as `0001_name.up.sql` are not accepted.
 
@@ -1336,7 +1617,7 @@ Checksum: SHA-256 of the file after CR LF → LF and stripping a single UTF-8 BO
 
 ### Example files
 
-Recommended pattern: composite `PRIMARY KEY (tenant_id, id)` so an FK can include `tenant_id` on both sides. `id UUID PRIMARY KEY` plus `REFERENCES parent (tenant_id, id)` is illegal unless a UNIQUE btree index on exactly `(tenant_id, id)` exists first.
+Recommended pattern: composite `PRIMARY KEY (account_id, id)` so an FK can include `account_id` on both sides. `id UUID PRIMARY KEY` plus `REFERENCES parent (account_id, id)` is illegal unless a UNIQUE btree index on exactly `(account_id, id)` exists first.
 
 Copies of the first two files live in [`docs/examples/migrations/`](docs/examples/migrations/). That is documentation only; this module has no application `migrations/` directory.
 
@@ -1346,7 +1627,7 @@ Copies of the first two files live in [`docs/examples/migrations/`](docs/example
 
 CREATE TABLE customers (
 
-    tenant_id  UUID NOT NULL,
+    account_id  UUID NOT NULL,
 
     id         UUID NOT NULL DEFAULT UUID(),
 
@@ -1356,11 +1637,11 @@ CREATE TABLE customers (
 
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 
-    PRIMARY KEY (tenant_id, id)
+    PRIMARY KEY (account_id, id)
 
 );
 
-CREATE UNIQUE INDEX ux_customers_tenant_email ON customers (tenant_id, email);
+CREATE UNIQUE INDEX ux_customers_tenant_email ON customers (account_id, email);
 
 ```
 
@@ -1378,7 +1659,7 @@ DELETE FROM customers;
 
 CREATE TABLE orders (
 
-    tenant_id   UUID NOT NULL,
+    account_id   UUID NOT NULL,
 
     id          UUID NOT NULL DEFAULT UUID(),
 
@@ -1388,13 +1669,13 @@ CREATE TABLE orders (
 
     created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 
-    PRIMARY KEY (tenant_id, id),
+    PRIMARY KEY (account_id, id),
 
     CONSTRAINT fk_orders_customer
 
-        FOREIGN KEY (tenant_id, customer_id)
+        FOREIGN KEY (account_id, customer_id)
 
-        REFERENCES customers (tenant_id, id)
+        REFERENCES customers (account_id, id)
 
         ON DELETE RESTRICT
 
@@ -1402,7 +1683,7 @@ CREATE TABLE orders (
 
 );
 
-CREATE INDEX ix_orders_customer ON orders (tenant_id, customer_id);
+CREATE INDEX ix_orders_customer ON orders (account_id, customer_id);
 
 ```
 
@@ -1412,7 +1693,7 @@ CREATE INDEX ix_orders_customer ON orders (tenant_id, customer_id);
 
 CREATE TABLE lines (
 
-    tenant_id  UUID NOT NULL,
+    account_id  UUID NOT NULL,
 
     id         UUID NOT NULL DEFAULT UUID(),
 
@@ -1422,13 +1703,13 @@ CREATE TABLE lines (
 
     qty        DECIMAL(12,0) NOT NULL,
 
-    PRIMARY KEY (tenant_id, id),
+    PRIMARY KEY (account_id, id),
 
     CONSTRAINT fk_lines_order
 
-        FOREIGN KEY (tenant_id, order_id)
+        FOREIGN KEY (account_id, order_id)
 
-        REFERENCES orders (tenant_id, id)
+        REFERENCES orders (account_id, id)
 
         ON DELETE CASCADE
 
@@ -1436,7 +1717,7 @@ CREATE TABLE lines (
 
 );
 
-CREATE INDEX ix_lines_order ON lines (tenant_id, order_id);
+CREATE INDEX ix_lines_order ON lines (account_id, order_id);
 
 ```
 
@@ -1450,11 +1731,11 @@ SELECT orders.id, customers.name, lines.sku
 
 FROM orders
 
-JOIN customers ON customers.tenant_id = orders.tenant_id
+JOIN customers ON customers.account_id = orders.account_id
 
               AND customers.id = orders.customer_id
 
-JOIN lines     ON lines.tenant_id = orders.tenant_id
+JOIN lines     ON lines.account_id = orders.account_id
 
               AND lines.order_id = orders.id;
 
@@ -1496,7 +1777,7 @@ The migrate user needs `CONNECT` + `CREATE` on the database, table DML on `nsql_
 
 If an `ADMIN` created the history table first, a later least-privilege migrator has no table DML: `GRANT` out of band or re-bootstrap as that user.
 
-`--tenant` issues `SET TENANT` after connect. Production non-`ADMIN` users must set a tenant before files touch tenant-keyed tables. History has no `tenant_id`; it is cluster-global.
+Migrations run only in the database selected by the connection. There is no row-tenant connection option.
 
 ---
 
@@ -1504,11 +1785,13 @@ If an `ADMIN` created the history table first, a later least-privilege migrator 
 
 ```text
 
-nextsqld --data-dir DIR --key-file FILE
+nextsqld --data-dir DIR --key-file FILE [--instance-key-file FILE]
 
          [--listen 127.0.0.1:7210] [--config FILE]
 
-         [--tls-cert FILE --tls-key FILE]
+         [--env-file PATH | --no-env]
+
+         [--tls-cert FILE --tls-key FILE [--tls-client-ca FILE [--tls-client-crl FILE]]]
 
          [--require-client-key]
 
@@ -1545,6 +1828,16 @@ buffer_pages=1024
 tls_cert=/etc/nextsql/server.crt
 
 tls_key=/etc/nextsql/server.key
+
+tls_client_ca=
+
+tls_client_crl=
+
+token_verify_keyset=
+
+token_revocations=
+
+token_audience=
 
 require_client_key=false
 
@@ -1636,7 +1929,7 @@ func main() {
 
     User:          "app",
 
-    Password:      os.Getenv("NEXTSQL_PASSWORD"),
+    Password:      os.Getenv("NEXTSQL_DATABASE_PASS"),
 
     InsecureNoTLS: true, // loopback only
 
@@ -1716,7 +2009,7 @@ const conn = await connect({
 
   user: "app",
 
-  password: process.env.NEXTSQL_PASSWORD,
+  password: process.env.NEXTSQL_DATABASE_PASS,
 
   insecureNoTLS: true,
 });
@@ -1750,7 +2043,7 @@ const conn = await connect({
 
   user: "app",
 
-  password: Deno.env.get("NEXTSQL_PASSWORD"),
+  password: Deno.env.get("NEXTSQL_DATABASE_PASS"),
 
   insecureNoTLS: true,
 });
@@ -1772,7 +2065,7 @@ $conn = NextSQL\Client::connect([
 
     'user' => 'app',
 
-    'password' => getenv('NEXTSQL_PASSWORD'),
+    'password' => getenv('NEXTSQL_DATABASE_PASS'),
 
     'insecureNoTLS' => true,
 
@@ -1798,7 +2091,7 @@ $conn = NextSQL\Client::connect([
 
     'user' => 'app',
 
-    'password' => getenv('NEXTSQL_PASSWORD'),
+    'password' => getenv('NEXTSQL_DATABASE_PASS'),
 
     'tls' => ['cafile' => '/etc/nextsql/ca.pem', 'servername' => 'db.example.com'],
 
@@ -1859,6 +2152,47 @@ Client:
 ```
 
 `--insecure` against a remote host is rejected.
+
+To require mTLS, set `--tls-client-ca`. The verified client leaf needs one
+`nextsql://service/<principal>` URI matching the native user. Add
+`--tls-client-crl` for fail-closed PEM X.509 CRL checks. Every non-root
+certificate in the verified chain must have current issuer coverage. Replace
+all configured TLS files, then send `SIGHUP`; a failed reload retains the last
+known-good snapshot, while a successful mTLS reload disconnects all accepted
+connections, including in-progress handshakes, so clients reauthenticate. Use
+an old+new CA overlap bundle during trust rotation. OCSP is not implemented.
+
+### Short-lived credentials
+
+A signed short-lived credential is presented **in place of the password** (same
+`Config.Password` / `--password-file` slot, no driver change). Enable
+verification with `token_verify_keyset=FILE`; optionally add
+`token_revocations=FILE` and `token_audience=STRING`. `SIGHUP` reloads the
+keyset and revocation list (last known-good on failure).
+
+```
+# once: create an issuer keyset, then a verify-only copy for the servers
+nextsql token keygen        --keyset /secure/token.keyset
+nextsql token export-public  --keyset /secure/token.keyset --out /etc/nextsql/token.keyset.pub
+
+# issue a 15-minute read-only credential for user "app" in one database
+nextsql token mint --keyset /secure/token.keyset --principal app \
+  --audience prod-eu --database orders --role readonly --ttl 15m
+
+# revoke one credential, or every credential for a principal
+nextsql token revoke --revocations /etc/nextsql/token.revocations --token-id <hex>
+nextsql token revoke --revocations /etc/nextsql/token.revocations --principal app
+
+# rotate the signing key (overlap), then retire the old one later
+nextsql token rotate --keyset /secure/token.keyset
+nextsql token retire --keyset /secure/token.keyset --key-id 1
+```
+
+The server checks the Ed25519 signature, the validity window (60 s skew, max
+lifetime 24 h), the audience, the served-database scope, and revocation; it
+requires the credential's principal to match the login user and to be a known
+native user, applies the role scope to the session, and closes the session when
+the credential expires. See [`docs/security.md`](docs/security.md).
 
 ### REQUIRE CLIENT KEY
 
@@ -2080,6 +2414,16 @@ Only **one** node bootstraps. The other two use the same `--raft-join` list with
 
 A wiped replica is restored with `nextsql backup` / `restore` (same identity and keys), then rejoined. Raft logs are ciphertext (replication DEK). HA is not a substitute for backups.
 
+### Read consistency and follower reads
+
+Every read runs in one of three session modes (default `STRONG`):
+
+- **`STRONG`** — observes every acknowledged write; served only on the leader behind a Raft read barrier (one quorum round trip). A follower rejects it with `unavailable`.
+- **`BOUNDED`** — served from any member within `MAX STALENESS` of the leader (default five heartbeats); a member that has fallen further behind is rejected. No quorum round trip.
+- **`STALE`** — served from any member's local applied state with no freshness bound.
+
+There is no SQL syntax for this yet — it is set on the wire (`SetReadConsistency` frame) / in a driver. Every official driver exposes `setReadConsistency` / `nodeStatus` and a routing cluster client — `nextsql.Cluster` (`OpenCluster` over `Config.Nodes`) in Go, `connectCluster` in Node/Bun/Deno, `NextSQL\Cluster::connect` in PHP — that sends eligible read-only statements to a healthy follower and writes / DDL / transactions / `STRONG` reads to the leader, and fails over to the new leader on a leader change. Per-node lag is visible in `system.replica_health` and the `NodeStatus` frame. `STRONG` reads keep read-your-writes and monotonic reads across a leader failover; `STALE`/`BOUNDED` may lag (documented trade-off). Consistency argument: [`docs/ha.md`](docs/ha.md) "Consistency model and sign-off".
+
 Details: [`docs/ha.md`](docs/ha.md).
 
 ---
@@ -2148,9 +2492,25 @@ Official numbers keep encryption, WAL, `fsync`, checksums, MVCC, and authenticat
 
 ./nextsql-bench --slo --slo-max-rows 1000000 --slo-vectors 256 --duration 2s
 
+# partition-pruning comparison: RANGE-partitioned vs unpartitioned, same rows
+
+./nextsql-bench --partition --partition-rows 40000 --duration 3s
+
+# follower-read scaling: STRONG vs STALE/BOUNDED reads across a 3-node cluster
+
+./nextsql-bench --readscale --readscale-rows 10000 --duration 5s
+
+# quantised-vector comparison: F32 vs F16 vs I8 element types, F16/I8-quantised HNSW graphs, IVF / IVF-PQ, and a SPARSEVECTOR inverted index — size, build, NEAREST latency + recall
+
+./nextsql-bench --vecquant --vecquant-rows 5000 --vecquant-dim 256 --vecquant-sparse-dim 4096 --vecquant-sparse-nnz 24
+
 ```
 
 `--slo` seeds a throwaway encrypted database and measures cached PK lookup, secondary-index equality, durable single-row INSERT/UPDATE, bulk INSERT plus `COUNT(*)` / `GROUP BY` / range / join at each scale, hybrid `WHERE`+`SEARCH`+`NEAREST`, and HNSW recall\@10 / recall\@100.
+
+`--partition` seeds an eight-band RANGE-partitioned table and an unpartitioned `PRIMARY KEY (id)` table with the same rows, then measures a pruned single-bucket scan, a pruned single-bucket `SUM`, an unpruned full `SUM` (partitioning overhead check), and routed vs plain `INSERT`, each with a `speedup` column. Reads run inside a read-only transaction so the SELECT result cache never serves a repeat. Published run: [`docs/partitioning.md`](docs/partitioning.md).
+
+`--readscale` builds a 3-node single-leader cluster (encryption, WAL, fsync on) and drives PK point reads under `STRONG` on the leader, `STALE` on the leader, `STALE` over two and three members, and `BOUNDED` over three. It reports aggregate read QPS, the leader's slice (`leader-qps`), p95/p99, and the ratio against the `stale-1n` baseline — showing the Raft read-barrier cost (`STALE` ≈ 2× `STRONG` on one node) and the leader read-offload (~3.5× lower `leader-qps` across three members). Aggregate QPS is CPU-bound on one host. Published run: [`docs/ha.md`](docs/ha.md) "Read scaling".
 
 100M rows and 1M-vector HNSW still need a longer run (`--slo-max-rows 100000000` / `--slo-vectors 1000000`). Published host numbers: [`docs/ops.md`](docs/ops.md).
 
@@ -2222,23 +2582,19 @@ P17/P18 added user-visible behavior that older copies of this manual did not des
 
 - `REBUILD INDEX ... ONLINE` — blocking rebuild is the shipped path; `ONLINE` remains rejected until concurrent-write safety is proven
 
-- P16 release gate remains open until the corrected 1M HNSW measurement and 100M randomized B+Tree invariant soak are green
+- P16 is **complete** (exit gate green); the terminal 100M B+Tree invariant soak is a deferred standalone measurement, not a release gate
 
-- partition-wise aggregation/join — waits on P21 physical partitioning
+- partition-wise aggregation/join — landed with P21 physical partitioning
 
-- P19 WORKFLOW / TRIGGER / SCHEDULE / TASK
+- P21 is **complete** (RANGE/HASH/LIST, ATTACH/DETACH, partition-local indexes, pruning-sound, offline `migrate-tenant`)
 
-- P20 CDC / change streams
+- P22 follower reads / read scaling — **complete** (2026-08-30): read-consistency modes (`STRONG`/`BOUNDED`/`STALE`), replica-lag surfacing (`system.replica_health`), follower-read routing across the server and every official driver, the read-scaling benchmark (`nextsql-bench --readscale`), and the exit gate — linearizability/consistency sign-off (`docs/ha.md` "Consistency model and sign-off") plus the failover session-guarantee test (`STRONG` sessions keep read-your-writes + monotonic reads across a leader change)
 
-- P21 native table partitioning
+- P23 Vector Engine 2.0 — **complete** (2026-08-31): production-gating sign-off in `docs/vector.md`. `VECTOR<F16,N>` / `VECTOR<I8,N>` / `BITVECTOR<N>` and the quantised HNSW index are production-gated; IVF / IVF-PQ / `SPARSEVECTOR` + `USING SPARSE` / dense+sparse+BM25 fusion are production-gated ANN paths with recall/latency/size/QPS/RAM measurements (`nextsql-bench --vecquant`). Documented follow-ons (not gate items): a `BITVECTOR`/Hamming `--vecquant` row, a process-local IVF-PQ cache, IVF/IVF-PQ/SPARSE on partitioned tables
 
-- P22 follower reads / read scaling
+- P24 Full-text Search 2.0 is complete; further language analyzers beyond `simple` / `english` / `french` / `german` / `spanish` and additional runtime/index optimizations are documented non-gate follow-ons
 
-- P23 Vector Engine 2.0 features such as F16/I8/bit vectors, IVF/IVF-PQ, quantization, and sparse retrieval
-
-- P24 Full-text Search 2.0 features such as richer analyzers/language handling/highlighting
-
-- P25 Security 2.0 features such as mTLS/service identities, short-lived credentials, external IdP, field-level client encryption, password-hash evolution, and audit hardening
+- P25 Security 2.0 remains open: mTLS/service identities, live certificate/trust rotation, X.509 CRL revocation, and signed short-lived credentials (format, expiry, audience/database/role/realm scope, signing-key rotation, revocation, audit) are implemented; OCSP, external IdP, field-level client encryption, password-hash evolution, and audit hardening remain open
 
 - P26 system catalog / introspection 2.0
 
@@ -2256,9 +2612,9 @@ P17/P18 added user-visible behavior that older copies of this manual did not des
 
 - Outer `JOIN` together with `SEARCH` or `NEAREST` remains unsupported where documented; inner join is allowed when the rank column is on the `FROM` table
 
-- Current shipped FTS does not yet include the P24 richer analyzer/language feature set
+- Additional language analyzers beyond `simple` / `english` / `french` / `german` / `spanish` remain open (`HIGHLIGHT` / `SNIPPET`, prefix, fuzzy matching, typo tolerance, multi-field search, field weighting, and faceting landed)
 
-- Current shipped vector engine remains the production-gated F32 + flat/HNSW surface until P23 extensions land
+- IVF / IVF-PQ / `USING SPARSE` are not available on partitioned tables; a process-local IVF-PQ cache and a `BITVECTOR`/Hamming `--vecquant` row remain documented follow-ons
 
 ### Known measurement / correctness notes (0.1.0-dev)
 
@@ -2266,24 +2622,20 @@ P17/P18 added user-visible behavior that older copies of this manual did not des
 
 - 100M-row analytics are published: the current tracker records COUNT **56 µs**, GROUP BY **16.31 s**, PK range **2.21 ms**, and join **35.54 s** on the labeled ext4 benchmark environment.
 
-- The corrected distinct-vector 100K validation records HNSW p95 **3.317 ms**, recall@10 **1.000**, recall@100 **0.999**. The corrected 1M-vector exit-gate run is still required before P16 closes.
+- The corrected 1M-vector HNSW v10 run records p95 **8.061 ms**, recall@10 **1.000**, recall@100 **0.998**. P16 is complete; the terminal 100M B+Tree soak is a deferred standalone measurement.
 
-- The randomized B+Tree soak must also reach its current P16 exit requirement before P16 is marked complete.
+- P23 `--vecquant` 2026-08-31 reference run (2000 × 128-d dense + 2000 × 4096-d nnz=24 sparse, encryption + WAL + fsync on) is published in `docs/vector.md` "Size / recall comparison" with recall@10/@100, p50/p95/p99, QPS, heap, index/db size, and build time.
 
 - `nextsql-bench --slo` on your hardware is the source of deployment-specific latency numbers, not this manual.
 
 ### Planned features are not current syntax
 
-`PROJECT.md` describes the intended finished product. This manual does **not** expose planned P19–P30 grammar as usable syntax before implementation.
+`PROJECT.md` describes the intended finished product. This manual does **not** expose unchecked P25–P30 grammar as usable syntax before implementation. P0–P24 shipped surfaces are documented above.
 
 For example, do not assume these work merely because they are planned:
 
 ```text
-CREATE WORKFLOW ...
-CREATE TRIGGER ...
-CREATE SCHEDULE ...
-CDC subscription syntax
-partitioning DDL
+Follower-read consistency syntax
 follower-read consistency syntax
 ```
 

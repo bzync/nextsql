@@ -43,6 +43,31 @@ CREATE TABLE products (
 	}
 }
 
+func TestParseSparsevector(t *testing.T) {
+	stmt, err := Parse(`CREATE TABLE docs (id UUID PRIMARY KEY, emb SPARSEVECTOR<30522>)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ct := stmt.(ast.CreateTable)
+	if ct.Columns[1].Type.String() != "SPARSEVECTOR<30522>" || ct.Columns[1].Type.VecElem != types.VecSparse {
+		t.Fatalf("sparse type %+v", ct.Columns[1].Type)
+	}
+	ix, err := Parse(`CREATE VECTOR INDEX ix ON docs (emb) USING SPARSE`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ci := ix.(ast.CreateIndex)
+	if !ci.Vector || ci.Using != "sparse" {
+		t.Fatalf("sparse index %+v", ci)
+	}
+	if _, err := Parse(`CREATE VECTOR INDEX ix ON docs (emb) USING SPARSE WITH (LISTS = 8)`); err == nil {
+		t.Fatal("expected USING SPARSE WITH to be rejected")
+	}
+	if _, err := Parse(`CREATE TABLE docs (id UUID PRIMARY KEY, emb SPARSEVECTOR<0>)`); err == nil {
+		t.Fatal("expected SPARSEVECTOR<0> rejection")
+	}
+}
+
 func TestParseSubscribe(t *testing.T) {
 	stmt, err := Parse(`SUBSCRIBE TO orders WHERE operation = 'update' AFTER 18446744073709551614`)
 	if err != nil {
@@ -152,9 +177,6 @@ func TestParseStatements(t *testing.T) {
 		{`MAINTAIN DATABASE`, ast.Maintain{}},
 		{`MAINTAIN TABLE products`, ast.Maintain{}},
 		{`MAINTAIN INDEX ix_products_name`, ast.Maintain{}},
-		{`SET TENANT = '11111111-1111-1111-1111-111111111111'`, ast.SetTenant{}},
-		{`SET TENANT = $1`, ast.SetTenant{}},
-		{`RESET TENANT`, ast.SetTenant{}},
 		{`SELECT name, price FROM products ORDER BY price DESC, name`, ast.Select{}},
 		{`SELECT * FROM products ORDER BY 1 ASC LIMIT 10`, ast.Select{}},
 		{`SELECT k, ROW_NUMBER() OVER (PARTITION BY k ORDER BY v) FROM t`, ast.Select{}},
@@ -221,10 +243,6 @@ func TestParseStatements(t *testing.T) {
 			if strings.Contains(tc.src, "ANALYZE") != ex.Analyze {
 				t.Fatalf("%s analyze=%v", tc.src, ex.Analyze)
 			}
-		case ast.SetTenant:
-			if _, ok := stmt.(ast.SetTenant); !ok {
-				t.Fatalf("%s: %T", tc.src, stmt)
-			}
 		case ast.Analyze:
 			if _, ok := stmt.(ast.Analyze); !ok {
 				t.Fatalf("%s: %T", tc.src, stmt)
@@ -245,6 +263,19 @@ func TestParseStatements(t *testing.T) {
 			if _, ok := stmt.(ast.CreateDatabase); !ok {
 				t.Fatalf("%s: %T", tc.src, stmt)
 			}
+		}
+	}
+}
+
+func TestParseRejectsRemovedSharedTenantSyntax(t *testing.T) {
+	for _, src := range []string{
+		`SET TENANT = '11111111-1111-1111-1111-111111111111'`,
+		`SET TENANT = $1`,
+		`RESET TENANT`,
+		`CREATE TABLE t (tenant_id STRING PRIMARY KEY) PARTITION BY TENANT (tenant_id) (PARTITION p VALUES IN ('a'))`,
+	} {
+		if _, err := Parse(src); err == nil {
+			t.Fatalf("accepted removed shared-tenant syntax: %s", src)
 		}
 	}
 }
@@ -534,6 +565,97 @@ func TestParseAlterTableCmds(t *testing.T) {
 	}
 }
 
+func TestParseAlterPartitionLifecycle(t *testing.T) {
+	tests := []struct {
+		sql  string
+		rule string
+	}{
+		{`ALTER TABLE events ADD PARTITION p2 VALUES LESS THAN MAXVALUE`, "RANGE"},
+		{`ALTER TABLE events ADD PARTITION p2 VALUES IN ('ap', 'au')`, "VALUE"},
+		{`ALTER TABLE events ADD PARTITION p2 MODULUS 4 REMAINDER 2`, "HASH"},
+	}
+	for _, tc := range tests {
+		stmt, err := Parse(tc.sql)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.sql, err)
+		}
+		cmd, ok := stmt.(ast.AlterTable).Cmd.(ast.AlterAddPartition)
+		if !ok || cmd.Partition.Name != "p2" || cmd.Partition.Rule != tc.rule {
+			t.Fatalf("%s: %T %+v", tc.sql, stmt.(ast.AlterTable).Cmd, stmt.(ast.AlterTable).Cmd)
+		}
+	}
+	stmt, err := Parse(`ALTER TABLE events DROP PARTITION p2`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd, ok := stmt.(ast.AlterTable).Cmd.(ast.AlterDropPartition)
+	if !ok || cmd.Name != "p2" {
+		t.Fatalf("%T %+v", stmt.(ast.AlterTable).Cmd, stmt.(ast.AlterTable).Cmd)
+	}
+
+	stmt, err = Parse(`ALTER TABLE events ATTACH PARTITION archived VALUES IN ('ap')`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	attach, ok := stmt.(ast.AlterTable).Cmd.(ast.AlterAttachPartition)
+	if !ok || attach.Partition.Name != "archived" || attach.Partition.Rule != "VALUE" {
+		t.Fatalf("%T %+v", stmt.(ast.AlterTable).Cmd, stmt.(ast.AlterTable).Cmd)
+	}
+
+	stmt, err = Parse(`ALTER TABLE events DETACH PARTITION archived`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	detach, ok := stmt.(ast.AlterTable).Cmd.(ast.AlterDetachPartition)
+	if !ok || detach.Name != "archived" {
+		t.Fatalf("%T %+v", stmt.(ast.AlterTable).Cmd, stmt.(ast.AlterTable).Cmd)
+	}
+}
+
+func TestParseMultiColumnRangeAndListPartitionKeys(t *testing.T) {
+	stmt, err := Parse(`CREATE TABLE ledger (
+		region STRING NOT NULL, bucket STRING NOT NULL, id STRING NOT NULL,
+		PRIMARY KEY (region, bucket, id)
+	) PARTITION BY RANGE (region, bucket) (
+		PARTITION p0 VALUES LESS THAN ('m', 'z'),
+		PARTITION p1 VALUES LESS THAN MAXVALUE
+	)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec := stmt.(ast.CreateTable).Partition
+	if spec == nil || len(spec.Columns) != 2 || len(spec.Partitions) != 2 {
+		t.Fatalf("range spec: %+v", spec)
+	}
+	if len(spec.Partitions[0].LessThanTuple) != 2 || spec.Partitions[0].LessThan != nil {
+		t.Fatalf("range tuple bound not parsed: %+v", spec.Partitions[0])
+	}
+	if spec.Partitions[1].LessThan != nil || spec.Partitions[1].LessThanTuple != nil {
+		t.Fatalf("MAXVALUE partition should carry no bound: %+v", spec.Partitions[1])
+	}
+
+	stmt, err = Parse(`CREATE TABLE placements (
+		region STRING NOT NULL, tier STRING NOT NULL, id STRING NOT NULL,
+		PRIMARY KEY (region, tier, id)
+	) PARTITION BY LIST (region, tier) (
+		PARTITION hot VALUES IN (('us', 'gold'), ('eu', 'gold')),
+		PARTITION cold VALUES IN (('us', 'bronze'))
+	)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec = stmt.(ast.CreateTable).Partition
+	if spec == nil || len(spec.Partitions) != 2 {
+		t.Fatalf("list spec: %+v", spec)
+	}
+	if len(spec.Partitions[0].ValueTuples) != 2 || len(spec.Partitions[0].ValueTuples[0]) != 2 {
+		t.Fatalf("list tuple membership not parsed: %+v", spec.Partitions[0])
+	}
+	if len(spec.Partitions[0].Values) != 0 {
+		t.Fatalf("tuple LIST must not populate scalar Values: %+v", spec.Partitions[0])
+	}
+}
+
 func TestParseLeftJoin(t *testing.T) {
 	stmt, err := Parse(`SELECT c.name, o.id FROM customers c LEFT JOIN orders o ON o.customer_id = c.id`)
 	if err != nil {
@@ -668,20 +790,145 @@ func TestParsePointAndSpatialIndex(t *testing.T) {
 		t.Fatal(err)
 	}
 	ix = stmt.(ast.CreateIndex)
-	if !ix.Fulltext || ix.Spatial || ix.Name != "ix_body" || ix.Cols[0] != "body" {
+	if !ix.Fulltext || ix.Spatial || ix.Name != "ix_body" || ix.Cols[0] != "body" || ix.Analyzer != "" {
 		t.Fatalf("fulltext %+v", ix)
+	}
+	stmt, err = Parse(`CREATE FULLTEXT INDEX ix_body ON articles (body) WITH (ANALYZER = 'english')`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ix = stmt.(ast.CreateIndex); !ix.Fulltext || ix.Analyzer != "english" {
+		t.Fatalf("fulltext analyzer %+v", ix)
+	}
+	stmt, err = Parse(`CREATE FULLTEXT INDEX ix_body ON articles (body) WITH (ANALYZER = simple)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ix = stmt.(ast.CreateIndex); ix.Analyzer != "simple" {
+		t.Fatalf("fulltext simple %+v", ix)
+	}
+	stmt, err = Parse(`CREATE FULLTEXT INDEX ix_fr ON articles (body) WITH (ANALYZER = 'french')`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ix = stmt.(ast.CreateIndex); ix.Analyzer != "french" {
+		t.Fatalf("fulltext french %+v", ix)
+	}
+	if _, err := Parse(`CREATE FULLTEXT INDEX ix ON t (body) WITH (FOO = 'english')`); err == nil {
+		t.Fatal("expected unknown FULLTEXT WITH option to be a syntax error")
 	}
 	stmt, err = Parse(`SELECT id FROM articles SEARCH body FOR 'database performance' LIMIT 20`)
 	if err != nil {
 		t.Fatal(err)
 	}
 	sel := stmt.(ast.Select)
-	if sel.SearchCol != "body" {
-		t.Fatalf("search col %q", sel.SearchCol)
+	if len(sel.SearchCols) != 1 || sel.SearchCols[0] != "body" {
+		t.Fatalf("search col %v", sel.SearchCols)
 	}
 	lit, ok := sel.SearchQuery.(ast.Literal)
 	if !ok || lit.Value.Str != "database performance" {
 		t.Fatalf("search query %+v", sel.SearchQuery)
+	}
+	stmt, err = Parse(`SELECT id FROM articles SEARCH title, body FOR 'database performance'`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sel = stmt.(ast.Select)
+	if len(sel.SearchCols) != 2 || sel.SearchCols[0] != "title" || sel.SearchCols[1] != "body" {
+		t.Fatalf("multi-field search %v", sel.SearchCols)
+	}
+	if sel.SearchWeights != nil {
+		t.Fatalf("unweighted %v", sel.SearchWeights)
+	}
+	stmt, err = Parse(`SELECT id FROM articles SEARCH title WEIGHT 3, body FOR 'database'`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sel = stmt.(ast.Select)
+	if len(sel.SearchCols) != 2 || sel.SearchCols[0] != "title" || sel.SearchCols[1] != "body" {
+		t.Fatalf("weighted cols %v", sel.SearchCols)
+	}
+	if len(sel.SearchWeights) != 2 || sel.SearchWeights[0] != 3 || sel.SearchWeights[1] != 1 {
+		t.Fatalf("weights %v", sel.SearchWeights)
+	}
+	stmt, err = Parse(`SELECT id FROM articles SEARCH title, weight FOR 'x'`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sel = stmt.(ast.Select)
+	if len(sel.SearchCols) != 2 || sel.SearchCols[1] != "weight" || sel.SearchWeights != nil {
+		t.Fatalf("column named weight %v %v", sel.SearchCols, sel.SearchWeights)
+	}
+	stmt, err = Parse(`SELECT id FROM articles SEARCH title WEIGHT 2.5 FOR 'x'`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sel = stmt.(ast.Select)
+	if len(sel.SearchWeights) != 1 || sel.SearchWeights[0] != 2.5 {
+		t.Fatalf("decimal weight %v", sel.SearchWeights)
+	}
+	for _, q := range []string{
+		`SELECT id FROM t SEARCH title WEIGHT 0 FOR 'x'`,
+		`SELECT id FROM t SEARCH title WEIGHT 65 FOR 'x'`,
+		`SELECT id FROM t SEARCH title WEIGHT -1 FOR 'x'`,
+		`SELECT id FROM t SEARCH title WEIGHT FOR 'x'`,
+	} {
+		if _, err := Parse(q); err == nil {
+			t.Fatalf("expected fail-closed weight: %s", q)
+		}
+	}
+	stmt, err = Parse(`SELECT * FROM articles SEARCH body FOR 'database' FACET category`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sel = stmt.(ast.Select)
+	if len(sel.FacetCols) != 1 || sel.FacetCols[0] != "category" {
+		t.Fatalf("facet %v", sel.FacetCols)
+	}
+	stmt, err = Parse(`SELECT * FROM articles SEARCH title WEIGHT 3, body FOR 'x' FACET category, year LIMIT 5`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sel = stmt.(ast.Select)
+	if len(sel.FacetCols) != 2 || sel.FacetCols[0] != "category" || sel.FacetCols[1] != "year" {
+		t.Fatalf("multi facet %v", sel.FacetCols)
+	}
+	if sel.Limit == nil || *sel.Limit != 5 {
+		t.Fatalf("facet limit %+v", sel.Limit)
+	}
+	stmt, err = Parse(`SELECT facet FROM articles`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sel = stmt.(ast.Select); !sel.Star && (len(sel.List) != 1) {
+		t.Fatalf("column named facet %+v", sel)
+	}
+	if _, err := Parse(`SELECT * FROM t SEARCH body FOR 'x' FACET`); err == nil {
+		t.Fatal("expected FACET without columns to fail")
+	}
+	stmt, err = Parse(`CREATE FULLTEXT INDEX ix_tb ON articles (title, body)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ix = stmt.(ast.CreateIndex)
+	if !ix.Fulltext || len(ix.Cols) != 2 || ix.Cols[0] != "title" || ix.Cols[1] != "body" {
+		t.Fatalf("multi-field fulltext %+v", ix)
+	}
+	stmt, err = Parse(`SELECT HIGHLIGHT(body), SNIPPET(body, 64) FROM articles SEARCH body FOR 'cat'`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sel = stmt.(ast.Select)
+	if len(sel.List) != 2 {
+		t.Fatalf("highlight list %+v", sel.List)
+	}
+	hl, ok := sel.List[0].Expr.(ast.Call)
+	if !ok || hl.Name != "highlight" || len(hl.Args) != 1 {
+		t.Fatalf("highlight %+v", sel.List[0].Expr)
+	}
+	sn, ok := sel.List[1].Expr.(ast.Call)
+	if !ok || sn.Name != "snippet" || len(sn.Args) != 2 {
+		t.Fatalf("snippet %+v", sel.List[1].Expr)
 	}
 	stmt, err = Parse(`CREATE VECTOR INDEX docs_embedding ON documents(embedding) USING HNSW`)
 	if err != nil {
@@ -690,6 +937,45 @@ func TestParsePointAndSpatialIndex(t *testing.T) {
 	ix = stmt.(ast.CreateIndex)
 	if !ix.Vector || ix.Using != "hnsw" || ix.Name != "docs_embedding" || ix.Cols[0] != "embedding" {
 		t.Fatalf("vector index %+v", ix)
+	}
+	stmt, err = Parse(`CREATE VECTOR INDEX ix ON documents(embedding) USING HNSW WITH (QUANTIZATION = 'I8')`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ix = stmt.(ast.CreateIndex)
+	if !ix.Vector || ix.VecQuant != "i8" {
+		t.Fatalf("vector index quantisation %+v", ix)
+	}
+	if _, err := Parse(`CREATE VECTOR INDEX ix ON documents(embedding) USING HNSW WITH (FOO = 'I8')`); err == nil {
+		t.Fatal("expected unknown WITH option to be a syntax error")
+	}
+	stmt, err = Parse(`CREATE VECTOR INDEX ix ON documents(embedding) USING IVF WITH (LISTS = 128, PROBES = 8)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ix = stmt.(ast.CreateIndex)
+	if !ix.Vector || ix.Using != "ivf" || ix.IVFLists != 128 || ix.IVFProbes != 8 {
+		t.Fatalf("ivf index %+v", ix)
+	}
+	stmt, err = Parse(`CREATE VECTOR INDEX ix ON documents(embedding) USING IVF WITH (LISTS = 64)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ix2 := stmt.(ast.CreateIndex); ix2.IVFLists != 64 || ix2.IVFProbes != 0 {
+		t.Fatalf("ivf index defaults %+v", ix2)
+	}
+	if _, err := Parse(`CREATE VECTOR INDEX ix ON documents(embedding) USING IVF WITH (FOO = 1)`); err == nil {
+		t.Fatal("expected unknown IVF WITH option to be a syntax error")
+	}
+	stmt, err = Parse(`CREATE VECTOR INDEX ix ON documents(embedding) USING IVFPQ WITH (LISTS = 256, PROBES = 16, SUBSPACES = 8)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ix3 := stmt.(ast.CreateIndex); ix3.Using != "ivfpq" || ix3.IVFLists != 256 || ix3.IVFProbes != 16 || ix3.IVFSubspaces != 8 {
+		t.Fatalf("ivfpq index %+v", stmt)
+	}
+	if _, err := Parse(`CREATE VECTOR INDEX ix ON documents(embedding) USING BOGUS`); err == nil {
+		t.Fatal("expected unknown vector method to be a syntax error")
 	}
 	stmt, err = Parse(`CREATE INDEX ix_cover ON products (name) INCLUDE (price, note)`)
 	if err != nil {
@@ -746,6 +1032,23 @@ func TestParsePointAndSpatialIndex(t *testing.T) {
 	sel = stmt.(ast.Select)
 	if sel.NearestMetric != "l2" {
 		t.Fatalf("metric %q", sel.NearestMetric)
+	}
+	stmt, err = Parse(`SELECT id FROM t SEARCH body FOR 'willow' NEAREST emb TO $d NEAREST sparse TO $s LIMIT 10`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sel = stmt.(ast.Select)
+	if len(sel.SearchCols) != 1 || sel.SearchCols[0] != "body" || sel.NearestCol != "emb" || sel.Nearest2Col != "sparse" {
+		t.Fatalf("fusion nearest %+v", sel)
+	}
+	if _, ok := sel.NearestQuery.(ast.Param); !ok {
+		t.Fatalf("fusion dense query %+v", sel.NearestQuery)
+	}
+	if _, ok := sel.Nearest2Query.(ast.Param); !ok {
+		t.Fatalf("fusion sparse query %+v", sel.Nearest2Query)
+	}
+	if _, err := Parse(`SELECT id FROM t NEAREST a TO $x NEAREST b TO $y NEAREST c TO $z`); err == nil {
+		t.Fatal("expected a third NEAREST clause to be rejected")
 	}
 	stmt, err = Parse(`SELECT name FROM places WHERE DWITHIN(loc, POINT(-73.98, 40.75), 1000)`)
 	if err != nil {

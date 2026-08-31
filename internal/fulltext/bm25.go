@@ -3,6 +3,8 @@ package fulltext
 import (
 	"bytes"
 	"math"
+
+	"github.com/bzync/nextsql/internal/nerr"
 )
 
 const (
@@ -31,7 +33,13 @@ func AvgDL(st Stats) float64 {
 
 // Score is the BM25 contribution of one term in one document.
 func Score(tf, dl uint32, avgdl, idf float64) float64 {
-	if tf == 0 || idf == 0 {
+	return ScoreTF(float64(tf), dl, avgdl, idf)
+}
+
+// ScoreTF is Score with a floating term frequency so field weights can
+// scale tf without changing k1 or b.
+func ScoreTF(tf float64, dl uint32, avgdl, idf float64) float64 {
+	if tf <= 0 || idf == 0 {
 		return 0
 	}
 	if avgdl <= 0 {
@@ -40,11 +48,20 @@ func Score(tf, dl uint32, avgdl, idf float64) float64 {
 	if dl == 0 {
 		dl = 1
 	}
-	denom := float64(tf) + K1*(1-B+B*float64(dl)/avgdl)
+	denom := tf + K1*(1-B+B*float64(dl)/avgdl)
 	if denom == 0 {
 		return 0
 	}
-	return idf * (float64(tf) * (K1 + 1) / denom)
+	return idf * (tf * (K1 + 1) / denom)
+}
+
+// CheckFieldWeight rejects a non-finite, non-positive, or oversized SEARCH
+// field weight.
+func CheckFieldWeight(w float64) error {
+	if math.IsNaN(w) || math.IsInf(w, 0) || w <= 0 || w > MaxFieldWeight {
+		return nerr.New(nerr.InvalidArgument, "fulltext.CheckFieldWeight", "field weight out of range")
+	}
+	return nil
 }
 
 // Hit is one scored document.

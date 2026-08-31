@@ -20,6 +20,12 @@ External root unlock key     (--key-file, never in the data directory)
 
 Established crypto only: AES-256-GCM. No custom cipher, hash, MAC, KDF, or AEAD. The sidecar `nextsql.db.keys` holds wrapped keys, versions, flags, and a nonce high-water. It does not hold the raw root. Mode `0600`.
 
+The deployment registry uses a separate external root
+(`--instance-key-file`, default `--key-file.instance`) and independent
+`nextsql.instance.keys` envelope. It is not a login password. Keep both roots
+off the data volume. This M1 foundation does not yet implement realm-local
+authentication or selectable database engines.
+
 Online DEK rotation, key-version revocation (kills sessions), and crypto-shred of the keystore are in the production surface. Field-level `ENCRYPTED CLIENT` columns are designed but **not implemented**.
 
 ## Bootstrap
@@ -44,29 +50,35 @@ A new principal has no rights until granted. Least privilege is fail-closed.
 Privileges include `CONNECT`, `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `CREATE`, `DROP`, `INDEX`, `EXECUTE`, `GRANT`, `BACKUP`, `REPLICATION`, `CDC`, `ADMIN`.
 
 `CDC` is independent of `SELECT`. A subscription rechecks its table-scoped
-grant on every pull, so revocation stops an open stream. Tenant scope comes
-only from the authenticated session's `SET TENANT` binding.
+grant on every pull, so revocation stops an open stream. Streams are scoped to the authenticated connection's selected database.
 
 Scopes: `CLUSTER`, `DATABASE`, `SCHEMA`, `TABLE`, `COLUMN`, `FUNCTION`, `BACKUP`, `REPLICATION`, `ADMINISTRATION`. `GRANT SELECT ON products TO analyst` treats a bare name as a table.
 
 `DROP USER` deletes the password hash and disconnects that user's sessions.
 
-## Tenants
+## Short-lived credentials
 
-Tables with a `tenant_id` column (`UUID`, `STRING`, or `TEXT`) are tenant-keyed. Cross-tenant leakage tolerance is 0.
+A signed short-lived credential (`NSSC1.`… , Ed25519) is presented **in place of
+the password** — same native principal, same RBAC. Enable verification with
+`token_verify_keyset=FILE`; optionally add `token_revocations=FILE` and
+`token_audience=STRING`. The server enforces the signature, an explicit expiry
+(60 s skew, max lifetime 24 h), the audience, the served-database scope, and
+revocation, and closes the session at expiry. An optional role scope narrows
+the session to privileges reachable through roles the principal already holds —
+it can never escalate. The signing keyset (`NSTK`) rotates with an overlap
+window; the revocation set (`NSTR`) revokes a single token id or every
+credential for a principal issued before a cutoff; `SIGHUP` reloads both. Manage
+everything with `nextsql token` (`keygen`, `export-public`, `mint`, `revoke`,
+`rotate`, `retire`, `verify`). Auth audit records `identity_source` `token` or
+`mtls+token`. Engine note: [`docs/security.md`](https://github.com/bzync/nextsql/blob/main/docs/security.md).
 
-```sql
-SET TENANT = '11111111-1111-1111-1111-111111111111';
-SET TENANT = $1;
-RESET TENANT;
-```
+## Hosted isolation
 
-- `SET TENANT` is session-local. It is not stored in the catalog.
-- Bound `SELECT` / `UPDATE` / `DELETE` / `SEARCH` / `NEAREST` / export get an implicit `tenant_id = <bound>` predicate.
-- `INSERT` injects the bound value and rejects a mismatched `tenant_id`. `UPDATE` cannot reassign `tenant_id`.
-- Production sessions (ACL attached, not cluster `ADMIN`) **must** `SET TENANT` before they touch a tenant-keyed table. Unbound access is `forbidden`.
-- Cluster `ADMIN` may omit `SET TENANT` and see every tenant.
-
-This is row isolation by `tenant_id`, not a separate catalog or encryption domain.
+Shared row tenancy is removed. `SET TENANT`, `RESET TENANT`, and
+`PARTITION BY TENANT` are rejected. Connections bind to a hosted realm and
+database. Non-`ADMIN` access to a legacy table containing a `tenant_id` marker
+fails closed; an administrator may access it only to migrate each former tenant
+into a separately provisioned database. New CDC/task/schedule records do not
+carry row-tenant authorization state.
 
 Session audit is a JSON-lines file (mode `0600`). See [TLS](/docs/tls) for the wire and client-held keys. Engine note: [`docs/security.md`](https://github.com/bzync/nextsql/blob/main/docs/security.md).

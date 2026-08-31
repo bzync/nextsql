@@ -1,9 +1,11 @@
 package parser
 
 import (
+	"math"
 	"strconv"
 	"strings"
 
+	"github.com/bzync/nextsql/internal/fulltext"
 	"github.com/bzync/nextsql/internal/nerr"
 	"github.com/bzync/nextsql/internal/sql/ast"
 	"github.com/bzync/nextsql/internal/sql/lexer"
@@ -82,9 +84,9 @@ func (p *Parser) stmt() (ast.Stmt, error) {
 	case lexer.KwMaintain:
 		return p.maintain()
 	case lexer.KwSet:
-		return p.setTenant()
+		return nil, nerr.New(nerr.Syntax, "sql.parser", "SET TENANT was removed; provision an isolated database with nextsql hosting")
 	case lexer.KwReset:
-		return p.resetTenant()
+		return nil, nerr.New(nerr.Syntax, "sql.parser", "RESET TENANT was removed; provision an isolated database with nextsql hosting")
 	case lexer.KwRun:
 		return p.runWorkflow()
 	case lexer.KwShow:
@@ -1090,9 +1092,36 @@ func (p *Parser) alter() (ast.Stmt, error) {
 }
 
 func (p *Parser) alterCmd() (ast.AlterCmd, error) {
+	if p.identIs("attach") {
+		p.next()
+		part, err := p.partitionDef("")
+		if err != nil {
+			return nil, err
+		}
+		return ast.AlterAttachPartition{Partition: part}, nil
+	}
+	if p.identIs("detach") {
+		p.next()
+		if !p.identIs("partition") {
+			return nil, nerr.New(nerr.Syntax, "sql.parser", "expected PARTITION after DETACH")
+		}
+		p.next()
+		name, err := p.ident()
+		if err != nil {
+			return nil, err
+		}
+		return ast.AlterDetachPartition{Name: name}, nil
+	}
 	switch p.tok.Kind {
 	case lexer.KwAdd:
 		p.next()
+		if p.identIs("partition") {
+			part, err := p.partitionDef("")
+			if err != nil {
+				return nil, err
+			}
+			return ast.AlterAddPartition{Partition: part}, nil
+		}
 		if p.tok.Kind == lexer.KwConstraint || p.tok.Kind == lexer.KwForeign {
 			fk, err := p.tableFK()
 			if err != nil {
@@ -1113,6 +1142,14 @@ func (p *Parser) alterCmd() (ast.AlterCmd, error) {
 		return ast.AlterAddColumn{Column: col}, nil
 	case lexer.KwDrop:
 		p.next()
+		if p.identIs("partition") {
+			p.next()
+			name, err := p.ident()
+			if err != nil {
+				return nil, err
+			}
+			return ast.AlterDropPartition{Name: name}, nil
+		}
 		if p.tok.Kind == lexer.KwConstraint {
 			p.next()
 			name, err := p.ident()
@@ -1415,8 +1452,7 @@ func (p *Parser) partitionSpec() (*ast.PartitionSpec, error) {
 		kind = "RANGE"
 		p.next()
 	case p.identIs("tenant"):
-		kind = "TENANT"
-		p.next()
+		return nil, nerr.New(nerr.Syntax, "sql.parser", "PARTITION BY TENANT was removed; use an isolated hosted database")
 	case p.identIs("hash"):
 		kind = "HASH"
 		p.next()
@@ -1424,7 +1460,7 @@ func (p *Parser) partitionSpec() (*ast.PartitionSpec, error) {
 		kind = "LIST"
 		p.next()
 	default:
-		return nil, nerr.New(nerr.Syntax, "sql.parser", "expected RANGE, HASH, LIST, or TENANT after PARTITION BY")
+		return nil, nerr.New(nerr.Syntax, "sql.parser", "expected RANGE, HASH, or LIST after PARTITION BY")
 	}
 	if err := p.expect(lexer.LParen, "("); err != nil {
 		return nil, err
@@ -1448,101 +1484,14 @@ func (p *Parser) partitionSpec() (*ast.PartitionSpec, error) {
 	if len(cols) == 0 {
 		return nil, nerr.New(nerr.InvalidArgument, "sql.parser", "PARTITION BY requires at least one column")
 	}
-	if kind == "TENANT" && len(cols) != 1 {
-		return nil, nerr.New(nerr.InvalidArgument, "sql.parser", "PARTITION BY TENANT requires exactly one column")
-	}
 	if err := p.expect(lexer.LParen, "("); err != nil {
 		return nil, err
 	}
 	var parts []ast.PartitionDef
 	for {
-		if !p.identIs("partition") {
-			return nil, nerr.New(nerr.Syntax, "sql.parser", "expected PARTITION in partition list")
-		}
-		p.next()
-		name, err := p.ident()
+		def, err := p.partitionDef(kind)
 		if err != nil {
 			return nil, err
-		}
-		def := ast.PartitionDef{Name: name}
-		switch kind {
-		case "RANGE":
-			if !(p.tok.Kind == lexer.KwValues || p.identIs("values")) {
-				return nil, nerr.New(nerr.Syntax, "sql.parser", "expected VALUES")
-			}
-			p.next()
-			if !p.identIs("less") {
-				return nil, nerr.New(nerr.Syntax, "sql.parser", "expected LESS THAN for RANGE partition")
-			}
-			p.next()
-			if !p.identIs("than") {
-				return nil, nerr.New(nerr.Syntax, "sql.parser", "expected THAN")
-			}
-			p.next()
-			if p.identIs("maxvalue") {
-				p.next()
-				def.LessThan = nil
-			} else {
-				if err := p.expect(lexer.LParen, "("); err != nil {
-					return nil, err
-				}
-				ex, err := p.or()
-				if err != nil {
-					return nil, err
-				}
-				def.LessThan = ex
-				if err := p.expect(lexer.RParen, ")"); err != nil {
-					return nil, err
-				}
-			}
-		case "HASH":
-			if !p.identIs("modulus") {
-				return nil, nerr.New(nerr.Syntax, "sql.parser", "expected MODULUS for HASH partition")
-			}
-			p.next()
-			modulus, err := p.uintLit()
-			if err != nil {
-				return nil, err
-			}
-			if !p.identIs("remainder") {
-				return nil, nerr.New(nerr.Syntax, "sql.parser", "expected REMAINDER for HASH partition")
-			}
-			p.next()
-			remainder, err := p.uintLit()
-			if err != nil {
-				return nil, err
-			}
-			def.Modulus = uint32(modulus)
-			def.Remainder = uint32(remainder)
-		case "LIST", "TENANT":
-			if !(p.tok.Kind == lexer.KwValues || p.identIs("values")) {
-				return nil, nerr.New(nerr.Syntax, "sql.parser", "expected VALUES")
-			}
-			p.next()
-			if !(p.tok.Kind == lexer.KwIn || p.identIs("in")) {
-				return nil, nerr.New(nerr.Syntax, "sql.parser", "expected IN for value partition")
-			}
-			p.next()
-			if err := p.expect(lexer.LParen, "("); err != nil {
-				return nil, err
-			}
-			for {
-				ex, err := p.or()
-				if err != nil {
-					return nil, err
-				}
-				def.Values = append(def.Values, ex)
-				if p.tok.Kind != lexer.Comma {
-					break
-				}
-				p.next()
-			}
-			if err := p.expect(lexer.RParen, ")"); err != nil {
-				return nil, err
-			}
-			if kind == "TENANT" && len(def.Values) != 1 {
-				return nil, nerr.New(nerr.InvalidArgument, "sql.parser", "TENANT partition requires one value")
-			}
 		}
 		parts = append(parts, def)
 		if p.tok.Kind == lexer.Comma {
@@ -1558,6 +1507,168 @@ func (p *Parser) partitionSpec() (*ast.PartitionSpec, error) {
 		return nil, nerr.New(nerr.InvalidArgument, "sql.parser", "partition list is empty")
 	}
 	return &ast.PartitionSpec{Kind: kind, Columns: cols, Partitions: parts}, nil
+}
+
+// partitionDef parses one PARTITION clause. expected is empty for ALTER TABLE,
+// where the rule syntax identifies the kind and the binder checks it against
+// the table descriptor.
+func (p *Parser) partitionDef(expected string) (ast.PartitionDef, error) {
+	if !p.identIs("partition") {
+		return ast.PartitionDef{}, nerr.New(nerr.Syntax, "sql.parser", "expected PARTITION")
+	}
+	p.next()
+	name, err := p.ident()
+	if err != nil {
+		return ast.PartitionDef{}, err
+	}
+	def := ast.PartitionDef{Name: name}
+	kind := expected
+	if kind == "" {
+		switch {
+		case p.tok.Kind == lexer.KwValues || p.identIs("values"):
+			// LESS and IN are distinguished after VALUES below.
+		case p.identIs("modulus"):
+			kind = "HASH"
+		default:
+			return ast.PartitionDef{}, nerr.New(nerr.Syntax, "sql.parser", "expected VALUES or MODULUS in partition definition")
+		}
+	}
+	if kind == "RANGE" || kind == "LIST" || kind == "TENANT" || (kind == "" && (p.tok.Kind == lexer.KwValues || p.identIs("values"))) {
+		if !(p.tok.Kind == lexer.KwValues || p.identIs("values")) {
+			return ast.PartitionDef{}, nerr.New(nerr.Syntax, "sql.parser", "expected VALUES")
+		}
+		p.next()
+		if kind == "" {
+			if p.identIs("less") {
+				kind = "RANGE"
+			} else if p.tok.Kind == lexer.KwIn || p.identIs("in") {
+				kind = "VALUE"
+			} else {
+				return ast.PartitionDef{}, nerr.New(nerr.Syntax, "sql.parser", "expected LESS THAN or IN")
+			}
+		}
+		if kind == "RANGE" {
+			def.Rule = "RANGE"
+			if !p.identIs("less") {
+				return ast.PartitionDef{}, nerr.New(nerr.Syntax, "sql.parser", "expected LESS THAN for RANGE partition")
+			}
+			p.next()
+			if !p.identIs("than") {
+				return ast.PartitionDef{}, nerr.New(nerr.Syntax, "sql.parser", "expected THAN")
+			}
+			p.next()
+			if p.identIs("maxvalue") {
+				p.next()
+				return def, nil
+			}
+			if err := p.expect(lexer.LParen, "("); err != nil {
+				return ast.PartitionDef{}, err
+			}
+			var bounds []ast.Expr
+			for {
+				ex, err := p.or()
+				if err != nil {
+					return ast.PartitionDef{}, err
+				}
+				bounds = append(bounds, ex)
+				if p.tok.Kind == lexer.Comma {
+					p.next()
+					continue
+				}
+				break
+			}
+			if err := p.expect(lexer.RParen, ")"); err != nil {
+				return ast.PartitionDef{}, err
+			}
+			if len(bounds) == 1 {
+				def.LessThan = bounds[0]
+			} else {
+				def.LessThanTuple = bounds
+			}
+			return def, nil
+		}
+		// VALUE is valid for both LIST and TENANT; arity is a binder rule.
+		def.Rule = "VALUE"
+		if !(p.tok.Kind == lexer.KwIn || p.identIs("in")) {
+			return ast.PartitionDef{}, nerr.New(nerr.Syntax, "sql.parser", "expected IN for value partition")
+		}
+		p.next()
+		if err := p.expect(lexer.LParen, "("); err != nil {
+			return ast.PartitionDef{}, err
+		}
+		if p.tok.Kind == lexer.LParen {
+			// Multi-column LIST: VALUES IN ((a, b), (c, d), ...).
+			for {
+				if err := p.expect(lexer.LParen, "("); err != nil {
+					return ast.PartitionDef{}, err
+				}
+				var tuple []ast.Expr
+				for {
+					ex, err := p.or()
+					if err != nil {
+						return ast.PartitionDef{}, err
+					}
+					tuple = append(tuple, ex)
+					if p.tok.Kind == lexer.Comma {
+						p.next()
+						continue
+					}
+					break
+				}
+				if err := p.expect(lexer.RParen, ")"); err != nil {
+					return ast.PartitionDef{}, err
+				}
+				def.ValueTuples = append(def.ValueTuples, tuple)
+				if p.tok.Kind == lexer.Comma {
+					p.next()
+					continue
+				}
+				break
+			}
+		} else {
+			for {
+				ex, err := p.or()
+				if err != nil {
+					return ast.PartitionDef{}, err
+				}
+				def.Values = append(def.Values, ex)
+				if p.tok.Kind != lexer.Comma {
+					break
+				}
+				p.next()
+			}
+		}
+		if err := p.expect(lexer.RParen, ")"); err != nil {
+			return ast.PartitionDef{}, err
+		}
+		if expected == "TENANT" && len(def.Values) != 1 {
+			return ast.PartitionDef{}, nerr.New(nerr.InvalidArgument, "sql.parser", "TENANT partition requires one value")
+		}
+		return def, nil
+	}
+	if kind != "HASH" {
+		return ast.PartitionDef{}, nerr.New(nerr.Syntax, "sql.parser", "unknown partition rule")
+	}
+	def.Rule = "HASH"
+	if !p.identIs("modulus") {
+		return ast.PartitionDef{}, nerr.New(nerr.Syntax, "sql.parser", "expected MODULUS for HASH partition")
+	}
+	p.next()
+	modulus, err := p.uintLit()
+	if err != nil {
+		return ast.PartitionDef{}, err
+	}
+	if !p.identIs("remainder") {
+		return ast.PartitionDef{}, nerr.New(nerr.Syntax, "sql.parser", "expected REMAINDER for HASH partition")
+	}
+	p.next()
+	remainder, err := p.uintLit()
+	if err != nil {
+		return ast.PartitionDef{}, err
+	}
+	def.Modulus = uint32(modulus)
+	def.Remainder = uint32(remainder)
+	return def, nil
 }
 
 func (p *Parser) tablePK() ([]string, error) {
@@ -1843,13 +1954,43 @@ func (p *Parser) colType() (types.Type, error) {
 	case lexer.KwPolygon:
 		p.next()
 		return types.Polygon(), nil
+	case lexer.KwBitvector:
+		p.next()
+		if err := p.expect(lexer.Lt, "<"); err != nil {
+			return types.Type{}, err
+		}
+		n, err := p.uintLit()
+		if err != nil {
+			return types.Type{}, err
+		}
+		if err := p.expect(lexer.Gt, ">"); err != nil {
+			return types.Type{}, err
+		}
+		return types.VectorBit(uint16(n))
+	case lexer.KwSparsevector:
+		p.next()
+		if err := p.expect(lexer.Lt, "<"); err != nil {
+			return types.Type{}, err
+		}
+		n, err := p.uintLit()
+		if err != nil {
+			return types.Type{}, err
+		}
+		if n < 1 || n > uint64(types.MaxSparseSQLDim) {
+			return types.Type{}, nerr.New(nerr.InvalidArgument, "sql.parser", "SPARSEVECTOR dimension out of range")
+		}
+		if err := p.expect(lexer.Gt, ">"); err != nil {
+			return types.Type{}, err
+		}
+		return types.VectorSparse(uint16(n))
 	case lexer.KwVector:
 		p.next()
 		if err := p.expect(lexer.Lt, "<"); err != nil {
 			return types.Type{}, err
 		}
-		if p.tok.Kind != lexer.KwF32 {
-			return types.Type{}, nerr.New(nerr.Syntax, "sql.parser", "expected F32")
+		elem := p.tok.Kind
+		if elem != lexer.KwF32 && elem != lexer.KwF16 && elem != lexer.KwI8 {
+			return types.Type{}, nerr.New(nerr.Syntax, "sql.parser", "expected F32, F16, or I8")
 		}
 		p.next()
 		if err := p.expect(lexer.Comma, ","); err != nil {
@@ -1861,6 +2002,12 @@ func (p *Parser) colType() (types.Type, error) {
 		}
 		if err := p.expect(lexer.Gt, ">"); err != nil {
 			return types.Type{}, err
+		}
+		switch elem {
+		case lexer.KwF16:
+			return types.VectorF16(uint16(n))
+		case lexer.KwI8:
+			return types.VectorI8(uint16(n))
 		}
 		return types.VectorF32(uint16(n))
 	default:
@@ -1936,15 +2083,127 @@ func (p *Parser) createIndex(unique, spatial, fulltext, vector bool) (ast.Stmt, 
 		where = ex
 	}
 	using := ""
+	vecQuant := ""
+	ivfLists := 0
+	ivfProbes := 0
+	ivfSubspaces := 0
+	analyzer := ""
+	if fulltext && p.tok.Kind == lexer.KwWith {
+		p.next()
+		if err := p.expect(lexer.LParen, "("); err != nil {
+			return nil, err
+		}
+		if !p.identIs("analyzer") {
+			return nil, nerr.New(nerr.Syntax, "sql.parser", "expected ANALYZER")
+		}
+		p.next()
+		if err := p.expect(lexer.Eq, "="); err != nil {
+			return nil, err
+		}
+		if p.tok.Kind != lexer.String && p.tok.Kind != lexer.Ident {
+			return nil, nerr.New(nerr.Syntax, "sql.parser", "expected analyzer name")
+		}
+		analyzer = strings.ToLower(p.tok.Lit)
+		p.next()
+		if err := p.expect(lexer.RParen, ")"); err != nil {
+			return nil, err
+		}
+	}
 	if vector {
 		if err := p.expect(lexer.KwUsing, "USING"); err != nil {
 			return nil, err
 		}
-		if p.tok.Kind != lexer.KwHnsw {
-			return nil, nerr.New(nerr.Syntax, "sql.parser", "expected HNSW")
+		switch {
+		case p.tok.Kind == lexer.KwHnsw:
+			p.next()
+			using = "hnsw"
+			if p.tok.Kind == lexer.KwWith {
+				p.next()
+				if err := p.expect(lexer.LParen, "("); err != nil {
+					return nil, err
+				}
+				if !p.identIs("quantization") {
+					return nil, nerr.New(nerr.Syntax, "sql.parser", "expected QUANTIZATION")
+				}
+				p.next()
+				if err := p.expect(lexer.Eq, "="); err != nil {
+					return nil, err
+				}
+				if p.tok.Kind != lexer.String && p.tok.Kind != lexer.Ident {
+					return nil, nerr.New(nerr.Syntax, "sql.parser", "expected quantisation name")
+				}
+				vecQuant = strings.ToLower(p.tok.Lit)
+				p.next()
+				if err := p.expect(lexer.RParen, ")"); err != nil {
+					return nil, err
+				}
+			}
+		case p.identIs("sparse"):
+			p.next()
+			using = "sparse"
+			if p.tok.Kind == lexer.KwWith {
+				return nil, nerr.New(nerr.Syntax, "sql.parser", "USING SPARSE does not take WITH options")
+			}
+		case p.identIs("ivf"), p.identIs("ivfpq"):
+			if p.identIs("ivfpq") {
+				using = "ivfpq"
+			} else {
+				using = "ivf"
+			}
+			p.next()
+			if p.tok.Kind == lexer.KwWith {
+				p.next()
+				if err := p.expect(lexer.LParen, "("); err != nil {
+					return nil, err
+				}
+				for {
+					switch {
+					case p.identIs("lists"):
+						p.next()
+						if err := p.expect(lexer.Eq, "="); err != nil {
+							return nil, err
+						}
+						n, err := p.uintLit()
+						if err != nil {
+							return nil, err
+						}
+						ivfLists = int(n)
+					case p.identIs("probes"):
+						p.next()
+						if err := p.expect(lexer.Eq, "="); err != nil {
+							return nil, err
+						}
+						n, err := p.uintLit()
+						if err != nil {
+							return nil, err
+						}
+						ivfProbes = int(n)
+					case p.identIs("subspaces"):
+						p.next()
+						if err := p.expect(lexer.Eq, "="); err != nil {
+							return nil, err
+						}
+						n, err := p.uintLit()
+						if err != nil {
+							return nil, err
+						}
+						ivfSubspaces = int(n)
+					default:
+						return nil, nerr.New(nerr.Syntax, "sql.parser", "expected LISTS, PROBES, or SUBSPACES")
+					}
+					if p.tok.Kind == lexer.Comma {
+						p.next()
+						continue
+					}
+					break
+				}
+				if err := p.expect(lexer.RParen, ")"); err != nil {
+					return nil, err
+				}
+			}
+		default:
+			return nil, nerr.New(nerr.Syntax, "sql.parser", "expected HNSW, IVF, IVFPQ, or SPARSE")
 		}
-		p.next()
-		using = "hnsw"
 	}
 	hasExpr := false
 	for _, e := range exprs {
@@ -1956,7 +2215,7 @@ func (p *Parser) createIndex(unique, spatial, fulltext, vector bool) (ast.Stmt, 
 	if !hasExpr {
 		exprs = nil
 	}
-	return ast.CreateIndex{Name: name, Table: table, Unique: unique, Spatial: spatial, Fulltext: fulltext, Vector: vector, Using: using, Cols: cols, Keys: keys, Exprs: exprs, Include: include, Where: where}, nil
+	return ast.CreateIndex{Name: name, Table: table, Unique: unique, Spatial: spatial, Fulltext: fulltext, Vector: vector, Using: using, VecQuant: vecQuant, IVFLists: ivfLists, IVFProbes: ivfProbes, IVFSubspaces: ivfSubspaces, Analyzer: analyzer, Cols: cols, Keys: keys, Exprs: exprs, Include: include, Where: where}, nil
 }
 
 func (p *Parser) indexKey() (string, []string, ast.Expr, error) {
@@ -2406,9 +2665,24 @@ joinsDone:
 	}
 	if p.tok.Kind == lexer.KwSearch {
 		p.next()
-		col, err := p.ident()
-		if err != nil {
-			return nil, err
+		var cols []string
+		var weights []float64
+		weighted := false
+		for {
+			col, w, err := p.searchField()
+			if err != nil {
+				return nil, err
+			}
+			cols = append(cols, col)
+			weights = append(weights, w)
+			if w != 1 {
+				weighted = true
+			}
+			if p.tok.Kind == lexer.Comma {
+				p.next()
+				continue
+			}
+			break
 		}
 		if err := p.expect(lexer.KwFor, "FOR"); err != nil {
 			return nil, err
@@ -2417,40 +2691,44 @@ joinsDone:
 		if err != nil {
 			return nil, err
 		}
-		s.SearchCol = col
+		s.SearchCols = cols
+		if weighted {
+			s.SearchWeights = weights
+		}
 		s.SearchQuery = q
 	}
-	if p.tok.Kind == lexer.KwNearest {
+	for n := 0; p.tok.Kind == lexer.KwNearest; n++ {
+		if n >= 2 {
+			return nil, nerr.New(nerr.Syntax, "sql.parser", "at most two NEAREST clauses")
+		}
+		col, q, metric, err := p.nearestClause()
+		if err != nil {
+			return nil, err
+		}
+		if n == 0 {
+			s.NearestCol = col
+			s.NearestQuery = q
+			s.NearestMetric = metric
+			continue
+		}
+		s.Nearest2Col = col
+		s.Nearest2Query = q
+		s.Nearest2Metric = metric
+	}
+	if p.identIs("facet") {
 		p.next()
-		col, err := p.ident()
-		if err != nil {
-			return nil, err
-		}
-		if err := p.expect(lexer.KwTo, "TO"); err != nil {
-			return nil, err
-		}
-		q, err := p.or()
-		if err != nil {
-			return nil, err
-		}
-		metric := ""
-		if p.tok.Kind == lexer.KwUsing {
-			p.next()
-			switch p.tok.Kind {
-			case lexer.KwCosine:
-				metric = "cosine"
-			case lexer.KwL2:
-				metric = "l2"
-			case lexer.KwInnerProduct:
-				metric = "inner_product"
-			default:
-				return nil, nerr.New(nerr.Syntax, "sql.parser", "expected COSINE, L2, or INNER_PRODUCT")
+		for {
+			col, err := p.ident()
+			if err != nil {
+				return nil, err
 			}
-			p.next()
+			s.FacetCols = append(s.FacetCols, col)
+			if p.tok.Kind == lexer.Comma {
+				p.next()
+				continue
+			}
+			break
 		}
-		s.NearestCol = col
-		s.NearestQuery = q
-		s.NearestMetric = metric
 	}
 	if p.tok.Kind == lexer.KwOrder {
 		p.next()
@@ -2477,6 +2755,38 @@ joinsDone:
 	s.Limit = lim
 	s.Offset = off
 	return s, nil
+}
+
+func (p *Parser) nearestClause() (col string, q ast.Expr, metric string, err error) {
+	p.next()
+	col, err = p.ident()
+	if err != nil {
+		return "", nil, "", err
+	}
+	if err := p.expect(lexer.KwTo, "TO"); err != nil {
+		return "", nil, "", err
+	}
+	q, err = p.or()
+	if err != nil {
+		return "", nil, "", err
+	}
+	if p.tok.Kind == lexer.KwUsing {
+		p.next()
+		switch p.tok.Kind {
+		case lexer.KwCosine:
+			metric = "cosine"
+		case lexer.KwL2:
+			metric = "l2"
+		case lexer.KwInnerProduct:
+			metric = "inner_product"
+		case lexer.KwHamming:
+			metric = "hamming"
+		default:
+			return "", nil, "", nerr.New(nerr.Syntax, "sql.parser", "expected COSINE, L2, INNER_PRODUCT, or HAMMING")
+		}
+		p.next()
+	}
+	return col, q, metric, nil
 }
 
 func (p *Parser) limitOffset() (lim *int64, off *int64, err error) {
@@ -2701,37 +3011,6 @@ func (p *Parser) maintain() (ast.Stmt, error) {
 		return nil, err
 	}
 	return ast.Maintain{Table: name}, nil
-}
-
-func (p *Parser) setTenant() (ast.Stmt, error) {
-	p.next()
-	name, err := p.ident()
-	if err != nil {
-		return nil, err
-	}
-	if name != "tenant" {
-		return nil, nerr.New(nerr.Syntax, "sql.parser", "SET supports TENANT")
-	}
-	if err := p.expect(lexer.Eq, "="); err != nil {
-		return nil, err
-	}
-	ex, err := p.or()
-	if err != nil {
-		return nil, err
-	}
-	return ast.SetTenant{Value: ex}, nil
-}
-
-func (p *Parser) resetTenant() (ast.Stmt, error) {
-	p.next()
-	name, err := p.ident()
-	if err != nil {
-		return nil, err
-	}
-	if name != "tenant" {
-		return nil, nerr.New(nerr.Syntax, "sql.parser", "RESET supports TENANT")
-	}
-	return ast.SetTenant{}, nil
 }
 
 func (p *Parser) begin() (ast.Stmt, error) {
@@ -3303,6 +3582,37 @@ func exprToFloat(e ast.Expr) (float32, error) {
 		f = -f
 	}
 	return float32(f), nil
+}
+
+func (p *Parser) searchField() (string, float64, error) {
+	col, err := p.ident()
+	if err != nil {
+		return "", 0, err
+	}
+	if !p.identIs("weight") {
+		return col, 1, nil
+	}
+	p.next()
+	w, err := p.fieldWeight()
+	if err != nil {
+		return "", 0, err
+	}
+	return col, w, nil
+}
+
+func (p *Parser) fieldWeight() (float64, error) {
+	if p.tok.Kind != lexer.Number {
+		return 0, nerr.New(nerr.Syntax, "sql.parser", "expected field weight")
+	}
+	w, err := strconv.ParseFloat(p.tok.Lit, 64)
+	if err != nil || math.IsNaN(w) || math.IsInf(w, 0) {
+		return 0, nerr.New(nerr.InvalidArgument, "sql.parser", "invalid field weight")
+	}
+	if err := fulltext.CheckFieldWeight(w); err != nil {
+		return 0, err
+	}
+	p.next()
+	return w, nil
 }
 
 func (p *Parser) ident() (string, error) {

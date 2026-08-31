@@ -8,6 +8,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/bzync/nextsql/internal/crypto"
 	"github.com/bzync/nextsql/internal/executor"
@@ -15,6 +16,20 @@ import (
 	"github.com/bzync/nextsql/internal/protocol"
 	"github.com/bzync/nextsql/internal/security"
 	"github.com/bzync/nextsql/internal/sql/types"
+)
+
+// ReadConsistency selects how a read observes replicated state. The wire byte
+// values match the server's executor.ReadConsistency ordering.
+type ReadConsistency uint8
+
+const (
+	// Strong observes every acknowledged write; served only by the leader
+	// behind a Raft read barrier.
+	Strong ReadConsistency = iota
+	// Bounded serves from any member within MaxStaleness of the leader.
+	Bounded
+	// Stale serves local applied state with no freshness bound.
+	Stale
 )
 
 // Config is the only supported way to open a connection. Do not put keys in URLs.
@@ -26,6 +41,16 @@ type Config struct {
 	KeyProvider   crypto.KeyProvider // reserved for client-held keys; never place keys in a URL
 	TLS           *tls.Config
 	InsecureNoTLS bool
+
+	// Nodes lists every cluster member address. OpenCluster uses it to route
+	// eligible reads to a follower and writes to the leader. Address stays the
+	// single-node entry point and is used when Nodes is empty.
+	Nodes []string
+	// ReadConsistency is the mode a Cluster applies to routed reads (and that
+	// OpenContext sets on a plain Conn). The zero value is Strong.
+	ReadConsistency ReadConsistency
+	// MaxStaleness bounds a Bounded read. Zero selects the server default.
+	MaxStaleness time.Duration
 }
 
 // Conn is one authenticated session.
@@ -95,6 +120,12 @@ func OpenContext(ctx context.Context, cfg Config) (*Conn, error) {
 	if err := c.handshake(); err != nil {
 		_ = raw.Close()
 		return nil, err
+	}
+	if cfg.ReadConsistency != Strong {
+		if err := c.SetReadConsistency(ctx, cfg.ReadConsistency, cfg.MaxStaleness); err != nil {
+			_ = raw.Close()
+			return nil, err
+		}
 	}
 	return c, nil
 }
@@ -223,7 +254,41 @@ func (c *Conn) Exec(ctx context.Context, sql string, params ...types.Value) (*Re
 	return out, nil
 }
 
+// ExecIdempotent executes a retryable mutation under a durable, user/tenant-
+// scoped key. Reusing the key with the same typed request returns the original
+// committed result; reusing it for a different request fails with conflict.
+func (c *Conn) ExecIdempotent(ctx context.Context, key, sql string, params ...types.Value) (*Result, error) {
+	payload, err := protocol.EncodeIdempotentQuery(protocol.IdempotentQuery{
+		Key: key, SQL: sql, Params: wireParams(params),
+	}, c.lim)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := c.queryPayload(ctx, protocol.TypeIdempotentQuery, payload)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := &Result{Columns: rows.Columns()}
+	for rows.Next() {
+		out.Rows = append(out.Rows, append([]types.Value(nil), rows.Values()...))
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	out.Affected = rows.Affected()
+	return out, nil
+}
+
 func (c *Conn) Query(ctx context.Context, sql string, params ...types.Value) (*Rows, error) {
+	payload, err := protocol.EncodeQuery(protocol.Query{SQL: sql, Params: wireParams(params)}, c.lim)
+	if err != nil {
+		return nil, err
+	}
+	return c.queryPayload(ctx, protocol.TypeQuery, payload)
+}
+
+func (c *Conn) queryPayload(ctx context.Context, typ protocol.Type, payload []byte) (*Rows, error) {
 	c.mu.Lock()
 	if c.raw == nil {
 		c.mu.Unlock()
@@ -234,13 +299,7 @@ func (c *Conn) Query(ctx context.Context, sql string, params ...types.Value) (*R
 		return nil, nerr.New(nerr.Conflict, "nextsql.Query", "connection is busy")
 	}
 	c.busy = true
-	payload, err := protocol.EncodeQuery(protocol.Query{SQL: sql, Params: wireParams(params)}, c.lim)
-	if err != nil {
-		c.busy = false
-		c.mu.Unlock()
-		return nil, err
-	}
-	if err := protocol.WriteFrame(c.raw, protocol.TypeQuery, payload, c.lim.MaxPacket); err != nil {
+	if err := protocol.WriteFrame(c.raw, typ, payload, c.lim.MaxPacket); err != nil {
 		c.busy = false
 		c.mu.Unlock()
 		return nil, err
@@ -318,6 +377,101 @@ func (c *Conn) expectReady() error {
 		return unexpected(typ, body, c.lim)
 	}
 	return nil
+}
+
+// readAck reads a single control acknowledgement: TypeReady, or TypeError
+// followed by TypeReady (which is drained so the session stays usable).
+func (c *Conn) readAck() error {
+	typ, body, err := c.read()
+	if err != nil {
+		return err
+	}
+	if typ == protocol.TypeReady {
+		return nil
+	}
+	e := unexpected(typ, body, c.lim)
+	if typ == protocol.TypeError {
+		_ = c.expectReady()
+	}
+	return e
+}
+
+// NodeStatus is a server node's key-free replication health snapshot.
+type NodeStatus struct {
+	Role          string // leader, follower, candidate, shutdown, standalone
+	HasLeader     bool
+	Healthy       bool
+	AppliedLSN    uint64
+	LastContactMS int64
+	ApplyBacklog  uint64
+}
+
+// SetReadConsistency sets this connection's read-consistency mode for
+// subsequent statements. maxStaleness applies only to Bounded (0 = server
+// default).
+func (c *Conn) SetReadConsistency(ctx context.Context, mode ReadConsistency, maxStaleness time.Duration) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.raw == nil {
+		return nerr.New(nerr.Unavailable, "nextsql.SetReadConsistency", "connection closed")
+	}
+	if c.busy {
+		return nerr.New(nerr.Conflict, "nextsql.SetReadConsistency", "connection is busy")
+	}
+	var ms uint64
+	if maxStaleness > 0 {
+		// Keep a sub-millisecond bound positive so it is not read as "server
+		// default" (0). Real staleness bounds are seconds.
+		if ms = uint64(maxStaleness.Milliseconds()); ms == 0 {
+			ms = 1
+		}
+	}
+	payload := protocol.EncodeSetReadConsistency(protocol.SetReadConsistency{Mode: uint8(mode), MaxStalenessMS: ms})
+	if err := protocol.WriteFrame(c.raw, protocol.TypeSetReadConsistency, payload, c.lim.MaxPacket); err != nil {
+		return err
+	}
+	return c.readAck()
+}
+
+// NodeStatus asks the connected server for its replication health.
+func (c *Conn) NodeStatus(ctx context.Context) (NodeStatus, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.raw == nil {
+		return NodeStatus{}, nerr.New(nerr.Unavailable, "nextsql.NodeStatus", "connection closed")
+	}
+	if c.busy {
+		return NodeStatus{}, nerr.New(nerr.Conflict, "nextsql.NodeStatus", "connection is busy")
+	}
+	if err := protocol.WriteFrame(c.raw, protocol.TypeNodeStatus, nil, c.lim.MaxPacket); err != nil {
+		return NodeStatus{}, err
+	}
+	typ, body, err := c.read()
+	if err != nil {
+		return NodeStatus{}, err
+	}
+	if typ != protocol.TypeNodeStatusResp {
+		e := unexpected(typ, body, c.lim)
+		if typ == protocol.TypeError {
+			_ = c.expectReady()
+		}
+		return NodeStatus{}, e
+	}
+	ns, err := protocol.DecodeNodeStatus(body, c.lim)
+	if err != nil {
+		return NodeStatus{}, err
+	}
+	if err := c.expectReady(); err != nil {
+		return NodeStatus{}, err
+	}
+	return NodeStatus{
+		Role:          ns.Role,
+		HasLeader:     ns.HasLeader,
+		Healthy:       ns.Healthy,
+		AppliedLSN:    ns.AppliedLSN,
+		LastContactMS: ns.LastContactMS,
+		ApplyBacklog:  ns.ApplyBacklog,
+	}, nil
 }
 
 func (c *Conn) Prepare(ctx context.Context, sql string) (*Stmt, error) {

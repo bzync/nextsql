@@ -6,7 +6,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/bzync/nextsql/internal/auth"
 	"github.com/bzync/nextsql/internal/catalog"
 	"github.com/bzync/nextsql/internal/nerr"
 	"github.com/bzync/nextsql/internal/security"
@@ -57,6 +56,47 @@ func TestTriggerCatalogLifecycleRestartAndDependencies(t *testing.T) {
 	}
 	execOK(t, s, `DROP WORKFLOW record`)
 	execOK(t, s, `DROP TABLE orders`)
+}
+
+func TestTriggerInvokerRights(t *testing.T) {
+	db := testDB(t)
+	acl, err := security.CreateACL(filepath.Join(t.TempDir(), "acl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := acl.Grant("dba", security.PrivAdmin, security.ScopeCluster, ""); err != nil {
+		t.Fatal(err)
+	}
+	admin := db.Session()
+	admin.SetIdentity("dba")
+	admin.SetACL(acl)
+	execOK(t, admin, `CREATE TABLE trigger_orders (id STRING PRIMARY KEY)`)
+	execOK(t, admin, `CREATE TABLE trigger_events (id STRING PRIMARY KEY)`)
+	execOK(t, admin, `CREATE WORKFLOW trigger_record(id STRING) AS BEGIN INSERT INTO trigger_events (id) VALUES ($id); END`)
+	execOK(t, admin, `CREATE TRIGGER trigger_audit AFTER INSERT ON trigger_orders FOR EACH ROW RUN WORKFLOW trigger_record(NEW.id)`)
+	if err := acl.Grant("app", security.PrivInsert, security.ScopeTable, "trigger_orders"); err != nil {
+		t.Fatal(err)
+	}
+	app := db.Session()
+	app.SetIdentity("app")
+	app.SetACL(acl)
+	if _, err := app.Exec(`INSERT INTO trigger_orders (id) VALUES ('no-execute')`); !nerr.HasCode(err, nerr.Forbidden) {
+		t.Fatalf("trigger EXECUTE must be required: %v", err)
+	}
+	if err := acl.Grant("app", security.PrivExecute, security.ScopeFunction, "trigger_record"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.Exec(`INSERT INTO trigger_orders (id) VALUES ('no-body-privilege')`); !nerr.HasCode(err, nerr.Forbidden) {
+		t.Fatalf("trigger body privilege must be required: %v", err)
+	}
+	if err := acl.Grant("app", security.PrivInsert, security.ScopeTable, "trigger_events"); err != nil {
+		t.Fatal(err)
+	}
+	execOK(t, app, `INSERT INTO trigger_orders (id) VALUES ('allowed')`)
+	rows := execOK(t, admin, `SELECT id FROM trigger_events`).Rows
+	if len(rows) != 1 || rows[0][0].Str != "allowed" {
+		t.Fatalf("trigger rows=%v", rows)
+	}
 }
 
 func TestTriggerCatalogRollbackAndLeaderGate(t *testing.T) {
@@ -232,60 +272,6 @@ func TestTriggerRuntimeDepthDefense(t *testing.T) {
 	}
 	if rows := execOK(t, s, `SELECT id FROM loop_rows`).Rows; len(rows) != 0 {
 		t.Fatalf("depth exhaustion retained rows: %v", rows)
-	}
-}
-
-func TestTriggerInvokerRightsAndTenantIsolation(t *testing.T) {
-	db := testDB(t)
-	acl, err := security.CreateACL(filepath.Join(t.TempDir(), "acl"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	users, err := auth.Create(filepath.Join(t.TempDir(), "users"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, user := range []string{"dba", "app"} {
-		if err := users.Upsert(user, "pw"); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := acl.Grant("dba", security.PrivAdmin, security.ScopeCluster, ""); err != nil {
-		t.Fatal(err)
-	}
-	admin := db.Session()
-	admin.SetIdentity("dba")
-	admin.SetACL(acl)
-	admin.SetAuth(users)
-	execOK(t, admin, `CREATE TABLE orders (id STRING PRIMARY KEY, tenant_id UUID NOT NULL)`)
-	execOK(t, admin, `CREATE TABLE events (id STRING PRIMARY KEY, tenant_id UUID NOT NULL)`)
-	execOK(t, admin, `CREATE WORKFLOW record(id STRING) AS BEGIN INSERT INTO events (id) VALUES ($id); END`)
-	execOK(t, admin, `CREATE TRIGGER audit AFTER INSERT ON orders FOR EACH ROW RUN WORKFLOW record(NEW.id)`)
-	if err := acl.Grant("app", security.PrivInsert, security.ScopeTable, "orders"); err != nil {
-		t.Fatal(err)
-	}
-	app := db.Session()
-	app.SetIdentity("app")
-	app.SetACL(acl)
-	execOK(t, app, `SET TENANT = '`+tenantA+`'`)
-	if _, err := app.Exec(`INSERT INTO orders (id) VALUES ('no-execute')`); !nerr.HasCode(err, nerr.Forbidden) {
-		t.Fatalf("trigger EXECUTE must be required: %v", err)
-	}
-	if err := acl.Grant("app", security.PrivExecute, security.ScopeFunction, "record"); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := app.Exec(`INSERT INTO orders (id) VALUES ('no-body-privilege')`); !nerr.HasCode(err, nerr.Forbidden) {
-		t.Fatalf("trigger body privilege must be required: %v", err)
-	}
-	if err := acl.Grant("app", security.PrivInsert, security.ScopeTable, "events"); err != nil {
-		t.Fatal(err)
-	}
-	execOK(t, app, `INSERT INTO orders (id) VALUES ('tenant-a')`)
-	execOK(t, app, `SET TENANT = '`+tenantB+`'`)
-	execOK(t, app, `INSERT INTO orders (id) VALUES ('tenant-b')`)
-	rows := execOK(t, admin, `SELECT id, tenant_id FROM events ORDER BY id`).Rows
-	if len(rows) != 2 || rows[0][0].Str != "tenant-a" || rows[1][0].Str != "tenant-b" || rows[0][1].String() == rows[1][1].String() {
-		t.Fatalf("tenant trigger rows=%v", rows)
 	}
 }
 

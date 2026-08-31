@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"crypto/sha256"
 	"math"
 	"math/rand"
 	"sort"
@@ -17,6 +18,7 @@ const (
 	histBuckets           = 32
 	mcvLimit              = 10
 	segmentCount          = 8
+	maxPartitionSample    = 4_096
 )
 
 func (s *Session) maybeAutoAnalyze(tab *catalog.Table, changed int64) error {
@@ -132,8 +134,32 @@ func (s *Session) persistStats(st *catalog.TableStats) error {
 	if err != nil {
 		return err
 	}
+	partitionRecords := make(map[string][]byte, len(st.Partitions))
+	snapshot := sha256.Sum256(raw)
+	for _, part := range st.Partitions {
+		body, err := catalog.EncodePartitionStats(st.TableID, snapshot, part)
+		if err != nil {
+			return err
+		}
+		partitionRecords[string(catalog.PartitionStatsKey(st.TableID, part.ID))] = body
+	}
 	key := catalog.StatsKey(st.Table)
 	ctx := s.x.use(s.db.CatTree)
+	start, end := catalog.PartitionStatsRange(st.TableID)
+	var stale [][]byte
+	if err := ctx.Range(start, end, func(key, _ []byte) error {
+		if _, keep := partitionRecords[string(key)]; !keep {
+			stale = append(stale, append([]byte(nil), key...))
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	for _, key := range stale {
+		if err := ctx.Delete(key); err != nil && !nerr.HasCode(err, nerr.NotFound) {
+			return err
+		}
+	}
 	_, err = ctx.Lookup(key)
 	if err != nil {
 		if !nerr.HasCode(err, nerr.NotFound) {
@@ -145,6 +171,25 @@ func (s *Session) persistStats(st *catalog.TableStats) error {
 	} else if err := ctx.Update(key, raw); err != nil {
 		return err
 	}
+	partitionKeys := make([]string, 0, len(partitionRecords))
+	for encodedKey := range partitionRecords {
+		partitionKeys = append(partitionKeys, encodedKey)
+	}
+	sort.Strings(partitionKeys)
+	for _, encodedKey := range partitionKeys {
+		body := partitionRecords[encodedKey]
+		key := []byte(encodedKey)
+		if _, err := ctx.Lookup(key); err != nil {
+			if !nerr.HasCode(err, nerr.NotFound) {
+				return err
+			}
+			if err := ctx.Insert(key, body); err != nil {
+				return err
+			}
+		} else if err := ctx.Update(key, body); err != nil {
+			return err
+		}
+	}
 	if s.pending != nil {
 		if s.pending.stats == nil {
 			s.pending.stats = make(map[string]*catalog.TableStats)
@@ -154,12 +199,39 @@ func (s *Session) persistStats(st *catalog.TableStats) error {
 	return nil
 }
 
-func (s *Session) collectStats(tab *catalog.Table) (*catalog.TableStats, error) {
-	heap, err := s.heapOf(tab)
-	if err != nil {
-		return nil, err
+func (s *Session) deletePartitionStats(tableID uint32) error {
+	if s == nil || s.x == nil || tableID == 0 {
+		return nil
 	}
-	htx := s.x.use(heap)
+	ctx := s.x.use(s.db.CatTree)
+	start, end := catalog.PartitionStatsRange(tableID)
+	var keys [][]byte
+	if err := ctx.Range(start, end, func(key, _ []byte) error {
+		keys = append(keys, append([]byte(nil), key...))
+		return nil
+	}); err != nil {
+		return err
+	}
+	for _, key := range keys {
+		if err := ctx.Delete(key); err != nil && !nerr.HasCode(err, nerr.NotFound) {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Session) deleteOnePartitionStats(tableID, partitionID uint32) error {
+	if s == nil || s.x == nil || tableID == 0 || partitionID == 0 {
+		return nil
+	}
+	err := s.x.use(s.db.CatTree).Delete(catalog.PartitionStatsKey(tableID, partitionID))
+	if err != nil && !nerr.HasCode(err, nerr.NotFound) {
+		return err
+	}
+	return nil
+}
+
+func (s *Session) collectStats(tab *catalog.Table) (*catalog.TableStats, error) {
 	ncols := len(tab.Columns)
 	nulls := make([]uint64, ncols)
 	mins := make([]types.Value, ncols)
@@ -170,9 +242,8 @@ func (s *Session) collectStats(tab *catalog.Table) (*catalog.TableStats, error) 
 		rows   uint64
 	)
 	rng := rand.New(rand.NewSource(1))
-	err = htx.Range(nil, nil, func(_, val []byte) error {
-		row, err := s.decodeHeapRow(tab, val)
-		if err != nil {
+	consume := func(row []types.Value) error {
+		if err := s.budget().Check(); err != nil {
 			return err
 		}
 		rows++
@@ -205,11 +276,28 @@ func (s *Session) collectStats(tab *catalog.Table) (*catalog.TableStats, error) 
 			sample[j] = cloneRow(row)
 		}
 		return nil
-	})
-	if err != nil {
+	}
+	var partitionStats []catalog.PartitionStats
+	if tab.Partitioning != nil {
+		partitionStats = make([]catalog.PartitionStats, 0, len(tab.Partitioning.Partitions))
+		for _, part := range tab.Partitioning.Partitions {
+			local := newAnalyzeAccumulator(tab, maxPartitionSample, int64(part.ID)+1)
+			if err := s.scanHeapPartitions(tab, []uint32{part.ID}, nil, nil, true, true, func(row []types.Value) error {
+				if err := consume(row); err != nil {
+					return err
+				}
+				local.consume(row)
+				return nil
+			}); err != nil {
+				return nil, err
+			}
+			partitionStats = append(partitionStats, s.finishPartitionStats(tab, part.ID, local))
+		}
+	} else if err := s.scanHeap(tab, nil, nil, true, true, consume); err != nil {
 		return nil, err
 	}
 	st := &catalog.TableStats{Table: tab.Name, TableID: tab.ID, Rows: rows}
+	st.Partitions = partitionStats
 	scale := 1.0
 	if len(sample) > 0 && rows > uint64(len(sample)) {
 		scale = float64(rows) / float64(len(sample))
@@ -247,6 +335,189 @@ func (s *Session) collectStats(tab *catalog.Table) (*catalog.TableStats, error) 
 	return st, nil
 }
 
+type analyzeAccumulator struct {
+	rows   uint64
+	nulls  []uint64
+	mins   []types.Value
+	maxs   []types.Value
+	hasMM  []bool
+	sample [][]types.Value
+	limit  int
+	rng    *rand.Rand
+}
+
+func newAnalyzeAccumulator(tab *catalog.Table, limit int, seed int64) *analyzeAccumulator {
+	ncols := 0
+	if tab != nil {
+		ncols = len(tab.Columns)
+	}
+	return &analyzeAccumulator{
+		nulls: make([]uint64, ncols),
+		mins:  make([]types.Value, ncols),
+		maxs:  make([]types.Value, ncols),
+		hasMM: make([]bool, ncols),
+		limit: limit,
+		rng:   rand.New(rand.NewSource(seed)),
+	}
+}
+
+func (a *analyzeAccumulator) consume(row []types.Value) {
+	if a == nil {
+		return
+	}
+	a.rows++
+	for i, value := range row {
+		if i >= len(a.nulls) {
+			break
+		}
+		if value.Null {
+			a.nulls[i]++
+			continue
+		}
+		if !value.Typ.Comparable() {
+			continue
+		}
+		if !a.hasMM[i] {
+			a.mins[i], a.maxs[i], a.hasMM[i] = value.Clone(), value.Clone(), true
+			continue
+		}
+		if cmp, err := value.Cmp(a.mins[i]); err == nil && cmp < 0 {
+			a.mins[i] = value.Clone()
+		}
+		if cmp, err := value.Cmp(a.maxs[i]); err == nil && cmp > 0 {
+			a.maxs[i] = value.Clone()
+		}
+	}
+	if a.limit <= 0 {
+		return
+	}
+	if len(a.sample) < a.limit {
+		a.sample = append(a.sample, cloneRow(row))
+		return
+	}
+	j := a.rng.Int63n(int64(a.rows))
+	if j < int64(a.limit) {
+		a.sample[j] = cloneRow(row)
+	}
+}
+
+func (s *Session) finishPartitionStats(tab *catalog.Table, id uint32, a *analyzeAccumulator) catalog.PartitionStats {
+	out := catalog.PartitionStats{ID: id}
+	if tab == nil || a == nil {
+		return out
+	}
+	out.Rows = a.rows
+	scale := 1.0
+	if len(a.sample) > 0 && a.rows > uint64(len(a.sample)) {
+		scale = float64(a.rows) / float64(len(a.sample))
+	}
+	for _, ord := range partitionSketchOrdinals(tab) {
+		col := catalog.ColumnStats{Ord: ord, Nulls: a.nulls[ord], HasMinMax: a.hasMM[ord]}
+		if col.HasMinMax {
+			col.Min, col.Max = a.mins[ord].Clone(), a.maxs[ord].Clone()
+		}
+		if tab.Columns[ord].Type.Comparable() {
+			col.NDV, _, _ = colSketch(a.sample, ord, scale)
+			col.Correlation = spearman(a.sample, ord, tab)
+		}
+		out.Columns = append(out.Columns, col)
+	}
+	for _, idx := range tab.Indexes {
+		if len(out.Indexes) >= catalog.MaxPartitionSketchIndexes {
+			break
+		}
+		is := catalog.IndexStats{Name: idx.Name, Unique: idx.Unique}
+		if len(idx.Columns) > 0 {
+			for _, col := range out.Columns {
+				if col.Ord == idx.Columns[0] {
+					is.NDV = col.NDV
+					break
+				}
+			}
+		}
+		if idx.Unique && a.rows > 0 {
+			is.Selectivity, is.NDV = 1/float64(a.rows), a.rows
+		} else if is.NDV > 0 {
+			is.Selectivity = 1 / float64(is.NDV)
+		} else {
+			is.Selectivity = 0.1
+		}
+		out.Indexes = append(out.Indexes, is)
+	}
+	for ord, col := range tab.Columns {
+		if len(out.Vectors) >= catalog.MaxPartitionSketchVectors {
+			break
+		}
+		if col.Type.Kind != types.KindVector {
+			continue
+		}
+		out.Vectors = append(out.Vectors, catalog.VectorStats{Ord: ord, Count: a.rows - a.nulls[ord], Dim: col.Type.Precision})
+	}
+	return boundPartitionStats(tab.ID, out)
+}
+
+// boundPartitionStats keeps validate-all-before-mutation memory below the
+// per-record catalog limit. It preserves the deterministic priority prefix and
+// converges in logarithmic steps for adversarial wide/value-heavy schemas.
+func boundPartitionStats(tableID uint32, out catalog.PartitionStats) catalog.PartitionStats {
+	for attempts := 0; attempts < 24; attempts++ {
+		if _, err := catalog.EncodePartitionStats(tableID, [32]byte{}, out); err == nil {
+			return out
+		}
+		switch {
+		case len(out.Columns) > 0:
+			out.Columns = out.Columns[:len(out.Columns)/2]
+		case len(out.Indexes) > 0:
+			out.Indexes = out.Indexes[:len(out.Indexes)/2]
+		case len(out.Vectors) > 0:
+			out.Vectors = out.Vectors[:len(out.Vectors)/2]
+		default:
+			return out
+		}
+	}
+	return out
+}
+
+// partitionSketchOrdinals prioritizes routing, indexed, and vector columns,
+// then fills the remaining bounded record in catalog order. Missing local
+// sketches always fall back to the global NSST distribution.
+func partitionSketchOrdinals(tab *catalog.Table) []int {
+	if tab == nil {
+		return nil
+	}
+	out := make([]int, 0, min(len(tab.Columns), catalog.MaxPartitionSketchColumns))
+	seen := make(map[int]struct{}, cap(out))
+	add := func(ord int) {
+		if len(out) >= catalog.MaxPartitionSketchColumns || ord < 0 || ord >= len(tab.Columns) {
+			return
+		}
+		if _, exists := seen[ord]; exists {
+			return
+		}
+		seen[ord] = struct{}{}
+		out = append(out, ord)
+	}
+	if tab.Partitioning != nil {
+		for _, ord := range tab.Partitioning.Columns {
+			add(ord)
+		}
+	}
+	for _, idx := range tab.Indexes {
+		for _, ord := range idx.Columns {
+			add(ord)
+		}
+	}
+	for ord, col := range tab.Columns {
+		if col.Type.Kind == types.KindVector {
+			add(ord)
+		}
+	}
+	for ord := range tab.Columns {
+		add(ord)
+	}
+	return out
+}
+
 func (s *Session) collectVectorStats(tab *catalog.Table, nulls []uint64, rows uint64) []catalog.VectorStats {
 	if tab == nil {
 		return nil
@@ -266,7 +537,32 @@ func (s *Session) collectVectorStats(tab *catalog.Table, nulls []uint64, rows ui
 				continue
 			}
 			vs.IndexName = idx.Name
-			if g, err := s.graphOf(tab, idx); err == nil {
+			if tab.Partitioning != nil {
+				var total uint64
+				var seen bool
+				for _, part := range tab.Partitioning.Partitions {
+					g, err := s.graphOfPartition(tab, part, idx)
+					if err != nil {
+						continue
+					}
+					meta, err := g.LoadMeta()
+					if err != nil {
+						continue
+					}
+					seen = true
+					total += meta.Count
+					if vs.M == 0 {
+						vs.M = uint16(meta.M)
+						vs.EfConstruct = meta.EfConstruct
+					}
+					if meta.Dim > 0 {
+						vs.Dim = meta.Dim
+					}
+				}
+				if seen {
+					vs.Count = total
+				}
+			} else if g, err := s.graphOf(tab, idx); err == nil {
 				if meta, err := g.LoadMeta(); err == nil {
 					vs.M = uint16(meta.M)
 					vs.EfConstruct = meta.EfConstruct

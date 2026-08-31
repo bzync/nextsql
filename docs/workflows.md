@@ -3,12 +3,13 @@
 This document defines the native NextSQL P19 contract. The synchronous manual
 workflow slice is implemented in the parser, binder, versioned catalog,
 planner, and executor. Its parser/descriptor fuzz, transaction, restart/crash,
-backup/PITR, WAL/Raft failover, RBAC/tenant, resource, race, and TLS driver gates
-pass as of 2026-08-24. The synchronous row-trigger slice also passes its
+backup/PITR, WAL/Raft failover, RBAC/database isolation, resource, race, and
+TLS driver gates pass as of 2026-08-24. The synchronous row-trigger slice also passes its
 parser/descriptor fuzz, atomicity, restart/crash, backup/PITR, WAL/Raft
-failover, RBAC/tenant, cycle/depth, race, audit-redaction, and TLS driver gates.
-The schedule and durable task runtime are now implemented; P19 remains open
-until their remaining cross-cutting verification is complete. P19 uses one
+failover, RBAC/database isolation, cycle/depth, race, audit-redaction, and TLS
+driver gates.
+The schedule and durable task runtime are implemented, and a clean
+repository-wide functional invocation passed on 2026-08-29. P19 uses one
 model:
 
 ```text
@@ -107,17 +108,15 @@ Manual `RUN WORKFLOW` is synchronous and atomic:
 - Workflow catalog changes use the ordinary encrypted, authenticated catalog
   transaction and WAL path. Targeted crash recovery, backup/restore, LSN PITR,
   WAL replication, leader-write gating, and TLS driver tests cover the manual
-  slice. Trigger, schedule, and task replication/failover gates are also covered;
-  P19 remains open only for the clean repository-wide functional run recorded
-  in `TODO.md`.
+  slice. Trigger, schedule, and task replication/failover gates are also covered.
 
 `RUN WORKFLOW` returns one command result with the sum of affected rows from its
 top-level body statements. V1 bodies cannot return row sets. Audit records carry
 the workflow action, name, caller, outcome, and remote identity when available,
-but never parameter values or secrets. Tenant, elapsed-time, and affected-row
+but never parameter values or secrets. Realm/database, elapsed-time, and affected-row
 audit fields remain future audit-schema work.
 
-## Tenant and authorization semantics
+## Hosted-database authorization semantics
 
 V1 workflows always use invoker rights. Creating one requires database
 `CREATE`; altering or dropping one requires the corresponding `ALTER` or
@@ -126,15 +125,13 @@ V1 workflows always use invoker rights. Creating one requires database
 The invoker must also hold every privilege required by every body statement;
 `EXECUTE` never bypasses table or administrative authorization.
 
-A workflow captures no tenant identity at creation. Each invocation inherits
-the caller's current `SET TENANT` binding. Existing tenant rewriting and
-row-validation apply to every body statement and nested workflow. A caller
-without the required tenant binding cannot use a workflow to access a
-tenant-keyed table, and a workflow cannot change or reset the tenant binding.
-Synchronous trigger invocation uses the DML caller's principal and tenant.
-Scheduled invocation stores the schedule creator and active tenant binding,
-then re-applies that identity and rechecks workflow/body privileges on every
-task attempt. Neither path silently acquires elevated rights.
+A workflow captures no row-tenant identity. Each invocation remains inside the
+database selected when the connection/task is admitted. Synchronous trigger
+invocation uses the DML caller's principal. Scheduled invocation stores the
+schedule creator, then reapplies that principal and rechecks workflow/body
+privileges on every task attempt. New schedule/task descriptors leave legacy
+tenant fields empty. Neither path silently acquires elevated rights or changes
+the selected database.
 
 ## Resource bounds
 
@@ -198,7 +195,7 @@ nested workflows share the caller's query budget. Static dependency analysis
 rejects trigger/workflow mutation cycles; the runtime depth cap remains a
 fail-closed defense.
 
-Triggers use invoker rights and inherit the session tenant. The caller must
+Triggers use invoker rights inside the caller's admitted database. The caller must
 hold the original DML privilege, `EXECUTE` on each invoked workflow, and all
 body privileges. Trigger definitions store stable table/workflow IDs and are
 replicated as catalog WAL. Followers apply resulting WAL rather than firing
@@ -228,7 +225,8 @@ CANCEL TASK 's/00000007/1787616000000000000';
 `AT` accepts a future RFC 3339 timestamp and is stored as a canonical UTC Unix
 nanosecond. V1 arguments are literals, are capped at 64, and are type-checked
 against the referenced workflow at definition time. A schedule stores its
-stable workflow ID, owner, tenant, creation time, last firing, and next firing.
+stable workflow ID, owner, creation time, last firing, and next firing. The
+versioned legacy tenant field is empty for new schedules.
 
 The leader reads a chronological schedule index in batches of at most 256. A
 firing creates a deterministic task ID from the stable schedule ID and due
@@ -239,7 +237,7 @@ boundary and advances directly to the first future boundary; it does not burst
 one task per missed interval. Followers reject dispatch and task claims.
 
 Task descriptors are versioned, bounded to 1 MiB, and contain the durable ID,
-state, source, owner, tenant, stable workflow identity, schedule identity,
+state, source, owner, stable workflow identity, schedule identity,
 literal arguments, due/update times, attempt limits, timeout, exponential
 backoff base, lease, idempotency key, concurrency policy, cancellation flag,
 bounded error metadata, and retention deadline. Arguments are executed but are
@@ -263,11 +261,11 @@ and a replacement worker may both compute after a severe pause or clock jump,
 but the task-row write conflict permits only one committed database effect.
 Workflows cannot perform external side effects or dynamic SQL in this version.
 
-Scheduled execution uses invoker rights as the stored schedule owner and
-stored tenant. `EXECUTE` and every body privilege are rechecked on each attempt;
+Scheduled execution uses invoker rights as the stored schedule owner in the
+admitted database. `EXECUTE` and every body privilege are rechecked on each attempt;
 revocation therefore fails closed. Non-admin `SHOW TASKS` uses an owner index
 and does not expose another principal's tasks. Non-admin cancellation requires
-ownership and, for tenant-bound tasks, the matching active tenant. A durable
+ownership. A durable
 cancellation write fences a late success before the local worker is signaled.
 
 ### Clock and failover semantics
@@ -281,22 +279,22 @@ creation and all task state transitions are replicated before acknowledgement,
 so a new leader continues from the committed cursor and deterministic task ID
 without creating a second firing for that boundary.
 
-This section describes the implemented active P19 slice, not a phase-complete
-claim. Its targeted functional/race/fuzz, backup/PITR, three-node Raft, TLS
-driver, and documentation gates pass. The remaining open gate in `TODO.md` is
-a clean repository-wide functional run after the P16 soak releases I/O.
+This section describes the completed native P19 v1 slice. Its targeted
+functional/race/fuzz, backup/PITR, three-node Raft, TLS driver, and
+documentation gates pass. The repository-wide functional gate also passed on
+2026-08-29.
 
 ## Required verification before claiming shipment
 
 The manual workflow increment requires parser tests and fuzzing, descriptor
 decoder fuzzing, binder/type/dependency tests, autocommit and explicit
 transaction rollback tests, restart/crash/WAL recovery, backup/restore and PITR,
-leader/follower behavior, adversarial RBAC and tenant-isolation tests, nested
+leader/follower behavior, adversarial RBAC and database-isolation tests, nested
 cycle/depth tests, cancellation and resource-limit tests, protocol/driver tests,
 audit redaction tests, and documentation updates. The trigger increment adds
 event-row validation, all six timing/event combinations, atomic failure,
 catalog restart/crash, backup/PITR, deterministic WAL/Raft failover, invoker
-RBAC and tenant isolation, static cycle and runtime depth defenses, audit
+RBAC and database isolation, static cycle and runtime depth defenses, audit
 redaction, race, fuzz, and TLS prepared-driver tests. The implemented schedule
 and task increment additionally requires deterministic duplicate prevention,
 clock-step and lease recovery behavior, retry/final-failure atomicity, durable

@@ -19,7 +19,7 @@ func main() {
 	conn, err := nextsql.Open(nextsql.Config{
 		Address:       "127.0.0.1:7210",
 		User:          "app",
-		Password:      os.Getenv("NEXTSQL_PASSWORD"),
+		Password:      os.Getenv("NEXTSQL_DATABASE_PASS"),
 		InsecureNoTLS: true, // loopback only
 	})
 	if err != nil {
@@ -40,6 +40,16 @@ func main() {
 	}
 	for _, row := range res.Rows {
 		fmt.Println(row[0].String())
+	}
+
+	// Safe to retry after a timeout: the mutation and replay result commit
+	// atomically under this user/tenant-scoped key.
+	_, err = conn.ExecIdempotent(context.Background(), "order-20260826-42",
+		`INSERT INTO orders (id, status) VALUES ($1, $2)`,
+		types.StringValue("42"), types.StringValue("created"),
+	)
+	if err != nil {
+		log.Fatal(err)
 	}
 
 	stmt, err := conn.Prepare(context.Background(),
@@ -75,6 +85,9 @@ Persist `resume_token` only after processing every row in its transaction. See
 [Change streams](/docs/cdc).
 
 For `--require-client-key`, set `Config.KeyProvider` (never a URL). Remote connections need a `tls.Config` with TLS 1.3 and a CA.
+
+To authenticate with a signed short-lived credential, put the `NSSC1.` value in
+`Config.Password` — no other change. See [security](/docs/security).
 
 Multi-statement transactions are a session of `BEGIN` / statements / `COMMIT` on the same connection:
 

@@ -73,6 +73,53 @@ func TestAllocationAndReuse(t *testing.T) {
 	}
 }
 
+func TestStorageCapBlocksGrowthAllowsReuse(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "nextsql.db")
+	e, err := Create(path, testKeys(t), 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := e.Alloc.Next()
+	e.SetStorageCapBytes(uint64(base+3) * uint64(format.PhysicalPageSize))
+	if got := e.StorageCapBytes(); got != uint64(base+3)*uint64(format.PhysicalPageSize) {
+		t.Fatalf("StorageCapBytes=%d", got)
+	}
+
+	var grown []format.PageID
+	for i := 0; i < 3; i++ {
+		id, err := e.Alloc.Alloc()
+		if err != nil {
+			t.Fatalf("growth %d within cap: %v", i, err)
+		}
+		grown = append(grown, id)
+	}
+	if _, err := e.Alloc.Alloc(); !nerr.HasCode(err, nerr.Exhausted) {
+		t.Fatalf("growth past cap: %v", err)
+	}
+
+	// Freeing pages and reusing them still works at the cap.
+	if err := e.Alloc.Free(grown[0]); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Alloc.Free(grown[1]); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		if _, err := e.Alloc.Alloc(); err != nil {
+			t.Fatalf("reuse %d at cap: %v", i, err)
+		}
+	}
+	if _, err := e.Alloc.Alloc(); !nerr.HasCode(err, nerr.Exhausted) {
+		t.Fatalf("growth past cap after reuse: %v", err)
+	}
+
+	// Lifting the cap re-enables growth.
+	e.SetStorageCapBytes(0)
+	if _, err := e.Alloc.Alloc(); err != nil {
+		t.Fatalf("growth after cap lifted: %v", err)
+	}
+}
+
 func TestFreelistMetadataTailRemainsReachable(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "nextsql.db")
 	keys := testKeys(t)

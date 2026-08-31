@@ -2,6 +2,7 @@ package executor
 
 import (
 	"sort"
+	"strings"
 
 	"github.com/bzync/nextsql/internal/catalog"
 	"github.com/bzync/nextsql/internal/fulltext"
@@ -17,7 +18,7 @@ func (s *Session) searchFulltext(n planner.Search) ([][]types.Value, error) {
 	if err != nil {
 		return nil, err
 	}
-	if len(q.Terms) == 0 {
+	if q.Empty() {
 		return nil, nil
 	}
 	var rows [][]types.Value
@@ -49,81 +50,215 @@ func (s *Session) searchQuery(n planner.Search) (fulltext.Query, error) {
 	if v.Typ.Kind != types.KindString && v.Typ.Kind != types.KindText {
 		return fulltext.Query{}, nerr.New(nerr.InvalidArgument, "executor.searchQuery", "SEARCH query must be a string")
 	}
-	return fulltext.ParseQuery(v.Str)
+	return fulltext.ParseQueryWith(v.Str, fulltextAnalyzer(n.Table, n.IndexName, n.Columns))
+}
+
+func fulltextAnalyzer(tab *catalog.Table, indexName string, cols []int) fulltext.Analyzer {
+	if tab == nil {
+		return fulltext.Simple
+	}
+	if indexName != "" {
+		idx := indexByName(tab, indexName)
+		if idx.Fulltext {
+			return fulltext.Analyzer{ID: idx.FTAnalyzer, Version: idx.FTVersion}
+		}
+	}
+	var found *catalog.Index
+	for i := range tab.Indexes {
+		idx := &tab.Indexes[i]
+		if !idx.Fulltext || !catalog.IntsEqual(idx.Columns, cols) {
+			continue
+		}
+		if found == nil || idx.Name < found.Name {
+			found = idx
+		}
+	}
+	if found != nil {
+		return fulltext.Analyzer{ID: found.FTAnalyzer, Version: found.FTVersion}
+	}
+	return fulltext.Simple
+}
+
+// ftSegment is one inverted-index tree paired with the heap that resolves its
+// primary keys. A non-partitioned table has one segment; a partitioned table
+// has one per partition-local FULLTEXT root.
+type ftSegment struct {
+	itx *btree.Txn
+	htx *btree.Txn
 }
 
 func (s *Session) searchIndex(n planner.Search, q fulltext.Query) ([][]types.Value, error) {
 	tab := n.Table
 	idx := indexByName(tab, n.IndexName)
-	ix, err := s.indexOf(tab, idx)
-	if err != nil {
-		return nil, err
-	}
-	itx := s.x.use(ix)
-	raw, err := itx.Lookup(fulltext.StatsKey())
-	if err != nil {
-		if nerr.HasCode(err, nerr.NotFound) {
-			return nil, nil
+	var segs []ftSegment
+	if tab.Partitioning != nil {
+		for _, part := range partitionSelection(tab, nil) {
+			local, err := s.partitionIndex(tab, part.ID, idx)
+			if err != nil {
+				return nil, err
+			}
+			heap, err := s.partitionHeap(tab, part.ID)
+			if err != nil {
+				return nil, err
+			}
+			segs = append(segs, ftSegment{itx: s.x.use(local), htx: s.x.use(heap)})
 		}
-		return nil, err
+	} else {
+		ix, err := s.indexOf(tab, idx)
+		if err != nil {
+			return nil, err
+		}
+		heap, err := s.heapOf(tab)
+		if err != nil {
+			return nil, err
+		}
+		segs = append(segs, ftSegment{itx: s.x.use(ix), htx: s.x.use(heap)})
 	}
-	st, err := fulltext.DecodeStats(raw)
-	if err != nil || st.Docs == 0 {
-		return nil, err
-	}
+	return s.searchSegments(n, q, tab, segs)
+}
+
+// searchSegments scores BM25 over one or more inverted-index segments as a
+// single logical corpus: document frequency and corpus size are summed across
+// segments so partitioning never changes ranking.
+func (s *Session) searchSegments(n planner.Search, q fulltext.Query, tab *catalog.Table, segs []ftSegment) ([][]types.Value, error) {
 	type posting struct {
 		tf  uint32
 		pos []uint32
 	}
-	docs := map[string]map[string]posting{}
-	df := make(map[string]uint64, len(q.Terms))
-	for _, term := range q.Terms {
-		start, end := fulltext.PostingBounds(term)
-		err := itx.Range(start, end, func(key, val []byte) error {
-			_, pk, err := fulltext.SplitPostingKey(key)
-			if err != nil {
-				return err
-			}
-			tf, pos, err := fulltext.DecodePosting(val)
-			if err != nil {
-				return err
-			}
-			id := string(pk)
-			m := docs[id]
-			if m == nil {
-				m = make(map[string]posting, len(q.Terms))
-				docs[id] = m
-			}
-			m[term] = posting{tf: tf, pos: pos}
+	type docKey struct {
+		seg int
+		id  string
+	}
+	docs := map[docKey]map[string]posting{}
+	df := make(map[string]uint64, len(q.Terms)+len(q.Prefixes)+len(q.Fuzzies))
+	var corpus fulltext.Stats
+	addPosting := func(si int, term string, pk, val []byte) error {
+		tf, pos, err := fulltext.DecodePosting(val)
+		if err != nil {
+			return err
+		}
+		dk := docKey{seg: si, id: string(pk)}
+		m := docs[dk]
+		if m == nil {
+			m = make(map[string]posting, len(q.Terms)+len(q.Prefixes)+len(q.Fuzzies))
+			docs[dk] = m
+		}
+		if _, exists := m[term]; !exists {
 			df[term]++
-			return nil
-		})
+		}
+		m[term] = posting{tf: tf, pos: pos}
+		return nil
+	}
+	for si := range segs {
+		itx := segs[si].itx
+		raw, err := itx.Lookup(fulltext.StatsKey())
+		if err != nil {
+			if nerr.HasCode(err, nerr.NotFound) {
+				continue
+			}
+			return nil, err
+		}
+		st, err := fulltext.DecodeStats(raw)
 		if err != nil {
 			return nil, err
 		}
-	}
-	avg := fulltext.AvgDL(st)
-	var hits []fulltext.Hit
-	for id, terms := range docs {
-		if len(terms) != len(q.Terms) {
+		if st.Docs == 0 {
 			continue
 		}
-		pos := make(map[string][]uint32, len(terms))
-		for t, p := range terms {
-			pos[t] = p.pos
-		}
-		ok := true
-		for _, ph := range q.Phrases {
-			if !fulltext.PhraseMatch(ph, pos) {
-				ok = false
-				break
+		corpus.Docs += st.Docs
+		corpus.Tokens += st.Tokens
+		for _, term := range q.Terms {
+			start, end := fulltext.PostingBounds(term)
+			err := itx.Range(start, end, func(key, val []byte) error {
+				_, pk, err := fulltext.SplitPostingKey(key)
+				if err != nil {
+					return err
+				}
+				return addPosting(si, term, pk, val)
+			})
+			if err != nil {
+				return nil, err
 			}
 		}
-		if !ok {
+	}
+	if corpus.Docs == 0 {
+		return nil, nil
+	}
+	q = fulltext.ApplyTypoTolerance(q, func(term string) bool {
+		return df[term] > 0
+	})
+	exp := fulltext.NewPrefixExpander(q.Terms)
+	fuzzyBudget := fulltext.NewFuzzyVocabularyBudget()
+	for si := range segs {
+		itx := segs[si].itx
+		for _, pfx := range q.Prefixes {
+			start, end := fulltext.PostingPrefixBounds(pfx)
+			err := itx.Range(start, end, func(key, val []byte) error {
+				term, pk, err := fulltext.SplitPostingKey(key)
+				if err != nil {
+					return err
+				}
+				if !strings.HasPrefix(term, pfx) {
+					return nil
+				}
+				if err := exp.Observe(term); err != nil {
+					return err
+				}
+				return addPosting(si, term, pk, val)
+			})
+			if err != nil {
+				return nil, err
+			}
+		}
+		if len(q.Fuzzies) > 0 {
+			start, end := fulltext.PostingPrefixBounds("")
+			var last string
+			var lastMatch bool
+			err := itx.Range(start, end, func(key, val []byte) error {
+				term, pk, err := fulltext.SplitPostingKey(key)
+				if err != nil {
+					return err
+				}
+				if term != last {
+					last = term
+					if err := fuzzyBudget.Observe(term); err != nil {
+						return err
+					}
+					lastMatch = q.FuzzyMatchesTerm(term)
+					if lastMatch {
+						if err := exp.Observe(term); err != nil {
+							return err
+						}
+					}
+				}
+				if !lastMatch {
+					return nil
+				}
+				return addPosting(si, term, pk, val)
+			})
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+	avg := fulltext.AvgDL(corpus)
+	type segHit struct {
+		seg int
+		hit fulltext.Hit
+	}
+	var hits []segHit
+	for dk, terms := range docs {
+		tf := make(map[string]uint32, len(terms))
+		pos := make(map[string][]uint32, len(terms))
+		for t, p := range terms {
+			tf[t] = p.tf
+			pos[t] = p.pos
+		}
+		if !fulltext.QueryMatches(q, tf, pos) {
 			continue
 		}
-		pk := []byte(id)
-		dlRaw, err := itx.Lookup(fulltext.DocLenKey(pk))
+		pk := []byte(dk.id)
+		dlRaw, err := segs[dk.seg].itx.Lookup(fulltext.DocLenKey(pk))
 		if err != nil {
 			if nerr.HasCode(err, nerr.NotFound) {
 				continue
@@ -134,24 +269,16 @@ func (s *Session) searchIndex(n planner.Search, q fulltext.Query) ([][]types.Val
 		if err != nil {
 			return nil, err
 		}
-		var score float64
-		for _, term := range q.Terms {
-			score += fulltext.Score(terms[term].tf, dl, avg, fulltext.IDF(st.Docs, df[term]))
-		}
-		hits = append(hits, fulltext.Hit{PK: pk, Score: score})
+		score := fulltext.QueryScoreWeighted(q, tf, pos, n.Weights, df, dl, avg, corpus.Docs)
+		hits = append(hits, segHit{seg: dk.seg, hit: fulltext.Hit{PK: pk, Score: score}})
 	}
-	sort.Slice(hits, func(i, j int) bool { return fulltext.LessHit(hits[i], hits[j]) })
-	heap, err := s.heapOf(tab)
-	if err != nil {
-		return nil, err
-	}
-	htx := s.x.use(heap)
+	sort.Slice(hits, func(i, j int) bool { return fulltext.LessHit(hits[i].hit, hits[j].hit) })
 	var out [][]types.Value
 	for _, h := range hits {
 		if err := s.budget().Check(); err != nil {
 			return nil, err
 		}
-		row, err := s.fetchPKRow(htx, tab, h.PK)
+		row, err := s.fetchPKRow(segs[h.seg].htx, tab, h.hit.PK)
 		if err != nil || row == nil {
 			if err != nil {
 				return nil, err
@@ -179,7 +306,7 @@ func (s *Session) searchScan(n planner.Search, q fulltext.Query) ([][]types.Valu
 	if tab == nil {
 		tab = tableOf(n.Input)
 	}
-	if tab == nil || n.Column < 0 || n.Column >= len(tab.Columns) {
+	if tab == nil || len(n.Columns) == 0 {
 		return nil, nerr.New(nerr.Internal, "executor.searchScan", "missing SEARCH column")
 	}
 	type scored struct {
@@ -190,14 +317,10 @@ func (s *Session) searchScan(n planner.Search, q fulltext.Query) ([][]types.Valu
 		dl  uint32
 	}
 	var cand []scored
-	df := make(map[string]uint64, len(q.Terms))
+	vocab := make(map[string]struct{})
 	var docs, tokens uint64
 	for _, row := range rows {
-		v := row[n.Column]
-		if v.Null {
-			continue
-		}
-		doc, err := fulltext.Analyze(v.Str)
+		doc, err := analyzeSearchRow(row, n.Columns, fulltextAnalyzer(tab, n.IndexName, n.Columns))
 		if err != nil {
 			return nil, err
 		}
@@ -211,28 +334,7 @@ func (s *Session) searchScan(n planner.Search, q fulltext.Query) ([][]types.Valu
 		for _, t := range doc.Terms {
 			tf[t.Term] = t.TF
 			pos[t.Term] = t.Pos
-		}
-		ok := true
-		for _, term := range q.Terms {
-			if tf[term] == 0 {
-				ok = false
-				break
-			}
-		}
-		if !ok {
-			continue
-		}
-		for _, ph := range q.Phrases {
-			if !fulltext.PhraseMatch(ph, pos) {
-				ok = false
-				break
-			}
-		}
-		if !ok {
-			continue
-		}
-		for _, term := range q.Terms {
-			df[term]++
+			vocab[t.Term] = struct{}{}
 		}
 		pk, err := types.EncodeKey(tab.PKValues(row))
 		if err != nil {
@@ -240,14 +342,60 @@ func (s *Session) searchScan(n planner.Search, q fulltext.Query) ([][]types.Valu
 		}
 		cand = append(cand, scored{row: row, hit: fulltext.Hit{PK: pk}, pos: pos, tf: tf, dl: doc.Len})
 	}
+	q = fulltext.ApplyTypoTolerance(q, func(term string) bool {
+		_, ok := vocab[term]
+		return ok
+	})
+	if len(q.Fuzzies) > 0 {
+		fuzzyBudget := fulltext.NewFuzzyVocabularyBudget()
+		for term := range vocab {
+			if err := fuzzyBudget.Observe(term); err != nil {
+				return nil, err
+			}
+		}
+	}
+	df := make(map[string]uint64, len(q.Terms)+len(q.Prefixes)+len(q.Fuzzies))
+	exp := fulltext.NewPrefixExpander(q.Terms)
+	var matched []scored
+	for _, c := range cand {
+		for term, freq := range c.tf {
+			if freq == 0 {
+				continue
+			}
+			if q.PrefixMatchesTerm(term) || q.FuzzyMatchesTerm(term) {
+				if err := exp.Observe(term); err != nil {
+					return nil, err
+				}
+			}
+		}
+		if !fulltext.QueryMatches(q, c.tf, c.pos) {
+			continue
+		}
+		counted := make(map[string]struct{}, len(c.tf))
+		for _, term := range q.Terms {
+			if c.tf[term] > 0 {
+				df[term]++
+				counted[term] = struct{}{}
+			}
+		}
+		for term, freq := range c.tf {
+			if freq == 0 {
+				continue
+			}
+			if _, ok := counted[term]; ok {
+				continue
+			}
+			if q.PrefixMatchesTerm(term) || q.FuzzyMatchesTerm(term) {
+				df[term]++
+			}
+		}
+		matched = append(matched, c)
+	}
+	cand = matched
 	avg := fulltext.AvgDL(fulltext.Stats{Docs: docs, Tokens: tokens})
 	var hits []scored
 	for _, c := range cand {
-		var score float64
-		for _, term := range q.Terms {
-			score += fulltext.Score(c.tf[term], c.dl, avg, fulltext.IDF(docs, df[term]))
-		}
-		c.hit.Score = score
+		c.hit.Score = fulltext.QueryScoreWeighted(q, c.tf, c.pos, n.Weights, df, c.dl, avg, docs)
 		hits = append(hits, c)
 	}
 	sort.Slice(hits, func(i, j int) bool { return fulltext.LessHit(hits[i].hit, hits[j].hit) })

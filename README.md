@@ -31,7 +31,7 @@ CREATE TABLE products (
 
     id          UUID PRIMARY KEY DEFAULT UUID(),
 
-    tenant_id   UUID NOT NULL,
+    account_id  UUID NOT NULL,
 
     name        STRING NOT NULL,
 
@@ -120,7 +120,9 @@ go install github.com/bzync/nextsql/cmd/nextsqld\@latest
 For Docker or Podman installation with persistent encrypted storage, see
 [`docs/docker.md`](docs/docker.md) and the checked-in `docker-compose.yml`.
 
-Initialize a data directory and a root unlock key (mode `0600`). Keep the key file **off** the data volume.
+Initialize a data directory, database root, and separate deployment-registry
+root (mode `0600`). `--instance-key-file` defaults to
+`--key-file.instance`. Keep both roots **off** the data volume.
 
 ```bash
 
@@ -137,6 +139,11 @@ nextsql init \\
   --user app --password-file /tmp/nextsql.pw
 
 ```
+
+For an existing pre-registry `DATA-DIR/nextsql.db`, stop `nextsqld` and run
+`nextsql hosting adopt --data-dir DIR --key-file FILE --confirm`. Adoption
+recovery-verifies and registers that exact default database without moving it
+or discovering sibling files.
 
 Start the server. Loopback may run without TLS; any non-loopback listen address requires TLS 1.3.
 
@@ -237,13 +244,13 @@ Unquoted identifiers fold to lowercase. Every table needs a `PRIMARY KEY`; that 
 
 | `JSON` | Compact binary (`NSJB`); path extract and path indexes |
 
-| `VECTOR<F32,N>` | Stored off-row; `COSINE` / `L2` / `INNER_PRODUCT` |
+| `VECTOR<F32,N>` | Stored off-row; search metrics plus bounded norm/algebra/inspection |
 
 | `POINT` / `LOCATION`, `BOX`, `LINESTRING`, `POLYGON` | WGS84; see [docs/geo.md](docs/geo.md) |
 
 ### Statements
 
-`CREATE TABLE` (including `FOREIGN KEY` / `REFERENCES`; DML enforces `RESTRICT` / `NO ACTION` / `CASCADE` / `SET NULL` / `SET DEFAULT`), `CREATE INDEX` / `CREATE UNIQUE INDEX` (including `metadata.category`, `INCLUDE`, `WHERE`, and expression keys), `CREATE SPATIAL INDEX`, `CREATE FULLTEXT INDEX`, `CREATE VECTOR INDEX … USING HNSW`, `INSERT`, `SELECT` (`JOIN` / `LEFT` / `RIGHT` / `FULL OUTER` / `CROSS JOIN`, `GROUP BY`, `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`), `UPDATE`, `DELETE`, `BEGIN` [`READ COMMITTED` | `SNAPSHOT` | `SERIALIZABLE`], `COMMIT`, `ROLLBACK`, `ANALYZE`, `EXPLAIN` [`ANALYZE`], `SET TENANT` / `RESET TENANT`, `CREATE`/`DROP` `USER`/`ROLE`, `GRANT`/`REVOKE`.
+`CREATE TABLE` (including `FOREIGN KEY` / `REFERENCES`; DML enforces `RESTRICT` / `NO ACTION` / `CASCADE` / `SET NULL` / `SET DEFAULT`), `CREATE INDEX` / `CREATE UNIQUE INDEX` (including `metadata.category`, `INCLUDE`, `WHERE`, and expression keys), `CREATE SPATIAL INDEX`, `CREATE FULLTEXT INDEX`, `CREATE VECTOR INDEX … USING HNSW`, `INSERT`, `SELECT` (`JOIN` / `LEFT` / `RIGHT` / `FULL OUTER` / `CROSS JOIN`, `GROUP BY`, `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`), `UPDATE`, `DELETE`, `BEGIN` [`READ COMMITTED` | `SNAPSHOT` | `SERIALIZABLE`], `COMMIT`, `ROLLBACK`, `ANALYZE`, `EXPLAIN` [`ANALYZE`], `CREATE`/`DROP` `USER`/`ROLE`, `GRANT`/`REVOKE`. Shared row-tenancy statements are rejected; use hosted realm/database isolation.
 
 ```sql
 
@@ -262,6 +269,7 @@ SELECT * FROM products SEARCH description FOR 'wireless noise cancelling' LIMIT 
 -- Vectors
 
 SELECT id, name FROM products NEAREST embedding TO $query USING COSINE LIMIT 20;
+SELECT VECTOR_DIM(embedding), VECTOR_NORM(embedding), VECTOR_NORMALIZE(embedding) FROM products;
 
 -- Isolation
 
@@ -291,7 +299,7 @@ SELECT name,
        ROW_NUMBER() OVER (ORDER BY price DESC) AS rn
 FROM expensive;
 
-UPSERT INTO products (id, tenant_id, name, price)
+UPSERT INTO products (id, account_id, name, price)
 VALUES ($1, $2, $3, $4)
 ON UNIQUE (id)
 SET price = excluded.price
@@ -328,6 +336,12 @@ Official drivers speak the native NSQL protocol. **Keys and passwords never go i
 
 Shared TypeScript types live in [`drivers/js`](drivers/js).
 
+The Go driver also exposes `ExecIdempotent(ctx, key, sql, params...)` for
+durably retryable mutations. Repeating the same typed request returns its
+committed result; using the key for another request returns `conflict`. Eligible
+autocommit SELECT results use the engine's bounded WAL-invalidated result cache
+automatically.
+
 ```go
 
 conn, err := nextsql.Open(nextsql.Config{
@@ -354,7 +368,7 @@ const conn = await connect({
 
   user: "app",
 
-  password: process.env.NEXTSQL_PASSWORD,
+  password: process.env.NEXTSQL_DATABASE_PASS,
 
   insecureNoTLS: true,
 });
@@ -398,7 +412,7 @@ Also in the production surface:
 
 - Password auth, RBAC (`GRANT` / `REVOKE`), session audit log
 
-- `SET TENANT` — implicit `tenant_id` predicate; ACL fail-closed unless `ADMIN`
+- Hosted realm/database registry foundation; legacy shared-tenant tables fail closed for non-`ADMIN` migration safety
 
 - Online DEK rotation, key-version revocation (kills sessions), crypto-shred of the keystore
 
@@ -414,13 +428,23 @@ Details: [docs/security.md](docs/security.md).
 
 ```text
 
-nextsql init     --data-dir DIR --key-file FILE [--user NAME --password-file FILE]
+nextsql init     --data-dir DIR --key-file FILE [--instance-key-file FILE]
+
+                 [--realm NAME --database NAME] [--user NAME --password-file FILE]
+
+                 [--env-file PATH | --no-env]
+
+nextsql hosting  adopt --data-dir DIR --key-file FILE [--instance-key-file FILE]
+
+                 [--realm NAME --database NAME] --confirm
+
+                 [--env-file PATH | --no-env]
 
 nextsql exec     [--addr HOST:PORT] [--user NAME] [--password-file FILE]
 
                  [--database NAME] [--tls-ca FILE | --insecure]
 
-                 [--env-file PATH | --no-env] [--tenant VALUE]
+                 [--env-file PATH | --no-env]
 
                  [-c SQL | SQL]
 
@@ -430,7 +454,7 @@ nextsql migrate  status|pending|version|validate|create|up|down|force|repair
 
                  [--password-file FILE] [--tls-ca FILE | --insecure]
 
-                 [--env-file PATH | --no-env] [--tenant VALUE]
+                 [--env-file PATH | --no-env]
 
 nextsql backup   --data-dir DIR --key-file FILE --out DIR
 
@@ -458,7 +482,7 @@ nextsql version
 
 A backup is not valid until `verify` (including a restore test) succeeds. Same rule for export / import.
 
-`nextsql migrate` is always server mode: it never reads `--data-dir` or the root unlock key. Prefer `NEXTSQL_PASSWORD_FILE`. Do not put the root key in the application `.env`. See [USAGE.md](USAGE.md#14-schema-migrations).
+`nextsql migrate` is always server mode: it never reads `--data-dir` or the root unlock key. Prefer `NEXTSQL_DATABASE_PASSWORD_FILE`. Do not put the root key in the application `.env`. See [USAGE.md](USAGE.md#14-schema-migrations).
 
 Migration parsing/validation now understands shipped `DROP INDEX` syntax. Forward-only migrations remain the recommended deployment model.
 
@@ -466,11 +490,13 @@ Migration parsing/validation now understands shipped `DROP INDEX` syntax. Forwar
 
 ```text
 
-nextsqld --data-dir DIR --key-file FILE
+nextsqld --data-dir DIR --key-file FILE [--instance-key-file FILE]
 
          [--listen 127.0.0.1:7210] [--config FILE]
 
-         [--tls-cert FILE --tls-key FILE]
+         [--env-file PATH | --no-env]
+
+         [--tls-cert FILE --tls-key FILE [--tls-client-ca FILE [--tls-client-crl FILE]]]
 
          [--require-client-key]
 
@@ -482,7 +508,27 @@ nextsqld --data-dir DIR --key-file FILE
 
 ```
 
-Optional `key=value` config file (`--config`). Unknown keys are rejected. Common keys: `data_dir`, `key_file`, `listen_addr`, `buffer_pages`, `tls_cert`, `tls_key`, `require_client_key`, `wal_archive`, `max_inflight_queries`, `max_query_queue`, `query_queue_wait_ms`, `max_result_rows`, `node_id`, `raft_bind`, `raft_join`, `raft_bootstrap`.
+Optional `key=value` config file (`--config`). Unknown keys are rejected. Common keys: `data_dir`, `key_file`, `listen_addr`, `buffer_pages`, `tls_cert`, `tls_key`, `tls_client_ca`, `tls_client_crl`, `require_client_key`, `wal_archive`, `max_inflight_queries`, `max_query_queue`, `query_queue_wait_ms`, `max_result_rows`, `node_id`, `raft_bind`, `raft_join`, `raft_bootstrap`.
+
+`nextsqld` reloads the configured server certificate/key, mTLS trust bundle,
+and optional PEM CRL bundle on `SIGHUP`. Invalid reloads retain the last
+known-good snapshot; successful mTLS reloads disconnect all accepted
+connections, including in-progress handshakes, so clients reauthenticate
+against the new trust and revocation state.
+
+Hosting is dotenv-integrated. `NEXTSQL_DATA_DIR`, `NEXTSQL_KEY_FILE`,
+`NEXTSQL_INSTANCE_KEY_FILE`, `NEXTSQL_REALM_NAME`, `NEXTSQL_DATABASE`,
+`NEXTSQL_BUFFER_PAGES`, `NEXTSQL_SERVER_USER`, and
+`NEXTSQL_SERVER_PASSWORD_FILE` (preferred) or `NEXTSQL_SERVER_PASS` can drive
+init/adoption; `NEXTSQL_HOSTING_CONFIRM=true` enables non-interactive adoption.
+`nextsqld` consumes the matching paths, buffer pages, server credentials, and
+`NEXTSQL_ADDR` as its listen address. These server credentials never become a
+client `NEXTSQL_DATABASE_USER` login fallback. Explicit flags win. Key values are paths,
+never raw key bytes. Keep host provisioning env files mode `0600` and out of
+source control.
+
+The complete authoritative variable reference and secure hosting/client
+examples are in [`ENV.md`](ENV.md).
 
 Admission defaults: 32 in-flight queries, 128 queued, 5 s wait. Overload is rejected (`unavailable`) instead of growing without bound.
 
@@ -645,9 +691,11 @@ Current development state:
 P0–P15  complete
 P16      open — correctness / SLO closure
 P17      complete except REBUILD INDEX ... ONLINE is deferred
-P18      implementable scope complete; partition-wise agg/join waits on P21
-P19      active — v1 implementation complete; final full-suite gate open
-P20–P30 planned/open
+P18      implementable scope complete; partition-wise agg/join now unblocked by P21
+P19      complete — native v1 plus clean repository-wide functional gate
+P20      complete — native committed CDC/change streams
+P21      complete — RANGE/HASH/LIST partitioning, local indexes, cross-partition UNIQUE/UPSERT, statistics, benchmarks, and offline legacy TENANT migration
+P22–P30 planned/open
 ```
 
 P17 now includes shipped schema/storage-lifecycle work such as:
@@ -677,15 +725,20 @@ P18 includes the modern SQL completeness surface such as:
 - Top-N optimization
 - improved join reordering
 
-P16 is still the immediate release gate. The corrected 1M-vector HNSW v10 run
-is green at p95 **8.061 ms**, recall@10 **1.000**, and recall@100 **0.998**.
-Do not mark P16 complete until the remaining randomized 100M B+Tree invariant
-soak is green.
+P16 is complete: its exit gate is green (corrected 1M-vector HNSW v10 at p95
+**8.061 ms**, recall@10 **1.000**, recall@100 **0.998**; 10M DELETE published;
+crash-during-merge recovers `Check()`-clean; 100M analytics `< 60 s`; 10M
+INSERT/UPDATE published; security sign-off). The terminal 100M-operation B+Tree
+invariant soak is a deferred standalone measurement, not a release gate — paper-
+closed 2026-08-30 with the same disposition as P18. P23 Vector Engine 2.0 is
+complete (production-gating sign-off 2026-08-31). P24 Full-text Search 2.0 is the
+current release gate (stemming, stop-word dictionaries, french/german/spanish
+analyzers, english synonym dictionary v1, prefix search, fuzzy matching, typo tolerance, HIGHLIGHT/SNIPPET, multi-field search, field weighting, and faceting landed; exit gate next).
 
 Large sequential `DELETE` is correct after the leaf-merge fix and its 10M timing methodology is published. The tracker also records published 100M analytics results.
 
-The P19 native v1 increment is implemented and undergoing its final
-repository-wide functional gate:
+The P19 native v1 increment and its repository-wide functional gate are
+complete:
 
 ```text
 P19 WORKFLOW
@@ -694,9 +747,21 @@ P19 WORKFLOW
 → TASK runtime
 ```
 
-Then the roadmap continues through CDC, native partitioning, follower reads, Vector Engine 2.0, Full-text Search 2.0, Security 2.0, system introspection, workload governance, Installer/Manager, web-based Studio, and NextSQL Intelligence/RAG.
+P20 CDC is complete. P21 native table partitioning is complete: RANGE/HASH/LIST
+with one-to-eight-column keys, ADD/DROP and validated ATTACH/DETACH ownership
+transfer, partition-local B+Tree-family/FULLTEXT/HNSW indexes, cross-partition
+secondary UNIQUE, partition-aware `UPSERT`, stable-ID statistics and costing,
+bounded maintenance, backup/restore/PITR, `nextsql-bench --partition`, a
+randomized pruning-soundness property test, and explicit offline migration of a
+legacy `tenant_id` / `PARTITION BY TENANT` database into an isolated hosted
+deployment (`nextsql hosting migrate-tenant`). Distributed sharding is a
+separate future phase. The roadmap then continues through follower reads, Vector
+Engine 2.0, Full-text Search 2.0, Security 2.0, system introspection, workload
+governance, Installer/Manager, web-based Studio, and NextSQL Intelligence/RAG.
 
-P20 and later capabilities are **planned**, not current syntax, until their implementation and exit gates are complete. P19 syntax and semantics are documented in `docs/workflows.md`; the phase remains open until its final gate in `TODO.md` is green.
+P22+ capabilities remain planned until their `TODO.md` gates are green. P19
+syntax and semantics are documented in `docs/workflows.md`; P20 and P21 are
+documented in `docs/cdc.md` and `docs/partitioning.md`.
 
 Run the relevant validation suites on your target hardware:
 

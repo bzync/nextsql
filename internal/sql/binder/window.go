@@ -382,6 +382,50 @@ func exprType(e ast.Expr, schema *catalog.Table) types.Type {
 	return types.Type{}
 }
 
+func containsSearchHL(e ast.Expr) bool {
+	if e == nil {
+		return false
+	}
+	switch x := e.(type) {
+	case ast.Call:
+		if x.Name == "highlight" || x.Name == "snippet" {
+			return true
+		}
+		for _, a := range x.Args {
+			if containsSearchHL(a) {
+				return true
+			}
+		}
+	case ast.Window:
+		return containsSearchHL(x.Fn)
+	case ast.Unary:
+		return containsSearchHL(x.Right)
+	case ast.Binary:
+		return containsSearchHL(x.Left) || containsSearchHL(x.Right)
+	case ast.Between:
+		return containsSearchHL(x.Expr) || containsSearchHL(x.Low) || containsSearchHL(x.High)
+	case ast.IsNull:
+		return containsSearchHL(x.Expr)
+	case ast.Case:
+		if containsSearchHL(x.Operand) || containsSearchHL(x.Else) {
+			return true
+		}
+		for _, arm := range x.Whens {
+			if containsSearchHL(arm.When) || containsSearchHL(arm.Then) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func rejectSearchHL(e ast.Expr) error {
+	if containsSearchHL(e) {
+		return nerr.New(nerr.InvalidArgument, "sql.binder", "HIGHLIGHT/SNIPPET is only valid in the SELECT list of a SEARCH query")
+	}
+	return nil
+}
+
 func containsWindow(e ast.Expr) bool {
 	if e == nil {
 		return false

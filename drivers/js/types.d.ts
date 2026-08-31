@@ -12,9 +12,21 @@ export interface TLSOptions {
   rejectUnauthorized?: boolean;
 }
 
+/** How a read observes replicated state. Values match the wire byte ordering. */
+export declare const ReadConsistency: {
+  /** Every acknowledged write; leader only, behind a Raft read barrier. */
+  readonly Strong: 0;
+  /** Any member within maxStalenessMs of the leader. */
+  readonly Bounded: 1;
+  /** Local applied state, no freshness bound. */
+  readonly Stale: 2;
+};
+export type ReadConsistencyMode = 0 | 1 | 2;
+
 /** The only supported way to open a connection. Do not put keys in URLs. */
 export interface Config {
-  address: string;
+  /** Single-node entry point. Required for connect(); optional when nodes is set. */
+  address?: string;
   database?: string;
   user: string;
   password?: string;
@@ -24,6 +36,22 @@ export interface Config {
   tls?: TLSOptions;
   /** Plaintext is allowed only on loopback. */
   insecureNoTLS?: boolean;
+  /** Every cluster member address, for connectCluster routing. */
+  nodes?: string[];
+  /** Read-consistency mode applied to routed reads / the plain connection. */
+  readConsistency?: ReadConsistencyMode;
+  /** Bounded-read staleness window in milliseconds. 0 selects the server default. */
+  maxStalenessMs?: number;
+}
+
+/** Key-free replication health snapshot for follower-read routing. */
+export interface NodeStatus {
+  role: string;
+  hasLeader: boolean;
+  healthy: boolean;
+  appliedLSN: bigint;
+  lastContactMs: bigint;
+  applyBacklog: bigint;
 }
 
 export type Point = { lon: number; lat: number };
@@ -31,6 +59,7 @@ export type Box = { west: number; south: number; east: number; north: number };
 export type LineString = { coords: number[] };
 export type Polygon = { rings: number[][] };
 export type VectorRef = { ref: true; dim: number };
+export type SparseVector = { dim: number; indices: number[]; values: number[] };
 
 export type Param =
   | null
@@ -60,6 +89,7 @@ export type Value =
   | LineString
   | Polygon
   | VectorRef
+  | SparseVector
   | Record<string, unknown>
   | unknown[];
 
@@ -96,6 +126,19 @@ export interface Conn {
   exec(sql: string, params?: Param[]): Promise<ExecResult>;
   prepare(sql: string): Promise<Stmt>;
   cancel(): Promise<void>;
+  close(): Promise<void>;
+  /** Set this connection's read-consistency mode for subsequent statements. */
+  setReadConsistency(mode: ReadConsistencyMode, maxStalenessMs?: number): Promise<void>;
+  /** This server node's key-free replication health. */
+  nodeStatus(): Promise<NodeStatus>;
+}
+
+/** Routing client over every node of a NextSQL HA cluster. */
+export interface Cluster {
+  query(sql: string, params?: Param[]): Promise<Rows>;
+  exec(sql: string, params?: Param[]): Promise<ExecResult>;
+  /** Last observed status of every reachable node. */
+  nodes(): Promise<NodeStatus[]>;
   close(): Promise<void>;
 }
 
@@ -162,9 +205,14 @@ export declare const Type: {
   readonly Ready: 18;
   readonly Unlock: 19;
   readonly UnlockOK: 20;
+  readonly IdempotentQuery: 21;
+  readonly SetReadConsistency: 22;
+  readonly NodeStatus: 23;
+  readonly NodeStatusResp: 24;
 };
 
 export declare function connect(cfg: Config): Promise<Conn>;
+export declare function connectCluster(cfg: Config): Promise<Cluster>;
 export declare function validateConfig(cfg: Config): void;
 export declare function isLoopback(addr: string): boolean;
 export declare function encodeParam(v: Param): Uint8Array;

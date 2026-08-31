@@ -1,8 +1,8 @@
 // Live TypeScript check invoked by tests/integration/drivers_test.go.
-// Env: NEXTSQL_ADDR, NEXTSQL_CA, NEXTSQL_USER, NEXTSQL_PASSWORD
+// Env: NEXTSQL_ADDR, NEXTSQL_CA, NEXTSQL_DATABASE_USER, NEXTSQL_DATABASE_PASS
 
 import fs from 'node:fs';
-import { connect, type Config } from './nextsql.js';
+import { connect, ReadConsistency, type Config } from './nextsql.js';
 
 async function main(): Promise<void> {
   const addr = process.env.NEXTSQL_ADDR;
@@ -13,8 +13,8 @@ async function main(): Promise<void> {
   const cfg: Config = {
     address: addr,
     database: 'production',
-    user: process.env.NEXTSQL_USER || 'app',
-    password: process.env.NEXTSQL_PASSWORD || 's3cret',
+    user: process.env.NEXTSQL_DATABASE_USER || 'app',
+    password: process.env.NEXTSQL_DATABASE_PASS || 's3cret',
     tls: {
       ca: fs.readFileSync(caPath),
       servername: 'localhost',
@@ -55,6 +55,16 @@ async function main(): Promise<void> {
     if (n !== 2) {
       throw new Error('streamed ' + n);
     }
+    const status = await conn.nodeStatus();
+    if (status.role !== 'standalone' || !status.healthy) {
+      throw new Error('node status ' + JSON.stringify(status));
+    }
+    await conn.setReadConsistency(ReadConsistency.Bounded, 5000);
+    const bounded = await conn.exec(`SELECT sku FROM items WHERE sku = $1`, ['A-1']);
+    if (bounded.rows.length !== 1) {
+      throw new Error('bounded read mismatch');
+    }
+    await conn.setReadConsistency(ReadConsistency.Strong);
   } finally {
     await conn.close();
   }

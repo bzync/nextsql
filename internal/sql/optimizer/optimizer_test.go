@@ -169,7 +169,15 @@ func findScan(p planner.Logical) *planner.Scan {
 	case planner.Candidates:
 		return findScan(n.Input)
 	case planner.Rerank:
-		return findScan(n.Input)
+		if got := findScan(n.Input); got != nil {
+			return got
+		}
+		for _, e := range n.Extra {
+			if got := findScan(e); got != nil {
+				return got
+			}
+		}
+		return nil
 	default:
 		return nil
 	}
@@ -450,6 +458,9 @@ func joinScanNames(p planner.Logical) []string {
 			walk(x.Input)
 		case planner.Rerank:
 			walk(x.Input)
+			for _, e := range x.Extra {
+				walk(e)
+			}
 		case planner.Filter:
 			walk(x.Input)
 		case planner.Project:
@@ -903,6 +914,54 @@ func hybridTable() *catalog.Table {
 	}
 }
 
+func fusionTable() *catalog.Table {
+	vt, _ := types.VectorF32(4)
+	sv, _ := types.VectorSparse(8)
+	return &catalog.Table{
+		ID:   9,
+		Name: "docs",
+		Columns: []catalog.Column{
+			{Name: "id", Type: types.String(), Primary: true, NotNull: true},
+			{Name: "body", Type: types.Text()},
+			{Name: "emb", Type: vt},
+			{Name: "sparse", Type: sv},
+		},
+		PK: []int{0},
+		Indexes: []catalog.Index{
+			{Name: "ix_body", Fulltext: true, Columns: []int{1}},
+			{Name: "ix_emb", Vector: true, Columns: []int{2}, VecMethod: catalog.VecMethodHNSW},
+			{Name: "ix_sparse", Vector: true, Columns: []int{3}, VecMethod: catalog.VecMethodSPARSE},
+		},
+	}
+}
+
+func TestDenseSparseBM25FusionPlan(t *testing.T) {
+	tab := fusionTable()
+	sql := `SELECT id FROM docs SEARCH body FOR 'willow' NEAREST emb TO (1, 0, 0, 0) NEAREST sparse TO (0, 0, 0, 0, 0, 0, 0, 1) LIMIT 3`
+	out := optSQL(t, sql, tab, nil)
+	s := formatPlan(out.Plan)
+	if !hasOp(out.Plan, "Rerank") || !hasOp(out.Plan, "Candidates") {
+		t.Fatalf("want Rerank + Candidates, got %s", s)
+	}
+	if !strings.Contains(s, "bm25+vector+sparse") || !strings.Contains(s, "fusion") {
+		t.Fatalf("want 3-way fusion rerank: %s", s)
+	}
+	rr := findRerank(out.Plan)
+	if rr == nil || rr.SparseCol != 3 || rr.NearestCol != 2 || rr.Strategy != "fusion" {
+		t.Fatalf("fusion rerank %+v", rr)
+	}
+	if len(rr.Extra) == 0 {
+		t.Fatalf("fusion should union extra retrievers: %s", s)
+	}
+
+	sql = `SELECT id FROM docs NEAREST emb TO (1, 0, 0, 0) NEAREST sparse TO (0, 0, 0, 0, 0, 0, 0, 1) LIMIT 3`
+	out = optSQL(t, sql, tab, nil)
+	s = formatPlan(out.Plan)
+	if !strings.Contains(s, "vector+sparse") || strings.Contains(s, "bm25+vector+sparse") {
+		t.Fatalf("want dense+sparse fusion without BM25: %s", s)
+	}
+}
+
 func TestHybridPlansAreOneProblem(t *testing.T) {
 	tab := hybridTable()
 	sql := `SELECT id, name, price FROM products WHERE metadata.category = 'headphones' AND price <= 15000 SEARCH description FOR 'wireless noise cancelling' NEAREST embedding TO (1, 0, 0) LIMIT 20`
@@ -1023,6 +1082,50 @@ func TestSearchChoosesFulltextIndex(t *testing.T) {
 	}
 }
 
+func TestSearchChoosesMultiFieldFulltextIndex(t *testing.T) {
+	tab := sampleTable()
+	tab.Indexes = append(tab.Indexes, catalog.Index{Name: "ix_name_note", Fulltext: true, Columns: []int{1, 3}})
+	out := optSQL(t, `SELECT name FROM products SEARCH name, note FOR 'database'`, tab, nil)
+	if !hasOp(out.Plan, "Search") || !strings.Contains(formatPlan(out.Plan), "ix_name_note") {
+		t.Fatalf("want multi-field fulltext Search, got %s", formatPlan(out.Plan))
+	}
+	out = optSQL(t, `SELECT name FROM products SEARCH note FOR 'database'`, tab, nil)
+	if !hasOp(out.Plan, "Search") || !strings.Contains(formatPlan(out.Plan), "seq") {
+		t.Fatalf("subset SEARCH must not use the multi-field index: %s", formatPlan(out.Plan))
+	}
+	out = optSQL(t, `SELECT name FROM products SEARCH note, name FOR 'database'`, tab, nil)
+	if !hasOp(out.Plan, "Search") || !strings.Contains(formatPlan(out.Plan), "seq") {
+		t.Fatalf("reordered SEARCH must not use the multi-field index: %s", formatPlan(out.Plan))
+	}
+	out = optSQL(t, `SELECT name FROM products SEARCH name WEIGHT 3, note FOR 'database'`, tab, nil)
+	got := formatPlan(out.Plan)
+	if !hasOp(out.Plan, "Search") || !strings.Contains(got, "ix_name_note") || !strings.Contains(got, "weights=3,1") {
+		t.Fatalf("weighted multi-field Search, got %s", got)
+	}
+}
+
+func TestSearchFacetPlan(t *testing.T) {
+	tab := sampleTable()
+	tab.Indexes = append(tab.Indexes, catalog.Index{Name: "ix_note", Fulltext: true, Columns: []int{3}})
+	out := optSQL(t, `SELECT * FROM products SEARCH note FOR 'database' FACET name`, tab, nil)
+	got := formatPlan(out.Plan)
+	if !hasOp(out.Plan, "Facet") || !hasOp(out.Plan, "Search") || !strings.Contains(got, "ix_note") {
+		t.Fatalf("want Facet over fulltext Search, got %s", got)
+	}
+	if !strings.Contains(got, "Facet name") {
+		t.Fatalf("facet columns: %s", got)
+	}
+	out = optSQL(t, `SELECT * FROM products SEARCH note FOR 'database' FACET name LIMIT 3`, tab, nil)
+	got = formatPlan(out.Plan)
+	if !strings.Contains(got, "limit=3") || hasOp(out.Plan, "Limit") {
+		t.Fatalf("per-facet limit, not a result Limit: %s", got)
+	}
+	out = optSQL(t, `SELECT * FROM products SEARCH note FOR 'x' FACET name`, sampleTable(), nil)
+	if !hasOp(out.Plan, "Facet") || !strings.Contains(formatPlan(out.Plan), "seq") {
+		t.Fatalf("seq Facet: %s", formatPlan(out.Plan))
+	}
+}
+
 func TestIndexSelection(t *testing.T) {
 	tab := sampleTable()
 	out := optSQL(t, `SELECT name FROM products WHERE name = 'alpha'`, tab, nil)
@@ -1049,6 +1152,95 @@ func TestIndexSelection(t *testing.T) {
 	is = findIndex(out.Plan)
 	if is == nil || is.Residual == nil {
 		t.Fatalf("want residual on index: %+v %s", is, formatPlan(out.Plan))
+	}
+}
+
+func TestPartitionRowsUsesStableAnalyzeCounts(t *testing.T) {
+	st := &catalog.TableStats{
+		Rows: 1000,
+		Partitions: []catalog.PartitionStats{
+			{ID: 2, Rows: 10},
+			{ID: 9, Rows: 990},
+		},
+	}
+	for _, tc := range []struct {
+		name string
+		ids  []uint32
+		want uint64
+	}{
+		{name: "all partitions", ids: nil, want: 1000},
+		{name: "pruned one", ids: []uint32{2}, want: 10},
+		{name: "pruned set", ids: []uint32{2, 9}, want: 1000},
+		{name: "pruned empty", ids: []uint32{}, want: 0},
+		{name: "stale identity falls back", ids: []uint32{7}, want: 1000},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := partitionRows(st, tc.ids, 1000); got != tc.want {
+				t.Fatalf("partitionRows(%v)=%d want %d", tc.ids, got, tc.want)
+			}
+		})
+	}
+	if got := partitionRows(&catalog.TableStats{Rows: 1000}, []uint32{2}, 1000); got != 1000 {
+		t.Fatalf("missing partition stats must fall back, got %d", got)
+	}
+}
+
+func TestPartitionCostStatsUseLocalSketchesAndFailSafe(t *testing.T) {
+	st := &catalog.TableStats{
+		Table: "events", TableID: 4, Rows: 1000,
+		Columns: []catalog.ColumnStats{{Ord: 1, Nulls: 100, NDV: 500, HasMinMax: true, Min: types.StringValue("a"), Max: types.StringValue("z")}},
+		Partitions: []catalog.PartitionStats{
+			{ID: 2, Rows: 10, Columns: []catalog.ColumnStats{{Ord: 1, Nulls: 1, NDV: 2, HasMinMax: true, Min: types.StringValue("a"), Max: types.StringValue("b"), Correlation: 0.5}}, Indexes: []catalog.IndexStats{{Name: "ix", NDV: 2, Selectivity: 0.5}}, Vectors: []catalog.VectorStats{{Ord: 2, Count: 9, Dim: 4}}},
+			{ID: 9, Rows: 30, Columns: []catalog.ColumnStats{{Ord: 1, Nulls: 2, NDV: 3, HasMinMax: true, Min: types.StringValue("m"), Max: types.StringValue("z"), Correlation: -0.5}}, Indexes: []catalog.IndexStats{{Name: "ix", NDV: 3, Selectivity: 1.0 / 3}}, Vectors: []catalog.VectorStats{{Ord: 2, Count: 28, Dim: 4}}},
+		},
+	}
+	local := partitionCostStats(st, []uint32{2, 9})
+	col, ok := local.Column(1)
+	if !ok || local.Rows != 40 || col.Nulls != 3 || col.NDV != 5 || col.Min.Str != "a" || col.Max.Str != "z" {
+		t.Fatalf("merged local statistics: %+v", local)
+	}
+	idx, ok := local.Index("ix")
+	if !ok || idx.NDV != 5 || idx.Selectivity != 0.2 {
+		t.Fatalf("merged local index statistics: %+v", local.Indexes)
+	}
+	vec, ok := local.Vector(2)
+	if !ok || vec.Count != 37 {
+		t.Fatalf("merged local vector statistics: %+v", local.Vectors)
+	}
+	if got := partitionCostStats(st, []uint32{7}); got != st {
+		t.Fatal("stale partition identity did not fall back to global statistics")
+	}
+	withoutSketch := st.Clone()
+	withoutSketch.Partitions[0].Columns = nil
+	if got := partitionCostStats(withoutSketch, []uint32{2}); got != withoutSketch {
+		t.Fatal("missing local sketches did not fall back to global statistics")
+	}
+}
+
+func BenchmarkPartitionCostStats(b *testing.B) {
+	st := &catalog.TableStats{Table: "events", TableID: 4}
+	ids := make([]uint32, 0, 32)
+	for p := 0; p < 64; p++ {
+		part := catalog.PartitionStats{ID: uint32(p + 1), Rows: 10_000}
+		st.Rows += part.Rows
+		for ord := 0; ord < 8; ord++ {
+			part.Columns = append(part.Columns, catalog.ColumnStats{Ord: ord, Nulls: 10, NDV: 1000})
+		}
+		for idx := 0; idx < 4; idx++ {
+			part.Indexes = append(part.Indexes, catalog.IndexStats{Name: "ix_" + string(rune('a'+idx)), NDV: 1000, Selectivity: 0.001})
+		}
+		part.Vectors = []catalog.VectorStats{{Ord: 8, Count: 9990, Dim: 128}}
+		st.Partitions = append(st.Partitions, part)
+		if p < cap(ids) {
+			ids = append(ids, part.ID)
+		}
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if got := partitionCostStats(st, ids); got == nil || got.Rows == 0 {
+			b.Fatal("missing merged partition statistics")
+		}
 	}
 }
 
@@ -1086,7 +1278,15 @@ func findIndex(p planner.Logical) *planner.IndexScan {
 	case planner.Candidates:
 		return findIndex(n.Input)
 	case planner.Rerank:
-		return findIndex(n.Input)
+		if got := findIndex(n.Input); got != nil {
+			return got
+		}
+		for _, e := range n.Extra {
+			if got := findIndex(e); got != nil {
+				return got
+			}
+		}
+		return nil
 	case planner.Join:
 		if got := findIndex(n.Left); got != nil {
 			return got

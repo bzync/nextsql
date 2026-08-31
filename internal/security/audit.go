@@ -28,10 +28,12 @@ const (
 	ActionKeyRevoke      = "key.revoke"
 	ActionKeyRewrap      = "key.rewrap"
 	ActionKeyShred       = "key.shred"
+	ActionTokenMint      = "token.mint"
+	ActionTokenRevoke    = "token.revoke"
+	ActionTokenKeyRotate = "token.key.rotate"
 	ActionMembership     = "cluster.membership"
 	ActionSecuritySet    = "security.setting"
 	ActionSessionKill    = "session.terminate"
-	ActionTenant         = "tenant.set"
 	ActionWorkflowCreate = "workflow.create"
 	ActionWorkflowAlter  = "workflow.alter"
 	ActionWorkflowDrop   = "workflow.drop"
@@ -49,12 +51,13 @@ const (
 
 // Event is one audit record. Never put passwords, keys, tokens, or secrets in these fields.
 type Event struct {
-	Time    time.Time `json:"time"`
-	Actor   string    `json:"actor"`
-	Action  string    `json:"action"`
-	Object  string    `json:"object,omitempty"`
-	Outcome string    `json:"outcome"`
-	Remote  string    `json:"remote,omitempty"`
+	Time           time.Time `json:"time"`
+	Actor          string    `json:"actor"`
+	Action         string    `json:"action"`
+	Object         string    `json:"object,omitempty"`
+	Outcome        string    `json:"outcome"`
+	Remote         string    `json:"remote,omitempty"`
+	IdentitySource string    `json:"identity_source,omitempty"`
 }
 
 // Log is an append-only JSON-lines audit file (mode 0600).
@@ -91,6 +94,7 @@ func (l *Log) Record(ev Event) {
 	ev.Object = Redact(ev.Object)
 	ev.Outcome = Redact(ev.Outcome)
 	ev.Remote = Redact(ev.Remote)
+	ev.IdentitySource = Redact(ev.IdentitySource)
 	line, err := json.Marshal(ev)
 	if err != nil {
 		return

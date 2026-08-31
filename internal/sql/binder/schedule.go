@@ -36,7 +36,7 @@ const (
 	maxScheduleEvery = 365 * 24 * time.Hour
 )
 
-func bindSchedule(stmt ast.Stmt, workflows WorkflowLookup, schedules ScheduleLookup, nextID uint32, owner, tenant string) (Bound, bool, error) {
+func bindSchedule(stmt ast.Stmt, workflows WorkflowLookup, schedules ScheduleLookup, nextID uint32, owner string) (Bound, bool, error) {
 	switch s := stmt.(type) {
 	case ast.CreateSchedule:
 		if existing, ok := schedules(s.Name); ok {
@@ -79,7 +79,7 @@ func bindSchedule(stmt ast.Stmt, workflows WorkflowLookup, schedules ScheduleLoo
 		} else if nextFireNS <= createdNS {
 			return nil, true, nerr.New(nerr.InvalidArgument, "sql.binder", "AT timestamp must be in the future")
 		}
-		schedule := &catalog.Schedule{ID: nextID, Name: s.Name, Owner: owner, Tenant: tenant, Kind: s.Kind, SpecNS: specNS, WorkflowID: workflow.ID, Workflow: workflow.Name, Args: s.Args, CreatedNS: createdNS, NextFireNS: nextFireNS, Enabled: true}
+		schedule := &catalog.Schedule{ID: nextID, Name: s.Name, Owner: owner, Kind: s.Kind, SpecNS: specNS, WorkflowID: workflow.ID, Workflow: workflow.Name, Args: s.Args, CreatedNS: createdNS, NextFireNS: nextFireNS, Enabled: true}
 		if _, err := catalog.EncodeSchedule(schedule); err != nil {
 			return nil, true, err
 		}

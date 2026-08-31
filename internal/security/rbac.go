@@ -293,7 +293,46 @@ func (a *ACL) Allowed(user string, priv Privilege, scope ScopeKind, object strin
 	object = strings.ToLower(strings.TrimSpace(object))
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	principals := a.expandLocked(name)
+	return a.allowedForLocked(a.expandLocked(name), priv, scope, object)
+}
+
+// AllowedScoped is Allowed further narrowed to the privileges reachable through
+// the named roles, as carried by a short-lived credential's role scope. The
+// user must be a member of every listed role; an empty roles slice is
+// identical to Allowed. A listed role the user does not hold denies every
+// check (the credential cannot escalate).
+func (a *ACL) AllowedScoped(user string, roles []string, priv Privilege, scope ScopeKind, object string) bool {
+	if a == nil {
+		return true
+	}
+	if len(roles) == 0 {
+		return a.Allowed(user, priv, scope, object)
+	}
+	name := strings.ToLower(strings.TrimSpace(user))
+	if name == "" {
+		return false
+	}
+	object = strings.ToLower(strings.TrimSpace(object))
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	member := a.expandLocked(name)
+	principals := make(map[string]struct{})
+	for _, role := range roles {
+		r := strings.ToLower(strings.TrimSpace(role))
+		if r == "" {
+			return false
+		}
+		if _, ok := member[r]; !ok {
+			return false
+		}
+		for k := range a.expandLocked(r) {
+			principals[k] = struct{}{}
+		}
+	}
+	return a.allowedForLocked(principals, priv, scope, object)
+}
+
+func (a *ACL) allowedForLocked(principals map[string]struct{}, priv Privilege, scope ScopeKind, object string) bool {
 	if a.hasLocked(principals, PrivAdmin, ScopeCluster, "") {
 		return true
 	}

@@ -29,26 +29,26 @@ func TestBindScheduleLifecycleAndDependency(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	bound, err := BindAutomation(stmt, lookupTable, workflows, func() []*catalog.Workflow { return []*catalog.Workflow{workflow} }, lookupTrigger, nil, schedules, scheduleList, 3, "alice", "tenant-a")
+	bound, err := BindAutomation(stmt, lookupTable, workflows, func() []*catalog.Workflow { return []*catalog.Workflow{workflow} }, lookupTrigger, nil, schedules, scheduleList, 3, "alice")
 	if err != nil {
 		t.Fatal(err)
 	}
 	created := bound.(CreateSchedule).Schedule
-	if created.WorkflowID != workflow.ID || created.SpecNS != int64(time.Hour) || created.Tenant != "tenant-a" {
+	if created.WorkflowID != workflow.ID || created.SpecNS != int64(time.Hour) || created.Tenant != "" {
 		t.Fatalf("schedule=%+v", created)
 	}
 	scheduleMap[created.Name] = created
 
 	dropWorkflow, _ := parser.Parse(`DROP WORKFLOW rollup`)
-	if _, err := BindAutomation(dropWorkflow, lookupTable, workflows, func() []*catalog.Workflow { return []*catalog.Workflow{workflow} }, lookupTrigger, nil, schedules, scheduleList, 4, "alice", "tenant-a"); err == nil {
+	if _, err := BindAutomation(dropWorkflow, lookupTable, workflows, func() []*catalog.Workflow { return []*catalog.Workflow{workflow} }, lookupTrigger, nil, schedules, scheduleList, 4, "alice"); err == nil {
 		t.Fatal("schedule did not protect workflow dependency")
 	}
 	rename, _ := parser.Parse(`ALTER SCHEDULE hourly RENAME TO hourly2`)
-	if _, err := BindAutomation(rename, lookupTable, workflows, nil, lookupTrigger, nil, schedules, scheduleList, 4, "alice", "tenant-a"); err != nil {
+	if _, err := BindAutomation(rename, lookupTable, workflows, nil, lookupTrigger, nil, schedules, scheduleList, 4, "alice"); err != nil {
 		t.Fatal(err)
 	}
 	drop, _ := parser.Parse(`DROP SCHEDULE hourly`)
-	if _, err := BindAutomation(drop, lookupTable, workflows, nil, lookupTrigger, nil, schedules, scheduleList, 4, "alice", "tenant-a"); err != nil {
+	if _, err := BindAutomation(drop, lookupTable, workflows, nil, lookupTrigger, nil, schedules, scheduleList, 4, "alice"); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -69,7 +69,7 @@ func TestBindScheduleRejectsInvalidSpecsAndArity(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := BindAutomation(stmt, lookupTable, workflows, nil, lookupTrigger, nil, schedules, nil, 3, "alice", ""); err == nil {
+		if _, err := BindAutomation(stmt, lookupTable, workflows, nil, lookupTrigger, nil, schedules, nil, 3, "alice"); err == nil {
 			t.Fatalf("accepted invalid schedule: %s", sql)
 		}
 	}

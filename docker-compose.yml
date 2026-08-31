@@ -6,8 +6,8 @@ services:
     ports:
       - "7210:7210"
     environment:
-      NEXTSQL_USER: app
-      NEXTSQL_PASSWORD_FILE: /run/bootstrap/app-password
+      NEXTSQL_SERVER_USER: app
+      NEXTSQL_SERVER_PASSWORD_FILE: /run/bootstrap/app-password
       NEXTSQL_TLS_CERT: /run/tls/server.crt
       NEXTSQL_TLS_KEY: /run/tls/server.key
     volumes:

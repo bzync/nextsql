@@ -21,9 +21,12 @@ type Vector struct {
 	Str    []string
 	Dec    []types.Decimal
 	Time   []int64
-	JSON   [][]byte
-	Vec    [][]float32
-	Bool   []bool
+	JSON      [][]byte
+	Vec       [][]float32
+	VecRef    []bool
+	SparseIdx [][]uint32
+	SparseVal [][]float32
+	Bool      []bool
 	Lon    []float64
 	Lat    []float64
 	Box    [][4]float64
@@ -60,6 +63,11 @@ func newVec(t types.Type, n int) Vector {
 		v.JSON = make([][]byte, n)
 	case types.KindVector:
 		v.Vec = make([][]float32, n)
+		v.VecRef = make([]bool, n)
+		if t.VecElem == types.VecSparse {
+			v.SparseIdx = make([][]uint32, n)
+			v.SparseVal = make([][]float32, n)
+		}
 	case types.KindBool:
 		v.Bool = make([]bool, n)
 	case types.KindPoint:
@@ -109,7 +117,11 @@ func (b *Batch) ApproxBytes() int64 {
 			case types.KindJSON:
 				n += int64(len(col.JSON[j]))
 			case types.KindVector:
-				n += int64(len(col.Vec[j]) * 4)
+				if col.Typ.VecElem == types.VecSparse && j < len(col.SparseIdx) {
+					n += int64(len(col.SparseIdx[j]) * 8)
+				} else {
+					n += int64(len(col.Vec[j]) * 4)
+				}
 			case types.KindLine, types.KindPolygon:
 				n += int64(len(col.Coords[j]) * 8)
 			}
@@ -155,7 +167,20 @@ func setAt(col *Vector, i int, v types.Value) {
 	case types.KindJSON:
 		col.JSON[i] = v.JSON
 	case types.KindVector:
-		col.Vec[i] = v.Vec
+		if col.VecRef == nil {
+			col.VecRef = make([]bool, len(col.Null))
+		}
+		col.VecRef[i] = v.VecRef
+		if v.Typ.VecElem == types.VecSparse || len(v.SparseIdx) > 0 {
+			if col.SparseIdx == nil {
+				col.SparseIdx = make([][]uint32, len(col.Null))
+				col.SparseVal = make([][]float32, len(col.Null))
+			}
+			col.SparseIdx[i] = v.SparseIdx
+			col.SparseVal[i] = v.SparseVal
+		} else {
+			col.Vec[i] = v.Vec
+		}
 	case types.KindBool:
 		col.Bool[i] = v.Bool
 	case types.KindPoint:
@@ -203,6 +228,12 @@ func getAt(col *Vector, i int) types.Value {
 	case types.KindJSON:
 		return types.JSONValue(col.JSON[i])
 	case types.KindVector:
+		if col.VecRef != nil && col.VecRef[i] {
+			return types.VectorRef(col.Typ)
+		}
+		if col.Typ.VecElem == types.VecSparse || (i < len(col.SparseIdx) && col.SparseIdx[i] != nil) {
+			return types.SparseValue(col.SparseIdx[i], col.SparseVal[i], col.Typ)
+		}
 		return types.VectorValue(col.Vec[i], col.Typ)
 	case types.KindBool:
 		return types.BoolValue(col.Bool[i])
@@ -256,6 +287,13 @@ func (b *Batch) Compact(sel []int) {
 				col.JSON[d] = col.JSON[s]
 			case types.KindVector:
 				col.Vec[d] = col.Vec[s]
+				if col.VecRef != nil {
+					col.VecRef[d] = col.VecRef[s]
+				}
+				if col.SparseIdx != nil {
+					col.SparseIdx[d] = col.SparseIdx[s]
+					col.SparseVal[d] = col.SparseVal[s]
+				}
 			case types.KindBool:
 				col.Bool[d] = col.Bool[s]
 			case types.KindPoint:
@@ -302,6 +340,20 @@ func clonePrefix(src Vector, n, cap int) Vector {
 		copy(dst.JSON, src.JSON[:n])
 	case types.KindVector:
 		copy(dst.Vec, src.Vec[:n])
+		if src.VecRef != nil {
+			if dst.VecRef == nil {
+				dst.VecRef = make([]bool, cap)
+			}
+			copy(dst.VecRef, src.VecRef[:n])
+		}
+		if src.SparseIdx != nil {
+			if dst.SparseIdx == nil {
+				dst.SparseIdx = make([][]uint32, cap)
+				dst.SparseVal = make([][]float32, cap)
+			}
+			copy(dst.SparseIdx, src.SparseIdx[:n])
+			copy(dst.SparseVal, src.SparseVal[:n])
+		}
 	case types.KindBool:
 		copy(dst.Bool, src.Bool[:n])
 	case types.KindPoint:

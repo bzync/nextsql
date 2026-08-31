@@ -20,6 +20,9 @@ func (s *Session) ForEachVisible(name string, fn func([]types.Value) error) erro
 	if !ok {
 		return nerr.New(nerr.NotFound, "executor.ForEachVisible", "unknown table")
 	}
+	if err := s.guardLegacyTenantTable(name); err != nil {
+		return err
+	}
 	auto := false
 	if s.x == nil {
 		if err := s.start(txn.SnapshotIsolation); err != nil {
@@ -27,12 +30,7 @@ func (s *Session) ForEachVisible(name string, fn func([]types.Value) error) erro
 		}
 		auto = true
 	}
-	err := s.scanHeap(tab, nil, nil, true, false, func(row []types.Value) error {
-		if !s.tenantVisible(tab, row) {
-			return nil
-		}
-		return fn(row)
-	})
+	err := s.scanHeap(tab, nil, nil, true, false, fn)
 	if auto {
 		if err != nil {
 			_ = s.abort()

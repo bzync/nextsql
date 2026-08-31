@@ -814,61 +814,6 @@ func TestSubqueryAdversarialNulls(t *testing.T) {
 	}
 }
 
-func TestSubqueryTenantAndRBAC(t *testing.T) {
-	db := testDB(t)
-	s := db.Session()
-	execOK(t, s, `CREATE TABLE t_outer (id STRING PRIMARY KEY, tenant_id UUID NOT NULL, k STRING NOT NULL)`)
-	execOK(t, s, `CREATE TABLE t_inner (id STRING PRIMARY KEY, tenant_id UUID NOT NULL, k STRING NOT NULL)`)
-	execOK(t, s, `INSERT INTO t_outer (id, tenant_id, k) VALUES ('o1', '`+tenantA+`', 'k'), ('o2', '`+tenantB+`', 'k')`)
-	execOK(t, s, `INSERT INTO t_inner (id, tenant_id, k) VALUES ('i1', '`+tenantA+`', 'k'), ('i2', '`+tenantB+`', 'k')`)
-	execOK(t, s, `SET TENANT = '`+tenantA+`'`)
-	got := execOK(t, s, `SELECT o.id FROM t_outer o WHERE EXISTS (SELECT i.id FROM t_inner i WHERE i.k = o.k)`)
-	if len(got.Rows) != 1 || got.Rows[0][0].Str != "o1" {
-		t.Fatalf("EXISTS leaked tenant rows: %+v", got.Rows)
-	}
-	got = execOK(t, s, `SELECT o.id FROM t_outer o WHERE o.k IN (SELECT i.k FROM t_inner i)`)
-	if len(got.Rows) != 1 || got.Rows[0][0].Str != "o1" {
-		t.Fatalf("IN leaked tenant rows: %+v", got.Rows)
-	}
-	execOK(t, s, `RESET TENANT`)
-
-	acl, err := security.CreateACL(filepath.Join(t.TempDir(), "acl"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	users, err := auth.Create(filepath.Join(t.TempDir(), "users"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := users.Upsert("dba", "s3cret"); err != nil {
-		t.Fatal(err)
-	}
-	if err := acl.Grant("dba", security.PrivAdmin, security.ScopeCluster, ""); err != nil {
-		t.Fatal(err)
-	}
-	admin := db.Session()
-	admin.SetIdentity("dba")
-	admin.SetACL(acl)
-	admin.SetAuth(users)
-	execOK(t, admin, `CREATE USER app IDENTIFIED BY 'pw'`)
-	execOK(t, admin, `GRANT SELECT ON TABLE t_outer TO app`)
-	app := db.Session()
-	app.SetIdentity("app")
-	app.SetACL(acl)
-	execOK(t, app, `SET TENANT = '`+tenantA+`'`)
-	if _, err := app.Exec(`SELECT id FROM t_outer WHERE EXISTS (SELECT id FROM t_inner)`); !nerr.HasCode(err, nerr.Forbidden) {
-		t.Fatalf("EXISTS must require inner SELECT: %v", err)
-	}
-	if _, err := app.Exec(`SELECT id FROM t_outer WHERE id IN (SELECT id FROM t_inner)`); !nerr.HasCode(err, nerr.Forbidden) {
-		t.Fatalf("IN must require inner SELECT: %v", err)
-	}
-	execOK(t, admin, `GRANT SELECT ON TABLE t_inner TO app`)
-	got = execOK(t, app, `SELECT id FROM t_outer WHERE EXISTS (SELECT id FROM t_inner)`)
-	if len(got.Rows) != 1 || got.Rows[0][0].Str != "o1" {
-		t.Fatalf("granted EXISTS: %+v", got.Rows)
-	}
-}
-
 func TestCorrelatedSubqueries(t *testing.T) {
 	db := testDB(t)
 	s := db.Session()

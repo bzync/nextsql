@@ -21,6 +21,31 @@ type Allocator struct {
 	set   map[format.PageID]struct{}
 	meta  []format.PageID
 	dirty bool
+	// capPages, when non-zero, is the ceiling on the logical page high-water:
+	// Alloc refuses to grow the file past it (freeing and reusing pages still
+	// works). It is a hosting storage cap, set out of band, and never persisted.
+	capPages format.PageID
+}
+
+// SetCapPages sets the logical page ceiling enforced by Alloc; 0 disables it.
+// A hosting deployment derives this from the realm/database StorageCapBytes.
+func (a *Allocator) SetCapPages(pages uint64) {
+	if a == nil {
+		return
+	}
+	a.mu.Lock()
+	a.capPages = format.PageID(pages)
+	a.mu.Unlock()
+}
+
+// CapPages returns the current logical page ceiling (0 = unlimited).
+func (a *Allocator) CapPages() uint64 {
+	if a == nil {
+		return 0
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return uint64(a.capPages)
 }
 
 // State is a stable allocator snapshot for diagnostics. Returned slices do
@@ -136,6 +161,9 @@ func (a *Allocator) Alloc() (format.PageID, error) {
 		a.free = a.free[:n-1]
 		delete(a.set, id)
 	} else {
+		if a.capPages != 0 && a.next >= a.capPages {
+			return 0, nerr.New(nerr.Exhausted, "allocator.Alloc", "storage cap exceeded")
+		}
 		id = a.next
 		if err := id.UserData(); err != nil {
 			return 0, err

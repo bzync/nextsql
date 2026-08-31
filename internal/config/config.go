@@ -26,11 +26,17 @@ const (
 type Config struct {
 	DataDir          string
 	KeyFile          string
+	InstanceKeyFile  string
 	AuthFile         string
 	ListenAddr       string
 	LogLevel         string
 	TLSCert          string
 	TLSKey           string
+	TLSClientCA      string
+	TLSClientCRL     string
+	TokenKeyset      string
+	TokenRevocations string
+	TokenAudience    string
 	BufferPages      int
 	RequireClientKey bool
 	AuditFile        string
@@ -61,6 +67,19 @@ func (c Config) DataFile() string {
 		return DataFileName
 	}
 	return strings.TrimRight(c.DataDir, "/") + "/" + DataFileName
+}
+
+// InstanceRootFile returns the external deployment-registry root key path.
+// It remains off the data volume when KeyFile does. An explicit setting is
+// required when the database root is supplied only by a client.
+func (c Config) InstanceRootFile() string {
+	if c.InstanceKeyFile != "" {
+		return c.InstanceKeyFile
+	}
+	if c.KeyFile == "" {
+		return ""
+	}
+	return c.KeyFile + ".instance"
 }
 
 func (c Config) UsersFile() string {
@@ -116,6 +135,8 @@ func Load(path string) (Config, error) {
 			cfg.DataDir = v
 		case "key_file":
 			cfg.KeyFile = v
+		case "instance_key_file":
+			cfg.InstanceKeyFile = v
 		case "listen_addr":
 			cfg.ListenAddr = v
 		case "log_level":
@@ -132,6 +153,16 @@ func Load(path string) (Config, error) {
 			cfg.TLSCert = v
 		case "tls_key":
 			cfg.TLSKey = v
+		case "tls_client_ca":
+			cfg.TLSClientCA = v
+		case "tls_client_crl":
+			cfg.TLSClientCRL = v
+		case "token_verify_keyset":
+			cfg.TokenKeyset = v
+		case "token_revocations":
+			cfg.TokenRevocations = v
+		case "token_audience":
+			cfg.TokenAudience = v
 		case "require_client_key":
 			switch strings.ToLower(v) {
 			case "true", "1", "yes":
@@ -203,6 +234,21 @@ func (c Config) Validate() error {
 	}
 	if c.MaxQueryQueue < 0 {
 		return nerr.New(nerr.InvalidArgument, "config.Validate", "max_query_queue must be >= 0")
+	}
+	if (c.TLSCert == "") != (c.TLSKey == "") {
+		return nerr.New(nerr.InvalidArgument, "config.Validate", "tls_cert and tls_key must be set together")
+	}
+	if c.TLSClientCA != "" && c.TLSCert == "" {
+		return nerr.New(nerr.InvalidArgument, "config.Validate", "tls_client_ca requires tls_cert and tls_key")
+	}
+	if c.TLSClientCRL != "" && c.TLSClientCA == "" {
+		return nerr.New(nerr.InvalidArgument, "config.Validate", "tls_client_crl requires tls_client_ca")
+	}
+	if c.TokenRevocations != "" && c.TokenKeyset == "" {
+		return nerr.New(nerr.InvalidArgument, "config.Validate", "token_revocations requires token_verify_keyset")
+	}
+	if c.TokenAudience != "" && c.TokenKeyset == "" {
+		return nerr.New(nerr.InvalidArgument, "config.Validate", "token_audience requires token_verify_keyset")
 	}
 	switch strings.ToLower(c.LogLevel) {
 	case "debug", "info", "warn", "error":

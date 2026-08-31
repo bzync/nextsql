@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/bzync/nextsql/internal/catalog"
+	"github.com/bzync/nextsql/internal/fulltext"
 	"github.com/bzync/nextsql/internal/sql/ast"
 	"github.com/bzync/nextsql/internal/sql/planner"
 	"github.com/bzync/nextsql/internal/sql/types"
@@ -233,7 +234,11 @@ func chooseAt(p planner.Logical, stats StatsFunc, underJoin bool) (planner.Logic
 			cost = kid.EstCost + kid.EstRows*cpuTuple
 		}
 		plan := planner.Aggregate{Input: in, Groups: n.Groups, Specs: n.Specs, Exprs: n.Exprs, Names: n.Names, Schema: n.Schema, Distinct: n.Distinct, Having: n.Having}
-		agg := &Node{Op: "Aggregate", Detail: joinNames(n.Names), EstRows: rows, EstCost: cost, Kids: kids(kid)}
+		aggDetail := joinNames(n.Names)
+		if sc, ok := in.(planner.SeqScan); ok && sc.Table != nil && sc.Table.Partitioning != nil {
+			aggDetail = strings.TrimSpace(aggDetail + " partition-wise")
+		}
+		agg := &Node{Op: "Aggregate", Detail: aggDetail, EstRows: rows, EstCost: cost, Kids: kids(kid)}
 		if n.Having != nil {
 			agg = &Node{Op: "Having", Detail: formatExpr(n.Having), EstRows: rows / 2, EstCost: cost + rows*cpuPred, Kids: kids(agg)}
 		}
@@ -243,8 +248,11 @@ func chooseAt(p planner.Logical, stats StatsFunc, underJoin bool) (planner.Logic
 		return plan, agg
 	case planner.Search:
 		return chooseSearch(n, stats)
+	case planner.Facet:
+		return chooseFacet(n, stats, underJoin)
 	case planner.Nearest:
-		if _, ok := n.Input.(planner.Search); ok {
+		switch n.Input.(type) {
+		case planner.Search, planner.Nearest:
 			return chooseHybrid(n, stats, underJoin)
 		}
 		return chooseNearest(n, stats)
@@ -255,10 +263,27 @@ func chooseAt(p planner.Logical, stats StatsFunc, underJoin bool) (planner.Logic
 		if kid != nil {
 			rows, cost = kid.EstRows, kid.EstCost
 		}
+		var extraKids []*Node
+		if kid != nil {
+			extraKids = append(extraKids, kid)
+		}
+		if len(n.Extra) > 0 {
+			extra := make([]planner.Logical, len(n.Extra))
+			for i, e := range n.Extra {
+				ee, ek := chooseAt(e, stats, underJoin)
+				extra[i] = ee
+				if ek != nil {
+					extraKids = append(extraKids, ek)
+					rows = satAdd(rows, ek.EstRows)
+					cost = satAdd(cost, ek.EstCost)
+				}
+			}
+			n.Extra = extra
+		}
 		if n.K > 0 && rows > n.K {
 			rows = n.K
 		}
-		return n, &Node{Op: "Rerank", Detail: rerankDetail(n), EstRows: rows, EstCost: cost + rows*cpuRerank, Kids: kids(kid)}
+		return n, &Node{Op: "Rerank", Detail: rerankDetail(n), EstRows: rows, EstCost: cost + rows*cpuRerank, Kids: extraKids}
 	case planner.Candidates:
 		return chooseCandidates(n, stats)
 	case planner.Filter, planner.Scan, planner.SeqScan, planner.IndexScan:
@@ -348,8 +373,29 @@ func finishJoin(n planner.Join, l planner.Logical, lk *Node, r planner.Logical, 
 		op = "MergeJoin"
 	}
 	cost := joinPairCost(lc, rc, lr, rr, len(lkys) == 0 && len(rkys) == 0, method, semi || anti)
+	detail := formatExpr(n.Pred)
+	if method != "merge" {
+		if _, aligned := catalog.AlignedPartitionJoin(seqLeafTable(l), seqLeafTable(r), lkys, rkys); aligned {
+			detail = strings.TrimSpace(detail + " partition-wise")
+		}
+	}
 	return planner.Join{Left: l, Right: r, Pred: n.Pred, Kind: n.Kind, Cross: n.Cross && !left && !full && !semi && !anti, Method: method, LeftKeys: lkys, RightKeys: rkys, Schema: schema},
-		&Node{Op: op, Detail: formatExpr(n.Pred), EstRows: out, EstCost: cost, Kids: []*Node{lk, rk}}
+		&Node{Op: op, Detail: detail, EstRows: out, EstCost: cost, Kids: []*Node{lk, rk}}
+}
+
+// seqLeafTable returns the table of a join input that is a plain partitioned
+// scan (optionally under a residual Filter), or nil when the input is anything
+// else. It is used only to tag partition-aligned joins in EXPLAIN.
+func seqLeafTable(p planner.Logical) *catalog.Table {
+	switch n := p.(type) {
+	case planner.SeqScan:
+		return n.Table
+	case planner.Filter:
+		if sc, ok := n.Input.(planner.SeqScan); ok {
+			return sc.Table
+		}
+	}
+	return nil
 }
 
 func joinPairCost(lc, rc, lr, rr int64, cartesian bool, method string, mark bool) int64 {
@@ -422,10 +468,11 @@ func chooseAccess(p planner.Logical, stats StatsFunc) (planner.Logical, *Node) {
 	}
 	var alts []cand
 
-	s := predSel(pred, tab, st)
-	rows := tableRows(st)
-	scost, sout := seqCost(rows, s)
 	partitionIDs, partitionSuffix := partitionAccessDetail(tab, pred)
+	costStats := partitionCostStats(st, partitionIDs)
+	s := predSel(pred, tab, costStats)
+	rows := partitionRows(st, partitionIDs, tableRows(st))
+	scost, sout := seqCost(rows, s)
 	seq := planner.SeqScan{Table: tab, Needed: needed, Segments: spans, Partitions: partitionIDs}
 	var seqPlan planner.Logical = seq
 	detail := tableName(tab)
@@ -439,7 +486,7 @@ func chooseAccess(p planner.Logical, stats StatsFunc) (planner.Logical, *Node) {
 
 	ranges := extractRanges(pred, tab)
 	// clustered PK
-	if alt, ok := indexAlt(tab, nil, true, ranges, pred, needed, st, rows); ok {
+	if alt, ok := indexAlt(tab, nil, true, ranges, pred, needed, costStats, rows); ok {
 		alts = append(alts, alt)
 	}
 	idxs := append([]catalog.Index(nil), tab.Indexes...)
@@ -450,7 +497,7 @@ func chooseAccess(p planner.Logical, stats StatsFunc) (planner.Logical, *Node) {
 			continue
 		}
 		if idx.Spatial {
-			if alt, ok := spatialAlt(tab, idx, pred, needed, st, rows); ok {
+			if alt, ok := spatialAlt(tab, idx, pred, needed, costStats, rows); ok {
 				alts = append(alts, alt)
 			}
 			continue
@@ -459,26 +506,26 @@ func chooseAccess(p planner.Logical, stats StatsFunc) (planner.Logical, *Node) {
 			continue
 		}
 		if idx.HasExpr() && idx.KeyIsExpr(0) {
-			if alt, ok := exprIndexAlt(tab, idx, pred, needed, st, rows); ok {
+			if alt, ok := exprIndexAlt(tab, idx, pred, needed, costStats, rows); ok {
 				alts = append(alts, cand{plan: alt.plan, node: alt.node, cost: alt.cost, rank: alt.rank, iname: alt.iname})
-			} else if alt, ok := coveringPartialAlt(tab, idx, pred, needed, st, rows); ok {
+			} else if alt, ok := coveringPartialAlt(tab, idx, pred, needed, costStats, rows); ok {
 				alts = append(alts, cand{plan: alt.plan, node: alt.node, cost: alt.cost, rank: alt.rank, iname: alt.iname})
 			}
 			continue
 		}
 		if len(idx.Path) > 0 {
-			if alt, ok := pathIndexAlt(tab, idx, pred, needed, st, rows); ok {
+			if alt, ok := pathIndexAlt(tab, idx, pred, needed, costStats, rows); ok {
 				alts = append(alts, alt)
 			}
 			continue
 		}
 		matched := false
-		if alt, ok := indexAlt(tab, &idx, false, ranges, pred, needed, st, rows); ok {
+		if alt, ok := indexAlt(tab, &idx, false, ranges, pred, needed, costStats, rows); ok {
 			alts = append(alts, alt)
 			matched = true
 		}
 		if !matched {
-			if alt, ok := coveringPartialAlt(tab, idx, pred, needed, st, rows); ok {
+			if alt, ok := coveringPartialAlt(tab, idx, pred, needed, costStats, rows); ok {
 				alts = append(alts, cand{plan: alt.plan, node: alt.node, cost: alt.cost, rank: alt.rank, iname: alt.iname})
 			}
 		}
@@ -493,6 +540,178 @@ func chooseAccess(p planner.Logical, stats StatsFunc) (planner.Logical, *Node) {
 	best.plan = setAccessPartitions(best.plan, partitionIDs)
 	addPartitionNodeDetail(best.node, partitionSuffix)
 	return best.plan, best.node
+}
+
+// partitionCostStats merges compact NSPS sketches only when every requested
+// stable identity has a local record. Any missing/stale record returns the
+// global NSST snapshot, preventing DDL between ANALYZE runs from manufacturing
+// unsupported selectivity claims.
+func partitionCostStats(st *catalog.TableStats, ids []uint32) *catalog.TableStats {
+	if st == nil || ids == nil {
+		return st
+	}
+	if len(ids) == 0 {
+		return &catalog.TableStats{Table: st.Table, TableID: st.TableID}
+	}
+	byID := make(map[uint32]catalog.PartitionStats, len(st.Partitions))
+	for _, part := range st.Partitions {
+		byID[part.ID] = part
+	}
+	parts := make([]catalog.PartitionStats, 0, len(ids))
+	for _, id := range ids {
+		part, ok := byID[id]
+		if !ok || len(part.Columns) == 0 {
+			return st
+		}
+		parts = append(parts, part)
+	}
+	out := &catalog.TableStats{Table: st.Table, TableID: st.TableID}
+	for _, part := range parts {
+		if ^uint64(0)-out.Rows < part.Rows {
+			return st
+		}
+		out.Rows += part.Rows
+	}
+
+	for _, first := range parts[0].Columns {
+		merged := first
+		merged.Min, merged.Max = first.Min.Clone(), first.Max.Clone()
+		merged.Histogram, merged.MCV = nil, nil
+		weight := float64(parts[0].Rows)
+		weightedCorrelation := first.Correlation * weight
+		complete := true
+		for _, part := range parts[1:] {
+			var next catalog.ColumnStats
+			found := false
+			for _, candidate := range part.Columns {
+				if candidate.Ord == first.Ord {
+					next, found = candidate, true
+					break
+				}
+			}
+			if !found {
+				complete = false
+				break
+			}
+			merged.Nulls = satAddU64(merged.Nulls, next.Nulls)
+			merged.NDV = satAddU64(merged.NDV, next.NDV)
+			if next.HasMinMax {
+				if !merged.HasMinMax {
+					merged.Min, merged.Max, merged.HasMinMax = next.Min.Clone(), next.Max.Clone(), true
+				} else {
+					if cmp, err := next.Min.Cmp(merged.Min); err == nil && cmp < 0 {
+						merged.Min = next.Min.Clone()
+					}
+					if cmp, err := next.Max.Cmp(merged.Max); err == nil && cmp > 0 {
+						merged.Max = next.Max.Clone()
+					}
+				}
+			}
+			partWeight := float64(part.Rows)
+			weightedCorrelation += next.Correlation * partWeight
+			weight += partWeight
+		}
+		if !complete {
+			continue
+		}
+		nonNull := out.Rows - min(out.Rows, merged.Nulls)
+		if merged.NDV > nonNull {
+			merged.NDV = nonNull
+		}
+		if weight > 0 {
+			merged.Correlation = weightedCorrelation / weight
+		}
+		out.Columns = append(out.Columns, merged)
+	}
+
+	for _, first := range parts[0].Indexes {
+		merged := first
+		complete := true
+		for _, part := range parts[1:] {
+			found := false
+			for _, candidate := range part.Indexes {
+				if candidate.Name == first.Name {
+					merged.NDV = satAddU64(merged.NDV, candidate.NDV)
+					found = true
+					break
+				}
+			}
+			if !found {
+				complete = false
+				break
+			}
+		}
+		if !complete {
+			continue
+		}
+		if merged.NDV > out.Rows {
+			merged.NDV = out.Rows
+		}
+		if merged.Unique && out.Rows > 0 {
+			merged.NDV, merged.Selectivity = out.Rows, 1/float64(out.Rows)
+		} else if merged.NDV > 0 {
+			merged.Selectivity = 1 / float64(merged.NDV)
+		}
+		out.Indexes = append(out.Indexes, merged)
+	}
+
+	for _, first := range parts[0].Vectors {
+		merged := first
+		complete := true
+		for _, part := range parts[1:] {
+			found := false
+			for _, candidate := range part.Vectors {
+				if candidate.Ord == first.Ord {
+					merged.Count = satAddU64(merged.Count, candidate.Count)
+					found = true
+					break
+				}
+			}
+			if !found {
+				complete = false
+				break
+			}
+		}
+		if complete {
+			out.Vectors = append(out.Vectors, merged)
+		}
+	}
+	return out
+}
+
+func satAddU64(a, b uint64) uint64 {
+	if ^uint64(0)-a < b {
+		return ^uint64(0)
+	}
+	return a + b
+}
+
+// partitionRows returns the exact ANALYZE row count for a pruned stable-ID
+// set. Missing/stale per-partition entries fall back to the global estimate so
+// DDL between ANALYZE runs cannot produce a falsely empty plan.
+func partitionRows(st *catalog.TableStats, ids []uint32, fallback uint64) uint64 {
+	if ids == nil || st == nil || len(st.Partitions) == 0 {
+		return fallback
+	}
+	if len(ids) == 0 {
+		return 0
+	}
+	byID := make(map[uint32]uint64, len(st.Partitions))
+	for _, part := range st.Partitions {
+		byID[part.ID] = part.Rows
+	}
+	var rows uint64
+	for _, id := range ids {
+		n, ok := byID[id]
+		if !ok {
+			return fallback
+		}
+		if ^uint64(0)-rows < n {
+			return fallback
+		}
+		rows += n
+	}
+	return rows
 }
 
 func partitionAccessDetail(tab *catalog.Table, pred ast.Expr) ([]uint32, string) {
@@ -592,7 +811,7 @@ func chooseSearch(n planner.Search, stats StatsFunc) (planner.Logical, *Node) {
 	var idx *catalog.Index
 	for i := range tab.Indexes {
 		ix := tab.Indexes[i]
-		if !ix.Fulltext || len(ix.Columns) != 1 || ix.Columns[0] != n.Column {
+		if !ix.Fulltext || !catalog.IntsEqual(ix.Columns, n.Columns) {
 			continue
 		}
 		if idx == nil || ix.Name < idx.Name {
@@ -606,12 +825,17 @@ func chooseSearch(n planner.Search, stats StatsFunc) (planner.Logical, *Node) {
 		plan := planner.Search{
 			Table:     tab,
 			IndexName: idx.Name,
-			Column:    n.Column,
+			Columns:   append([]int(nil), n.Columns...),
+			Weights:   append([]float64(nil), n.Weights...),
 			Query:     n.Query,
 			Residual:  pred,
 			Needed:    needed,
 		}
 		detail := tableName(tab) + " " + idx.Name + " fulltext"
+		if name := (fulltext.Analyzer{ID: idx.FTAnalyzer, Version: idx.FTVersion}).Name(); name != "" && name != "simple" {
+			detail += " analyzer=" + name
+		}
+		detail += formatSearchWeights(n.Weights)
 		if pred != nil {
 			detail += " residual=" + formatExpr(pred)
 		}
@@ -623,13 +847,55 @@ func chooseSearch(n planner.Search, stats StatsFunc) (planner.Logical, *Node) {
 		est, cost = kid.EstRows, kid.EstCost+kid.EstRows*cpuPred
 	}
 	plan := planner.Search{
-		Input:  in,
-		Table:  tab,
-		Column: n.Column,
-		Query:  n.Query,
-		Needed: needed,
+		Input:   in,
+		Table:   tab,
+		Columns: append([]int(nil), n.Columns...),
+		Weights: append([]float64(nil), n.Weights...),
+		Query:   n.Query,
+		Needed:  needed,
 	}
-	return plan, &Node{Op: "Search", Detail: tableName(tab) + " seq", EstRows: est, EstCost: cost, Kids: kids(kid)}
+	return plan, &Node{Op: "Search", Detail: tableName(tab) + " seq" + formatSearchWeights(n.Weights), EstRows: est, EstCost: cost, Kids: kids(kid)}
+}
+
+func chooseFacet(n planner.Facet, stats StatsFunc, underJoin bool) (planner.Logical, *Node) {
+	in, kid := chooseAt(n.Input, stats, underJoin)
+	n.Input = in
+	rows, cost := int64(0), int64(0)
+	if kid != nil {
+		rows = kid.EstRows
+		if len(n.Columns) > 0 {
+			rows = kid.EstRows / 4
+			if rows < 1 && kid.EstRows > 0 {
+				rows = 1
+			}
+			rows *= int64(len(n.Columns))
+		}
+		cost = kid.EstCost + kid.EstRows*cpuTuple
+	}
+	if n.Limit >= 0 {
+		capRows := n.Limit * int64(len(n.Columns))
+		if n.Limit == 0 {
+			rows = 0
+		} else if capRows < rows {
+			rows = capRows
+		}
+	}
+	detail := strings.Join(n.Names, ",")
+	if n.Limit >= 0 {
+		detail += " limit=" + itoa64(n.Limit)
+	}
+	return n, &Node{Op: "Facet", Detail: detail, EstRows: rows, EstCost: cost, Kids: kids(kid)}
+}
+
+func formatSearchWeights(weights []float64) string {
+	if fulltext.UniformWeights(weights) {
+		return ""
+	}
+	parts := make([]string, len(weights))
+	for i, w := range weights {
+		parts[i] = strconv.FormatFloat(w, 'g', -1, 64)
+	}
+	return " weights=" + strings.Join(parts, ",")
 }
 
 func chooseNearest(n planner.Nearest, stats StatsFunc) (planner.Logical, *Node) {
@@ -663,6 +929,7 @@ func chooseNearest(n planner.Nearest, stats StatsFunc) (planner.Logical, *Node) 
 			pred = nil
 		}
 	}
+	partitionIDs, partitionSuffix := partitionAccessDetail(tab, pred)
 	st := lookupStats(stats, tab)
 	rows := tableRows(st)
 	var idx *catalog.Index
@@ -685,27 +952,38 @@ func chooseNearest(n planner.Nearest, stats StatsFunc) (planner.Logical, *Node) 
 	}
 	if idx != nil {
 		s := sel(100_000)
-		cost, out := idxCost(rows, s, predSel(pred, tab, st), false, 0)
+		cost, out := idxCost(rows, s, predSel(pred, tab, partitionCostStats(st, partitionIDs)), false, 0)
 		if out > outK {
 			out = outK
 		}
 		plan := planner.Nearest{
-			Table:     tab,
-			IndexName: idx.Name,
-			Column:    n.Column,
-			Query:     n.Query,
-			Metric:    n.Metric,
-			Residual:  pred,
-			Needed:    needed,
-			K:         n.K,
+			Table:      tab,
+			IndexName:  idx.Name,
+			Column:     n.Column,
+			Query:      n.Query,
+			Metric:     n.Metric,
+			Residual:   pred,
+			Needed:     needed,
+			K:          n.K,
+			Partitions: partitionIDs,
 		}
-		detail := tableName(tab) + " " + idx.Name + " hnsw"
+		method := "hnsw"
+		switch idx.VecMethod {
+		case catalog.VecMethodIVF:
+			method = "ivf"
+		case catalog.VecMethodIVFPQ:
+			method = "ivfpq"
+		case catalog.VecMethodSPARSE:
+			method = "sparse"
+		}
+		detail := tableName(tab) + " " + idx.Name + " " + method
 		if n.Metric != "" {
 			detail += " " + n.Metric
 		}
 		if pred != nil {
 			detail += " residual=" + formatExpr(pred)
 		}
+		detail += partitionSuffix
 		return plan, &Node{Op: "Nearest", Detail: detail, EstRows: out, EstCost: cost, Index: idx.Name}
 	}
 	in, kid := chooseAccess(n.Input, stats)
@@ -717,15 +995,16 @@ func chooseNearest(n planner.Nearest, stats StatsFunc) (planner.Logical, *Node) 
 		}
 	}
 	plan := planner.Nearest{
-		Input:  in,
-		Table:  tab,
-		Column: n.Column,
-		Query:  n.Query,
-		Metric: n.Metric,
-		Needed: needed,
-		K:      n.K,
+		Input:      in,
+		Table:      tab,
+		Column:     n.Column,
+		Query:      n.Query,
+		Metric:     n.Metric,
+		Needed:     needed,
+		K:          n.K,
+		Partitions: partitionIDs,
 	}
-	return plan, &Node{Op: "Nearest", Detail: tableName(tab) + " flat", EstRows: est, EstCost: cost, Kids: kids(kid)}
+	return plan, &Node{Op: "Nearest", Detail: tableName(tab) + " flat" + partitionSuffix, EstRows: est, EstCost: cost, Kids: kids(kid)}
 }
 
 func peelAccess(p planner.Logical) (*catalog.Table, ast.Expr, []int, bool) {
@@ -1709,71 +1988,131 @@ func prunePartitionsForExplain(tab *catalog.Table, where ast.Expr) []catalog.Par
 		return pruneHashForExplain(tab, where)
 	case catalog.PartitionList:
 		return pruneValueForExplain(tab, where)
-	case catalog.PartitionTenant:
+	case catalog.PartitionLegacyTenant:
 		return pruneValueForExplain(tab, where)
 	default:
 		return all
 	}
 }
 
+// pruneRangeForExplain prunes RANGE partitions from a predicate. RANGE partition
+// bounds are lexicographically ordered tuples covering the half-open interval
+// [lower, upper) (lower inclusive, upper exclusive; nil is unbounded). The
+// predicate is reduced to a query lower/upper bound prefix over the ordered
+// partition-key columns: successive equality constraints extend both prefixes,
+// and the first non-equality constraint contributes its own lower/upper literal
+// and terminates the walk, because tuples between that column's bounds range
+// freely over every later partition column. A partition survives only when the
+// query bound interval can intersect its [lower, upper) tuple interval, so a
+// predicate that also pins trailing partition-key columns prunes partitions that
+// merely share a leading value.
 func pruneRangeForExplain(tab *catalog.Table, where ast.Expr) []catalog.Partition {
-	if tab.Partitioning == nil || len(tab.Partitioning.Columns) != 1 {
-		return tab.Partitioning.Partitions
+	p := tab.Partitioning
+	if p == nil || len(p.Columns) == 0 {
+		return p.Partitions
 	}
-	colOrd := tab.Partitioning.Columns[0]
-	colName := tab.Columns[colOrd].Name
-	eq, lower, upper, lowerInc, upperInc := extractRangeConstraintsForExplain(where, colName)
-	if eq != nil {
-		tmp := []types.Value{*eq}
-		for _, part := range tab.Partitioning.Partitions {
-			lowerV, upperV := part.Values[0], part.Values[1]
-			if lowerV != nil {
-				cmp, _ := compareValuesForExplain(tmp, lowerV)
-				if cmp < 0 || (cmp == 0 && !part.LowerInclusive) {
-					continue
-				}
+	var qlo, qhi []types.Value
+	// qloInc/qhiInc report whether the terminating bound of the corresponding
+	// prefix is inclusive; qloRest/qhiRest order the unconstrained suffix
+	// (-1 == -infinity, +1 == +infinity) when the prefix is shorter than a
+	// partition bound tuple.
+	qloInc, qhiInc := true, true
+	for _, ord := range p.Columns {
+		colType := tab.Columns[ord].Type
+		eq, lower, upper, lowerInc, upperInc := extractRangeConstraintsForExplain(where, tab.Columns[ord].Name)
+		if eq != nil {
+			cv, err := types.Coerce(*eq, colType)
+			if err != nil {
+				break
 			}
-			if upperV != nil {
-				cmp, _ := compareValuesForExplain(tmp, upperV)
-				if cmp > 0 || (cmp == 0 && !part.UpperInclusive) {
-					continue
-				}
-			}
-			return []catalog.Partition{part}
+			qlo = append(qlo, cv)
+			qhi = append(qhi, cv)
+			continue
 		}
-		return []catalog.Partition{}
+		if lower != nil {
+			if cv, err := types.Coerce(*lower, colType); err == nil {
+				qlo = append(qlo, cv)
+				qloInc = lowerInc
+			}
+		}
+		if upper != nil {
+			if cv, err := types.Coerce(*upper, colType); err == nil {
+				qhi = append(qhi, cv)
+				qhiInc = upperInc
+			}
+		}
+		break
+	}
+	if len(qlo) == 0 && len(qhi) == 0 {
+		return p.Partitions
+	}
+	qloRest := -1
+	if !qloInc {
+		qloRest = 1
+	}
+	qhiRest := 1
+	if !qhiInc {
+		qhiRest = -1
 	}
 	var out []catalog.Partition
-	for _, part := range tab.Partitioning.Partitions {
-		plower, pupper := part.Values[0], part.Values[1]
-		if upper != nil && plower != nil {
-			cmp, _ := compareValuesForExplain([]types.Value{*upper}, plower)
-			if cmp < 0 || (cmp == 0 && !upperInc && !part.LowerInclusive) {
-				continue
-			}
-		}
-		if lower != nil && pupper != nil {
-			cmp, _ := compareValuesForExplain([]types.Value{*lower}, pupper)
-			if cmp > 0 || (cmp == 0 && !lowerInc && !part.UpperInclusive) {
-				if cmp > 0 {
-					continue
-				}
-				if !part.UpperInclusive {
-					continue
+	for _, part := range p.Partitions {
+		lo, hi := part.Values[0], part.Values[1]
+		prune := false
+		// Query maximum tuple below the partition's inclusive lower bound.
+		if lo != nil && len(qhi) > 0 {
+			if c, ok := cmpBoundTuple(qhi, qhiRest, lo); ok {
+				if c < 0 || (c == 0 && !qhiInc) {
+					prune = true
 				}
 			}
 		}
-		out = append(out, part)
+		// Query minimum tuple at or above the partition's exclusive upper bound.
+		if !prune && hi != nil && len(qlo) > 0 {
+			if c, ok := cmpBoundTuple(qlo, qloRest, hi); ok && c >= 0 {
+				prune = true
+			}
+		}
+		if !prune {
+			out = append(out, part)
+		}
 	}
 	if len(out) == 0 {
-		return tab.Partitioning.Partitions
+		return []catalog.Partition{}
 	}
 	return out
 }
 
+// cmpBoundTuple compares a query bound prefix q against a full partition bound
+// tuple pt using the order-preserving key encoding. When q is a strict prefix of
+// pt (all shared elements equal), restInf decides the result: -1 orders q's
+// missing suffix as -infinity, +1 as +infinity. ok is false only when a value
+// pair cannot be compared, in which case the caller must not prune.
+func cmpBoundTuple(q []types.Value, restInf int, pt []types.Value) (int, bool) {
+	m := len(q)
+	if len(pt) < m {
+		m = len(pt)
+	}
+	for i := 0; i < m; i++ {
+		c, err := compareValuesForExplain([]types.Value{q[i]}, []types.Value{pt[i]})
+		if err != nil {
+			return 0, false
+		}
+		if c != 0 {
+			return c, true
+		}
+	}
+	if len(q) >= len(pt) {
+		return 0, true
+	}
+	return restInf, true
+}
+
 func pruneValueForExplain(tab *catalog.Table, where ast.Expr) []catalog.Partition {
-	if tab.Partitioning == nil || len(tab.Partitioning.Columns) != 1 {
+	if tab.Partitioning == nil || len(tab.Partitioning.Columns) == 0 {
 		return tab.Partitioning.Partitions
+	}
+	if len(tab.Partitioning.Columns) > 1 {
+		return pruneMultiColumnValueForExplain(tab, where)
 	}
 	colOrd := tab.Partitioning.Columns[0]
 	colName := tab.Columns[colOrd].Name
@@ -1817,22 +2156,81 @@ func pruneValueForExplain(tab *catalog.Table, where ast.Expr) []catalog.Partitio
 	return out
 }
 
+// pruneMultiColumnValueForExplain prunes multi-column LIST partitions only when
+// every partition column is pinned to a single equality value; the resulting
+// tuple matches at most one partition's membership set. Any looser predicate
+// keeps every partition.
+func pruneMultiColumnValueForExplain(tab *catalog.Table, where ast.Expr) []catalog.Partition {
+	tuple := make([]types.Value, len(tab.Partitioning.Columns))
+	for i, ord := range tab.Partitioning.Columns {
+		vals, ok := extractEqualValuesForExplain(where, tab.Columns[ord].Name)
+		if !ok || len(vals) != 1 {
+			return tab.Partitioning.Partitions
+		}
+		coerced, err := types.Coerce(vals[0], tab.Columns[ord].Type)
+		if err != nil {
+			return tab.Partitioning.Partitions
+		}
+		tuple[i] = coerced
+	}
+	key, err := types.EncodeKey(tuple)
+	if err != nil {
+		return tab.Partitioning.Partitions
+	}
+	for _, part := range tab.Partitioning.Partitions {
+		for _, v := range part.Values {
+			ek, err := types.EncodeKey(v)
+			if err != nil {
+				return tab.Partitioning.Partitions
+			}
+			if string(ek) == string(key) {
+				return []catalog.Partition{part}
+			}
+		}
+	}
+	return []catalog.Partition{}
+}
+
 func pruneHashForExplain(tab *catalog.Table, where ast.Expr) []catalog.Partition {
 	if tab == nil || tab.Partitioning == nil {
 		return nil
 	}
-	if len(tab.Partitioning.Columns) != 1 || len(tab.Partitioning.Partitions) == 0 {
-		return tab.Partitioning.Partitions
-	}
-	colOrd := tab.Partitioning.Columns[0]
-	vals, ok := extractEqualValuesForExplain(where, tab.Columns[colOrd].Name)
-	if !ok || len(vals) == 0 {
+	if len(tab.Partitioning.Columns) == 0 || len(tab.Partitioning.Partitions) == 0 {
 		return tab.Partitioning.Partitions
 	}
 	modulus := tab.Partitioning.Partitions[0].Modulus
 	byRemainder := make(map[uint32]catalog.Partition, len(tab.Partitioning.Partitions))
 	for _, part := range tab.Partitioning.Partitions {
 		byRemainder[part.Remainder] = part
+	}
+	// Multi-column HASH prunes only when every partition column is pinned to a
+	// single equality value; the tuple then hashes to exactly one partition.
+	if len(tab.Partitioning.Columns) > 1 {
+		tuple := make([]types.Value, len(tab.Partitioning.Columns))
+		for i, ord := range tab.Partitioning.Columns {
+			cvals, cok := extractEqualValuesForExplain(where, tab.Columns[ord].Name)
+			if !cok || len(cvals) != 1 {
+				return tab.Partitioning.Partitions
+			}
+			coerced, err := types.Coerce(cvals[0], tab.Columns[ord].Type)
+			if err != nil {
+				return tab.Partitioning.Partitions
+			}
+			tuple[i] = coerced
+		}
+		remainder, err := catalog.HashPartitionRemainder(tuple, modulus)
+		if err != nil {
+			return tab.Partitioning.Partitions
+		}
+		if part, ok := byRemainder[remainder]; ok {
+			return []catalog.Partition{part}
+		}
+		return tab.Partitioning.Partitions
+	}
+	colOrd := tab.Partitioning.Columns[0]
+	vals, ok := extractEqualValuesForExplain(where, tab.Columns[colOrd].Name)
+	if !ok || len(vals) == 0 {
+		return tab.Partitioning.Partitions
 	}
 	out := make([]catalog.Partition, 0, len(vals))
 	seen := make(map[uint32]struct{}, len(vals))

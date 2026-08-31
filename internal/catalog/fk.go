@@ -201,9 +201,6 @@ func validateOneFK(child *Table, fk *ForeignKey, lookup func(string) (*Table, bo
 			}
 		}
 	}
-	if err := checkTenantFK(child, parent, fk); err != nil {
-		return err
-	}
 	if (fk.OnDelete == FKCascade || fk.OnUpdate == FKCascade) && parent.Name != child.Name {
 		if cascadeReaches(parent.Name, child.Name, child, lookup) {
 			return nerr.New(nerr.InvalidArgument, "catalog.ValidateForeignKeys", "cyclic CASCADE is not allowed")
@@ -227,36 +224,6 @@ func resolveParent(child *Table, name string, lookup func(string) (*Table, bool)
 		return nil, nerr.New(nerr.NotFound, "catalog.ValidateForeignKeys", "referenced table missing")
 	}
 	return p, nil
-}
-
-func checkTenantFK(child, parent *Table, fk *ForeignKey) error {
-	cIdx, childKeyed := child.TenantCol()
-	pIdx, parentKeyed := parent.TenantCol()
-	if parentKeyed && !childKeyed {
-		return nerr.New(nerr.InvalidArgument, "catalog.ValidateForeignKeys", "tenant-keyed parent cannot be referenced by a global table")
-	}
-	if childKeyed && parentKeyed {
-		cPos, pPos := -1, -1
-		for i, o := range fk.Columns {
-			if o == cIdx {
-				cPos = i
-				break
-			}
-		}
-		for i, o := range fk.RefColumns {
-			if o == pIdx {
-				pPos = i
-				break
-			}
-		}
-		if cPos < 0 || pPos < 0 {
-			return nerr.New(nerr.InvalidArgument, "catalog.ValidateForeignKeys", "tenant_id must be part of the foreign key")
-		}
-		if cPos != pPos {
-			return nerr.New(nerr.InvalidArgument, "catalog.ValidateForeignKeys", "tenant_id must pair at the same foreign key position")
-		}
-	}
-	return nil
 }
 
 func cascadeReaches(start, target string, child *Table, lookup func(string) (*Table, bool)) bool {

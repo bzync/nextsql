@@ -11,7 +11,7 @@ import (
 
 const (
 	statsMagic   = "NSST"
-	statsVersion = 2
+	statsVersion = 3
 )
 
 // TableStats is a deterministic snapshot of table / index / segment statistics.
@@ -23,6 +23,17 @@ type TableStats struct {
 	Indexes  []IndexStats
 	Segments []SegmentStats
 	Vectors  []VectorStats
+	// Partitions records exact row counts by stable partition identity at the
+	// ANALYZE snapshot. Column/index sketches remain global and deterministic.
+	Partitions []PartitionStats
+}
+
+type PartitionStats struct {
+	ID      uint32
+	Rows    uint64
+	Columns []ColumnStats
+	Indexes []IndexStats
+	Vectors []VectorStats
 }
 
 // VectorStats is ANALYZE output for one VECTOR column (and its HNSW index, if any).
@@ -97,6 +108,12 @@ func (s *TableStats) Clone() *TableStats {
 	}
 	c.Indexes = append([]IndexStats(nil), s.Indexes...)
 	c.Vectors = append([]VectorStats(nil), s.Vectors...)
+	c.Partitions = append([]PartitionStats(nil), s.Partitions...)
+	for i := range c.Partitions {
+		c.Partitions[i].Columns = cloneColumnStats(s.Partitions[i].Columns)
+		c.Partitions[i].Indexes = append([]IndexStats(nil), s.Partitions[i].Indexes...)
+		c.Partitions[i].Vectors = append([]VectorStats(nil), s.Partitions[i].Vectors...)
+	}
 	c.Segments = append([]SegmentStats(nil), s.Segments...)
 	for i := range c.Segments {
 		c.Segments[i].LowPK = cloneVals(s.Segments[i].LowPK)
@@ -105,6 +122,24 @@ func (s *TableStats) Clone() *TableStats {
 		c.Segments[i].ColMax = cloneVals(s.Segments[i].ColMax)
 	}
 	return &c
+}
+
+func cloneColumnStats(in []ColumnStats) []ColumnStats {
+	out := append([]ColumnStats(nil), in...)
+	for i := range out {
+		out[i].Min = in[i].Min.Clone()
+		out[i].Max = in[i].Max.Clone()
+		out[i].Histogram = append([]HistBucket(nil), in[i].Histogram...)
+		for j := range out[i].Histogram {
+			out[i].Histogram[j].Lower = in[i].Histogram[j].Lower.Clone()
+			out[i].Histogram[j].Upper = in[i].Histogram[j].Upper.Clone()
+		}
+		out[i].MCV = append([]MCV(nil), in[i].MCV...)
+		for j := range out[i].MCV {
+			out[i].MCV[j].Value = in[i].MCV[j].Value.Clone()
+		}
+	}
+	return out
 }
 
 func (s *TableStats) Column(ord int) (ColumnStats, bool) {
@@ -188,6 +223,22 @@ func EncodeStats(s *TableStats) ([]byte, error) {
 	for _, v := range s.Vectors {
 		buf = appendVecStats(buf, v)
 	}
+	if len(s.Partitions) > MaxPartitions {
+		return nil, nerr.New(nerr.InvalidArgument, "catalog.EncodeStats", "partition stats count")
+	}
+	seenPartitions := make(map[uint32]struct{}, len(s.Partitions))
+	buf = appendU16(buf, uint16(len(s.Partitions)))
+	for _, part := range s.Partitions {
+		if part.ID == 0 {
+			return nil, nerr.New(nerr.InvalidArgument, "catalog.EncodeStats", "zero partition stats identity")
+		}
+		if _, exists := seenPartitions[part.ID]; exists {
+			return nil, nerr.New(nerr.InvalidArgument, "catalog.EncodeStats", "duplicate partition stats identity")
+		}
+		seenPartitions[part.ID] = struct{}{}
+		buf = appendU32(buf, part.ID)
+		buf = appendU64(buf, part.Rows)
+	}
 	return buf, nil
 }
 
@@ -200,7 +251,7 @@ func DecodeStats(raw []byte) (*TableStats, error) {
 	if err != nil {
 		return nil, err
 	}
-	if ver != 1 && ver != statsVersion {
+	if ver < 1 || ver > statsVersion {
 		return nil, nerr.New(nerr.InvalidFormat, "catalog.DecodeStats", "unsupported stats version")
 	}
 	s := &TableStats{}
@@ -265,6 +316,38 @@ func DecodeStats(raw []byte) (*TableStats, error) {
 			}
 			s.Vectors = append(s.Vectors, v)
 		}
+	}
+	if ver >= 3 {
+		n, off, err = takeU16(raw, off)
+		if err != nil {
+			return nil, err
+		}
+		if int(n) > MaxPartitions {
+			return nil, nerr.New(nerr.InvalidFormat, "catalog.DecodeStats", "partition stats count")
+		}
+		seen := make(map[uint32]struct{}, int(n))
+		for i := 0; i < int(n); i++ {
+			var part PartitionStats
+			part.ID, off, err = takeU32(raw, off)
+			if err != nil {
+				return nil, err
+			}
+			part.Rows, off, err = takeU64(raw, off)
+			if err != nil {
+				return nil, err
+			}
+			if part.ID == 0 {
+				return nil, nerr.New(nerr.InvalidFormat, "catalog.DecodeStats", "zero partition stats identity")
+			}
+			if _, exists := seen[part.ID]; exists {
+				return nil, nerr.New(nerr.InvalidFormat, "catalog.DecodeStats", "duplicate partition stats identity")
+			}
+			seen[part.ID] = struct{}{}
+			s.Partitions = append(s.Partitions, part)
+		}
+	}
+	if off != len(raw) {
+		return nil, nerr.New(nerr.InvalidFormat, "catalog.DecodeStats", "trailing stats bytes")
 	}
 	return s, nil
 }

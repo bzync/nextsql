@@ -457,12 +457,14 @@ func waitForWorkflowReplica(t *testing.T, dbs []*DB, id string, exclude int) {
 				all = false
 				break
 			}
-			res, err := db.Session().Exec(`SELECT id FROM jobs WHERE id = '` + id + `'`)
+			sess := db.Session()
+			_ = sess.SetReadConsistency(ReadStale) // inspect this replica's applied state
+			res, err := sess.Exec(`SELECT id FROM jobs WHERE id = '` + id + `'`)
 			if err != nil || len(res.Rows) != 1 {
 				all = false
 				break
 			}
-			res, err = db.Session().Exec(`SELECT id FROM job_audit WHERE id = '` + id + `'`)
+			res, err = sess.Exec(`SELECT id FROM job_audit WHERE id = '` + id + `'`)
 			if err != nil || len(res.Rows) != 1 {
 				all = false
 				break

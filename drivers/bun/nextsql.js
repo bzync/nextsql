@@ -8,6 +8,7 @@ import tls from 'node:tls';
 import {
   Kind,
   NextSQLError,
+  ReadConsistency,
   Type,
   decodeDecimal,
   decodeHelloOK,
@@ -21,21 +22,34 @@ import {
   splitHostPort,
   validateConfig,
 } from '../js/protocol.mjs';
-import { ByteReader, Wire, open } from '../js/client.mjs';
+import {
+  ByteReader,
+  Wire,
+  isReadOnlySQL,
+  open,
+  openCluster,
+  txnControl,
+} from '../js/client.mjs';
+import { decodeNodeStatus, encodeSetReadConsistency } from '../js/protocol.mjs';
 
 export {
   Kind,
   NextSQLError,
+  ReadConsistency,
   Type,
   decodeDecimal,
   decodeHelloOK,
   decodeNSJB,
+  decodeNodeStatus,
   decodeValue,
   encodeDecimalString,
   encodeHello,
   encodeParam,
+  encodeSetReadConsistency,
   formatUUID,
   isLoopback,
+  isReadOnlySQL,
+  txnControl,
   validateConfig,
 };
 
@@ -135,4 +149,14 @@ export async function dial(cfg) {
 export async function connect(cfg) {
   validateConfig(cfg);
   return open(cfg, dial);
+}
+
+export async function connectCluster(cfg) {
+  const addrs = Array.isArray(cfg && cfg.nodes) && cfg.nodes.length > 0
+    ? cfg.nodes
+    : [cfg && cfg.address];
+  for (const a of addrs) {
+    validateConfig({ ...cfg, address: a, nodes: undefined });
+  }
+  return openCluster(cfg, dial);
 }

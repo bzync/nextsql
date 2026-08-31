@@ -57,7 +57,7 @@ Examples:
 - Do not improve throughput by weakening fsync or WAL durability in official benchmarks.
 - Do not add features while an earlier correctness gate is red.
 - Do not claim HA guarantees that have not been measured.
-- Do not weaken tenant isolation for convenience.
+- Do not weaken realm/database isolation for convenience.
 
 ## 2.2 Definition of done
 
@@ -70,7 +70,7 @@ A change is complete only when applicable items are satisfied:
 - persistence and restart behavior are verified;
 - WAL/recovery behavior is verified where state changes;
 - Raft determinism/replication is verified where distributed state changes;
-- RBAC and tenant isolation are verified;
+- RBAC and realm/database isolation are verified;
 - limits and resource budgets are enforced;
 - tests pass;
 - race tests pass;
@@ -115,33 +115,29 @@ Current development state:
 
 ```text
 P0–P15  complete
-P16      open — correctness / SLO closure
-P17      complete except REBUILD INDEX ... ONLINE is deferred
-P18      implementable scope complete; partition-wise agg/join waits on P21
-P19      implementation complete; final repository-wide functional gate open
+P16      complete — exit gate green; terminal 100M B+Tree soak deferred as a non-gate standalone measurement
+P17      complete — REBUILD INDEX ... ONLINE is a deferred follow-on (not a gate item)
+P18      implementable scope complete
+P19      complete; clean repository-wide functional gate passed 2026-08-29
 P20      complete
-P21      bounded single-column RANGE/HASH/LIST/TENANT slice landed; lifecycle breadth open
-P22–P30 planned/open
+P21      complete — RANGE/HASH/LIST with 1–8-column keys, ATTACH/DETACH, partition-local indexes, pruning-sound, partition-wise agg/join, offline legacy TENANT migration
+P22      complete — follower reads / read scaling; exit gate closed 2026-08-30
+P23      complete — Vector Engine 2.0; production-gating sign-off 2026-08-31
+P24      complete — Full-text Search 2.0; exit gate closed 2026-08-31
+P25–P30 planned/open
 ```
 
-Immediate release-gate work is **P16**.
+Immediate release-gate work is **P25 Security 2.0**.
 
-Current P16 focus:
+Current P25 focus:
 
-1. Preserve the green corrected 1M-vector HNSW v10 result: p95 8.061 ms,
-   recall@10 1.000, recall@100 0.998.
-2. Complete the randomized 100M B+Tree insert/delete invariant soak.
-3. Do not close P16 until the remaining B+Tree gate is green.
+1. Audit every P25 security item as designed, implemented, tested, or
+   production-gated; then take the smallest coherent mTLS/service-identity
+   increment without weakening the existing TLS/RBAC/key boundaries.
 
-After P16, finish the remaining P19 repository-wide functional gate, then
-resume P21 physical partitioning:
-
-```text
-P19 final full-suite gate
-→ P21 native table partitioning
-```
-
-Do not let P19 or later feature work destabilize P16.
+P16, P23, and P24 are complete (exit gates green; the terminal 100M B+Tree invariant
+soak is a deferred standalone measurement, not a gate). Do not let later feature
+work destabilize the earlier gates.
 
 ---
 
@@ -392,6 +388,11 @@ Current full-text engine includes:
 - BM25-style ranking
 - phrase search
 - `SEARCH col FOR '...'`
+- versioned analyzers (`simple`, Snowball `english` v1 stem-only / v2 stem + stop-word dictionary v1 / v3 + synonym dictionary v1 at query time, `french` / `german` / `spanish` v1) and `WITH (ANALYZER = …)`
+- prefix search (`cat*` / `"data* performance"`, fail-closed expansion caps)
+- fuzzy matching (`cat~` / `cat~1` / `cat~2` / `"databas~ performance"`, OSA Damerau-Levenshtein, fail-closed expansion caps)
+- typo tolerance (unadorned missing terms become AUTO fuzzy; 0/1/2 edits for 1–4 / 5–8 / 9+ runes; present exact terms unchanged)
+- fail-closed query-expansion CPU/memory caps
 - transaction/WAL/recovery integration
 - encrypted index structures
 
@@ -411,6 +412,8 @@ Current vector support includes:
 - encrypted vector blocks/ANN structures
 - bounded dimensions
 - parallel distance calculation
+- bounded F32 value algebra: dimension, norm/normalize, add/subtract/scale,
+  dot, cosine distance, and L1/Manhattan
 
 Vector performance claims must always pair latency with recall.
 
@@ -445,6 +448,10 @@ Current native geospatial support includes:
 - DWITHIN
 - WITHIN / COVERS
 - line length
+- full pairwise native distance/intersection across POINT, BOX, LINESTRING,
+  and POLYGON
+- polygon area/perimeter, centroid/envelope, type/point/ring inspection
+- self-intersection and hole topology validation
 - spatial indexes
 - optimizer integration
 
@@ -591,7 +598,7 @@ Implement a native workflow object with:
 - `DROP WORKFLOW`
 - `RUN WORKFLOW`
 - documented transaction semantics
-- documented tenant semantics
+- documented database-isolation semantics
 - workflow RBAC
 - audit events
 - dependency tracking
@@ -664,7 +671,7 @@ Track:
 - task ID
 - workflow/source metadata
 - trigger metadata
-- tenant identity
+- admitted database identity (legacy tenant fields remain empty for new tasks)
 - attempts
 - error metadata
 - timeout
@@ -690,7 +697,7 @@ Do not close P19 until:
 - schedules survive restart and failover;
 - tasks are observable and cancellable;
 - resource budgets are enforced;
-- RBAC and tenant isolation are adversarially tested;
+- RBAC and database isolation are adversarially tested;
 - `docs/workflows.md` is complete.
 
 ---
@@ -714,7 +721,7 @@ Required capabilities:
 - backpressure
 - lag metrics
 - RBAC
-- tenant isolation
+- database isolation
 - TLS/network integration
 
 Never expose uncommitted changes.
@@ -732,7 +739,7 @@ Expected partition types:
 - RANGE
 - HASH
 - LIST where justified
-- tenant-aware partitioning
+- LIST partitioning for application-defined locality
 
 Required engineering:
 
@@ -751,7 +758,8 @@ Required engineering:
 - partition-wise aggregation
 - partition-wise joins
 
-Tenant partitioning must not replace tenant authorization. Physical locality is not an access-control boundary.
+Legacy TENANT descriptors remain decoder/runtime compatibility only. Physical
+partition locality never replaces realm/database authorization.
 
 ---
 
@@ -782,17 +790,21 @@ Never route a request to a follower if its requested consistency cannot be satis
 
 # 11. P23 Skill — Vector Engine 2.0
 
-Future vector work may include:
+P23 is complete (production-gating sign-off 2026-08-31, `docs/vector.md`).
+Shipped:
 
 - F16 vectors
 - I8 vectors
-- bit vectors
+- bit vectors + HAMMING
 - IVF
 - IVF-PQ
-- quantization
+- quantized HNSW
 - sparse vectors/retrieval
-- hybrid sparse+dense retrieval
-- SIMD/architecture-specific kernels only after profiling
+- hybrid sparse+dense+BM25 retrieval
+
+Documented follow-ons (not gate items): a `BITVECTOR`/Hamming `--vecquant` row,
+a process-local IVF-PQ cache, a re-rank-free quantised HNSW mode, IVF/IVF-PQ/SPARSE
+on partitioned tables, and SIMD/architecture-specific kernels only after profiling.
 
 Every ANN optimization must report:
 
@@ -810,7 +822,10 @@ Never improve a headline latency number by silently lowering recall.
 
 # 12. P24 Skill — Full-text Search 2.0
 
-Extend full-text search while preserving current BM25/phrase behavior.
+P24 is complete (exit gate closed 2026-08-31). Preserve its Phase-10
+BM25/phrase golden compatibility, query-expansion and 4096-term fuzzy
+vocabulary bounds, multilingual quality fixtures, and analyzer-aware encrypted
+recovery coverage.
 
 Potential areas include:
 
@@ -827,11 +842,14 @@ Compatibility with already-shipped behavior must be tested.
 
 # 13. P25 Skill — Security 2.0
 
-Future security work includes:
+Implemented in P25: mTLS / service identity / certificate + trust rotation /
+X.509 CRL revocation, and signed short-lived credentials (`NSSC1.` Ed25519
+credential in place of the password; expiry + audience/database/realm/role
+scope; `NSTK` rotatable keyset; `NSTR` fail-closed revocation; `SIGHUP` reload;
+`nextsql token` CLI; `identity_source` audit).
 
-- mTLS
-- service identity
-- short-lived credentials
+Remaining security work:
+
 - external identity provider integration
 - field-level client encryption
 - stronger password hashing evolution
@@ -846,7 +864,7 @@ Security rules:
 - no impossible “unhackable” claims;
 - document live unlocked-host limitations;
 - preserve key revocation/rotation semantics;
-- retain tenant isolation through every new surface.
+- retain realm/database isolation through every new surface.
 
 ---
 
@@ -880,7 +898,7 @@ Create a coherent native introspection surface for:
 
 Prefer stable system views/tables over ad-hoc one-off diagnostic commands where possible.
 
-All introspection must obey permissions and tenant boundaries.
+All introspection must obey permissions and realm/database boundaries.
 
 ---
 
@@ -1055,7 +1073,7 @@ Studio should provide specialized experiences for:
 - workflows/tasks
 - CDC
 
-Studio must not bypass server RBAC/tenant controls.
+Studio must not bypass server RBAC or realm/database controls.
 
 ---
 
@@ -1074,7 +1092,7 @@ Never let model output override:
 - optimizer
 - catalog
 - RBAC
-- tenant policy
+- realm/database policy
 - server validation
 
 ## 18.2 Knowledge sources
@@ -1109,7 +1127,7 @@ Prefer context roughly in this order:
 Every retrieval/tool action must respect:
 
 - current user identity
-- current tenant
+- current realm/database
 - RBAC
 - database scope
 - table/column restrictions
@@ -1158,7 +1176,7 @@ Never allow retrieved content to:
 - broaden permissions
 - reveal secrets
 - invoke unauthorized tools
-- override tenant boundaries
+- override realm/database boundaries
 
 ## 18.8 Read-only by default
 
@@ -1200,7 +1218,7 @@ Always verify:
 - authentication
 - authorization
 - least privilege
-- tenant isolation
+- realm/database isolation
 - secret redaction
 - encrypted persistence
 - secure temp/spill files
@@ -1272,7 +1290,7 @@ Raft/failover
 backup/restore
 PITR
 RBAC
-tenant isolation
+realm/database isolation
 prepared statements
 driver/wire protocol
 resource-limit tests
@@ -1280,7 +1298,7 @@ benchmark
 documentation
 ```
 
-Adversarial tests are required where security, permissions, tenant boundaries, recursion, parser input, or network input is involved.
+Adversarial tests are required where security, permissions, realm/database boundaries, recursion, parser input, or network input is involved.
 
 Do not rely exclusively on happy-path tests.
 
@@ -1356,7 +1374,7 @@ grammar
 → transactions/WAL
 → recovery
 → replication
-→ RBAC/tenant checks
+→ RBAC/realm/database checks
 → protocol/driver exposure
 → EXPLAIN
 → metrics
@@ -1461,7 +1479,7 @@ Before modifying code:
 - [ ] Identify persisted/wire/catalog format impact.
 - [ ] Identify transaction/WAL/recovery impact.
 - [ ] Identify Raft/failover impact.
-- [ ] Identify RBAC/tenant impact.
+- [ ] Identify RBAC/realm/database impact.
 - [ ] Identify resource-abuse risks.
 - [ ] Identify driver/API impact.
 - [ ] Identify documentation impact.
@@ -1474,7 +1492,7 @@ Before claiming completion:
 - [ ] Race tests pass where applicable.
 - [ ] Restart/crash tests pass where applicable.
 - [ ] Fuzz coverage added for new untrusted decoders/parsers.
-- [ ] RBAC/tenant tests pass.
+- [ ] RBAC/realm/database tests pass.
 - [ ] Resource limits are tested.
 - [ ] Distributed behavior is tested where applicable.
 - [ ] Benchmarks include required correctness metrics.
@@ -1485,26 +1503,16 @@ Before claiming completion:
 
 # 30. Current Execution Directive
 
-Until P16 closes, prioritize:
+P0–P24 are complete. Continue with P25 Security 2.0 in dependency order:
 
 ```text
-1. Corrected 1M HNSW measurement
-2. Validate p95 < 25 ms with recall
-3. 100M randomized B+Tree invariant soak
-4. Diagnose/fix any correctness regression
-5. Close P16 only when both gates are green
+1. Audit designed vs implemented vs tested vs production-gated security state
+2. Implement the smallest coherent mTLS/service-identity increment
+3. Fix any correctness, durability, security, or isolation regression first
+4. Close P25 only when its exit gate is actually green
 ```
 
-Then proceed to:
-
-```text
-P19 WORKFLOW
-→ TRIGGER
-→ SCHEDULE
-→ TASK runtime
-```
-
-Do not begin feature-heavy later phases in a way that destabilizes correctness, durability, security, integrity, or the P16 release gate.
+Do not begin later feature work in a way that destabilizes completed release gates.
 
 ---
 

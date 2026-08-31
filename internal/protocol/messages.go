@@ -36,6 +36,38 @@ type Query struct {
 	Params []executor.Param
 }
 
+type IdempotentQuery struct {
+	Key    string
+	SQL    string
+	Params []executor.Param
+}
+
+// ReadConsistency mode bytes on the wire. They match
+// replication.ReadConsistency / executor.ReadConsistency ordering.
+const (
+	ReadModeStrong  uint8 = 0
+	ReadModeBounded uint8 = 1
+	ReadModeStale   uint8 = 2
+)
+
+// SetReadConsistency sets a connection's read-consistency mode. MaxStalenessMS
+// applies only to the bounded mode; 0 selects the server's default window.
+type SetReadConsistency struct {
+	Mode           uint8
+	MaxStalenessMS uint64
+}
+
+// NodeStatus is a key-free replication health snapshot for follower-read
+// routing. Role is "standalone" when the server has no attached cluster.
+type NodeStatus struct {
+	Role          string
+	HasLeader     bool
+	Healthy       bool
+	AppliedLSN    uint64
+	LastContactMS int64
+	ApplyBacklog  uint64
+}
+
 type PrepareOK struct {
 	ID uint32
 }
@@ -161,6 +193,98 @@ func DecodeQuery(b []byte, lim Limits) (Query, error) {
 		return Query{}, err
 	}
 	return Query{SQL: sql, Params: params}, nil
+}
+
+func EncodeIdempotentQuery(q IdempotentQuery, lim Limits) ([]byte, error) {
+	lim = lim.normalized()
+	buf, err := appendU16String(nil, q.Key, lim.MaxName)
+	if err != nil {
+		return nil, err
+	}
+	body, err := encodeSQLParams(q.SQL, q.Params, lim)
+	if err != nil {
+		return nil, err
+	}
+	if len(buf)+len(body) > lim.MaxPacket {
+		return nil, protoErr("idempotent query exceeds packet limit")
+	}
+	return append(buf, body...), nil
+}
+
+func DecodeIdempotentQuery(b []byte, lim Limits) (IdempotentQuery, error) {
+	lim = lim.normalized()
+	key, off, err := readU16String(b, 0, lim.MaxName)
+	if err != nil {
+		return IdempotentQuery{}, err
+	}
+	if key == "" {
+		return IdempotentQuery{}, protoErr("empty idempotency key")
+	}
+	sql, params, err := decodeSQLParams(b[off:], lim)
+	if err != nil {
+		return IdempotentQuery{}, err
+	}
+	return IdempotentQuery{Key: key, SQL: sql, Params: params}, nil
+}
+
+func EncodeSetReadConsistency(s SetReadConsistency) []byte {
+	buf := make([]byte, 9)
+	buf[0] = s.Mode
+	encoding.PutU64(buf, 1, s.MaxStalenessMS)
+	return buf
+}
+
+func DecodeSetReadConsistency(b []byte) (SetReadConsistency, error) {
+	if len(b) != 9 {
+		return SetReadConsistency{}, protoErr("bad set-read-consistency length")
+	}
+	m := SetReadConsistency{Mode: b[0], MaxStalenessMS: encoding.U64(b, 1)}
+	if m.Mode > ReadModeStale {
+		return SetReadConsistency{}, protoErr("unknown read consistency mode")
+	}
+	return m, nil
+}
+
+func EncodeNodeStatus(n NodeStatus, lim Limits) ([]byte, error) {
+	lim = lim.normalized()
+	buf, err := appendU16String(nil, n.Role, lim.MaxName)
+	if err != nil {
+		return nil, err
+	}
+	var flags byte
+	if n.HasLeader {
+		flags |= 1
+	}
+	if n.Healthy {
+		flags |= 2
+	}
+	buf = append(buf, flags)
+	var tail [24]byte
+	encoding.PutU64(tail[:], 0, n.AppliedLSN)
+	encoding.PutU64(tail[:], 8, uint64(n.LastContactMS))
+	encoding.PutU64(tail[:], 16, n.ApplyBacklog)
+	return append(buf, tail[:]...), nil
+}
+
+func DecodeNodeStatus(b []byte, lim Limits) (NodeStatus, error) {
+	lim = lim.normalized()
+	role, off, err := readU16String(b, 0, lim.MaxName)
+	if err != nil {
+		return NodeStatus{}, err
+	}
+	if len(b)-off != 25 {
+		return NodeStatus{}, protoErr("bad node-status length")
+	}
+	flags := b[off]
+	off++
+	return NodeStatus{
+		Role:          role,
+		HasLeader:     flags&1 != 0,
+		Healthy:       flags&2 != 0,
+		AppliedLSN:    encoding.U64(b, off),
+		LastContactMS: int64(encoding.U64(b, off+8)),
+		ApplyBacklog:  encoding.U64(b, off+16),
+	}, nil
 }
 
 func EncodePrepare(sql string, lim Limits) ([]byte, error) {

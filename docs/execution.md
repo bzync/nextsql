@@ -47,6 +47,8 @@ Spill files (`NSPL`) are AES-256-GCM encrypted with a per-query DEK that exists 
 | Merge join | Chosen when both sides are index-ordered on the join keys |
 | Hash aggregation | `COUNT`, `SUM`, `AVG`, `MIN`, `MAX` with optional `GROUP BY` |
 | Parallel agg / join | Partition, local work, merge under the scheduler |
+| Partition-wise aggregation | An aggregate directly over a natively partitioned table aggregates each surviving partition heap in parallel and merges the partial hash tables; cross-partition groups fold during the merge. `EXPLAIN` tags it `Aggregate … partition-wise`. See `docs/partitioning.md`. |
+| Partition-wise join | An equi-join between two identically partitioned tables on their full partition key runs one bounded hash join per aligned partition pair, in parallel across pairs; pruned pairs are skipped. `INNER`/`LEFT`/`FULL`/`SEMI`/`ANTI`. `EXPLAIN` tags the join node `… partition-wise`. See `docs/partitioning.md`. |
 | Parallel `CREATE INDEX` | Workers encode keys; inserts stay on the writer transaction |
 | CTE materialize / scan | A materialized CTE is computed once, charged against the query memory budget, and reused by `CTEScan`. Inlined CTEs execute as ordinary nested plans. |
 | Recursive CTE | Anchor, then working-table iterations of the recursive term. Depth, row, memory, and time budgets apply; overflow is `exhausted`. |
@@ -76,6 +78,42 @@ LEFT JOIN orders o ON o.customer_id = c.id;
 ## Streaming
 
 `Session.Exec` still returns materialized `Result.Rows` under the memory budget (and the 1 000 000 row cap). `Session.Query` attaches `Result.NextBatch`. `Session.Stream` delivers batches to a callback so callers need not retain the whole result.
+
+## Built-in SELECT result cache
+
+Eligible autocommit SELECT/CTE/set-operation results use a process-local
+cache-aside path: lookup first, execute on miss, then store a deep copy. The
+key hashes exact SQL, typed parameters, authenticated user, and bound tenant.
+Every lookup must match both the durable WAL position and catalog generation,
+so any committed engine write or schema/statistics change invalidates old
+entries. Authorization and tenant rewriting still run before lookup.
+
+The cache is bounded to 128 entries and 8 MiB total. One entry may contain at
+most 4,096 rows and 1 MiB. Oversized results execute normally but are not
+stored. Explicit transactions, continuous subscriptions, and volatile expressions
+(`UUID()`, `NOW()`, `AI()`) bypass it. `Query`/`Stream` may reuse an eligible
+materialized entry and then batch that copy. Returned rows are deep copies; caller
+mutation cannot alter another hit. `Result.Cached` and
+`DB.ResultCacheStats()` expose local diagnostics. The cache is an acceleration
+only and is empty after restart.
+
+## Durable mutation idempotency
+
+`Session.ExecIdempotent(ctx, key, sql, params)` executes `INSERT`, `UPSERT`,
+`UPDATE`, `DELETE`, `RUN WORKFLOW`, or `CANCEL TASK` in a transaction that also
+writes its replay result. Retrying the same typed request returns that result
+with `Result.IdempotentReplay = true`; using the key for another request is
+`conflict`. Failed/rolled-back mutations do not consume a key. The API rejects
+an already-open explicit transaction so the retry fence cannot accidentally
+commit unrelated work.
+
+Keys are SHA-256 scoped by authenticated user and tenant and are never stored
+raw. `NSID` v1 catalog records are WAL-backed, encrypted, replicated with
+catalog pages, survive restart, and expire after 24 hours. Retention is bounded
+to 1,024 records with a 256 KiB replay response and 4,096-row decoder cap;
+expired entries are reclaimed synchronously before a new mutation. Capacity or
+response overflow fails before commit. The native protocol and Go driver expose
+the same behavior through `IdempotentQuery` / `Conn.ExecIdempotent`.
 
 ## Measurement notes
 

@@ -95,6 +95,30 @@ func cluster3(t *testing.T) []*node {
 	return nodes
 }
 
+// staleSession reads a node's locally applied state without the STRONG Raft
+// read barrier, so a follower can be inspected directly.
+func staleSession(t *testing.T, n *node) *executor.Session {
+	t.Helper()
+	s := n.db.Session()
+	if err := s.SetReadConsistency(executor.ReadStale); err != nil {
+		t.Fatal(err)
+	}
+	return s
+}
+
+// boundedSession reads a node's applied state behind the BOUNDED freshness
+// gate: served while the node is the leader or a follower within maxStaleness
+// of the leader, rejected as unavailable once it falls further behind.
+func boundedSession(t *testing.T, n *node, maxStaleness time.Duration) *executor.Session {
+	t.Helper()
+	s := n.db.Session()
+	if err := s.SetReadConsistency(executor.ReadBounded); err != nil {
+		t.Fatal(err)
+	}
+	s.SetMaxStaleness(maxStaleness)
+	return s
+}
+
 func live(nodes []*node) *node {
 	var found *node
 	n := 0
@@ -159,7 +183,12 @@ func TestHAThreeNodeQuorumCommit(t *testing.T) {
 			break
 		}
 	}
-	res, err := fol.db.Session().Exec(`SELECT id FROM t`)
+	// A STRONG (default) read on a follower is rejected, not served stale.
+	if _, err := fol.db.Session().Exec(`SELECT id FROM t`); !nerr.HasCode(err, nerr.Unavailable) {
+		t.Fatalf("follower strong read %v", err)
+	}
+	// A STALE read observes the follower's applied state.
+	res, err := staleSession(t, fol).Exec(`SELECT id FROM t`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -169,6 +198,53 @@ func TestHAThreeNodeQuorumCommit(t *testing.T) {
 	if _, err := fol.db.Session().Exec(`INSERT INTO t (id) VALUES ('no')`); !nerr.HasCode(err, nerr.Unavailable) {
 		t.Fatalf("follower write %v", err)
 	}
+}
+
+func TestHABoundedFollowerRead(t *testing.T) {
+	nodes := cluster3(t)
+	lead := leader(t, nodes)
+	if _, err := lead.db.Session().Exec(`CREATE TABLE t (id STRING PRIMARY KEY)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := lead.db.Session().Exec(`INSERT INTO t (id) VALUES ('ok')`); err != nil {
+		t.Fatal(err)
+	}
+	waitAll(t, nodes, uint64(lead.cluster.AppliedLSN()))
+	var fol *node
+	for _, n := range nodes {
+		if n != lead {
+			fol = n
+			break
+		}
+	}
+
+	// A caught-up follower serves a BOUNDED read from local state.
+	res, err := boundedSession(t, fol, time.Minute).Exec(`SELECT id FROM t`)
+	if err != nil || len(res.Rows) != 1 {
+		t.Fatalf("bounded follower read: err=%v rows=%+v", err, res)
+	}
+	// The leader always passes the BOUNDED gate.
+	if _, err := boundedSession(t, lead, time.Nanosecond).Exec(`SELECT id FROM t`); err != nil {
+		t.Fatalf("bounded leader read: %v", err)
+	}
+
+	// Partition the follower: once it stops hearing the leader past the healthy
+	// window, BOUNDED reads are rejected as unavailable rather than served stale.
+	for _, n := range nodes {
+		if n != fol {
+			fol.trans.Disconnect(n.addr)
+			n.trans.Disconnect(fol.addr)
+		}
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		_, err := boundedSession(t, fol, time.Minute).Exec(`SELECT id FROM t`)
+		if nerr.HasCode(err, nerr.Unavailable) {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("partitioned follower kept serving BOUNDED reads")
 }
 
 func TestHAKillLeader(t *testing.T) {
@@ -291,7 +367,7 @@ func TestHAReplicaRepair(t *testing.T) {
 		n.trans.Connect(lag.addr, lag.trans)
 	}
 	waitAll(t, nodes, uint64(lead.cluster.AppliedLSN()))
-	res, err := lag.db.Session().Exec(`SELECT id FROM t`)
+	res, err := staleSession(t, lag).Exec(`SELECT id FROM t`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -368,14 +444,15 @@ func TestHAFKCascadeFollowersMatchLeader(t *testing.T) {
 	}
 	waitAll(t, nodes, uint64(lead.cluster.AppliedLSN()))
 	for _, n := range nodes {
-		res, err := n.db.Session().Exec(`SELECT id FROM parents`)
+		sess := staleSession(t, n)
+		res, err := sess.Exec(`SELECT id FROM parents`)
 		if err != nil {
 			t.Fatal(err)
 		}
 		if len(res.Rows) != 0 {
 			t.Fatalf("%s parents %d (followers apply WAL, not FK actions)", n.id, len(res.Rows))
 		}
-		res, err = n.db.Session().Exec(`SELECT id FROM children`)
+		res, err = sess.Exec(`SELECT id FROM children`)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -383,4 +460,74 @@ func TestHAFKCascadeFollowersMatchLeader(t *testing.T) {
 			t.Fatalf("%s children %d", n.id, len(res.Rows))
 		}
 	}
+}
+
+// system.replica_health surfaces each node's replication position and
+// freshness over SQL: the leader is healthy with zero staleness, and a
+// follower reports its role, a visible leader, and a bounded contact age.
+func TestHAReplicaHealthSurface(t *testing.T) {
+	nodes := cluster3(t)
+	lead := leader(t, nodes)
+	if _, err := lead.db.Session().Exec(`CREATE TABLE t (id STRING PRIMARY KEY)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := lead.db.Session().Exec(`INSERT INTO t (id) VALUES ('a')`); err != nil {
+		t.Fatal(err)
+	}
+	waitAll(t, nodes, uint64(lead.cluster.AppliedLSN()))
+
+	// staleSession so a follower can answer without the STRONG barrier.
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, ok := nodesAllFollowersHealthy(nodes); ok {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	for _, n := range nodes {
+		res, err := staleSession(t, n).Exec(`SELECT * FROM system.replica_health`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(res.Rows) != 1 {
+			t.Fatalf("%s: %d rows", n.id, len(res.Rows))
+		}
+		col := map[string]int{}
+		for i, c := range res.Columns {
+			col[c] = i
+		}
+		row := res.Rows[0]
+		role := row[col["role"]].Str
+		hasLeader := row[col["has_leader"]].Bool
+		lastContact := row[col["last_contact_ms"]].Dec.String()
+		healthy := row[col["healthy"]].Bool
+		if !hasLeader {
+			t.Fatalf("%s: no leader visible", n.id)
+		}
+		if n == lead {
+			if role != "leader" || !healthy || lastContact != "0" {
+				t.Fatalf("%s leader row: %+v", n.id, row)
+			}
+			continue
+		}
+		if role != "follower" {
+			t.Fatalf("%s: role %q", n.id, role)
+		}
+		if !healthy {
+			t.Fatalf("%s: follower unhealthy: %+v", n.id, row)
+		}
+	}
+}
+
+func nodesAllFollowersHealthy(nodes []*node) (string, bool) {
+	for _, n := range nodes {
+		if n.cluster.IsLeader() {
+			continue
+		}
+		if !n.cluster.ReplicaHealth().Healthy {
+			return n.id, false
+		}
+	}
+	return "", true
 }

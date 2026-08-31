@@ -1,9 +1,10 @@
 # Server configuration
 
 ```text
-nextsqld --data-dir DIR --key-file FILE
+nextsqld --data-dir DIR --key-file FILE [--instance-key-file FILE]
          [--listen 127.0.0.1:7210] [--config FILE]
-         [--tls-cert FILE --tls-key FILE]
+         [--env-file PATH | --no-env]
+         [--tls-cert FILE --tls-key FILE [--tls-client-ca FILE [--tls-client-crl FILE]]]
          [--require-client-key]
          [--user NAME --password-file FILE]
          [--auth-file FILE] [--audit-file FILE]
@@ -12,7 +13,16 @@ nextsqld --data-dir DIR --key-file FILE
          [--node-id ID --raft-bind ADDR --raft-join id=addr,... [--raft-bootstrap]]
 ```
 
-`--data-dir` is required (flag or config). `--key-file` is required unless `--require-client-key` is set.
+`--data-dir` is required (flag or config). `--key-file` is required unless `--require-client-key` is set. For a deployment initialized with `nextsql.instance`, `--instance-key-file` defaults to `KEY-FILE.instance`; client-key mode must set it explicitly.
+
+The hosting fields can also come from process environment, `.env.local`,
+`.env`, or `--env-file`: `NEXTSQL_DATA_DIR`, `NEXTSQL_KEY_FILE`,
+`NEXTSQL_INSTANCE_KEY_FILE`, `NEXTSQL_BUFFER_PAGES`, `NEXTSQL_ADDR` (listen),
+`NEXTSQL_SERVER_USER`, and `NEXTSQL_SERVER_PASSWORD_FILE` (preferred) or
+`NEXTSQL_SERVER_PASS`. Priority is flags > process env > dotenv > `--config` >
+defaults. Server credentials are separate from client `NEXTSQL_DATABASE_USER` /
+`NEXTSQL_DATABASE_PASS*`. Values for the key variables are file paths, not key
+bytes; use a protected host-only env file.
 
 ## Config file (`--config`)
 
@@ -21,11 +31,17 @@ Simple `key=value`. Comments start with `#`. Unknown keys are rejected. Command-
 ```text
 data_dir=/var/lib/nextsql
 key_file=/etc/nextsql/root.key
+instance_key_file=/etc/nextsql/root.key.instance
 listen_addr=127.0.0.1:7210
 log_level=info
 buffer_pages=1024
 tls_cert=/etc/nextsql/server.crt
 tls_key=/etc/nextsql/server.key
+tls_client_ca=
+tls_client_crl=
+token_verify_keyset=
+token_revocations=
+token_audience=
 require_client_key=false
 audit_file=
 wal_archive=/var/lib/nextsql-wal

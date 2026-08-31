@@ -324,3 +324,81 @@ func TestMaintainIndexScopesCleanupAndRejectsAmbiguity(t *testing.T) {
 		t.Fatal("ambiguous index maintenance accepted")
 	}
 }
+
+func TestMaintainPartitionedTableAndIndexScopesEveryLocalTree(t *testing.T) {
+	db := testDB(t)
+	reader := db.Session()
+	writer := db.Session()
+	execOK(t, writer, `CREATE TABLE partition_maint (
+		region STRING NOT NULL,
+		id STRING NOT NULL,
+		tag STRING NOT NULL,
+		PRIMARY KEY (region, id)
+	) PARTITION BY LIST (region) (
+		PARTITION americas VALUES IN ('us'),
+		PARTITION europe VALUES IN ('eu')
+	)`)
+	execOK(t, writer, `CREATE INDEX ix_partition_maint_tag ON partition_maint (tag)`)
+	execOK(t, writer, `INSERT INTO partition_maint (region, id, tag) VALUES
+		('us', '1', 'old-us'),
+		('eu', '2', 'old-eu')`)
+
+	execOK(t, reader, `BEGIN SNAPSHOT`)
+	execOK(t, reader, `SELECT id FROM partition_maint ORDER BY id`)
+	execOK(t, writer, `DELETE FROM partition_maint`)
+	execOK(t, reader, `COMMIT`)
+
+	tab, ok := db.Cat.Get("partition_maint")
+	if !ok || tab.Partitioning == nil || len(tab.Partitioning.Partitions) != 2 {
+		t.Fatalf("partitioned table missing: %+v", tab)
+	}
+	for _, part := range tab.Partitioning.Partitions {
+		heap, err := db.partitionHeap(tab.Name, part.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		idx, err := db.partitionIndex(tab.Name, part.ID, "ix_partition_maint_tag")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if physicalRows(t, heap) != 1 || physicalRows(t, idx) != 1 {
+			t.Fatalf("partition %s expected deferred heap/index tombstones", part.Name)
+		}
+	}
+
+	res := execOK(t, writer, `MAINTAIN INDEX ix_partition_maint_tag`)
+	if res.Affected != 2 {
+		t.Fatalf("partitioned index maintenance affected=%d", res.Affected)
+	}
+	for _, part := range tab.Partitioning.Partitions {
+		heap, _ := db.partitionHeap(tab.Name, part.ID)
+		idx, _ := db.partitionIndex(tab.Name, part.ID, "ix_partition_maint_tag")
+		if physicalRows(t, idx) != 0 || physicalRows(t, heap) != 1 {
+			t.Fatalf("partition %s index scope crossed into heap", part.Name)
+		}
+	}
+
+	res = execOK(t, writer, `MAINTAIN TABLE partition_maint`)
+	if res.Affected != 2 {
+		t.Fatalf("partitioned table maintenance affected=%d", res.Affected)
+	}
+	for _, part := range tab.Partitioning.Partitions {
+		heap, _ := db.partitionHeap(tab.Name, part.ID)
+		if physicalRows(t, heap) != 0 {
+			t.Fatalf("partition %s heap tombstone survived table maintenance", part.Name)
+		}
+	}
+
+	part := tab.Partitioning.Partitions[0]
+	key := partitionIndexKey(tab.Name, part.ID, "ix_partition_maint_tag")
+	db.mu.Lock()
+	missing := db.partIdxs[key]
+	delete(db.partIdxs, key)
+	db.mu.Unlock()
+	if _, err := writer.Exec(`MAINTAIN INDEX ix_partition_maint_tag`); !nerr.HasCode(err, nerr.Corruption) {
+		t.Fatalf("missing partition-local root did not fail closed: %v", err)
+	}
+	db.mu.Lock()
+	db.partIdxs[key] = missing
+	db.mu.Unlock()
+}

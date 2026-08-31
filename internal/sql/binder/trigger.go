@@ -30,7 +30,7 @@ func (AlterTrigger) bound()  {}
 func (DropTrigger) bound()   {}
 
 // BindAutomation adds trigger-wide dependency context to workflow binding.
-func BindAutomation(stmt ast.Stmt, tables Lookup, workflows WorkflowLookup, workflowList WorkflowList, triggers TriggerLookup, triggerList TriggerList, schedules ScheduleLookup, scheduleList ScheduleList, nextID uint32, owner, tenant string) (Bound, error) {
+func BindAutomation(stmt ast.Stmt, tables Lookup, workflows WorkflowLookup, workflowList WorkflowList, triggers TriggerLookup, triggerList TriggerList, schedules ScheduleLookup, scheduleList ScheduleList, nextID uint32, owner string) (Bound, error) {
 	switch s := stmt.(type) {
 	case ast.ShowTasks:
 		if s.Limit < 1 || s.Limit > 256 || len(s.After) > catalog.MaxTaskIDBytes {
@@ -43,7 +43,7 @@ func BindAutomation(stmt ast.Stmt, tables Lookup, workflows WorkflowLookup, work
 		}
 		return CancelTask{ID: s.ID}, nil
 	}
-	if bound, handled, err := bindSchedule(stmt, workflows, schedules, nextID, owner, tenant); handled {
+	if bound, handled, err := bindSchedule(stmt, workflows, schedules, nextID, owner); handled {
 		return bound, err
 	}
 	switch s := stmt.(type) {

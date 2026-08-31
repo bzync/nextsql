@@ -128,7 +128,7 @@ func simpleSubquery(query ast.Stmt) (ast.Select, bool) {
 	if sel.FromQuery != nil || len(sel.Joins) > 0 || sel.Distinct || len(sel.Group) > 0 || sel.Having != nil {
 		return ast.Select{}, false
 	}
-	if sel.Limit != nil || sel.Offset != nil || sel.SearchCol != "" || sel.NearestCol != "" {
+	if sel.Limit != nil || sel.Offset != nil || len(sel.SearchCols) > 0 || sel.NearestCol != "" || sel.Nearest2Col != "" {
 		return ast.Select{}, false
 	}
 	if sel.Table == "" {

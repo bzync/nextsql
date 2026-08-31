@@ -36,6 +36,58 @@ func TestACLLeastPrivilege(t *testing.T) {
 	}
 }
 
+func TestACLAllowedScoped(t *testing.T) {
+	a, err := CreateACL(filepath.Join(t.TempDir(), "acl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range []string{"readonly", "writer"} {
+		if err := a.CreateRole(r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := a.Grant("readonly", PrivSelect, ScopeTable, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Grant("writer", PrivInsert, ScopeTable, ""); err != nil {
+		t.Fatal(err)
+	}
+	// alice holds both roles directly, plus a direct DELETE grant.
+	for _, r := range []string{"readonly", "writer"} {
+		if err := a.GrantRole(r, "alice"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := a.Grant("alice", PrivDelete, ScopeTable, "orders"); err != nil {
+		t.Fatal(err)
+	}
+
+	// No scope: alice has everything she was granted.
+	if !a.AllowedScoped("alice", nil, PrivDelete, ScopeTable, "orders") {
+		t.Fatal("unscoped check lost a direct grant")
+	}
+	// Scoped to readonly: SELECT yes, INSERT/DELETE no (narrowed below her rights).
+	if !a.AllowedScoped("alice", []string{"readonly"}, PrivSelect, ScopeTable, "orders") {
+		t.Fatal("scoped credential lost the role's own privilege")
+	}
+	if a.AllowedScoped("alice", []string{"readonly"}, PrivInsert, ScopeTable, "orders") {
+		t.Fatal("scoped credential kept a privilege outside the role")
+	}
+	if a.AllowedScoped("alice", []string{"readonly"}, PrivDelete, ScopeTable, "orders") {
+		t.Fatal("scoped credential kept the principal's direct grant")
+	}
+	// Scoping to a role alice does not hold denies everything (no escalation).
+	if err := a.CreateRole("dba"); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Grant("dba", PrivAdmin, ScopeCluster, ""); err != nil {
+		t.Fatal(err)
+	}
+	if a.AllowedScoped("alice", []string{"dba"}, PrivSelect, ScopeTable, "orders") {
+		t.Fatal("credential escalated to a role the principal lacks")
+	}
+}
+
 func TestACLAdminAndRoles(t *testing.T) {
 	a, err := CreateACL(filepath.Join(t.TempDir(), "acl"))
 	if err != nil {

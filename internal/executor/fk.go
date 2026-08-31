@@ -410,7 +410,7 @@ func (s *Session) checkOutboundFK(child *catalog.Table, fk catalog.ForeignKey, r
 	if err != nil {
 		return err
 	}
-	if !found || !s.tenantVisible(parent, parentRow) {
+	if !found || !s.legacyTenantVisible(parent, parentRow) {
 		s.fkNote(false)
 		return fkErr()
 	}
@@ -481,7 +481,7 @@ func (s *Session) collectInbound(parent *catalog.Table, old, neu []types.Value, 
 	if len(inbounds) == 0 {
 		return nil, nil
 	}
-	if err := s.checkTenantRow(parent, old); err != nil {
+	if err := s.checkLegacyTenantRow(parent, old); err != nil {
 		return nil, err
 	}
 	s.fkProbes = 0
@@ -540,7 +540,7 @@ func (s *Session) applyInboundWork(parent *catalog.Table, work []fkChildWork, ol
 		if !deleting && parent != nil && w.child != nil && w.child.Name == parent.Name && sameEncodedPK(w.child, w.row, old) {
 			src = cloneRow(neu)
 		}
-		if err := s.checkTenantRow(w.child, src); err != nil {
+		if err := s.checkLegacyTenantRow(w.child, src); err != nil {
 			return err
 		}
 		if err := s.touchFKCascade(); err != nil {
@@ -825,7 +825,7 @@ func (s *Session) probeChildHeap(child *catalog.Table, fk catalog.ForeignKey, pa
 		if err != nil {
 			return err
 		}
-		_ = s.tenantVisible(child, row)
+		_ = s.legacyTenantVisible(child, row)
 		ok, err := fkRowMatches(row, fk, parentRow)
 		if err != nil || !ok {
 			return err
@@ -858,7 +858,7 @@ func (s *Session) childRowExists(child *catalog.Table, pkRaw []byte, probe txn.S
 	if err != nil {
 		return false, err
 	}
-	_ = s.tenantVisible(child, row)
+	_ = s.legacyTenantVisible(child, row)
 	return true, nil
 }
 

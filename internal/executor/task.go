@@ -343,7 +343,7 @@ func (db *DB) ClaimDueTasks(ctx context.Context, now time.Time, limit int) ([]*c
 	return claimed, nil
 }
 
-// ExecuteClaimedTask runs one leased workflow as its stored owner and tenant.
+// ExecuteClaimedTask runs one leased workflow as its stored owner.
 // Workflow effects and SUCCEEDED are committed atomically. Failure metadata is
 // persisted only after the body transaction has rolled back.
 func (db *DB) ExecuteClaimedTask(ctx context.Context, claimed *catalog.Task, acl *security.ACL, audit *security.Log, limits scheduler.Limits) error {
@@ -369,10 +369,6 @@ func (db *DB) executeClaimedTask(ctx context.Context, claimed *catalog.Task, acl
 	s.SetIdentity(claimed.Owner)
 	s.SetACL(acl)
 	s.SetAudit(audit)
-	if claimed.Tenant != "" {
-		tenant := types.StringValue(claimed.Tenant)
-		s.tenant = &tenant
-	}
 	if limits.Workers == 0 && limits.Memory == 0 {
 		limits = scheduler.DefaultLimits()
 	}
@@ -903,12 +899,6 @@ func (s *Session) execCancelTask(p planner.CancelTask) (*Result, error) {
 	}
 	if s.acl != nil && !s.isAdmin() && task.Owner != s.user {
 		return nil, security.Deny("executor.CancelTask")
-	}
-	if task.Tenant != "" {
-		bound, ok := s.boundTenant()
-		if !ok || bound.String() != task.Tenant {
-			return nil, security.Deny("executor.CancelTask")
-		}
 	}
 	task, changed, err := requestTaskCancellationTxn(tx, p.ID, time.Now().UTC().UnixNano())
 	if err != nil {

@@ -324,6 +324,23 @@ func TestVectorsAreInlined(t *testing.T) {
 	}
 }
 
+func TestSqlTypeBitvector(t *testing.T) {
+	bt, err := types.VectorBit(64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := sqlType(bt); got != "BITVECTOR<64>" {
+		t.Fatalf("sqlType(BITVECTOR<64>) = %q", got)
+	}
+	st, err := types.VectorSparse(128)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := sqlType(st); got != "SPARSEVECTOR<128>" {
+		t.Fatalf("sqlType(SPARSEVECTOR<128>) = %q", got)
+	}
+}
+
 func mustVec(t *testing.T, n uint16) types.Type {
 	t.Helper()
 	vt, err := types.VectorF32(n)

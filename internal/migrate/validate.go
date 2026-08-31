@@ -141,8 +141,6 @@ func rejectStmt(stmt ast.Stmt) error {
 	switch stmt.(type) {
 	case ast.Begin, ast.Commit, ast.Rollback:
 		return nerr.New(nerr.InvalidArgument, "migrate", "BEGIN/COMMIT/ROLLBACK is not allowed")
-	case ast.SetTenant:
-		return nerr.New(nerr.InvalidArgument, "migrate", "SET TENANT/RESET TENANT is not allowed")
 	case ast.Grant, ast.Revoke, ast.CreateUser, ast.DropUser, ast.CreateRole, ast.DropRole:
 		return nerr.New(nerr.InvalidArgument, "migrate", "GRANT/REVOKE and CREATE/DROP USER/ROLE are not allowed")
 	default:

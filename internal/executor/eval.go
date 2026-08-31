@@ -59,6 +59,8 @@ func (s *Session) eval(e ast.Expr, tab *catalog.Table, row []types.Value) (types
 			return types.Now(), nil
 		case "ai":
 			return types.Value{}, nerr.New(nerr.InvalidArgument, "executor.eval", "AI() is only valid as a column default")
+		case "highlight", "snippet":
+			return s.evalHighlight(x, tab, row)
 		case "coalesce":
 			for _, arg := range x.Args {
 				v, err := s.eval(arg, tab, row)
@@ -286,7 +288,7 @@ func (s *Session) evalSubqueryAnyColumns(id uint64, query ast.Stmt, outer *catal
 			return result, nil
 		}
 	}
-	stmt, err := s.applyTenant(query)
+	stmt, err := s.guardLegacyTenancy(query)
 	if err != nil {
 		return nil, err
 	}
@@ -1037,34 +1039,162 @@ func (s *Session) evalCase(x ast.Case, tab *catalog.Table, row []types.Value) (t
 }
 
 func evalVecFn(name string, args []types.Value) (types.Value, bool, error) {
-	var metric nsvec.Metric
+	canonical := name
 	switch name {
-	case "cosine":
-		metric = nsvec.MetricCosine
-	case "l2":
-		metric = nsvec.MetricL2
-	case "inner_product":
-		metric = nsvec.MetricIP
+	case "dot", "vector_dot":
+		canonical = "inner_product"
+	case "vector_dims", "dimensions":
+		canonical = "vector_dim"
+	case "norm":
+		canonical = "vector_norm"
+	case "normalize":
+		canonical = "vector_normalize"
+	case "vector_sub":
+		canonical = "vector_subtract"
+	case "manhattan":
+		canonical = "l1"
+	}
+	switch canonical {
+	case "cosine", "cosine_distance", "l2", "l1", "inner_product", "vector_dim", "vector_norm", "vector_normalize", "vector_add", "vector_subtract", "vector_scale":
 	default:
 		return types.Value{}, false, nil
 	}
-	if len(args) != 2 {
-		return types.Value{}, true, nerr.New(nerr.InvalidArgument, "executor.evalVecFn", name+" takes two arguments")
+	want := 2
+	if canonical == "vector_dim" || canonical == "vector_norm" || canonical == "vector_normalize" {
+		want = 1
 	}
-	if args[0].Null || args[1].Null {
+	if len(args) != want {
+		return types.Value{}, true, nerr.New(nerr.InvalidArgument, "executor.evalVecFn", name+" has invalid argument count")
+	}
+	vectorType := types.Type{Kind: types.KindVector, VecElem: types.VecF32}
+	if len(args) > 0 && args[0].Typ.Kind == types.KindVector {
+		vectorType = args[0].Typ
+	}
+	if args[0].Null || len(args) == 2 && args[1].Null {
+		if canonical == "vector_normalize" || canonical == "vector_add" || canonical == "vector_subtract" || canonical == "vector_scale" {
+			return types.Null(vectorType), true, nil
+		}
 		return types.Null(types.Type{Kind: types.KindDecimal}), true, nil
 	}
-	if args[0].Typ.Kind != types.KindVector || args[1].Typ.Kind != types.KindVector {
-		return types.Value{}, true, nerr.New(nerr.InvalidArgument, "executor.evalVecFn", name+" requires VECTOR arguments")
+	if args[0].Typ.Kind != types.KindVector {
+		return types.Value{}, true, nerr.New(nerr.InvalidArgument, "executor.evalVecFn", name+" requires a VECTOR first argument")
+	}
+	if args[0].Typ.VecElem == types.VecSparse || len(args[0].SparseIdx) > 0 {
+		return evalSparseVecFn(canonical, name, args, vectorType)
 	}
 	if err := nsvec.Check(args[0].Vec, 0); err != nil {
 		return types.Value{}, true, err
 	}
+	switch canonical {
+	case "vector_dim":
+		return types.DecimalValue(types.DecimalFromInt64(int64(len(args[0].Vec))), types.Type{Kind: types.KindDecimal}), true, nil
+	case "vector_norm":
+		norm, err := nsvec.Norm(args[0].Vec)
+		if err != nil {
+			return types.Value{}, true, err
+		}
+		d, err := types.DecimalFromFloat(norm)
+		return d, true, err
+	case "vector_normalize":
+		out, err := nsvec.Normalize(args[0].Vec)
+		if err != nil {
+			return types.Value{}, true, err
+		}
+		return types.VectorValue(out, vectorType), true, nil
+	case "vector_scale":
+		if args[1].Typ.Kind != types.KindDecimal {
+			return types.Value{}, true, nerr.New(nerr.InvalidArgument, "executor.evalVecFn", "VECTOR_SCALE requires a DECIMAL scale")
+		}
+		scalar, err := strconv.ParseFloat(args[1].Dec.String(), 64)
+		if err != nil {
+			return types.Value{}, true, nerr.New(nerr.InvalidArgument, "executor.evalVecFn", "invalid VECTOR_SCALE scale")
+		}
+		out, err := nsvec.Scale(args[0].Vec, scalar)
+		if err != nil {
+			return types.Value{}, true, err
+		}
+		return types.VectorValue(out, vectorType), true, nil
+	}
+	if args[1].Typ.Kind != types.KindVector {
+		return types.Value{}, true, nerr.New(nerr.InvalidArgument, "executor.evalVecFn", name+" requires VECTOR arguments")
+	}
 	if err := nsvec.Check(args[1].Vec, len(args[0].Vec)); err != nil {
 		return types.Value{}, true, err
 	}
-	d, err := types.DecimalFromFloat(nsvec.Similarity(metric, args[0].Vec, args[1].Vec))
-	return d, true, err
+	switch canonical {
+	case "vector_add", "vector_subtract":
+		var out []float32
+		var err error
+		if canonical == "vector_add" {
+			out, err = nsvec.Add(args[0].Vec, args[1].Vec)
+		} else {
+			out, err = nsvec.Sub(args[0].Vec, args[1].Vec)
+		}
+		if err != nil {
+			return types.Value{}, true, err
+		}
+		return types.VectorValue(out, vectorType), true, nil
+	case "l1":
+		value, err := nsvec.L1(args[0].Vec, args[1].Vec)
+		if err != nil {
+			return types.Value{}, true, err
+		}
+		d, err := types.DecimalFromFloat(value)
+		return d, true, err
+	case "cosine_distance":
+		d, err := types.DecimalFromFloat(nsvec.Distance(nsvec.MetricCosine, args[0].Vec, args[1].Vec))
+		return d, true, err
+	default:
+		metric := nsvec.MetricCosine
+		if canonical == "l2" {
+			metric = nsvec.MetricL2
+		} else if canonical == "inner_product" {
+			metric = nsvec.MetricIP
+		}
+		d, err := types.DecimalFromFloat(nsvec.Similarity(metric, args[0].Vec, args[1].Vec))
+		return d, true, err
+	}
+}
+
+func evalSparseVecFn(canonical, name string, args []types.Value, vectorType types.Type) (types.Value, bool, error) {
+	dim := uint32(args[0].Typ.Precision)
+	a, err := valueSparse(args[0], dim)
+	if err != nil {
+		return types.Value{}, true, err
+	}
+	switch canonical {
+	case "vector_dim":
+		d := int64(a.Dim)
+		if d == 0 {
+			d = int64(args[0].Typ.Precision)
+		}
+		return types.DecimalValue(types.DecimalFromInt64(d), types.Type{Kind: types.KindDecimal}), true, nil
+	case "vector_norm":
+		dec, err := types.DecimalFromFloat(nsvec.SparseNorm(a))
+		return dec, true, err
+	case "l1", "l2", "vector_add", "vector_subtract", "vector_normalize", "vector_scale":
+		return types.Value{}, true, nerr.New(nerr.InvalidArgument, "executor.evalSparseVecFn", name+" is not supported on SPARSEVECTOR")
+	}
+	if len(args) != 2 || args[1].Typ.Kind != types.KindVector {
+		return types.Value{}, true, nerr.New(nerr.InvalidArgument, "executor.evalSparseVecFn", name+" requires VECTOR arguments")
+	}
+	b, err := valueSparse(args[1], a.Dim)
+	if err != nil {
+		return types.Value{}, true, err
+	}
+	switch canonical {
+	case "cosine_distance":
+		d, err := types.DecimalFromFloat(nsvec.SparseDistance(nsvec.MetricCosine, a, b))
+		return d, true, err
+	case "cosine":
+		d, err := types.DecimalFromFloat(nsvec.SparseSimilarity(nsvec.MetricCosine, a, b))
+		return d, true, err
+	case "inner_product":
+		d, err := types.DecimalFromFloat(nsvec.SparseDot(a, b))
+		return d, true, err
+	default:
+		return types.Value{}, true, nerr.New(nerr.InvalidArgument, "executor.evalSparseVecFn", name+" is not supported on SPARSEVECTOR")
+	}
 }
 
 func (s *Session) evalLogic(x ast.Binary, tab *catalog.Table, row []types.Value) (types.Value, error) {

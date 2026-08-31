@@ -5,9 +5,6 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/bzync/nextsql/internal/auth"
-	"github.com/bzync/nextsql/internal/nerr"
-	"github.com/bzync/nextsql/internal/security"
 	"github.com/bzync/nextsql/internal/sql/types"
 )
 
@@ -115,99 +112,6 @@ func TestP18SQLGateNullTxnPrepared(t *testing.T) {
 	got = execOK(t, s, `SELECT k FROM p18_src WHERE id = '2'`)
 	if len(got.Rows) != 1 || got.Rows[0][0].Str != "z" {
 		t.Fatalf("committed RETURNING update: %+v", got.Rows)
-	}
-}
-
-func TestP18SQLGateTenantRBAC(t *testing.T) {
-	db := testDB(t)
-	s := db.Session()
-	execOK(t, s, `CREATE TABLE p18_left (id STRING PRIMARY KEY, tenant_id UUID NOT NULL, k STRING, n STRING)`)
-	execOK(t, s, `CREATE TABLE p18_right (id STRING PRIMARY KEY, tenant_id UUID NOT NULL, k STRING, n STRING)`)
-	execOK(t, s, `INSERT INTO p18_left (id, tenant_id, k, n) VALUES
-		('l1', '`+tenantA+`', 'a', 'L'),
-		('l2', '`+tenantB+`', 'a', 'X'),
-		('l3', '`+tenantA+`', NULL, 'N')`)
-	execOK(t, s, `INSERT INTO p18_right (id, tenant_id, k, n) VALUES
-		('r1', '`+tenantA+`', 'a', 'R'),
-		('r2', '`+tenantB+`', 'b', 'Y')`)
-	execOK(t, s, `CREATE INDEX ix_p18_left_k ON p18_left (k) INCLUDE (n)`)
-
-	execOK(t, s, `SET TENANT = '`+tenantA+`'`)
-	got := execOK(t, s, `SELECT DISTINCT k FROM p18_left ORDER BY k`)
-	if len(got.Rows) != 2 || got.Rows[0][0].Str != "a" || !got.Rows[1][0].Null {
-		t.Fatalf("tenant DISTINCT leaked: %+v", got.Rows)
-	}
-	got = execOK(t, s, `SELECT k, COUNT(*) AS total FROM p18_left GROUP BY k HAVING total >= 1 ORDER BY k`)
-	if len(got.Rows) != 2 {
-		t.Fatalf("tenant HAVING leaked: %+v", got.Rows)
-	}
-	got = execOK(t, s, `SELECT n FROM p18_left UNION SELECT n FROM p18_right`)
-	if !strSet(got, "L", "N", "R") {
-		t.Fatalf("tenant UNION leaked: %+v", got.Rows)
-	}
-	got = execOK(t, s, `SELECT k FROM p18_left INTERSECT SELECT k FROM p18_right`)
-	if len(got.Rows) != 1 || got.Rows[0][0].Str != "a" {
-		t.Fatalf("tenant INTERSECT leaked: %+v", got.Rows)
-	}
-	got = execOK(t, s, `SELECT id FROM p18_left WHERE EXISTS (SELECT id FROM p18_right WHERE p18_right.k = p18_left.k)`)
-	if len(got.Rows) != 1 || got.Rows[0][0].Str != "l1" {
-		t.Fatalf("tenant EXISTS leaked: %+v", got.Rows)
-	}
-	got = execOK(t, s, `WITH c AS (SELECT id FROM p18_left) SELECT id FROM c`)
-	if len(got.Rows) != 2 {
-		t.Fatalf("tenant CTE leaked: %+v", got.Rows)
-	}
-	got = execOK(t, s, `SELECT id, ROW_NUMBER() OVER (ORDER BY id) FROM p18_left ORDER BY id`)
-	if len(got.Rows) != 2 || got.Rows[0][0].Str != "l1" || got.Rows[1][0].Str != "l3" {
-		t.Fatalf("tenant window leaked: %+v", got.Rows)
-	}
-	execOK(t, s, `UPSERT INTO p18_left (id, k, n) VALUES ('l4', 'c', 'U') RETURNING id`)
-	got = execOK(t, s, `SELECT id FROM p18_left WHERE id = 'l4'`)
-	if len(got.Rows) != 1 {
-		t.Fatalf("tenant UPSERT: %+v", got.Rows)
-	}
-	execOK(t, s, `RESET TENANT`)
-
-	acl, err := security.CreateACL(filepath.Join(t.TempDir(), "acl"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	users, err := auth.Create(filepath.Join(t.TempDir(), "users"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := users.Upsert("dba", "s3cret"); err != nil {
-		t.Fatal(err)
-	}
-	if err := acl.Grant("dba", security.PrivAdmin, security.ScopeCluster, ""); err != nil {
-		t.Fatal(err)
-	}
-	admin := db.Session()
-	admin.SetIdentity("dba")
-	admin.SetACL(acl)
-	admin.SetAuth(users)
-	execOK(t, admin, `CREATE USER app IDENTIFIED BY 'pw'`)
-	execOK(t, admin, `GRANT SELECT ON TABLE p18_left TO app`)
-	app := db.Session()
-	app.SetIdentity("app")
-	app.SetACL(acl)
-	execOK(t, app, `SET TENANT = '`+tenantA+`'`)
-	if _, err := app.Exec(`SELECT n FROM p18_left UNION SELECT n FROM p18_right`); !nerr.HasCode(err, nerr.Forbidden) {
-		t.Fatalf("UNION must require both arms: %v", err)
-	}
-	if _, err := app.Exec(`SELECT id FROM p18_left WHERE EXISTS (SELECT id FROM p18_right)`); !nerr.HasCode(err, nerr.Forbidden) {
-		t.Fatalf("EXISTS must require inner SELECT: %v", err)
-	}
-	if _, err := app.Exec(`SELECT k FROM p18_left INTERSECT SELECT k FROM p18_right`); !nerr.HasCode(err, nerr.Forbidden) {
-		t.Fatalf("INTERSECT must require both arms: %v", err)
-	}
-	execOK(t, admin, `GRANT SELECT ON TABLE p18_right TO app`)
-	got = execOK(t, app, `SELECT n FROM p18_left UNION SELECT n FROM p18_right`)
-	if !strSet(got, "L", "N", "R", "U") {
-		t.Fatalf("granted tenant UNION: %+v", got.Rows)
-	}
-	if _, err := app.Exec(`UPSERT INTO p18_left (id, k, n) VALUES ('l5', 'd', 'Z')`); !nerr.HasCode(err, nerr.Forbidden) {
-		t.Fatalf("UPSERT must require INSERT/UPDATE: %v", err)
 	}
 }
 

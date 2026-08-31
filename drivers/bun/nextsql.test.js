@@ -2,16 +2,22 @@ import { expect, test } from 'bun:test';
 import {
   Kind,
   NextSQLError,
+  ReadConsistency,
   connect,
+  connectCluster,
   decodeDecimal,
   decodeHelloOK,
   decodeNSJB,
+  decodeNodeStatus,
   decodeValue,
   encodeDecimalString,
   encodeHello,
   encodeParam,
+  encodeSetReadConsistency,
   formatUUID,
   isLoopback,
+  isReadOnlySQL,
+  txnControl,
   validateConfig,
 } from './nextsql.js';
 
@@ -101,4 +107,45 @@ test('point param', () => {
   expect(got.kind).toBe(Kind.Point);
   expect(Math.abs(got.value.lon + 73.98)).toBeLessThan(1e-9);
   expect(Math.abs(got.value.lat - 40.75)).toBeLessThan(1e-9);
+});
+
+test('follower-read routing classifiers', () => {
+  for (const s of ['SELECT 1', '  select n from t', '\n-- c\nSELECT n FROM t', 'SHOW TASKS', 'WITH c AS (SELECT n FROM t) SELECT n FROM c']) {
+    expect(isReadOnlySQL(s)).toBe(true);
+  }
+  for (const s of ["INSERT INTO t (n) VALUES ('x')", 'UPDATE t SET n = 1', 'DELETE FROM t', "UPSERT INTO t (id) VALUES ('x')", 'EXPLAIN ANALYZE SELECT n FROM t', 'BEGIN']) {
+    expect(isReadOnlySQL(s)).toBe(false);
+  }
+  expect(txnControl('  begin transaction ')).toEqual({ begin: true, end: false });
+  expect(txnControl('rollback')).toEqual({ begin: false, end: true });
+  expect(txnControl('SELECT 1')).toEqual({ begin: false, end: false });
+});
+
+test('SetReadConsistency / NodeStatus wire codec', () => {
+  const b = encodeSetReadConsistency(ReadConsistency.Bounded, 2500);
+  expect(b.length).toBe(9);
+  expect(b[0]).toBe(1);
+  expect(new DataView(b.buffer, b.byteOffset).getBigUint64(1, true)).toBe(2500n);
+  expect(() => encodeSetReadConsistency(9, 0)).toThrow(NextSQLError);
+
+  const role = new TextEncoder().encode('follower');
+  const buf = new Uint8Array(2 + role.length + 25);
+  const dv = new DataView(buf.buffer);
+  dv.setUint16(0, role.length, true);
+  buf.set(role, 2);
+  const off = 2 + role.length;
+  buf[off] = 0x03;
+  dv.setBigUint64(off + 1, 99n, true);
+  dv.setBigInt64(off + 9, 4n, true);
+  dv.setBigUint64(off + 17, 0n, true);
+  const st = decodeNodeStatus(buf);
+  expect(st.role).toBe('follower');
+  expect(st.hasLeader).toBe(true);
+  expect(st.healthy).toBe(true);
+  expect(st.appliedLSN).toBe(99n);
+  expect(st.lastContactMs).toBe(4n);
+});
+
+test('connectCluster requires an address', async () => {
+  await expect(connectCluster({ user: 'app', tls: {} })).rejects.toBeInstanceOf(NextSQLError);
 });

@@ -12,16 +12,25 @@ import (
 
 const (
 	tableMagic     = "NSCT"
-	tableVersion   = 4
+	tableVersion   = 9
 	tableVersionV1 = 1
 	tableVersionV2 = 2
 	tableVersionV3 = 3
+	tableVersionV4 = 4
+	tableVersionV5 = 5
+	tableVersionV6 = 6
+	tableVersionV7 = 7
+	tableVersionV8 = 8
 	// KeyTable prefixes durable table descriptors in the catalog tree.
 	KeyTable byte = 'T'
 	// KeyStats prefixes durable table statistics in the catalog tree.
 	KeyStats byte = 'S'
 	// KeyAI prefixes per-column AUTOINCREMENT high-water values in the catalog tree.
 	KeyAI byte = 'A'
+	// KeyPartitionStats prefixes per-physical-partition ANALYZE sketches. The
+	// table/partition identities in the key are immutable, so table renames do
+	// not require rewriting these records.
+	KeyPartitionStats byte = 'J'
 )
 
 func TableKey(name string) []byte {
@@ -36,6 +45,30 @@ func StatsKey(name string) []byte {
 	k[0] = KeyStats
 	copy(k[1:], name)
 	return k
+}
+
+// PartitionStatsKey addresses one versioned partition statistics record.
+func PartitionStatsKey(tableID, partitionID uint32) []byte {
+	k := make([]byte, 1+4+4)
+	k[0] = KeyPartitionStats
+	encoding.PutU32(k, 1, tableID)
+	encoding.PutU32(k, 5, partitionID)
+	return k
+}
+
+// PartitionStatsRange returns the catalog-key interval for one stable table
+// identity. It remains valid for the maximum uint32 table identity.
+func PartitionStatsRange(tableID uint32) ([]byte, []byte) {
+	start := make([]byte, 1+4)
+	start[0] = KeyPartitionStats
+	encoding.PutU32(start, 1, tableID)
+	if tableID == ^uint32(0) {
+		return start, []byte{KeyPartitionStats + 1}
+	}
+	end := make([]byte, 1+4)
+	end[0] = KeyPartitionStats
+	encoding.PutU32(end, 1, tableID+1)
+	return start, end
 }
 
 // AIKey is the catalog-tree key for the next AI() value of one column.
@@ -91,7 +124,49 @@ func EncodeTable(t *Table) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	// v6: one HNSW traversal-quantisation byte per index, in Indexes order.
+	for _, idx := range t.Indexes {
+		buf = append(buf, idx.VecQuant)
+	}
+	// v7: per index, the vector ANN method plus IVF list/probe counts.
+	for _, idx := range t.Indexes {
+		buf = append(buf, idx.VecMethod)
+		buf = appendU32(buf, idx.IVFLists)
+		buf = appendU32(buf, idx.IVFProbes)
+	}
+	// v8: per index, the IVF-PQ product-quantisation subspace count.
+	for _, idx := range t.Indexes {
+		buf = appendU32(buf, idx.IVFSubspaces)
+	}
+	// v9: per index, the full-text analyzer id + revision.
+	for _, idx := range t.Indexes {
+		if !validFTMeta(idx) {
+			return nil, nerr.New(nerr.InvalidArgument, "catalog.EncodeTable", "invalid full-text analyzer")
+		}
+		buf = append(buf, idx.FTAnalyzer)
+		buf = appendU16(buf, idx.FTVersion)
+	}
 	return buf, nil
+}
+
+func validFTMeta(idx Index) bool {
+	if !idx.Fulltext {
+		return idx.FTAnalyzer == 0 && idx.FTVersion == 0
+	}
+	switch idx.FTAnalyzer {
+	case FTAnalyzerSimple:
+		return idx.FTVersion <= 1
+	case FTAnalyzerEnglish:
+		return idx.FTVersion == FTAnalyzerEnglishV1 || idx.FTVersion == FTAnalyzerEnglishV2 || idx.FTVersion == FTAnalyzerEnglishV3
+	case FTAnalyzerFrench:
+		return idx.FTVersion == FTAnalyzerFrenchV1
+	case FTAnalyzerGerman:
+		return idx.FTVersion == FTAnalyzerGermanV1
+	case FTAnalyzerSpanish:
+		return idx.FTVersion == FTAnalyzerSpanishV1
+	default:
+		return false
+	}
 }
 
 func DecodeTable(raw []byte) (*Table, error) {
@@ -103,7 +178,7 @@ func DecodeTable(raw []byte) (*Table, error) {
 	if err != nil {
 		return nil, err
 	}
-	if ver != tableVersionV1 && ver != tableVersionV2 && ver != tableVersionV3 && ver != tableVersion {
+	if ver != tableVersionV1 && ver != tableVersionV2 && ver != tableVersionV3 && ver != tableVersionV4 && ver != tableVersionV5 && ver != tableVersionV6 && ver != tableVersionV7 && ver != tableVersionV8 && ver != tableVersion {
 		return nil, nerr.New(nerr.InvalidFormat, "catalog.DecodeTable", "unsupported catalog version")
 	}
 	t := &Table{}
@@ -207,17 +282,133 @@ func DecodeTable(raw []byte) (*Table, error) {
 		}
 		return t, nil
 	}
-	t.Partitioning, off, err = takePartitioning(raw, off, t)
+	t.Partitioning, off, err = takePartitioning(raw, off, t, ver)
 	if err != nil {
 		return nil, err
 	}
 	if err := ValidatePartitioning(t); err != nil {
 		return nil, nerr.Wrap(nerr.InvalidFormat, "catalog.DecodeTable", "invalid partition descriptor", err)
 	}
+	if ver >= tableVersionV6 {
+		for i := range t.Indexes {
+			if off >= len(raw) {
+				return nil, nerr.New(nerr.InvalidFormat, "catalog.DecodeTable", "truncated index quantisation")
+			}
+			q := raw[off]
+			off++
+			if q != 0 && q != types.VecF16 && q != types.VecI8 {
+				return nil, nerr.New(nerr.InvalidFormat, "catalog.DecodeTable", "bad index quantisation")
+			}
+			t.Indexes[i].VecQuant = q
+		}
+	}
+	if ver >= tableVersionV7 {
+		for i := range t.Indexes {
+			if off >= len(raw) {
+				return nil, nerr.New(nerr.InvalidFormat, "catalog.DecodeTable", "truncated index method")
+			}
+			m := raw[off]
+			off++
+			if m != VecMethodHNSW && m != VecMethodIVF && m != VecMethodIVFPQ && m != VecMethodSPARSE {
+				return nil, nerr.New(nerr.InvalidFormat, "catalog.DecodeTable", "bad vector index method")
+			}
+			if m == VecMethodIVFPQ && ver < tableVersionV8 {
+				return nil, nerr.New(nerr.InvalidFormat, "catalog.DecodeTable", "IVF-PQ method requires catalog format v8")
+			}
+			if m == VecMethodSPARSE && ver < tableVersionV7 {
+				return nil, nerr.New(nerr.InvalidFormat, "catalog.DecodeTable", "SPARSE method requires catalog format v7")
+			}
+			var lists, probes uint32
+			lists, off, err = takeU32(raw, off)
+			if err != nil {
+				return nil, err
+			}
+			probes, off, err = takeU32(raw, off)
+			if err != nil {
+				return nil, err
+			}
+			if m == VecMethodIVF || m == VecMethodIVFPQ {
+				if !t.Indexes[i].Vector {
+					return nil, nerr.New(nerr.InvalidFormat, "catalog.DecodeTable", "IVF method on a non-vector index")
+				}
+				if lists == 0 || lists > MaxVectorIndexLists || probes > lists {
+					return nil, nerr.New(nerr.InvalidFormat, "catalog.DecodeTable", "bad IVF list/probe count")
+				}
+			} else if lists != 0 || probes != 0 {
+				return nil, nerr.New(nerr.InvalidFormat, "catalog.DecodeTable", "non-IVF index carries IVF parameters")
+			}
+			if m == VecMethodSPARSE {
+				if !t.Indexes[i].Vector {
+					return nil, nerr.New(nerr.InvalidFormat, "catalog.DecodeTable", "SPARSE method on a non-vector index")
+				}
+				col := t.Indexes[i].Columns
+				if len(col) != 1 || col[0] < 0 || col[0] >= len(t.Columns) || t.Columns[col[0]].Type.VecElem != types.VecSparse {
+					return nil, nerr.New(nerr.InvalidFormat, "catalog.DecodeTable", "SPARSE index requires a SPARSEVECTOR column")
+				}
+			}
+			t.Indexes[i].VecMethod = m
+			t.Indexes[i].IVFLists = lists
+			t.Indexes[i].IVFProbes = probes
+		}
+	}
+	if ver >= tableVersionV8 {
+		for i := range t.Indexes {
+			var subs uint32
+			subs, off, err = takeU32(raw, off)
+			if err != nil {
+				return nil, err
+			}
+			if t.Indexes[i].VecMethod == VecMethodIVFPQ {
+				dim := indexVectorDim(t, i)
+				if subs == 0 || subs > MaxVectorIndexSubspaces || dim == 0 || dim%int(subs) != 0 {
+					return nil, nerr.New(nerr.InvalidFormat, "catalog.DecodeTable", "bad IVF-PQ subspace count")
+				}
+			} else if subs != 0 {
+				return nil, nerr.New(nerr.InvalidFormat, "catalog.DecodeTable", "non-IVFPQ index carries a subspace count")
+			}
+			t.Indexes[i].IVFSubspaces = subs
+		}
+	}
+	if ver >= tableVersion {
+		for i := range t.Indexes {
+			if off >= len(raw) {
+				return nil, nerr.New(nerr.InvalidFormat, "catalog.DecodeTable", "truncated full-text analyzer")
+			}
+			id := raw[off]
+			off++
+			var veru uint16
+			veru, off, err = takeU16(raw, off)
+			if err != nil {
+				return nil, err
+			}
+			t.Indexes[i].FTAnalyzer = id
+			t.Indexes[i].FTVersion = veru
+			if !validFTMeta(t.Indexes[i]) {
+				return nil, nerr.New(nerr.InvalidFormat, "catalog.DecodeTable", "bad full-text analyzer")
+			}
+		}
+	}
 	if off != len(raw) {
 		return nil, nerr.New(nerr.InvalidFormat, "catalog.DecodeTable", "trailing catalog bytes")
 	}
 	return t, nil
+}
+
+// indexVectorDim returns the declared dimension of index i's vector column, or 0
+// when the index is not a single-column vector index.
+func indexVectorDim(t *Table, i int) int {
+	if i < 0 || i >= len(t.Indexes) {
+		return 0
+	}
+	idx := t.Indexes[i]
+	if !idx.Vector || len(idx.Columns) != 1 {
+		return 0
+	}
+	c := idx.Columns[0]
+	if c < 0 || c >= len(t.Columns) {
+		return 0
+	}
+	return int(t.Columns[c].Type.Precision)
 }
 
 func appendPartitioning(buf []byte, t *Table) ([]byte, error) {
@@ -265,10 +456,19 @@ func appendPartitioning(buf []byte, t *Table) ([]byte, error) {
 			buf = appendBytes(buf, raw)
 		}
 	}
+	nextID := p.NextID
+	if nextID == 0 {
+		for _, part := range p.Partitions {
+			if part.ID >= nextID {
+				nextID = part.ID + 1
+			}
+		}
+	}
+	buf = appendU32(buf, nextID)
 	return buf, nil
 }
 
-func takePartitioning(raw []byte, off int, t *Table) (*Partitioning, int, error) {
+func takePartitioning(raw []byte, off int, t *Table, version uint16) (*Partitioning, int, error) {
 	if off >= len(raw) {
 		return nil, 0, nerr.New(nerr.InvalidFormat, "catalog.takePartitioning", "truncated partition kind")
 	}
@@ -277,7 +477,7 @@ func takePartitioning(raw []byte, off int, t *Table) (*Partitioning, int, error)
 	if kind == PartitionNone {
 		return nil, off, nil
 	}
-	if kind < PartitionRange || kind > PartitionTenant {
+	if kind < PartitionRange || kind > PartitionLegacyTenant {
 		return nil, 0, nerr.New(nerr.InvalidFormat, "catalog.takePartitioning", "unknown partition kind")
 	}
 	p := &Partitioning{Kind: kind}
@@ -386,6 +586,21 @@ func takePartitioning(raw []byte, off int, t *Table) (*Partitioning, int, error)
 			part.Values = append(part.Values, tuple)
 		}
 		p.Partitions = append(p.Partitions, part)
+	}
+	if version >= tableVersionV5 {
+		p.NextID, off, err = takeU32(raw, off)
+		if err != nil {
+			return nil, 0, err
+		}
+		if p.NextID == 0 {
+			return nil, 0, nerr.New(nerr.InvalidFormat, "catalog.takePartitioning", "zero next partition identity")
+		}
+	} else {
+		for _, part := range p.Partitions {
+			if part.ID >= p.NextID {
+				p.NextID = part.ID + 1
+			}
+		}
 	}
 	return p, off, nil
 }

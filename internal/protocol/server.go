@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"log/slog"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
@@ -14,6 +15,7 @@ import (
 	"github.com/bzync/nextsql/internal/crypto"
 	"github.com/bzync/nextsql/internal/executor"
 	"github.com/bzync/nextsql/internal/nerr"
+	"github.com/bzync/nextsql/internal/replication"
 	"github.com/bzync/nextsql/internal/security"
 	"github.com/bzync/nextsql/internal/sql/types"
 )
@@ -22,6 +24,7 @@ import (
 type Server struct {
 	DB       *executor.DB
 	Auth     *auth.Store
+	Tokens   *auth.TokenVerifier
 	ACL      *security.ACL
 	Audit    *security.Log
 	Registry *security.Registry
@@ -32,10 +35,14 @@ type Server struct {
 	Tasks    *executor.TaskRuntime
 
 	RequireClientKey bool
-	Unlock           func(*crypto.DEK) error
+	// RequireServiceIdentity binds the verified client-certificate URI
+	// nextsql://service/<principal> to Hello.User before password/RBAC checks.
+	RequireServiceIdentity bool
+	Unlock                 func(*crypto.DEK) error
 
 	mu       sync.Mutex
 	ln       net.Listener
+	conns    map[net.Conn]struct{}
 	backends map[uint64]*backend
 	nconn    int
 	closed   bool
@@ -104,6 +111,7 @@ func NewServer(db *executor.DB, users *auth.Store) *Server {
 		DB:       db,
 		Auth:     users,
 		Limits:   DefaultLimits(),
+		conns:    make(map[net.Conn]struct{}),
 		backends: make(map[uint64]*backend),
 	}
 }
@@ -160,6 +168,10 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 			continue
 		}
 		s.nconn++
+		if s.conns == nil {
+			s.conns = make(map[net.Conn]struct{})
+		}
+		s.conns[conn] = struct{}{}
 		s.mu.Unlock()
 		go s.serveConn(ctx, conn)
 	}
@@ -205,6 +217,10 @@ func (s *Server) Close() error {
 	ln := s.ln
 	tasks := s.Tasks
 	s.Tasks = nil
+	connections := make([]net.Conn, 0, len(s.conns))
+	for conn := range s.conns {
+		connections = append(connections, conn)
+	}
 	for _, b := range s.backends {
 		b.mu.Lock()
 		if b.cancel != nil {
@@ -213,6 +229,9 @@ func (s *Server) Close() error {
 		b.mu.Unlock()
 	}
 	s.mu.Unlock()
+	for _, conn := range connections {
+		_ = conn.Close()
+	}
 	if tasks != nil {
 		_ = tasks.Close()
 	}
@@ -220,6 +239,26 @@ func (s *Server) Close() error {
 		return ln.Close()
 	}
 	return nil
+}
+
+// TerminateConnections closes every accepted connection, including TLS
+// handshakes that have not authenticated yet. Security reloads use this after
+// publishing new mTLS trust/revocation state so no in-flight connection can
+// become a session under the previous snapshot.
+func (s *Server) TerminateConnections() int {
+	if s == nil {
+		return 0
+	}
+	s.mu.Lock()
+	connections := make([]net.Conn, 0, len(s.conns))
+	for conn := range s.conns {
+		connections = append(connections, conn)
+	}
+	s.mu.Unlock()
+	for _, conn := range connections {
+		_ = conn.Close()
+	}
+	return len(connections)
 }
 
 // SetTaskRuntime attaches the database's bounded automation runtime. Replacing
@@ -241,6 +280,7 @@ func (s *Server) serveConn(ctx context.Context, conn net.Conn) {
 	defer func() {
 		_ = conn.Close()
 		s.mu.Lock()
+		delete(s.conns, conn)
 		s.nconn--
 		s.mu.Unlock()
 	}()
@@ -266,6 +306,21 @@ func (s *Server) serveConn(ctx context.Context, conn net.Conn) {
 	if hello.Version != 0 && hello.Version != Version {
 		s.writeErr(conn, nerr.New(nerr.Protocol, "protocol", "unsupported protocol version"), lim)
 		return
+	}
+	identitySource := "native"
+	if s.RequireServiceIdentity {
+		identitySource = "mtls+native"
+		tlsConn, ok := conn.(*tls.Conn)
+		if !ok {
+			s.auditAuth(hello.User, false, "mtls", "connect", conn.RemoteAddr().String())
+			s.writeErr(conn, nerr.New(nerr.Unauthorized, "protocol", "verified client certificate required"), lim)
+			return
+		}
+		if err := matchServiceIdentity(tlsConn.ConnectionState(), hello.User); err != nil {
+			s.auditAuth(hello.User, false, "mtls", "connect", conn.RemoteAddr().String())
+			s.writeErr(conn, nerr.New(nerr.Unauthorized, "protocol", "client certificate identity does not match requested user"), lim)
+			return
+		}
 	}
 	if s.Database != "" && hello.Database != "" && hello.Database != s.Database {
 		s.writeErr(conn, nerr.New(nerr.NotFound, "protocol", "unknown database"), lim)
@@ -304,20 +359,40 @@ func (s *Server) serveConn(ctx context.Context, conn net.Conn) {
 		s.writeErr(conn, nerr.New(nerr.Unavailable, "protocol", "authentication is not configured"), lim)
 		return
 	}
-	if err := s.Auth.Verify(hello.User, authMsg.Password); err != nil {
-		s.log().Info("authentication failed", "user", hello.User)
-		if s.Audit != nil {
-			s.Audit.Record(security.Event{Actor: hello.User, Action: security.ActionAuthFailure, Outcome: "failure", Remote: conn.RemoteAddr().String()})
+	var tokenClaims *auth.TokenClaims
+	if s.Tokens != nil && auth.LooksLikeToken(authMsg.Password) {
+		claims, err := s.Tokens.Verify(authMsg.Password)
+		if err == nil && !strings.EqualFold(strings.TrimSpace(claims.Principal), strings.TrimSpace(hello.User)) {
+			err = nerr.New(nerr.Unauthorized, "protocol", "credential principal mismatch")
 		}
+		if err == nil && !s.Auth.Has(claims.Principal) {
+			err = nerr.New(nerr.Unauthorized, "protocol", "unknown credential principal")
+		}
+		if err == nil && claims.Database != "" && s.Database != "" && !strings.EqualFold(claims.Database, s.Database) {
+			err = nerr.New(nerr.Unauthorized, "protocol", "credential database scope mismatch")
+		}
+		identitySource = tokenIdentitySource(identitySource)
+		if err != nil {
+			s.log().Info("authentication failed", "user", hello.User)
+			s.auditAuth(hello.User, false, identitySource, "", conn.RemoteAddr().String())
+			s.writeErr(conn, nerr.New(nerr.Unauthorized, "protocol", "authentication failed"), lim)
+			return
+		}
+		tokenClaims = claims
+	} else if err := s.Auth.Verify(hello.User, authMsg.Password); err != nil {
+		s.log().Info("authentication failed", "user", hello.User)
+		s.auditAuth(hello.User, false, identitySource, "", conn.RemoteAddr().String())
 		s.writeErr(conn, err, lim)
 		return
 	}
-	if s.ACL != nil && !s.ACL.Allowed(hello.User, security.PrivConnect, security.ScopeDatabase, s.Database) &&
-		!s.ACL.Allowed(hello.User, security.PrivAdmin, security.ScopeCluster, "") {
+	var tokenRoles []string
+	if tokenClaims != nil {
+		tokenRoles = tokenClaims.Roles
+	}
+	if s.ACL != nil && !s.ACL.AllowedScoped(hello.User, tokenRoles, security.PrivConnect, security.ScopeDatabase, s.Database) &&
+		!s.ACL.AllowedScoped(hello.User, tokenRoles, security.PrivAdmin, security.ScopeCluster, "") {
 		s.log().Info("authentication failed", "user", hello.User)
-		if s.Audit != nil {
-			s.Audit.Record(security.Event{Actor: hello.User, Action: security.ActionAuthFailure, Object: "connect", Outcome: "failure", Remote: conn.RemoteAddr().String()})
-		}
+		s.auditAuth(hello.User, false, identitySource, "connect", conn.RemoteAddr().String())
 		s.writeErr(conn, nerr.New(nerr.Forbidden, "protocol", "permission denied"), lim)
 		return
 	}
@@ -349,6 +424,15 @@ func (s *Server) serveConn(ctx context.Context, conn net.Conn) {
 	}
 	b.sess.SetLimits(lim.Query)
 	b.sess.SetIdentity(hello.User)
+	if tokenClaims != nil {
+		b.sess.SetAuthRoles(tokenClaims.Roles)
+		d := time.Until(tokenClaims.ExpiresAt)
+		if d < time.Millisecond {
+			d = time.Millisecond
+		}
+		expiry := time.AfterFunc(d, b.kill)
+		defer expiry.Stop()
+	}
 	b.sess.SetACL(s.ACL)
 	b.sess.SetAudit(s.Audit)
 	b.sess.SetAuth(s.Auth)
@@ -369,9 +453,7 @@ func (s *Server) serveConn(ctx context.Context, conn net.Conn) {
 		s.mu.Unlock()
 	}()
 
-	if s.Audit != nil {
-		s.Audit.Record(security.Event{Actor: hello.User, Action: security.ActionAuthSuccess, Outcome: "success", Remote: conn.RemoteAddr().String()})
-	}
+	s.auditAuth(hello.User, true, identitySource, "", conn.RemoteAddr().String())
 	s.log().Info("session authenticated", "user", hello.User)
 	for {
 		_ = conn.SetDeadline(time.Now().Add(lim.Idle))
@@ -392,6 +474,13 @@ func (s *Server) serveConn(ctx context.Context, conn net.Conn) {
 				continue
 			}
 			s.runSQL(ctx, conn, b, q.SQL, q.Params, lim)
+		case TypeIdempotentQuery:
+			q, err := DecodeIdempotentQuery(payload, lim)
+			if err != nil {
+				s.writeErrReady(conn, err, lim)
+				continue
+			}
+			s.runIdempotentSQL(ctx, conn, b, q, lim)
 		case TypePrepare:
 			sql, err := DecodePrepare(payload, lim)
 			if err != nil {
@@ -443,12 +532,115 @@ func (s *Server) serveConn(ctx context.Context, conn net.Conn) {
 			if err := WriteFrame(conn, TypeReady, nil, lim.MaxPacket); err != nil {
 				return
 			}
+		case TypeSetReadConsistency:
+			m, err := DecodeSetReadConsistency(payload)
+			if err != nil {
+				s.writeErrReady(conn, err, lim)
+				continue
+			}
+			if err := applyReadConsistency(b.sess, m); err != nil {
+				s.writeErrReady(conn, err, lim)
+				continue
+			}
+			if err := WriteFrame(conn, TypeReady, nil, lim.MaxPacket); err != nil {
+				return
+			}
+		case TypeNodeStatus:
+			out, err := EncodeNodeStatus(s.nodeStatus(), lim)
+			if err != nil {
+				s.writeErrReady(conn, err, lim)
+				continue
+			}
+			if err := WriteFrame(conn, TypeNodeStatusResp, out, lim.MaxPacket); err != nil {
+				return
+			}
+			if err := WriteFrame(conn, TypeReady, nil, lim.MaxPacket); err != nil {
+				return
+			}
 		case TypeFlowAck:
 			// stray ack; ignore
 		default:
 			s.writeErrReady(conn, nerr.New(nerr.Protocol, "protocol", "unexpected message type"), lim)
 		}
 	}
+}
+
+func matchServiceIdentity(state tls.ConnectionState, user string) error {
+	serviceUser, err := security.ServiceIdentity(state)
+	if err != nil {
+		return err
+	}
+	if !strings.EqualFold(strings.TrimSpace(user), serviceUser) {
+		return nerr.New(nerr.Unauthorized, "protocol", "client certificate identity does not match requested user")
+	}
+	return nil
+}
+
+// tokenIdentitySource labels an auth that presented a short-lived credential,
+// preserving the mTLS prefix when the connection also carried a client cert.
+func tokenIdentitySource(base string) string {
+	if base == "mtls+native" {
+		return "mtls+token"
+	}
+	return "token"
+}
+
+func (s *Server) auditAuth(actor string, success bool, source, object, remote string) {
+	if s.Audit == nil {
+		return
+	}
+	action := security.ActionAuthFailure
+	outcome := "failure"
+	if success {
+		action = security.ActionAuthSuccess
+		outcome = "success"
+	}
+	s.Audit.Record(security.Event{
+		Actor: actor, Action: action, Object: object, Outcome: outcome, Remote: remote,
+		IdentitySource: source,
+	})
+}
+
+func applyReadConsistency(sess *executor.Session, m SetReadConsistency) error {
+	var mode executor.ReadConsistency
+	switch m.Mode {
+	case ReadModeStrong:
+		mode = executor.ReadStrong
+	case ReadModeBounded:
+		mode = executor.ReadBounded
+	case ReadModeStale:
+		mode = executor.ReadStale
+	default:
+		return nerr.New(nerr.Protocol, "protocol", "unknown read consistency mode")
+	}
+	sess.SetMaxStaleness(time.Duration(m.MaxStalenessMS) * time.Millisecond)
+	return sess.SetReadConsistency(mode)
+}
+
+// nodeStatus returns this server node's key-free replication health for
+// follower-read routing. A server with no attached cluster reports "standalone".
+func (s *Server) nodeStatus() NodeStatus {
+	db := s.DatabaseHandle()
+	if db == nil {
+		return NodeStatus{Role: "shutdown"}
+	}
+	h, ok := db.ClusterHealth()
+	if !ok {
+		return NodeStatus{Role: "standalone", HasLeader: true, Healthy: true}
+	}
+	ns := NodeStatus{
+		Role:         h.Role,
+		HasLeader:    h.HasLeader,
+		Healthy:      h.Healthy,
+		AppliedLSN:   uint64(h.AppliedLSN),
+		ApplyBacklog: h.ApplyBacklog,
+	}
+	if h.LastContact == replication.NeverContacted {
+		ns.LastContactMS = -1
+	} else {
+		ns.LastContactMS = h.LastContact.Milliseconds()
+	}
+	return ns
 }
 
 func (s *Server) handleCancel(conn net.Conn, secret uint64, lim Limits) {
@@ -489,6 +681,36 @@ func (s *Server) runSQL(parent context.Context, conn net.Conn, b *backend, sql s
 		_ = conn.SetDeadline(time.Now().Add(lim.Idle))
 		s.writeErrReady(conn, err, lim)
 		return
+	}
+}
+
+func (s *Server) runIdempotentSQL(parent context.Context, conn net.Conn, b *backend, query IdempotentQuery, lim Limits) {
+	if len(query.SQL) > lim.MaxSQL {
+		s.writeErrReady(conn, nerr.New(nerr.Protocol, "protocol", "SQL exceeds limit"), lim)
+		return
+	}
+	ctx, cancel := context.WithCancel(parent)
+	b.mu.Lock()
+	b.cancel = cancel
+	b.queryConn = conn
+	b.mu.Unlock()
+	defer func() {
+		cancel()
+		b.mu.Lock()
+		b.cancel = nil
+		b.queryConn = nil
+		b.mu.Unlock()
+	}()
+
+	res, err := b.sess.ExecIdempotent(ctx, query.Key, query.SQL, query.Params)
+	_ = conn.SetDeadline(time.Now().Add(lim.Idle))
+	if err != nil {
+		s.writeErrReady(conn, err, lim)
+		return
+	}
+	if err := s.streamResult(conn, res, lim); err != nil {
+		_ = conn.SetDeadline(time.Now().Add(lim.Idle))
+		s.writeErrReady(conn, err, lim)
 	}
 }
 

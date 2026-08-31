@@ -66,6 +66,14 @@ type Status struct {
 	Applied   uint64 `json:"applied_lsn"`
 	Voters    int    `json:"voters"`
 	HasLeader bool   `json:"has_leader"`
+	// ApplyBacklog is the count of Raft log entries known committed but not yet
+	// applied to this node's FSM (0 on the leader and on a caught-up follower).
+	ApplyBacklog uint64 `json:"apply_backlog"`
+	// LastContactMS is the age in milliseconds of the last leader contact: 0 on
+	// the leader, -1 on a follower that has never heard from a leader.
+	LastContactMS int64 `json:"last_contact_ms"`
+	// Healthy reports whether this node is a safe follower-read target now.
+	Healthy bool `json:"healthy"`
 }
 
 // Cluster is one Raft node plus the WAL-batch FSM.
@@ -266,7 +274,7 @@ func (c *Cluster) Replicate(recs []wal.Record) error {
 		return nerr.New(nerr.Unavailable, "replication.Replicate", "cluster is closed")
 	}
 	if c.raft.State() != raft.Leader {
-		return c.notLeader()
+		return c.notLeader("replication.Replicate")
 	}
 	data, err := EncodeCommand(c.dek, recs)
 	if err != nil {
@@ -298,15 +306,15 @@ func (c *Cluster) AllowWrite() error {
 	if c.raft.State() == raft.Leader {
 		return nil
 	}
-	return c.notLeader()
+	return c.notLeader("replication.AllowWrite")
 }
 
-func (c *Cluster) notLeader() error {
+func (c *Cluster) notLeader(op string) error {
 	addr, id := c.raft.LeaderWithID()
 	if addr == "" || id == "" {
-		return nerr.New(nerr.Unavailable, "replication.AllowWrite", "no leader")
+		return nerr.New(nerr.Unavailable, op, "no leader")
 	}
-	return nerr.New(nerr.Unavailable, "replication.AllowWrite", "not the leader")
+	return nerr.New(nerr.Unavailable, op, "not the leader")
 }
 
 func (c *Cluster) IsLeader() bool {
@@ -409,6 +417,14 @@ func (c *Cluster) Status() Status {
 	st.HasLeader = id != ""
 	st.Applied = uint64(c.AppliedLSN())
 	st.Voters = c.Voters()
+	h := c.ReplicaHealth()
+	st.ApplyBacklog = h.ApplyBacklog
+	st.Healthy = h.Healthy
+	if h.LastContact == NeverContacted {
+		st.LastContactMS = -1
+	} else {
+		st.LastContactMS = h.LastContact.Milliseconds()
+	}
 	return st
 }
 

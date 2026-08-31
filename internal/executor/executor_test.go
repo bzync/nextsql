@@ -14,10 +14,14 @@ import (
 
 	"github.com/bzync/nextsql/internal/crypto"
 	"github.com/bzync/nextsql/internal/executor/vector"
+	"github.com/bzync/nextsql/internal/float16"
+	"github.com/bzync/nextsql/internal/fulltext"
+	"github.com/bzync/nextsql/internal/int8vec"
 	"github.com/bzync/nextsql/internal/nerr"
 	"github.com/bzync/nextsql/internal/scheduler"
 	"github.com/bzync/nextsql/internal/sql/types"
 	"github.com/bzync/nextsql/internal/storage"
+	"github.com/bzync/nextsql/internal/storage/format"
 	"github.com/bzync/nextsql/internal/wal"
 )
 
@@ -72,6 +76,40 @@ func execOK(t *testing.T, s *Session, sql string) *Result {
 		t.Fatalf("%s: %v", sql, err)
 	}
 	return res
+}
+
+func TestStorageCapRejectsGrowthNotDeletes(t *testing.T) {
+	db := testDB(t)
+	s := db.Session()
+	execOK(t, s, `CREATE TABLE t (id UUID PRIMARY KEY DEFAULT UUID(), body STRING NOT NULL)`)
+	// Seed a little data, then cap the file just above its current size.
+	for i := 0; i < 20; i++ {
+		execOK(t, s, `INSERT INTO t (body) VALUES ('seed-row-padding-padding-padding')`)
+	}
+	base := uint64(db.Eng.Alloc.Next())
+	db.SetStorageCapBytes((base + 8) * uint64(format.PhysicalPageSize))
+
+	// INSERT eventually fails once the file needs to grow past the cap.
+	var insertErr error
+	for i := 0; i < 5000; i++ {
+		if _, insertErr = s.Exec(`INSERT INTO t (body) VALUES ('more-more-more-more-more-more-more-more')`); insertErr != nil {
+			break
+		}
+	}
+	if !nerr.HasCode(insertErr, nerr.Exhausted) {
+		t.Fatalf("expected storage cap exhaustion, got %v", insertErr)
+	}
+
+	// DELETE still works at the cap (it does not grow the data file).
+	if _, err := s.Exec(`DELETE FROM t`); err != nil {
+		t.Fatalf("DELETE at cap: %v", err)
+	}
+
+	// Lifting the cap restores INSERT.
+	db.SetStorageCapBytes(0)
+	if _, err := s.Exec(`INSERT INTO t (body) VALUES ('after-cap-lifted')`); err != nil {
+		t.Fatalf("INSERT after cap lifted: %v", err)
+	}
 }
 
 func TestStatementsAndRestart(t *testing.T) {
@@ -630,6 +668,29 @@ func TestGeospatialLinePolygonRestart(t *testing.T) {
 	got := execOK(t, s, `SELECT ST_Length(route) FROM shapes`)
 	if len(got.Rows) != 1 {
 		t.Fatal(len(got.Rows))
+	}
+	rich := execOK(t, s, `SELECT
+		ST_Intersects(route, zone),
+		ST_Area(zone),
+		ST_Perimeter(zone),
+		ST_Centroid(zone),
+		ST_Envelope(route),
+		ST_GeometryType(zone),
+		ST_NPoints(route),
+		ST_NRings(zone),
+		DISTANCE(route, zone)
+		FROM shapes`)
+	if len(rich.Rows) != 1 || !rich.Rows[0][0].Bool || rich.Rows[0][5].Str != "POLYGON" ||
+		rich.Rows[0][6].Dec.String() != "2" || rich.Rows[0][7].Dec.String() != "1" ||
+		rich.Rows[0][8].Dec.String() != "0.000" {
+		t.Fatalf("rich geo result: %+v", rich.Rows)
+	}
+	if !rich.Rows[0][3].IsPoint() || !rich.Rows[0][4].IsBox() {
+		t.Fatalf("rich geo result types: %+v", rich.Rows[0])
+	}
+	disjoint := execOK(t, s, `SELECT ST_Disjoint(route, 'LINESTRING(0 0, 1 1)') FROM shapes`)
+	if len(disjoint.Rows) != 1 || !disjoint.Rows[0][0].Bool {
+		t.Fatalf("disjoint: %+v", disjoint.Rows)
 	}
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
@@ -1575,6 +1636,210 @@ func TestFulltextSearch(t *testing.T) {
 	}
 }
 
+func TestFulltextEnglishStemming(t *testing.T) {
+	db := testDB(t)
+	s := db.Session()
+	execOK(t, s, `CREATE TABLE articles (
+		id UUID PRIMARY KEY DEFAULT UUID(),
+		title STRING NOT NULL,
+		body TEXT
+	)`)
+	execOK(t, s, `INSERT INTO articles (title, body) VALUES
+		('one', 'the cat sat'),
+		('two', 'running dogs on the mat'),
+		('three', 'dogs only')`)
+	execOK(t, s, `CREATE FULLTEXT INDEX ix_simple ON articles (body)`)
+
+	got := execOK(t, s, `SELECT title FROM articles SEARCH body FOR 'cats'`)
+	if len(got.Rows) != 0 {
+		t.Fatalf("simple analyzer must not stem: %v", titles(got))
+	}
+	got = execOK(t, s, `SELECT title FROM articles SEARCH body FOR 'cat'`)
+	if len(got.Rows) != 1 || got.Rows[0][0].Str != "one" {
+		t.Fatalf("simple cat: %v", titles(got))
+	}
+	got = execOK(t, s, `SELECT title FROM articles SEARCH body FOR 'run'`)
+	if len(got.Rows) != 0 {
+		t.Fatalf("simple run must not match running: %v", titles(got))
+	}
+
+	execOK(t, s, `DROP INDEX ix_simple`)
+	execOK(t, s, `CREATE FULLTEXT INDEX ix_en ON articles (body) WITH (ANALYZER = 'english')`)
+
+	got = execOK(t, s, `SELECT title FROM articles SEARCH body FOR 'cats'`)
+	if len(got.Rows) != 1 || got.Rows[0][0].Str != "one" {
+		t.Fatalf("english cats: %v", titles(got))
+	}
+	got = execOK(t, s, `SELECT title FROM articles SEARCH body FOR 'running'`)
+	if len(got.Rows) != 1 || got.Rows[0][0].Str != "two" {
+		t.Fatalf("english running: %v", titles(got))
+	}
+	got = execOK(t, s, `SELECT title FROM articles SEARCH body FOR '"running dogs"'`)
+	if len(got.Rows) != 1 || got.Rows[0][0].Str != "two" {
+		t.Fatalf("english phrase: %v", titles(got))
+	}
+
+	plan := execOK(t, s, `EXPLAIN SELECT title FROM articles SEARCH body FOR 'cats'`)
+	if !explainHas(plan, "Search") || !explainHas(plan, "ix_en") || !explainHas(plan, "analyzer=english") {
+		t.Fatalf("plan: %+v", explainOps(plan))
+	}
+}
+
+func TestFulltextEnglishStopWords(t *testing.T) {
+	db := testDB(t)
+	s := db.Session()
+	execOK(t, s, `CREATE TABLE articles (
+		id UUID PRIMARY KEY DEFAULT UUID(),
+		title STRING NOT NULL,
+		body TEXT
+	)`)
+	execOK(t, s, `INSERT INTO articles (title, body) VALUES
+		('one', 'the cat sat'),
+		('two', 'the cat sat on the mat'),
+		('three', 'dogs only')`)
+	execOK(t, s, `CREATE FULLTEXT INDEX ix_simple ON articles (body)`)
+
+	got := execOK(t, s, `SELECT title FROM articles SEARCH body FOR 'the'`)
+	if len(got.Rows) != 2 {
+		t.Fatalf("simple must index the: %v", titles(got))
+	}
+
+	execOK(t, s, `DROP INDEX ix_simple`)
+	execOK(t, s, `CREATE FULLTEXT INDEX ix_en ON articles (body) WITH (ANALYZER = 'english')`)
+
+	got = execOK(t, s, `SELECT title FROM articles SEARCH body FOR 'the'`)
+	if len(got.Rows) != 0 {
+		t.Fatalf("english must drop the: %v", titles(got))
+	}
+	got = execOK(t, s, `SELECT title FROM articles SEARCH body FOR 'the cat'`)
+	if len(got.Rows) != 2 {
+		t.Fatalf("english the cat: %v", titles(got))
+	}
+	got = execOK(t, s, `SELECT title FROM articles SEARCH body FOR '"the cat sat"'`)
+	if len(got.Rows) != 2 {
+		t.Fatalf("english phrase with stops: %v", titles(got))
+	}
+	got = execOK(t, s, `SELECT title FROM articles SEARCH body FOR '"cat sat"'`)
+	if len(got.Rows) != 2 {
+		t.Fatalf("english phrase remaining terms: %v", titles(got))
+	}
+}
+
+func TestFulltextEnglishSynonyms(t *testing.T) {
+	db := testDB(t)
+	s := db.Session()
+	execOK(t, s, `CREATE TABLE articles (
+		id UUID PRIMARY KEY DEFAULT UUID(),
+		title STRING NOT NULL,
+		body TEXT
+	)`)
+	execOK(t, s, `INSERT INTO articles (title, body) VALUES
+		('one', 'the red car sat'),
+		('two', 'the red automobile sat'),
+		('three', 'dogs only')`)
+	execOK(t, s, `CREATE FULLTEXT INDEX ix_simple ON articles (body)`)
+
+	got := execOK(t, s, `SELECT title FROM articles SEARCH body FOR 'automobile'`)
+	if len(got.Rows) != 1 || got.Rows[0][0].Str != "two" {
+		t.Fatalf("simple must not expand synonyms: %v", titles(got))
+	}
+
+	execOK(t, s, `DROP INDEX ix_simple`)
+	execOK(t, s, `CREATE FULLTEXT INDEX ix_en ON articles (body) WITH (ANALYZER = 'english')`)
+
+	got = execOK(t, s, `SELECT title FROM articles SEARCH body FOR 'car'`)
+	if len(got.Rows) != 2 {
+		t.Fatalf("english car should match automobile: %v", titles(got))
+	}
+	got = execOK(t, s, `SELECT title FROM articles SEARCH body FOR 'automobile'`)
+	if len(got.Rows) != 2 {
+		t.Fatalf("english automobile should match car: %v", titles(got))
+	}
+	got = execOK(t, s, `SELECT title FROM articles SEARCH body FOR 'the car'`)
+	if len(got.Rows) != 2 {
+		t.Fatalf("english stop+synonym: %v", titles(got))
+	}
+	got = execOK(t, s, `SELECT title FROM articles SEARCH body FOR '"red car"'`)
+	if len(got.Rows) != 2 {
+		t.Fatalf("english synonym phrase: %v", titles(got))
+	}
+	got = execOK(t, s, `SELECT title FROM articles SEARCH body FOR '"red automobile"'`)
+	if len(got.Rows) != 2 {
+		t.Fatalf("english synonym phrase reverse: %v", titles(got))
+	}
+	got = execOK(t, s, `SELECT title FROM articles SEARCH body FOR 'cats'`)
+	if len(got.Rows) != 0 {
+		t.Fatalf("unrelated stem must not match: %v", titles(got))
+	}
+
+	plan := execOK(t, s, `EXPLAIN SELECT title FROM articles SEARCH body FOR 'car'`)
+	if !explainHas(plan, "Search") || !explainHas(plan, "ix_en") || !explainHas(plan, "analyzer=english") {
+		t.Fatalf("plan: %+v", explainOps(plan))
+	}
+}
+
+func TestFulltextLanguageAnalyzers(t *testing.T) {
+	db := testDB(t)
+	s := db.Session()
+	execOK(t, s, `CREATE TABLE articles (
+		id UUID PRIMARY KEY DEFAULT UUID(),
+		title STRING NOT NULL,
+		body TEXT
+	)`)
+	execOK(t, s, `INSERT INTO articles (title, body) VALUES
+		('fr', 'les chevaux dans la maison'),
+		('de', 'die katzen auf dem mat'),
+		('es', 'los trabajadores en la casa')`)
+
+	execOK(t, s, `CREATE FULLTEXT INDEX ix_fr ON articles (body) WITH (ANALYZER = 'french')`)
+	got := execOK(t, s, `SELECT title FROM articles SEARCH body FOR 'cheval'`)
+	if len(got.Rows) != 1 || got.Rows[0][0].Str != "fr" {
+		t.Fatalf("french cheval: %v", titles(got))
+	}
+	got = execOK(t, s, `SELECT title FROM articles SEARCH body FOR 'chevaux'`)
+	if len(got.Rows) != 1 || got.Rows[0][0].Str != "fr" {
+		t.Fatalf("french chevaux: %v", titles(got))
+	}
+	got = execOK(t, s, `SELECT title FROM articles SEARCH body FOR 'les'`)
+	if len(got.Rows) != 0 {
+		t.Fatalf("french stop les: %v", titles(got))
+	}
+	plan := execOK(t, s, `EXPLAIN SELECT title FROM articles SEARCH body FOR 'cheval'`)
+	if !explainHas(plan, "analyzer=french") {
+		t.Fatalf("french plan: %+v", explainOps(plan))
+	}
+	execOK(t, s, `DROP INDEX ix_fr`)
+
+	execOK(t, s, `CREATE FULLTEXT INDEX ix_de ON articles (body) WITH (ANALYZER = 'german')`)
+	got = execOK(t, s, `SELECT title FROM articles SEARCH body FOR 'katze'`)
+	if len(got.Rows) != 1 || got.Rows[0][0].Str != "de" {
+		t.Fatalf("german katze: %v", titles(got))
+	}
+	got = execOK(t, s, `SELECT title FROM articles SEARCH body FOR 'die'`)
+	if len(got.Rows) != 0 {
+		t.Fatalf("german stop die: %v", titles(got))
+	}
+	plan = execOK(t, s, `EXPLAIN SELECT title FROM articles SEARCH body FOR 'katze'`)
+	if !explainHas(plan, "analyzer=german") {
+		t.Fatalf("german plan: %+v", explainOps(plan))
+	}
+	execOK(t, s, `DROP INDEX ix_de`)
+
+	execOK(t, s, `CREATE FULLTEXT INDEX ix_es ON articles (body) WITH (ANALYZER = 'spanish')`)
+	got = execOK(t, s, `SELECT title FROM articles SEARCH body FOR 'trabajar'`)
+	if len(got.Rows) != 1 || got.Rows[0][0].Str != "es" {
+		t.Fatalf("spanish trabajar: %v", titles(got))
+	}
+	got = execOK(t, s, `SELECT title FROM articles SEARCH body FOR 'los'`)
+	if len(got.Rows) != 0 {
+		t.Fatalf("spanish stop los: %v", titles(got))
+	}
+	plan = execOK(t, s, `EXPLAIN SELECT title FROM articles SEARCH body FOR 'trabajar'`)
+	if !explainHas(plan, "analyzer=spanish") {
+		t.Fatalf("spanish plan: %+v", explainOps(plan))
+	}
+}
+
 func TestFulltextRestartAndEncryption(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "nextsql.db")
@@ -1624,6 +1889,613 @@ func TestFulltextRestartAndEncryption(t *testing.T) {
 	got := execOK(t, s, `SELECT body FROM articles SEARCH body FOR 'database performance'`)
 	if len(got.Rows) != 1 {
 		t.Fatalf("after restart %d", len(got.Rows))
+	}
+}
+
+func TestFulltextPrefixSearch(t *testing.T) {
+	db := testDB(t)
+	s := db.Session()
+	execOK(t, s, `CREATE TABLE articles (
+		id UUID PRIMARY KEY DEFAULT UUID(),
+		title STRING NOT NULL,
+		body TEXT
+	)`)
+	execOK(t, s, `INSERT INTO articles (title, body) VALUES
+		('one', 'the cat sat'),
+		('two', 'the catalog of dogs'),
+		('three', 'database performance tuning'),
+		('four', 'dogs only')`)
+	execOK(t, s, `CREATE FULLTEXT INDEX ix_body ON articles (body)`)
+
+	got := execOK(t, s, `SELECT title FROM articles SEARCH body FOR 'cat*'`)
+	if len(got.Rows) != 2 || !containsTitle(got, "one") || !containsTitle(got, "two") {
+		t.Fatalf("cat*: %v", titles(got))
+	}
+	got = execOK(t, s, `SELECT title FROM articles SEARCH body FOR 'cat'`)
+	if len(got.Rows) != 1 || got.Rows[0][0].Str != "one" {
+		t.Fatalf("exact cat must not match catalog: %v", titles(got))
+	}
+	got = execOK(t, s, `SELECT title FROM articles SEARCH body FOR 'cat* dogs'`)
+	if len(got.Rows) != 1 || got.Rows[0][0].Str != "two" {
+		t.Fatalf("and: %v", titles(got))
+	}
+	got = execOK(t, s, `SELECT title FROM articles SEARCH body FOR '"data* performance"'`)
+	if len(got.Rows) != 1 || got.Rows[0][0].Str != "three" {
+		t.Fatalf("phrase: %v", titles(got))
+	}
+	got = execOK(t, s, `SELECT title FROM articles SEARCH body FOR 'zzz*'`)
+	if len(got.Rows) != 0 {
+		t.Fatalf("no match: %v", titles(got))
+	}
+
+	plan := execOK(t, s, `EXPLAIN SELECT title FROM articles SEARCH body FOR 'cat*'`)
+	if !explainHas(plan, "Search") || !explainHas(plan, "ix_body") {
+		t.Fatalf("plan: %+v", explainOps(plan))
+	}
+
+	execOK(t, s, `DROP INDEX ix_body`)
+	got = execOK(t, s, `SELECT title FROM articles SEARCH body FOR 'cat*'`)
+	if len(got.Rows) != 2 || !containsTitle(got, "one") || !containsTitle(got, "two") {
+		t.Fatalf("seq cat*: %v", titles(got))
+	}
+
+	execOK(t, s, `CREATE FULLTEXT INDEX ix_en ON articles (body) WITH (ANALYZER = 'english')`)
+	got = execOK(t, s, `SELECT title FROM articles SEARCH body FOR 'run*'`)
+	if len(got.Rows) != 0 {
+		t.Fatalf("no running docs: %v", titles(got))
+	}
+	execOK(t, s, `INSERT INTO articles (title, body) VALUES ('five', 'running dogs')`)
+	got = execOK(t, s, `SELECT title FROM articles SEARCH body FOR 'run*'`)
+	if len(got.Rows) != 1 || got.Rows[0][0].Str != "five" {
+		t.Fatalf("english run* should match stemmed running: %v", titles(got))
+	}
+	got = execOK(t, s, `SELECT title FROM articles SEARCH body FOR 'running*'`)
+	if len(got.Rows) != 0 {
+		t.Fatalf("english running* must not stem: %v", titles(got))
+	}
+	got = execOK(t, s, `SELECT title FROM articles SEARCH body FOR 'car*'`)
+	if containsTitle(got, "one") || containsTitle(got, "two") {
+		t.Fatalf("car* must not expand synonyms: %v", titles(got))
+	}
+
+	execOK(t, s, `CREATE TABLE many (id UUID PRIMARY KEY DEFAULT UUID(), body TEXT)`)
+	var b strings.Builder
+	b.WriteString(`INSERT INTO many (body) VALUES `)
+	for i := 0; i < fulltext.MaxQueryExpansions+1; i++ {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		fmt.Fprintf(&b, "('term%03d unique')", i)
+	}
+	execOK(t, s, b.String())
+	execOK(t, s, `CREATE FULLTEXT INDEX ix_many ON many (body)`)
+	if _, err := s.Exec(`SELECT id FROM many SEARCH body FOR 'term*'`); err == nil || !nerr.HasCode(err, nerr.InvalidArgument) {
+		t.Fatalf("expected prefix expansion cap, got %v", err)
+	}
+}
+
+func TestFulltextFuzzySearch(t *testing.T) {
+	db := testDB(t)
+	s := db.Session()
+	execOK(t, s, `CREATE TABLE articles (
+		id UUID PRIMARY KEY DEFAULT UUID(),
+		title STRING NOT NULL,
+		body TEXT
+	)`)
+	execOK(t, s, `INSERT INTO articles (title, body) VALUES
+		('one', 'the cat sat'),
+		('two', 'the cot sat'),
+		('three', 'database performance tuning'),
+		('four', 'the catalog of dogs'),
+		('five', 'dogs only')`)
+	execOK(t, s, `CREATE FULLTEXT INDEX ix_body ON articles (body)`)
+
+	got := execOK(t, s, `SELECT title FROM articles SEARCH body FOR 'cat~'`)
+	if len(got.Rows) != 2 || !containsTitle(got, "one") || !containsTitle(got, "two") {
+		t.Fatalf("cat~: %v", titles(got))
+	}
+	got = execOK(t, s, `SELECT title FROM articles SEARCH body FOR 'cat'`)
+	if len(got.Rows) != 1 || got.Rows[0][0].Str != "one" {
+		t.Fatalf("exact cat must not match cot/catalog: %v", titles(got))
+	}
+	got = execOK(t, s, `SELECT title FROM articles SEARCH body FOR 'cat~ dogs'`)
+	if len(got.Rows) != 0 {
+		t.Fatalf("and needs both groups: %v", titles(got))
+	}
+	got = execOK(t, s, `SELECT title FROM articles SEARCH body FOR 'catalog~ dogs'`)
+	if len(got.Rows) != 1 || got.Rows[0][0].Str != "four" {
+		t.Fatalf("and catalog~ dogs: %v", titles(got))
+	}
+	got = execOK(t, s, `SELECT title FROM articles SEARCH body FOR '"databas~ performance"'`)
+	if len(got.Rows) != 1 || got.Rows[0][0].Str != "three" {
+		t.Fatalf("phrase: %v", titles(got))
+	}
+	got = execOK(t, s, `SELECT title FROM articles SEARCH body FOR 'zzz~'`)
+	if len(got.Rows) != 0 {
+		t.Fatalf("no match: %v", titles(got))
+	}
+	if _, err := s.Exec(`SELECT title FROM articles SEARCH body FOR 'cat~3'`); err == nil || !nerr.HasCode(err, nerr.InvalidArgument) {
+		t.Fatalf("expected ~3 fail closed, got %v", err)
+	}
+	if _, err := s.Exec(`SELECT title FROM articles SEARCH body FOR 'cat*~'`); err == nil || !nerr.HasCode(err, nerr.InvalidArgument) {
+		t.Fatalf("expected mixed operators fail closed, got %v", err)
+	}
+
+	plan := execOK(t, s, `EXPLAIN SELECT title FROM articles SEARCH body FOR 'cat~'`)
+	if !explainHas(plan, "Search") || !explainHas(plan, "ix_body") {
+		t.Fatalf("plan: %+v", explainOps(plan))
+	}
+
+	execOK(t, s, `DROP INDEX ix_body`)
+	got = execOK(t, s, `SELECT title FROM articles SEARCH body FOR 'cat~'`)
+	if len(got.Rows) != 2 || !containsTitle(got, "one") || !containsTitle(got, "two") {
+		t.Fatalf("seq cat~: %v", titles(got))
+	}
+
+	execOK(t, s, `CREATE FULLTEXT INDEX ix_en ON articles (body) WITH (ANALYZER = 'english')`)
+	execOK(t, s, `INSERT INTO articles (title, body) VALUES ('six', 'running dogs'), ('seven', 'red automobile')`)
+	got = execOK(t, s, `SELECT title FROM articles SEARCH body FOR 'run~'`)
+	if len(got.Rows) != 1 || got.Rows[0][0].Str != "six" {
+		t.Fatalf("english run~ should match stemmed run: %v", titles(got))
+	}
+	got = execOK(t, s, `SELECT title FROM articles SEARCH body FOR 'running~'`)
+	if containsTitle(got, "six") {
+		t.Fatalf("english running~ must not stem: %v", titles(got))
+	}
+	got = execOK(t, s, `SELECT title FROM articles SEARCH body FOR 'car~'`)
+	if containsTitle(got, "seven") {
+		t.Fatalf("car~ must not expand synonyms: %v", titles(got))
+	}
+
+	execOK(t, s, `CREATE TABLE many (id UUID PRIMARY KEY DEFAULT UUID(), body TEXT)`)
+	var b strings.Builder
+	b.WriteString(`INSERT INTO many (body) VALUES `)
+	for i := 0; i < fulltext.MaxQueryExpansions+1; i++ {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		fmt.Fprintf(&b, "('aaa%c unique')", rune(0x4e00+i))
+	}
+	execOK(t, s, b.String())
+	execOK(t, s, `CREATE FULLTEXT INDEX ix_many ON many (body)`)
+	if _, err := s.Exec(`SELECT id FROM many SEARCH body FOR 'aaaa~'`); err == nil || !nerr.HasCode(err, nerr.InvalidArgument) {
+		t.Fatalf("expected fuzzy expansion cap, got %v", err)
+	}
+}
+
+func TestFulltextTypoSearch(t *testing.T) {
+	db := testDB(t)
+	s := db.Session()
+	execOK(t, s, `CREATE TABLE articles (
+		id UUID PRIMARY KEY DEFAULT UUID(),
+		title STRING NOT NULL,
+		body TEXT
+	)`)
+	execOK(t, s, `INSERT INTO articles (title, body) VALUES
+		('one', 'the cat sat'),
+		('two', 'the cot sat'),
+		('three', 'database performance tuning'),
+		('four', 'the catalog of dogs'),
+		('five', 'dogs only')`)
+	execOK(t, s, `CREATE FULLTEXT INDEX ix_body ON articles (body)`)
+
+	got := execOK(t, s, `SELECT title FROM articles SEARCH body FOR 'databse'`)
+	if len(got.Rows) != 1 || got.Rows[0][0].Str != "three" {
+		t.Fatalf("databse: %v", titles(got))
+	}
+	got = execOK(t, s, `SELECT title FROM articles SEARCH body FOR 'cat'`)
+	if len(got.Rows) != 1 || got.Rows[0][0].Str != "one" {
+		t.Fatalf("exact cat must not match cot/catalog: %v", titles(got))
+	}
+	got = execOK(t, s, `SELECT title FROM articles SEARCH body FOR 'cta'`)
+	if len(got.Rows) != 0 {
+		t.Fatalf("short token cta must stay an exact miss: %v", titles(got))
+	}
+	got = execOK(t, s, `SELECT title FROM articles SEARCH body FOR '"databse performance"'`)
+	if len(got.Rows) != 1 || got.Rows[0][0].Str != "three" {
+		t.Fatalf("phrase: %v", titles(got))
+	}
+	got = execOK(t, s, `SELECT title FROM articles SEARCH body FOR 'catalg dogs'`)
+	if len(got.Rows) != 1 || got.Rows[0][0].Str != "four" {
+		t.Fatalf("and catalg dogs: %v", titles(got))
+	}
+	got = execOK(t, s, `SELECT title FROM articles SEARCH body FOR 'zzzzzz'`)
+	if len(got.Rows) != 0 {
+		t.Fatalf("no match: %v", titles(got))
+	}
+
+	plan := execOK(t, s, `EXPLAIN SELECT title FROM articles SEARCH body FOR 'databse'`)
+	if !explainHas(plan, "Search") || !explainHas(plan, "ix_body") {
+		t.Fatalf("plan: %+v", explainOps(plan))
+	}
+
+	execOK(t, s, `DROP INDEX ix_body`)
+	got = execOK(t, s, `SELECT title FROM articles SEARCH body FOR 'databse'`)
+	if len(got.Rows) != 1 || got.Rows[0][0].Str != "three" {
+		t.Fatalf("seq databse: %v", titles(got))
+	}
+	got = execOK(t, s, `SELECT title FROM articles SEARCH body FOR 'cat'`)
+	if len(got.Rows) != 1 || got.Rows[0][0].Str != "one" {
+		t.Fatalf("seq exact cat: %v", titles(got))
+	}
+
+	execOK(t, s, `CREATE FULLTEXT INDEX ix_en ON articles (body) WITH (ANALYZER = 'english')`)
+	execOK(t, s, `INSERT INTO articles (title, body) VALUES ('six', 'running dogs'), ('seven', 'red automobile')`)
+	got = execOK(t, s, `SELECT title FROM articles SEARCH body FOR 'catalag'`)
+	if len(got.Rows) != 1 || got.Rows[0][0].Str != "four" {
+		t.Fatalf("english catalag should typo-match catalog: %v", titles(got))
+	}
+	got = execOK(t, s, `SELECT title FROM articles SEARCH body FOR 'cra'`)
+	if containsTitle(got, "seven") {
+		t.Fatalf("cra must not typo into synonym automobile: %v", titles(got))
+	}
+
+	execOK(t, s, `CREATE TABLE many (id UUID PRIMARY KEY DEFAULT UUID(), body TEXT)`)
+	var b strings.Builder
+	b.WriteString(`INSERT INTO many (body) VALUES `)
+	for i := 0; i < fulltext.MaxQueryExpansions+1; i++ {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		fmt.Fprintf(&b, "('aaaa%c unique')", rune(0x4e00+i))
+	}
+	execOK(t, s, b.String())
+	execOK(t, s, `CREATE FULLTEXT INDEX ix_many ON many (body)`)
+	if _, err := s.Exec(`SELECT id FROM many SEARCH body FOR 'aaaaa'`); err == nil || !nerr.HasCode(err, nerr.InvalidArgument) {
+		t.Fatalf("expected typo expansion cap, got %v", err)
+	}
+}
+
+func TestFulltextHighlight(t *testing.T) {
+	db := testDB(t)
+	s := db.Session()
+	execOK(t, s, `CREATE TABLE articles (
+		id UUID PRIMARY KEY DEFAULT UUID(),
+		title STRING NOT NULL,
+		body TEXT
+	)`)
+	execOK(t, s, `INSERT INTO articles (title, body) VALUES
+		('one', 'the cat sat'),
+		('two', 'the cot sat'),
+		('three', 'database performance tuning'),
+		('four', 'the catalog of dogs'),
+		('long', 'aaa aaa aaa aaa aaa aaa aaa aaa the cat sat zzz zzz zzz zzz zzz zzz zzz zzz')`)
+	execOK(t, s, `CREATE FULLTEXT INDEX ix_body ON articles (body)`)
+
+	got := execOK(t, s, `SELECT HIGHLIGHT(body) FROM articles WHERE title = 'one' SEARCH body FOR 'cat'`)
+	if len(got.Rows) != 1 || got.Rows[0][0].Str != "the <mark>cat</mark> sat" {
+		t.Fatalf("highlight cat: %v", titles(got))
+	}
+	got = execOK(t, s, `SELECT HIGHLIGHT(body, '**', '**') FROM articles WHERE title = 'one' SEARCH body FOR 'cat'`)
+	if len(got.Rows) != 1 || got.Rows[0][0].Str != "the **cat** sat" {
+		t.Fatalf("custom markers: %v", titles(got))
+	}
+	got = execOK(t, s, `SELECT HIGHLIGHT(body) FROM articles SEARCH body FOR 'cat*'`)
+	if len(got.Rows) < 2 {
+		t.Fatalf("prefix rows %v", titles(got))
+	}
+	var sawCatalog, sawCat bool
+	for _, r := range got.Rows {
+		if strings.Contains(r[0].Str, "<mark>catalog</mark>") {
+			sawCatalog = true
+		}
+		if strings.Contains(r[0].Str, "<mark>cat</mark>") {
+			sawCat = true
+		}
+	}
+	if !sawCatalog || !sawCat {
+		t.Fatalf("prefix marks %v", titles(got))
+	}
+	got = execOK(t, s, `SELECT HIGHLIGHT(body) FROM articles SEARCH body FOR 'cat~'`)
+	if len(got.Rows) < 2 {
+		t.Fatalf("fuzzy rows %v", titles(got))
+	}
+	var sawCot bool
+	for _, r := range got.Rows {
+		if strings.Contains(r[0].Str, "<mark>cot</mark>") {
+			sawCot = true
+		}
+	}
+	if !sawCot {
+		t.Fatalf("fuzzy cot %v", titles(got))
+	}
+	got = execOK(t, s, `SELECT HIGHLIGHT(body) FROM articles SEARCH body FOR 'databse'`)
+	if len(got.Rows) != 1 || !strings.Contains(got.Rows[0][0].Str, "<mark>database</mark>") {
+		t.Fatalf("typo %v", titles(got))
+	}
+	got = execOK(t, s, `SELECT SNIPPET(body, 32) FROM articles WHERE title = 'long' SEARCH body FOR 'cat'`)
+	if len(got.Rows) != 1 {
+		t.Fatalf("snippet rows %v", titles(got))
+	}
+	snip := got.Rows[0][0].Str
+	if !strings.Contains(snip, "<mark>cat</mark>") {
+		t.Fatalf("snippet mark %q", snip)
+	}
+	if !strings.Contains(snip, fulltext.SnippetEllipsis) {
+		t.Fatalf("snippet ellipsis %q", snip)
+	}
+
+	if _, err := s.Exec(`SELECT HIGHLIGHT(body) FROM articles`); err == nil || !nerr.HasCode(err, nerr.InvalidArgument) {
+		t.Fatalf("expected HIGHLIGHT without SEARCH, got %v", err)
+	}
+	if _, err := s.Exec(`SELECT SNIPPET(body, 8) FROM articles SEARCH body FOR 'cat'`); err == nil || !nerr.HasCode(err, nerr.InvalidArgument) {
+		t.Fatalf("expected snippet width error, got %v", err)
+	}
+
+	execOK(t, s, `DROP INDEX ix_body`)
+	got = execOK(t, s, `SELECT HIGHLIGHT(body) FROM articles WHERE title = 'one' SEARCH body FOR 'cat'`)
+	if len(got.Rows) != 1 || got.Rows[0][0].Str != "the <mark>cat</mark> sat" {
+		t.Fatalf("seq highlight: %v", titles(got))
+	}
+
+	execOK(t, s, `CREATE FULLTEXT INDEX ix_en ON articles (body) WITH (ANALYZER = 'english')`)
+	execOK(t, s, `INSERT INTO articles (title, body) VALUES ('run', 'running dogs'), ('car', 'red automobile')`)
+	got = execOK(t, s, `SELECT HIGHLIGHT(body) FROM articles SEARCH body FOR 'runs'`)
+	if len(got.Rows) != 1 || got.Rows[0][0].Str != "<mark>running</mark> dogs" {
+		t.Fatalf("english stem highlight: %v", titles(got))
+	}
+	got = execOK(t, s, `SELECT HIGHLIGHT(body) FROM articles SEARCH body FOR 'car'`)
+	if len(got.Rows) != 1 || got.Rows[0][0].Str != "red <mark>automobile</mark>" {
+		t.Fatalf("english synonym highlight: %v", titles(got))
+	}
+}
+
+func TestFulltextMultiFieldSearch(t *testing.T) {
+	db := testDB(t)
+	s := db.Session()
+	execOK(t, s, `CREATE TABLE articles (
+		id UUID PRIMARY KEY DEFAULT UUID(),
+		title STRING NOT NULL,
+		body TEXT
+	)`)
+	execOK(t, s, `INSERT INTO articles (title, body) VALUES
+		('database', 'performance tuning'),
+		('cat', 'the mat sat'),
+		('dogs', 'loyal hound'),
+		('mixed', 'unrelated text')`)
+	execOK(t, s, `CREATE FULLTEXT INDEX ix_tb ON articles (title, body)`)
+
+	got := execOK(t, s, `SELECT title FROM articles SEARCH title, body FOR 'cat'`)
+	if len(got.Rows) != 1 || got.Rows[0][0].Str != "cat" {
+		t.Fatalf("term in one field: %v", titles(got))
+	}
+
+	got = execOK(t, s, `SELECT title FROM articles SEARCH title, body FOR 'database performance'`)
+	if len(got.Rows) != 1 || got.Rows[0][0].Str != "database" {
+		t.Fatalf("and across fields: %v", titles(got))
+	}
+
+	got = execOK(t, s, `SELECT title FROM articles SEARCH title, body FOR '"database performance"'`)
+	if len(got.Rows) != 0 {
+		t.Fatalf("phrase must not cross fields: %v", titles(got))
+	}
+
+	got = execOK(t, s, `SELECT title FROM articles SEARCH title, body FOR '"performance tuning"'`)
+	if len(got.Rows) != 1 || got.Rows[0][0].Str != "database" {
+		t.Fatalf("in-field phrase: %v", titles(got))
+	}
+
+	got = execOK(t, s, `SELECT title FROM articles SEARCH title FOR 'performance'`)
+	if len(got.Rows) != 0 {
+		t.Fatalf("single-field SEARCH must not use the multi-field index: %v", titles(got))
+	}
+
+	plan := execOK(t, s, `EXPLAIN SELECT title FROM articles SEARCH title, body FOR 'cat'`)
+	if !explainHas(plan, "Search") || !explainHas(plan, "ix_tb") {
+		t.Fatalf("plan: %+v", explainOps(plan))
+	}
+	plan = execOK(t, s, `EXPLAIN SELECT title FROM articles SEARCH title FOR 'cat'`)
+	if !explainHas(plan, "Search") || explainHas(plan, "ix_tb") {
+		t.Fatalf("subset plan: %+v", explainOps(plan))
+	}
+
+	got = execOK(t, s, `SELECT HIGHLIGHT(title), HIGHLIGHT(body) FROM articles SEARCH title, body FOR 'cat'`)
+	if len(got.Rows) != 1 || got.Rows[0][0].Str != "<mark>cat</mark>" || got.Rows[0][1].Str != "the mat sat" {
+		t.Fatalf("highlight: %+v", got.Rows)
+	}
+
+	got = execOK(t, s, `SELECT title FROM articles SEARCH title, body FOR 'databse'`)
+	if len(got.Rows) != 1 || got.Rows[0][0].Str != "database" {
+		t.Fatalf("typo: %v", titles(got))
+	}
+	got = execOK(t, s, `SELECT title FROM articles SEARCH title, body FOR 'perf*'`)
+	if len(got.Rows) != 1 || got.Rows[0][0].Str != "database" {
+		t.Fatalf("prefix: %v", titles(got))
+	}
+	got = execOK(t, s, `SELECT title FROM articles SEARCH title, body FOR 'hound~'`)
+	if len(got.Rows) != 1 || got.Rows[0][0].Str != "dogs" {
+		t.Fatalf("fuzzy: %v", titles(got))
+	}
+
+	execOK(t, s, `UPDATE articles SET body = 'the dog sat' WHERE title = 'cat'`)
+	got = execOK(t, s, `SELECT title FROM articles SEARCH title, body FOR 'cat'`)
+	if len(got.Rows) != 1 || got.Rows[0][0].Str != "cat" {
+		t.Fatalf("title still matches after body update: %v", titles(got))
+	}
+	got = execOK(t, s, `SELECT title FROM articles SEARCH title, body FOR 'dog'`)
+	if len(got.Rows) != 1 || got.Rows[0][0].Str != "cat" {
+		t.Fatalf("body update: %v", titles(got))
+	}
+
+	s2 := testDB(t).Session()
+	execOK(t, s2, `CREATE TABLE notes (id UUID PRIMARY KEY DEFAULT UUID(), title STRING, body TEXT)`)
+	execOK(t, s2, `INSERT INTO notes (title, body) VALUES ('cat', 'the mat sat'), ('dogs', NULL)`)
+	got = execOK(t, s2, `SELECT title FROM notes SEARCH title, body FOR 'cat'`)
+	if len(got.Rows) != 1 || got.Rows[0][0].Str != "cat" {
+		t.Fatalf("seq multi-field: %v", titles(got))
+	}
+	plan = execOK(t, s2, `EXPLAIN SELECT title FROM notes SEARCH title, body FOR 'cat'`)
+	if !explainHas(plan, "Search") || explainHas(plan, "fulltext") {
+		t.Fatalf("seq plan: %+v", explainOps(plan))
+	}
+}
+
+func TestFulltextFieldWeight(t *testing.T) {
+	db := testDB(t)
+	s := db.Session()
+	execOK(t, s, `CREATE TABLE articles (
+		id UUID PRIMARY KEY DEFAULT UUID(),
+		title STRING NOT NULL,
+		body TEXT
+	)`)
+	execOK(t, s, `INSERT INTO articles (title, body) VALUES
+		('database', 'aa bb cc dd ee ff gg hh'),
+		('aa bb', 'database'),
+		('other', 'unrelated text')`)
+	execOK(t, s, `CREATE FULLTEXT INDEX ix_tb ON articles (title, body)`)
+
+	got := execOK(t, s, `SELECT title FROM articles SEARCH title, body FOR 'database'`)
+	if len(got.Rows) != 2 || got.Rows[0][0].Str != "aa bb" {
+		t.Fatalf("unweighted shorter body first: %v", titles(got))
+	}
+
+	got = execOK(t, s, `SELECT title FROM articles SEARCH title WEIGHT 3, body FOR 'database'`)
+	if len(got.Rows) != 2 || got.Rows[0][0].Str != "database" {
+		t.Fatalf("title WEIGHT 3 first: %v", titles(got))
+	}
+
+	got = execOK(t, s, `SELECT title FROM articles SEARCH title WEIGHT 1, body WEIGHT 1 FOR 'database'`)
+	if len(got.Rows) != 2 || got.Rows[0][0].Str != "aa bb" {
+		t.Fatalf("WEIGHT 1 is unweighted: %v", titles(got))
+	}
+
+	plan := execOK(t, s, `EXPLAIN SELECT title FROM articles SEARCH title WEIGHT 3, body FOR 'database'`)
+	if !explainHas(plan, "Search") || !explainHas(plan, "ix_tb") || !explainHas(plan, "weights=3,1") {
+		t.Fatalf("weighted plan: %+v", explainOps(plan))
+	}
+
+	got = execOK(t, s, `SELECT HIGHLIGHT(title) FROM articles SEARCH title WEIGHT 3, body FOR 'database'`)
+	if len(got.Rows) == 0 || got.Rows[0][0].Str != "<mark>database</mark>" {
+		t.Fatalf("highlight: %+v", got.Rows)
+	}
+
+	got = execOK(t, s, `SELECT title FROM articles SEARCH title, body FOR '"database aa"'`)
+	if len(got.Rows) != 0 {
+		t.Fatalf("phrase must not cross fields under weighting: %v", titles(got))
+	}
+
+	s2 := testDB(t).Session()
+	execOK(t, s2, `CREATE TABLE notes (id UUID PRIMARY KEY DEFAULT UUID(), title STRING, body TEXT)`)
+	execOK(t, s2, `INSERT INTO notes (title, body) VALUES
+		('database', 'aa bb cc dd ee ff gg hh'),
+		('aa bb', 'database')`)
+	got = execOK(t, s2, `SELECT title FROM notes SEARCH title WEIGHT 3, body FOR 'database'`)
+	if len(got.Rows) != 2 || got.Rows[0][0].Str != "database" {
+		t.Fatalf("seq weighted: %v", titles(got))
+	}
+	plan = execOK(t, s2, `EXPLAIN SELECT title FROM notes SEARCH title WEIGHT 3, body FOR 'database'`)
+	if !explainHas(plan, "Search") || explainHas(plan, "fulltext") || !explainHas(plan, "weights=3,1") {
+		t.Fatalf("seq weighted plan: %+v", explainOps(plan))
+	}
+
+	if _, err := s.Exec(`SELECT title FROM articles SEARCH title WEIGHT 0, body FOR 'x'`); err == nil {
+		t.Fatal("expected WEIGHT 0 to fail closed")
+	}
+	if _, err := s.Exec(`SELECT title FROM articles SEARCH title WEIGHT 65, body FOR 'x'`); err == nil {
+		t.Fatal("expected WEIGHT 65 to fail closed")
+	}
+}
+
+func TestFulltextFacet(t *testing.T) {
+	db := testDB(t)
+	s := db.Session()
+	execOK(t, s, `CREATE TABLE articles (
+		id UUID PRIMARY KEY DEFAULT UUID(),
+		title STRING NOT NULL,
+		body TEXT,
+		category STRING,
+		year DECIMAL(4,0)
+	)`)
+	execOK(t, s, `INSERT INTO articles (title, body, category, year) VALUES
+		('one', 'the cat sat', 'pets', 2024),
+		('two', 'the cat sat on the mat', 'pets', 2024),
+		('three', 'database performance', 'tech', 2023),
+		('four', 'the cat and databases', 'pets', 2023),
+		('five', 'unrelated text', 'tech', 2024)`)
+	execOK(t, s, `CREATE FULLTEXT INDEX ix_body ON articles (body)`)
+
+	got := execOK(t, s, `SELECT * FROM articles SEARCH body FOR 'cat' FACET category`)
+	if len(got.Columns) != 3 || got.Columns[0] != "facet" || got.Columns[1] != "value" || got.Columns[2] != "count" {
+		t.Fatalf("columns %v", got.Columns)
+	}
+	if len(got.Rows) != 1 || got.Rows[0][0].Str != "category" || got.Rows[0][1].Str != "pets" || got.Rows[0][2].Dec.String() != "3" {
+		t.Fatalf("category facet %+v", got.Rows)
+	}
+
+	got = execOK(t, s, `SELECT * FROM articles SEARCH body FOR 'cat' FACET category, year`)
+	if len(got.Rows) != 3 {
+		t.Fatalf("two facets %d rows %+v", len(got.Rows), got.Rows)
+	}
+	if got.Rows[0][0].Str != "category" || got.Rows[0][1].Str != "pets" || got.Rows[0][2].Dec.String() != "3" {
+		t.Fatalf("first facet %+v", got.Rows[0])
+	}
+	if got.Rows[1][0].Str != "year" {
+		t.Fatalf("second facet group %+v", got.Rows)
+	}
+	year := map[string]string{}
+	for _, r := range got.Rows[1:] {
+		if r[0].Str != "year" {
+			t.Fatalf("expected year rows after category: %+v", got.Rows)
+		}
+		year[r[1].Str] = r[2].Dec.String()
+	}
+	if year["2024"] != "2" || year["2023"] != "1" {
+		t.Fatalf("year counts %v", year)
+	}
+
+	got = execOK(t, s, `SELECT * FROM articles SEARCH body FOR 'cat' FACET year LIMIT 1`)
+	if len(got.Rows) != 1 || got.Rows[0][1].Str != "2024" || got.Rows[0][2].Dec.String() != "2" {
+		t.Fatalf("per-facet LIMIT %+v", got.Rows)
+	}
+
+	got = execOK(t, s, `SELECT * FROM articles WHERE year = 2024 SEARCH body FOR 'cat' FACET category`)
+	if len(got.Rows) != 1 || got.Rows[0][1].Str != "pets" || got.Rows[0][2].Dec.String() != "2" {
+		t.Fatalf("WHERE + FACET %+v", got.Rows)
+	}
+
+	got = execOK(t, s, `SELECT * FROM articles SEARCH body WEIGHT 3 FOR 'cat' FACET category`)
+	if len(got.Rows) != 1 || got.Rows[0][1].Str != "pets" || got.Rows[0][2].Dec.String() != "3" {
+		t.Fatalf("weight does not change facet counts %+v", got.Rows)
+	}
+
+	got = execOK(t, s, `SELECT * FROM articles SEARCH body FOR 'databse' FACET category`)
+	if len(got.Rows) != 1 || got.Rows[0][1].Str != "tech" {
+		t.Fatalf("typo facet %+v", got.Rows)
+	}
+
+	execOK(t, s, `INSERT INTO articles (title, body, category, year) VALUES ('six', 'the cat sat', NULL, 2024)`)
+	got = execOK(t, s, `SELECT * FROM articles SEARCH body FOR 'cat' FACET category`)
+	if len(got.Rows) != 1 || got.Rows[0][2].Dec.String() != "3" {
+		t.Fatalf("NULL facet value skipped %+v", got.Rows)
+	}
+
+	plan := execOK(t, s, `EXPLAIN SELECT * FROM articles SEARCH body FOR 'cat' FACET category`)
+	if !explainHas(plan, "Facet") || !explainHas(plan, "Search") || !explainHas(plan, "ix_body") {
+		t.Fatalf("plan: %+v", explainOps(plan))
+	}
+
+	s2 := testDB(t).Session()
+	execOK(t, s2, `CREATE TABLE notes (id UUID PRIMARY KEY DEFAULT UUID(), body TEXT, tag STRING)`)
+	execOK(t, s2, `INSERT INTO notes (body, tag) VALUES ('the cat sat', 'a'), ('the cat sat', 'a'), ('dogs only', 'b')`)
+	got = execOK(t, s2, `SELECT * FROM notes SEARCH body FOR 'cat' FACET tag`)
+	if len(got.Rows) != 1 || got.Rows[0][1].Str != "a" || got.Rows[0][2].Dec.String() != "2" {
+		t.Fatalf("seq facet %+v", got.Rows)
+	}
+	plan = execOK(t, s2, `EXPLAIN SELECT * FROM notes SEARCH body FOR 'cat' FACET tag`)
+	if !explainHas(plan, "Facet") || !explainHas(plan, "Search") || explainHas(plan, "fulltext") {
+		t.Fatalf("seq plan: %+v", explainOps(plan))
+	}
+
+	for _, q := range []string{
+		`SELECT title FROM articles SEARCH body FOR 'cat' FACET category`,
+		`SELECT * FROM articles WHERE true FACET category`,
+		`SELECT * FROM articles SEARCH body FOR 'cat' FACET category ORDER BY count`,
+		`SELECT * FROM articles SEARCH body FOR 'cat' FACET category OFFSET 1`,
+		`SELECT * FROM articles SEARCH body FOR 'cat' FACET category, category`,
+	} {
+		if _, err := s.Exec(q); err == nil {
+			t.Fatalf("expected fail-closed: %s", q)
+		}
 	}
 }
 
@@ -1692,6 +2564,24 @@ func TestVectorNearestFlatAndHNSW(t *testing.T) {
 	fn := execOK(t, s, `SELECT name, COSINE(emb, (1, 0, 0)) FROM docs WHERE name = 'x'`)
 	if len(fn.Rows) != 1 {
 		t.Fatalf("cosine rows %d", len(fn.Rows))
+	}
+	rich := execOK(t, s, `SELECT
+		VECTOR_DIM(emb), VECTOR_NORM(emb), VECTOR_NORMALIZE(emb),
+		VECTOR_ADD(emb, (1, 0, 0)), VECTOR_SUBTRACT(emb, (1, 0, 0)),
+		VECTOR_SCALE(emb, 2), DOT(emb, (1, 0, 0)),
+		L1(emb, (1, 0, 0)), COSINE_DISTANCE(emb, (1, 0, 0))
+		FROM docs WHERE name = 'x'`)
+	if len(rich.Rows) != 1 || rich.Rows[0][0].Dec.String() != "3" ||
+		rich.Rows[0][1].Dec.String() != "1.00000000" || rich.Rows[0][6].Dec.String() != "1.00000000" ||
+		rich.Rows[0][7].Dec.String() != "0.00000000" || rich.Rows[0][8].Dec.String() != "0.00000000" {
+		t.Fatalf("rich vector scalars: %+v", rich.Rows)
+	}
+	if rich.Rows[0][2].Vec[0] != 1 || rich.Rows[0][3].Vec[0] != 2 ||
+		rich.Rows[0][4].Vec[0] != 0 || rich.Rows[0][5].Vec[0] != 2 {
+		t.Fatalf("rich vector values: %+v", rich.Rows[0])
+	}
+	if _, err := s.Exec(`SELECT VECTOR_NORMALIZE((0, 0, 0)) FROM docs WHERE name = 'x'`); err == nil {
+		t.Fatal("expected zero-vector normalization error")
 	}
 
 	got = execOK(t, s, `SELECT name FROM docs WHERE name = 'xy' NEAREST emb TO (1, 0, 0)`)
@@ -1771,6 +2661,798 @@ func TestVectorRejectsBad(t *testing.T) {
 	}
 }
 
+func TestVectorF16Quantized(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "nextsql.db")
+	keys := testKeys(t)
+	db, err := Create(path, keys, 32)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := db.Session()
+	execOK(t, s, `CREATE TABLE docs (
+		id UUID PRIMARY KEY DEFAULT UUID(),
+		name STRING NOT NULL,
+		emb VECTOR<F16,4>
+	)`)
+	execOK(t, s, `INSERT INTO docs (name, emb) VALUES
+		('a', (1, 0, 0, 0)),
+		('b', (0, 1, 0, 0)),
+		('c', (0.1, 0.2, 0.3, 0.4))`)
+
+	// Reads return the half-precision round-trip of what was written.
+	sel := execOK(t, s, `SELECT emb FROM docs WHERE name = 'c'`)
+	if len(sel.Rows) != 1 {
+		t.Fatalf("rows %d", len(sel.Rows))
+	}
+	got := sel.Rows[0][0]
+	if got.Typ.Kind != types.KindVector || got.Typ.VecElem != types.VecF16 || got.Typ.String() != "VECTOR<F16,4>" {
+		t.Fatalf("column type: %+v (%s)", got.Typ, got.Typ.String())
+	}
+	want := float16.Quantize([]float32{0.1, 0.2, 0.3, 0.4})
+	for i := range want {
+		if got.Vec[i] != want[i] {
+			t.Fatalf("element %d: got %v want quantized %v", i, got.Vec[i], want[i])
+		}
+		if got.Vec[i] == float32([]float64{0.1, 0.2, 0.3, 0.4}[i]) {
+			t.Fatalf("element %d not actually quantized", i)
+		}
+	}
+
+	// Flat NEAREST.
+	near := execOK(t, s, `SELECT name FROM docs NEAREST emb TO (1, 0, 0, 0) LIMIT 1`)
+	if len(near.Rows) != 1 || near.Rows[0][0].Str != "a" {
+		t.Fatalf("flat f16 nearest: %v", titles(near))
+	}
+
+	// HNSW over an F16 column.
+	execOK(t, s, `CREATE VECTOR INDEX ix_emb ON docs (emb) USING HNSW`)
+	plan := execOK(t, s, `EXPLAIN SELECT name FROM docs NEAREST emb TO (0, 1, 0, 0) LIMIT 1`)
+	if !explainHas(plan, "ix_emb") {
+		t.Fatalf("expected HNSW plan: %+v", explainOps(plan))
+	}
+	near = execOK(t, s, `SELECT name FROM docs NEAREST emb TO (0, 1, 0, 0) LIMIT 1`)
+	if len(near.Rows) != 1 || near.Rows[0][0].Str != "b" {
+		t.Fatalf("hnsw f16 nearest: %v", titles(near))
+	}
+
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(raw, []byte("NSVV")) {
+		t.Fatal("plaintext vector magic on disk")
+	}
+
+	db, err = Open(path, keys, 32)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	s = db.Session()
+	near = execOK(t, s, `SELECT name FROM docs NEAREST emb TO (1, 0, 0, 0) LIMIT 1`)
+	if len(near.Rows) != 1 || near.Rows[0][0].Str != "a" {
+		t.Fatalf("after restart: %v", titles(near))
+	}
+	// Dimension mismatch still fails closed.
+	if _, err := s.Exec(`INSERT INTO docs (name, emb) VALUES ('bad', (1, 2, 3))`); err == nil {
+		t.Fatal("expected dim mismatch")
+	}
+}
+
+func TestVectorI8Quantized(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "nextsql.db")
+	keys := testKeys(t)
+	db, err := Create(path, keys, 32)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := db.Session()
+	execOK(t, s, `CREATE TABLE docs (
+		id UUID PRIMARY KEY DEFAULT UUID(),
+		name STRING NOT NULL,
+		emb VECTOR<I8,4>
+	)`)
+	execOK(t, s, `INSERT INTO docs (name, emb) VALUES
+		('a', (1, 0, 0, 0)),
+		('b', (0, 1, 0, 0)),
+		('c', (0.1, 0.2, 0.3, 0.4))`)
+
+	sel := execOK(t, s, `SELECT emb FROM docs WHERE name = 'c'`)
+	if len(sel.Rows) != 1 {
+		t.Fatalf("rows %d", len(sel.Rows))
+	}
+	got := sel.Rows[0][0]
+	if got.Typ.Kind != types.KindVector || got.Typ.VecElem != types.VecI8 || got.Typ.String() != "VECTOR<I8,4>" {
+		t.Fatalf("column type: %+v (%s)", got.Typ, got.Typ.String())
+	}
+	want := int8vec.Quantize([]float32{0.1, 0.2, 0.3, 0.4})
+	for i := range want {
+		if got.Vec[i] != want[i] {
+			t.Fatalf("element %d: got %v want quantized %v", i, got.Vec[i], want[i])
+		}
+	}
+	if got.Vec[0] == float32(0.1) {
+		t.Fatal("element 0 not actually quantized")
+	}
+
+	// Flat NEAREST.
+	near := execOK(t, s, `SELECT name FROM docs NEAREST emb TO (1, 0, 0, 0) LIMIT 1`)
+	if len(near.Rows) != 1 || near.Rows[0][0].Str != "a" {
+		t.Fatalf("flat i8 nearest: %v", titles(near))
+	}
+
+	// HNSW over an I8 column.
+	execOK(t, s, `CREATE VECTOR INDEX ix_emb ON docs (emb) USING HNSW`)
+	plan := execOK(t, s, `EXPLAIN SELECT name FROM docs NEAREST emb TO (0, 1, 0, 0) LIMIT 1`)
+	if !explainHas(plan, "ix_emb") {
+		t.Fatalf("expected HNSW plan: %+v", explainOps(plan))
+	}
+	near = execOK(t, s, `SELECT name FROM docs NEAREST emb TO (0, 1, 0, 0) LIMIT 1`)
+	if len(near.Rows) != 1 || near.Rows[0][0].Str != "b" {
+		t.Fatalf("hnsw i8 nearest: %v", titles(near))
+	}
+
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(raw, []byte("NSVV")) {
+		t.Fatal("plaintext vector magic on disk")
+	}
+
+	db, err = Open(path, keys, 32)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	s = db.Session()
+	near = execOK(t, s, `SELECT name FROM docs NEAREST emb TO (1, 0, 0, 0) LIMIT 1`)
+	if len(near.Rows) != 1 || near.Rows[0][0].Str != "a" {
+		t.Fatalf("after restart: %v", titles(near))
+	}
+	if _, err := s.Exec(`INSERT INTO docs (name, emb) VALUES ('bad', (1, 2, 3))`); err == nil {
+		t.Fatal("expected dim mismatch")
+	}
+}
+
+func TestVectorBitvector(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "nextsql.db")
+	keys := testKeys(t)
+	db, err := Create(path, keys, 32)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := db.Session()
+	execOK(t, s, `CREATE TABLE docs (
+		id UUID PRIMARY KEY DEFAULT UUID(),
+		name STRING NOT NULL,
+		sig BITVECTOR<8>
+	)`)
+	execOK(t, s, `INSERT INTO docs (name, sig) VALUES
+		('a', (1, 0, 0, 0, 0, 0, 0, 0)),
+		('b', (1, 1, 1, 0, 0, 0, 0, 0)),
+		('c', (0, 0, 0, 0, 1, 1, 1, 1))`)
+
+	// A non-bit element fails closed.
+	if _, err := s.Exec(`INSERT INTO docs (name, sig) VALUES ('bad', (0, 1, 2, 0, 0, 0, 0, 0))`); err == nil {
+		t.Fatal("expected non-bit element rejection")
+	}
+	// Dimension mismatch fails closed.
+	if _, err := s.Exec(`INSERT INTO docs (name, sig) VALUES ('bad', (1, 0, 1))`); err == nil {
+		t.Fatal("expected dim mismatch")
+	}
+
+	sel := execOK(t, s, `SELECT sig FROM docs WHERE name = 'b'`)
+	got := sel.Rows[0][0]
+	if got.Typ.String() != "BITVECTOR<8>" || got.Typ.VecElem != types.VecBit {
+		t.Fatalf("column type: %+v (%s)", got.Typ, got.Typ.String())
+	}
+	want := []float32{1, 1, 1, 0, 0, 0, 0, 0}
+	for i := range want {
+		if got.Vec[i] != want[i] {
+			t.Fatalf("element %d: got %v want %v", i, got.Vec[i], want[i])
+		}
+	}
+
+	// Flat NEAREST defaults to HAMMING for a BITVECTOR column.
+	near := execOK(t, s, `SELECT name FROM docs NEAREST sig TO (1, 0, 0, 0, 0, 0, 0, 0) LIMIT 1`)
+	if len(near.Rows) != 1 || near.Rows[0][0].Str != "a" {
+		t.Fatalf("flat hamming nearest: %v", titles(near))
+	}
+	// Explicit USING HAMMING is accepted; a real-valued metric is rejected.
+	execOK(t, s, `SELECT name FROM docs NEAREST sig TO (1, 1, 1, 1, 0, 0, 0, 0) USING HAMMING LIMIT 1`)
+	if _, err := s.Exec(`SELECT name FROM docs NEAREST sig TO (1, 1, 1, 1, 0, 0, 0, 0) USING COSINE LIMIT 1`); err == nil {
+		t.Fatal("expected COSINE on BITVECTOR rejection")
+	}
+
+	// HNSW over a BITVECTOR column (Hamming graph).
+	execOK(t, s, `CREATE VECTOR INDEX ix_sig ON docs (sig) USING HNSW`)
+	plan := execOK(t, s, `EXPLAIN SELECT name FROM docs NEAREST sig TO (0, 0, 0, 0, 1, 1, 1, 0) LIMIT 1`)
+	if !explainHas(plan, "ix_sig") {
+		t.Fatalf("expected HNSW plan: %+v", explainOps(plan))
+	}
+	near = execOK(t, s, `SELECT name FROM docs NEAREST sig TO (0, 0, 0, 0, 1, 1, 1, 0) LIMIT 1`)
+	if len(near.Rows) != 1 || near.Rows[0][0].Str != "c" {
+		t.Fatalf("hnsw hamming nearest: %v", titles(near))
+	}
+	// QUANTIZATION on a BITVECTOR index is rejected.
+	if _, err := s.Exec(`CREATE VECTOR INDEX ix_bad ON docs (sig) USING HNSW WITH (QUANTIZATION = 'I8')`); err == nil {
+		t.Fatal("expected QUANTIZATION on BITVECTOR rejection")
+	}
+
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(raw, []byte("NSVV")) {
+		t.Fatal("plaintext vector magic on disk")
+	}
+
+	db, err = Open(path, keys, 32)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	s = db.Session()
+	near = execOK(t, s, `SELECT name FROM docs NEAREST sig TO (1, 0, 0, 0, 0, 0, 0, 0) LIMIT 1`)
+	if len(near.Rows) != 1 || near.Rows[0][0].Str != "a" {
+		t.Fatalf("after restart: %v", titles(near))
+	}
+}
+
+func TestQuantizedHNSWIndex(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "nextsql.db")
+	keys := testKeys(t)
+	db, err := Create(path, keys, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := db.Session()
+	execOK(t, s, `CREATE TABLE docs (
+		id UUID PRIMARY KEY DEFAULT UUID(),
+		name STRING NOT NULL,
+		emb VECTOR<F32,4>
+	)`)
+	execOK(t, s, `INSERT INTO docs (name, emb) VALUES
+		('a', (1, 0, 0, 0)),
+		('b', (0, 1, 0, 0)),
+		('c', (0, 0, 1, 0)),
+		('d', (0, 0, 0, 1)),
+		('e', (0.9, 0.1, 0, 0))`)
+
+	if _, err := s.Exec(`CREATE VECTOR INDEX bad ON docs (emb) USING HNSW WITH (QUANTIZATION = 'q9')`); err == nil {
+		t.Fatal("expected unknown quantisation to be rejected")
+	}
+
+	execOK(t, s, `CREATE VECTOR INDEX ix_emb ON docs (emb) USING HNSW WITH (QUANTIZATION = 'I8')`)
+
+	plan := execOK(t, s, `EXPLAIN SELECT name FROM docs NEAREST emb TO (1, 0, 0, 0) LIMIT 1`)
+	if !explainHas(plan, "ix_emb") {
+		t.Fatalf("expected HNSW plan: %+v", explainOps(plan))
+	}
+	// Re-rank against the full-precision payloads makes the top hit exact.
+	near := execOK(t, s, `SELECT name FROM docs NEAREST emb TO (1, 0, 0, 0) LIMIT 1`)
+	if len(near.Rows) != 1 || near.Rows[0][0].Str != "a" {
+		t.Fatalf("quantized hnsw nearest: %v", titles(near))
+	}
+	near = execOK(t, s, `SELECT name FROM docs NEAREST emb TO (0, 0, 1, 0) LIMIT 2`)
+	if len(near.Rows) != 2 || near.Rows[0][0].Str != "c" {
+		t.Fatalf("quantized hnsw nearest k=2: %v", titles(near))
+	}
+
+	// The emitted vector column stays full precision despite an I8 index.
+	sel := execOK(t, s, `SELECT emb FROM docs NEAREST emb TO (0.9, 0.1, 0, 0) LIMIT 1`)
+	if len(sel.Rows) != 1 {
+		t.Fatalf("rows %d", len(sel.Rows))
+	}
+	v := sel.Rows[0][0].Vec
+	if v[0] != float32(0.9) || v[1] != float32(0.1) {
+		t.Fatalf("column value not full precision: %v", v)
+	}
+
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(raw, []byte("NSVV")) || bytes.Contains(raw, []byte("NSHM")) {
+		t.Fatal("plaintext vector/graph magic on disk")
+	}
+
+	db, err = Open(path, keys, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	s = db.Session()
+	near = execOK(t, s, `SELECT name FROM docs NEAREST emb TO (0, 1, 0, 0) LIMIT 1`)
+	if len(near.Rows) != 1 || near.Rows[0][0].Str != "b" {
+		t.Fatalf("after restart: %v", titles(near))
+	}
+	// A row inserted after restart is quantised into the graph and found.
+	execOK(t, s, `INSERT INTO docs (name, emb) VALUES ('f', (0.5, 0.5, 0.5, 0.5))`)
+	near = execOK(t, s, `SELECT name FROM docs NEAREST emb TO (0.5, 0.5, 0.5, 0.5) LIMIT 1`)
+	if len(near.Rows) != 1 || near.Rows[0][0].Str != "f" {
+		t.Fatalf("post-restart insert not indexed: %v", titles(near))
+	}
+}
+
+func TestIVFVectorIndex(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "nextsql.db")
+	keys := testKeys(t)
+	db, err := Create(path, keys, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := db.Session()
+	execOK(t, s, `CREATE TABLE docs (
+		id UUID PRIMARY KEY DEFAULT UUID(),
+		name STRING NOT NULL,
+		emb VECTOR<F32,4>
+	)`)
+	execOK(t, s, `INSERT INTO docs (name, emb) VALUES
+		('a', (1, 0, 0, 0)),
+		('b', (0, 1, 0, 0)),
+		('c', (0, 0, 1, 0)),
+		('d', (0, 0, 0, 1)),
+		('e', (0.9, 0.1, 0, 0)),
+		('f', (0.1, 0.9, 0, 0)),
+		('g', (0, 0.1, 0.9, 0)),
+		('h', (0.7, 0, 0, 0.7))`)
+
+	// LISTS is required; PROBES cannot exceed LISTS.
+	if _, err := s.Exec(`CREATE VECTOR INDEX bad ON docs (emb) USING IVF`); err == nil {
+		t.Fatal("expected USING IVF without LISTS to be rejected")
+	}
+	if _, err := s.Exec(`CREATE VECTOR INDEX bad ON docs (emb) USING IVF WITH (LISTS = 3, PROBES = 9)`); err == nil {
+		t.Fatal("expected PROBES > LISTS to be rejected")
+	}
+
+	// Probing every list makes the result exact.
+	execOK(t, s, `CREATE VECTOR INDEX ix_emb ON docs (emb) USING IVF WITH (LISTS = 3, PROBES = 3)`)
+
+	plan := execOK(t, s, `EXPLAIN SELECT name FROM docs NEAREST emb TO (1, 0, 0, 0) LIMIT 1`)
+	if !explainHas(plan, "ix_emb") || !explainHas(plan, "ivf") {
+		t.Fatalf("expected IVF plan: %+v", explainOps(plan))
+	}
+	near := execOK(t, s, `SELECT name FROM docs NEAREST emb TO (1, 0, 0, 0) LIMIT 1`)
+	if len(near.Rows) != 1 || near.Rows[0][0].Str != "a" {
+		t.Fatalf("ivf nearest: %v", titles(near))
+	}
+	near = execOK(t, s, `SELECT name FROM docs NEAREST emb TO (0, 0, 1, 0) LIMIT 2`)
+	if len(near.Rows) != 2 || near.Rows[0][0].Str != "c" {
+		t.Fatalf("ivf nearest k=2: %v", titles(near))
+	}
+	// Covering projection (PK only) still works.
+	cov := execOK(t, s, `SELECT id FROM docs NEAREST emb TO (0, 1, 0, 0) LIMIT 1`)
+	if len(cov.Rows) != 1 {
+		t.Fatalf("covering rows %d", len(cov.Rows))
+	}
+
+	// Maintenance: INSERT, UPDATE, DELETE keep the posting lists in sync.
+	execOK(t, s, `INSERT INTO docs (name, emb) VALUES ('z', (0.2, 0.2, 0.95, 0))`)
+	near = execOK(t, s, `SELECT name FROM docs NEAREST emb TO (0.2, 0.2, 0.95, 0) LIMIT 1`)
+	if len(near.Rows) != 1 || near.Rows[0][0].Str != "z" {
+		t.Fatalf("ivf insert not indexed: %v", titles(near))
+	}
+	execOK(t, s, `UPDATE docs SET emb = (0, 0, 0, 1) WHERE name = 'z'`)
+	near = execOK(t, s, `SELECT name FROM docs NEAREST emb TO (0, 0, 1, 0) LIMIT 1`)
+	if len(near.Rows) != 1 || near.Rows[0][0].Str != "c" {
+		t.Fatalf("ivf update not reflected: %v", titles(near))
+	}
+	execOK(t, s, `DELETE FROM docs WHERE name = 'a'`)
+	near = execOK(t, s, `SELECT name FROM docs NEAREST emb TO (1, 0, 0, 0) LIMIT 1`)
+	if len(near.Rows) != 1 || near.Rows[0][0].Str != "e" {
+		t.Fatalf("ivf delete not reflected: %v", titles(near))
+	}
+
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, magic := range []string{"NSVV", "NSIV", "NSIC", "NSIL"} {
+		if bytes.Contains(raw, []byte(magic)) {
+			t.Fatalf("plaintext %s magic on disk", magic)
+		}
+	}
+
+	db, err = Open(path, keys, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	s = db.Session()
+	near = execOK(t, s, `SELECT name FROM docs NEAREST emb TO (0, 1, 0, 0) LIMIT 1`)
+	if len(near.Rows) != 1 || near.Rows[0][0].Str != "b" {
+		t.Fatalf("ivf after restart: %v", titles(near))
+	}
+	execOK(t, s, `REBUILD INDEX ix_emb`)
+	near = execOK(t, s, `SELECT name FROM docs NEAREST emb TO (0, 0.1, 0.9, 0) LIMIT 1`)
+	if len(near.Rows) != 1 || near.Rows[0][0].Str != "g" {
+		t.Fatalf("ivf after rebuild: %v", titles(near))
+	}
+}
+
+// TestIVFCentroidGrouping exercises a coarse quantiser whose centroid set is too
+// large for one B+Tree record: SaveCentroids must split it across several groups
+// and LoadCentroids must stitch them back for training, search, and restart.
+func TestIVFCentroidGrouping(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "nextsql.db")
+	keys := testKeys(t)
+	db, err := Create(path, keys, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := db.Session()
+	const dim, rows, lists = 96, 60, 48 // 48 * 96 * 4 = 18 KiB of centroids > one leaf record
+	execOK(t, s, fmt.Sprintf(`CREATE TABLE docs (id STRING PRIMARY KEY, emb VECTOR<F32,%d>)`, dim))
+	mkVec := func(seed int) string {
+		var b strings.Builder
+		b.WriteByte('(')
+		for j := 0; j < dim; j++ {
+			if j > 0 {
+				b.WriteByte(',')
+			}
+			// A distinct near-one-hot direction per row so clusters are well separated.
+			v := 0.01
+			if j == seed%dim {
+				v = 1.0
+			}
+			fmt.Fprintf(&b, "%g", v)
+		}
+		b.WriteByte(')')
+		return b.String()
+	}
+	for i := 0; i < rows; i++ {
+		execOK(t, s, fmt.Sprintf(`INSERT INTO docs (id, emb) VALUES ('r%d', %s)`, i, mkVec(i)))
+	}
+	execOK(t, s, fmt.Sprintf(`CREATE VECTOR INDEX ix_emb ON docs (emb) USING IVF WITH (LISTS = %d, PROBES = %d)`, lists, lists))
+
+	// PROBES = LISTS ⇒ exact: the nearest row to row 7's own vector is row 7.
+	near := execOK(t, s, fmt.Sprintf(`SELECT id FROM docs NEAREST emb TO %s LIMIT 1`, mkVec(7)))
+	if len(near.Rows) != 1 || near.Rows[0][0].Str != "r7" {
+		t.Fatalf("grouped-centroid IVF nearest: %v", near.Rows)
+	}
+
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err = Open(path, keys, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	s = db.Session()
+	near = execOK(t, s, fmt.Sprintf(`SELECT id FROM docs NEAREST emb TO %s LIMIT 1`, mkVec(42)))
+	if len(near.Rows) != 1 || near.Rows[0][0].Str != "r42" {
+		t.Fatalf("grouped-centroid IVF after restart: %v", near.Rows)
+	}
+	execOK(t, s, `REBUILD INDEX ix_emb`)
+	near = execOK(t, s, fmt.Sprintf(`SELECT id FROM docs NEAREST emb TO %s LIMIT 1`, mkVec(13)))
+	if len(near.Rows) != 1 || near.Rows[0][0].Str != "r13" {
+		t.Fatalf("grouped-centroid IVF after rebuild: %v", near.Rows)
+	}
+}
+
+// TestIVFPQVectorIndex exercises the IVF-PQ SQL surface end to end: the
+// SUBSPACES clause, build + exact-rerank search, INSERT/UPDATE/DELETE
+// maintenance, restart recovery, REBUILD INDEX, and no plaintext ANN magic on
+// disk.
+func TestIVFPQVectorIndex(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "nextsql.db")
+	keys := testKeys(t)
+	db, err := Create(path, keys, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := db.Session()
+	execOK(t, s, `CREATE TABLE docs (
+		id STRING PRIMARY KEY,
+		name STRING NOT NULL,
+		emb VECTOR<F32,8>
+	)`)
+	execOK(t, s, `INSERT INTO docs (id, name, emb) VALUES
+		('1','a',(1,0,0,0,0,0,0,0)),
+		('2','b',(0,1,0,0,0,0,0,0)),
+		('3','c',(0,0,1,0,0,0,0,0)),
+		('4','d',(0,0,0,1,0,0,0,0)),
+		('5','e',(0,0,0,0,1,0,0,0)),
+		('6','f',(0,0,0,0,0,1,0,0)),
+		('7','g',(0,0,0,0,0,0,1,0)),
+		('8','h',(0,0,0,0,0,0,0,1)),
+		('9','i',(0.9,0.1,0,0,0,0,0,0)),
+		('10','j',(0,0,0.9,0.1,0,0,0,0)),
+		('11','k',(0,0,0,0,0.9,0.1,0,0)),
+		('12','l',(0,0,0,0,0,0,0.1,0.9))`)
+
+	// LISTS is required; SUBSPACES is required and must divide the dimension.
+	if _, err := s.Exec(`CREATE VECTOR INDEX bad ON docs (emb) USING IVFPQ WITH (LISTS = 4)`); err == nil {
+		t.Fatal("expected USING IVFPQ without SUBSPACES to be rejected")
+	}
+	if _, err := s.Exec(`CREATE VECTOR INDEX bad ON docs (emb) USING IVFPQ WITH (LISTS = 4, SUBSPACES = 3)`); err == nil {
+		t.Fatal("expected SUBSPACES not dividing the dimension to be rejected")
+	}
+	if _, err := s.Exec(`CREATE VECTOR INDEX bad ON docs (emb) USING IVFPQ WITH (LISTS = 4, PROBES = 9, SUBSPACES = 4)`); err == nil {
+		t.Fatal("expected PROBES > LISTS to be rejected")
+	}
+
+	execOK(t, s, `CREATE VECTOR INDEX ix_emb ON docs (emb) USING IVFPQ WITH (LISTS = 4, PROBES = 4, SUBSPACES = 4)`)
+
+	plan := execOK(t, s, `EXPLAIN SELECT name FROM docs NEAREST emb TO (1,0,0,0,0,0,0,0) LIMIT 1`)
+	if !explainHas(plan, "ix_emb") || !explainHas(plan, "ivfpq") {
+		t.Fatalf("expected IVFPQ plan: %+v", explainOps(plan))
+	}
+	near := execOK(t, s, `SELECT name FROM docs NEAREST emb TO (1,0,0,0,0,0,0,0) LIMIT 1`)
+	if len(near.Rows) != 1 || near.Rows[0][0].Str != "a" {
+		t.Fatalf("ivfpq nearest: %v", titles(near))
+	}
+	near = execOK(t, s, `SELECT name FROM docs NEAREST emb TO (0,0,0.95,0.05,0,0,0,0) LIMIT 2`)
+	if len(near.Rows) != 2 || near.Rows[0][0].Str != "c" {
+		t.Fatalf("ivfpq nearest k=2: %v", titles(near))
+	}
+
+	// Maintenance: INSERT, UPDATE, DELETE keep the posting lists in sync.
+	execOK(t, s, `INSERT INTO docs (id, name, emb) VALUES ('13','z',(0,0.95,0.05,0,0,0,0,0))`)
+	near = execOK(t, s, `SELECT name FROM docs NEAREST emb TO (0,0.95,0.05,0,0,0,0,0) LIMIT 1`)
+	if len(near.Rows) != 1 || near.Rows[0][0].Str != "z" {
+		t.Fatalf("ivfpq insert not indexed: %v", titles(near))
+	}
+	execOK(t, s, `UPDATE docs SET emb = (0,0,0,0,0,0,0,1) WHERE name = 'z'`)
+	near = execOK(t, s, `SELECT name FROM docs NEAREST emb TO (0,0.95,0.05,0,0,0,0,0) LIMIT 1`)
+	if len(near.Rows) != 1 || near.Rows[0][0].Str == "z" {
+		t.Fatalf("ivfpq update not reflected: %v", titles(near))
+	}
+	execOK(t, s, `DELETE FROM docs WHERE name = 'a'`)
+	near = execOK(t, s, `SELECT name FROM docs NEAREST emb TO (1,0,0,0,0,0,0,0) LIMIT 1`)
+	if len(near.Rows) != 1 || near.Rows[0][0].Str != "i" {
+		t.Fatalf("ivfpq delete not reflected: %v", titles(near))
+	}
+
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, magic := range []string{"NSVV", "NSPQ", "NSPC", "NSPL", "NSIC"} {
+		if bytes.Contains(raw, []byte(magic)) {
+			t.Fatalf("plaintext %s magic on disk", magic)
+		}
+	}
+
+	db, err = Open(path, keys, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	s = db.Session()
+	near = execOK(t, s, `SELECT name FROM docs NEAREST emb TO (0,1,0,0,0,0,0,0) LIMIT 1`)
+	if len(near.Rows) != 1 || near.Rows[0][0].Str != "b" {
+		t.Fatalf("ivfpq after restart: %v", titles(near))
+	}
+	execOK(t, s, `REBUILD INDEX ix_emb`)
+	near = execOK(t, s, `SELECT name FROM docs NEAREST emb TO (0,0,0,0,0,0,1,0) LIMIT 1`)
+	if len(near.Rows) != 1 || near.Rows[0][0].Str != "g" {
+		t.Fatalf("ivfpq after rebuild: %v", titles(near))
+	}
+}
+
+func TestSparseVectorIndex(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "nextsql.db")
+	keys := testKeys(t)
+	db, err := Create(path, keys, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := db.Session()
+	execOK(t, s, `CREATE TABLE docs (
+		id STRING PRIMARY KEY,
+		name STRING NOT NULL,
+		emb SPARSEVECTOR<8>
+	)`)
+	execOK(t, s, `INSERT INTO docs (id, name, emb) VALUES
+		('1','a',(1,0,0,0,0,0,0,0)),
+		('2','b',(0,1,0,0,0,0,0,0)),
+		('3','c',(0,0,1,0,0,0,0,0)),
+		('4','d',(0,0,0,1,0,0,0,0)),
+		('5','e',(0,0,0,0,1,0,0,0)),
+		('6','f',(0,0,0,0,0,1,0,0)),
+		('7','g',(0,0,0,0,0,0,1,0)),
+		('8','h',(0,0,0,0,0,0,0,1)),
+		('9','i',(0.9,0.1,0,0,0,0,0,0)),
+		('10','j',(0,0,0.9,0.1,0,0,0,0))`)
+
+	sel := execOK(t, s, `SELECT emb FROM docs WHERE name = 'i'`)
+	got := sel.Rows[0][0]
+	if got.Typ.String() != "SPARSEVECTOR<8>" || got.Typ.VecElem != types.VecSparse {
+		t.Fatalf("column type: %+v (%s)", got.Typ, got.Typ.String())
+	}
+	if len(got.SparseIdx) != 2 || got.SparseIdx[0] != 0 || got.SparseIdx[1] != 1 {
+		t.Fatalf("sparse indices: %v val=%v", got.SparseIdx, got.SparseVal)
+	}
+
+	if _, err := s.Exec(`CREATE VECTOR INDEX bad ON docs (emb) USING HNSW`); err == nil {
+		t.Fatal("expected HNSW on SPARSEVECTOR to be rejected")
+	}
+	if _, err := s.Exec(`CREATE VECTOR INDEX bad ON docs (emb) USING IVF WITH (LISTS = 2)`); err == nil {
+		t.Fatal("expected IVF on SPARSEVECTOR to be rejected")
+	}
+	if _, err := s.Exec(`SELECT name FROM docs NEAREST emb TO (1,0,0,0,0,0,0,0) USING L2 LIMIT 1`); err == nil {
+		t.Fatal("expected L2 on SPARSEVECTOR to be rejected")
+	}
+
+	flat := execOK(t, s, `SELECT name FROM docs NEAREST emb TO (1,0,0,0,0,0,0,0) LIMIT 1`)
+	if len(flat.Rows) != 1 || flat.Rows[0][0].Str != "a" {
+		t.Fatalf("flat sparse nearest: %v", titles(flat))
+	}
+
+	execOK(t, s, `CREATE VECTOR INDEX ix_emb ON docs (emb) USING SPARSE`)
+	plan := execOK(t, s, `EXPLAIN SELECT name FROM docs NEAREST emb TO (1,0,0,0,0,0,0,0) LIMIT 1`)
+	if !explainHas(plan, "ix_emb") || !explainHas(plan, "sparse") {
+		t.Fatalf("expected SPARSE plan: %+v", explainOps(plan))
+	}
+	near := execOK(t, s, `SELECT name FROM docs NEAREST emb TO (1,0,0,0,0,0,0,0) LIMIT 1`)
+	if len(near.Rows) != 1 || near.Rows[0][0].Str != "a" {
+		t.Fatalf("sparse nearest: %v", titles(near))
+	}
+	near = execOK(t, s, `SELECT name FROM docs NEAREST emb TO (0,0,0.95,0.05,0,0,0,0) LIMIT 2`)
+	if len(near.Rows) != 2 || near.Rows[0][0].Str != "c" {
+		t.Fatalf("sparse nearest k=2: %v", titles(near))
+	}
+
+	execOK(t, s, `INSERT INTO docs (id, name, emb) VALUES ('13','z',(0,0.95,0.05,0,0,0,0,0))`)
+	near = execOK(t, s, `SELECT name FROM docs NEAREST emb TO (0,0.95,0.05,0,0,0,0,0) LIMIT 1`)
+	if len(near.Rows) != 1 || near.Rows[0][0].Str != "z" {
+		t.Fatalf("sparse insert not indexed: %v", titles(near))
+	}
+	execOK(t, s, `UPDATE docs SET emb = (0,0,0,0,0,0,0,1) WHERE name = 'z'`)
+	near = execOK(t, s, `SELECT name FROM docs NEAREST emb TO (0,0.95,0.05,0,0,0,0,0) LIMIT 1`)
+	if len(near.Rows) != 1 || near.Rows[0][0].Str == "z" {
+		t.Fatalf("sparse update not reflected: %v", titles(near))
+	}
+	execOK(t, s, `DELETE FROM docs WHERE name = 'a'`)
+	near = execOK(t, s, `SELECT name FROM docs NEAREST emb TO (1,0,0,0,0,0,0,0) LIMIT 1`)
+	if len(near.Rows) != 1 || near.Rows[0][0].Str != "i" {
+		t.Fatalf("sparse delete not reflected: %v", titles(near))
+	}
+
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, magic := range []string{"NSSV", "NSSM", "NSSP"} {
+		if bytes.Contains(raw, []byte(magic)) {
+			t.Fatalf("plaintext %s magic on disk", magic)
+		}
+	}
+
+	db, err = Open(path, keys, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	s = db.Session()
+	near = execOK(t, s, `SELECT name FROM docs NEAREST emb TO (0,1,0,0,0,0,0,0) LIMIT 1`)
+	if len(near.Rows) != 1 || near.Rows[0][0].Str != "b" {
+		t.Fatalf("sparse after restart: %v", titles(near))
+	}
+	execOK(t, s, `REBUILD INDEX ix_emb`)
+	near = execOK(t, s, `SELECT name FROM docs NEAREST emb TO (0,0,0,0,0,0,1,0) LIMIT 1`)
+	if len(near.Rows) != 1 || near.Rows[0][0].Str != "g" {
+		t.Fatalf("sparse after rebuild: %v", titles(near))
+	}
+}
+
+// TestIVFProcessLocalCache checks that a NEAREST query through an IVF index is
+// served from the process-local committed copy rather than reloading the coarse
+// quantiser from the encrypted index tree every time, and that the copy is
+// invalidated when the index is mutated, rebuilt, or reloaded after restart.
+func TestIVFProcessLocalCache(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "nextsql.db")
+	keys := testKeys(t)
+	db, err := Create(path, keys, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := db.Session()
+	execOK(t, s, `CREATE TABLE docs (id STRING PRIMARY KEY, emb VECTOR<F32,4>)`)
+	execOK(t, s, `INSERT INTO docs (id, emb) VALUES
+		('a', (1,0,0,0)), ('b', (0,1,0,0)), ('c', (0,0,1,0)), ('d', (0,0,0,1))`)
+	execOK(t, s, `CREATE VECTOR INDEX ix_emb ON docs (emb) USING IVF WITH (LISTS = 2, PROBES = 2)`)
+
+	key := idxKey("docs", "ix_emb")
+	if db.getIVF(key) == nil {
+		t.Fatal("expected the IVF build to install a process-local copy at commit")
+	}
+	gen0 := db.hnswGeneration()
+	if m := db.getIVF(key); m == nil || m.gen != gen0 {
+		t.Fatalf("cached IVF copy generation: got %v want %d", m, gen0)
+	}
+
+	// A search does not evict or rebuild the cached copy.
+	near := execOK(t, s, `SELECT id FROM docs NEAREST emb TO (1,0,0,0) LIMIT 1`)
+	if len(near.Rows) != 1 || near.Rows[0][0].Str != "a" {
+		t.Fatalf("ivf nearest: %v", near.Rows)
+	}
+	if m := db.getIVF(key); m == nil || m.gen != gen0 {
+		t.Fatal("a read-only NEAREST must not invalidate the cached IVF copy")
+	}
+
+	// A mutation invalidates every cached vector-index copy at commit.
+	execOK(t, s, `INSERT INTO docs (id, emb) VALUES ('e', (0.95, 0.05, 0, 0))`)
+	if db.hnswGeneration() == gen0 {
+		t.Fatal("an INSERT into an IVF-indexed table must bump the cache generation")
+	}
+	if old := db.getIVF(key); old != nil && old.gen == gen0 {
+		t.Fatal("stale IVF copy still served at the old generation after a mutation")
+	}
+	near = execOK(t, s, `SELECT id FROM docs NEAREST emb TO (0.95, 0.05, 0, 0) LIMIT 1`)
+	if len(near.Rows) != 1 || near.Rows[0][0].Str != "e" {
+		t.Fatalf("ivf nearest after insert: %v", near.Rows)
+	}
+	// The next search repopulates the cache at the current generation.
+	if m := db.getIVF(key); m == nil || m.gen != db.hnswGeneration() {
+		t.Fatal("expected the post-mutation search to repopulate the IVF cache")
+	}
+
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err = Open(path, keys, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	s = db.Session()
+	if db.getIVF(key) != nil {
+		t.Fatal("a freshly opened DB should hold no cached IVF copy until first search")
+	}
+	near = execOK(t, s, `SELECT id FROM docs NEAREST emb TO (0,1,0,0) LIMIT 1`)
+	if len(near.Rows) != 1 || near.Rows[0][0].Str != "b" {
+		t.Fatalf("ivf nearest after restart: %v", near.Rows)
+	}
+	if db.getIVF(key) == nil {
+		t.Fatal("first search after restart should lazily populate the IVF cache")
+	}
+
+	// REBUILD INDEX replaces the cached copy in place.
+	execOK(t, s, `REBUILD INDEX ix_emb`)
+	near = execOK(t, s, `SELECT id FROM docs NEAREST emb TO (0,0,1,0) LIMIT 1`)
+	if len(near.Rows) != 1 || near.Rows[0][0].Str != "c" {
+		t.Fatalf("ivf nearest after rebuild: %v", near.Rows)
+	}
+	if m := db.getIVF(key); m == nil || m.gen != db.hnswGeneration() {
+		t.Fatal("REBUILD INDEX should leave a current cached IVF copy")
+	}
+}
+
 func TestHybridSearchNearest(t *testing.T) {
 	db := testDB(t)
 	s := db.Session()
@@ -1844,6 +3526,92 @@ func TestHybridSearchNearest(t *testing.T) {
 	st, ok := db.Cat.Stats("products")
 	if !ok || len(st.Vectors) != 1 || st.Vectors[0].Dim != 4 || st.Vectors[0].IndexName != "ix_emb" {
 		t.Fatalf("vector stats %+v ok=%v", st, ok)
+	}
+}
+
+func TestDenseSparseBM25Fusion(t *testing.T) {
+	db := testDB(t)
+	s := db.Session()
+	execOK(t, s, `CREATE TABLE docs (
+		id STRING PRIMARY KEY,
+		body TEXT,
+		emb VECTOR<F32,4>,
+		sparse SPARSEVECTOR<8>
+	)`)
+	execOK(t, s, `INSERT INTO docs (id, body, emb, sparse) VALUES
+		('lex', 'willow tree notes', (0, 1, 0, 0), (0.1, 0, 0, 0, 0, 0, 0, 0)),
+		('vec', 'unrelated xyz', (1, 0, 0, 0), (0, 0.1, 0, 0, 0, 0, 0, 0)),
+		('spr', 'unrelated abc', (0, 0, 1, 0), (0, 0, 0, 0, 0, 0, 0, 1)),
+		('none', 'zzzz', (0, 0, 0, 1), (0, 0, 0.1, 0, 0, 0, 0, 0))`)
+	execOK(t, s, `CREATE FULLTEXT INDEX ix_body ON docs (body)`)
+	execOK(t, s, `CREATE VECTOR INDEX ix_emb ON docs (emb) USING HNSW`)
+	execOK(t, s, `CREATE VECTOR INDEX ix_sparse ON docs (sparse) USING SPARSE`)
+	execOK(t, s, `ANALYZE docs`)
+
+	lex := execOK(t, s, `SELECT id FROM docs SEARCH body FOR 'willow' LIMIT 1`)
+	if !containsTitle(lex, "lex") || containsTitle(lex, "vec") || containsTitle(lex, "spr") {
+		t.Fatalf("BM25-only should retrieve lex: %v", titles(lex))
+	}
+	vec := execOK(t, s, `SELECT id FROM docs NEAREST emb TO (1, 0, 0, 0) LIMIT 1`)
+	if !containsTitle(vec, "vec") {
+		t.Fatalf("dense-only should retrieve vec: %v", titles(vec))
+	}
+	spr := execOK(t, s, `SELECT id FROM docs NEAREST sparse TO (0, 0, 0, 0, 0, 0, 0, 1) LIMIT 1`)
+	if !containsTitle(spr, "spr") {
+		t.Fatalf("sparse-only should retrieve spr: %v", titles(spr))
+	}
+
+	got := execOK(t, s, `SELECT id FROM docs
+		SEARCH body FOR 'willow'
+		NEAREST emb TO (1, 0, 0, 0)
+		NEAREST sparse TO (0, 0, 0, 0, 0, 0, 0, 1)
+		LIMIT 3`)
+	if len(got.Rows) != 3 {
+		t.Fatalf("fusion LIMIT 3: %v", titles(got))
+	}
+	if !containsTitle(got, "lex") || !containsTitle(got, "vec") || !containsTitle(got, "spr") {
+		t.Fatalf("3-way fusion should surface each channel's hit: %v", titles(got))
+	}
+	if containsTitle(got, "none") {
+		t.Fatalf("fusion leaked unrelated row: %v", titles(got))
+	}
+
+	plan := execOK(t, s, `EXPLAIN SELECT id FROM docs
+		SEARCH body FOR 'willow'
+		NEAREST emb TO (1, 0, 0, 0)
+		NEAREST sparse TO (0, 0, 0, 0, 0, 0, 0, 1)
+		LIMIT 3`)
+	if !explainHas(plan, "Rerank") || !explainHas(plan, "bm25+vector+sparse") || !explainHas(plan, "fusion") {
+		t.Fatalf("explain missing 3-way fusion: %+v", explainOps(plan))
+	}
+
+	pair := execOK(t, s, `SELECT id FROM docs
+		NEAREST emb TO (1, 0, 0, 0)
+		NEAREST sparse TO (0, 0, 0, 0, 0, 0, 0, 1)
+		LIMIT 2`)
+	if !containsTitle(pair, "vec") || !containsTitle(pair, "spr") {
+		t.Fatalf("dense+sparse fusion: %v", titles(pair))
+	}
+
+	execOK(t, s, `BEGIN`)
+	execOK(t, s, `INSERT INTO docs (id, body, emb, sparse) VALUES
+		('txn', 'willow extra', (0.99, 0.01, 0, 0), (0, 0, 0, 0, 0, 0, 0, 0.5))`)
+	inTxn := execOK(t, s, `SELECT id FROM docs
+		SEARCH body FOR 'willow'
+		NEAREST emb TO (1, 0, 0, 0)
+		NEAREST sparse TO (0, 0, 0, 0, 0, 0, 0, 1)
+		LIMIT 5`)
+	if !containsTitle(inTxn, "txn") {
+		t.Fatalf("fusion should see uncommitted insert: %v", titles(inTxn))
+	}
+	execOK(t, s, `ROLLBACK`)
+	after := execOK(t, s, `SELECT id FROM docs
+		SEARCH body FOR 'willow'
+		NEAREST emb TO (1, 0, 0, 0)
+		NEAREST sparse TO (0, 0, 0, 0, 0, 0, 0, 1)
+		LIMIT 5`)
+	if containsTitle(after, "txn") {
+		t.Fatalf("rolled back fusion row still visible: %v", titles(after))
 	}
 }
 

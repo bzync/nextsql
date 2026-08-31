@@ -8,11 +8,13 @@ import (
 
 	"github.com/bzync/nextsql/internal/catalog"
 	"github.com/bzync/nextsql/internal/crypto"
+	"github.com/bzync/nextsql/internal/fulltext"
 	"github.com/bzync/nextsql/internal/nerr"
 	"github.com/bzync/nextsql/internal/sql/ast"
 	"github.com/bzync/nextsql/internal/sql/planner"
 	"github.com/bzync/nextsql/internal/sql/types"
 	"github.com/bzync/nextsql/internal/storage/btree"
+	"github.com/bzync/nextsql/internal/wal"
 )
 
 func (s *Session) execCreateDatabase(p planner.CreateDatabase) (*Result, error) {
@@ -112,13 +114,15 @@ func (s *Session) execDropTable(p planner.DropTable) (*Result, error) {
 			return nil, err
 		}
 	}
-	for _, idx := range p.Table.Indexes {
-		tr, err := s.indexOf(p.Table, idx)
-		if err != nil {
-			return nil, err
-		}
-		if err := s.queueTreeReclaim(tr); err != nil {
-			return nil, err
+	if p.Table.Partitioning == nil {
+		for _, idx := range p.Table.Indexes {
+			tr, err := s.indexOf(p.Table, idx)
+			if err != nil {
+				return nil, err
+			}
+			if err := s.queueTreeReclaim(tr); err != nil {
+				return nil, err
+			}
 		}
 	}
 	if p.Table.Partitioning != nil {
@@ -155,6 +159,9 @@ func (s *Session) execDropTable(p planner.DropTable) (*Result, error) {
 		return nil, err
 	}
 	if err := ctx.Delete(catalog.StatsKey(name)); err != nil && !nerr.HasCode(err, nerr.NotFound) {
+		return nil, err
+	}
+	if err := s.deletePartitionStats(p.Table.ID); err != nil {
 		return nil, err
 	}
 	if err := s.dropAIKeys(p.Table); err != nil {
@@ -273,6 +280,34 @@ func (s *Session) execDropIndex(p planner.DropIndex) (*Result, error) {
 	if p.Index.Unique && s.uniqueIndexRequiredByFK(tab, pos) {
 		return nil, nerr.New(nerr.ForeignKey, "executor.DropIndex", "unique index is required by a foreign key")
 	}
+	if tab.Partitioning != nil {
+		if p.Index.Vector {
+			s.dirtyHNSW = true
+		}
+		neu := tab.Clone()
+		for i, part := range tab.Partitioning.Partitions {
+			local, err := s.partitionIndex(tab, part.ID, p.Index)
+			if err != nil {
+				return nil, err
+			}
+			if err := s.queueTreeReclaim(local); err != nil {
+				return nil, err
+			}
+			s.pending.indexDrops = append(s.pending.indexDrops, indexMapDrop{key: partitionIndexKey(tab.Name, part.ID, p.Index.Name), tree: local, partition: true})
+			kept := neu.Partitioning.Partitions[i].Indexes[:0]
+			for _, physical := range neu.Partitioning.Partitions[i].Indexes {
+				if physical.Name != p.Index.Name {
+					kept = append(kept, physical)
+				}
+			}
+			neu.Partitioning.Partitions[i].Indexes = kept
+		}
+		neu.Indexes = append(neu.Indexes[:pos], neu.Indexes[pos+1:]...)
+		if err := s.putCatalog(neu, tab.Name); err != nil {
+			return nil, err
+		}
+		return &Result{}, nil
+	}
 	old, err := s.indexOf(tab, p.Index)
 	if err != nil {
 		return nil, err
@@ -280,6 +315,7 @@ func (s *Session) execDropIndex(p planner.DropIndex) (*Result, error) {
 	if err := s.queueTreeReclaim(old); err != nil {
 		return nil, err
 	}
+	s.pending.indexDrops = append(s.pending.indexDrops, indexMapDrop{key: idxKey(tab.Name, p.Index.Name), tree: old})
 	neu := tab.Clone()
 	neu.Indexes = append(neu.Indexes[:pos], neu.Indexes[pos+1:]...)
 	if err := s.putCatalog(neu, tab.Name); err != nil {
@@ -307,6 +343,9 @@ func (s *Session) execRebuildIndex(p planner.RebuildIndex) (res *Result, err err
 	if pos < 0 {
 		return nil, nerr.New(nerr.NotFound, "executor.RebuildIndex", "unknown index")
 	}
+	if tab.Partitioning != nil {
+		return s.rebuildPartitionedIndex(tab, pos, p.Index)
+	}
 	old, err := s.indexOf(tab, p.Index)
 	if err != nil {
 		return nil, err
@@ -314,6 +353,7 @@ func (s *Session) execRebuildIndex(p planner.RebuildIndex) (res *Result, err err
 	if err := s.queueTreeReclaim(old); err != nil {
 		return nil, err
 	}
+	s.pending.indexDrops = append(s.pending.indexDrops, indexMapDrop{key: idxKey(tab.Name, p.Index.Name), tree: old})
 	progress := s.db.beginIndexRebuild(tab.Name, p.Index.Name)
 	started := time.Now()
 	defer func() {
@@ -328,6 +368,72 @@ func (s *Session) execRebuildIndex(p planner.RebuildIndex) (res *Result, err err
 	}
 	neu := tab.Clone()
 	neu.Indexes[pos] = built
+	progress.phase.Store("committing")
+	if err := s.putCatalog(neu, tab.Name); err != nil {
+		return nil, err
+	}
+	return &Result{}, nil
+}
+
+func (s *Session) rebuildPartitionedIndex(tab *catalog.Table, pos int, idx catalog.Index) (res *Result, err error) {
+	progress := s.db.beginIndexRebuild(tab.Name, idx.Name)
+	started := time.Now()
+	defer func() {
+		s.db.finishIndexRebuild(progress)
+		if s.db.metrics != nil {
+			s.db.metrics.ObserveIndexRebuild(progress.rows.Load(), progress.entries.Load(), time.Since(started), err)
+		}
+	}()
+	if err := s.db.Eng.CrashAt(wal.PointDuringIndexBuild); err != nil {
+		return nil, err
+	}
+	neu := tab.Clone()
+	for i, part := range tab.Partitioning.Partitions {
+		old, err := s.partitionIndex(tab, part.ID, idx)
+		if err != nil {
+			return nil, err
+		}
+		if err := s.queueTreeReclaim(old); err != nil {
+			return nil, err
+		}
+		s.pending.indexDrops = append(s.pending.indexDrops, indexMapDrop{key: partitionIndexKey(tab.Name, part.ID, idx.Name), tree: old, partition: true})
+		heap, err := s.partitionHeap(tab, part.ID)
+		if err != nil {
+			return nil, err
+		}
+		s.db.Eng.Enter(s.x.owner.Storage())
+		local, err := btree.CreateDetached(s.db.Eng)
+		s.db.Eng.Leave(s.x.owner.Storage())
+		if err != nil {
+			return nil, err
+		}
+		s.pending.partIdxs[partitionIndexKey(tab.Name, part.ID, idx.Name)] = local
+		if idx.Vector {
+			s.dirtyHNSW = true
+			if err := s.buildPartitionVectorIndex(tab, idx, part, s.x.use(heap), progress); err != nil {
+				return nil, err
+			}
+		} else if err := s.populatePartitionIndex(tab, idx, s.x.use(heap), s.x.use(local), progress); err != nil {
+			return nil, err
+		}
+		found := false
+		for j := range neu.Partitioning.Partitions[i].Indexes {
+			if neu.Partitioning.Partitions[i].Indexes[j].Name == idx.Name {
+				neu.Partitioning.Partitions[i].Indexes[j].Meta = local.Meta()
+				found = true
+				break
+			}
+		}
+		if !found {
+			return nil, nerr.New(nerr.Corruption, "executor.RebuildIndex", "partition-local index metadata missing")
+		}
+	}
+	if idx.Unique && !idx.Vector {
+		if err := s.verifyCrossPartitionUnique(tab, idx); err != nil {
+			return nil, err
+		}
+	}
+	neu.Indexes[pos].Meta = 0
 	progress.phase.Store("committing")
 	if err := s.putCatalog(neu, tab.Name); err != nil {
 		return nil, err
@@ -419,10 +525,358 @@ func (s *Session) execAlterTable(p planner.AlterTable) (*Result, error) {
 		if err := s.putCatalog(neu, old.Name); err != nil {
 			return nil, err
 		}
+	case ast.AlterAddPartition:
+		if err := s.alterAddPartition(old, neu, cmd); err != nil {
+			return nil, err
+		}
+	case ast.AlterDropPartition:
+		if err := s.alterDropPartition(old, neu, cmd); err != nil {
+			return nil, err
+		}
+	case ast.AlterAttachPartition:
+		if err := s.alterAttachPartition(old, neu, p.Transfer, cmd); err != nil {
+			return nil, err
+		}
+	case ast.AlterDetachPartition:
+		if err := s.alterDetachPartition(old, neu, p.Transfer, cmd); err != nil {
+			return nil, err
+		}
 	default:
 		return nil, nerr.New(nerr.InvalidArgument, "executor.AlterTable", "unsupported ALTER TABLE command")
 	}
 	return &Result{}, nil
+}
+
+func (s *Session) alterAttachPartition(old, neu, source *catalog.Table, cmd ast.AlterAttachPartition) error {
+	if old == nil || neu == nil || source == nil || old.Partitioning == nil || neu.Partitioning == nil ||
+		len(neu.Partitioning.Partitions) != len(old.Partitioning.Partitions)+1 {
+		return nerr.New(nerr.Internal, "executor.AlterTable", "invalid partition attachment")
+	}
+	if len(s.inboundFKs(source)) != 0 || len(source.ForeignKeys) != 0 {
+		return nerr.New(nerr.ForeignKey, "executor.AlterTable", "attached table has foreign-key dependencies")
+	}
+	if err := s.rejectTableAutomationDependencies(source); err != nil {
+		return err
+	}
+	part := &neu.Partitioning.Partitions[len(neu.Partitioning.Partitions)-1]
+	if part.Name != cmd.Partition.Name || part.HeapMeta != source.HeapMeta || part.VecMeta != source.VecMeta {
+		return nerr.New(nerr.Internal, "executor.AlterTable", "partition attachment mismatch")
+	}
+	heap, err := s.heapOf(source)
+	if err != nil {
+		return err
+	}
+	if err := s.validateAttachedRows(neu, source, part.ID, heap); err != nil {
+		return err
+	}
+	s.pending.partHeaps[partitionHeapKey(old.Name, part.ID)] = heap
+	if source.VecMeta != 0 {
+		vec, err := s.vecOf(source)
+		if err != nil {
+			return err
+		}
+		s.pending.partVecs[partitionHeapKey(old.Name, part.ID)] = vec
+	}
+	for i, idx := range source.Indexes {
+		if i >= len(part.Indexes) || part.Indexes[i].Name != idx.Name || part.Indexes[i].Meta != idx.Meta {
+			return nerr.New(nerr.Corruption, "executor.AlterTable", "attached table index ownership mismatch")
+		}
+		tree, err := s.indexOf(source, idx)
+		if err != nil {
+			return err
+		}
+		s.pending.partIdxs[partitionIndexKey(old.Name, part.ID, idx.Name)] = tree
+		if idx.Vector {
+			// The source's process-local HNSW mem copy is keyed by the source
+			// table name; force search to reload under the partition key.
+			s.dirtyHNSW = true
+		}
+	}
+	ctx := s.x.use(s.db.CatTree)
+	if err := ctx.Delete(catalog.TableKey(source.Name)); err != nil {
+		return err
+	}
+	if err := ctx.Delete(catalog.StatsKey(source.Name)); err != nil && !nerr.HasCode(err, nerr.NotFound) {
+		return err
+	}
+	if err := s.dropAIKeys(source); err != nil {
+		return err
+	}
+	if s.overlay == nil {
+		s.overlay = make(map[string]*catalog.Table)
+	}
+	s.overlay[source.Name] = nil
+	return s.putCatalog(neu, old.Name)
+}
+
+func (s *Session) alterDetachPartition(old, neu, detached *catalog.Table, cmd ast.AlterDetachPartition) error {
+	if old == nil || neu == nil || detached == nil || old.Partitioning == nil || neu.Partitioning == nil ||
+		len(neu.Partitioning.Partitions)+1 != len(old.Partitioning.Partitions) {
+		return nerr.New(nerr.Internal, "executor.AlterTable", "invalid partition detachment")
+	}
+	var part *catalog.Partition
+	for i := range old.Partitioning.Partitions {
+		if old.Partitioning.Partitions[i].Name == cmd.Name {
+			part = &old.Partitioning.Partitions[i]
+			break
+		}
+	}
+	if part == nil || detached.Name != part.Name || detached.HeapMeta != part.HeapMeta || detached.VecMeta != part.VecMeta {
+		return nerr.New(nerr.Internal, "executor.AlterTable", "partition detachment mismatch")
+	}
+	heap, err := s.partitionHeap(old, part.ID)
+	if err != nil {
+		return err
+	}
+	if err := s.validateDetachedRows(detached, heap); err != nil {
+		return err
+	}
+	s.pending.heaps[detached.Name] = heap
+	if part.VecMeta != 0 {
+		vec, err := s.partitionVec(old, part.ID)
+		if err != nil {
+			return err
+		}
+		s.pending.vecs[detached.Name] = vec
+	}
+	for i, idx := range detached.Indexes {
+		if i >= len(part.Indexes) || part.Indexes[i].Name != idx.Name || part.Indexes[i].Meta != idx.Meta {
+			return nerr.New(nerr.Corruption, "executor.AlterTable", "detached table index ownership mismatch")
+		}
+		tree, err := s.partitionIndex(old, part.ID, idx)
+		if err != nil {
+			return err
+		}
+		s.pending.idxs[idxKey(detached.Name, idx.Name)] = tree
+		if idx.Vector {
+			s.dirtyHNSW = true
+		}
+	}
+	raw, err := catalog.EncodeTable(detached)
+	if err != nil {
+		return err
+	}
+	if err := s.x.use(s.db.CatTree).Insert(catalog.TableKey(detached.Name), raw); err != nil {
+		return err
+	}
+	if s.overlay == nil {
+		s.overlay = make(map[string]*catalog.Table)
+	}
+	s.overlay[detached.Name] = detached.Clone()
+	s.pending.partitionDrops = append(s.pending.partitionDrops, partitionHeapKey(old.Name, part.ID))
+	if err := s.deleteOnePartitionStats(old.ID, part.ID); err != nil {
+		return err
+	}
+	return s.putCatalog(neu, old.Name)
+}
+
+func (s *Session) validateAttachedRows(parent, source *catalog.Table, partitionID uint32, heap *btree.Tree) error {
+	uniques := crossPartitionUniqueIndexes(parent)
+	var lockTx *btree.Txn
+	if len(uniques) > 0 {
+		for _, p := range parent.Partitioning.Partitions {
+			if p.ID == partitionID {
+				continue
+			}
+			ix, err := s.partitionIndex(parent, p.ID, uniques[0])
+			if err != nil {
+				return err
+			}
+			lockTx = s.x.use(ix)
+			break
+		}
+	}
+	return s.x.use(heap).Range(nil, nil, func(_, raw []byte) error {
+		if err := s.budget().Check(); err != nil {
+			return err
+		}
+		row, err := s.decodeHeapRow(source, raw)
+		if err != nil {
+			return err
+		}
+		part, err := parent.PartitionForRow(row)
+		if err != nil || part == nil || part.ID != partitionID {
+			return nerr.New(nerr.InvalidArgument, "executor.AlterTable", "attached table contains a row outside the partition rule")
+		}
+		for i := range parent.Columns {
+			if parent.Columns[i].Default.Kind == catalog.DefAI {
+				if err := s.bumpAI(parent, i, row[i]); err != nil {
+					return err
+				}
+			}
+		}
+		for _, idx := range uniques {
+			ok, err := s.indexRowMatches(parent, idx, row)
+			if err != nil {
+				return err
+			}
+			if !ok {
+				continue
+			}
+			k, _, err := s.indexKV(parent, idx, row)
+			if err != nil {
+				return err
+			}
+			if lockTx != nil {
+				if err := lockTx.LockExclusive(k); err != nil {
+					return err
+				}
+			}
+			dup, err := s.crossPartitionUniqueConflict(parent, idx, partitionID, k)
+			if err != nil {
+				return err
+			}
+			if dup {
+				return nerr.New(nerr.AlreadyExists, "executor.AlterTable", "attached partition duplicates a UNIQUE key in an existing partition")
+			}
+		}
+		return nil
+	})
+}
+
+func (s *Session) validateDetachedRows(detached *catalog.Table, heap *btree.Tree) error {
+	return s.x.use(heap).Range(nil, nil, func(_, raw []byte) error {
+		if err := s.budget().Check(); err != nil {
+			return err
+		}
+		row, err := s.decodeHeapRow(detached, raw)
+		if err != nil {
+			return err
+		}
+		for i := range detached.Columns {
+			if detached.Columns[i].Default.Kind == catalog.DefAI {
+				if err := s.bumpAI(detached, i, row[i]); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	})
+}
+
+func (s *Session) rejectTableAutomationDependencies(tab *catalog.Table) error {
+	for _, trigger := range s.listTriggers() {
+		if trigger.TableID == tab.ID {
+			return nerr.New(nerr.InvalidArgument, "executor.AlterTable", "attached table has trigger dependencies")
+		}
+	}
+	for _, workflow := range s.listWorkflows() {
+		for _, dep := range workflow.Dependencies {
+			if dep.Kind == catalog.WorkflowDependencyTable && dep.ID == tab.ID {
+				return nerr.New(nerr.InvalidArgument, "executor.AlterTable", "attached table has workflow dependencies")
+			}
+		}
+	}
+	return nil
+}
+
+func (s *Session) alterAddPartition(old, neu *catalog.Table, cmd ast.AlterAddPartition) error {
+	if old.Partitioning == nil || neu.Partitioning == nil || len(neu.Partitioning.Partitions) != len(old.Partitioning.Partitions)+1 {
+		return nerr.New(nerr.Internal, "executor.AlterTable", "invalid partition addition")
+	}
+	part := &neu.Partitioning.Partitions[len(neu.Partitioning.Partitions)-1]
+	if part.Name != cmd.Partition.Name {
+		return nerr.New(nerr.Internal, "executor.AlterTable", "partition addition mismatch")
+	}
+	s.db.Eng.Enter(s.x.owner.Storage())
+	heap, err := btree.CreateDetached(s.db.Eng)
+	s.db.Eng.Leave(s.x.owner.Storage())
+	if err != nil {
+		return err
+	}
+	part.HeapMeta = heap.Meta()
+	s.pending.partHeaps[partitionHeapKey(old.Name, part.ID)] = heap
+	if neu.HasVector() {
+		s.db.Eng.Enter(s.x.owner.Storage())
+		vec, err := btree.CreateDetached(s.db.Eng)
+		s.db.Eng.Leave(s.x.owner.Storage())
+		if err != nil {
+			return err
+		}
+		part.VecMeta = vec.Meta()
+		s.pending.partVecs[partitionHeapKey(old.Name, part.ID)] = vec
+	}
+	for i := range part.Indexes {
+		idx := indexByName(neu, part.Indexes[i].Name)
+		s.db.Eng.Enter(s.x.owner.Storage())
+		local, err := btree.CreateDetached(s.db.Eng)
+		s.db.Eng.Leave(s.x.owner.Storage())
+		if err != nil {
+			return err
+		}
+		if idx.Fulltext {
+			if err := s.x.use(local).Insert(fulltext.StatsKey(), fulltext.EncodeStats(fulltext.Stats{})); err != nil {
+				return err
+			}
+		}
+		part.Indexes[i].Meta = local.Meta()
+		s.pending.partIdxs[partitionIndexKey(old.Name, part.ID, idx.Name)] = local
+		if idx.Vector {
+			if err := s.initPartitionVectorIndex(neu, idx, *part); err != nil {
+				return err
+			}
+		}
+	}
+	if err := catalog.ValidatePartitioning(neu); err != nil {
+		return err
+	}
+	return s.putCatalog(neu, old.Name)
+}
+
+func (s *Session) alterDropPartition(old, neu *catalog.Table, cmd ast.AlterDropPartition) error {
+	if old.Partitioning == nil || neu.Partitioning == nil || len(neu.Partitioning.Partitions)+1 != len(old.Partitioning.Partitions) {
+		return nerr.New(nerr.Internal, "executor.AlterTable", "invalid partition removal")
+	}
+	var dropped *catalog.Partition
+	for i := range old.Partitioning.Partitions {
+		if old.Partitioning.Partitions[i].Name == cmd.Name {
+			dropped = &old.Partitioning.Partitions[i]
+			break
+		}
+	}
+	if dropped == nil {
+		return nerr.New(nerr.NotFound, "executor.AlterTable", "unknown partition")
+	}
+	rows, err := s.countHeapPartitions(old, []uint32{dropped.ID}, nil, nil, true, true)
+	if err != nil {
+		return err
+	}
+	if rows != 0 {
+		return nerr.New(nerr.InvalidArgument, "executor.AlterTable", "cannot drop a non-empty partition")
+	}
+	heap, err := s.partitionHeap(old, dropped.ID)
+	if err != nil {
+		return err
+	}
+	if err := s.queueTreeReclaim(heap); err != nil {
+		return err
+	}
+	if dropped.VecMeta != 0 {
+		vec, err := s.partitionVec(old, dropped.ID)
+		if err != nil {
+			return err
+		}
+		if err := s.queueTreeReclaim(vec); err != nil {
+			return err
+		}
+	}
+	for _, idx := range dropped.Indexes {
+		tree, err := s.partitionIndex(old, dropped.ID, catalog.Index{Name: idx.Name, Meta: idx.Meta})
+		if err != nil {
+			return err
+		}
+		if err := s.queueTreeReclaim(tree); err != nil {
+			return err
+		}
+		if indexByName(old, idx.Name).Vector {
+			s.dirtyHNSW = true
+		}
+	}
+	s.pending.partitionDrops = append(s.pending.partitionDrops, partitionHeapKey(old.Name, dropped.ID))
+	if err := s.deleteOnePartitionStats(old.ID, dropped.ID); err != nil {
+		return err
+	}
+	return s.putCatalog(neu, old.Name)
 }
 
 func (s *Session) alterAddColumn(old, neu *catalog.Table, cmd ast.AlterAddColumn) error {
@@ -673,7 +1127,7 @@ func (s *Session) rewriteHeapRows(old, neu *catalog.Table, mapRow func([]types.V
 		if err != nil {
 			return err
 		}
-		if err := s.deleteVectors(old, k); err != nil {
+		if err := s.deleteVectors(old, k, row); err != nil {
 			return err
 		}
 		if err := s.putVectors(neu, k, mapped); err != nil {

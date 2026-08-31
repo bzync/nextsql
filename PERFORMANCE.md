@@ -93,25 +93,19 @@ These are targets, not universal guarantees.
 
 ---
 
-## 5. Current P16 Gate
+## 5. P16 Gate (closed)
 
-P16 remains open until:
+P16 is complete (paper-closed 2026-08-30). Exit gate, all satisfied:
 
-- corrected 1M-vector HNSW run completes;
-- p95 target is satisfied;
-- recall is reported;
-- randomized 100M B+Tree invariant soak completes;
-- no unresolved correctness regression remains.
+- corrected 1M-vector HNSW v10: p95 **8.061 ms**, recall@10 **1.000**,
+  recall@100 **0.998**;
+- 10M DELETE published, crash-during-merge `Check()`-clean;
+- 100M analytics `< 60 s`; 10M INSERT/UPDATE published;
+- no unresolved correctness regression.
 
-Known corrected 100K vector validation:
-
-```text
-p95       3.317 ms
-recall@10 1.000
-recall@100 0.999
-```
-
-This does not replace the 1M exit-gate run.
+The terminal randomized 100M-operation B+Tree invariant soak is a deferred
+standalone measurement, not a release gate (same disposition as P18); v8
+reached 44M clean operations. The current release gate is P22 follower reads.
 
 ---
 

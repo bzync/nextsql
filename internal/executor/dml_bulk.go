@@ -51,7 +51,7 @@ func (s *Session) InsertRows(table string, rows [][]types.Value) (int64, error) 
 			}
 			row[i] = nv
 		}
-		if err := s.checkTenantRow(tab, row); err != nil {
+		if err := s.checkLegacyTenantRow(tab, row); err != nil {
 			return n, err
 		}
 		if useBatch {
@@ -108,7 +108,7 @@ func (s *Session) InsertEncoded(table string, keys, payloads [][]byte) (int64, e
 		if err != nil {
 			return 0, err
 		}
-		if err := s.checkTenantRow(tab, row); err != nil {
+		if err := s.checkLegacyTenantRow(tab, row); err != nil {
 			return 0, err
 		}
 		decoded[i] = row
@@ -120,8 +120,8 @@ func (s *Session) InsertEncoded(table string, keys, payloads [][]byte) (int64, e
 	if err := s.x.use(heap).InsertBatch(keys, payloads); err != nil {
 		return 0, err
 	}
-	for i, row := range decoded {
-		if err := s.stageEncodedChange(tab, wal.ChangeInsert, nil, keys[i], nil, payloads[i], "", rowTenant(tab, row)); err != nil {
+	for i := range decoded {
+		if err := s.stageEncodedChange(tab, wal.ChangeInsert, nil, keys[i], nil, payloads[i], "", ""); err != nil {
 			return 0, err
 		}
 	}
@@ -394,17 +394,7 @@ func (s *Session) patchDecimal(tab *catalog.Table, ci int, val types.Value) (int
 			if err != nil {
 				return nil, err
 			}
-			tenant := ""
-			if ti, ok := tab.TenantCol(); ok {
-				tv, err := types.DecodeRowColumn(payload, cols, ti)
-				if err != nil {
-					return nil, err
-				}
-				if !tv.Null {
-					tenant = tv.String()
-				}
-			}
-			if err := s.stageEncodedChange(tab, wal.ChangeUpdate, key, key, payload, rowBuf, tenant, tenant); err != nil {
+			if err := s.stageEncodedChange(tab, wal.ChangeUpdate, key, key, payload, rowBuf, "", ""); err != nil {
 				return nil, err
 			}
 			return rowBuf, nil

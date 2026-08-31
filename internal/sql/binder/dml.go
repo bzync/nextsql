@@ -39,6 +39,9 @@ func bindInsertRows(table string, columns []string, rows [][]ast.Expr, lookup Lo
 			if err := checkExpr(ex, tab, tab.Columns[cols[i]].Type, false); err != nil {
 				return nil, nil, err
 			}
+			if err := rejectSearchHL(ex); err != nil {
+				return nil, nil, err
+			}
 		}
 	}
 	return tab, cols, nil
@@ -48,6 +51,10 @@ func bindUpsert(s ast.Upsert, lookup Lookup) (Bound, error) {
 	tab, cols, err := bindInsertRows(s.Table, s.Columns, s.Rows, lookup, "UPSERT")
 	if err != nil {
 		return nil, err
+	}
+	if tab.Partitioning != nil && tab.Partitioning.Kind == catalog.PartitionLegacyTenant {
+		// Legacy shared-tenant tables are compatibility/migration surface only.
+		return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "UPSERT is not supported on legacy TENANT-partitioned tables")
 	}
 	uniqueCols, uniquePK, uniqueIdx, err := resolveUpsertTarget(tab, s.OnUnique, cols)
 	if err != nil {
@@ -72,6 +79,9 @@ func bindUpsert(s ast.Upsert, lookup Lookup) (Bound, error) {
 				return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "UPSERT SET does not support window functions or aggregates")
 			}
 			if err := checkExpr(ex, evalTab, tab.Columns[i].Type, false); err != nil {
+				return nil, err
+			}
+			if err := rejectSearchHL(ex); err != nil {
 				return nil, err
 			}
 			sets = append(sets, Set{Col: i, Expr: ex})
@@ -118,6 +128,9 @@ func bindReturning(star bool, list []ast.SelectItem, tab, eval *catalog.Table) (
 		ex := rewriteQual(item.Expr, eval)
 		if containsWindow(ex) || containsGroupingAgg(ex) {
 			return Returning{}, nerr.New(nerr.InvalidArgument, "sql.binder", "RETURNING does not support window functions or aggregates")
+		}
+		if err := rejectSearchHL(ex); err != nil {
+			return Returning{}, err
 		}
 		if err := checkExpr(ex, eval, types.Type{}, false); err != nil {
 			return Returning{}, err

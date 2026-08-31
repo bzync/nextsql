@@ -40,28 +40,66 @@ UPDATE scan SET n = 0 WHERE n <> 0 LIMIT 8192;
 DELETE FROM scan LIMIT 8192;
 ```
 
+## Physical partitioning
+
+Bounded single-column `RANGE`, `HASH`, and `LIST` partitioning routes rows to
+local encrypted heaps and exposes pruning in `EXPLAIN`. Non-unique B+Tree,
+covering, partial, expression, JSON-path, and spatial indexes have one physical
+root per partition.
+
+```sql
+CREATE TABLE events (
+    region STRING NOT NULL,
+    id     UUID NOT NULL DEFAULT UUID(),
+    note   STRING,
+    PRIMARY KEY (region, id)
+) PARTITION BY LIST (region) (
+    PARTITION americas VALUES IN ('us', 'ca'),
+    PARTITION europe   VALUES IN ('eu')
+);
+
+ALTER TABLE events ADD PARTITION apac VALUES IN ('ap', 'au');
+-- archived is an existing unpartitioned table with the exact same schema and indexes.
+ALTER TABLE events ATTACH PARTITION archived VALUES IN ('old');
+ALTER TABLE events DETACH PARTITION archived;
+```
+
+`ATTACH` consumes an existing unpartitioned table named by the partition after
+streaming typed validation of its matching schema, indexes, and rows; no roots
+or rows are copied. `DETACH` publishes that owned member as an unpartitioned
+table of the same name. Both are atomic WAL/catalog ownership transfers. HASH
+membership changes, secondary `UNIQUE`, FULLTEXT, and HNSW partition indexes
+remain rejected. See the repository's `docs/partitioning.md` for exact DDL,
+RBAC, recovery, and lifecycle limits.
+
+`ANALYZE events` records exact stable-partition row counts plus bounded local
+column/index/vector sketches. Pruned plans use local costing only when every
+selected partition has a matching versioned sketch; otherwise they fall back
+to the global table distribution. Local samples cap at 4,096 rows and each
+encrypted catalog record caps at 64 entries per sketch class and 15 KiB total.
+
 ## Foreign keys
 
 Declared on `CREATE TABLE` or `ALTER TABLE ADD CONSTRAINT`. The referenced columns must be exactly a `PRIMARY KEY` or `UNIQUE` btree index (same columns, any order). `DECIMAL` precision and scale must match. `NO ACTION` is stored as `RESTRICT`.
 
-Recommended tenant pattern is a composite `PRIMARY KEY (tenant_id, id)` so the FK can include `tenant_id` on both sides at the same position.
+Recommended account-scoped key pattern is a composite `PRIMARY KEY (account_id, id)` so the FK can include `account_id` on both sides at the same position.
 
 ```sql
 CREATE TABLE customers (
-    tenant_id UUID NOT NULL,
+    account_id UUID NOT NULL,
     id        UUID NOT NULL DEFAULT UUID(),
     email     STRING NOT NULL,
-    PRIMARY KEY (tenant_id, id)
+    PRIMARY KEY (account_id, id)
 );
 
 CREATE TABLE orders (
-    tenant_id   UUID NOT NULL,
+    account_id   UUID NOT NULL,
     id          UUID NOT NULL DEFAULT UUID(),
     customer_id UUID NOT NULL,
-    PRIMARY KEY (tenant_id, id),
+    PRIMARY KEY (account_id, id),
     CONSTRAINT fk_orders_customer
-        FOREIGN KEY (tenant_id, customer_id)
-        REFERENCES customers (tenant_id, id)
+        FOREIGN KEY (account_id, customer_id)
+        REFERENCES customers (account_id, id)
         ON DELETE RESTRICT
 );
 ```
@@ -82,7 +120,7 @@ Other FK rules:
 - `MATCH SIMPLE` only. `MATCH FULL` is rejected.
 - `VECTOR` and `JSON` cannot be FK columns.
 - At most 16 foreign keys per table and 8 columns per key.
-- If both tables are tenant-keyed, the FK must include `tenant_id` on both sides at the **same position**.
+- If both tables are account-keyed, the FK must include `account_id` on both sides at the **same position**.
 - Cyclic `CASCADE` graphs are rejected at DDL time. Self-referential FKs and cyclic `RESTRICT` graphs are allowed.
 
 ## Joins

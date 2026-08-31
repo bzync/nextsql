@@ -2,10 +2,28 @@ package binder
 
 import (
 	"github.com/bzync/nextsql/internal/catalog"
+	"github.com/bzync/nextsql/internal/fulltext"
 	"github.com/bzync/nextsql/internal/nerr"
 	"github.com/bzync/nextsql/internal/sql/ast"
 	"github.com/bzync/nextsql/internal/sql/types"
 )
+
+// maxIVFCentroidBytes is a conservative bound on one encoded IVF centroid: a
+// B+Tree leaf record holds roughly half of the 16 KiB logical page.
+const maxIVFCentroidBytes = 8000
+
+// isIVFFamily reports whether m is an inverted-file vector index method (plain
+// IVF or IVF-PQ), which share the coarse-quantiser build/search restrictions.
+func isIVFFamily(m uint8) bool {
+	return m == catalog.VecMethodIVF || m == catalog.VecMethodIVFPQ
+}
+
+func upperVecMethod(using string) string {
+	if using == "ivfpq" {
+		return "IVFPQ"
+	}
+	return "IVF"
+}
 
 func bindCreateIndex(s ast.CreateIndex, lookup Lookup) (Bound, error) {
 	tab, err := mustTable(lookup, s.Table)
@@ -42,8 +60,78 @@ func bindCreateIndex(s ast.CreateIndex, lookup Lookup) (Bound, error) {
 	if s.Vector && (s.Unique || s.Spatial || s.Fulltext) {
 		return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "VECTOR INDEX cannot be UNIQUE, SPATIAL, or FULLTEXT")
 	}
-	if s.Vector && s.Using != "hnsw" {
-		return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "VECTOR INDEX requires USING HNSW")
+	if s.Vector {
+		switch s.Using {
+		case "hnsw":
+			idx.VecMethod = catalog.VecMethodHNSW
+		case "sparse":
+			idx.VecMethod = catalog.VecMethodSPARSE
+			if s.IVFLists != 0 || s.IVFProbes != 0 || s.IVFSubspaces != 0 {
+				return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "USING SPARSE does not take IVF parameters")
+			}
+		case "ivf", "ivfpq":
+			if s.Using == "ivfpq" {
+				idx.VecMethod = catalog.VecMethodIVFPQ
+			} else {
+				idx.VecMethod = catalog.VecMethodIVF
+			}
+			if s.IVFLists <= 0 {
+				return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "USING "+upperVecMethod(s.Using)+" requires WITH (LISTS = n)")
+			}
+			if s.IVFLists > catalog.MaxVectorIndexLists {
+				return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "IVF LISTS exceeds the maximum")
+			}
+			if s.IVFProbes < 0 {
+				return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "IVF PROBES cannot be negative")
+			}
+			if s.IVFProbes > s.IVFLists {
+				return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "IVF PROBES cannot exceed LISTS")
+			}
+			idx.IVFLists = uint32(s.IVFLists)
+			idx.IVFProbes = uint32(s.IVFProbes)
+			if idx.VecMethod == catalog.VecMethodIVFPQ {
+				if s.IVFSubspaces <= 0 {
+					return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "USING IVFPQ requires WITH (SUBSPACES = M)")
+				}
+				if s.IVFSubspaces > catalog.MaxVectorIndexSubspaces {
+					return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "IVFPQ SUBSPACES exceeds the maximum")
+				}
+				idx.IVFSubspaces = uint32(s.IVFSubspaces)
+			} else if s.IVFSubspaces != 0 {
+				return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "SUBSPACES requires USING IVFPQ")
+			}
+		default:
+			return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "VECTOR INDEX requires USING HNSW, IVF, IVFPQ, or SPARSE")
+		}
+	}
+	if s.Analyzer != "" {
+		if !s.Fulltext {
+			return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "ANALYZER requires a FULLTEXT INDEX")
+		}
+		a, err := fulltext.LookupAnalyzer(s.Analyzer)
+		if err != nil {
+			return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "unknown full-text analyzer")
+		}
+		idx.FTAnalyzer = a.ID
+		idx.FTVersion = a.Version
+	}
+	if s.VecQuant != "" {
+		if !s.Vector {
+			return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "QUANTIZATION requires a VECTOR INDEX")
+		}
+		if idx.VecMethod != catalog.VecMethodHNSW {
+			return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "QUANTIZATION requires USING HNSW")
+		}
+		switch s.VecQuant {
+		case "none", "f32":
+			idx.VecQuant = 0
+		case "f16":
+			idx.VecQuant = types.VecF16
+		case "i8":
+			idx.VecQuant = types.VecI8
+		default:
+			return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "unknown HNSW QUANTIZATION (want F16, I8, or NONE)")
+		}
 	}
 	special := s.Spatial || s.Fulltext || s.Vector
 	if special && (len(s.Include) > 0 || s.Where != nil) {
@@ -52,14 +140,15 @@ func bindCreateIndex(s ast.CreateIndex, lookup Lookup) (Bound, error) {
 	if s.Spatial && len(keys) != 1 {
 		return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "SPATIAL INDEX requires one POINT column")
 	}
-	if s.Fulltext && len(keys) != 1 {
-		return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "FULLTEXT INDEX requires one STRING or TEXT column")
+	if s.Fulltext && (len(keys) == 0 || len(keys) > fulltext.MaxFields) {
+		return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "FULLTEXT INDEX requires 1 to 8 STRING or TEXT columns")
 	}
 	if s.Vector && len(keys) != 1 {
 		return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "VECTOR INDEX requires one VECTOR column")
 	}
 	var pathKeys int
 	hasExpr := false
+	ftSeen := make(map[int]struct{})
 	for i, parts := range keys {
 		var expr ast.Expr
 		if i < len(s.Exprs) {
@@ -105,9 +194,42 @@ func bindCreateIndex(s ast.CreateIndex, lookup Lookup) (Bound, error) {
 			if k != types.KindString && k != types.KindText {
 				return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "FULLTEXT INDEX requires a STRING or TEXT column")
 			}
+			if _, dup := ftSeen[col]; dup {
+				return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "duplicate FULLTEXT INDEX column")
+			}
+			ftSeen[col] = struct{}{}
 		}
 		if s.Vector && tab.Columns[col].Type.Kind != types.KindVector {
 			return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "VECTOR INDEX requires a VECTOR column")
+		}
+		if s.Vector && idx.VecQuant != 0 && tab.Columns[col].Type.VecElem == types.VecBit {
+			return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "QUANTIZATION is not supported on a BITVECTOR index")
+		}
+		if s.Vector && idx.VecQuant != 0 && tab.Columns[col].Type.VecElem == types.VecSparse {
+			return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "QUANTIZATION is not supported on a SPARSEVECTOR index")
+		}
+		if s.Vector && isIVFFamily(idx.VecMethod) && tab.Columns[col].Type.VecElem == types.VecBit {
+			return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "IVF does not support a BITVECTOR column; use USING HNSW")
+		}
+		if s.Vector && idx.VecMethod == catalog.VecMethodSPARSE && tab.Columns[col].Type.VecElem != types.VecSparse {
+			return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "USING SPARSE requires a SPARSEVECTOR column")
+		}
+		if s.Vector && idx.VecMethod != catalog.VecMethodSPARSE && tab.Columns[col].Type.VecElem == types.VecSparse {
+			return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "SPARSEVECTOR requires CREATE VECTOR INDEX … USING SPARSE")
+		}
+		// One IVF centroid group is stored as a single B+Tree record, which
+		// holds roughly half a logical page (~8 KiB). A single f32 centroid
+		// ("NSIC" header + 4*dim bytes) past that ceiling will not fit even
+		// alone, so reject it up front rather than failing mid-build with a
+		// storage error.
+		if s.Vector && isIVFFamily(idx.VecMethod) && 11+4*int(tab.Columns[col].Type.Precision) > maxIVFCentroidBytes {
+			return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "IVF is not supported at this vector dimension; use USING HNSW")
+		}
+		if s.Vector && idx.VecMethod == catalog.VecMethodIVFPQ {
+			dim := int(tab.Columns[col].Type.Precision)
+			if dim == 0 || dim%int(idx.IVFSubspaces) != 0 {
+				return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "IVFPQ SUBSPACES must divide the vector dimension")
+			}
 		}
 		if !s.Vector && tab.Columns[col].Type.Kind == types.KindVector {
 			return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "VECTOR column requires CREATE VECTOR INDEX")
@@ -154,6 +276,30 @@ func bindCreateIndex(s ast.CreateIndex, lookup Lookup) (Bound, error) {
 			return nil, err
 		}
 		idx.Predicate = s.Where
+	}
+	if tab.Partitioning != nil && isIVFFamily(idx.VecMethod) {
+		return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "IVF indexes on partitioned tables are not supported in this slice")
+	}
+	if tab.Partitioning != nil && idx.VecMethod == catalog.VecMethodSPARSE {
+		return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "SPARSE indexes on partitioned tables are not supported in this slice")
+	}
+	if tab.Partitioning != nil && idx.Unique {
+		// Cross-partition UNIQUE is enforced by probing every partition-local
+		// root on every write (CREATE INDEX, INSERT, UPDATE, ATTACH PARTITION).
+		// Partial, expression, and JSON-path UNIQUE indexes, and UNIQUE on
+		// legacy TENANT tables, stay fail-closed on partitioned tables.
+		if tab.Partitioning.Kind == catalog.PartitionLegacyTenant {
+			return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "secondary UNIQUE indexes on legacy TENANT tables are not supported")
+		}
+		if idx.Predicate != nil {
+			return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "partial UNIQUE indexes on partitioned tables are not supported in this slice")
+		}
+		if hasExpr {
+			return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "expression UNIQUE indexes on partitioned tables are not supported in this slice")
+		}
+		if pathKeys > 0 {
+			return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "JSON-path UNIQUE indexes on partitioned tables are not supported in this slice")
+		}
 	}
 	return CreateIndex{Table: tab, Index: idx}, nil
 }
@@ -358,6 +504,8 @@ func indexExprType(e ast.Expr, tab *catalog.Table) (types.Type, error) {
 		return x.Value.Typ, nil
 	case ast.Call:
 		switch x.Name {
+		case "highlight", "snippet":
+			return types.Type{}, nerr.New(nerr.InvalidArgument, "sql.binder", "HIGHLIGHT/SNIPPET cannot be indexed")
 		case "lower", "upper", "trim", "ltrim", "rtrim", "replace", "substring", "concat":
 			out := types.String()
 			for _, a := range x.Args {

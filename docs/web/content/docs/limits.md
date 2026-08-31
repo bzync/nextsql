@@ -10,7 +10,7 @@ This is still **0.1.0-dev**. Treat it as an engine under measurement, not a drop
 | Packet / SQL text | 1 MiB |
 | Parameters | 256 |
 | JSON depth / size | 32 / 1 MiB |
-| Vector dimension | 8192, finite elements |
+| Vector dimension | 8192 dense / bit; 65535 `SPARSEVECTOR<N>` (finite elements) |
 | LINESTRING / POLYGON vertices | 256 |
 | JOIN tables | 8 (`FROM` + up to seven `JOIN`s) |
 | Foreign keys per table | 16 |
@@ -19,15 +19,16 @@ This is still **0.1.0-dev**. Treat it as an engine under measurement, not a drop
 | FK cascade touched rows | 100 000 |
 | Wire result | 64 MiB |
 | Default result rows | 1 000 000 |
+| FTS fuzzy vocabulary scan | 4096 distinct terms/query |
 
 ## Not in this version
 
 - Heap/index page reclaim after `DROP TABLE`
 - Outer `JOIN` together with `SEARCH` or `NEAREST` (inner join is allowed when the rank column is on the `FROM` table)
-- Stemming / stop words
-- `VECTOR<F16,N>`, `VECTOR<I8,N>`, IVF / IVF-PQ
+- Additional language analyzers beyond `simple` / `english` / `french` / `german` / `spanish` (`HIGHLIGHT` / `SNIPPET`, prefix, fuzzy matching, typo tolerance, multi-field search, field weighting, and faceting are implemented)
+- Dense+sparse+BM25 fusion (`VECTOR<F16,N>`, `VECTOR<I8,N>`, `BITVECTOR<N>`, the quantised HNSW index, compressed HNSW neighbour lists, IVF, IVF-PQ, and `SPARSEVECTOR<N>` / `USING SPARSE` are implemented)
 - Field-level `ENCRYPTED CLIENT` / server-side zero-knowledge SQL
-- mTLS, external IdP, short-lived credentials
+- External IdP and short-lived credentials (mTLS, live rotation, and X.509 CRL revocation are implemented; OCSP is not)
 - Multi-primary writes
 
 ## Known measurement notes (0.1.0-dev)

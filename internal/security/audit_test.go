@@ -19,7 +19,7 @@ func TestAuditNeverWritesSecrets(t *testing.T) {
 		Object:  "password=hunter2",
 		Outcome: "failure",
 	})
-	l.Record(Event{Actor: "app", Action: ActionKeyRotate, Object: "page:v2", Outcome: "success"})
+	l.Record(Event{Actor: "app", Action: ActionKeyRotate, Object: "page:v2", Outcome: "success", IdentitySource: "mtls+native"})
 	if err := l.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -33,6 +33,9 @@ func TestAuditNeverWritesSecrets(t *testing.T) {
 	}
 	if !strings.Contains(s, "[redacted]") || !strings.Contains(s, ActionKeyRotate) {
 		t.Fatalf("audit content: %s", s)
+	}
+	if !strings.Contains(s, `"identity_source":"mtls+native"`) {
+		t.Fatalf("identity source missing: %s", s)
 	}
 }
 

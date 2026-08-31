@@ -7,6 +7,7 @@ require (
 	github.com/hashicorp/raft v1.7.3
 	github.com/hashicorp/raft-boltdb/v2 v2.3.1
 	golang.org/x/sys v0.13.0
+	gopkg.in/yaml.v3 v3.0.1
 )
 
 require (

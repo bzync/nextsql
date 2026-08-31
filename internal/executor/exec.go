@@ -75,7 +75,7 @@ func (s *Session) execPlan(plan planner.Logical) (*Result, error) {
 		return s.execSetOperation(p)
 	case planner.With:
 		return s.execWith(p)
-	case planner.CTEScan, planner.Limit, planner.Sort, planner.Project, planner.Filter, planner.Scan, planner.SeqScan, planner.IndexScan, planner.Join, planner.Aggregate, planner.Window, planner.Search, planner.Nearest, planner.Candidates, planner.Rerank:
+	case planner.CTEScan, planner.Limit, planner.Sort, planner.Project, planner.Filter, planner.Scan, planner.SeqScan, planner.IndexScan, planner.Join, planner.Aggregate, planner.Window, planner.Search, planner.Facet, planner.Nearest, planner.Candidates, planner.Rerank:
 		return s.execSelect(plan)
 	default:
 		return nil, nerr.New(nerr.Internal, "executor.execPlan", "unsupported plan")
@@ -364,13 +364,20 @@ func (s *Session) execCreateIndex(p planner.CreateIndex) (*Result, error) {
 	if !ok {
 		return nil, nerr.New(nerr.NotFound, "executor.CreateIndex", "unknown table")
 	}
-	if tab.Partitioning != nil {
-		return nil, nerr.New(nerr.InvalidArgument, "executor.CreateIndex", "partitioned tables do not support secondary indexes in this slice")
-	}
 	for _, idx := range tab.Indexes {
 		if idx.Name == p.Index.Name {
 			return nil, nerr.New(nerr.AlreadyExists, "executor.CreateIndex", "index already exists")
 		}
+	}
+	if tab.Partitioning != nil {
+		neu, err := s.buildPartitionedIndex(tab, p.Index, nil)
+		if err != nil {
+			return nil, err
+		}
+		if err := s.putCatalog(neu, tab.Name); err != nil {
+			return nil, err
+		}
+		return &Result{}, nil
 	}
 	built, err := s.buildIndex(tab, p.Index, nil)
 	if err != nil {
@@ -381,6 +388,90 @@ func (s *Session) execCreateIndex(p planner.CreateIndex) (*Result, error) {
 		return nil, err
 	}
 	return &Result{}, nil
+}
+
+func (s *Session) buildPartitionedIndex(tab *catalog.Table, idx catalog.Index, progress *rebuildProgress) (*catalog.Table, error) {
+	if tab == nil || tab.Partitioning == nil {
+		return nil, nerr.New(nerr.Internal, "executor.CreateIndex", "missing partition descriptor")
+	}
+	neu := tab.Clone()
+	idx.Meta = 0 // the logical index is backed only by partition-local roots
+	neu.Indexes = append(neu.Indexes, idx)
+	if err := s.db.Eng.CrashAt(wal.PointDuringIndexBuild); err != nil {
+		return nil, err
+	}
+	for i := range neu.Partitioning.Partitions {
+		part := &neu.Partitioning.Partitions[i]
+		heap, err := s.partitionHeap(tab, part.ID)
+		if err != nil {
+			return nil, err
+		}
+		s.db.Eng.Enter(s.x.owner.Storage())
+		local, err := btree.CreateDetached(s.db.Eng)
+		s.db.Eng.Leave(s.x.owner.Storage())
+		if err != nil {
+			return nil, err
+		}
+		key := partitionIndexKey(tab.Name, part.ID, idx.Name)
+		s.pending.partIdxs[key] = local
+		if idx.Vector {
+			if err := s.buildPartitionVectorIndex(tab, idx, *part, s.x.use(heap), progress); err != nil {
+				return nil, err
+			}
+		} else if err := s.populatePartitionIndex(tab, idx, s.x.use(heap), s.x.use(local), progress); err != nil {
+			return nil, err
+		}
+		part.Indexes = append(part.Indexes, catalog.PartitionIndex{Name: idx.Name, Meta: local.Meta()})
+	}
+	if idx.Unique && !idx.Vector {
+		if err := s.verifyCrossPartitionUnique(tab, idx); err != nil {
+			return nil, err
+		}
+	}
+	if err := catalog.ValidatePartitioning(neu); err != nil {
+		return nil, err
+	}
+	return neu, nil
+}
+
+// populatePartitionIndex streams one local heap into one local index. Keeping
+// this path streaming avoids an input-sized result buffer during DDL.
+func (s *Session) populatePartitionIndex(tab *catalog.Table, idx catalog.Index, htx, itx *btree.Txn, progress *rebuildProgress) error {
+	var st fulltext.Stats
+	if err := htx.Range(nil, nil, func(_, val []byte) error {
+		if err := s.budget().Check(); err != nil {
+			return err
+		}
+		row, err := s.decodeHeapRow(tab, val)
+		if err != nil {
+			return err
+		}
+		pairs, err := s.indexPairs(tab, idx, row)
+		if err != nil {
+			return err
+		}
+		for _, pair := range pairs {
+			if err := itx.Insert(pair.k, pair.v); err != nil {
+				return err
+			}
+			if idx.Fulltext && fulltext.IsDocLenKey(pair.k) {
+				n, err := fulltext.DecodeDocLen(pair.v)
+				if err != nil {
+					return err
+				}
+				st.Docs++
+				st.Tokens += uint64(n)
+			}
+		}
+		progress.add(1, int64(len(pairs)))
+		return nil
+	}); err != nil {
+		return err
+	}
+	if idx.Fulltext {
+		return itx.Insert(fulltext.StatsKey(), fulltext.EncodeStats(st))
+	}
+	return nil
 }
 
 func (s *Session) buildIndex(tab *catalog.Table, idx catalog.Index, progress *rebuildProgress) (catalog.Index, error) {
@@ -404,7 +495,19 @@ func (s *Session) buildIndex(tab *catalog.Table, idx catalog.Index, progress *re
 	var pairs []kv
 	w := s.workers()
 	if idx.Vector {
-		if err := s.buildVectorIndex(tab, idx, htx, progress); err != nil {
+		if idx.VecMethod == catalog.VecMethodIVF {
+			if err := s.buildIVFIndex(tab, idx, htx, progress); err != nil {
+				return catalog.Index{}, err
+			}
+		} else if idx.VecMethod == catalog.VecMethodIVFPQ {
+			if err := s.buildIVFPQIndex(tab, idx, htx, progress); err != nil {
+				return catalog.Index{}, err
+			}
+		} else if idx.VecMethod == catalog.VecMethodSPARSE {
+			if err := s.buildSparseIndex(tab, idx, htx, progress); err != nil {
+				return catalog.Index{}, err
+			}
+		} else if err := s.buildVectorIndex(tab, idx, htx, progress); err != nil {
 			return catalog.Index{}, err
 		}
 	} else {
@@ -520,7 +623,7 @@ func (s *Session) execInsert(p planner.Insert) (*Result, error) {
 			}
 			row[i] = nv
 		}
-		if err := s.checkTenantRow(tab, row); err != nil {
+		if err := s.checkLegacyTenantRow(tab, row); err != nil {
 			return nil, err
 		}
 		if err := s.writeRow(tab, htx, row, true); err != nil {
@@ -642,10 +745,10 @@ func (s *Session) applyUpdate(tab *catalog.Table, sets []binder.Set, row []types
 		}
 		neu[set.Col] = v
 	}
-	if err := s.checkTenantRow(tab, row); err != nil {
+	if err := s.checkLegacyTenantRow(tab, row); err != nil {
 		return nil, err
 	}
-	if err := s.checkTenantRow(tab, neu); err != nil {
+	if err := s.checkLegacyTenantRow(tab, neu); err != nil {
 		return nil, err
 	}
 	return neu, nil
@@ -707,7 +810,7 @@ func (s *Session) execDelete(p planner.Delete) (*Result, error) {
 func (s *Session) execDeleteBuffered(p planner.Delete, tab *catalog.Table, htx *btree.Txn) (*Result, error) {
 	var rows [][]types.Value
 	err := s.forEachRow(p.Input, func(row []types.Value) error {
-		if err := s.checkTenantRow(tab, row); err != nil {
+		if err := s.checkLegacyTenantRow(tab, row); err != nil {
 			return err
 		}
 		rows = append(rows, row)
@@ -882,7 +985,7 @@ func (s *Session) replaceRow(tab *catalog.Table, htx *btree.Txn, old, neu []type
 			return err
 		}
 		if oldPart.ID != newPart.ID {
-			if err := s.deleteVectors(tab, oldPK); err != nil {
+			if err := s.deleteVectors(tab, oldPK, old); err != nil {
 				return err
 			}
 			if err := s.putVectors(tab, newPK, neu); err != nil {
@@ -925,7 +1028,7 @@ func (s *Session) replaceRow(tab *catalog.Table, htx *btree.Txn, old, neu []type
 		htx = s.x.use(partHeap)
 	}
 	if string(oldPK) != string(newPK) {
-		if err := s.deleteVectors(tab, oldPK); err != nil {
+		if err := s.deleteVectors(tab, oldPK, old); err != nil {
 			return err
 		}
 	}
@@ -988,7 +1091,7 @@ func (s *Session) removeRow(tab *catalog.Table, htx *btree.Txn, row []types.Valu
 	if err := s.heapDelete(htx, pk); err != nil {
 		return err
 	}
-	if err := s.deleteVectors(tab, pk); err != nil {
+	if err := s.deleteVectors(tab, pk, row); err != nil {
 		return err
 	}
 	if err := s.maintainIndexes(tab, row, nil); err != nil {
@@ -1014,6 +1117,12 @@ func (s *Session) maintainIndexes(tab *catalog.Table, old, neu []types.Value) er
 		if oldPart.ID != newPart.ID {
 			// Cross-partition move: delete from old, insert into new.
 			for _, idx := range tab.Indexes {
+				if idx.Vector {
+					if err := s.maintainCrossPartitionVectorIndex(tab, idx, *oldPart, *newPart, old, neu); err != nil {
+						return err
+					}
+					continue
+				}
 				oldIx, err := s.partitionIndex(tab, oldPart.ID, idx)
 				if err != nil {
 					return err
@@ -1024,10 +1133,6 @@ func (s *Session) maintainIndexes(tab *catalog.Table, old, neu []types.Value) er
 				}
 				oldItx := s.x.use(oldIx)
 				newItx := s.x.use(newIx)
-				if idx.Vector {
-					// Vector indexes are not partitioned in this slice; skip cross-partition handling.
-					continue
-				}
 				if ok, err := s.indexRowMatches(tab, idx, old); err != nil {
 					return err
 				} else if ok {
@@ -1044,6 +1149,9 @@ func (s *Session) maintainIndexes(tab *catalog.Table, old, neu []types.Value) er
 				if ok, err := s.indexRowMatches(tab, idx, neu); err != nil {
 					return err
 				} else if ok {
+					if err := s.checkCrossPartitionUnique(tab, idx, newItx, neu); err != nil {
+						return err
+					}
 					pairs, err := s.indexPairs(tab, idx, neu)
 					if err != nil {
 						return err
@@ -1054,11 +1162,61 @@ func (s *Session) maintainIndexes(tab *catalog.Table, old, neu []types.Value) er
 						}
 					}
 				}
+				if idx.Fulltext {
+					oldDoc, err := fulltextDoc(tab, idx, old)
+					if err != nil {
+						return err
+					}
+					newDoc, err := fulltextDoc(tab, idx, neu)
+					if err != nil {
+						return err
+					}
+					if oldDoc.Len > 0 {
+						if err := adjustFulltextStats(oldItx, -1, -int64(oldDoc.Len)); err != nil {
+							return err
+						}
+					}
+					if newDoc.Len > 0 {
+						if err := adjustFulltextStats(newItx, 1, int64(newDoc.Len)); err != nil {
+							return err
+						}
+					}
+				}
 			}
 			return nil
 		}
 	}
 	for _, idx := range tab.Indexes {
+		if idx.Vector {
+			if tab.Partitioning != nil {
+				prow := neu
+				if prow == nil {
+					prow = old
+				}
+				part, err := s.partitionForRow(tab, prow)
+				if err != nil {
+					return err
+				}
+				if err := s.maintainPartitionVectorIndex(tab, idx, *part, old, neu); err != nil {
+					return err
+				}
+			} else if idx.VecMethod == catalog.VecMethodIVF {
+				if err := s.maintainIVFIndex(tab, idx, old, neu); err != nil {
+					return err
+				}
+			} else if idx.VecMethod == catalog.VecMethodIVFPQ {
+				if err := s.maintainIVFPQIndex(tab, idx, old, neu); err != nil {
+					return err
+				}
+			} else if idx.VecMethod == catalog.VecMethodSPARSE {
+				if err := s.maintainSparseIndex(tab, idx, old, neu); err != nil {
+					return err
+				}
+			} else if err := s.maintainVectorIndex(tab, idx, old, neu); err != nil {
+				return err
+			}
+			continue
+		}
 		var itx *btree.Txn
 		if tab.Partitioning != nil {
 			// For partitioned tables, secondary indexes are per-partition.
@@ -1076,15 +1234,9 @@ func (s *Session) maintainIndexes(tab *catalog.Table, old, neu []types.Value) er
 				}
 				ix, err := s.partitionIndex(tab, part.ID, idx)
 				if err != nil {
-					// No partition index yet (should not happen), fallback to global
-					ix2, err2 := s.indexOf(tab, idx)
-					if err2 != nil {
-						return err
-					}
-					itx = s.x.use(ix2)
-				} else {
-					itx = s.x.use(ix)
+					return err
 				}
+				itx = s.x.use(ix)
 			} else {
 				ix, err := s.indexOf(tab, idx)
 				if err != nil {
@@ -1100,12 +1252,6 @@ func (s *Session) maintainIndexes(tab *catalog.Table, old, neu []types.Value) er
 			itx = s.x.use(ix)
 		}
 		if idx.Fulltext && old != nil && neu != nil && sameFulltextRow(tab, idx, old, neu) {
-			continue
-		}
-		if idx.Vector {
-			if err := s.maintainVectorIndex(tab, idx, old, neu); err != nil {
-				return err
-			}
 			continue
 		}
 		if old != nil {
@@ -1131,6 +1277,9 @@ func (s *Session) maintainIndexes(tab *catalog.Table, old, neu []types.Value) er
 				return err
 			}
 			if ok {
+				if err := s.checkCrossPartitionUnique(tab, idx, itx, neu); err != nil {
+					return err
+				}
 				pairs, err := s.indexPairs(tab, idx, neu)
 				if err != nil {
 					return err
@@ -1217,21 +1366,35 @@ func (s *Session) indexPairs(tab *catalog.Table, idx catalog.Index, row []types.
 }
 
 func fulltextDoc(tab *catalog.Table, idx catalog.Index, row []types.Value) (fulltext.Doc, error) {
-	if len(idx.Columns) != 1 {
+	if len(idx.Columns) == 0 || len(idx.Columns) > fulltext.MaxFields {
 		return fulltext.Doc{}, nerr.New(nerr.InvalidArgument, "executor.fulltextDoc", "FULLTEXT INDEX column count")
 	}
-	v := row[idx.Columns[0]]
-	if v.Null {
-		return fulltext.Doc{}, nil
+	return analyzeSearchRow(row, idx.Columns, fulltext.Analyzer{ID: idx.FTAnalyzer, Version: idx.FTVersion})
+}
+
+func analyzeSearchRow(row []types.Value, cols []int, a fulltext.Analyzer) (fulltext.Doc, error) {
+	if len(cols) == 0 || len(cols) > fulltext.MaxFields {
+		return fulltext.Doc{}, nerr.New(nerr.InvalidArgument, "executor.analyzeSearchRow", "SEARCH column count")
 	}
-	if v.Typ.Kind != types.KindString && v.Typ.Kind != types.KindText {
-		return fulltext.Doc{}, nerr.New(nerr.InvalidArgument, "executor.fulltextDoc", "FULLTEXT INDEX requires text")
+	texts := make([]string, len(cols))
+	for i, ord := range cols {
+		if ord < 0 || ord >= len(row) {
+			return fulltext.Doc{}, nerr.New(nerr.InvalidArgument, "executor.analyzeSearchRow", "SEARCH column out of range")
+		}
+		v := row[ord]
+		if v.Null {
+			continue
+		}
+		if v.Typ.Kind != types.KindString && v.Typ.Kind != types.KindText {
+			return fulltext.Doc{}, nerr.New(nerr.InvalidArgument, "executor.analyzeSearchRow", "SEARCH requires text")
+		}
+		texts[i] = v.Str
 	}
-	return fulltext.Analyze(v.Str)
+	return fulltext.AnalyzeFields(texts, a)
 }
 
 func sameFulltextRow(tab *catalog.Table, idx catalog.Index, old, neu []types.Value) bool {
-	if len(idx.Columns) != 1 {
+	if len(idx.Columns) == 0 {
 		return false
 	}
 	oldPK, err := types.EncodeKey(tab.PKValues(old))
@@ -1245,11 +1408,19 @@ func sameFulltextRow(tab *catalog.Table, idx catalog.Index, old, neu []types.Val
 	if string(oldPK) != string(newPK) {
 		return false
 	}
-	o, n := old[idx.Columns[0]], neu[idx.Columns[0]]
-	if o.Null && n.Null {
-		return true
+	for _, ord := range idx.Columns {
+		if ord < 0 || ord >= len(old) || ord >= len(neu) {
+			return false
+		}
+		o, n := old[ord], neu[ord]
+		if o.Null && n.Null {
+			continue
+		}
+		if o.Null || n.Null || o.Str != n.Str {
+			return false
+		}
 	}
-	return !o.Null && !n.Null && o.Str == n.Str
+	return true
 }
 
 func writeFulltextStats(itx *btree.Txn, pairs []kv) error {
@@ -1450,6 +1621,11 @@ func tableOf(p planner.Logical) *catalog.Table {
 	case planner.IndexScan:
 		return n.Table
 	case planner.Search:
+		if n.Table != nil {
+			return n.Table
+		}
+		return tableOf(n.Input)
+	case planner.Facet:
 		if n.Table != nil {
 			return n.Table
 		}

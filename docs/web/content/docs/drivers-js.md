@@ -10,7 +10,7 @@ const { connect } = require("./drivers/node/nextsql"); // Bun: drivers/bun/nexts
 const conn = await connect({
   address: "127.0.0.1:7210",
   user: "app",
-  password: process.env.NEXTSQL_PASSWORD,
+  password: process.env.NEXTSQL_DATABASE_PASS,
   insecureNoTLS: true,
 });
 
@@ -35,7 +35,7 @@ import { connect } from "./drivers/deno/mod.ts";
 const conn = await connect({
   address: "127.0.0.1:7210",
   user: "app",
-  password: Deno.env.get("NEXTSQL_PASSWORD"),
+  password: Deno.env.get("NEXTSQL_DATABASE_PASS"),
   insecureNoTLS: true,
 });
 const res = await conn.exec("SELECT 1");
@@ -52,7 +52,7 @@ Remote TLS:
 const conn = await connect({
   address: "db.example.com:7210",
   user: "app",
-  password: process.env.NEXTSQL_PASSWORD,
+  password: process.env.NEXTSQL_DATABASE_PASS,
   tls: { ca, servername: "db.example.com" },
 });
 ```

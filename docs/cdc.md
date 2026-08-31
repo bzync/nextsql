@@ -141,12 +141,12 @@ batch is canceled at the idle deadline; it does not accumulate a server queue.
 not use table, tenant, key, or token labels. The stream also carries `lag_lsn`
 on every event for consumer-side alerting.
 
-## Tenant filtering
+## Database isolation
 
-The internal filter can restrict stable table IDs, table names, and one tenant.
-A tenant-filtered cross-tenant UPDATE fails closed: it is suppressed unless old
-and new tenant identities both match. Normal tenant-bound SQL already rejects
-changing `tenant_id`.
+New CDC records and public subscriptions are scoped to the connection's
+selected database. They do not derive or accept a row-tenant selector.
+Historical WAL tenant fields remain decodable for recovery compatibility but
+new writes leave them empty.
 
 The public surface requires an explicit table-scoped `CDC` privilege:
 
@@ -156,9 +156,8 @@ REVOKE CDC ON TABLE orders FROM streamer;
 ```
 
 Authorization is checked at statement admission and again for every stream
-pull, so a revoke stops an open stream. A tenant table requires a server-side
-session tenant binding; SQL cannot supply or override a subscription tenant.
-The stable table-ID filter and tenant filter are applied before delivery.
+pull, so a revoke stops an open stream. The stable table-ID filter is applied
+before delivery.
 Subscription attempts are audit logged as `cdc.subscribe` without keys or
 resume tokens. Transport uses the existing TLS-only production NSQL path.
 

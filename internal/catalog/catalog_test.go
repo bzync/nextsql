@@ -1,6 +1,8 @@
 package catalog
 
 import (
+	"crypto/sha256"
+	"strings"
 	"testing"
 
 	"github.com/bzync/nextsql/internal/sql/ast"
@@ -55,10 +57,20 @@ func TestTableEncodeRoundTrip(t *testing.T) {
 	if !got.Indexes[2].Fulltext || got.Indexes[2].Name != "ix_body" {
 		t.Fatalf("fulltext index %+v", got.Indexes[2])
 	}
+	if got.Indexes[2].FTAnalyzer != 0 || got.Indexes[2].FTVersion != 0 {
+		t.Fatalf("default analyzer %+v", got.Indexes[2])
+	}
 	if !got.Indexes[3].Vector || got.Indexes[3].Name != "ix_emb" {
 		t.Fatalf("vector index %+v", got.Indexes[3])
 	}
-	v3 := append([]byte(nil), raw[:len(raw)-1]...)
+	// v6 appends one traversal-quantisation byte per index after the
+	// partitioning descriptor, v7 a further 9 bytes per index (method + IVF
+	// list/probe counts), v8 a further 4 bytes per index (IVF-PQ subspace
+	// count), and v9 a further 3 bytes per index (full-text analyzer id +
+	// revision); strip all of that plus the partitioning byte to synthesise a
+	// legacy v3 body, and one more for v2.
+	trailer := len(got.Indexes)*17 + 1
+	v3 := append([]byte(nil), raw[:len(raw)-trailer]...)
 	v3[4], v3[5] = byte(tableVersionV3), 0
 	legacyV3, err := DecodeTable(v3)
 	if err != nil {
@@ -67,7 +79,7 @@ func TestTableEncodeRoundTrip(t *testing.T) {
 	if legacyV3.CDCImages != CDCImagesFull || legacyV3.Partitioning != nil {
 		t.Fatalf("v3 decode=%+v", legacyV3)
 	}
-	v2 := append([]byte(nil), raw[:len(raw)-2]...)
+	v2 := append([]byte(nil), raw[:len(raw)-trailer-1]...)
 	v2[4], v2[5] = byte(tableVersionV2), 0
 	legacy, err := DecodeTable(v2)
 	if err != nil {
@@ -75,6 +87,110 @@ func TestTableEncodeRoundTrip(t *testing.T) {
 	}
 	if legacy.CDCImages != CDCImagesKeys {
 		t.Fatalf("v2 image default=%v", legacy.CDCImages)
+	}
+}
+
+func TestTableEncodeFulltextAnalyzerV9(t *testing.T) {
+	tab := &Table{
+		ID: 1, Name: "articles",
+		Columns: []Column{
+			{Name: "id", Type: types.UUID(), NotNull: true, Primary: true},
+			{Name: "body", Type: types.Text()},
+		},
+		PK: []int{0},
+		Indexes: []Index{{
+			Name: "ix_body", Fulltext: true, Columns: []int{1}, Meta: 14,
+			FTAnalyzer: FTAnalyzerEnglish, FTVersion: FTAnalyzerEnglishV1,
+		}},
+	}
+	raw, err := EncodeTable(tab)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := DecodeTable(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Indexes[0].FTAnalyzer != FTAnalyzerEnglish || got.Indexes[0].FTVersion != FTAnalyzerEnglishV1 {
+		t.Fatalf("analyzer %+v", got.Indexes[0])
+	}
+	tab.Indexes[0].FTVersion = FTAnalyzerEnglishV2
+	raw2, err := EncodeTable(tab)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got2, err := DecodeTable(raw2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got2.Indexes[0].FTAnalyzer != FTAnalyzerEnglish || got2.Indexes[0].FTVersion != FTAnalyzerEnglishV2 {
+		t.Fatalf("v2 analyzer %+v", got2.Indexes[0])
+	}
+	tab.Indexes[0].FTVersion = FTAnalyzerEnglishV3
+	raw3, err := EncodeTable(tab)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got3, err := DecodeTable(raw3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got3.Indexes[0].FTAnalyzer != FTAnalyzerEnglish || got3.Indexes[0].FTVersion != FTAnalyzerEnglishV3 {
+		t.Fatalf("v3 analyzer %+v", got3.Indexes[0])
+	}
+	for _, pair := range []struct {
+		id  uint8
+		ver uint16
+	}{
+		{FTAnalyzerFrench, FTAnalyzerFrenchV1},
+		{FTAnalyzerGerman, FTAnalyzerGermanV1},
+		{FTAnalyzerSpanish, FTAnalyzerSpanishV1},
+	} {
+		tab.Indexes[0].FTAnalyzer = pair.id
+		tab.Indexes[0].FTVersion = pair.ver
+		rawL, err := EncodeTable(tab)
+		if err != nil {
+			t.Fatalf("encode lang %d: %v", pair.id, err)
+		}
+		gotL, err := DecodeTable(rawL)
+		if err != nil {
+			t.Fatalf("decode lang %d: %v", pair.id, err)
+		}
+		if gotL.Indexes[0].FTAnalyzer != pair.id || gotL.Indexes[0].FTVersion != pair.ver {
+			t.Fatalf("lang analyzer %+v", gotL.Indexes[0])
+		}
+	}
+	// v8 ended after the IVF-PQ subspace counts; strip the 3-byte analyzer
+	// trailer per index and the descriptor still decodes as simple.
+	v8 := append([]byte(nil), raw[:len(raw)-3]...)
+	v8[4], v8[5] = byte(tableVersionV8), 0
+	legacy, err := DecodeTable(v8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if legacy.Indexes[0].FTAnalyzer != 0 || legacy.Indexes[0].FTVersion != 0 {
+		t.Fatalf("v8 analyzer %+v", legacy.Indexes[0])
+	}
+	bad := append([]byte(nil), raw...)
+	bad[len(bad)-3] = 99
+	if _, err := DecodeTable(bad); err == nil {
+		t.Fatal("expected unknown analyzer")
+	}
+	tab.Indexes[0].FTAnalyzer = FTAnalyzerEnglish
+	tab.Indexes[0].FTVersion = 4
+	if _, err := EncodeTable(tab); err == nil {
+		t.Fatal("expected unknown english version")
+	}
+	tab.Indexes[0].FTAnalyzer = 0
+	tab.Indexes[0].FTVersion = 2
+	if _, err := EncodeTable(tab); err == nil {
+		t.Fatal("expected invalid simple version")
+	}
+	tab.Indexes[0].Fulltext = false
+	tab.Indexes[0].FTAnalyzer = FTAnalyzerEnglish
+	tab.Indexes[0].FTVersion = FTAnalyzerEnglishV1
+	if _, err := EncodeTable(tab); err == nil {
+		t.Fatal("expected analyzer on non-fulltext index")
 	}
 }
 
@@ -402,8 +518,8 @@ func TestValidateForeignKeys(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := ValidateForeignKeys(mp, lookup); err == nil {
-		t.Fatal("expected tenant pairing error")
+	if err := ValidateForeignKeys(mp, lookup); err != nil {
+		t.Fatalf("tenant_id is no longer a special foreign-key column: %v", err)
 	}
 }
 
@@ -559,8 +675,9 @@ func TestStatsEncodeRoundTrip(t *testing.T) {
 			MCV:         []MCV{{Value: types.StringValue("x"), Freq: 10}},
 			Correlation: 0.5,
 		}},
-		Indexes:  []IndexStats{{Name: "ix", Selectivity: 0.1, NDV: 80, Unique: false}},
-		Segments: []SegmentStats{{ID: 1, Rows: 50, HasBounds: true, LowPK: []types.Value{types.DecimalValue(d, types.Type{Kind: types.KindDecimal})}, HighPK: []types.Value{types.DecimalValue(d, types.Type{Kind: types.KindDecimal})}}},
+		Indexes:    []IndexStats{{Name: "ix", Selectivity: 0.1, NDV: 80, Unique: false}},
+		Segments:   []SegmentStats{{ID: 1, Rows: 50, HasBounds: true, LowPK: []types.Value{types.DecimalValue(d, types.Type{Kind: types.KindDecimal})}, HighPK: []types.Value{types.DecimalValue(d, types.Type{Kind: types.KindDecimal})}}},
+		Partitions: []PartitionStats{{ID: 1, Rows: 25}, {ID: 7, Rows: 75}},
 	}
 	raw, err := EncodeStats(st)
 	if err != nil {
@@ -576,6 +693,128 @@ func TestStatsEncodeRoundTrip(t *testing.T) {
 	if got.Indexes[0].Name != "ix" || got.Segments[0].ID != 1 {
 		t.Fatalf("%+v", got)
 	}
+	if len(got.Partitions) != 2 || got.Partitions[0].Rows != 25 || got.Partitions[1].ID != 7 {
+		t.Fatalf("partition stats: %+v", got.Partitions)
+	}
+	if _, err := DecodeStats(append(append([]byte(nil), raw...), 0)); err == nil {
+		t.Fatal("stats decoder accepted trailing bytes")
+	}
+}
+
+func TestStatsRejectInvalidPartitionCounts(t *testing.T) {
+	for _, parts := range [][]PartitionStats{
+		{{ID: 0, Rows: 1}},
+		{{ID: 1, Rows: 1}, {ID: 1, Rows: 2}},
+	} {
+		if _, err := EncodeStats(&TableStats{Table: "t", TableID: 1, Partitions: parts}); err == nil {
+			t.Fatalf("accepted invalid partition stats: %+v", parts)
+		}
+	}
+}
+
+func TestPartitionStatsEncodeRoundTrip(t *testing.T) {
+	part := PartitionStats{
+		ID:   7,
+		Rows: 12,
+		Columns: []ColumnStats{{
+			Ord: 1, Nulls: 2, NDV: 4, HasMinMax: true,
+			Min: types.StringValue("a"), Max: types.StringValue("z"), Correlation: 0.25,
+		}},
+		Indexes: []IndexStats{{Name: "ix_name", Selectivity: 0.25, NDV: 4}},
+		Vectors: []VectorStats{{Ord: 2, Count: 10, Dim: 4}},
+	}
+	snapshot := sha256.Sum256([]byte("global NSST"))
+	raw, err := EncodePartitionStats(3, snapshot, part)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tableID, gotSnapshot, got, err := DecodePartitionStats(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tableID != 3 || gotSnapshot != snapshot || got.ID != 7 || got.Rows != 12 || len(got.Columns) != 1 || got.Columns[0].Min.Str != "a" ||
+		len(got.Indexes) != 1 || got.Indexes[0].Name != "ix_name" || len(got.Vectors) != 1 || got.Vectors[0].Count != 10 {
+		t.Fatalf("table=%d partition=%+v", tableID, got)
+	}
+	if _, _, _, err := DecodePartitionStats(append(append([]byte(nil), raw...), 0)); err == nil {
+		t.Fatal("partition stats decoder accepted trailing bytes")
+	}
+	if _, err := EncodePartitionStats(3, snapshot, PartitionStats{ID: 7, Columns: []ColumnStats{{Ord: 1, Histogram: []HistBucket{{}}}}}); err == nil {
+		t.Fatal("partition stats encoder accepted a non-compact column sketch")
+	}
+	start, end := PartitionStatsRange(3)
+	key := PartitionStatsKey(3, 7)
+	if string(key[:5]) != string(start) || string(key) >= string(end) {
+		t.Fatalf("key %x outside range [%x,%x)", key, start, end)
+	}
+	wide := PartitionStats{ID: 7}
+	for ord := 0; ord < MaxPartitionSketchColumns; ord++ {
+		wide.Columns = append(wide.Columns, ColumnStats{
+			Ord: ord, HasMinMax: true,
+			Min: types.StringValue(strings.Repeat("a", 256)),
+			Max: types.StringValue(strings.Repeat("z", 256)),
+		})
+	}
+	if _, err := EncodePartitionStats(3, snapshot, wide); err == nil {
+		t.Fatal("partition stats encoder accepted an oversized record")
+	}
+	if _, _, _, err := DecodePartitionStats(make([]byte, MaxPartitionStatsBytes+1)); err == nil {
+		t.Fatal("partition stats decoder accepted an oversized record")
+	}
+}
+
+func FuzzDecodePartitionStats(f *testing.F) {
+	snapshot := sha256.Sum256([]byte("fuzz snapshot"))
+	seed, err := EncodePartitionStats(2, snapshot, PartitionStats{
+		ID:      9,
+		Rows:    1,
+		Columns: []ColumnStats{{Ord: 0, NDV: 1, HasMinMax: true, Min: types.StringValue("x"), Max: types.StringValue("x")}},
+	})
+	if err != nil {
+		f.Fatal(err)
+	}
+	f.Add(seed)
+	f.Add([]byte("NSPS"))
+	f.Fuzz(func(t *testing.T, raw []byte) {
+		tableID, snapshot, part, err := DecodePartitionStats(raw)
+		if err != nil {
+			return
+		}
+		roundTrip, err := EncodePartitionStats(tableID, snapshot, part)
+		if err != nil {
+			t.Fatalf("decoded partition stats did not re-encode: %v", err)
+		}
+		if _, _, _, err := DecodePartitionStats(roundTrip); err != nil {
+			t.Fatalf("re-encoded partition stats did not decode: %v", err)
+		}
+	})
+}
+
+func FuzzDecodeStats(f *testing.F) {
+	seed, err := EncodeStats(&TableStats{
+		Table:      "events",
+		TableID:    7,
+		Rows:       3,
+		Partitions: []PartitionStats{{ID: 1, Rows: 1}, {ID: 4, Rows: 2}},
+	})
+	if err != nil {
+		f.Fatal(err)
+	}
+	f.Add(seed)
+	f.Add([]byte("NSST"))
+	f.Fuzz(func(t *testing.T, raw []byte) {
+		st, err := DecodeStats(raw)
+		if err != nil {
+			return
+		}
+		roundTrip, err := EncodeStats(st)
+		if err != nil {
+			t.Fatalf("decoded stats did not re-encode: %v", err)
+		}
+		if _, err := DecodeStats(roundTrip); err != nil {
+			t.Fatalf("re-encoded stats did not decode: %v", err)
+		}
+	})
 }
 
 func TestVectorStatsEncodeRoundTrip(t *testing.T) {
@@ -613,6 +852,16 @@ func TestVectorStatsEncodeRoundTrip(t *testing.T) {
 	}
 	if len(old.Vectors) != 0 {
 		t.Fatalf("v1 should have no vectors: %+v", old.Vectors)
+	}
+	v2 := append([]byte(nil), v1...)
+	copy(v2[4:6], appendU16(nil, 2))
+	v2 = appendU16(v2, 0)
+	old, err = DecodeStats(v2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(old.Partitions) != 0 {
+		t.Fatalf("v2 should have no partition stats: %+v", old.Partitions)
 	}
 }
 

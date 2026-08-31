@@ -188,6 +188,26 @@ func TestPolygonPointInAndHole(t *testing.T) {
 	if err != nil || !in {
 		t.Fatalf("downtown still inside: %v %v", in, err)
 	}
+	// WITHIN is strict interior; COVERS includes polygon boundaries, including
+	// the boundary of a hole.
+	holeBoundary := MustPoint(-74.00, 40.74)
+	covered, err := PointInPolygon(holeBoundary, holed)
+	if err != nil || !covered {
+		t.Fatalf("hole boundary covered: %v %v", covered, err)
+	}
+	within, err := PointWithinPolygon(holeBoundary, holed)
+	if err != nil || within {
+		t.Fatalf("hole boundary not within: %v %v", within, err)
+	}
+	exteriorBoundary := MustPoint(-74.1, 40.7)
+	covered, err = PointInPolygon(exteriorBoundary, holed)
+	if err != nil || !covered {
+		t.Fatalf("exterior boundary covered: %v %v", covered, err)
+	}
+	within, err = PointWithinPolygon(exteriorBoundary, holed)
+	if err != nil || within {
+		t.Fatalf("exterior boundary not within: %v %v", within, err)
+	}
 }
 
 func TestLineLengthAndDWithin(t *testing.T) {
@@ -206,6 +226,118 @@ func TestLineLengthAndDWithin(t *testing.T) {
 	far, err := DistanceAny(MustPoint(139.6917, 35.6895), ln)
 	if err != nil || far < 1e7 {
 		t.Fatalf("tokyo to nyc line %f %v", far, err)
+	}
+}
+
+func TestRichGeometryDistanceAndTopology(t *testing.T) {
+	crossA, err := ParseWKT("LINESTRING(0 0, 2 2)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	crossB, err := ParseWKT("LINESTRING(0 2, 2 0)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	d, err := DistanceAny(crossA, crossB)
+	if err != nil || d != 0 {
+		t.Fatalf("crossing lines distance=%f err=%v", d, err)
+	}
+	intersects, err := GeometriesIntersect(crossA, crossB)
+	if err != nil || !intersects {
+		t.Fatalf("crossing lines intersect=%v err=%v", intersects, err)
+	}
+
+	poly, err := ParseWKT("POLYGON((0 0, 2 0, 2 2, 0 2, 0 0))")
+	if err != nil {
+		t.Fatal(err)
+	}
+	through, _ := ParseWKT("LINESTRING(-1 1, 3 1)")
+	d, err = DistanceAny(through, poly)
+	if err != nil || d != 0 {
+		t.Fatalf("line/polygon distance=%f err=%v", d, err)
+	}
+	disjoint, _ := ParseWKT("LINESTRING(3 3, 4 4)")
+	d, err = DistanceAny(disjoint, poly)
+	if err != nil || d < 100000 {
+		t.Fatalf("disjoint line/polygon distance=%f err=%v", d, err)
+	}
+
+	overlap, _ := ParseWKT("POLYGON((1 1, 3 1, 3 3, 1 3, 1 1))")
+	d, err = DistanceAny(poly, overlap)
+	if err != nil || d != 0 {
+		t.Fatalf("overlapping polygons distance=%f err=%v", d, err)
+	}
+	far, _ := ParseWKT("POLYGON((4 4, 5 4, 5 5, 4 5, 4 4))")
+	d, err = DistanceAny(poly, far)
+	if err != nil || d < 100000 {
+		t.Fatalf("disjoint polygons distance=%f err=%v", d, err)
+	}
+
+	box, _ := BoxValue(0, 0, 2, 2)
+	d, err = DistanceAny(MustPoint(1, 1), box)
+	if err != nil || d != 0 {
+		t.Fatalf("point/box distance=%f err=%v", d, err)
+	}
+	wrap, _ := BoxValue(170, -10, -170, 10)
+	d, err = DistanceAny(MustPoint(175, 0), wrap)
+	if err != nil || d != 0 {
+		t.Fatalf("point/wrapping-box distance=%f err=%v", d, err)
+	}
+}
+
+func TestRichGeometryMeasurementsAndInspection(t *testing.T) {
+	poly, err := ParseWKT("POLYGON((0 0, 1 0, 1 1, 0 1, 0 0))")
+	if err != nil {
+		t.Fatal(err)
+	}
+	area, err := PolygonAreaM2(poly)
+	if err != nil || area < 1.2e10 || area > 1.3e10 {
+		t.Fatalf("one-degree area=%f err=%v", area, err)
+	}
+	perimeter, err := PolygonPerimeterM(poly)
+	if err != nil || perimeter < 440000 || perimeter > 450000 {
+		t.Fatalf("one-degree perimeter=%f err=%v", perimeter, err)
+	}
+	center, err := GeoCentroid(poly)
+	if err != nil || math.Abs(center.Lon-.5) > 1e-12 || math.Abs(center.Lat-.5) > 1e-12 {
+		t.Fatalf("centroid=%+v err=%v", center, err)
+	}
+	env, err := GeoEnvelope(poly)
+	if err != nil || env.Box != [4]float64{0, 0, 1, 1} {
+		t.Fatalf("envelope=%+v err=%v", env, err)
+	}
+	name, err := GeometryTypeName(poly)
+	if err != nil || name != "POLYGON" {
+		t.Fatalf("type=%q err=%v", name, err)
+	}
+	n, err := GeometryPointCount(poly)
+	if err != nil || n != 5 {
+		t.Fatalf("npoints=%d err=%v", n, err)
+	}
+
+	areaValue, ok, err := EvalGeo("st_area", []Value{poly})
+	if err != nil || !ok || areaValue.Dec.String() == "0.000" {
+		t.Fatalf("ST_Area=%+v ok=%v err=%v", areaValue, ok, err)
+	}
+	typeValue, ok, err := EvalGeo("st_geometrytype", []Value{poly})
+	if err != nil || !ok || typeValue.Str != "POLYGON" {
+		t.Fatalf("ST_GeometryType=%+v ok=%v err=%v", typeValue, ok, err)
+	}
+	countValue, ok, err := EvalGeo("st_nrings", []Value{poly})
+	if err != nil || !ok || countValue.Dec.String() != "1" {
+		t.Fatalf("ST_NRings=%+v ok=%v err=%v", countValue, ok, err)
+	}
+}
+
+func TestPolygonRejectsInvalidTopology(t *testing.T) {
+	for _, wkt := range []string{
+		"POLYGON((0 0, 2 2, 0 2, 2 0, 0 0))",
+		"POLYGON((0 0, 4 0, 4 4, 0 4, 0 0), (5 5, 6 5, 6 6, 5 6, 5 5))",
+		"POLYGON((0 0, 8 0, 8 8, 0 8, 0 0), (1 1, 5 1, 5 5, 1 5, 1 1), (4 4, 7 4, 7 7, 4 7, 4 4))",
+	} {
+		if _, err := ParseWKT(wkt); err == nil {
+			t.Fatalf("expected invalid topology: %s", wkt)
+		}
 	}
 }
 

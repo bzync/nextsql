@@ -87,6 +87,9 @@ func decideCTEs(p planner.Logical, stats StatsFunc) planner.Logical {
 	case planner.Search:
 		n.Input = decideCTEs(n.Input, stats)
 		return n
+	case planner.Facet:
+		n.Input = decideCTEs(n.Input, stats)
+		return n
 	case planner.Nearest:
 		n.Input = decideCTEs(n.Input, stats)
 		return n
@@ -94,8 +97,7 @@ func decideCTEs(p planner.Logical, stats StatsFunc) planner.Logical {
 		n.Input = decideCTEs(n.Input, stats)
 		return n
 	case planner.Rerank:
-		n.Input = decideCTEs(n.Input, stats)
-		return n
+		return mapRerankInputs(n, func(p planner.Logical) planner.Logical { return decideCTEs(p, stats) })
 	case planner.Update:
 		n.Input = decideCTEs(n.Input, stats)
 		return n
@@ -202,12 +204,18 @@ func countCTEScans(p planner.Logical, id uint64) int {
 		return countCTEScans(n.Input, id)
 	case planner.Search:
 		return countCTEScans(n.Input, id)
+	case planner.Facet:
+		return countCTEScans(n.Input, id)
 	case planner.Nearest:
 		return countCTEScans(n.Input, id)
 	case planner.Candidates:
 		return countCTEScans(n.Input, id)
 	case planner.Rerank:
-		return countCTEScans(n.Input, id)
+		total := countCTEScans(n.Input, id)
+		for _, e := range n.Extra {
+			total += countCTEScans(e, id)
+		}
+		return total
 	case planner.Update:
 		return countCTEScans(n.Input, id)
 	case planner.Delete:
@@ -267,6 +275,9 @@ func replaceCTEScan(p planner.Logical, id uint64, repl planner.Logical) planner.
 	case planner.Search:
 		n.Input = replaceCTEScan(n.Input, id, repl)
 		return n
+	case planner.Facet:
+		n.Input = replaceCTEScan(n.Input, id, repl)
+		return n
 	case planner.Nearest:
 		n.Input = replaceCTEScan(n.Input, id, repl)
 		return n
@@ -274,8 +285,7 @@ func replaceCTEScan(p planner.Logical, id uint64, repl planner.Logical) planner.
 		n.Input = replaceCTEScan(n.Input, id, repl)
 		return n
 	case planner.Rerank:
-		n.Input = replaceCTEScan(n.Input, id, repl)
-		return n
+		return mapRerankInputs(n, func(p planner.Logical) planner.Logical { return replaceCTEScan(p, id, repl) })
 	case planner.Update:
 		n.Input = replaceCTEScan(n.Input, id, repl)
 		return n
@@ -329,6 +339,9 @@ func stampCTEScanRows(p planner.Logical, id uint64, rows int64) planner.Logical 
 	case planner.Search:
 		n.Input = stampCTEScanRows(n.Input, id, rows)
 		return n
+	case planner.Facet:
+		n.Input = stampCTEScanRows(n.Input, id, rows)
+		return n
 	case planner.Nearest:
 		n.Input = stampCTEScanRows(n.Input, id, rows)
 		return n
@@ -336,8 +349,7 @@ func stampCTEScanRows(p planner.Logical, id uint64, rows int64) planner.Logical 
 		n.Input = stampCTEScanRows(n.Input, id, rows)
 		return n
 	case planner.Rerank:
-		n.Input = stampCTEScanRows(n.Input, id, rows)
-		return n
+		return mapRerankInputs(n, func(p planner.Logical) planner.Logical { return stampCTEScanRows(p, id, rows) })
 	default:
 		return p
 	}
@@ -377,6 +389,9 @@ func clonePlan(p planner.Logical) planner.Logical {
 	case planner.Search:
 		n.Input = clonePlan(n.Input)
 		return n
+	case planner.Facet:
+		n.Input = clonePlan(n.Input)
+		return n
 	case planner.Nearest:
 		n.Input = clonePlan(n.Input)
 		return n
@@ -384,8 +399,7 @@ func clonePlan(p planner.Logical) planner.Logical {
 		n.Input = clonePlan(n.Input)
 		return n
 	case planner.Rerank:
-		n.Input = clonePlan(n.Input)
-		return n
+		return mapRerankInputs(n, clonePlan)
 	case planner.With:
 		n.Query = clonePlan(n.Query)
 		ctes := make([]planner.CTE, len(n.CTEs))

@@ -24,18 +24,21 @@ func main() {
 	s := db.Session()
 	s.Exec := func(sql string) {
 		_, err := s.ExecRaw(sql)
-		if err != nil { fmt.Printf("exec %q err: %v\n", sql, err); os.Exit(1) }
+		if err != nil {
+			fmt.Printf("exec %q err: %v\n", sql, err)
+			os.Exit(1)
+		}
 	}
 	_ = sExec
 	// Use direct catalog test
 	tab := &catalog.Table{
 		ID: 1, Name: "t",
-		Columns: []catalog.Column{{Name: "id", Type: types.String()}, {Name: "tenant_id", Type: types.String()}, {Name: "n", Type: types.String()}},
-		PK: []int{0},
+		Columns: []catalog.Column{{Name: "id", Type: types.String()}, {Name: "account_id", Type: types.String()}, {Name: "n", Type: types.String()}},
+		PK:      []int{0},
 	}
 	// Simulate what binder does for TENANT
 	part := catalog.Partitioning{
-		Kind: catalog.PartitionTenant,
+		Kind:    catalog.PartitionList,
 		Columns: []int{1},
 		Partitions: []catalog.Partition{
 			{ID: 1, Name: "p_a", HeapMeta: 1, Values: [][]types.Value{{types.StringValue("a")}}},
@@ -48,35 +51,58 @@ func main() {
 	rowC := []types.Value{types.StringValue("3"), types.StringValue("c"), types.StringValue("bad")}
 	for _, row := range [][]types.Value{rowA, rowB, rowC} {
 		p, err := tab.PartitionForRow(row)
-		if err != nil { fmt.Printf("row %v partition err: %v\n", row[1].Str, err) } else { fmt.Printf("row %v -> partition %s ID %d\n", row[1].Str, p.Name, p.ID) }
+		if err != nil {
+			fmt.Printf("row %v partition err: %v\n", row[1].Str, err)
+		} else {
+			fmt.Printf("row %v -> partition %s ID %d\n", row[1].Str, p.Name, p.ID)
+		}
 	}
 	// Now test actual DB with tenant
 	fmt.Println("--- DB tenant test ---")
 	s2 := db.Session()
-	_, err := s2.Exec(`CREATE TABLE t_tenant (id STRING PRIMARY KEY, tenant_id STRING NOT NULL, n STRING NOT NULL) PARTITION BY TENANT (tenant_id) (PARTITION p_a VALUES IN ('a'), PARTITION p_b VALUES IN ('b'))`)
-	if err != nil { fmt.Println("create err", err); os.Exit(1) }
+	_, err := s2.Exec(`CREATE TABLE t_list (id STRING PRIMARY KEY, account_id STRING NOT NULL, n STRING NOT NULL) PARTITION BY LIST (account_id) (PARTITION p_a VALUES IN ('a'), PARTITION p_b VALUES IN ('b'))`)
+	if err != nil {
+		fmt.Println("create err", err)
+		os.Exit(1)
+	}
 	// Try to lookup table
-	tbl, ok := db.Cat.Get("t_tenant")
-	if !ok { fmt.Println("not found cat"); os.Exit(1) }
+	tbl, ok := db.Cat.Get("t_list")
+	if !ok {
+		fmt.Println("not found cat")
+		os.Exit(1)
+	}
 	fmt.Printf("cat partitioning: %+v\n", tbl.Partitioning)
 	for _, p := range tbl.Partitioning.Partitions {
 		fmt.Printf(" part %s ID %d HeapMeta %d Values %v\n", p.Name, p.ID, p.HeapMeta, p.Values)
 	}
 	// Check partition heap exists
-	_, err = s2.Exec(`INSERT INTO t_tenant (id, tenant_id, n) VALUES ('1', 'a', 'hello')`)
-	if err != nil { fmt.Println("insert a err", err); os.Exit(1) }
+	_, err = s2.Exec(`INSERT INTO t_list (id, account_id, n) VALUES ('1', 'a', 'hello')`)
+	if err != nil {
+		fmt.Println("insert a err", err)
+		os.Exit(1)
+	}
 	// After insert, try to see if we can find via direct heap scan debug
 	// Use executor internal via reflection? Just try select
-	res, err := s2.Exec(`SELECT * FROM t_tenant`)
-	if err != nil { fmt.Println("select err", err); os.Exit(1) }
+	res, err := s2.Exec(`SELECT * FROM t_list`)
+	if err != nil {
+		fmt.Println("select err", err)
+		os.Exit(1)
+	}
 	fmt.Printf("select all rows %d\n", len(res.Rows))
-	for _, r := range res.Rows { fmt.Printf(" row %v\n", r) }
+	for _, r := range res.Rows {
+		fmt.Printf(" row %v\n", r)
+	}
 	// Try select with filter
-	res, err = s2.Exec(`SELECT * FROM t_tenant WHERE tenant_id = 'a'`)
-	if err != nil { fmt.Println("select a err", err); os.Exit(1) }
+	res, err = s2.Exec(`SELECT * FROM t_list WHERE account_id = 'a'`)
+	if err != nil {
+		fmt.Println("select a err", err)
+		os.Exit(1)
+	}
 	fmt.Printf("select a rows %d\n", len(res.Rows))
 	// Check via scanHeap directly: call db.Session().Exec with EXPLAIN
-	res, _ = s2.Exec(`EXPLAIN SELECT * FROM t_tenant WHERE tenant_id = 'a'`)
-	for _, r := range res.Rows { fmt.Printf("explain %v\n", r) }
+	res, _ = s2.Exec(`EXPLAIN SELECT * FROM t_list WHERE account_id = 'a'`)
+	for _, r := range res.Rows {
+		fmt.Printf("explain %v\n", r)
+	}
 }
 func (s *executor.Session) ExecRaw(sql string) (*executor.Result, error) { return s.Exec(sql) }

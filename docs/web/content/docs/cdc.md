@@ -43,9 +43,9 @@ advances past it.
 
 `nextsql status` exposes process-local subscription, active-stream,
 transaction, event, error, and latest-lag counters without table, tenant, key,
-or token labels. Each event also includes `lag_lsn`.
+or resume-token labels. Each event also includes `lag_lsn`.
 
-For tenant-keyed tables, `SET TENANT` is required for non-admin sessions and
-SQL cannot choose another subscription tenant. `CDC` is checked at admission
+Subscriptions are scoped to the connection's selected database; SQL has no
+row-tenant selector. `CDC` is checked at admission
 and on every pull, so revoke stops an open stream. Subscription control is
 recorded as `cdc.subscribe` without keys or tokens.

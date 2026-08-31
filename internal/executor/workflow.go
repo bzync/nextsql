@@ -61,7 +61,7 @@ func (s *Session) execRunWorkflow(p planner.RunWorkflow) (*Result, error) {
 		if err := s.budget().Check(); err != nil {
 			return nil, err
 		}
-		stmt, err := s.applyTenant(body)
+		stmt, err := s.guardLegacyTenancy(body)
 		if err != nil {
 			return nil, err
 		}

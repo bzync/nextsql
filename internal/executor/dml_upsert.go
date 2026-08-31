@@ -51,7 +51,7 @@ func (s *Session) execUpsert(p planner.Upsert) (*Result, error) {
 			}
 			row[i] = nv
 		}
-		if err := s.checkTenantRow(tab, row); err != nil {
+		if err := s.checkLegacyTenantRow(tab, row); err != nil {
 			return nil, err
 		}
 		final, err := s.upsertRow(tab, htx, p, row)
@@ -125,10 +125,10 @@ func (s *Session) applyUpsertUpdate(tab *catalog.Table, p planner.Upsert, old, p
 			}
 			neu[set.Col] = v
 		}
-		if err := s.checkTenantRow(tab, old); err != nil {
+		if err := s.checkLegacyTenantRow(tab, old); err != nil {
 			return nil, err
 		}
-		if err := s.checkTenantRow(tab, neu); err != nil {
+		if err := s.checkLegacyTenantRow(tab, neu); err != nil {
 			return nil, err
 		}
 		return neu, nil
@@ -147,16 +147,19 @@ func (s *Session) applyUpsertUpdate(tab *catalog.Table, p planner.Upsert, old, p
 		}
 		neu[col] = proposed[col]
 	}
-	if err := s.checkTenantRow(tab, old); err != nil {
+	if err := s.checkLegacyTenantRow(tab, old); err != nil {
 		return nil, err
 	}
-	if err := s.checkTenantRow(tab, neu); err != nil {
+	if err := s.checkLegacyTenantRow(tab, neu); err != nil {
 		return nil, err
 	}
 	return neu, nil
 }
 
 func (s *Session) findConflict(tab *catalog.Table, htx *btree.Txn, p planner.Upsert, proposed []types.Value) ([]types.Value, bool, error) {
+	if tab.Partitioning != nil {
+		return s.findConflictPartitioned(tab, p, proposed)
+	}
 	keyVals := make([]types.Value, len(p.UniqueCols))
 	for i, ord := range p.UniqueCols {
 		if ord < 0 || ord >= len(proposed) {
@@ -223,7 +226,112 @@ func (s *Session) findConflict(tab *catalog.Table, htx *btree.Txn, p planner.Ups
 	return row, true, nil
 }
 
+// findConflictPartitioned resolves an existing UPSERT-conflicting row for a
+// partitioned table. Every primary key includes every partition column, so a
+// PK-target UPSERT's proposed row routes to exactly one partition and any PK
+// conflict must live in that same partition-local heap. A secondary UNIQUE
+// target is enforced across partitions, so the conflicting key may live in any
+// partition: one exclusive lock on the encoded key (the engine key-lock
+// namespace is global, so concurrent UPSERTs of the same value serialize) then
+// probe every partition-local root.
+func (s *Session) findConflictPartitioned(tab *catalog.Table, p planner.Upsert, proposed []types.Value) ([]types.Value, bool, error) {
+	keyVals := make([]types.Value, len(p.UniqueCols))
+	for i, ord := range p.UniqueCols {
+		if ord < 0 || ord >= len(proposed) {
+			return nil, false, nerr.New(nerr.Internal, "executor.Upsert", "unique column out of range")
+		}
+		keyVals[i] = proposed[ord]
+	}
+	k, err := types.EncodeKey(keyVals)
+	if err != nil {
+		return nil, false, err
+	}
+	if p.UniquePK {
+		part, err := s.partitionForRow(tab, proposed)
+		if err != nil {
+			return nil, false, err
+		}
+		ph, err := s.partitionHeap(tab, part.ID)
+		if err != nil {
+			return nil, false, err
+		}
+		probe := s.x.use(ph)
+		if err := probe.LockExclusive(k); err != nil {
+			return nil, false, err
+		}
+		raw, err := s.lookupConflict(probe, k)
+		if err != nil {
+			if nerr.HasCode(err, nerr.NotFound) {
+				return nil, false, nil
+			}
+			return nil, false, err
+		}
+		row, err := s.decodeHeapRow(tab, raw)
+		if err != nil {
+			return nil, false, err
+		}
+		return row, true, nil
+	}
+	idx := indexByName(tab, p.UniqueIdx)
+	parts := tab.Partitioning.Partitions
+	if len(parts) == 0 {
+		return nil, false, nil
+	}
+	lockIx, err := s.partitionIndex(tab, parts[0].ID, idx)
+	if err != nil {
+		return nil, false, err
+	}
+	if err := s.x.use(lockIx).LockExclusive(k); err != nil {
+		return nil, false, err
+	}
+	for _, part := range parts {
+		ix, err := s.partitionIndex(tab, part.ID, idx)
+		if err != nil {
+			return nil, false, err
+		}
+		pk, err := s.lookupConflict(s.x.use(ix), k)
+		if err != nil {
+			if nerr.HasCode(err, nerr.NotFound) {
+				continue
+			}
+			return nil, false, err
+		}
+		heapKey, err := indexPKKey(tab, pk)
+		if err != nil {
+			return nil, false, err
+		}
+		ph, err := s.partitionHeap(tab, part.ID)
+		if err != nil {
+			return nil, false, err
+		}
+		raw, err := s.lookupConflict(s.x.use(ph), heapKey)
+		if err != nil {
+			if nerr.HasCode(err, nerr.NotFound) {
+				continue
+			}
+			return nil, false, err
+		}
+		row, err := s.decodeHeapRow(tab, raw)
+		if err != nil {
+			return nil, false, err
+		}
+		return row, true, nil
+	}
+	return nil, false, nil
+}
+
 func (s *Session) lookupHeapPK(tab *catalog.Table, htx *btree.Txn, row []types.Value) ([]types.Value, bool, error) {
+	if tab.Partitioning != nil {
+		part, err := s.partitionForRow(tab, row)
+		if err != nil {
+			return nil, false, err
+		}
+		ph, err := s.partitionHeap(tab, part.ID)
+		if err != nil {
+			return nil, false, err
+		}
+		htx = s.x.use(ph)
+	}
 	pk, err := types.EncodeKey(tab.PKValues(row))
 	if err != nil {
 		return nil, false, err

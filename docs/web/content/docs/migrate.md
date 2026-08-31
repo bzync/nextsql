@@ -2,7 +2,7 @@
 
 Keep schema in Git. `nextsql migrate` applies timestamped SQL files to a running `nextsqld` over NSQL. It is always **server mode**: it never opens `--data-dir` and never reads the root unlock key. A laptop `nextsqld` and a remote VPS are the same session. Only TLS and latency differ.
 
-Prefer a password file. Never put the root unlock key in the application `.env`. Default directory is `./migrations` (`--dir` / `NEXTSQL_MIGRATIONS_DIR`). Connection flags and dotenv match [exec](/docs/cli).
+Prefer a password file. Never put the root unlock key in the application `.env`. Default directory is `./migrations` (`--dir` / `NEXTSQL_MIGRATION_DIR`). Connection flags and dotenv match [exec](/docs/cli).
 
 ## Commands
 
@@ -32,7 +32,7 @@ nextsql migrate repair --confirm
 
 `status` / `up` / `down` / `force` / `repair` create `nsql_schema_migrations` if it is missing. The CLI never sends `GRANT` SQL: creating that table grants `SELECT`/`INSERT`/`UPDATE`/`DELETE` on it to the handshake user.
 
-Each up file is one transaction: `BEGIN`, dirty history insert, each statement, finalize (`dirty=0`), `COMMIT`. On error the file is rolled back. Files must not contain `BEGIN`/`COMMIT`/`ROLLBACK`, `SET TENANT`, or `GRANT`/`REVOKE`/`CREATE`/`DROP` `USER`/`ROLE`. Pass `--tenant` on the CLI instead.
+Each up file is one transaction: `BEGIN`, dirty history insert, each statement, finalize (`dirty=0`), `COMMIT`. On error the file is rolled back. Files must not contain `BEGIN`/`COMMIT`/`ROLLBACK` or `GRANT`/`REVOKE`/`CREATE`/`DROP` `USER`/`ROLE`. Removed shared-tenancy syntax is rejected by the parser.
 
 `--dry-run` connects, lists the files that would run, checksums them, and parses every statement. It does not `BEGIN` and does not execute user SQL.
 
@@ -43,14 +43,14 @@ Each up file is one transaction: `BEGIN`, dirty history insert, each statement, 
 ```bash
 # .env  — safe to commit if it contains no secrets
 NEXTSQL_ADDR=127.0.0.1:7210
-NEXTSQL_USER=app
+NEXTSQL_DATABASE_USER=app
 NEXTSQL_INSECURE=true
-NEXTSQL_MIGRATIONS_DIR=./migrations
+NEXTSQL_MIGRATION_DIR=./migrations
 ```
 
 ```bash
 # .env.local  — gitignored
-NEXTSQL_PASSWORD_FILE=/home/dev/secrets/nextsql.pw
+NEXTSQL_DATABASE_PASSWORD_FILE=/home/dev/secrets/nextsql.pw
 ```
 
 `NEXTSQL_INSECURE=true` is loopback-only. A laptop that omits both `--insecure` and `--tls-ca` fails at resolve, including `127.0.0.1`.
@@ -62,10 +62,10 @@ Load this on the migrate runner, not on the database host. The VPS `nextsqld` al
 ```bash
 # .env.production
 NEXTSQL_ADDR=db.example.com:7210
-NEXTSQL_USER=migrator
-NEXTSQL_PASSWORD_FILE=/run/secrets/nextsql-migrator.pw
+NEXTSQL_DATABASE_USER=migrator
+NEXTSQL_DATABASE_PASSWORD_FILE=/run/secrets/nextsql-migrator.pw
 NEXTSQL_TLS_CA=/etc/nextsql/ca.pem
-NEXTSQL_MIGRATIONS_DIR=./migrations
+NEXTSQL_MIGRATION_DIR=./migrations
 ```
 
 ```bash
@@ -84,38 +84,38 @@ migrations/
   20260818120100_create_orders.down.sql
 ```
 
-Pattern: `YYYYMMDDHHMMSS_slug.up.sql` (optional matching `.down.sql`). Version is a 14-digit UTC timestamp. Integer prefixes such as `0001_name.up.sql` are not accepted.
+Pattern: `YYYYMMDDHHMMSS_slug.up.sql` (optional matching `.down.sql`). Migration versions are timestamp-formatted, monotonically increasing identifiers. `migrate create NAME` allocates the later of the current UTC second or one second after the latest existing version. Multiple creates in one wall-clock second therefore continue immediately with subsequent versions, even if the latest version is already ahead of the wall clock. This supports bulk and programmatic migration generation without changing the 14-digit format. Integer prefixes such as `0001_name.up.sql` are not accepted.
 
 Preferred style: one statement per file. Multi-statement files are split on `;` (not inside strings or comments), up to 32 statements per file. Checksum: SHA-256 of the file after CR LF → LF and stripping a single UTF-8 BOM. Comment edits change the digest; `repair --confirm` updates stored checksums of already-applied files.
 
 ## Example
 
-Recommended pattern: composite `PRIMARY KEY (tenant_id, id)` so an FK can include `tenant_id` on both sides. Sample files live in [`docs/examples/migrations/`](https://github.com/bzync/nextsql/tree/main/docs/examples/migrations).
+Recommended pattern: composite `PRIMARY KEY (account_id, id)` so an FK can include `account_id` on both sides. Sample files live in [`docs/examples/migrations/`](https://github.com/bzync/nextsql/tree/main/docs/examples/migrations).
 
 ```sql
 CREATE TABLE customers (
-    tenant_id  UUID NOT NULL,
+    account_id  UUID NOT NULL,
     id         UUID NOT NULL DEFAULT UUID(),
     email      STRING NOT NULL,
     name       STRING NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    PRIMARY KEY (tenant_id, id)
+    PRIMARY KEY (account_id, id)
 );
 
-CREATE UNIQUE INDEX ux_customers_tenant_email ON customers (tenant_id, email);
+CREATE UNIQUE INDEX ux_customers_tenant_email ON customers (account_id, email);
 ```
 
 ```sql
 CREATE TABLE orders (
-    tenant_id   UUID NOT NULL,
+    account_id   UUID NOT NULL,
     id          UUID NOT NULL DEFAULT UUID(),
     customer_id UUID NOT NULL,
     total       DECIMAL(12,2) NOT NULL,
     created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    PRIMARY KEY (tenant_id, id),
+    PRIMARY KEY (account_id, id),
     CONSTRAINT fk_orders_customer
-        FOREIGN KEY (tenant_id, customer_id)
-        REFERENCES customers (tenant_id, id)
+        FOREIGN KEY (account_id, customer_id)
+        REFERENCES customers (account_id, id)
         ON DELETE RESTRICT
         ON UPDATE RESTRICT
 );
@@ -134,4 +134,4 @@ The recommended v1 workflow is **forward-only** (`up`) when you want expand/cont
 
 A dirty history row or a checksum mismatch stops `up` (exit 3 / 4). Run **one migrator per database**: the history primary key is the lock.
 
-The migrate user needs `CONNECT` + `CREATE` on the database, table DML on `nsql_schema_migrations`, and whatever the files themselves require. Cluster `ADMIN` is sufficient. `--tenant` issues `SET TENANT` after connect. History has no `tenant_id`; it is cluster-global.
+The migrate user needs `CONNECT` + `CREATE` on the database, table DML on `nsql_schema_migrations`, and whatever the files themselves require. Cluster `ADMIN` is sufficient. Migrations run only in the database selected by the connection; there is no row-tenant connection option.

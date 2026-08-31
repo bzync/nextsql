@@ -69,12 +69,22 @@ podman run -d --name nextsql \
   --secret nextsql-app-password,type=mount,target=/run/bootstrap/app-password \
   --secret nextsql-server-crt,type=mount,target=/run/tls/server.crt \
   --secret nextsql-server-key,type=mount,target=/run/tls/server.key \
-  -e NEXTSQL_USER=app \
-  -e NEXTSQL_PASSWORD_FILE=/run/bootstrap/app-password \
+  -e NEXTSQL_SERVER_USER=app \
+  -e NEXTSQL_SERVER_PASSWORD_FILE=/run/bootstrap/app-password \
   -e NEXTSQL_TLS_CERT=/run/tls/server.crt \
   -e NEXTSQL_TLS_KEY=/run/tls/server.key \
   nextsql:local
 ```
+
+To require service-certificate mTLS, mount the client CA bundle and set
+`NEXTSQL_TLS_CLIENT_CA` to its in-container path. Each client certificate must
+carry `nextsql://service/<principal>` matching its database user. Optionally
+mount a PEM CRL bundle and set `NEXTSQL_TLS_CLIENT_CRL`; it requires the client
+CA setting and fails closed on missing/stale chain coverage. After atomically
+replacing mounted TLS files, send `SIGHUP` to the container. Invalid reloads
+retain the last known-good snapshot; successful mTLS reloads disconnect all
+accepted connections, including in-progress handshakes. OCSP is not
+implemented.
 
 Use `podman logs -f nextsql`, `podman stop nextsql`, and `podman start nextsql`
 to operate the container. Remove the container with `podman rm nextsql`; only

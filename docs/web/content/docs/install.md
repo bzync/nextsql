@@ -58,6 +58,9 @@ A data directory is **not** a single file. After `nextsql init` and the first se
 
 ```text
 DATA-DIR/
+  nextsql.lock          advisory deployment/offline-migration lock
+  nextsql.instance      encrypted deployment/default realm/database registry
+  nextsql.instance.keys wrapped registry keys — never the registry root
   nextsql.db            encrypted pages (16 KiB logical)
   nextsql.db.keys       wrapped DEKs only — never the root unlock key
   nextsql.db.wal/       encrypted WAL control + segments
@@ -68,7 +71,20 @@ DATA-DIR/
   raft/                 present only when Raft HA is enabled
 ```
 
-The **root unlock key** is a separate `--key-file` (`NSKY`, mode `0600`). Keep it **off** the data volume. Stolen disks, snapshots, WAL, backups, vector trees, and full-text trees stay ciphertext without that file.
+The database **root unlock key** is a separate `--key-file` (`NSKY`, mode
+`0600`). Initialization also creates a deployment registry root at
+`--instance-key-file` (default `KEY-FILE.instance`). Keep both **off** the data
+volume. The registry foundation currently verifies one default database; it is
+not yet selectable multi-database hosting.
+
+Automated installs may place the corresponding file paths and logical names in
+a protected mode-`0600` host env file and run `nextsql init --env-file PATH`:
+`NEXTSQL_DATA_DIR`, `NEXTSQL_KEY_FILE`, `NEXTSQL_INSTANCE_KEY_FILE`,
+`NEXTSQL_REALM_NAME`, `NEXTSQL_DATABASE`, `NEXTSQL_SERVER_USER`, and
+`NEXTSQL_SERVER_PASSWORD_FILE` (preferred) or `NEXTSQL_SERVER_PASS`. These are
+server/bootstrap settings, not client login fallback. Key values are paths,
+not raw key bytes. Keep this host provisioning file out of application
+containers and source control.
 
 ## Drivers
 

@@ -8,6 +8,21 @@ func FuzzTokenize(f *testing.F) {
 		"database performance",
 		"CAFÉ",
 		`"noise cancelling"`,
+		"cat*",
+		"*cat",
+		"a*",
+		`"data* performance"`,
+		"*",
+		"cat~",
+		"cat~1",
+		"cat~2",
+		"cat~3",
+		"~cat",
+		"c~t",
+		`"databas~ performance"`,
+		"~",
+		"cat*~",
+		"cat~*",
 		"a\x00b",
 		string([]byte{0, 1, 255}),
 	} {
@@ -22,9 +37,23 @@ func FuzzTokenize(f *testing.F) {
 			if tok.Term == "" || len(tok.Term) > MaxTermRunes*4 {
 				t.Fatalf("%+v", tok)
 			}
+			if tok.Start < 0 || tok.End > len(s) || tok.Start > tok.End {
+				t.Fatalf("span %+v len=%d", tok, len(s))
+			}
+		}
+		if q, err := ParseQuery(s); err == nil {
+			_, _ = Highlight(s, q, Simple, DefaultHighlightPre, DefaultHighlightPost)
+			_, _ = Snippet(s, q, Simple, DefaultSnippetRunes, DefaultHighlightPre, DefaultHighlightPost)
 		}
 		_, _ = ParseQuery(s)
 		_, _ = Analyze(s)
+		_, _ = ParseQueryWith(s, EnglishV1)
+		_, _ = AnalyzeWith(s, EnglishV1)
+		_, _ = ParseQueryWith(s, EnglishV2)
+		_, _ = AnalyzeWith(s, EnglishV2)
+		_, _ = ParseQueryWith(s, EnglishV3)
+		_, _ = AnalyzeWith(s, EnglishV3)
+		_ = stemEnglish(s)
 	})
 }
 

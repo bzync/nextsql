@@ -1,5 +1,5 @@
 // Live driver check invoked by tests/integration/drivers_test.go.
-// Env: NEXTSQL_ADDR, NEXTSQL_CA, NEXTSQL_USER, NEXTSQL_PASSWORD
+// Env: NEXTSQL_ADDR, NEXTSQL_CA, NEXTSQL_DATABASE_USER, NEXTSQL_DATABASE_PASS
 
 import { connect } from './mod.js';
 
@@ -12,8 +12,8 @@ async function main() {
   const conn = await connect({
     address: addr,
     database: 'production',
-    user: Deno.env.get('NEXTSQL_USER') || 'app',
-    password: Deno.env.get('NEXTSQL_PASSWORD') || 's3cret',
+    user: Deno.env.get('NEXTSQL_DATABASE_USER') || 'app',
+    password: Deno.env.get('NEXTSQL_DATABASE_PASS') || 's3cret',
     tls: {
       ca: await Deno.readTextFile(caPath),
       servername: 'localhost',

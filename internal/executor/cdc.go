@@ -18,17 +18,6 @@ import (
 	"github.com/bzync/nextsql/internal/wal"
 )
 
-func rowTenant(tab *catalog.Table, row []types.Value) string {
-	if tab == nil || row == nil {
-		return ""
-	}
-	i, ok := tab.TenantCol()
-	if !ok || i < 0 || i >= len(row) || row[i].Null {
-		return ""
-	}
-	return row[i].String()
-}
-
 func (s *Session) stageRowChange(tab *catalog.Table, op wal.ChangeOperation, old, neu []types.Value) error {
 	if s == nil || s.x == nil || s.x.owner == nil || s.x.owner.Storage() == nil || tab == nil {
 		return nerr.New(nerr.Internal, "executor.stageRowChange", "active transaction and table are required")
@@ -51,14 +40,10 @@ func (s *Session) stageRowChange(tab *catalog.Table, op wal.ChangeOperation, old
 	switch op {
 	case wal.ChangeInsert:
 		change.Key = key
-		change.Tenant = rowTenant(tab, neu)
 	case wal.ChangeDelete:
 		change.Key = oldKey
-		change.Tenant = rowTenant(tab, old)
 	case wal.ChangeUpdate:
 		change.Key = key
-		change.Tenant = rowTenant(tab, neu)
-		change.OldTenant = rowTenant(tab, old)
 		if !bytes.Equal(oldKey, key) {
 			change.OldKey = oldKey
 		}
@@ -82,11 +67,11 @@ func (s *Session) stageRowChange(tab *catalog.Table, op wal.ChangeOperation, old
 	return s.x.owner.Storage().StageChange(change)
 }
 
-func (s *Session) stageEncodedChange(tab *catalog.Table, op wal.ChangeOperation, oldKey, key, before, after []byte, oldTenant, tenant string) error {
+func (s *Session) stageEncodedChange(tab *catalog.Table, op wal.ChangeOperation, oldKey, key, before, after []byte, _, _ string) error {
 	if s == nil || s.x == nil || s.x.owner == nil || s.x.owner.Storage() == nil || tab == nil {
 		return nerr.New(nerr.Internal, "executor.stageEncodedChange", "active transaction and table are required")
 	}
-	change := wal.Change{Operation: op, TableID: tab.ID, Table: tab.Name, Tenant: tenant}
+	change := wal.Change{Operation: op, TableID: tab.ID, Table: tab.Name}
 	switch op {
 	case wal.ChangeInsert:
 		change.Key = key
@@ -94,7 +79,6 @@ func (s *Session) stageEncodedChange(tab *catalog.Table, op wal.ChangeOperation,
 		change.Key = oldKey
 	case wal.ChangeUpdate:
 		change.Key = key
-		change.OldTenant = oldTenant
 		if !bytes.Equal(oldKey, key) {
 			change.OldKey = oldKey
 		}
@@ -129,11 +113,7 @@ func (s *Session) execSubscribe(parent context.Context, p planner.Subscribe) (*R
 	} else {
 		ctx, cancel = context.WithCancel(parent)
 	}
-	tenant := ""
-	if s.tenant != nil && !s.tenant.Null {
-		tenant = s.tenant.String()
-	}
-	filter := cdcstream.Filter{TableIDs: map[uint32]struct{}{p.Table.ID: {}}, Tenant: tenant}
+	filter := cdcstream.Filter{TableIDs: map[uint32]struct{}{p.Table.ID: {}}}
 	if p.Operation != "" {
 		filter.Operations = make(map[wal.ChangeOperation]struct{}, 1)
 		switch p.Operation {

@@ -272,49 +272,6 @@ func TestWorkflowInvokerRights(t *testing.T) {
 	}
 }
 
-func TestWorkflowTenantIsolation(t *testing.T) {
-	db := testDB(t)
-	acl, err := security.CreateACL(filepath.Join(t.TempDir(), "acl"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := acl.Grant("dba", security.PrivAdmin, security.ScopeCluster, ""); err != nil {
-		t.Fatal(err)
-	}
-	admin := db.Session()
-	admin.SetIdentity("dba")
-	admin.SetACL(acl)
-	execOK(t, admin, `CREATE TABLE jobs (id STRING PRIMARY KEY, tenant_id UUID NOT NULL, state STRING NOT NULL)`)
-	execOK(t, admin, `CREATE WORKFLOW put_job(id STRING) AS BEGIN INSERT INTO jobs (id, state) VALUES ($id, 'new'); END`)
-
-	for _, grant := range []struct {
-		priv  security.Privilege
-		scope security.ScopeKind
-		name  string
-	}{
-		{security.PrivExecute, security.ScopeFunction, "put_job"},
-		{security.PrivInsert, security.ScopeTable, "jobs"},
-	} {
-		if err := acl.Grant("app", grant.priv, grant.scope, grant.name); err != nil {
-			t.Fatal(err)
-		}
-	}
-	app := db.Session()
-	app.SetIdentity("app")
-	app.SetACL(acl)
-	if _, err := app.Exec(`RUN WORKFLOW put_job('unbound')`); !nerr.HasCode(err, nerr.Forbidden) {
-		t.Fatalf("unbound tenant workflow must fail closed: %v", err)
-	}
-	execOK(t, app, `SET TENANT = '`+tenantA+`'`)
-	execOK(t, app, `RUN WORKFLOW put_job('a')`)
-	execOK(t, app, `SET TENANT = '`+tenantB+`'`)
-	execOK(t, app, `RUN WORKFLOW put_job('b')`)
-	rows := execOK(t, admin, `SELECT id, tenant_id FROM jobs`).Rows
-	if len(rows) != 2 {
-		t.Fatalf("rows=%v", rows)
-	}
-}
-
 func TestWorkflowNestingLimit(t *testing.T) {
 	db := testDB(t)
 	s := db.Session()

@@ -14,6 +14,16 @@ LIMIT 20;
 
 `EXPLAIN` shows `Candidates` and `Rerank bm25+vector`. Operator order is not hard-coded. Run `ANALYZE` first so statistics exist.
 
+A second `NEAREST` clause fuses a dense `VECTOR` column with a `SPARSEVECTOR` column (optional `SEARCH`). Candidates from each retriever are unioned and reciprocal-rank fused. `EXPLAIN` shows `Rerank bm25+vector+sparse fusion` (or `vector+sparse fusion` without `SEARCH`). At most two `NEAREST` clauses; they must be one dense vector and one sparse vector.
+
+```sql
+SELECT id, title FROM documents
+SEARCH body FOR 'wireless headphones'
+NEAREST embedding TO $dense
+NEAREST sparse TO $sparse
+LIMIT 20;
+```
+
 `SEARCH` and `NEAREST` may be combined with `INNER JOIN` when the rank column belongs to the `FROM` table. The `FROM` table is ranked first, then joined. A rank column on a joined table is rejected. Outer join + `SEARCH` / `NEAREST` is not supported.
 
 Hybrid results are reciprocal-rank fused, then truncated to `LIMIT` (or re-sorted when `ORDER BY` is present).

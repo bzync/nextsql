@@ -35,6 +35,17 @@ func PostingBounds(term string) (start, end []byte) {
 	return start, end
 }
 
+// PostingPrefixBounds is the exclusive range covering every posting whose
+// term starts with prefix. An empty prefix covers every posting record
+// (used by fuzzy matching) and still excludes stats and doclen keys.
+func PostingPrefixBounds(prefix string) (start, end []byte) {
+	start = make([]byte, 1+len(prefix))
+	start[0] = kindPost
+	copy(start[1:], prefix)
+	end = types.PrefixEnd(start)
+	return start, end
+}
+
 // SplitPostingKey extracts term and primary-key bytes.
 func SplitPostingKey(k []byte) (term string, pk []byte, err error) {
 	if len(k) < 2 || k[0] != kindPost {

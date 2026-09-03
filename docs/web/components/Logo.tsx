@@ -1,9 +1,11 @@
+import Image from "next/image";
 import Link from "next/link";
+import { assetPath } from "@/lib/asset-path";
 
 export function Mark({ className = "h-[30px] w-[30px]" }: { className?: string }) {
   return (
-    <img
-      src="/icons/icon-192.png"
+    <Image
+      src={assetPath("/icons/icon-192.png")}
       alt=""
       width={30}
       height={30}

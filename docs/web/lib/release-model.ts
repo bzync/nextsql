@@ -1,3 +1,5 @@
+import { assetPath } from "@/lib/asset-path";
+
 export const PLATFORMS = [
   "linux-amd64",
   "linux-arm64",
@@ -97,7 +99,7 @@ function parseVersion(version: string): { nums: number[]; pre: string } {
 }
 
 export function artifactUrl(version: string, filename: string): string {
-  return `/downloads/${encodeURIComponent(version)}/${encodeURIComponent(filename)}`;
+  return assetPath(`/downloads/${encodeURIComponent(version)}/${encodeURIComponent(filename)}`);
 }
 
 export function formatBytes(size: number): string {

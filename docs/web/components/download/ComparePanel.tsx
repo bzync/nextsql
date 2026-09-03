@@ -9,7 +9,7 @@ import {
   changesBetween,
   groupChanges,
 } from "@/lib/release-model";
-import { Badge } from "@/components/ui/badge";
+import { Badge } from "@bzync/rui";
 
 const kindBadge: Record<ChangeKind, "success" | "info" | "warning" | "muted" | "error"> = {
   added: "success",

@@ -1,13 +1,11 @@
 import type { Metadata } from "next";
 import Link from "next/link";
-import { Badge } from "@/components/ui/badge";
 import { buttonClassName } from "@/components/ui/button";
+import { Badge } from "@bzync/rui";
 import { ComparePanel } from "@/components/download/ComparePanel";
 import { PlatformDownloads } from "@/components/download/PlatformDownloads";
 import { formatDate, latestRelease, listReleases } from "@/lib/releases";
 import { site } from "@/lib/site";
-
-export const dynamic = "force-dynamic";
 
 export const metadata: Metadata = {
   title: "Download",

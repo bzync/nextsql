@@ -1,15 +1,43 @@
 {
-  "name": "nextsql",
+  "name": "@bzync/nextsql",
   "version": "0.1.0",
   "description": "Official NextSQL Node.js driver. Keys never go in URLs.",
-  "license": "UNLICENSED",
+  "license": "MIT",
   "main": "nextsql.js",
   "types": "nextsql.d.ts",
   "type": "commonjs",
+  "files": [
+    "nextsql.js",
+    "nextsql.d.ts",
+    "client-encryption.js"
+  ],
   "engines": {
     "node": ">=18"
   },
   "scripts": {
     "test": "node --test nextsql.test.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bzync/nextsql.git",
+    "directory": "drivers/node"
+  },
+  "homepage": "https://nextsql.dev/docs/drivers",
+  "bugs": {
+    "url": "https://github.com/bzync/nextsql/issues"
+  },
+  "author": "Rayan Reynaldo (https://www.bzync.com)",
+  "keywords": [
+    "nextsql",
+    "database",
+    "sql",
+    "driver",
+    "client",
+    "encryption",
+    "vector",
+    "full-text-search"
+  ],
+  "publishConfig": {
+    "access": "public"
   }
 }

@@ -1,11 +1,14 @@
 import type { Metadata } from "next";
 import Link from "next/link";
 import { notFound } from "next/navigation";
-import { Badge } from "@/components/ui/badge";
+import { Badge } from "@bzync/rui";
 import { CHANGE_KINDS, changeKindLabel, formatDate, getRelease, groupChanges, listReleases } from "@/lib/releases";
 import { PlatformDownloads } from "@/components/download/PlatformDownloads";
 
-export const dynamic = "force-dynamic";
+export async function generateStaticParams() {
+  const releases = await listReleases();
+  return releases.map((release) => ({ version: release.version }));
+}
 
 export async function generateMetadata({ params }: { params: Promise<{ version: string }> }): Promise<Metadata> {
   const { version } = await params;

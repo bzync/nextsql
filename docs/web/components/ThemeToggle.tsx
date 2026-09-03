@@ -1,37 +1,30 @@
 "use client";
 
 import { useEffect } from "react";
-
-const STORAGE_KEY = "nextsql-theme";
-
-export function applyTheme(dark: boolean) {
-  document.documentElement.classList.toggle("dark", dark);
-  const meta = document.querySelector('meta[name="theme-color"]');
-  if (meta) meta.setAttribute("content", dark ? "#040912" : "#f8fafc");
-  try {
-    localStorage.setItem(STORAGE_KEY, dark ? "dark" : "light");
-  } catch {
-    /* ignore quota / private mode */
-  }
-}
+import { useTheme } from "@bzync/rui";
 
 export function ThemeToggle({ className = "" }: { className?: string }) {
+  const { resolvedTheme, setTheme } = useTheme();
+
   useEffect(() => {
     const requested = new URLSearchParams(window.location.search).get("theme");
     if (requested === "light" || requested === "dark") {
-      applyTheme(requested === "dark");
+      setTheme(requested);
     }
+    // Only ever apply the query override once, on mount.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  const isDark = resolvedTheme === "dark";
 
   return (
     <button
       type="button"
       className={`relative inline-flex h-10 w-10 items-center justify-center rounded-lg text-slate-600 transition-colors hover:bg-bg-hover hover:text-foreground sm:h-9 sm:w-9 dark:text-slate-400 ${className}`}
       aria-label="Toggle theme"
+      aria-pressed={isDark}
       title="Toggle theme"
-      onClick={() => {
-        applyTheme(!document.documentElement.classList.contains("dark"));
-      }}
+      onClick={() => setTheme(isDark ? "light" : "dark")}
     >
       <SunIcon className="hidden dark:block" />
       <MoonIcon className="block dark:hidden" />

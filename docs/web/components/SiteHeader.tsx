@@ -6,7 +6,7 @@ import { useEffect, useState } from "react";
 import { Logo } from "./Logo";
 import { ThemeToggle } from "./ThemeToggle";
 import { buttonClassName } from "@/components/ui/button";
-import { Kbd } from "@/components/ui/kbd";
+import { Kbd } from "@bzync/rui";
 
 export function SiteHeader({
   onSearch,
@@ -86,7 +86,7 @@ export function SiteHeader({
                 className="ml-1 hidden h-8 items-center gap-2 rounded-lg border border-slate-300/80 bg-white px-2.5 text-[12px] text-slate-600 transition-all hover:border-slate-400/80 hover:text-slate-900 dark:border-white/[0.09] dark:bg-white/[0.045] dark:text-slate-400 dark:hover:border-white/[0.16] dark:hover:text-slate-200 sm:inline-flex"
               >
                 Search
-                <Kbd>/</Kbd>
+                <Kbd keys="/" />
               </button>
             </>
           ) : null}

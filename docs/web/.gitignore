@@ -2,4 +2,5 @@
 !/public/downloads/.gitkeep
 .env*.local
 .next
+out
 node_modules

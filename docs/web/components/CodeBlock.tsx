@@ -1,7 +1,7 @@
 "use client";
 
 import { HighlightCode } from "@/lib/highlight";
-import { CopyButton } from "@/components/ui/copy-button";
+import { CopyButton } from "@bzync/rui";
 
 export function CodeBlock({
   code,
@@ -18,7 +18,11 @@ export function CodeBlock({
         <span className="font-mono text-xs text-slate-400">
           {title || lang || "code"}
         </span>
-        <CopyButton value={code} tone="onDark" />
+        <CopyButton
+          value={code}
+          label="Copy"
+          className="border-transparent bg-transparent text-slate-400 hover:bg-white/10 hover:text-white"
+        />
       </div>
       <pre className="overflow-x-auto overscroll-x-contain p-4 text-[12.5px] leading-6 text-code-fg [-webkit-overflow-scrolling:touch] sm:px-5 sm:text-[13px]">
         <code>

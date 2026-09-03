@@ -138,7 +138,7 @@ function Sidebar({
                     className={cn(
                       "group relative flex min-h-11 items-center rounded-lg px-3 text-[14px] leading-none transition-all duration-150 lg:h-9 lg:min-h-0 lg:text-[13px]",
                       active
-                        ? "border border-blue-200/80 bg-blue-50 font-semibold text-blue-700 dark:border-blue-400/[0.16] dark:bg-blue-500/[0.13] dark:text-blue-300 dark:shadow-[inset_0_1px_0_rgba(255,255,255,0.055)]"
+                        ? "border border-blue-200/80 bg-blue-50 font-semibold text-blue-700 dark:border-blue-400/[0.16] dark:bg-blue-500/[0.13] dark:text-blue-300"
                         : "text-slate-600 hover:bg-black/[0.04] hover:text-slate-900 dark:text-slate-400 dark:hover:bg-white/[0.055] dark:hover:text-slate-100",
                     )}
                   >

@@ -1,7 +1,9 @@
 import type { Metadata, Viewport } from "next";
 import { Geist_Mono, Manrope, Syne } from "next/font/google";
+import "@bzync/rui/styles.css";
 import "./globals.css";
 import { site } from "@/lib/site";
+import { SiteThemeProvider } from "@/components/SiteThemeProvider";
 
 const manrope = Manrope({
   variable: "--font-geist",
@@ -22,7 +24,7 @@ const syne = Syne({
   display: "swap",
 });
 
-const themeScript = `(function(){try{var q=new URLSearchParams(location.search).get("theme");var t=q||localStorage.getItem("nextsql-theme");var d=t!=="light";document.documentElement.classList.toggle("dark",d);var m=document.querySelector('meta[name="theme-color"]');if(m)m.setAttribute("content",d?"#040912":"#f8fafc");}catch(e){document.documentElement.classList.add("dark");}})();`;
+const themeScript = `(function(){try{var q=new URLSearchParams(location.search).get("theme");var t=q||localStorage.getItem("nextsql-theme");var d=t!=="light";var root=document.documentElement;root.classList.toggle("dark",d);root.classList.add("rui-theme","rtui-theme");root.dataset.theme=d?"dark":"light";var m=document.querySelector('meta[name="theme-color"]');if(m)m.setAttribute("content",d?"#040912":"#f8fafc");}catch(e){document.documentElement.classList.add("dark");}})();`;
 
 export const viewport: Viewport = {
   themeColor: "#040912",
@@ -72,7 +74,7 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
         <a href="#content" className="skip-link">
           Skip to content
         </a>
-        {children}
+        <SiteThemeProvider>{children}</SiteThemeProvider>
       </body>
     </html>
   );

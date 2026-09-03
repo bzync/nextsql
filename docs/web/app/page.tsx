@@ -2,10 +2,8 @@ import Link from "next/link";
 import { SearchHeader } from "@/components/SearchHeader";
 import { SiteFooter } from "@/components/SiteFooter";
 import { CodePanel, HYBRID_SQL } from "@/components/landing/CodePanel";
-import { Badge } from "@/components/ui/badge";
 import { buttonClassName } from "@/components/ui/button";
-import { Card } from "@/components/ui/card";
-import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+import { Badge, Card, Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@bzync/rui";
 
 const specs = [
   { k: "Crypto", v: "AES-256-GCM envelope" },
@@ -428,7 +426,8 @@ function Status() {
     <section>
       <div className="mx-auto max-w-6xl px-4 py-12 sm:px-5 sm:py-16 lg:py-20">
         <Card variant="elevated" className="border-blue-500/20 px-5 py-10 sm:px-10 sm:py-12">
-          <Badge variant="info" dot pulse>
+          <Badge variant="info">
+            <span className="h-1.5 w-1.5 shrink-0 animate-pulse rounded-full bg-current" />
             Engine complete
           </Badge>
           <h2 className="mt-5 max-w-2xl text-[1.85rem] font-bold tracking-[-0.035em] sm:text-[2.15rem]">

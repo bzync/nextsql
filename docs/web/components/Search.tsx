@@ -3,7 +3,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 import { allDocs } from "@/lib/nav";
-import { Kbd } from "@/components/ui/kbd";
+import { Kbd } from "@bzync/rui";
 
 export function SearchDialog({
   open,
@@ -100,7 +100,7 @@ export function SearchDialog({
             Close
           </button>
           <span className="hidden sm:inline-flex">
-            <Kbd>ESC</Kbd>
+            <Kbd keys="ESC" />
           </span>
         </div>
         <ul className="max-h-none flex-1 overflow-auto p-1.5 sm:max-h-80">

@@ -1,6 +1,7 @@
 # NextSQL website
 
-Landing page, documentation, versioned downloads, and a release admin for NextSQL.
+Landing page, documentation, and versioned downloads for NextSQL. Pure static
+site — no server, no admin console.
 
 ```bash
 cd docs/web
@@ -13,25 +14,25 @@ Open [http://localhost:3000](http://localhost:3000).
 | Path | What |
 |---|---|
 | `/docs` | Documentation |
-| `/download` | Published binaries, checksums, and version comparison |
-| `/admin` | Password-protected release admin |
+| `/download` | Release history, checksums, and version comparison (read-only) |
 
 ```bash
-npm run build
-npm start
+npm run build   # emits static HTML into out/
+npm start       # serves out/ locally for a production preview
 ```
 
-The site is a Next.js server (`next start`), not a static export, so the admin can accept binary uploads.
+Deployed to GitHub Pages by `.github/workflows/docs-pages.yml` on every push to
+`master` that touches `docs/web/**` or `content/docs/**`.
 
-## Admin
+## Publishing a release
 
-Set `NEXTSQL_ADMIN_PASSWORD` (8+ characters) in `.env.local`. In development, if it is unset, the password is `nextsql-admin`.
+There's no admin UI — releases are data, edited directly:
 
-1. Sign in at `/admin/login`
-2. Create a version with highlights and a changelog (added / changed / fixed / removed / breaking)
-3. Upload `nextsql`, `nextsqld`, `nextsql-bench`, or an archive per platform
-4. Publish. The release appears on `/download` and can be compared with earlier versions
-
-Catalog: `data/releases.json`. Binaries: `public/downloads/<version>/`.
+1. Add or edit the version's entry in `data/releases.json` (highlights, changelog,
+   artifact metadata) and commit it.
+2. Place the actual binaries under `public/downloads/<version>/` before running
+   `npm run build`. That directory is gitignored — CI needs its own step (or a
+   separate release pipeline) to fetch/stage the right binaries there before the
+   static build runs; nothing does this automatically today.
 
 Markdown pages are in `content/docs/`; navigation is `lib/nav.ts`.

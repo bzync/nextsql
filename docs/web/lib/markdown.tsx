@@ -1,8 +1,7 @@
 import type { ReactNode } from "react";
 import Link from "next/link";
 import { CodeBlock } from "@/components/CodeBlock";
-import { Callout } from "@/components/ui/callout";
-import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+import { Callout, Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@bzync/rui";
 
 type Block =
   | { type: "heading"; level: 1 | 2 | 3 | 4; text: string; id: string }

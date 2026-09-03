@@ -1,17 +1,21 @@
 # Proposed External Identity Provider (OIDC) Integration
 
-> Status: **ACCEPTED DESIGN — PARTIALLY IMPLEMENTED (`NSIP` policy engine +
-> authentication broker); NOT PRODUCTION-GATED**
+> Status: **ACCEPTED DESIGN — REQUIRED OIDC SURFACE IMPLEMENTED (`NSIP` policy
+> engine + standalone/embedded broker + interactive/client-credentials CLI +
+> server audit labeling); NOT
+> PRODUCTION-GATED**
 >
 > This document is a design and delivery plan for Phase 25's "External IdP"
 > checklist group. `TODO.md` remains authoritative for implementation status and
-> sequencing. As of 2026-08-31 the offline `NSIP` identity-policy engine
-> (§6, `internal/auth/identitypolicy.go`) and the authentication broker
-> (§5, `cmd/nextsql-auth-broker`, `internal/oidc`, `internal/authbroker`) are
-> implemented and tested: the broker's `POST /v1/exchange` validates an OIDC ID
-> token against a cached JWKS, maps it through the `NSIP` policy, and mints an
-> `NSSC1.` credential. There is no `nextsql login` client flow yet, no `oidc`
-> audit `identity_source`, and no client-credentials / embedded / JIT support;
+> sequencing. As of 2026-09-01 the offline `NSIP` identity-policy engine
+> (§6, `internal/auth/identitypolicy.go`), authentication broker (§5,
+> `cmd/nextsql-auth-broker`, `internal/oidc`, `internal/authbroker`), and
+> interactive and client-credentials clients (`internal/oidcclient`, `nextsql
+> login`) are implemented and tested. The CLI obtains and refreshes the
+> broker-minted `NSSC1.` credential and supplies it through `--idp`. Server
+> audit labeling is key-derived and implemented (§8). Embedded broker mode is
+> implemented for non-HA deployments. There is no opaque-token introspection or
+> JIT support; both remain optional and off by default;
 > the server does not accept an OIDC identity in any form (it only ever sees the
 > minted `NSSC1.` credential).
 
@@ -199,8 +203,9 @@ a future requirement (e.g. "absolutely no additional process") demands it.
 5. Broker validates the ID token (§5.5), applies the mapping policy (§6), and
    mints an `NSSC1.` credential (§5.6).
 6. Broker returns `{ credential, principal, roles, expires_at }`. CLI stores it
-   in the OS keychain / `0600` file under `~/.config/nextsql/credentials/` keyed
-   by host+principal, and uses it as the password for subsequent connections
+   in a `0600` file under `~/.config/nextsql/credentials/`, keyed by a
+   collision-resistant hash of IdP profile + server host (the record binds the
+   returned principal), and uses it as the password for subsequent connections
    until `expires_at`.
 7. On expiry the CLI silently re-runs the flow if a cached IdP refresh token is
    still valid, otherwise prompts for interactive re-login.
@@ -211,14 +216,29 @@ long-lived secret on the client.
 
 ### 5.3 Client-credentials flow (workloads)
 
-`nextsql login --idp corp --client-credentials --client-secret-file S` (or a
-private-key-JWT client assertion) obtains an `access_token` directly from the
+`nextsql login --idp corp --client-credentials --client-secret-file S` obtains
+an `access_token` directly from the
 IdP and exchanges it at `broker_url/v1/exchange` with `{ access_token }`. The
 broker validates it as an access token (introspection endpoint per RFC 7662, or
 JWT validation if the IdP issues JWT access tokens) and maps its `sub` /
 `client_id` and any roles/groups claim the same way. Recommended for workloads
 that lack an mTLS identity; mTLS + `nextsql token mint` remains the first-choice
 machine path.
+
+**Implemented JWT path (2026-08-31):** `nextsql login --client-credentials`
+performs exact-issuer discovery, authenticates to the discovered HTTPS token
+endpoint with the client id/secret, requires a Bearer access token, and sends
+only that token to the broker. `access_token_audience` explicitly enables the
+path per broker profile. The broker requires an asymmetric JWT signature, exact
+issuer, configured resource audience, expiry/time validity, non-empty `sub`,
+and an exact `client_id` or `azp` binding to the profile's configured client id.
+The access token uses the same bounded JWKS cache, replay guard, `NSIP` mapping,
+RBAC narrowing, and credential TTL clamp as ID tokens. The secret is read from
+a bounded regular mode-`0600` file, never sent to the broker or stored in the
+credential record, and is reused for automatic non-interactive renewal.
+Opaque access tokens and RFC 7662 introspection remain unimplemented.
+Private-key JWT client assertions also remain a follow-on; the implemented
+confidential-client method is a client secret read from a protected file.
 
 ### 5.4 Embedded broker mode
 
@@ -228,6 +248,20 @@ handler, still no OIDC on the SQL listener). It uses the same `NSIP` policy file
 and an `NSTK` issuing key held in the data directory. This keeps small
 deployments to one process while preserving the "SQL path stays offline"
 property. HA deployments run the standalone `cmd/nextsql-auth-broker`.
+
+**Implemented (2026-09-01).** `nextsqld --auth-broker-listen ADDR` enables this
+mode; `--auth-broker-config FILE` selects the same configuration accepted by
+the standalone command, defaulting to
+`DATA-DIR/nextsql-auth-broker.conf`. The listener has its own address,
+TLS certificate/key, HTTP timeouts, and graceful lifecycle; a non-loopback
+address requires TLS. Embedded mode is rejected when Raft is enabled. Startup
+fails unless `token_verify_keyset` accepts a probe signed by the configured
+private broker key, and `SIGHUP` reloads the verifier before publishing a new
+issuer key, with a pre-publication compatibility check. The broker reads the
+live native user store and direct/transitive ACL role memberships on every
+exchange; a missing user or empty mapped∩held set denies immediately. The SQL
+listener, authentication frames, and offline `NSSC1.` verification path remain
+unchanged.
 
 ### 5.5 ID-token validation (in the broker)
 
@@ -300,11 +334,12 @@ Loaded by the broker.
 all bounds), `IdentityPolicy.Map` (subject match → principal → group→role),
 `IdentityPolicy.Authorize` (Map + RBAC intersection), `IntersectRoles`,
 `Reload` last-known-good, `FuzzDecodeIdentityPolicy`, `FuzzMapClaims`. The
-broker (increment 3) now consumes it via `IdentityPolicy.Map`; the automatic
-`security.ACL` membership feed for `Authorize`'s `held` argument is a later
-increment (the broker accepts an optional `RoleMembershipFunc` hook today, and
-the server's `ACL.AllowedScoped` enforces no-escalation on every statement
-independently of the broker).
+broker consumes it via `IdentityPolicy.Map` and an optional
+`RoleMembershipFunc`. Embedded mode wires that hook to the live `auth.Store`
+and direct/transitive `security.ACL` membership. Standalone deployments may
+supply their own feed; the server's `ACL.AllowedScoped` remains the
+authoritative no-escalation check on every statement independently of the
+broker.
 
 ### 6.1 Subject → principal
 
@@ -379,7 +414,7 @@ skew                  = 120s
 [idp "corp"]
 issuer                = https://corp.okta.com/oauth2/abc
 client_id             = 0oa...
-client_secret_file    = /etc/nextsql/corp-client-secret   # code flow (confidential client) / CC flow
+access_token_audience = api://nextsql-broker              # broker; enables JWT CC exchange
 allowed_algs          = RS256,ES256
 jwks_soft_ttl         = 1h
 jwks_hard_ttl         = 24h
@@ -392,16 +427,35 @@ group_claim           = groups
 [idp.corp]
 issuer     = "https://corp.okta.com/oauth2/abc"
 client_id  = "0oa..."
+client_secret_file = "/run/secrets/nextsql-oidc-client" # confidential clients only
 broker_url = "https://auth.db.internal"
 scopes     = ["openid", "profile", "email", "groups"]
 ```
 
 ### 7.3 `nextsqld` (data plane)
 
-Only the already-existing short-lived-credential keys. The broker's public
-issuing key is added to `token_verify_keyset`. Optionally a new
+The SQL data plane uses only the already-existing short-lived-credential keys.
+The broker's public issuing key is added to `token_verify_keyset`. Optionally a
 `token_identity_source_hint` map (§8) to label broker-issued credentials as
 `oidc` in the audit log; if unset they simply audit as `token`.
+
+```text
+token_verify_keyset        = /etc/nextsql/token.keyset.pub
+token_identity_source_hint = 7:oidc,9:oidc
+auth_broker_config         = /etc/nextsql/auth-broker.conf # embedded only
+auth_broker_listen         = 127.0.0.1:8645                # embedded only
+```
+
+The two `auth_broker_*` keys control only the separate embedded HTTP(S)
+listener and are absent for a standalone deployment; they do not add OIDC to
+the NSQL listener or authentication frames.
+
+Each key id is relative to that verify keyset. The map is bounded to 64 entries
+and accepts only the closed value `oidc`; zero, duplicate, malformed, or unknown
+values fail configuration loading. Broker rotation should publish the new
+public key, update this map, and restart/roll the servers before the broker
+begins issuing with it. `SIGHUP` reloads the keyset but does not reread the
+inline server configuration map.
 
 ## 8. Audit
 
@@ -415,12 +469,15 @@ issuing key is added to `token_verify_keyset`. Optionally a new
   - `oidc` — broker-issued credential, no client cert;
   - `mtls+oidc` — broker-issued credential presented on an mTLS connection.
 
-  The server distinguishes an OIDC-origin `NSSC1.` from a hand-minted one via an
-  optional `source` marker in the claims (new optional claim field, backward
-  compatible: absent ⇒ `token`) set by the broker, cross-checked against the
-  `token_identity_source_hint` for that `KeyID`. A minted credential cannot
-  upgrade its own label; the label is a function of the verifying key, not of
-  attacker-controlled bytes.
+  The server distinguishes an OIDC-origin `NSSC1.` from a hand-minted one via
+  `token_identity_source_hint` for the credential's authenticated `KeyID`. The
+  implementation deliberately does not add or trust a source claim: the label
+  is selected only after the Ed25519 signature verifies under the configured
+  key. A malformed token, invalid signature, unknown key, or unknown hint value
+  stays `token` / `mtls+token`; client bytes cannot upgrade the label. This also
+  avoids a credential-format or NSQL wire change. Operators must dedicate every
+  hinted key id to broker issuance, because all valid credentials signed by that
+  authority are labeled OIDC.
 - The broker↔`nextsqld` correlation id (minted token id) lets an operator join
   the two logs.
 
@@ -461,15 +518,28 @@ Each increment is independently shippable and testable. Checkboxes mirror
    mint via `NSTK`. Integration test with a fake IdP (self-signed JWKS + issued
    JWTs) and a real `TokenVerifier`. *(done, 2026-08-31 — `internal/oidc`,
    `internal/authbroker`; the RBAC-membership feed for `Authorize`'s `held`
-   argument is an optional hook, wired in a later increment; the server's
-   `ACL.AllowedScoped` still enforces no-escalation on every statement.)*
+   argument is an optional hook, now wired to the live ACL in embedded mode;
+   the server's `ACL.AllowedScoped` still enforces no-escalation on every
+   statement.)*
 4. **CLI `nextsql login`** — discovery, PKCE code flow, local callback, exchange,
    secure credential storage, silent refresh, `nextsql logout`, `nextsql whoami`.
-5. **Server audit labeling** — optional `source` claim + `token_identity_source_hint`,
-   `identity_source` `oidc` / `mtls+oidc`, `auditAuth` plumbing, redaction test.
-6. **Client-credentials grant** + optional JWT access-token / introspection.
-7. **Embedded broker mode** (`nextsqld --auth-broker-listen`).
-8. **Optional JIT provisioning**, off by default, behind its own gate.
+   *(done, 2026-08-31 — fake IdP → PKCE client → broker → real
+   `TokenVerifier`; targeted functional/race and adversarial redirect,
+   callback-state/concurrency, response-bound, and store-safety tests green.)*
+5. **Server audit labeling** — bounded `token_identity_source_hint`,
+   key-derived `identity_source` `oidc` / `mtls+oidc`, `auditAuth` plumbing,
+   redaction and forged-key-id tests. *(done, 2026-08-31 — no claim or wire
+   change; a hint is consulted only after signature verification.)*
+6. **Client-credentials grant** — JWT access-token validation and CLI flow are
+   done (2026-08-31); opaque access-token / RFC 7662 introspection remains an
+   optional follow-on.
+7. **Embedded broker mode** (`nextsqld --auth-broker-listen`). *(done,
+   2026-09-01 — same bounded HTTP(S) runtime and handler as standalone,
+   separate listener, single-node gate, issuer/verifier compatibility checks,
+   verifier-before-issuer reload, live native-user/ACL role feed.)*
+8. **Optional JIT provisioning**, off by default, behind its own gate. Not
+   justified for the core P25 gate: it adds a privileged user/role mutation
+   path and pre-created native principals already satisfy the accepted model.
 9. **P25 doc + audit update**: flip `docs/security.md` OIDC rows to
    `implemented` / `tested` as each lands; `ENCRYPTED CLIENT` and password
    hashing are separate P25 groups.
@@ -513,8 +583,10 @@ increment 4, like the existing short-lived-credential helper follow-on.
   should the broker pick the realm from a claim, or only from the client's
   requested target? Leaning: client requests target, policy may *constrain*
   which realms an issuer may mint for.
-- **Refresh-token custody**: OS keychain vs encrypted file — support both,
-  keychain preferred where available.
+- **Refresh-token custody**: the implemented portable baseline is an atomic
+  mode-`0600` file inside a real mode-`0700` directory. OS-keychain backends
+  remain a follow-on; secrets must never appear outside an equivalently
+  protected store.
 - **Studio**: the browser-based Studio (P29) will use the same broker
   `/v1/exchange` with a browser-side PKCE flow; no separate design needed, but
   CORS + a stricter `redirect_uri` allowlist on the broker will be required.

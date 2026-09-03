@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
@@ -9,15 +11,66 @@ import (
 	"testing"
 	"time"
 
+	nextsql "github.com/bzync/nextsql/drivers/go"
 	"github.com/bzync/nextsql/internal/auth"
+	"github.com/bzync/nextsql/internal/backup"
 	"github.com/bzync/nextsql/internal/cli"
 	"github.com/bzync/nextsql/internal/config"
 	"github.com/bzync/nextsql/internal/crypto"
 	"github.com/bzync/nextsql/internal/executor"
 	"github.com/bzync/nextsql/internal/hosting"
 	"github.com/bzync/nextsql/internal/nerr"
+	"github.com/bzync/nextsql/internal/sql/types"
 	"github.com/bzync/nextsql/internal/storage/format"
 )
+
+func TestPrintJSONResultTo(t *testing.T) {
+	res := &nextsql.Result{
+		Columns: []string{"result"},
+		Rows:    [][]types.Value{{types.TextValue("drain_initiated")}},
+	}
+	var buf bytes.Buffer
+	printJSONResultTo(&buf, res)
+
+	var got struct {
+		Columns  []string   `json:"columns"`
+		Rows     [][]string `json:"rows"`
+		Affected int64      `json:"affected"`
+	}
+	if err := json.Unmarshal(buf.Bytes(), &got); err != nil {
+		t.Fatalf("invalid JSON: %v\noutput: %s", err, buf.String())
+	}
+	if len(got.Columns) != 1 || got.Columns[0] != "result" {
+		t.Fatalf("columns=%+v", got.Columns)
+	}
+	if len(got.Rows) != 1 || len(got.Rows[0]) != 1 || got.Rows[0][0] != "drain_initiated" {
+		t.Fatalf("rows=%+v", got.Rows)
+	}
+	if got.Affected != 0 {
+		t.Fatalf("affected=%d", got.Affected)
+	}
+}
+
+func TestPrintJSONResultToAffectedRows(t *testing.T) {
+	res := &nextsql.Result{Affected: 3}
+	var buf bytes.Buffer
+	printJSONResultTo(&buf, res)
+
+	var got struct {
+		Columns  []string `json:"columns"`
+		Rows     []any    `json:"rows"`
+		Affected int64    `json:"affected"`
+	}
+	if err := json.Unmarshal(buf.Bytes(), &got); err != nil {
+		t.Fatalf("invalid JSON: %v\noutput: %s", err, buf.String())
+	}
+	if got.Affected != 3 {
+		t.Fatalf("affected=%d", got.Affected)
+	}
+	if len(got.Columns) != 0 || len(got.Rows) != 0 {
+		t.Fatalf("expected no columns/rows for a DML result, got %+v / %+v", got.Columns, got.Rows)
+	}
+}
 
 func TestInitBootstrapsDeploymentRegistry(t *testing.T) {
 	dir := t.TempDir()
@@ -56,6 +109,142 @@ func TestInitBootstrapsDeploymentRegistry(t *testing.T) {
 	if err := initDB(args); !nerr.HasCode(err, nerr.AlreadyExists) {
 		t.Fatalf("second init: %v", err)
 	}
+}
+
+func TestInitFromManifestBootstrapsEveryRealm(t *testing.T) {
+	dir := t.TempDir()
+	secrets := t.TempDir()
+	instanceKeyFile := filepath.Join(secrets, "instance.key")
+	// keyB pre-exists; keyA and keyC are created by init from the manifest.
+	createRootKeyFile(t, filepath.Join(secrets, "b.key"))
+	manifest := filepath.Join(t.TempDir(), "hosting.yaml")
+	if err := os.WriteFile(manifest, []byte(`version: 1
+default:
+  realm: Customer-A
+  database: Production
+realms:
+  - name: Customer-A
+    databases:
+      - {name: Production, key_file: `+filepath.Join(secrets, "a.key")+`}
+  - name: Customer-B
+    databases:
+      - {name: Analytics, key_file: `+filepath.Join(secrets, "b.key")+`}
+      - {name: Reporting, key_file: `+filepath.Join(secrets, "c.key")+`}
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	args := []string{
+		"--data-dir", dir,
+		"--instance-key-file", instanceKeyFile,
+		"--hosting-manifest", manifest,
+		"--user", "admin",
+		"--password-file", writeTempFile(t, "s3cret-pass"),
+		"--buffer-pages", "8",
+	}
+	if err := initDB(args); err != nil {
+		t.Fatal(err)
+	}
+
+	root, err := crypto.ReadKeyFile(instanceKeyFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reg, err := hosting.Open(hosting.Path(dir), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reg.Close()
+	m := reg.Manifest()
+	seen := map[string]hosting.State{}
+	for _, realm := range m.Realms {
+		for _, db := range realm.Databases {
+			seen[realm.Name+"/"+db.Name] = db.State
+			if db.State != hosting.StateActive {
+				t.Fatalf("%s/%s not active: %v", realm.Name, db.Name, db.State)
+			}
+			if _, err := os.Stat(hosting.ManagedDatabasePath(dir, realm.ID, db.ID)); err != nil {
+				t.Fatalf("managed database file missing for %s/%s: %v", realm.Name, db.Name, err)
+			}
+		}
+	}
+	for _, want := range []string{"customer-a/production", "customer-b/analytics", "customer-b/reporting"} {
+		if _, ok := seen[want]; !ok {
+			t.Fatalf("manifest realm/database %q not registered; got %v", want, seen)
+		}
+	}
+	dr, dd, err := reg.Default()
+	if err != nil || dr.Name != "customer-a" || dd.Name != "production" {
+		t.Fatalf("default realm/database = %s/%s err=%v", dr.Name, dd.Name, err)
+	}
+
+	// The deployment-wide bootstrap user was created.
+	store, err := auth.OpenOrCreate(filepath.Join(dir, config.AuthFileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Verify("admin", "s3cret-pass"); err != nil {
+		t.Fatalf("bootstrap user not usable: %v", err)
+	}
+
+	// Idempotent reapply: a second run with the same manifest is a no-op.
+	if err := initDB(args); err != nil {
+		t.Fatalf("reapply: %v", err)
+	}
+}
+
+func TestInitFromManifestViaEnvVar(t *testing.T) {
+	dir := t.TempDir()
+	secrets := t.TempDir()
+	manifest := filepath.Join(t.TempDir(), "hosting.yaml")
+	if err := os.WriteFile(manifest, []byte(`version: 1
+default: {realm: only, database: main}
+realms:
+  - name: only
+    databases:
+      - {name: main, key_file: `+filepath.Join(secrets, "main.key")+`}
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("NEXTSQL_HOSTING_MANIFEST_FILE", manifest)
+	if err := initDB([]string{
+		"--data-dir", dir,
+		"--instance-key-file", filepath.Join(secrets, "instance.key"),
+		"--no-env",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	root, err := crypto.ReadKeyFile(filepath.Join(secrets, "instance.key"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	reg, err := hosting.Open(hosting.Path(dir), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reg.Close()
+	realm, db, err := reg.Default()
+	if err != nil || realm.Name != "only" || db.Name != "main" || db.State != hosting.StateActive {
+		t.Fatalf("env-var manifest bootstrap: realm=%+v db=%+v err=%v", realm, db, err)
+	}
+}
+
+func createRootKeyFile(t *testing.T, path string) {
+	t.Helper()
+	root, err := crypto.CreateKeyFile(path, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root.Zero()
+}
+
+func writeTempFile(t *testing.T, body string) string {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), "f")
+	if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return p
 }
 
 func TestInitResolvesHostingFromDotenv(t *testing.T) {
@@ -706,6 +895,58 @@ func TestStatusServerRequiresUser(t *testing.T) {
 	}
 }
 
+func TestClusterTransferLeaderRequiresUser(t *testing.T) {
+	t.Setenv("NEXTSQL_DATABASE_USER", "")
+	t.Setenv("NEXTSQL_DATABASE_PASS", "")
+	t.Setenv("NEXTSQL_DATABASE_PASSWORD_FILE", "")
+	err := clusterCmd([]string{"transfer-leader", "--no-env", "--insecure"})
+	if !nerr.HasCode(err, nerr.InvalidArgument) {
+		t.Fatalf("%v", err)
+	}
+	if cli.Code(err) != cli.ExitUsage {
+		t.Fatalf("code %d", cli.Code(err))
+	}
+}
+
+func TestClusterDrainRequiresUser(t *testing.T) {
+	t.Setenv("NEXTSQL_DATABASE_USER", "")
+	t.Setenv("NEXTSQL_DATABASE_PASS", "")
+	t.Setenv("NEXTSQL_DATABASE_PASSWORD_FILE", "")
+	err := clusterCmd([]string{"drain", "--no-env", "--insecure"})
+	if !nerr.HasCode(err, nerr.InvalidArgument) {
+		t.Fatalf("%v", err)
+	}
+	if cli.Code(err) != cli.ExitUsage {
+		t.Fatalf("code %d", cli.Code(err))
+	}
+}
+
+func TestClusterMaintenanceRequiresUser(t *testing.T) {
+	t.Setenv("NEXTSQL_DATABASE_USER", "")
+	t.Setenv("NEXTSQL_DATABASE_PASS", "")
+	t.Setenv("NEXTSQL_DATABASE_PASSWORD_FILE", "")
+	for _, verb := range []string{"enable", "disable"} {
+		err := clusterCmd([]string{"maintenance", verb, "--no-env", "--insecure"})
+		if !nerr.HasCode(err, nerr.InvalidArgument) {
+			t.Fatalf("%s: %v", verb, err)
+		}
+		if cli.Code(err) != cli.ExitUsage {
+			t.Fatalf("%s: code %d", verb, cli.Code(err))
+		}
+	}
+}
+
+func TestClusterMaintenanceRejectsUnknownVerb(t *testing.T) {
+	err := clusterCmd([]string{"maintenance", "bogus"})
+	if !nerr.HasCode(err, nerr.InvalidArgument) {
+		t.Fatalf("%v", err)
+	}
+	err = clusterCmd([]string{"maintenance"})
+	if !nerr.HasCode(err, nerr.InvalidArgument) {
+		t.Fatalf("%v", err)
+	}
+}
+
 func TestLocalCommandsMissingDataDirExit7(t *testing.T) {
 	cases := []struct {
 		name string
@@ -722,6 +963,105 @@ func TestLocalCommandsMissingDataDirExit7(t *testing.T) {
 		if cli.Code(err) != cli.ExitLocal {
 			t.Errorf("%s: Code(%v)=%d want %d", tc.name, err, cli.Code(err), cli.ExitLocal)
 		}
+	}
+}
+
+func TestBackupListRequiresBaseDir(t *testing.T) {
+	err := backupList(nil)
+	if cli.Code(err) != cli.ExitLocal {
+		t.Fatalf("Code(%v)=%d want %d", err, cli.Code(err), cli.ExitLocal)
+	}
+}
+
+func TestBackupPruneRequiresBaseDir(t *testing.T) {
+	err := backupPrune([]string{"--keep-count", "1"})
+	if cli.Code(err) != cli.ExitLocal {
+		t.Fatalf("Code(%v)=%d want %d", err, cli.Code(err), cli.ExitLocal)
+	}
+}
+
+func TestBackupPruneRequiresExactlyOnePolicy(t *testing.T) {
+	dir := t.TempDir()
+	if err := backupPrune([]string{"--base-dir", dir}); !nerr.HasCode(err, nerr.InvalidArgument) {
+		t.Fatalf("neither policy flag: %v", err)
+	}
+	if err := backupPrune([]string{"--base-dir", dir, "--keep-count", "1", "--keep-days", "1"}); !nerr.HasCode(err, nerr.InvalidArgument) {
+		t.Fatalf("both policy flags: %v", err)
+	}
+}
+
+func TestBackupCmdDispatchesUnknownVerb(t *testing.T) {
+	err := backupCmd([]string{"bogus"})
+	if !nerr.HasCode(err, nerr.InvalidArgument) {
+		t.Fatalf("%v", err)
+	}
+}
+
+func TestBackupListAndPruneEndToEnd(t *testing.T) {
+	root := t.TempDir()
+	baseDir := filepath.Join(root, "backups")
+	if err := os.MkdirAll(baseDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// Create 3 backups of 3 independently initialized databases (backup
+	// retention doesn't care whether they're the same database; it only
+	// looks at each subdirectory's own header).
+	var names []string
+	for i := 0; i < 3; i++ {
+		dataDir := filepath.Join(root, fmt.Sprintf("data%d", i))
+		kf := filepath.Join(root, fmt.Sprintf("db%d.key", i))
+		ikf := kf + ".instance"
+		if err := initDB([]string{
+			"--data-dir", dataDir, "--key-file", kf, "--instance-key-file", ikf,
+			"--no-env",
+		}); err != nil {
+			t.Fatal(err)
+		}
+		name := fmt.Sprintf("b%d", i)
+		names = append(names, name)
+		if err := backupDB([]string{"--data-dir", dataDir, "--key-file", kf, "--out", filepath.Join(baseDir, name)}); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(2 * time.Millisecond) // strictly increasing CreatedNano
+	}
+
+	backups, err := backup.ListBackups(baseDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(backups) != 3 {
+		t.Fatalf("expected 3 backups, got %d: %+v", len(backups), backups)
+	}
+
+	// Preview (no --confirm): nothing actually removed.
+	if err := backupPrune([]string{"--base-dir", baseDir, "--keep-count", "1"}); err != nil {
+		t.Fatal(err)
+	}
+	if backups, err = backup.ListBackups(baseDir); err != nil || len(backups) != 3 {
+		t.Fatalf("preview must not delete anything: err=%v backups=%+v", err, backups)
+	}
+
+	// Confirmed: prunes down to the newest 1.
+	if err := backupPrune([]string{"--base-dir", baseDir, "--keep-count", "1", "--confirm"}); err != nil {
+		t.Fatal(err)
+	}
+	backups, err = backup.ListBackups(baseDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(backups) != 1 {
+		t.Fatalf("expected 1 backup remaining, got %d: %+v", len(backups), backups)
+	}
+	if filepath.Base(backups[0].Path) != names[len(names)-1] {
+		t.Fatalf("expected the newest backup (%s) to survive, got %s", names[len(names)-1], filepath.Base(backups[0].Path))
+	}
+
+	// A second prune with the same policy: nothing left to do.
+	if err := backupPrune([]string{"--base-dir", baseDir, "--keep-count", "1", "--confirm"}); err != nil {
+		t.Fatal(err)
+	}
+	if backups, err = backup.ListBackups(baseDir); err != nil || len(backups) != 1 {
+		t.Fatalf("expected the last backup to survive a no-op prune: err=%v backups=%+v", err, backups)
 	}
 }
 

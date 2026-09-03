@@ -3,6 +3,7 @@ package catalog
 import (
 	"sync"
 
+	"github.com/bzync/nextsql/internal/clientenc"
 	"github.com/bzync/nextsql/internal/nerr"
 	"github.com/bzync/nextsql/internal/sql/ast"
 	"github.com/bzync/nextsql/internal/sql/types"
@@ -23,11 +24,24 @@ type Default struct {
 }
 
 type Column struct {
-	Name    string
-	Type    types.Type
-	NotNull bool
-	Primary bool
-	Default Default
+	Name string
+	Type types.Type
+	// ClientType is the logical plaintext type for ENCRYPTED CLIENT. Type is
+	// STRING because nextsqld stores and returns only an NSCE1 ciphertext.
+	// KindInvalid means the column is not client-encrypted.
+	ClientType types.Type
+	NotNull    bool
+	Primary    bool
+	Default    Default
+}
+
+func (c Column) ClientEncrypted() bool { return c.ClientType.Kind != types.KindInvalid }
+
+func (c Column) LogicalType() types.Type {
+	if c.ClientEncrypted() {
+		return c.ClientType
+	}
+	return c.Type
 }
 
 type Index struct {
@@ -623,17 +637,11 @@ func TableFromAST(id uint32, stmt ast.CreateTable) (*Table, error) {
 			return nil, nerr.New(nerr.AlreadyExists, "catalog.TableFromAST", "duplicate column")
 		}
 		seen[c.Name] = i
-		def, err := defaultFromAST(c)
+		col, err := ColumnFromAST(c)
 		if err != nil {
 			return nil, err
 		}
-		t.Columns = append(t.Columns, Column{
-			Name:    c.Name,
-			Type:    c.Type,
-			NotNull: c.NotNull || c.Primary,
-			Primary: c.Primary,
-			Default: def,
-		})
+		t.Columns = append(t.Columns, col)
 	}
 	if len(stmt.PK) == 0 {
 		return nil, nerr.New(nerr.InvalidArgument, "catalog.TableFromAST", "PRIMARY KEY is required")
@@ -644,6 +652,9 @@ func TableFromAST(id uint32, stmt ast.CreateTable) (*Table, error) {
 			return nil, nerr.New(nerr.NotFound, "catalog.TableFromAST", "PRIMARY KEY column missing")
 		}
 		t.PK = append(t.PK, i)
+		if t.Columns[i].ClientEncrypted() {
+			return nil, nerr.New(nerr.InvalidArgument, "catalog.TableFromAST", "ENCRYPTED CLIENT column cannot be a primary key")
+		}
 		t.Columns[i].Primary = true
 		t.Columns[i].NotNull = true
 		if t.Columns[i].Type.Kind == types.KindVector {
@@ -677,13 +688,31 @@ func ColumnFromAST(c ast.ColumnDef) (Column, error) {
 	if err != nil {
 		return Column{}, err
 	}
-	return Column{
+	col := Column{
 		Name:    c.Name,
 		Type:    c.Type,
 		NotNull: c.NotNull || c.Primary,
 		Primary: c.Primary,
 		Default: def,
-	}, nil
+	}
+	if !c.EncryptedClient {
+		return col, nil
+	}
+	if !clientenc.SupportedType(c.Type) {
+		return Column{}, nerr.New(nerr.InvalidArgument, "catalog.ColumnFromAST", "ENCRYPTED CLIENT supports scalar UUID, STRING, TEXT, BLOB, INT8, INT16, INT32, INT64, DECIMAL, TIMESTAMPTZ, JSON, and BOOL values")
+	}
+	if c.Primary {
+		return Column{}, nerr.New(nerr.InvalidArgument, "catalog.ColumnFromAST", "ENCRYPTED CLIENT column cannot be a primary key")
+	}
+	if c.Default != nil {
+		return Column{}, nerr.New(nerr.InvalidArgument, "catalog.ColumnFromAST", "ENCRYPTED CLIENT column cannot have a server-side default")
+	}
+	if c.References != nil {
+		return Column{}, nerr.New(nerr.InvalidArgument, "catalog.ColumnFromAST", "ENCRYPTED CLIENT column cannot have a foreign key")
+	}
+	col.ClientType = c.Type
+	col.Type = types.String()
+	return col, nil
 }
 
 func defaultFromAST(c ast.ColumnDef) (Default, error) {

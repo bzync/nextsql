@@ -21,6 +21,7 @@ import (
 	"github.com/bzync/nextsql/internal/storage"
 	"github.com/bzync/nextsql/internal/storage/btree"
 	"github.com/bzync/nextsql/internal/storage/format"
+	"github.com/bzync/nextsql/internal/txn"
 	"github.com/bzync/nextsql/internal/wal"
 )
 
@@ -29,6 +30,10 @@ type DB struct {
 	path        string
 	keys        crypto.KeyProvider
 	bufferPages int
+	// databaseName is the logical served name used by system.storage and
+	// SHOW DATABASES. It is deliberately separate from path: filesystem
+	// layout is not SQL-visible metadata. Empty means "default".
+	databaseName atomic.Pointer[string]
 
 	Eng     *storage.Engine
 	Cat     *catalog.Store
@@ -44,22 +49,50 @@ type DB struct {
 	workflows map[string]*catalog.Workflow
 	triggers  map[string]*catalog.Trigger
 	schedules map[string]*catalog.Schedule
-	hnswMu    sync.RWMutex
-	hnswGen   uint64
-	hnsw      map[string]*lockedMem
-	ivf       map[string]*lockedIVF // process-local committed IVF copies, same gen/lock as hnsw
-	optCache  *optimizer.Cache
-	resCache  *resultCache
-	feedback  *optimizer.Feedback
-	sched     *scheduler.Pool
-	metrics   *metrics.Registry
-	admit     *scheduler.Admission
-	maint     *maintenance.Manager
+	resGroups map[string]*catalog.ResourceGroup
+	// resGroupGates caches a lazily-built, process-wide scheduler.Admission
+	// per resource group with a non-zero MaxConcurrency, keyed by group
+	// name. It is a pure cache: dropped (not migrated) on any change to the
+	// backing group, guarded by mu like resGroups itself. A group with
+	// MaxConcurrency == 0 never gets an entry (0 means unbounded for
+	// resource groups, unlike scheduler.NewAdmission's own <1-means-default
+	// convention, so the two must never be confused).
+	resGroupGates map[string]*scheduler.Admission
+	hnswMu        sync.RWMutex
+	hnswGen       uint64
+	hnsw          map[string]*lockedMem
+	ivf           map[string]*lockedIVF // process-local committed IVF copies, same gen/lock as hnsw
+	optCache      *optimizer.Cache
+	resCache      *resultCache
+	feedback      *optimizer.Feedback
+	sched         *scheduler.Pool
+	metrics       *metrics.Registry
+	admit         *scheduler.Admission
+	maint         *maintenance.Manager
+	// drainFn is set by the embedding server (nextsqld) to receive CLUSTER
+	// DRAIN requests issued over SQL. Nil in embedded/CLI use, where there
+	// is no listening protocol.Server to drain.
+	drainFn func(timeout time.Duration)
+
+	// maintenanceMode gates every mutating statement with Unavailable while
+	// set, node-local like drainFn (no Raft replication — see
+	// CLUSTER MAINTENANCE's doc comment in internal/sql/ast).
+	maintenanceMode atomic.Bool
+
+	// diskWatermarkTripped gates every mutating statement with Unavailable
+	// while set, same enforcement point as maintenanceMode but a distinct
+	// flag: it is driven automatically by cmd/nextsqld's disk-watermark
+	// monitor (see config.Config.DiskWatermarkThresholds), not by an
+	// operator's CLUSTER MAINTENANCE ENABLE, so the two must not be
+	// conflated — clearing one must never clear the other.
+	diskWatermarkTripped atomic.Bool
 
 	applyMu        sync.RWMutex
 	gate           WriteGate
 	rebuildMu      sync.RWMutex
 	rebuilds       map[string]*rebuildProgress
+	onlineMu       sync.RWMutex
+	onlineBuilds   map[string]*onlineBuild // key: idxKey(table, index)
 	reclaimMu      sync.Mutex
 	reclaimErr     error
 	reclaimPending []format.PageID
@@ -69,6 +102,183 @@ type DB struct {
 	taskCancels    map[string]context.CancelFunc
 	idempotencyMu  sync.Mutex
 	walRetention   atomic.Uint64
+
+	// sessMu/sessions/nextSessID back system.sessions, system.active_queries,
+	// and system.transactions: a process-local, node-local registry of live
+	// Session objects. Entries are ephemeral (not persisted, not replicated).
+	sessMu     sync.RWMutex
+	sessions   map[uint64]*Session
+	nextSessID atomic.Uint64
+
+	// cdcMu/cdcSubs/nextCDCID back system.change_streams: a process-local
+	// registry of open CDC subscriptions, keyed by an opaque id assigned at
+	// Subscribe time.
+	cdcMu     sync.RWMutex
+	cdcSubs   map[uint64]*cdcSubInfo
+	nextCDCID atomic.Uint64
+}
+
+// SetDatabaseName publishes the logical served database name for
+// introspection. It never exposes or derives the storage path.
+func (db *DB) SetDatabaseName(name string) {
+	if db == nil {
+		return
+	}
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return
+	}
+	db.databaseName.Store(&name)
+}
+
+// DatabaseName returns the logical served database name. Embedded/single-user
+// databases that have no configured routing name use the native default.
+func (db *DB) DatabaseName() string {
+	if db == nil {
+		return "default"
+	}
+	if name := db.databaseName.Load(); name != nil && *name != "" {
+		return *name
+	}
+	return "default"
+}
+
+// cdcSubInfo is one open CDC subscription's introspectable state. lsn is
+// updated via atomic.Uint64 from the subscribing session's own goroutine
+// (Subscription.Token/Lag are not safe to call cross-goroutine), then read
+// from any session evaluating system.change_streams.
+type cdcSubInfo struct {
+	table string
+	lsn   atomic.Uint64
+}
+
+// RegisterSession adds s to the live-session registry consulted by
+// system.sessions / system.active_queries / system.transactions, and
+// assigns it a stable per-process session id. The caller that owns the
+// session's lifecycle (the protocol server, for a network connection) must
+// call UnregisterSession when the session ends.
+func (db *DB) RegisterSession(s *Session) uint64 {
+	if db == nil || s == nil {
+		return 0
+	}
+	id := db.nextSessID.Add(1)
+	s.id = id
+	s.connectedAt = time.Now()
+	db.sessMu.Lock()
+	if db.sessions == nil {
+		db.sessions = make(map[uint64]*Session)
+	}
+	db.sessions[id] = s
+	db.sessMu.Unlock()
+	return id
+}
+
+// UnregisterSession removes a session from the live-session registry.
+func (db *DB) UnregisterSession(id uint64) {
+	if db == nil || id == 0 {
+		return
+	}
+	db.sessMu.Lock()
+	delete(db.sessions, id)
+	db.sessMu.Unlock()
+}
+
+// LiveSessions returns a snapshot of currently registered sessions.
+func (db *DB) LiveSessions() []*Session {
+	if db == nil {
+		return nil
+	}
+	db.sessMu.RLock()
+	defer db.sessMu.RUnlock()
+	out := make([]*Session, 0, len(db.sessions))
+	for _, s := range db.sessions {
+		out = append(out, s)
+	}
+	return out
+}
+
+// registerCDCSubscription adds an open CDC subscription to the registry
+// consulted by system.change_streams, seeded with its starting LSN.
+func (db *DB) registerCDCSubscription(table string, startLSN uint64) uint64 {
+	if db == nil {
+		return 0
+	}
+	id := db.nextCDCID.Add(1)
+	info := &cdcSubInfo{table: table}
+	info.lsn.Store(startLSN)
+	db.cdcMu.Lock()
+	if db.cdcSubs == nil {
+		db.cdcSubs = make(map[uint64]*cdcSubInfo)
+	}
+	db.cdcSubs[id] = info
+	db.cdcMu.Unlock()
+	return id
+}
+
+// unregisterCDCSubscription removes a closed subscription from the registry.
+func (db *DB) unregisterCDCSubscription(id uint64) {
+	if db == nil || id == 0 {
+		return
+	}
+	db.cdcMu.Lock()
+	delete(db.cdcSubs, id)
+	db.cdcMu.Unlock()
+}
+
+// updateCDCSubscriptionLSN publishes a subscription's latest observed commit
+// LSN. Must only be called from the subscribing session's own goroutine.
+func (db *DB) updateCDCSubscriptionLSN(id uint64, lsn uint64) {
+	if db == nil || id == 0 {
+		return
+	}
+	db.cdcMu.RLock()
+	info := db.cdcSubs[id]
+	db.cdcMu.RUnlock()
+	if info != nil {
+		info.lsn.Store(lsn)
+	}
+}
+
+// CDCSubscriptionInfo is a snapshot of one open CDC subscription.
+type CDCSubscriptionInfo struct {
+	Table string
+	LSN   uint64
+}
+
+// CDCSubscriptions returns a snapshot of currently open CDC subscriptions.
+func (db *DB) CDCSubscriptions() []CDCSubscriptionInfo {
+	if db == nil {
+		return nil
+	}
+	db.cdcMu.RLock()
+	defer db.cdcMu.RUnlock()
+	out := make([]CDCSubscriptionInfo, 0, len(db.cdcSubs))
+	for _, info := range db.cdcSubs {
+		out = append(out, CDCSubscriptionInfo{Table: info.table, LSN: info.lsn.Load()})
+	}
+	return out
+}
+
+// LockSnapshot returns a snapshot of every key/range lock currently held in
+// this database's storage engine, for system.locks. table_name is only as
+// good as the tags threaded through btree.Tree.SetName at the executor's
+// tree-resolver call sites (db.heap/db.index/db.vecStore and the partition
+// equivalents); a lock acquired through an untagged path reports "".
+func (db *DB) LockSnapshot() []txn.LockInfo {
+	if db == nil || db.Eng == nil || db.Eng.TM == nil || db.Eng.TM.Locks == nil {
+		return nil
+	}
+	return db.Eng.TM.Locks.Snapshot()
+}
+
+// SetLockWaitTimeout bounds how long a contended, non-deadlocking key/range
+// lock wait blocks before failing Exhausted. d <= 0 (the default) blocks
+// indefinitely, matching pre-P27 behavior.
+func (db *DB) SetLockWaitTimeout(d time.Duration) {
+	if db == nil || db.Eng == nil || db.Eng.TM == nil || db.Eng.TM.Locks == nil {
+		return
+	}
+	db.Eng.TM.Locks.SetWaitTimeout(d)
 }
 
 type IndexRebuildProgress struct {
@@ -364,6 +574,113 @@ func (db *DB) ClusterHealth() (replication.ReplicaHealth, bool) {
 	}
 	return c.ReplicaHealth(), true
 }
+
+// ConfirmReplicationReconciled clears this node's local replication-suspect
+// flag — set automatically when a local commit couldn't reach quorum (see
+// storage.Engine's ReplicationOrphanReporter) and, while set, blocks this
+// node from serving STRONG reads. Run only after an operator has verified
+// or repaired this node's divergence (CLUSTER RECONCILE CONFIRM). Returns
+// Unavailable when no cluster is attached (single-node deployment, where
+// the flag can never be set in the first place).
+func (db *DB) ConfirmReplicationReconciled() error {
+	c := db.cluster()
+	if c == nil {
+		return nerr.New(nerr.Unavailable, "executor.ConfirmReplicationReconciled", "no cluster attached")
+	}
+	c.ClearReplicationSuspect()
+	return nil
+}
+
+// TransferLeadership asks this Raft cluster's current leader to step down in
+// favor of another voter. Returns Unavailable when no cluster is attached
+// (single-node deployment).
+func (db *DB) TransferLeadership() error {
+	c := db.cluster()
+	if c == nil {
+		return nerr.New(nerr.Unavailable, "executor.TransferLeadership", "no cluster attached")
+	}
+	return c.TransferLeadership()
+}
+
+// SetDrainFunc registers the callback CLUSTER DRAIN invokes: normally
+// protocol.Server.Drain, wired by nextsqld at startup. Nil (the default,
+// used by embedded/CLI callers with no listening server) makes Drain fail
+// Unavailable.
+func (db *DB) SetDrainFunc(fn func(timeout time.Duration)) {
+	if db == nil {
+		return
+	}
+	db.drainFn = fn
+}
+
+// Drain asks the attached server, if any, to begin a graceful drain —
+// stop accepting new connections, close idle ones immediately, wait up to
+// timeout for busy ones, then force-close whatever remains. It launches the
+// drain in its own goroutine and returns immediately: the calling
+// connection is itself "busy" running this very call, so waiting here for
+// it to become idle (as Drain's own idle-polling loop would) would never
+// complete until the timeout forced it closed.
+func (db *DB) Drain(timeout time.Duration) error {
+	if db == nil || db.drainFn == nil {
+		return nerr.New(nerr.Unavailable, "executor.Drain", "no server attached")
+	}
+	fn := db.drainFn
+	go fn(timeout)
+	return nil
+}
+
+// EnableMaintenanceMode makes every subsequent mutating statement on this
+// node fail Unavailable until DisableMaintenanceMode is called. Node-local,
+// like Drain: not Raft-replicated, so a leader failover does not carry it to
+// the new leader. Distinct from PauseMaintenance/ResumeMaintenance below,
+// which pause the background dead-version cleanup (MAINTAIN) scheduler, not
+// client query traffic.
+func (db *DB) EnableMaintenanceMode() {
+	if db == nil {
+		return
+	}
+	db.maintenanceMode.Store(true)
+}
+
+// DisableMaintenanceMode reverses EnableMaintenanceMode.
+func (db *DB) DisableMaintenanceMode() {
+	if db == nil {
+		return
+	}
+	db.maintenanceMode.Store(false)
+}
+
+// InMaintenanceMode reports the current node-local maintenance-mode state.
+func (db *DB) InMaintenanceMode() bool {
+	if db == nil {
+		return false
+	}
+	return db.maintenanceMode.Load()
+}
+
+// SetDiskWatermarkTripped is called by cmd/nextsqld's disk-watermark monitor
+// to flip the node into (or out of) the automatic write-reject state once
+// free disk space crosses the configured reject/warn thresholds (with
+// hysteresis applied by the caller). Node-local, like EnableMaintenanceMode,
+// and intentionally independent of it: an operator's own CLUSTER MAINTENANCE
+// ENABLE/DISABLE must not be able to mask a real disk-space emergency, and
+// clearing an operator maintenance window must not silently un-reject writes
+// on a node that is still critically low on disk.
+func (db *DB) SetDiskWatermarkTripped(tripped bool) {
+	if db == nil {
+		return
+	}
+	db.diskWatermarkTripped.Store(tripped)
+}
+
+// DiskWatermarkTripped reports the current node-local disk-watermark state.
+func (db *DB) DiskWatermarkTripped() bool {
+	if db == nil {
+		return false
+	}
+	return db.diskWatermarkTripped.Load()
+}
+
 func (db *DB) PauseMaintenance()                               { db.maint.Pause() }
 func (db *DB) ResumeMaintenance()                              { db.maint.Resume() }
 func (db *DB) SetMaintenanceLimits(l maintenance.Limits) error { return db.maint.SetLimits(l) }
@@ -468,30 +785,32 @@ func newDB(e *storage.Engine) (*DB, error) {
 		return nil, err
 	}
 	return &DB{
-		path:        e.Path(),
-		keys:        e.Keys(),
-		Eng:         e,
-		Cat:         catalog.New(),
-		CatTree:     tr,
-		heaps:       make(map[string]*btree.Tree),
-		partHeaps:   make(map[string]*btree.Tree),
-		partVecs:    make(map[string]*btree.Tree),
-		partIdxs:    make(map[string]*btree.Tree),
-		idxs:        make(map[string]*btree.Tree),
-		vecs:        make(map[string]*btree.Tree),
-		workflows:   make(map[string]*catalog.Workflow),
-		triggers:    make(map[string]*catalog.Trigger),
-		schedules:   make(map[string]*catalog.Schedule),
-		hnsw:        make(map[string]*lockedMem),
-		optCache:    optimizer.NewCache(),
-		resCache:    newResultCache(),
-		feedback:    optimizer.NewFeedback(),
-		sched:       scheduler.DefaultPool,
-		metrics:     metrics.New(),
-		admit:       scheduler.DefaultAdmission(),
-		maint:       maintenance.New(),
-		rebuilds:    make(map[string]*rebuildProgress),
-		taskCancels: make(map[string]context.CancelFunc),
+		path:         e.Path(),
+		keys:         e.Keys(),
+		Eng:          e,
+		Cat:          catalog.New(),
+		CatTree:      tr,
+		heaps:        make(map[string]*btree.Tree),
+		partHeaps:    make(map[string]*btree.Tree),
+		partVecs:     make(map[string]*btree.Tree),
+		partIdxs:     make(map[string]*btree.Tree),
+		idxs:         make(map[string]*btree.Tree),
+		vecs:         make(map[string]*btree.Tree),
+		workflows:    make(map[string]*catalog.Workflow),
+		triggers:     make(map[string]*catalog.Trigger),
+		schedules:    make(map[string]*catalog.Schedule),
+		resGroups:    make(map[string]*catalog.ResourceGroup),
+		hnsw:         make(map[string]*lockedMem),
+		optCache:     optimizer.NewCache(),
+		resCache:     newResultCache(),
+		feedback:     optimizer.NewFeedback(),
+		sched:        scheduler.DefaultPool,
+		metrics:      metrics.New(),
+		admit:        scheduler.DefaultAdmission(),
+		maint:        maintenance.New(),
+		rebuilds:     make(map[string]*rebuildProgress),
+		onlineBuilds: make(map[string]*onlineBuild),
+		taskCancels:  make(map[string]context.CancelFunc),
 	}, nil
 }
 
@@ -586,9 +905,15 @@ func (db *DB) drainCommittedReclaims() {
 	db.reclaimIdxMap = nil
 	db.reclaimMu.Unlock()
 	if len(ids) == 0 && len(partitionMaps) == 0 && len(indexMaps) == 0 {
+		if db.hasSwappedOnlineBuilds() {
+			db.applyMu.Lock()
+			db.disarmSwappedOnlineBuilds()
+			db.applyMu.Unlock()
+		}
 		return
 	}
 	db.applyMu.Lock()
+	db.disarmSwappedOnlineBuilds()
 	err := db.writeReclaimIntent(ids)
 	if err == nil {
 		err = db.Eng.CrashAt(wal.PointDuringPageReclaim)
@@ -713,30 +1038,32 @@ func OpenWith(path string, keys crypto.KeyProvider, bufferPages int, opt storage
 		return nil, err
 	}
 	db := &DB{
-		path:        path,
-		keys:        keys,
-		bufferPages: bufferPages,
-		Eng:         e,
-		Cat:         catalog.New(),
-		CatTree:     tr,
-		heaps:       make(map[string]*btree.Tree),
-		partHeaps:   make(map[string]*btree.Tree),
-		partVecs:    make(map[string]*btree.Tree),
-		partIdxs:    make(map[string]*btree.Tree),
-		idxs:        make(map[string]*btree.Tree),
-		vecs:        make(map[string]*btree.Tree),
-		workflows:   make(map[string]*catalog.Workflow),
-		triggers:    make(map[string]*catalog.Trigger),
-		schedules:   make(map[string]*catalog.Schedule),
-		hnsw:        make(map[string]*lockedMem),
-		optCache:    optimizer.NewCache(),
-		resCache:    newResultCache(),
-		feedback:    optimizer.NewFeedback(),
-		sched:       scheduler.DefaultPool,
-		metrics:     metrics.New(),
-		admit:       scheduler.DefaultAdmission(),
-		maint:       maintenance.New(),
-		rebuilds:    make(map[string]*rebuildProgress),
+		path:         path,
+		keys:         keys,
+		bufferPages:  bufferPages,
+		Eng:          e,
+		Cat:          catalog.New(),
+		CatTree:      tr,
+		heaps:        make(map[string]*btree.Tree),
+		partHeaps:    make(map[string]*btree.Tree),
+		partVecs:     make(map[string]*btree.Tree),
+		partIdxs:     make(map[string]*btree.Tree),
+		idxs:         make(map[string]*btree.Tree),
+		vecs:         make(map[string]*btree.Tree),
+		workflows:    make(map[string]*catalog.Workflow),
+		triggers:     make(map[string]*catalog.Trigger),
+		schedules:    make(map[string]*catalog.Schedule),
+		resGroups:    make(map[string]*catalog.ResourceGroup),
+		hnsw:         make(map[string]*lockedMem),
+		optCache:     optimizer.NewCache(),
+		resCache:     newResultCache(),
+		feedback:     optimizer.NewFeedback(),
+		sched:        scheduler.DefaultPool,
+		metrics:      metrics.New(),
+		admit:        scheduler.DefaultAdmission(),
+		maint:        maintenance.New(),
+		rebuilds:     make(map[string]*rebuildProgress),
+		onlineBuilds: make(map[string]*onlineBuild),
 	}
 	if err := db.reloadCatalog(); err != nil {
 		_ = e.Close()
@@ -964,6 +1291,29 @@ func (db *DB) reloadCatalog() error {
 	if err != nil {
 		return err
 	}
+	resGroups := make(map[string]*catalog.ResourceGroup)
+	start = catalog.ResourceGroupKey("")
+	end = []byte{catalog.KeyResourceGroup + 1}
+	err = db.CatTree.Range(start, end, func(k, v []byte) error {
+		if len(k) == 0 || k[0] != catalog.KeyResourceGroup {
+			return nil
+		}
+		g, err := catalog.DecodeResourceGroup(v)
+		if err != nil {
+			return err
+		}
+		if string(k[1:]) != g.Name {
+			return nerr.New(nerr.InvalidFormat, "executor.reloadCatalog", "resource group catalog key/name mismatch")
+		}
+		if _, exists := resGroups[g.Name]; exists {
+			return nerr.New(nerr.InvalidFormat, "executor.reloadCatalog", "duplicate resource group")
+		}
+		resGroups[g.Name] = g
+		return nil
+	})
+	if err != nil {
+		return err
+	}
 	tablesByID := make(map[uint32]*catalog.Table, len(tables))
 	for _, table := range tables {
 		tablesByID[table.ID] = table
@@ -1010,6 +1360,8 @@ func (db *DB) reloadCatalog() error {
 	db.workflows = workflows
 	db.triggers = triggers
 	db.schedules = schedules
+	db.resGroups = resGroups
+	db.resGroupGates = nil
 	for _, w := range workflows {
 		db.Cat.SetNextID(w.ID + 1)
 	}
@@ -1188,6 +1540,92 @@ func (db *DB) removeSchedule(name string) {
 	db.mu.Unlock()
 }
 
+func (db *DB) resourceGroup(name string) (*catalog.ResourceGroup, bool) {
+	if db == nil {
+		return nil, false
+	}
+	db.mu.RLock()
+	group, ok := db.resGroups[name]
+	db.mu.RUnlock()
+	if !ok || group == nil {
+		return nil, false
+	}
+	return group.Clone(), true
+}
+
+func (db *DB) resourceGroupList() []*catalog.ResourceGroup {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	out := make([]*catalog.ResourceGroup, 0, len(db.resGroups))
+	for _, group := range db.resGroups {
+		if clone := group.Clone(); clone != nil {
+			out = append(out, clone)
+		}
+	}
+	return out
+}
+
+func (db *DB) putResourceGroup(group *catalog.ResourceGroup) {
+	if db == nil || group == nil {
+		return
+	}
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	if db.resGroups == nil {
+		db.resGroups = make(map[string]*catalog.ResourceGroup)
+	}
+	db.resGroups[group.Name] = group
+	delete(db.resGroupGates, group.Name)
+}
+
+func (db *DB) removeResourceGroup(name string) {
+	if db == nil {
+		return
+	}
+	db.mu.Lock()
+	delete(db.resGroups, name)
+	delete(db.resGroupGates, name)
+	db.mu.Unlock()
+}
+
+// resourceGroupGate returns the process-wide concurrency gate for a named
+// resource group, or nil if the group does not exist or has no
+// MaxConcurrency bound (0 = unbounded, no gate needed). The gate is built
+// once and cached; ALTER RESOURCE GROUP drops the cache entry via
+// putResourceGroup so the next query under that group picks up the new
+// bound (starting its in-flight count fresh at zero).
+func (db *DB) resourceGroupGate(name string) *scheduler.Admission {
+	if db == nil || name == "" {
+		return nil
+	}
+	db.mu.RLock()
+	g, ok := db.resGroups[name]
+	gate, cached := db.resGroupGates[name]
+	db.mu.RUnlock()
+	if !ok || g == nil || g.MaxConcurrency <= 0 {
+		return nil
+	}
+	if cached && gate != nil {
+		return gate
+	}
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	g, ok = db.resGroups[name]
+	if !ok || g == nil || g.MaxConcurrency <= 0 {
+		delete(db.resGroupGates, name)
+		return nil
+	}
+	if existing, ok := db.resGroupGates[name]; ok && existing != nil {
+		return existing
+	}
+	gate = scheduler.NewAdmission(scheduler.AdmissionConfig{MaxInflight: int(g.MaxConcurrency)})
+	if db.resGroupGates == nil {
+		db.resGroupGates = make(map[string]*scheduler.Admission)
+	}
+	db.resGroupGates[name] = gate
+	return gate
+}
+
 func (db *DB) putWorkflow(w *catalog.Workflow) {
 	if db == nil || w == nil {
 		return
@@ -1292,6 +1730,7 @@ func (db *DB) heap(name string) (*btree.Tree, error) {
 	if tr == nil {
 		return nil, nerr.New(nerr.NotFound, "executor.heap", "table heap not open")
 	}
+	tr.SetName(name)
 	return tr, nil
 }
 
@@ -1302,6 +1741,9 @@ func (db *DB) index(table, name string) (*btree.Tree, error) {
 	if tr == nil {
 		return nil, nerr.New(nerr.NotFound, "executor.index", "index not open")
 	}
+	// Tag the index tree with its owning table (not the index name) so
+	// system.locks reports the same table_name as the heap.
+	tr.SetName(table)
 	return tr, nil
 }
 
@@ -1312,6 +1754,7 @@ func (db *DB) vecStore(name string) (*btree.Tree, error) {
 	if tr == nil {
 		return nil, nerr.New(nerr.NotFound, "executor.vecStore", "vector store not open")
 	}
+	tr.SetName(name)
 	return tr, nil
 }
 

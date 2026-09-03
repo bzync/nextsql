@@ -8,13 +8,27 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bzync/nextsql/internal/clientenc"
 	"github.com/bzync/nextsql/internal/config"
 	"github.com/bzync/nextsql/internal/crypto"
 	"github.com/bzync/nextsql/internal/executor"
 	"github.com/bzync/nextsql/internal/nerr"
+	"github.com/bzync/nextsql/internal/sql/types"
 	"github.com/bzync/nextsql/internal/storage/format"
 	"github.com/bzync/nextsql/internal/wal"
 )
+
+type backupFieldKeys struct{ key clientenc.Key }
+
+func (p backupFieldKeys) CurrentFieldKey(context.Context, string, string, string) (clientenc.Key, error) {
+	return p.key, nil
+}
+func (p backupFieldKeys) FieldKey(_ context.Context, _, _, _, id string) (clientenc.Key, error) {
+	if id != p.key.ID {
+		return clientenc.Key{}, nerr.New(nerr.NotFound, "test", "field key missing")
+	}
+	return p.key, nil
+}
 
 func setupSQL(t *testing.T, dir string) (dataDir, dbPath string, root *crypto.DEK, env *crypto.Envelope) {
 	t.Helper()
@@ -137,6 +151,156 @@ func TestBackupRestoreRoundTrip(t *testing.T) {
 	got = execSKUs(t, filepath.Join(restored, config.DataFileName), env2)
 	if !contains(got, "from-backup") {
 		t.Fatalf("restored workflow did not execute: %v", got)
+	}
+}
+
+func TestEncryptedClientBackupRestoreRemainsOpaque(t *testing.T) {
+	dir := t.TempDir()
+	dataDir, dbPath, root, env := setupSQL(t, dir)
+	db, err := executor.Open(dbPath, env, 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Session().Exec(`CREATE TABLE accounts (id STRING PRIMARY KEY, secret TEXT ENCRYPTED CLIENT NOT NULL)`); err != nil {
+		t.Fatal(err)
+	}
+	fieldKey := clientenc.Key{ID: "backup-v1"}
+	for i := range fieldKey.Material {
+		fieldKey.Material[i] = 4
+	}
+	provider := backupFieldKeys{key: fieldKey}
+	ciphertext, err := clientenc.Encrypt(context.Background(), provider, "app", "accounts", "secret", types.TextValue("backup-secret"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Session().ExecContext(context.Background(), `INSERT INTO accounts (id, secret) VALUES ('1', $1)`, []executor.Param{{Value: types.StringValue(ciphertext)}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	backupDir := filepath.Join(dir, "clientenc.nsbak")
+	if _, err := Create(dataDir, backupDir, env, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	_ = env.Close()
+	restoreKeys, err := crypto.OpenEnvelope(crypto.KeystorePath(dbPath), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restoreKeys.Close()
+	restoredDir := filepath.Join(dir, "restored-clientenc")
+	if _, err := Restore(backupDir, restoredDir, restoreKeys, RestoreOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	restored, err := executor.Open(filepath.Join(restoredDir, config.DataFileName), restoreKeys, 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restored.Close()
+	res, err := restored.Session().Exec(`SELECT secret FROM accounts WHERE id = '1'`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Rows) != 1 || res.Rows[0][0].Str != ciphertext {
+		t.Fatalf("restored ciphertext: %+v", res.Rows)
+	}
+	plain, err := clientenc.Decrypt(context.Background(), provider, "app", "accounts", "secret", res.Rows[0][0].Str)
+	if err != nil || plain.Str != "backup-secret" {
+		t.Fatalf("restored decrypt: %+v %v", plain, err)
+	}
+}
+
+func TestEncryptedClientPITRRestoresExactCiphertextAtTarget(t *testing.T) {
+	dir := t.TempDir()
+	dataDir, dbPath, _, env := setupSQL(t, dir)
+	db, err := executor.Open(dbPath, env, 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Session().Exec(`CREATE TABLE accounts (id STRING PRIMARY KEY, secret TEXT ENCRYPTED CLIENT NOT NULL)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	base := filepath.Join(dir, "clientenc-base.nsbak")
+	if _, err := Create(dataDir, base, env, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	archiveDir := filepath.Join(dir, "clientenc-walarch")
+	archiver, err := NewDirArchiver(archiveDir, env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err = executor.Open(dbPath, env, 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.Eng.SetArchiver(archiver)
+
+	fieldKey := clientenc.Key{ID: "pitr-v1"}
+	for i := range fieldKey.Material {
+		fieldKey.Material[i] = 5
+	}
+	provider := backupFieldKeys{key: fieldKey}
+	atTarget, err := clientenc.Encrypt(context.Background(), provider, "app", "accounts", "secret", types.TextValue("secret-at-target"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Session().ExecContext(context.Background(), `INSERT INTO accounts (id, secret) VALUES ('1', $1)`, []executor.Param{{Value: types.StringValue(atTarget)}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Eng.Checkpoint(); err != nil {
+		t.Fatal(err)
+	}
+	targetLSN := db.Eng.WAL.NextLSN() - 1
+	if targetLSN == 0 {
+		t.Fatal("client-encrypted insert did not allocate a recovery LSN")
+	}
+
+	afterTarget, err := clientenc.Encrypt(context.Background(), provider, "app", "accounts", "secret", types.TextValue("secret-after-target"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Session().ExecContext(context.Background(), `UPDATE accounts SET secret = $1 WHERE id = '1'`, []executor.Param{{Value: types.StringValue(afterTarget)}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Eng.Checkpoint(); err != nil {
+		t.Fatal(err)
+	}
+	if db.Eng.WAL.NextLSN()-1 <= targetLSN {
+		t.Fatal("post-target update did not allocate a later recovery LSN")
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	restoredDir := filepath.Join(dir, "clientenc-pitr")
+	if _, err := Restore(base, restoredDir, env, RestoreOptions{ArchiveDir: archiveDir, UntilLSN: targetLSN}); err != nil {
+		t.Fatal(err)
+	}
+	restored, err := executor.Open(filepath.Join(restoredDir, config.DataFileName), env, 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restored.Close()
+	meta, err := restored.Session().Exec(`SELECT type FROM system.columns WHERE table_name = 'accounts' AND column_name = 'secret'`)
+	if err != nil || len(meta.Rows) != 1 || meta.Rows[0][0].Str != "TEXT ENCRYPTED CLIENT" {
+		t.Fatalf("PITR client-encrypted catalog metadata: rows=%+v err=%v", meta.Rows, err)
+	}
+	res, err := restored.Session().Exec(`SELECT secret FROM accounts WHERE id = '1'`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Rows) != 1 || res.Rows[0][0].Str != atTarget || res.Rows[0][0].Str == afterTarget {
+		t.Fatalf("PITR ciphertext at target: rows=%+v", res.Rows)
+	}
+	plain, err := clientenc.Decrypt(context.Background(), provider, "app", "accounts", "secret", res.Rows[0][0].Str)
+	if err != nil || plain.Typ.Kind != types.KindText || plain.Str != "secret-at-target" {
+		t.Fatalf("PITR decrypt: value=%+v err=%v", plain, err)
 	}
 }
 

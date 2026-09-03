@@ -15,10 +15,47 @@ nextsql backup  --data-dir DIR --key-file FILE --out DEST
 nextsql verify  --from DEST --key-file FILE
 nextsql restore --from DEST --data-dir DIR --key-file FILE
                 [--wal-archive DIR] [--until-lsn N | --until RFC3339]
+nextsql backup list  --base-dir DIR
+nextsql backup prune --base-dir DIR (--keep-count N | --keep-days N) [--confirm]
 ```
 
 `nextsqld --wal-archive DIR` installs a WAL archiver so recycled (and
-checkpoint-time current) segments are copied for point-in-time recovery.
+checkpoint-time current) segments are copied for point-in-time recovery. See
+`docs/wal.md` "Retention" for the matching `wal_retention_ms` policy that
+keeps local WAL pruning current automatically.
+
+## Retention (`backup list` / `backup prune`)
+
+Each `nextsql backup --out DEST` is a fully independent, self-contained
+directory — there is no built-in "backup set" concept. `backup list
+--base-dir DIR` and `backup prune --base-dir DIR` instead treat every
+immediate subdirectory of `DIR` that has a valid backup header as one
+backup, oldest first; anything else in `DIR` (a stray file, an unrelated
+directory) is silently skipped rather than treated as an error. This means
+retention only needs an operator convention — write each backup into its
+own subdirectory under one common root, e.g.
+`nextsql backup --out /backups/$(date -u +%Y-%m-%dT%H:%M:%SZ)` — with
+nothing new to configure on the server side.
+
+`backup prune` takes exactly one policy: `--keep-count N` (keep the N
+newest, prune the rest) or `--keep-days N` (keep everything created within
+the last N days, prune the rest). Either way, the single newest backup is
+never a prune candidate, even if it is older than the policy would
+otherwise allow — pruning down to zero backups is a strictly worse outcome
+than keeping one stale one. Without `--confirm`, `prune` only previews what
+it would remove; nothing is deleted until you pass it, matching the
+`--confirm` convention used elsewhere in this CLI (`migrate force`,
+`hosting migrate-tenant`). A pruned backup is deleted outright
+(`os.RemoveAll`) — there is no undo, so verify the preview first.
+
+`backup prune` has no awareness of WAL archive dependencies: if a
+`wal_retention_ms`/`MAINTAIN DATABASE` policy elsewhere has already pruned
+local WAL history back past a backup's own checkpoint LSN, deleting that
+backup is safe from the *server's* perspective (nothing server-side
+depends on it), but it may still be the last remaining restore point for
+whatever data existed only up to that point — coordinate backup and WAL
+retention policies so the WAL archive always covers at least back to the
+oldest backup you intend to keep.
 
 ## On-disk layout (`NSBK` v1)
 

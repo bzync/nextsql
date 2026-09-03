@@ -20,6 +20,11 @@ func TestAuditNeverWritesSecrets(t *testing.T) {
 		Outcome: "failure",
 	})
 	l.Record(Event{Actor: "app", Action: ActionKeyRotate, Object: "page:v2", Outcome: "success", IdentitySource: "mtls+native"})
+	l.Record(Event{Actor: "app", Action: ActionAuthSuccess, Outcome: "success", IdentitySource: "token"})
+	l.Record(Event{Actor: "app", Action: ActionAuthSuccess, Outcome: "success", IdentitySource: "mtls+token"})
+	l.Record(Event{Actor: "app", Action: ActionAuthSuccess, Outcome: "success", IdentitySource: "oidc"})
+	l.Record(Event{Actor: "app", Action: ActionAuthSuccess, Outcome: "success", IdentitySource: "mtls+oidc"})
+	l.Record(Event{Actor: "app", Action: ActionAuthFailure, Outcome: "failure", IdentitySource: "token=credential"})
 	if err := l.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -36,6 +41,14 @@ func TestAuditNeverWritesSecrets(t *testing.T) {
 	}
 	if !strings.Contains(s, `"identity_source":"mtls+native"`) {
 		t.Fatalf("identity source missing: %s", s)
+	}
+	for _, source := range []string{"token", "mtls+token", "oidc", "mtls+oidc"} {
+		if !strings.Contains(s, `"identity_source":"`+source+`"`) {
+			t.Fatalf("identity source %q missing: %s", source, s)
+		}
+	}
+	if strings.Contains(s, "token=credential") {
+		t.Fatalf("unexpected identity source leaked: %s", s)
 	}
 }
 

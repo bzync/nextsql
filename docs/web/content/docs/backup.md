@@ -59,4 +59,22 @@ Recycled (and checkpoint-time current) segments are copied as sealed `NSWA` arch
 
 HA is not a substitute for backups. A wiped replica is restored with `backup` / `restore` (same identity and keys), then rejoined.
 
+## Retention
+
+Each backup is independent — there is no built-in "backup set." Write
+successive backups into their own subdirectory under one common root (e.g.
+`/backups/$(date -u +%Y-%m-%dT%H:%M:%SZ)`), then manage them as a group:
+
+```bash
+./nextsql backup list --base-dir /backups
+
+# preview only — nothing deleted without --confirm
+./nextsql backup prune --base-dir /backups --keep-count 7
+./nextsql backup prune --base-dir /backups --keep-days 30 --confirm
+```
+
+The single newest backup is never pruned, even past the policy window.
+Pair this with `wal_retention_ms` (`docs/wal.md` "Retention") so archived
+WAL history still covers back to the oldest backup you keep.
+
 Engine note: [`docs/backup.md`](https://github.com/bzync/nextsql/blob/main/docs/backup.md).

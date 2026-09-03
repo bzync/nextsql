@@ -402,9 +402,10 @@ func excludedEvalTable(tab *catalog.Table) *catalog.Table {
 	out := tab.Clone()
 	for _, c := range tab.Columns {
 		out.Columns = append(out.Columns, catalog.Column{
-			Name:    "excluded." + c.Name,
-			Type:    c.Type,
-			NotNull: c.NotNull,
+			Name:       "excluded." + c.Name,
+			Type:       c.Type,
+			ClientType: c.ClientType,
+			NotNull:    c.NotNull,
 		})
 	}
 	return out

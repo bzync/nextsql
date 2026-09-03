@@ -19,6 +19,10 @@ type Hello struct {
 	Secret   uint64
 	Database string
 	User     string
+	// Realm is an optional trailing field (M2-2): emitted on the wire only
+	// when non-empty, so a Hello with no realm selected is byte-identical to
+	// the pre-realm wire shape. See EncodeHello/DecodeHello.
+	Realm string
 }
 
 type HelloOK struct {
@@ -105,7 +109,7 @@ type ErrorMsg struct {
 
 func EncodeHello(h Hello, lim Limits) ([]byte, error) {
 	lim = lim.normalized()
-	buf := make([]byte, 0, 16+len(h.Database)+len(h.User))
+	buf := make([]byte, 0, 16+len(h.Database)+len(h.User)+len(h.Realm))
 	var hdr [12]byte
 	encoding.PutU16(hdr[:], 0, h.Version)
 	encoding.PutU16(hdr[:], 2, h.Flags)
@@ -117,6 +121,13 @@ func EncodeHello(h Hello, lim Limits) ([]byte, error) {
 	}
 	if buf, err = appendU16String(buf, h.User, lim.MaxName); err != nil {
 		return nil, err
+	}
+	// Realm is emitted only when selected, so an unconfigured client's Hello
+	// is byte-identical to the pre-realm wire shape (docs/design-multidatabase-dbaas.md §19 item 7).
+	if h.Realm != "" {
+		if buf, err = appendU16String(buf, h.Realm, lim.MaxName); err != nil {
+			return nil, err
+		}
 	}
 	return buf, nil
 }
@@ -140,6 +151,16 @@ func DecodeHello(b []byte, lim Limits) (Hello, error) {
 	h.User, off, err = readU16String(b, off, lim.MaxName)
 	if err != nil {
 		return Hello{}, err
+	}
+	// Optional trailing field, present only from a client that selected a
+	// realm (see EncodeHello). Absent entirely from an old-shape Hello, in
+	// which case off == len(b) already and Realm stays "". Mirrors NSCT's
+	// V1 tail-sniff (internal/catalog/encode.go).
+	if off < len(b) {
+		h.Realm, off, err = readU16String(b, off, lim.MaxName)
+		if err != nil {
+			return Hello{}, err
+		}
 	}
 	if off != len(b) {
 		return Hello{}, protoErr("trailing hello bytes")

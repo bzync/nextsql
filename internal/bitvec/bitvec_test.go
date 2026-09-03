@@ -45,7 +45,7 @@ func TestEncodeDecodeRoundTrip(t *testing.T) {
 }
 
 func TestEncodeClearsPadBits(t *testing.T) {
-	buf := []byte{0xff} // 1 byte = Bytes(3)
+	buf := []byte{0xff}             // 1 byte = Bytes(3)
 	Encode(buf, []float32{1, 0, 0}) // 3 elements, 5 pad bits in this byte
 	if buf[0] != 0x01 {
 		t.Fatalf("pad bits not cleared: %#v", buf)

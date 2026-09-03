@@ -2,6 +2,7 @@ package txn
 
 import (
 	"sync"
+	"sync/atomic"
 
 	"github.com/bzync/nextsql/internal/nerr"
 	"github.com/bzync/nextsql/internal/storage/format"
@@ -25,6 +26,11 @@ type Manager struct {
 	status   map[format.TxnID]Status
 	Locks    *LockManager
 	cv       *sync.Cond
+	// onlineBuilds counts in-progress online index rebuilds. While non-zero,
+	// lockWrite never takes its single-writer fast path, so every row write
+	// acquires its key lock and serializes with an online rebuild's
+	// per-row backfill probe. See executor.rebuildIndexOnline.
+	onlineBuilds atomic.Int64
 }
 
 func NewManager(next format.TxnID) *Manager {
@@ -212,6 +218,38 @@ func (m *Manager) HasForeign(self format.TxnID) bool {
 	return false
 }
 
+// BeginOnlineBuild / EndOnlineBuild bracket an online index rebuild.
+// OnlineBuildActive reports whether any is in progress.
+func (m *Manager) BeginOnlineBuild() {
+	if m != nil {
+		m.onlineBuilds.Add(1)
+	}
+}
+
+func (m *Manager) EndOnlineBuild() {
+	if m != nil {
+		m.onlineBuilds.Add(-1)
+	}
+}
+
+func (m *Manager) OnlineBuildActive() bool {
+	return m != nil && m.onlineBuilds.Load() > 0
+}
+
+// ActiveWriterIDs returns the ids of every in-progress write transaction.
+func (m *Manager) ActiveWriterIDs() []format.TxnID {
+	if m == nil {
+		return nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]format.TxnID, 0, len(m.active))
+	for id := range m.active {
+		out = append(out, id)
+	}
+	return out
+}
+
 func (m *Manager) WaitDone(id format.TxnID) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -230,16 +268,20 @@ func (m *Manager) StatusFn() func(format.TxnID) Status {
 // LockKey takes a key lock for h. btree.Txn.lockWrite skips this under
 // SNAPSHOT / RC when ActiveCount()<=1; callers that must conflict on a
 // key they do not write (foreign keys) have to call LockKey themselves.
-func (m *Manager) LockKey(h *Handle, key []byte, mode Mode) error {
+// tag labels the lock for introspection (system.locks) — typically a table
+// name; pass "" when none is available.
+func (m *Manager) LockKey(h *Handle, key []byte, mode Mode, tag string) error {
 	if h == nil {
 		return nerr.New(nerr.InvalidArgument, "txn.LockKey", "nil handle")
 	}
-	return m.Locks.Acquire(h.ID, key, mode)
+	return m.Locks.Acquire(h.ID, key, mode, tag)
 }
 
-func (m *Manager) LockRange(h *Handle, start, end []byte, mode Mode) error {
+// LockRange takes a range lock for h. tag labels the lock for introspection
+// (system.locks) — typically a table name; pass "" when none is available.
+func (m *Manager) LockRange(h *Handle, start, end []byte, mode Mode, tag string) error {
 	if h == nil {
 		return nerr.New(nerr.InvalidArgument, "txn.LockRange", "nil handle")
 	}
-	return m.Locks.AcquireRange(h.ID, start, end, mode)
+	return m.Locks.AcquireRange(h.ID, start, end, mode, tag)
 }

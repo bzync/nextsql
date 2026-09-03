@@ -214,6 +214,10 @@ CREATE SCHEDULE once
 AT '2026-08-25T00:00:00Z'
 RUN WORKFLOW close_period('august');
 
+CREATE SCHEDULE weekday_report
+CRON '30 3 * * 1-5'
+RUN WORKFLOW rollup('daily');
+
 ALTER SCHEDULE hourly RENAME TO hourly_rollup;
 DROP SCHEDULE IF EXISTS once;
 
@@ -223,7 +227,23 @@ CANCEL TASK 's/00000007/1787616000000000000';
 
 `EVERY` accepts a native Go-style duration from one second through 8760 hours.
 `AT` accepts a future RFC 3339 timestamp and is stored as a canonical UTC Unix
-nanosecond. V1 arguments are literals, are capped at 64, and are type-checked
+nanosecond.
+
+`CRON` accepts a standard five-field expression —
+`minute hour day-of-month month day-of-week`, all evaluated in **UTC**. Each
+field is `*`, a value, an inclusive range `a-b`, a comma list, or a step
+`*/n` / `a-b/n`; day-of-week is `0`–`6` with Sunday `0` (a bare `7` also
+means Sunday). Month and weekday names, `@`-macros, seconds, and the
+`L`/`W`/`#` qualifiers are not supported. When both the day-of-month and
+day-of-week fields are restricted, a day matches if **either** field matches
+(Vixie-cron semantics). The expression is validated at definition time —
+including a bounded forward search that rejects an unsatisfiable spec such
+as `0 0 30 2 *` — and stored in its canonical single-space form; the
+computed next firing is a `CRON` schedule's only durable cursor (its
+interval field is zero). The catalog descriptor is `NSSC` **v2**; v1
+descriptors (no cron field) still decode.
+
+V1 arguments are literals, are capped at 64, and are type-checked
 against the referenced workflow at definition time. A schedule stores its
 stable workflow ID, owner, creation time, last firing, and next firing. The
 versioned legacy tenant field is empty for new schedules.

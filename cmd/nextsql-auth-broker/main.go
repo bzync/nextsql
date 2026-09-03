@@ -13,12 +13,8 @@ package main
 
 import (
 	"context"
-	"crypto/tls"
-	"errors"
 	"flag"
 	"fmt"
-	"net"
-	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -27,7 +23,6 @@ import (
 	"github.com/bzync/nextsql/internal/authbroker"
 	"github.com/bzync/nextsql/internal/logging"
 	"github.com/bzync/nextsql/internal/nerr"
-	"github.com/bzync/nextsql/internal/security"
 	"github.com/bzync/nextsql/internal/version"
 )
 
@@ -64,29 +59,11 @@ func run() error {
 		return err
 	}
 
-	if security.RequireTLS(cfg.Listen) && cfg.TLSCert == "" {
-		return nerr.New(nerr.InvalidArgument, "nextsql-auth-broker", "a non-loopback listen address requires tls_cert and tls_key")
-	}
-
-	srv := &http.Server{
-		Handler:           broker.Handler(),
-		ReadHeaderTimeout: 10 * time.Second,
-		ReadTimeout:       20 * time.Second,
-		WriteTimeout:      20 * time.Second,
-		IdleTimeout:       60 * time.Second,
-	}
-	if cfg.TLSCert != "" {
-		tlsCfg, err := security.ServerTLS(cfg.TLSCert, cfg.TLSKey)
-		if err != nil {
-			return err
-		}
-		srv.TLSConfig = tlsCfg
-	}
-
-	ln, err := net.Listen("tcp", cfg.Listen)
+	srv, err := authbroker.NewHTTPServer(cfg, broker.Handler())
 	if err != nil {
-		return nerr.Wrap(nerr.IO, "nextsql-auth-broker", "listen", err)
+		return err
 	}
+	defer srv.Close()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -107,13 +84,9 @@ func run() error {
 
 	errc := make(chan error, 1)
 	go func() {
-		if srv.TLSConfig != nil {
-			errc <- srv.ServeTLS(tlsListener(ln, srv.TLSConfig), "", "")
-		} else {
-			errc <- srv.Serve(ln)
-		}
+		errc <- srv.Serve()
 	}()
-	log.Info("nextsql-auth-broker: listening", "addr", cfg.Listen, "tls", srv.TLSConfig != nil, "profiles", len(cfg.Profiles))
+	log.Info("nextsql-auth-broker: listening", "addr", srv.Addr().String(), "tls", srv.TLS(), "profiles", len(cfg.Profiles))
 
 	select {
 	case <-ctx.Done():
@@ -121,13 +94,6 @@ func run() error {
 		defer cancel()
 		return srv.Shutdown(shutCtx)
 	case err := <-errc:
-		if errors.Is(err, http.ErrServerClosed) {
-			return nil
-		}
 		return err
 	}
-}
-
-func tlsListener(inner net.Listener, cfg *tls.Config) net.Listener {
-	return tls.NewListener(inner, cfg)
 }

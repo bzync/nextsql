@@ -9,7 +9,7 @@ soak_ops=${NEXTSQL_BTREE_OPS:-100000000}
 # set NEXTSQL_BTREE_SPACE to cap the key space so the tree fits the pool.
 soak_pool_pages=${NEXTSQL_BTREE_POOL_PAGES:-24576}
 soak_space=${NEXTSQL_BTREE_SPACE:-}
-soak_gomemlimit=${NEXTSQL_SOAK_GOMEMLIMIT:-3GiB}
+soak_gomemlimit=${NEXTSQL_SOAK_GOMEMLIMIT:-6GiB}
 # GOGC 40 (was 25): fewer GC cycles per unit work once the pool is large enough
 # to hold the working set, without a large heap ceiling.
 soak_gogc=${NEXTSQL_SOAK_GOGC:-40}

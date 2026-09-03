@@ -69,7 +69,9 @@ Internal format and design notes live in [`docs/`](docs/). This file is the oper
 
 22. [Limits and current gaps](#22-limits-and-current-gaps)
 
-23. [Further reading](#23-further-reading)
+23. [System catalog](#23-system-catalog)
+
+24. [Further reading](#24-further-reading)
 
 ---
 
@@ -213,7 +215,7 @@ Confirm:
 
 ```
 
-Official drivers live in the same tree (`drivers/go`, `drivers/node`, `drivers/bun`, `drivers/deno`, `drivers/php`). They are not published as public packages.
+Official drivers live in the same tree (`drivers/go`, `drivers/node`, `drivers/bun`, `drivers/deno`, `drivers/php`, `drivers/python`, `drivers/ruby`). They are not published as public packages.
 
 ---
 
@@ -1242,7 +1244,15 @@ nextsql hosting  set-database-cap --data-dir DIR --key-file FILE
 
 nextsql hosting  show --data-dir DIR --key-file FILE [--instance-key-file FILE]
 
-nextsql exec     [--addr HOST:PORT] [--user NAME] [--password-file FILE]
+nextsql login    --idp NAME [--addr HOST:PORT] [--idp-config FILE]
+
+                 [--database NAME] [--realm NAME] [--no-browser] [--timeout DURATION]
+
+nextsql logout   (--idp NAME --addr HOST:PORT | --all)
+
+nextsql whoami   --idp NAME [--addr HOST:PORT] [--idp-config FILE] [--json]
+
+nextsql exec     [--addr HOST:PORT] [--user NAME] [--password-file FILE | --idp NAME]
 
                  [--database NAME] [--tls-ca FILE | --insecure]
 
@@ -1260,6 +1270,10 @@ nextsql migrate  status|pending|version|validate|create|up|down|force|repair
 
 nextsql backup   --data-dir DIR --key-file FILE --out DIR
 
+nextsql backup list  --base-dir DIR
+
+nextsql backup prune --base-dir DIR (--keep-count N | --keep-days N) [--confirm]
+
 nextsql restore  --from DIR --data-dir DIR --key-file FILE
 
                  [--wal-archive DIR] [--until-lsn N | --until RFC3339]
@@ -1272,7 +1286,7 @@ nextsql import   --from DIR --data-dir DIR --key-file FILE
 
 nextsql diagnose --data-dir DIR
 
-nextsql status   [--addr HOST:PORT] [--user NAME] [--password-file FILE]
+nextsql status   [--addr HOST:PORT] [--user NAME] [--password-file FILE | --idp NAME]
 
                  [--database NAME] [--tls-ca FILE | --insecure]
 
@@ -1281,6 +1295,14 @@ nextsql status   [--addr HOST:PORT] [--user NAME] [--password-file FILE]
 nextsql status --local [--data-dir DIR] [--key-file FILE]
 
 nextsql cluster status --data-dir DIR
+
+nextsql cluster transfer-leader [--addr HOST:PORT] [--user NAME] [--password-file FILE]
+
+                 [--database NAME] [--tls-ca FILE | --insecure] [--env-file PATH | --no-env]
+
+nextsql cluster drain [--timeout-ms N] [--addr HOST:PORT] [--user NAME] [--password-file FILE]
+
+                 [--database NAME] [--tls-ca FILE | --insecure] [--env-file PATH | --no-env]
 
 nextsql token    keygen --keyset FILE
 
@@ -1296,6 +1318,14 @@ nextsql token    keygen --keyset FILE
 
                  verify --keyset FILE [--revocations FILE] [--audience S] TOKEN
 
+nextsql audit    keygen --keyset FILE
+
+                 rotate --keyset FILE | retire --keyset FILE --key-id N
+
+                 list-keys --keyset FILE | export-public --keyset FILE --out FILE
+
+                 verify --file FILE [--keyset FILE | --pubkey FILE] [--json]
+
 nextsql version
 
 nextsql help
@@ -1306,7 +1336,7 @@ nextsql help
 
 ### External identity (OIDC) broker
 
-`nextsql-auth-broker` is an optional standalone service that lets an operator delegate *who a person is* to an OpenID Connect provider while NextSQL keeps full control of *what they may do*. It runs the OIDC flow, validates the IdP ID token against a cached JWKS, maps the verified claims to a native principal and role set through an `NSIP` identity policy, and mints an ordinary `NSSC1.` short-lived credential. `nextsqld` gains **no** OIDC parsing and makes **no** outbound calls — it just needs the broker's public issuing key in `token_verify_keyset`.
+The authentication broker lets an operator delegate *who a person is* to an OpenID Connect provider while NextSQL keeps full control of *what they may do*. It runs standalone as `nextsql-auth-broker`, or inside a single-node `nextsqld` on a separate listener. It validates an IdP ID token or explicitly enabled client-credentials JWT access token against a cached JWKS, maps the verified claims to a native principal and role set through an `NSIP` identity policy, and mints an ordinary `NSSC1.` short-lived credential. The SQL listener gains **no** OIDC parsing and makes **no** outbound calls — it only needs the broker's public issuing key in `token_verify_keyset`.
 
 ```text
 
@@ -1329,6 +1359,7 @@ oidc_credential_ttl = 1h
 [idp "corp"]
 issuer     = https://corp.okta.com/oauth2/abc
 client_id  = 0oa...
+access_token_audience = api://nextsql-broker  # enables JWT client-credentials exchange
 jwks_uri   = https://corp.okta.com/oauth2/abc/v1/keys
 group_claim = groups
 
@@ -1336,7 +1367,93 @@ group_claim = groups
 
 Create the issuing keyset with `nextsql token keygen --keyset broker-issuing.nstk`, then `nextsql token export-public --keyset broker-issuing.nstk --out verify.nstk` and point every server's `token_verify_keyset` at `verify.nstk`. The minted credential's lifetime is `min(oidc_credential_ttl, time until the IdP token expires)`; its roles are the policy-mapped set, and the server's `ACL.AllowedScoped` still drops any role the principal does not actually hold.
 
-The client-side `nextsql login` flow, the `oidc` audit `identity_source`, the OAuth2 client-credentials grant, and the embedded-in-`nextsqld` broker mode are not built yet.
+To label broker-issued sessions in `nextsql.audit`, dedicate the broker key and
+configure its ids beside the verify keyset:
+
+```text
+token_verify_keyset=/etc/nextsql/token.keyset.pub
+token_identity_source_hint=7:oidc,9:oidc
+```
+
+The bounded map is consulted only after the Ed25519 signature verifies. A
+mapped credential records `identity_source` `oidc` (or `mtls+oidc`); forged,
+unverified, or unhinted credentials remain `token` / `mtls+token`. No source
+claim is trusted, and no credential-format or NSQL wire change is involved.
+
+Configure an interactive client profile in
+`~/.config/nextsql/config.toml` (or pass `--idp-config`):
+
+```toml
+[idp.corp]
+issuer = "https://corp.okta.com/oauth2/abc"
+client_id = "0oa..."
+client_secret_file = "/run/secrets/nextsql-oidc-client" # confidential workloads only
+broker_url = "https://auth.db.internal"
+scopes = ["openid", "profile", "email", "groups"]
+```
+
+Then sign in and connect without putting an ID token or NextSQL credential on
+the command line:
+
+```bash
+nextsql login --idp corp --addr db.internal:7210 --database production
+nextsql whoami --idp corp --addr db.internal:7210
+nextsql exec --idp corp --addr db.internal:7210 --database production \
+  --tls-ca /etc/nextsql/ca.pem -c 'SELECT 1'
+nextsql logout --idp corp --addr db.internal:7210
+```
+
+Login uses OIDC Authorization Code + PKCE S256 with a random state/nonce and a
+transient `127.0.0.1` callback. `--no-browser` prints the authorization URL for
+manual opening. The broker-minted `NSSC1.` credential and an IdP refresh token,
+when issued, are atomically stored in mode-`0600` files under the user's
+mode-`0700` NextSQL credentials directory, keyed by IdP+server. Expired
+credentials refresh silently; without a refresh token the command fails closed
+and asks for a new interactive login. Redirected token/broker POSTs are never
+followed, HTTP and stored-credential bodies are capped at 1 MiB, and symlink or
+group/other-readable credential files are rejected. `logout` removes the local
+secret; server-side revocation remains `nextsql token revoke`. Mode `0600` does
+not protect against a process already running as your OS account; OS-keychain
+integration remains a follow-on.
+
+For a confidential workload whose IdP issues asymmetric JWT access tokens,
+protect the client secret in a regular mode-`0600` file, configure
+`access_token_audience` on the matching broker profile, and run:
+
+```bash
+nextsql login --idp corp --addr db.internal:7210 --database production \
+  --client-credentials --client-secret-file /run/secrets/nextsql-oidc-client
+nextsql exec --idp corp --addr db.internal:7210 --database production \
+  --tls-ca /etc/nextsql/ca.pem -c 'SELECT 1'
+```
+
+The broker validates issuer, asymmetric signature, configured resource
+audience, expiry, and exact `client_id`/`azp` binding before applying the same
+`NSIP` and RBAC narrowing as interactive login. The secret never reaches the
+broker or credential store; expired workload credentials renew from the secret
+file. Opaque access tokens/RFC 7662 introspection remains optional and is not
+built.
+
+For a single-node/non-HA deployment, host the same broker in `nextsqld`:
+
+```bash
+nextsqld --data-dir /var/lib/nextsql --key-file /run/keys/root.key \
+  --config /etc/nextsql/nextsqld.conf \
+  --auth-broker-listen 127.0.0.1:8645 \
+  --auth-broker-config /etc/nextsql/auth-broker.conf
+```
+
+When `--auth-broker-config` is omitted, the broker file defaults to
+`DATA-DIR/nextsql-auth-broker.conf`; its format is exactly the standalone file
+shown above. The `listen` value in that file is used unless
+`--auth-broker-listen` overrides it. A non-loopback broker listener requires
+the broker config's own `tls_cert`/`tls_key`. Embedded mode requires
+`token_verify_keyset`, verifies that it accepts the private broker issuer key,
+and is rejected when Raft is enabled; use the standalone broker for HA. On
+`SIGHUP`, the token verifier reloads before a compatible issuer key is
+published. Each exchange checks that the mapped native user still exists and
+intersects mapped roles with the live direct/transitive ACL memberships; an
+empty result is denied. Optional JIT provisioning remains off and unimplemented.
 
 ### Hosting dotenv configuration
 
@@ -1386,7 +1503,7 @@ For an mTLS server, pass `--tls-client-cert FILE --tls-client-key FILE` (or
 `nextsql://service/<principal>` URI matching the database user. Both files are
 required together and `--tls-ca` remains required.
 
-### Client configuration (`exec`)
+### Client configuration (`exec` / server-mode `status` / OIDC login)
 
 Priority, highest wins: explicit flags (including empty strings) > non-empty process environment > `.env.local` (cwd only) > `.env` (walk from the working directory toward `/`, at most 16 levels) > defaults.
 
@@ -1403,6 +1520,10 @@ Priority, highest wins: explicit flags (including empty strings) > non-empty pro
 | `NEXTSQL_DATABASE_PASSWORD_FILE` | Database/client password file (newline stripped) | none |
 
 | `NEXTSQL_DATABASE_PASS` | Inline database/client password (CI convenience) | none |
+
+| `NEXTSQL_IDP` | Named `[idp.NAME]` profile; replaces password auth with a stored broker credential | none |
+
+| `NEXTSQL_IDP_CONFIG` | OIDC client profile file | user config dir `nextsql/config.toml` |
 
 | `NEXTSQL_DATABASE` | Hello database; validated against registered default when present | empty (select default) |
 
@@ -1793,6 +1914,8 @@ nextsqld --data-dir DIR --key-file FILE [--instance-key-file FILE]
 
          [--tls-cert FILE --tls-key FILE [--tls-client-ca FILE [--tls-client-crl FILE]]]
 
+         [--auth-broker-listen ADDR [--auth-broker-config FILE]]
+
          [--require-client-key]
 
          [--user NAME --password-file FILE]
@@ -1839,6 +1962,12 @@ token_revocations=
 
 token_audience=
 
+token_identity_source_hint=
+
+auth_broker_config=
+
+auth_broker_listen=
+
 require_client_key=false
 
 audit_file=
@@ -1852,6 +1981,14 @@ max_query_queue=128
 query_queue_wait_ms=5000
 
 max_result_rows=1000000
+
+max_connections=128
+
+max_connections_per_user=0
+
+idle_timeout_ms=60000
+
+shutdown_drain_ms=30000
 
 node_id=
 
@@ -1873,7 +2010,11 @@ Defaults: 32 in-flight, 128 queued, 5 s wait.
 
 Per-query budgets (defaults): 64 MiB memory, 256 MiB spill, 1 GiB I/O, 30 s, 1 000 000 result rows / 64 MiB result bytes. Exceeding a budget fails with `exhausted`. Worker goroutines are bounded (`min(GOMAXPROCS, 8)` per query through a process pool).
 
-Wire defaults: 1 MiB packet, 1 MiB SQL, 256 parameters, 64 prepared statements per session, 128 concurrent sessions, 60 s idle.
+Wire defaults: 1 MiB packet, 1 MiB SQL, 256 parameters, 64 prepared statements per session, 128 concurrent sessions, 60 s idle. `max_connections` and `idle_timeout_ms` override the session cap and idle deadline; `max_connections_per_user` (0 = unlimited) additionally caps concurrent authenticated connections per user name, rejecting an over-limit connection after authentication with `exhausted`. All three are node-local, not cluster-synchronized.
+
+### Graceful shutdown
+
+On SIGINT/SIGTERM, `nextsqld` stops accepting new connections and closes each existing one as soon as it becomes idle (no in-flight statement, no open transaction) rather than force-aborting it. `shutdown_drain_ms` (default 30000) bounds how long it waits for a busy connection before force-closing it; `0` disables waiting (immediate hard close, the pre-P27 behavior).
 
 ---
 
@@ -1894,6 +2035,10 @@ Official drivers speak NSQL v1. **Do not put keys or passwords in a URL.** TLS 1
 | Deno | [`drivers/deno`](drivers/deno) | `import { connect } from "./mod.ts"` |
 
 | PHP 8.1+ | [`drivers/php`](drivers/php) | `NextSQL\Client::connect([…])` |
+
+| Python 3.10+ | [`drivers/python`](drivers/python) | `nextsql.connect(nextsql.Config(…))` |
+
+| Ruby 3.0+ | [`drivers/ruby`](drivers/ruby) | `NextSQL.connect(NextSQL::Config.new(…))` |
 
 Shared TypeScript types: [`drivers/js/types.d.ts`](drivers/js/types.d.ts).
 
@@ -2099,6 +2244,73 @@ $conn = NextSQL\Client::connect([
 
 ```
 
+### Python 3.10+
+
+Stdlib only, not published to PyPI — import from the tree directly.
+
+```python
+
+import sys
+sys.path.insert(0, 'drivers/python')
+import nextsql
+
+conn = nextsql.connect(nextsql.Config(
+    address='127.0.0.1:7210',
+    user='app',
+    password=os.environ['NEXTSQL_DATABASE_PASS'],
+    insecure_no_tls=True,
+))
+res = conn.exec('SELECT name FROM items WHERE price < $1', [decimal.Decimal('50.00')])
+conn.close()
+
+```
+
+Remote TLS:
+
+```python
+
+conn = nextsql.connect(nextsql.Config(
+    address='db.example.com:7210',
+    user='app',
+    password=os.environ['NEXTSQL_DATABASE_PASS'],
+    tls=nextsql.TLSConfig(cafile='/etc/nextsql/ca.pem', server_name='db.example.com'),
+))
+
+```
+
+### Ruby 3.0+
+
+Stdlib only, not published as a gem — require from the tree directly.
+
+```ruby
+
+$LOAD_PATH.unshift('drivers/ruby/lib')
+require 'nextsql'
+
+conn = NextSQL.connect(NextSQL::Config.new(
+  address: '127.0.0.1:7210',
+  user: 'app',
+  password: ENV['NEXTSQL_DATABASE_PASS'],
+  insecure_no_tls: true,
+))
+res = conn.exec('SELECT name FROM items WHERE price < $1', [BigDecimal('50.00')])
+conn.close
+
+```
+
+Remote TLS:
+
+```ruby
+
+conn = NextSQL.connect(NextSQL::Config.new(
+  address: 'db.example.com:7210',
+  user: 'app',
+  password: ENV['NEXTSQL_DATABASE_PASS'],
+  tls: NextSQL::TLSConfig.new(cafile: '/etc/nextsql/ca.pem', server_name: 'db.example.com'),
+))
+
+```
+
 ---
 
 ## 17. TLS and client-held keys
@@ -2167,7 +2379,8 @@ an old+new CA overlap bundle during trust rotation. OCSP is not implemented.
 A signed short-lived credential is presented **in place of the password** (same
 `Config.Password` / `--password-file` slot, no driver change). Enable
 verification with `token_verify_keyset=FILE`; optionally add
-`token_revocations=FILE` and `token_audience=STRING`. `SIGHUP` reloads the
+`token_revocations=FILE`, `token_audience=STRING`, and the audit-only bounded
+`token_identity_source_hint=KEY_ID:oidc[,KEY_ID:oidc...]`. `SIGHUP` reloads the
 keyset and revocation list (last known-good on failure).
 
 ```
@@ -2222,7 +2435,49 @@ Drivers:
 
 - PHP: `'key' => $clientRoot` (32-byte string).
 
-Field-level `ENCRYPTED CLIENT` columns are designed but **not implemented**. See [`docs/security.md`](docs/security.md).
+Field-level `ENCRYPTED CLIENT` columns are **experimental**. The randomized
+`NSCE1.` SQL/catalog/server path, helpers for Go, Node.js/TypeScript, Bun,
+Deno, and PHP, PITR, replication/failover, and durable key-rotation/revocation
+(`FileFieldKeyring`) are all implemented and tested; formal production gating
+awaits the phase-wide P25 exit gate. See
+[`docs/client-encryption.md`](docs/client-encryption.md).
+
+### Tamper-evident audit chain
+
+Every new `nextsql.audit` record carries a versioned hash-chain trailer
+(`seq`, `prev_hash`, `hash`), and a rotatable Ed25519 keyset can additionally
+sign each record. Verification detects a tampered, reordered, or deleted
+line; an unsigned chain still detects accidental corruption, while signed
+records cannot be rewritten without an accepted private key.
+
+```bash
+# once: create a signer keyset, then a verify-only copy for auditors
+nextsql audit keygen --keyset /secure/nextsql-audit.nsak
+nextsql audit export-public --keyset /secure/nextsql-audit.nsak \
+  --out /verify/nextsql-audit-public.nsak
+
+# configure the server to sign new records
+nextsqld --audit-signing-keyset /secure/nextsql-audit.nsak ...
+
+# verify the chain (and every signature, given a keyset)
+nextsql audit verify --file /var/lib/nextsql/nextsql.audit \
+  --pubkey /verify/nextsql-audit-public.nsak
+nextsql audit verify --file /var/lib/nextsql/nextsql.audit --json
+
+# rotate the signing key (overlap), then retire the old one later
+nextsql audit rotate --keyset /secure/nextsql-audit.nsak
+kill -HUP <nextsqld-pid>
+nextsql audit retire --keyset /secure/nextsql-audit.nsak --key-id 1
+```
+
+`SIGHUP` reloads the signing keyset with last-known-good fallback. A file
+with no signer configured stays a plain hash chain (accidental-corruption
+detection only); once a signer appends the first signed record, every later
+chained record must be signed and the server refuses to reopen the file
+without a keyset. Neither an unsigned chain nor per-record signatures alone
+prove that an attacker did not delete a valid final suffix — see
+[`docs/security.md`](docs/security.md) "Versioned hash chain and optional
+signatures" for the full threat boundary.
 
 ---
 
@@ -2412,6 +2667,34 @@ Only **one** node bootstraps. The other two use the same `--raft-join` list with
 
 ```
 
+Before restarting or taking the current leader down for maintenance, hand
+off leadership first so the new leader is already serving before the old one
+stops:
+
+```bash
+
+./nextsql cluster transfer-leader --addr 10.0.0.1:7210 --user app --password-file /tmp/nextsql.pw
+
+# result
+
+# transfer_initiated
+
+```
+
+Drain a specific node for planned maintenance — no signal or restart
+required, and no Raft leadership requirement (a follower is exactly as
+drainable as a leader):
+
+```bash
+
+./nextsql cluster drain --addr 10.0.0.2:7210 --user app --password-file /tmp/nextsql.pw --timeout-ms 30000
+
+# result
+
+# drain_initiated
+
+```
+
 A wiped replica is restored with `nextsql backup` / `restore` (same identity and keys), then rejoined. Raft logs are ciphertext (replication DEK). HA is not a substitute for backups.
 
 ### Read consistency and follower reads
@@ -2594,9 +2877,9 @@ P17/P18 added user-visible behavior that older copies of this manual did not des
 
 - P24 Full-text Search 2.0 is complete; further language analyzers beyond `simple` / `english` / `french` / `german` / `spanish` and additional runtime/index optimizations are documented non-gate follow-ons
 
-- P25 Security 2.0 remains open: mTLS/service identities, live certificate/trust rotation, X.509 CRL revocation, and signed short-lived credentials (format, expiry, audience/database/role/realm scope, signing-key rotation, revocation, audit) are implemented; OCSP, external IdP, field-level client encryption, password-hash evolution, and audit hardening remain open
+- P25 Security 2.0 is **complete** (exit gate closed 2026-09-02, `docs/security.md` "P25 security review sign-off"): mTLS/service identities, live certificate/trust rotation, X.509 CRL revocation, signed short-lived credentials, the external-IdP broker, field-level client encryption (experimental SQL/catalog/server slice, all official drivers, PITR, replication/failover, and `FileFieldKeyring` key rotation/revocation), Argon2id password hashing, and tamper-evident/signed audit-chain hardening are all production-gated. OCSP and optional OIDC opaque introspection/JIT remain off by design, not as open blockers
 
-- P26 system catalog / introspection 2.0
+- P26 System catalog / introspection 2.0 is **complete** (exit gate closed 2026-09-02, `docs/system-catalog.md` "P26 exit gate closure"): the virtual `system` schema (catalog/storage/replication/live session/security-administration tables), nine `SHOW` convenience aliases, and an authoritative capability registry are all production-gated. The current release gate is P27 Operational maturity + workload governance
 
 - P27 workload governance / operational maturity
 
@@ -2643,7 +2926,52 @@ Check `TODO.md`, server capability metadata when available, and the matching-ver
 
 ---
 
-## 23. Further reading
+## 23. System catalog
+
+The virtual `system` schema is a read-only introspection surface: ordinary
+`SELECT`s computed from live server state, not stored rows.
+
+```sql
+SELECT * FROM system.tables;
+SELECT name, remote FROM system.sessions WHERE state = 'active';
+SELECT sql FROM system.active_queries;
+```
+
+`WHERE`, `ORDER BY`, `LIMIT`, `DISTINCT`, and typed parameters are
+supported; `JOIN` and `GROUP BY` are not. Every session needs `CONNECT` on
+the database; some tables layer RBAC filtering on top.
+
+Catalog/storage tables (always visible, or filtered to tables you can
+`SELECT`): `capabilities`, `tables`, `columns`, `indexes`, `table_stats`,
+`index_stats`, `partitions`, `storage`, `replication` (alias `raft`),
+`replica_health`, `workflows`, `tasks`.
+
+Live, node-local, in-memory tables — cleared on restart, not replicated, one
+per `nextsqld` process; a non-admin sees only their own rows:
+
+- `sessions` — one row per connected session (`session_id, user, remote,
+  state`); `state` is `active` while executing a statement, else `idle`.
+- `active_queries` — one row per session currently executing a statement
+  (`query_id, user, sql, state`), including your own running query.
+- `transactions` — one row per session with an open transaction (`txn_id,
+  user, isolation, state`).
+- `change_streams` — one row per open `SUBSCRIBE` on this node (`table_name,
+  lsn, state`), visible to sessions that can see the underlying table.
+- `locks` — one row per currently held key or range lock (`lock_id,
+  table_name, mode, granted`); `mode` is `shared`/`exclusive`, `granted` is
+  always `true` (waiting requests aren't shown). `table_name` is best-effort
+  (see [docs/system-catalog.md](docs/system-catalog.md)).
+
+The convenience aliases `SHOW DATABASES`, `SHOW TABLES`, `SHOW INDEXES`,
+`SHOW CONNECTIONS`, `SHOW QUERIES`, `SHOW TRANSACTIONS`, `SHOW LOCKS`,
+`SHOW CLUSTER`, and `SHOW STORAGE` read the same permission-filtered
+`system.*` sources. They accept no clauses; use a direct system-table query
+for filtering, ordering, or pagination. Full reference:
+[docs/system-catalog.md](docs/system-catalog.md).
+
+---
+
+## 24. Further reading
 
 | Document | Topic |
 

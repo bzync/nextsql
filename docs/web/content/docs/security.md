@@ -26,7 +26,7 @@ The deployment registry uses a separate external root
 off the data volume. This M1 foundation does not yet implement realm-local
 authentication or selectable database engines.
 
-Online DEK rotation, key-version revocation (kills sessions), and crypto-shred of the keystore are in the production surface. Field-level `ENCRYPTED CLIENT` columns are designed but **not implemented**.
+Online DEK rotation, key-version revocation (kills sessions), and crypto-shred of the keystore are in the production surface. Field-level `ENCRYPTED CLIENT` columns are **experimental**: the randomized `NSCE1.` server/catalog path and Go, Node.js/TypeScript, Bun, Deno, and PHP helpers ship, while PITR and HA coverage remain open. The server stores only opaque ciphertext and rejects predicates, indexes, and search on these fields.
 
 ## Bootstrap
 
@@ -41,6 +41,7 @@ GRANT analyst TO reporter;
 GRANT SELECT ON TABLE products TO analyst;
 GRANT CDC ON TABLE orders TO streamer;
 GRANT ADMIN ON CLUSTER TO dba;
+GRANT USAGE ON RESOURCE GROUP reporting TO analyst;
 REVOKE SELECT ON TABLE products FROM analyst;
 DROP USER reporter;
 ```
@@ -71,6 +72,41 @@ credential for a principal issued before a cutoff; `SIGHUP` reloads both. Manage
 everything with `nextsql token` (`keygen`, `export-public`, `mint`, `revoke`,
 `rotate`, `retire`, `verify`). Auth audit records `identity_source` `token` or
 `mtls+token`. Engine note: [`docs/security.md`](https://github.com/bzync/nextsql/blob/main/docs/security.md).
+
+## External identity (OIDC)
+
+The broker, run as `nextsql-auth-broker` or embedded on a separate single-node
+`nextsqld` listener, validates an external OIDC ID token or
+explicitly enabled client-credentials JWT access token against a bounded cached
+JWKS, maps verified claims through the `NSIP` identity policy,
+and mints the same short-lived `NSSC1.` credential. `nextsqld` stays offline and
+never parses an OIDC token. `nextsql login --idp NAME` implements browser
+Authorization Code + PKCE S256 with state/nonce and a transient loopback
+callback; `nextsql exec --idp NAME` and server `status --idp NAME` use the
+stored credential, renewing it with an IdP refresh token when available.
+`whoami` reports non-secret metadata and `logout` removes the local secret.
+
+To distinguish broker-issued sessions in the server audit, dedicate the
+broker's signing key and configure
+`token_identity_source_hint=KEY_ID:oidc[,KEY_ID:oidc...]` beside
+`token_verify_keyset`. The bounded map is consulted only after the `NSSC1.`
+signature verifies, producing `oidc` or `mtls+oidc`. Forged/unverified tokens
+remain labeled `token`; no source claim is trusted and no token or credential
+is logged.
+
+Credential/refresh-token files are atomically written mode `0600` under a real
+mode-`0700` directory. Redirected token POST replay, oversized responses/files,
+wrong-state callbacks, symlink paths, and group/other-readable files fail
+closed. A same-OS-account compromise can still read this portable file store;
+an OS-keychain backend is a follow-on. OAuth2 client credentials are supported
+when the IdP issues an asymmetric JWT access token: the profile secret comes
+from a mode-`0600` file, and the broker requires its configured resource
+audience plus exact client binding before applying the normal NSIP/RBAC gate.
+Embedded mode uses `--auth-broker-listen` and the standalone-format
+`--auth-broker-config` (default `DATA-DIR/nextsql-auth-broker.conf`). It is
+rejected with Raft, requires TLS off loopback, verifies issuer/server keyset
+compatibility before startup/reload, and intersects roles with the live native
+ACL. Opaque-token introspection and JIT provisioning remain optional and off.
 
 ## Hosted isolation
 

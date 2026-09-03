@@ -22,7 +22,9 @@ P21      complete — RANGE/HASH/LIST (1–8 col keys) DDL, routing, tuple-tight
 P22      complete — follower reads / read scaling
 P23      complete — Vector Engine 2.0 (quantised types, quantised HNSW, IVF/IVF-PQ, sparse retrieval, dense+sparse+BM25 fusion; production-gating sign-off 2026-08-31)
 P24      complete — Full-text Search 2.0; compatibility, adversarial bounds, quality, and encrypted recovery exit gate closed 2026-08-31
-P25–P30 planned/open
+P25      complete — Security 2.0; mTLS, short-lived credentials, external IdP broker, field-level client encryption, password-hash evolution, and audit-chain hardening all production-gated; exit gate closed 2026-09-02
+P26      complete — System catalog / introspection 2.0; virtual system schema, live session/security-administration tables, SHOW aliases, and an authoritative capability registry all production-gated; exit gate closed 2026-09-02
+P27–P30 planned/open
 Hosting   partial — accepted multi-database M1 registry/bootstrap foundation; selectable multi-engine routing remains open
 ```
 
@@ -58,7 +60,10 @@ The terminal randomized 100M-operation B+Tree invariant soak is a deferred
 standalone measurement, not a release gate (paper-closed 2026-08-30, same
 disposition as P18). P22 follower reads / read scaling is complete (exit gate
 closed 2026-08-30). P23 Vector Engine 2.0 is complete (exit gate closed
-2026-08-31). P24 Full-text Search 2.0 is complete; the current release gate is P25 Security 2.0.
+2026-08-31). P24 Full-text Search 2.0 is complete. P25 Security 2.0 is
+complete (exit gate closed 2026-09-02). P26 System catalog / introspection
+2.0 is complete (exit gate closed 2026-09-02); the current release gate is
+P27 Operational maturity + workload governance.
 
 ---
 
@@ -330,7 +335,8 @@ Documented follow-ons (not gate items):
 
 ## P25 — Security 2.0
 
-Active. The dated checklist audit is recorded in `docs/security.md`. The first
+**Complete (exit gate closed 2026-09-02).** The dated checklist audit and the
+security review sign-off are both recorded in `docs/security.md`. The first
 mTLS/service-identity surface is implemented and tested: a configured client CA
 requires verified client certificates, the URI SAN
 `nextsql://service/<principal>` binds the certificate to the native login user,
@@ -348,9 +354,9 @@ signing keyset (`NSTK`), a fail-closed revocation set (`NSTR`, by token id or
 per-principal cutoff), `SIGHUP` reload, `nextsql token` tooling, and
 `identity_source` audit. Role scope narrows the session and cannot escalate.
 
-Remaining:
+Also production-gated:
 
-- external identity providers — design accepted (`docs/design-oidc-external-idp.md`:
+- external identity providers — required surface complete; design accepted (`docs/design-oidc-external-idp.md`:
   a brokered OIDC token exchange that mints an `NSSC1.` credential, with an
   `NSIP` identity policy whose group→role mapping cannot escalate past native
   RBAC). The offline `NSIP` policy engine (`internal/auth`) and the
@@ -358,26 +364,63 @@ Remaining:
   tested: the broker's `POST /v1/exchange` validates an OIDC ID token against a
   soft/hard-TTL cached JWKS (`internal/oidc`), maps it through the `NSIP`
   policy, and mints an `NSSC1.` credential its issuing `NSTK` key signs — the
-  `nextsqld` SQL auth path is unchanged and never calls the IdP. The client
-  `nextsql login` flow, the `oidc` / `mtls+oidc` audit source, client
-  credentials, the embedded broker mode, and optional JIT provisioning are not
-  built;
-- field-level client encryption;
-- password-hash evolution;
-- audit hardening.
+  `nextsqld` SQL auth path is unchanged and never calls the IdP. The interactive
+  client flow is implemented: `nextsql login` uses discovery + Authorization
+  Code/PKCE + a bounded loopback callback, stores/refreshes the broker-minted
+  credential with strict local permissions, and `exec` / server `status` accept
+  `--idp`; `logout` / `whoami` are available. Server audit labeling is also
+  implemented: a bounded operator map labels only credentials successfully
+  verified by dedicated broker key ids as `oidc` / `mtls+oidc`; forged tokens
+  stay generic and no source claim is trusted. JWT client credentials are also
+  implemented: protected secret-file token acquisition, explicit resource
+  audience + client binding at the broker, and non-interactive renewal. The
+  embedded single-node mode is implemented on a separate bounded listener with
+  issuer/verifier compatibility checks and a live native-user/ACL membership
+  feed. Optional opaque-token introspection and JIT provisioning remain off;
+- field-level client encryption — experimental SQL/catalog/server slice plus
+  portable randomized `NSCE1.` helpers for Go, Node.js/TypeScript, Bun, Deno,
+  and PHP, PITR (exact-ciphertext restore-to-target-LSN), replication/failover
+  (no lost acknowledged ciphertext across a three-voter leader failover), and
+  durable key-rotation/revocation (`FileFieldKeyring` in every official
+  driver) all landed and tested;
+- password-hash evolution — Argon2id migration, versioned records, PBKDF2
+  compatibility, transparent rehash, DoS benchmarks;
+- audit hardening — a versioned hash-chained audit log with optional Ed25519
+  signatures via a rotatable `NSAK` keyset, plus `nextsql audit` verification
+  tooling.
+
+The phase-wide exit gate — a dated security review sign-off — closed
+2026-09-02 (`docs/security.md` "P25 security review sign-off"), so
+`ENCRYPTED CLIENT` and every item above is now formally production-gated.
+`ENCRYPTED CLIENT` stays labeled `experimental` in `system.capabilities` only
+because no searchable/deterministic mode ships (a deliberate scope decision,
+not an open blocker).
 
 ---
 
-## P26 — System Introspection 2.0
+## P26 — System catalog / introspection 2.0 (complete)
 
 The virtual `system` schema core is implemented with stable columns and
-permission-aware redaction. Live activity views and SHOW aliases remain open.
+permission-aware redaction. All 5 live tables landed 2026-09-01
+(`system.sessions`, `system.active_queries`, `system.transactions`,
+`system.change_streams`, `system.locks` — node-local, in-memory,
+RBAC-filtered; see `docs/system-catalog.md`). All nine planned `SHOW`
+convenience aliases landed 2026-09-02. The phase-wide exit gate closed
+2026-09-02 (`docs/system-catalog.md` "P26 exit gate closure"): the one real
+gap it found — Manager's planned users/roles/privileges administration and
+security dashboard had no official read source — is closed by new
+admin-only `system.users`/`system.roles`/`system.grants`; the capability
+registry gained rows for every previously-undiscoverable P23/P25 surface;
+RBAC-coverage and realm/database-visibility were audited and confirmed
+already satisfied. The current release gate is **P27 Operational maturity +
+workload governance**.
 
 Stable native introspection for:
 
 - schema;
 - sessions;
 - locks;
+- security administration (users, roles, grants);
 - replication;
 - backups;
 - maintenance;

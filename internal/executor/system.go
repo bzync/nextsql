@@ -1,16 +1,20 @@
 package executor
 
 import (
+	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/bzync/nextsql/internal/catalog"
+	"github.com/bzync/nextsql/internal/hosting"
 	"github.com/bzync/nextsql/internal/nerr"
 	"github.com/bzync/nextsql/internal/security"
 	"github.com/bzync/nextsql/internal/sql/ast"
 	"github.com/bzync/nextsql/internal/sql/types"
 	"github.com/bzync/nextsql/internal/storage/format"
 	"github.com/bzync/nextsql/internal/system"
+	"github.com/bzync/nextsql/internal/txn"
 )
 
 func (s *Session) isSystemSelect(stmt ast.Stmt) (ast.Select, bool) {
@@ -289,8 +293,28 @@ func (s *Session) systemRows(name string, schema *catalog.Table) ([][]types.Valu
 		return s.systemTableStatsRows()
 	case "system.index_stats":
 		return s.systemIndexStatsRows()
-	case "system.active_queries", "system.sessions", "system.transactions", "system.locks", "system.change_streams":
-		return [][]types.Value{}, nil
+	case "system.sessions":
+		return s.systemSessionsRows()
+	case "system.active_queries":
+		return s.systemActiveQueriesRows()
+	case "system.transactions":
+		return s.systemTransactionsRows()
+	case "system.change_streams":
+		return s.systemChangeStreamsRows()
+	case "system.locks":
+		return s.systemLocksRows()
+	case "system.users":
+		return s.systemUsersRows()
+	case "system.roles":
+		return s.systemRolesRows()
+	case "system.grants":
+		return s.systemGrantsRows()
+	case "system.resource_groups":
+		return s.systemResourceGroupsRows()
+	case "system.realms":
+		return s.systemRealmsRows()
+	case "system.databases":
+		return s.systemDatabasesRows()
 	default:
 		return nil, nerr.New(nerr.NotFound, "executor.system", "unknown system table")
 	}
@@ -339,9 +363,13 @@ func (s *Session) systemColumnsRows() ([][]types.Value, error) {
 		}
 		for ord, col := range t.Columns {
 			// Tenant filtering not needed
-			typStr := col.Type.String()
-			if col.Type.Kind == types.KindDecimal {
+			logical := col.LogicalType()
+			typStr := logical.String()
+			if logical.Kind == types.KindDecimal {
 				typStr = "DECIMAL"
+			}
+			if col.ClientEncrypted() {
+				typStr += " ENCRYPTED CLIENT"
 			}
 			defaultStr := ""
 			if col.Default.Kind != catalog.DefNone {
@@ -425,11 +453,8 @@ func (s *Session) systemIndexesRows() ([][]types.Value, error) {
 
 func (s *Session) systemStorageRows() ([][]types.Value, error) {
 	dbName := "default"
-	if s.db != nil && s.db.Eng != nil {
-		dbName = strings.TrimSpace(s.db.Eng.Path())
-		if dbName == "" {
-			dbName = "default"
-		}
+	if s.db != nil {
+		dbName = s.db.DatabaseName()
 	}
 	// Redacted: do not expose keys, only high-level status
 	enc := "enabled"
@@ -490,6 +515,7 @@ func (s *Session) systemReplicationRows() ([][]types.Value, error) {
 		sysDec(voters, 10),
 		sysDec(applied, 20),
 		types.BoolValue(hasLeader),
+		types.BoolValue(s.db.InMaintenanceMode()),
 	}
 	return [][]types.Value{row}, nil
 }
@@ -501,6 +527,7 @@ func (s *Session) systemReplicaHealthRows() ([][]types.Value, error) {
 	var appliedLSN, commitIdx, appliedIdx, backlog int64
 	lastContactMS := int64(0)
 	healthy := true
+	replicationSuspect := false
 	if s.db != nil {
 		if h, ok := s.db.ClusterHealth(); ok {
 			nodeID = h.NodeID
@@ -511,6 +538,7 @@ func (s *Session) systemReplicaHealthRows() ([][]types.Value, error) {
 			appliedIdx = int64(h.AppliedIndex)
 			backlog = int64(h.ApplyBacklog)
 			healthy = h.Healthy
+			replicationSuspect = h.ReplicationSuspect
 			if h.LastContact < 0 {
 				lastContactMS = -1
 			} else {
@@ -528,6 +556,7 @@ func (s *Session) systemReplicaHealthRows() ([][]types.Value, error) {
 		sysDec(backlog, 20),
 		sysDec(lastContactMS, 20),
 		types.BoolValue(healthy),
+		types.BoolValue(replicationSuspect),
 	}
 	return [][]types.Value{row}, nil
 }
@@ -559,14 +588,201 @@ func (s *Session) systemWorkflowsRows() ([][]types.Value, error) {
 	return out, nil
 }
 
-func (s *Session) systemTasksRows() ([][]types.Value, error) {
-	if s.db == nil || s.db.Cat == nil {
+// systemResourceGroupsRows is admin-only, like system.users/roles/grants:
+// RESOURCE GROUP is a cluster-wide workload-governance object gated on
+// PrivAdmin/ScopeCluster, so listing it follows the same "row-filter, never
+// fail, on RBAC" convention rather than system.workflows' broader visibility.
+func (s *Session) systemResourceGroupsRows() ([][]types.Value, error) {
+	if s.db == nil {
 		return [][]types.Value{}, nil
 	}
-	// Enumerate tasks via catalog: Cat.List not sufficient. Tasks are stored separately.
-	// Use DB's internal task store via CatTree? For stub, return empty deterministic.
-	// Try to read from DB via known method if available; otherwise empty.
-	return [][]types.Value{}, nil
+	if !(s.acl == nil || s.isAdmin()) {
+		return [][]types.Value{}, nil
+	}
+	dec10 := types.Type{Kind: types.KindDecimal, Precision: 10, Scale: 0}
+	dec20 := types.Type{Kind: types.KindDecimal, Precision: 20, Scale: 0}
+	s.db.mu.RLock()
+	defer s.db.mu.RUnlock()
+	var out [][]types.Value
+	for _, g := range s.db.resGroups {
+		if g == nil {
+			continue
+		}
+		out = append(out, []types.Value{
+			types.StringValue(g.Name),
+			types.StringValue(g.Owner),
+			types.DecimalValue(types.DecimalFromInt64(int64(g.MaxConcurrency)), dec10),
+			types.DecimalValue(types.DecimalFromInt64(g.MemoryBytes), dec20),
+			types.DecimalValue(types.DecimalFromInt64(int64(g.Workers)), dec10),
+			types.DecimalValue(types.DecimalFromInt64(int64(g.Priority)), dec10),
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i][0].Str < out[j][0].Str })
+	return out, nil
+}
+
+// hostingStateName/hostingLayoutName give system.realms/system.databases
+// (M2-4a) human-readable strings for hosting.State/hosting.Layout, mirroring
+// how every other system.* view (e.g. replica_health's role column) avoids
+// exposing raw numeric enum values.
+func hostingStateName(st hosting.State) string {
+	switch st {
+	case hosting.StateProvisioning:
+		return "provisioning"
+	case hosting.StateActive:
+		return "active"
+	case hosting.StateSuspended:
+		return "suspended"
+	case hosting.StateDeleting:
+		return "deleting"
+	case hosting.StateTombstoned:
+		return "tombstoned"
+	case hosting.StateFailed:
+		return "failed"
+	default:
+		return "unknown"
+	}
+}
+
+func hostingLayoutName(l hosting.Layout) string {
+	switch l {
+	case hosting.LayoutLegacyDefault:
+		return "legacy_default"
+	case hosting.LayoutManaged:
+		return "managed"
+	default:
+		return "unknown"
+	}
+}
+
+// systemRealmsRows and systemDatabasesRows (M2-4a) expose the hosted
+// deployment registry (internal/hosting.Registry.Manifest) read-only.
+// Admin-only, like system.resource_groups: deployment structure across
+// realms is not tenant-visible data. Empty (not an error) on a
+// legacy/non-hosted deployment (s.hostingRegistry is nil, e.g. Databases
+// was never configured) or for a non-admin caller.
+func (s *Session) systemRealmsRows() ([][]types.Value, error) {
+	if s.hostingRegistry == nil {
+		return [][]types.Value{}, nil
+	}
+	if !(s.acl == nil || s.isAdmin()) {
+		return [][]types.Value{}, nil
+	}
+	m := s.hostingRegistry.Manifest()
+	out := make([][]types.Value, 0, len(m.Realms))
+	for _, r := range m.Realms {
+		var zero [32]byte
+		out = append(out, []types.Value{
+			types.StringValue(r.ID.String()),
+			types.StringValue(r.Name),
+			types.StringValue(hostingStateName(r.State)),
+			sysDec(int64(len(r.Databases)), 10),
+			sysDec(int64(r.StorageCapBytes), 20),
+			types.BoolValue(r.RealmRootAuthHash != zero),
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i][1].Str < out[j][1].Str })
+	return out, nil
+}
+
+func (s *Session) systemDatabasesRows() ([][]types.Value, error) {
+	if s.hostingRegistry == nil {
+		return [][]types.Value{}, nil
+	}
+	if !(s.acl == nil || s.isAdmin()) {
+		return [][]types.Value{}, nil
+	}
+	m := s.hostingRegistry.Manifest()
+	var out [][]types.Value
+	for _, r := range m.Realms {
+		for _, d := range r.Databases {
+			out = append(out, []types.Value{
+				types.StringValue(r.ID.String()),
+				types.StringValue(r.Name),
+				types.StringValue(d.ID.String()),
+				types.StringValue(d.Name),
+				types.StringValue(hostingStateName(d.State)),
+				types.StringValue(hostingLayoutName(d.Layout)),
+				sysDec(int64(d.StorageCapBytes), 20),
+			})
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i][1].Str != out[j][1].Str {
+			return out[i][1].Str < out[j][1].Str
+		}
+		return out[i][3].Str < out[j][3].Str
+	})
+	return out, nil
+}
+
+func (s *Session) systemTasksRows() ([][]types.Value, error) {
+	if s.db == nil || s.db.CatTree == nil {
+		return [][]types.Value{}, nil
+	}
+	// Tasks live only in the catalog tree (not the in-memory catalog.Store),
+	// so unlike the other system.* views this needs a scan txn; reuse one
+	// already open on the session, or open a short-lived autocommit read.
+	auto := false
+	if s.x == nil {
+		if err := s.startRead(txn.SnapshotIsolation); err != nil {
+			return nil, err
+		}
+		auto = true
+	}
+	out, err := s.scanTaskRows()
+	if auto {
+		if err != nil {
+			_ = s.abort()
+			return nil, err
+		}
+		if _, cerr := s.commit(); cerr != nil {
+			return nil, cerr
+		}
+	}
+	return out, err
+}
+
+func (s *Session) scanTaskRows() ([][]types.Value, error) {
+	tx := s.x.use(s.db.CatTree)
+	admin := s.acl == nil || s.isAdmin()
+	var start, end []byte
+	if admin {
+		start, end = catalog.TaskKey(""), []byte{catalog.KeyTask + 1}
+	} else {
+		start, end = catalog.TaskOwnerRange(s.user)
+	}
+	var out [][]types.Value
+	err := tx.Range(start, end, func(key, value []byte) error {
+		raw := value
+		if !admin {
+			id := string(value)
+			var lerr error
+			raw, lerr = tx.Lookup(catalog.TaskKey(id))
+			if lerr != nil {
+				return nerr.New(nerr.InvalidFormat, "executor.system", "dangling task owner index")
+			}
+		} else if len(key) < 1 || key[0] != catalog.KeyTask {
+			return nerr.New(nerr.InvalidFormat, "executor.system", "invalid task key")
+		}
+		task, derr := catalog.DecodeTask(raw)
+		if derr != nil {
+			return derr
+		}
+		out = append(out, []types.Value{
+			types.StringValue(task.ID),
+			types.StringValue(task.Schedule),
+			types.StringValue(task.Workflow),
+			types.StringValue(taskStateName(task.State)),
+			sysDec(int64(task.Attempt), 10),
+		})
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i][0].Str < out[j][0].Str })
+	return out, nil
 }
 
 func (s *Session) systemPartitionsRows() ([][]types.Value, error) {
@@ -654,6 +870,296 @@ func (s *Session) systemIndexStatsRows() ([][]types.Value, error) {
 		}
 		return out[i][0].Str < out[j][0].Str
 	})
+	return out, nil
+}
+
+// systemSessionsRows lists sessions registered by DB.RegisterSession — i.e.
+// live network connections on this node. A non-admin sees only their own
+// sessions; an admin sees every session.
+func (s *Session) systemSessionsRows() ([][]types.Value, error) {
+	if s.db == nil {
+		return [][]types.Value{}, nil
+	}
+	admin := s.acl == nil || s.isAdmin()
+	live := s.db.LiveSessions()
+	type row struct {
+		id     uint64
+		user   string
+		remote string
+		state  string
+	}
+	rows := make([]row, 0, len(live))
+	for _, sess := range live {
+		if sess == nil || sess.SessionID() == 0 {
+			continue
+		}
+		user := sess.User()
+		if !admin && !strings.EqualFold(user, s.user) {
+			continue
+		}
+		_, _, _, running := sess.CurrentQuery()
+		state := "idle"
+		if running {
+			state = "active"
+		}
+		rows = append(rows, row{sess.SessionID(), user, sess.Remote(), state})
+	}
+	sort.Slice(rows, func(i, j int) bool { return rows[i].id < rows[j].id })
+	out := make([][]types.Value, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, []types.Value{
+			types.StringValue(strconv.FormatUint(r.id, 10)),
+			types.StringValue(r.user),
+			types.StringValue(r.remote),
+			types.StringValue(r.state),
+		})
+	}
+	return out, nil
+}
+
+// systemActiveQueriesRows lists the statement (if any) each registered
+// session is presently executing. A non-admin sees only their own queries;
+// an admin sees every session's.
+func (s *Session) systemActiveQueriesRows() ([][]types.Value, error) {
+	if s.db == nil {
+		return [][]types.Value{}, nil
+	}
+	admin := s.acl == nil || s.isAdmin()
+	live := s.db.LiveSessions()
+	type row struct {
+		id   uint64
+		user string
+		sql  string
+	}
+	rows := make([]row, 0, len(live))
+	for _, sess := range live {
+		if sess == nil {
+			continue
+		}
+		qid, text, _, running := sess.CurrentQuery()
+		if !running {
+			continue
+		}
+		user := sess.User()
+		if !admin && !strings.EqualFold(user, s.user) {
+			continue
+		}
+		rows = append(rows, row{qid, user, text})
+	}
+	sort.Slice(rows, func(i, j int) bool { return rows[i].id < rows[j].id })
+	out := make([][]types.Value, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, []types.Value{
+			types.StringValue(strconv.FormatUint(r.id, 10)),
+			types.StringValue(r.user),
+			types.StringValue(r.sql),
+			types.StringValue("running"),
+		})
+	}
+	return out, nil
+}
+
+// systemTransactionsRows lists sessions with a currently open transaction.
+// A non-admin sees only their own transactions; an admin sees every
+// session's.
+func (s *Session) systemTransactionsRows() ([][]types.Value, error) {
+	if s.db == nil {
+		return [][]types.Value{}, nil
+	}
+	admin := s.acl == nil || s.isAdmin()
+	live := s.db.LiveSessions()
+	type row struct {
+		id   format.TxnID
+		user string
+		iso  string
+	}
+	rows := make([]row, 0, len(live))
+	for _, sess := range live {
+		if sess == nil {
+			continue
+		}
+		txnID, iso, _, _, active := sess.TxnSnapshot()
+		if !active {
+			continue
+		}
+		user := sess.User()
+		if !admin && !strings.EqualFold(user, s.user) {
+			continue
+		}
+		rows = append(rows, row{txnID, user, iso.String()})
+	}
+	sort.Slice(rows, func(i, j int) bool { return rows[i].id < rows[j].id })
+	out := make([][]types.Value, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, []types.Value{
+			types.StringValue(strconv.FormatUint(uint64(r.id), 10)),
+			types.StringValue(r.user),
+			types.StringValue(r.iso),
+			types.StringValue("active"),
+		})
+	}
+	return out, nil
+}
+
+// systemChangeStreamsRows lists currently open CDC subscriptions on this
+// node, filtered to tables the caller may see.
+func (s *Session) systemChangeStreamsRows() ([][]types.Value, error) {
+	if s.db == nil {
+		return [][]types.Value{}, nil
+	}
+	subs := s.db.CDCSubscriptions()
+	type row struct {
+		table string
+		lsn   uint64
+	}
+	rows := make([]row, 0, len(subs))
+	for _, sub := range subs {
+		if !s.canSeeTable(sub.Table) {
+			continue
+		}
+		rows = append(rows, row{sub.Table, sub.LSN})
+	}
+	sort.Slice(rows, func(i, j int) bool {
+		if rows[i].table == rows[j].table {
+			return rows[i].lsn < rows[j].lsn
+		}
+		return rows[i].table < rows[j].table
+	})
+	out := make([][]types.Value, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, []types.Value{
+			types.StringValue(r.table),
+			sysDec(int64(r.lsn), 20),
+			types.StringValue("active"),
+		})
+	}
+	return out, nil
+}
+
+// systemLocksRows lists every key/range lock currently held in this
+// database's storage engine (internal/txn.LockManager.Snapshot; waiting,
+// not-yet-granted requests are not included, so granted is always true
+// today). table_name reflects the tags threaded through btree.Tree.SetName
+// at the executor's tree-resolver call sites; a lock acquired through an
+// untagged path reports an empty table_name rather than a wrong one.
+// Visibility matches system.transactions: a lock is attributed to the user
+// of whichever live registered session currently holds that transaction; an
+// admin sees every lock, a non-admin sees only their own, and a lock whose
+// transaction cannot be attributed to a live session (e.g. embedded/CLI/test
+// use never registered with DB.RegisterSession) is visible only to an admin.
+func (s *Session) systemLocksRows() ([][]types.Value, error) {
+	if s.db == nil {
+		return [][]types.Value{}, nil
+	}
+	admin := s.acl == nil || s.isAdmin()
+	userByTxn := make(map[format.TxnID]string)
+	for _, sess := range s.db.LiveSessions() {
+		if sess == nil {
+			continue
+		}
+		if txnID, _, _, _, active := sess.TxnSnapshot(); active {
+			userByTxn[txnID] = sess.User()
+		}
+	}
+	infos := s.db.LockSnapshot()
+	sort.Slice(infos, func(i, j int) bool {
+		if infos[i].Txn != infos[j].Txn {
+			return infos[i].Txn < infos[j].Txn
+		}
+		if infos[i].Tag != infos[j].Tag {
+			return infos[i].Tag < infos[j].Tag
+		}
+		if infos[i].Mode != infos[j].Mode {
+			return infos[i].Mode < infos[j].Mode
+		}
+		return !infos[i].Range && infos[j].Range
+	})
+	counts := make(map[format.TxnID]int)
+	out := make([][]types.Value, 0, len(infos))
+	for _, li := range infos {
+		user, known := userByTxn[li.Txn]
+		if !admin && (!known || !strings.EqualFold(user, s.user)) {
+			continue
+		}
+		n := counts[li.Txn]
+		counts[li.Txn] = n + 1
+		out = append(out, []types.Value{
+			types.StringValue(fmt.Sprintf("%d:%d", uint64(li.Txn), n)),
+			types.StringValue(li.Tag),
+			types.StringValue(lockModeName(li.Mode)),
+			types.BoolValue(true),
+		})
+	}
+	return out, nil
+}
+
+func lockModeName(m txn.Mode) string {
+	switch m {
+	case txn.Shared:
+		return "shared"
+	case txn.Exclusive:
+		return "exclusive"
+	default:
+		return "unknown"
+	}
+}
+
+// systemUsersRows, systemRolesRows, and systemGrantsRows back a Manager-style
+// security dashboard entirely through the official system.* surface: before
+// these landed, listing users/roles/grants had no SQL-level answer at all,
+// so a Studio/Manager implementation would have had to read the auth.Store
+// or security.ACL files directly. Like system.tasks/system.locks, they are
+// admin-only: a non-admin gets zero rows rather than an error, matching the
+// rest of this package's "row-filter, never fail, on RBAC" convention for
+// SELECT against system.*. Never expose password hashes or salts.
+
+func (s *Session) systemUsersRows() ([][]types.Value, error) {
+	if s.users == nil {
+		return [][]types.Value{}, nil
+	}
+	if !(s.acl == nil || s.isAdmin()) {
+		return [][]types.Value{}, nil
+	}
+	infos := s.users.SnapshotInRealm(s.realmID)
+	out := make([][]types.Value, 0, len(infos))
+	for _, u := range infos {
+		out = append(out, []types.Value{
+			types.StringValue(u.Name),
+			types.StringValue(u.Algo),
+		})
+	}
+	return out, nil
+}
+
+func (s *Session) systemRolesRows() ([][]types.Value, error) {
+	if s.acl == nil || !s.isAdmin() {
+		return [][]types.Value{}, nil
+	}
+	roles, _ := s.acl.SnapshotInRealm(s.realmID)
+	out := make([][]types.Value, 0, len(roles))
+	for _, r := range roles {
+		out = append(out, []types.Value{
+			types.StringValue(r.Role),
+			types.StringValue(strings.Join(r.Members, ",")),
+		})
+	}
+	return out, nil
+}
+
+func (s *Session) systemGrantsRows() ([][]types.Value, error) {
+	if s.acl == nil || !s.isAdmin() {
+		return [][]types.Value{}, nil
+	}
+	_, grants := s.acl.SnapshotInRealm(s.realmID)
+	out := make([][]types.Value, 0, len(grants))
+	for _, g := range grants {
+		out = append(out, []types.Value{
+			types.StringValue(g.Grantee),
+			types.StringValue(g.Priv.String()),
+			types.StringValue(g.Scope.String()),
+			types.StringValue(g.Object),
+		})
+	}
 	return out, nil
 }
 

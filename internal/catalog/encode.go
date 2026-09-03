@@ -3,24 +3,28 @@ package catalog
 import (
 	"bytes"
 
+	"github.com/bzync/nextsql/internal/clientenc"
 	"github.com/bzync/nextsql/internal/encoding"
 	"github.com/bzync/nextsql/internal/nerr"
 	"github.com/bzync/nextsql/internal/sql/ast"
 	"github.com/bzync/nextsql/internal/sql/types"
 	"github.com/bzync/nextsql/internal/storage/format"
+	"github.com/bzync/nextsql/internal/upgrade/compat"
 )
 
 const (
-	tableMagic     = "NSCT"
-	tableVersion   = 9
-	tableVersionV1 = 1
-	tableVersionV2 = 2
-	tableVersionV3 = 3
-	tableVersionV4 = 4
-	tableVersionV5 = 5
-	tableVersionV6 = 6
-	tableVersionV7 = 7
-	tableVersionV8 = 8
+	tableMagic      = "NSCT"
+	tableVersion    = 11
+	tableVersionV1  = 1
+	tableVersionV2  = 2
+	tableVersionV3  = 3
+	tableVersionV4  = 4
+	tableVersionV5  = 5
+	tableVersionV6  = 6
+	tableVersionV7  = 7
+	tableVersionV8  = 8
+	tableVersionV9  = 9
+	tableVersionV10 = 10
 	// KeyTable prefixes durable table descriptors in the catalog tree.
 	KeyTable byte = 'T'
 	// KeyStats prefixes durable table statistics in the catalog tree.
@@ -88,6 +92,9 @@ func EncodeTable(t *Table) ([]byte, error) {
 	if err := ValidatePartitioning(t); err != nil {
 		return nil, err
 	}
+	if err := validateClientTable(t); err != nil {
+		return nil, err
+	}
 	var buf []byte
 	buf = append(buf, tableMagic...)
 	buf = appendU16(buf, tableVersion)
@@ -100,6 +107,9 @@ func EncodeTable(t *Table) ([]byte, error) {
 	}
 	buf = appendU16(buf, uint16(len(t.Columns)))
 	for _, c := range t.Columns {
+		if !validClientColumn(c) {
+			return nil, nerr.New(nerr.InvalidArgument, "catalog.EncodeTable", "invalid ENCRYPTED CLIENT column metadata")
+		}
 		var err error
 		buf, err = appendColumn(buf, c)
 		if err != nil {
@@ -146,7 +156,90 @@ func EncodeTable(t *Table) ([]byte, error) {
 		buf = append(buf, idx.FTAnalyzer)
 		buf = appendU16(buf, idx.FTVersion)
 	}
+	// v10: one bounded client-encryption flag and logical type per column.
+	// Physical row values remain STRING ciphertext and never contain plaintext.
+	for _, col := range t.Columns {
+		if !col.ClientEncrypted() {
+			buf = append(buf, 0)
+			continue
+		}
+		buf = append(buf, 1)
+		buf = appendType(buf, col.ClientType)
+	}
+	// v11: per column, an ENUM label list (empty for every non-ENUM column).
+	for _, col := range t.Columns {
+		if col.Type.Kind != types.KindEnum {
+			buf = appendU16(buf, 0)
+			continue
+		}
+		buf = appendU16(buf, uint16(len(col.Type.EnumLabels)))
+		for _, l := range col.Type.EnumLabels {
+			buf = appendString(buf, l)
+		}
+	}
 	return buf, nil
+}
+
+func validClientColumn(c Column) bool {
+	if !c.ClientEncrypted() {
+		return c.ClientType.Equals(types.Type{})
+	}
+	if c.Type.Kind != types.KindString || c.Type.Precision != 0 || c.Type.Scale != 0 || c.Type.VecElem != 0 {
+		return false
+	}
+	if c.Primary || c.Default.Kind != DefNone {
+		return false
+	}
+	return clientenc.SupportedType(c.ClientType)
+}
+
+func validateClientTable(t *Table) error {
+	if t == nil {
+		return nerr.New(nerr.InvalidArgument, "catalog.clientenc", "nil table")
+	}
+	for ord, col := range t.Columns {
+		if !validClientColumn(col) {
+			return nerr.New(nerr.InvalidArgument, "catalog.clientenc", "invalid ENCRYPTED CLIENT column metadata")
+		}
+		if !col.ClientEncrypted() {
+			continue
+		}
+		for _, pk := range t.PK {
+			if pk == ord {
+				return nerr.New(nerr.InvalidArgument, "catalog.clientenc", "ENCRYPTED CLIENT column cannot be a primary key")
+			}
+		}
+		for _, fk := range t.ForeignKeys {
+			for _, c := range fk.Columns {
+				if c == ord {
+					return nerr.New(nerr.InvalidArgument, "catalog.clientenc", "ENCRYPTED CLIENT column cannot be a foreign key")
+				}
+			}
+		}
+		for _, idx := range t.Indexes {
+			for _, c := range append(append([]int(nil), idx.Columns...), idx.Include...) {
+				if c == ord {
+					return nerr.New(nerr.InvalidArgument, "catalog.clientenc", "ENCRYPTED CLIENT column cannot be indexed")
+				}
+			}
+			if ExprUsesIdent(idx.Predicate, col.Name) {
+				return nerr.New(nerr.InvalidArgument, "catalog.clientenc", "ENCRYPTED CLIENT column cannot be used in an index predicate")
+			}
+			for _, expr := range idx.Exprs {
+				if ExprUsesIdent(expr, col.Name) {
+					return nerr.New(nerr.InvalidArgument, "catalog.clientenc", "ENCRYPTED CLIENT column cannot be used in an index expression")
+				}
+			}
+		}
+		if t.Partitioning != nil {
+			for _, c := range t.Partitioning.Columns {
+				if c == ord {
+					return nerr.New(nerr.InvalidArgument, "catalog.clientenc", "ENCRYPTED CLIENT column cannot be a partition key")
+				}
+			}
+		}
+	}
+	return nil
 }
 
 func validFTMeta(idx Index) bool {
@@ -178,8 +271,8 @@ func DecodeTable(raw []byte) (*Table, error) {
 	if err != nil {
 		return nil, err
 	}
-	if ver != tableVersionV1 && ver != tableVersionV2 && ver != tableVersionV3 && ver != tableVersionV4 && ver != tableVersionV5 && ver != tableVersionV6 && ver != tableVersionV7 && ver != tableVersionV8 && ver != tableVersion {
-		return nil, nerr.New(nerr.InvalidFormat, "catalog.DecodeTable", "unsupported catalog version")
+	if err := compat.Check(compat.FamilyCatalog, ver); err != nil {
+		return nil, nerr.Wrap(nerr.InvalidFormat, "catalog.DecodeTable", "unsupported catalog version", err)
 	}
 	t := &Table{}
 	t.ID, off, err = takeU32(raw, off)
@@ -369,7 +462,7 @@ func DecodeTable(raw []byte) (*Table, error) {
 			t.Indexes[i].IVFSubspaces = subs
 		}
 	}
-	if ver >= tableVersion {
+	if ver >= tableVersionV9 {
 		for i := range t.Indexes {
 			if off >= len(raw) {
 				return nil, nerr.New(nerr.InvalidFormat, "catalog.DecodeTable", "truncated full-text analyzer")
@@ -386,6 +479,63 @@ func DecodeTable(raw []byte) (*Table, error) {
 			if !validFTMeta(t.Indexes[i]) {
 				return nil, nerr.New(nerr.InvalidFormat, "catalog.DecodeTable", "bad full-text analyzer")
 			}
+		}
+	}
+	if ver >= tableVersionV10 {
+		for i := range t.Columns {
+			if off >= len(raw) {
+				return nil, nerr.New(nerr.InvalidFormat, "catalog.DecodeTable", "truncated ENCRYPTED CLIENT metadata")
+			}
+			flag := raw[off]
+			off++
+			switch flag {
+			case 0:
+			case 1:
+				var typ types.Type
+				typ, off, err = takeType(raw, off)
+				if err != nil {
+					return nil, err
+				}
+				t.Columns[i].ClientType = typ
+			default:
+				return nil, nerr.New(nerr.InvalidFormat, "catalog.DecodeTable", "unknown ENCRYPTED CLIENT flag")
+			}
+			if !validClientColumn(t.Columns[i]) {
+				return nil, nerr.New(nerr.InvalidFormat, "catalog.DecodeTable", "invalid ENCRYPTED CLIENT column metadata")
+			}
+		}
+		if err := validateClientTable(t); err != nil {
+			return nil, nerr.Wrap(nerr.InvalidFormat, "catalog.DecodeTable", "invalid ENCRYPTED CLIENT table", err)
+		}
+	}
+	if ver >= tableVersion {
+		for i := range t.Columns {
+			var n uint16
+			n, off, err = takeU16(raw, off)
+			if err != nil {
+				return nil, err
+			}
+			if n == 0 {
+				continue
+			}
+			if n > types.MaxEnumLabels {
+				return nil, nerr.New(nerr.InvalidFormat, "catalog.DecodeTable", "ENUM label count exceeds limit")
+			}
+			labels := make([]string, n)
+			for j := range labels {
+				labels[j], off, err = takeString(raw, off)
+				if err != nil {
+					return nil, err
+				}
+			}
+			et, eerr := types.EnumType(labels)
+			if eerr != nil {
+				return nil, nerr.Wrap(nerr.InvalidFormat, "catalog.DecodeTable", "invalid ENUM labels", eerr)
+			}
+			if t.Columns[i].Type.Kind != types.KindEnum {
+				return nil, nerr.New(nerr.InvalidFormat, "catalog.DecodeTable", "ENUM labels on a non-ENUM column")
+			}
+			t.Columns[i].Type = et
 		}
 	}
 	if off != len(raw) {

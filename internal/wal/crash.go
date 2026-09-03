@@ -31,6 +31,17 @@ const (
 	PointDuringIndexBuild
 	PointDuringPageReclaim
 	PointAfterPageReclaimBeforeIntentClear
+	// PointAfterCommitRecordHeld fires right after a transaction's
+	// CommitRec is appended via AppendHeld — durable-worthy but not yet
+	// flushed, replicated, visible, or lock-released — before Replicate is
+	// called. A crash here must recover the transaction as an ordinary
+	// open/never-committed one (recovery never sees the held CommitRec: it
+	// was never flushed).
+	PointAfterCommitRecordHeld
+	// PointAfterHoldReleaseDiscardBeforeAbortAppend fires after a held
+	// CommitRec has been discarded (spliced out, never durable) but before
+	// the compensating AbortRec is appended.
+	PointAfterHoldReleaseDiscardBeforeAbortAppend
 )
 
 // ErrCrash is returned when an armed crash point fires. Tests treat it as

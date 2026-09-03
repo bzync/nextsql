@@ -124,18 +124,32 @@ P21      complete — RANGE/HASH/LIST with 1–8-column keys, ATTACH/DETACH, par
 P22      complete — follower reads / read scaling; exit gate closed 2026-08-30
 P23      complete — Vector Engine 2.0; production-gating sign-off 2026-08-31
 P24      complete — Full-text Search 2.0; exit gate closed 2026-08-31
-P25–P30 planned/open
+P25      complete — Security 2.0; exit gate closed 2026-09-02, security review sign-off in docs/security.md
+P26      complete — System catalog / introspection 2.0; exit gate closed 2026-09-02, see docs/system-catalog.md "P26 exit gate closure"
+P27–P30 planned/open
 ```
 
-Immediate release-gate work is **P25 Security 2.0**.
+Immediate release-gate work is **P27 Operational maturity + workload
+governance**. P26 System catalog / introspection 2.0 is complete: the
+virtual `system` schema core (RBAC-filtered
+capabilities/tables/columns/indexes/storage/replication/raft/workflows/
+tasks/partitions/stats), all 5 live tables (`system.sessions`/
+`system.active_queries`/`system.transactions`/`system.change_streams`/
+`system.locks`, node-local and in-memory), the 3 security-administration
+tables (`system.users`/`system.roles`/`system.grants`, admin-only), nine
+`SHOW` convenience aliases, and an authoritative capability registry all
+landed — see `docs/system-catalog.md`.
 
-Current P25 focus:
+P25 landed mTLS/service identity, signed short-lived credentials, the
+external-IdP broker, field-level client encryption (all official drivers as
+of P25 — Go/Node/Bun/Deno/PHP; Python and Ruby, added later, do not yet
+implement it — PITR, HA/failover, and durable `FileFieldKeyring` key
+rotation/revocation), Argon2id password hashing, and audit-chain hardening —
+all production-gated.
+OIDC opaque introspection and JIT provisioning stay optional and off by
+design, not as open blockers.
 
-1. Audit every P25 security item as designed, implemented, tested, or
-   production-gated; then take the smallest coherent mTLS/service-identity
-   increment without weakening the existing TLS/RBAC/key boundaries.
-
-P16, P23, and P24 are complete (exit gates green; the terminal 100M B+Tree invariant
+P16, P23, P24, and P25 are complete (exit gates green; the terminal 100M B+Tree invariant
 soak is a deferred standalone measurement, not a gate). Do not let later feature
 work destabilize the earlier gates.
 
@@ -357,6 +371,8 @@ Current official driver surface includes:
 - Deno
 - TypeScript types
 - PHP
+- Python
+- Ruby
 
 Keys must be delivered via a key provider or equivalent secure mechanism, not URLs.
 
@@ -649,7 +665,11 @@ Requirements:
 - no unintended duplicate firing within documented guarantees
 - documented clock-skew behavior
 
-Cron syntax is deferred until the core scheduler is proven.
+Cron syntax landed 2026-09-03: `CREATE SCHEDULE … CRON '<m h dom mon dow>'`,
+standard five-field, UTC, numeric-only (`internal/cron`; `NSSC` v2). The
+recurrence rule matches `EVERY` — the cursor advances to the next match
+strictly after now, so a forward clock jump emits one task and skips the
+missed boundaries rather than bursting.
 
 ## 7.4 TASK runtime
 
@@ -848,12 +868,20 @@ credential in place of the password; expiry + audience/database/realm/role
 scope; `NSTK` rotatable keyset; `NSTR` fail-closed revocation; `SIGHUP` reload;
 `nextsql token` CLI; `identity_source` audit).
 
-Remaining security work:
+The `NSIP` policy, standalone/embedded broker, interactive `nextsql login` /
+`logout` / `whoami` PKCE client, JWT client-credentials path, live embedded
+ACL feed, key-derived OIDC server audit labeling, field-level client
+encryption (core plus Go/Node.js/TypeScript/Bun/Deno/PHP helpers, PITR, and
+HA/failover), stronger password hashing (Argon2id migration, transparent
+rehash, DoS benchmarks), and audit hardening (hash-chained + optionally
+Ed25519-signed `nextsql.audit`, `nextsql audit` verification tooling) are all
+implemented and tested. Remaining:
 
-- external identity provider integration
-- field-level client encryption
-- stronger password hashing evolution
-- audit hardening
+- external identity provider opaque-token introspection and JIT provisioning
+  (optional and off by default)
+- durable key-rotation/revocation KMS lifecycle for field-level client
+  encryption
+- the P25 phase-wide exit gate itself: a dated security review sign-off
 
 Security rules:
 
@@ -899,6 +927,11 @@ Create a coherent native introspection surface for:
 Prefer stable system views/tables over ad-hoc one-off diagnostic commands where possible.
 
 All introspection must obey permissions and realm/database boundaries.
+
+The P26 convenience aliases are implemented as direct reads of the canonical
+system views: `SHOW DATABASES`, `TABLES`, `INDEXES`, `CONNECTIONS`, `QUERIES`,
+`TRANSACTIONS`, `LOCKS`, `CLUSTER`, and `STORAGE`. Preserve that single source
+of truth; do not add an independent diagnostic path.
 
 ---
 
@@ -1503,13 +1536,16 @@ Before claiming completion:
 
 # 30. Current Execution Directive
 
-P0–P24 are complete. Continue with P25 Security 2.0 in dependency order:
+P0–P26 are complete. P26 System catalog / introspection 2.0's exit gate
+closed 2026-09-02 with the dated closure record in `docs/system-catalog.md`.
+Continue in dependency order on **P27 Operational maturity + workload
+governance**:
 
 ```text
-1. Audit designed vs implemented vs tested vs production-gated security state
-2. Implement the smallest coherent mTLS/service-identity increment
-3. Fix any correctness, durability, security, or isolation regression first
-4. Close P25 only when its exit gate is actually green
+1. Audit designed vs implemented vs tested vs production-gated status for
+   whatever surface is being extended, the same way P25's audit table did
+2. Fix any correctness, durability, security, or isolation regression first
+3. Close a phase only when its exit gate is actually green
 ```
 
 Do not begin later feature work in a way that destabilizes completed release gates.

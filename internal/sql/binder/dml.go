@@ -36,6 +36,9 @@ func bindInsertRows(table string, columns []string, rows [][]ast.Expr, lookup Lo
 			return nil, nil, nerr.New(nerr.InvalidArgument, "sql.binder", kind+" value count mismatch")
 		}
 		for i, ex := range row {
+			if err := checkClientEncryptedAssignment(ex, tab, tab.Columns[cols[i]]); err != nil {
+				return nil, nil, err
+			}
 			if err := checkExpr(ex, tab, tab.Columns[cols[i]].Type, false); err != nil {
 				return nil, nil, err
 			}
@@ -48,6 +51,23 @@ func bindInsertRows(table string, columns []string, rows [][]ast.Expr, lookup Lo
 }
 
 func bindUpsert(s ast.Upsert, lookup Lookup) (Bound, error) {
+	for _, row := range s.Rows {
+		for _, ex := range row {
+			if err := rejectClientEncryptedSubqueryExpr(ex, lookup, nil); err != nil {
+				return nil, err
+			}
+		}
+	}
+	for _, set := range s.Sets {
+		if err := rejectClientEncryptedSubqueryExpr(set.Expr, lookup, nil); err != nil {
+			return nil, err
+		}
+	}
+	for _, item := range s.Returning {
+		if err := rejectClientEncryptedSubqueryExpr(item.Expr, lookup, nil); err != nil {
+			return nil, err
+		}
+	}
 	tab, cols, err := bindInsertRows(s.Table, s.Columns, s.Rows, lookup, "UPSERT")
 	if err != nil {
 		return nil, err
@@ -77,6 +97,9 @@ func bindUpsert(s ast.Upsert, lookup Lookup) (Bound, error) {
 			ex := rewriteQual(a.Expr, evalTab)
 			if containsWindow(ex) || containsGroupingAgg(ex) {
 				return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "UPSERT SET does not support window functions or aggregates")
+			}
+			if err := checkClientEncryptedAssignment(ex, evalTab, tab.Columns[i]); err != nil {
+				return nil, err
 			}
 			if err := checkExpr(ex, evalTab, tab.Columns[i].Type, false); err != nil {
 				return nil, err
@@ -135,6 +158,9 @@ func bindReturning(star bool, list []ast.SelectItem, tab, eval *catalog.Table) (
 		if err := checkExpr(ex, eval, types.Type{}, false); err != nil {
 			return Returning{}, err
 		}
+		if exprUsesClientEncrypted(ex, eval) && !bareClientEncryptedColumn(ex, eval) {
+			return Returning{}, nerr.New(nerr.InvalidArgument, "sql.binder", "ENCRYPTED CLIENT RETURNING item must be a bare column")
+		}
 		name := item.Alias
 		ord := -1
 		if id, ok := ex.(ast.Ident); ok {
@@ -165,9 +191,10 @@ func excludedSchema(tab *catalog.Table) *catalog.Table {
 	out := tab.Clone()
 	for _, c := range tab.Columns {
 		out.Columns = append(out.Columns, catalog.Column{
-			Name:    "excluded." + c.Name,
-			Type:    c.Type,
-			NotNull: c.NotNull,
+			Name:       "excluded." + c.Name,
+			Type:       c.Type,
+			ClientType: c.ClientType,
+			NotNull:    c.NotNull,
 		})
 	}
 	return out

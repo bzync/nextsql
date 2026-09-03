@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os/exec"
 	"runtime"
+	"sync"
 	"time"
 
 	"github.com/bzync/nextsql/internal/nerr"
@@ -106,7 +107,13 @@ func Login(ctx context.Context, opts LoginOptions) (BrokerResult, TokenSet, erro
 	cbCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	codeCh := make(chan callbackResult, 1)
-	srv := &http.Server{Handler: callbackHandler(state, codeCh)}
+	srv := &http.Server{
+		Handler:           callbackHandler(state, codeCh),
+		ReadHeaderTimeout: 5 * time.Second,
+		WriteTimeout:      5 * time.Second,
+		IdleTimeout:       5 * time.Second,
+		MaxHeaderBytes:    16 << 10,
+	}
 	go func() { _ = srv.Serve(ln) }()
 	defer func() {
 		shutCtx, c := context.WithTimeout(context.Background(), time.Second)
@@ -152,19 +159,29 @@ type callbackResult struct {
 }
 
 func callbackHandler(wantState string, out chan<- callbackResult) http.Handler {
-	var once bool
+	var once sync.Once
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", http.MethodGet)
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
 		if r.URL.Path != "/callback" {
 			http.NotFound(w, r)
 			return
 		}
 		q := r.URL.Query()
+		// An unsolicited request must not consume the one callback result and
+		// deny the legitimate browser redirect. Only a matching state can end
+		// the flow.
+		if q.Get("state") != wantState {
+			http.Error(w, "callback state did not match", http.StatusBadRequest)
+			return
+		}
 		var res callbackResult
 		switch {
 		case q.Get("error") != "":
 			res.err = nerr.New(nerr.Unauthorized, "oidcclient", "identity provider returned an error: "+q.Get("error"))
-		case q.Get("state") != wantState:
-			res.err = nerr.New(nerr.Protocol, "oidcclient", "callback state did not match; possible cross-site request forgery")
 		case q.Get("code") == "":
 			res.err = nerr.New(nerr.Protocol, "oidcclient", "callback carried no authorization code")
 		default:
@@ -178,10 +195,7 @@ func callbackHandler(wantState string, out chan<- callbackResult) http.Handler {
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
 			_, _ = io.WriteString(w, callbackSuccessHTML)
 		}
-		if !once {
-			once = true
-			out <- res
-		}
+		once.Do(func() { out <- res })
 	})
 }
 

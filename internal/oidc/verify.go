@@ -61,6 +61,27 @@ type IDTokenVerifier struct {
 	now     func() time.Time
 }
 
+// AccessTokenConfig configures JWT access-token verification for an OAuth2
+// client-credentials profile. Audience is the protected-resource identifier,
+// while ClientID binds the token to the configured confidential client through
+// its client_id or azp claim.
+type AccessTokenConfig struct {
+	Issuer      string
+	ClientID    string
+	Audience    string
+	AllowedAlgs []string
+	Skew        time.Duration
+	Now         func() time.Time
+}
+
+// AccessTokenVerifier validates JWT access tokens for one confidential client.
+// Opaque access tokens require RFC 7662 introspection and are not accepted by
+// this verifier.
+type AccessTokenVerifier struct {
+	base     *IDTokenVerifier
+	audience string
+}
+
 // NewIDTokenVerifier builds a verifier. It rejects a config that names a
 // non-asymmetric algorithm — that is a configuration error, not a token to
 // deny at runtime.
@@ -97,12 +118,51 @@ func NewIDTokenVerifier(cfg IDTokenConfig, jwks *JWKSCache) (*IDTokenVerifier, e
 	return &IDTokenVerifier{cfg: cfg, jwks: jwks, allowed: allowed, skew: skew, now: now}, nil
 }
 
+// NewAccessTokenVerifier builds a verifier for asymmetric JWT access tokens.
+func NewAccessTokenVerifier(cfg AccessTokenConfig, jwks *JWKSCache) (*AccessTokenVerifier, error) {
+	if strings.TrimSpace(cfg.Audience) == "" {
+		return nil, nerr.New(nerr.InvalidArgument, "oidc.NewAccessTokenVerifier", "access-token audience is required")
+	}
+	base, err := NewIDTokenVerifier(IDTokenConfig{
+		Issuer: cfg.Issuer, ClientID: cfg.ClientID, AllowedAlgs: cfg.AllowedAlgs,
+		Skew: cfg.Skew, Now: cfg.Now,
+	}, jwks)
+	if err != nil {
+		return nil, err
+	}
+	return &AccessTokenVerifier{base: base, audience: cfg.Audience}, nil
+}
+
 // Verify validates rawToken. When expectedNonce is non-empty the token's nonce
 // claim must equal it exactly. Every failure is a typed Unauthorized /
 // InvalidFormat error with no attacker-useful detail.
 func (v *IDTokenVerifier) Verify(ctx context.Context, rawToken, expectedNonce string) (*VerifiedToken, error) {
+	return v.verify(ctx, rawToken, tokenExpectation{
+		op: "oidc.IDTokenVerifier", audience: v.cfg.ClientID,
+		expectedNonce: expectedNonce,
+	})
+}
+
+// Verify validates a JWT access token. It requires the configured resource
+// audience and an exact client_id or azp binding to the configured OAuth2
+// client. A nonce is intentionally not part of the client-credentials flow.
+func (v *AccessTokenVerifier) Verify(ctx context.Context, rawToken string) (*VerifiedToken, error) {
+	return v.base.verify(ctx, rawToken, tokenExpectation{
+		op: "oidc.AccessTokenVerifier", audience: v.audience,
+		requiredParty: v.base.cfg.ClientID,
+	})
+}
+
+type tokenExpectation struct {
+	op            string
+	audience      string
+	expectedNonce string
+	requiredParty string
+}
+
+func (v *IDTokenVerifier) verify(ctx context.Context, rawToken string, want tokenExpectation) (*VerifiedToken, error) {
 	deny := func(msg string) (*VerifiedToken, error) {
-		return nil, nerr.New(nerr.Unauthorized, "oidc.IDTokenVerifier", msg)
+		return nil, nerr.New(nerr.Unauthorized, want.op, msg)
 	}
 
 	p, err := parseCompact(rawToken)
@@ -121,7 +181,7 @@ func (v *IDTokenVerifier) Verify(ctx context.Context, rawToken, expectedNonce st
 
 	var claims map[string]any
 	if err := strictJSON(p.payload, &claims); err != nil {
-		return nil, nerr.New(nerr.InvalidFormat, "oidc.IDTokenVerifier", "token payload is not a JSON object")
+		return nil, nerr.New(nerr.InvalidFormat, want.op, "token payload is not a JSON object")
 	}
 
 	iss, _ := claims["iss"].(string)
@@ -130,10 +190,19 @@ func (v *IDTokenVerifier) Verify(ctx context.Context, rawToken, expectedNonce st
 	}
 
 	aud := audienceList(claims["aud"])
-	if !contains(aud, v.cfg.ClientID) {
-		return deny("token audience does not include this client")
+	if !contains(aud, want.audience) {
+		return deny("token audience does not include the configured audience")
 	}
-	if azp, ok := claims["azp"].(string); ok && azp != "" && azp != v.cfg.ClientID {
+	clientID, _ := claims["client_id"].(string)
+	azp, _ := claims["azp"].(string)
+	if want.requiredParty != "" {
+		if (clientID != "" && clientID != want.requiredParty) || (azp != "" && azp != want.requiredParty) {
+			return deny("access token is bound to a different client")
+		}
+		if clientID != want.requiredParty && azp != want.requiredParty {
+			return deny("access token has no binding to the configured client")
+		}
+	} else if azp != "" && azp != v.cfg.ClientID {
 		return deny("token authorized party is not this client")
 	}
 
@@ -166,7 +235,7 @@ func (v *IDTokenVerifier) Verify(ctx context.Context, rawToken, expectedNonce st
 	}
 
 	nonce, _ := claims["nonce"].(string)
-	if expectedNonce != "" && nonce != expectedNonce {
+	if want.expectedNonce != "" && nonce != want.expectedNonce {
 		return deny("token nonce does not match the request")
 	}
 

@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Journal Entry",
+  "$comment": "JSON Schema cannot enforce cross-line debit/credit totals. Application validation must also require total debits to equal total credits before posting.",
+  "type": "object",
+  "required": ["entry_date", "currency", "source", "status", "lines"],
+  "properties": {
+    "entry_date": {"type": "string", "format": "date"},
+    "currency": {"type": "string", "pattern": "^[A-Z]{3}$"},
+    "source": {"type": "string", "minLength": 1},
+    "source_reference": {"type": ["string", "null"]},
+    "description": {"type": ["string", "null"]},
+    "status": {"enum": ["DRAFT", "APPROVED", "POSTED", "REVERSED"]},
+    "lines": {
+      "type": "array",
+      "minItems": 2,
+      "items": {
+        "type": "object",
+        "required": ["account_code", "debit_minor", "credit_minor"],
+        "properties": {
+          "account_code": {"type": "string", "minLength": 1},
+          "debit_minor": {"type": "integer", "minimum": 0},
+          "credit_minor": {"type": "integer", "minimum": 0},
+          "memo": {"type": ["string", "null"]},
+          "counterparty_id": {"type": ["string", "null"]},
+          "cost_center": {"type": ["string", "null"]},
+          "project_id": {"type": ["string", "null"]}
+        },
+        "oneOf": [
+          {
+            "properties": {
+              "debit_minor": {"type": "integer", "minimum": 1},
+              "credit_minor": {"const": 0}
+            }
+          },
+          {
+            "properties": {
+              "debit_minor": {"const": 0},
+              "credit_minor": {"type": "integer", "minimum": 1}
+            }
+          }
+        ],
+        "additionalProperties": true
+      }
+    }
+  },
+  "additionalProperties": true
+}

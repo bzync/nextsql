@@ -14,6 +14,7 @@ import (
 	"github.com/bzync/nextsql/internal/storage/format"
 	"github.com/bzync/nextsql/internal/storage/integrity"
 	"github.com/bzync/nextsql/internal/undo"
+	"github.com/bzync/nextsql/internal/upgrade/compat"
 	"github.com/bzync/nextsql/internal/wal"
 )
 
@@ -36,7 +37,7 @@ const (
 
 // FileReport is one on-disk encoding observed under a data directory.
 type FileReport struct {
-	Family   Family
+	Family   compat.Family
 	Path     string
 	Present  bool
 	Version  uint16
@@ -105,7 +106,7 @@ func Inspect(dataDir string) (Report, error) {
 		r.HasIsolate = present
 	}
 	for _, f := range r.Files {
-		if f.Family == FamilyPage && (!f.Present || f.Err != "") {
+		if f.Family == compat.FamilyPage && (!f.Present || f.Err != "") {
 			r.OK = false
 		}
 		if f.Present && (!f.Compat || !f.MagicOK || f.Err != "") {
@@ -118,7 +119,7 @@ func Inspect(dataDir string) (Report, error) {
 func cryptoKeystore(dbPath string) string { return dbPath + ".keys" }
 
 func inspectSuperblock(r *Report) FileReport {
-	fr := FileReport{Family: FamilyPage, Path: r.DataFile}
+	fr := FileReport{Family: compat.FamilyPage, Path: r.DataFile}
 	st, err := os.Stat(r.DataFile)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -141,7 +142,7 @@ func inspectSuperblock(r *Report) FileReport {
 	}
 	fr.MagicOK = true
 	fr.Version = encoding.U16(raw, sbOffVersion)
-	fr.Compat = Compatible(FamilyPage, fr.Version)
+	fr.Compat = compat.Compatible(compat.FamilyPage, fr.Version)
 	if err := checksum.Verify(raw[:format.SuperblockSize], sbOffChecksum); err != nil {
 		fr.Err = "superblock checksum mismatch"
 	} else {
@@ -158,7 +159,7 @@ func inspectSuperblock(r *Report) FileReport {
 	r.Created = int64(encoding.U64(raw, sbOffCreated))
 	r.CheckLSN = format.LSN(encoding.U64(raw, sbOffCheckLSN))
 	r.RedoLSN = format.LSN(encoding.U64(raw, sbOffRedoLSN))
-	if !Compatible(FamilyEnvelope, r.Envelope) {
+	if !compat.Compatible(compat.FamilyEnvelope, r.Envelope) {
 		fr.Compat = false
 		if fr.Err == "" {
 			fr.Err = "unsupported envelope version"
@@ -176,7 +177,7 @@ func inspectSuperblock(r *Report) FileReport {
 
 func inspectWALCtrl(r *Report) FileReport {
 	path := filepath.Join(wal.DirFor(r.DataFile), "control")
-	fr := FileReport{Family: FamilyWALCtrl, Path: path}
+	fr := FileReport{Family: compat.FamilyWALCtrl, Path: path}
 	raw, err := readPrefix(path, 104)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -193,7 +194,7 @@ func inspectWALCtrl(r *Report) FileReport {
 	}
 	fr.MagicOK = true
 	fr.Version = encoding.U16(raw, 4)
-	fr.Compat = Compatible(FamilyWALCtrl, fr.Version)
+	fr.Compat = compat.Compatible(compat.FamilyWALCtrl, fr.Version)
 	if err := checksum.Verify(raw[:104], 100); err != nil {
 		fr.Err = "WAL control checksum mismatch"
 	} else {
@@ -207,7 +208,7 @@ func inspectWALCtrl(r *Report) FileReport {
 
 func inspectUNDOCtrl(r *Report) FileReport {
 	path := filepath.Join(undo.DirFor(r.DataFile), "control")
-	fr := FileReport{Family: FamilyUNDOCtrl, Path: path}
+	fr := FileReport{Family: compat.FamilyUNDOCtrl, Path: path}
 	raw, err := readPrefix(path, 72)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -224,7 +225,7 @@ func inspectUNDOCtrl(r *Report) FileReport {
 	}
 	fr.MagicOK = true
 	fr.Version = encoding.U16(raw, 4)
-	fr.Compat = Compatible(FamilyUNDOCtrl, fr.Version)
+	fr.Compat = compat.Compatible(compat.FamilyUNDOCtrl, fr.Version)
 	if err := checksum.Verify(raw[:72], 68); err != nil {
 		fr.Err = "UNDO control checksum mismatch"
 	} else {
@@ -284,7 +285,7 @@ func WriteReport(w io.Writer, r Report) {
 		r.CheckLSN, r.RedoLSN, r.WALNext, r.WALDur, r.WALCheck)
 	fmt.Fprintf(w, "keystore %t\nauth_file %t\nacl_file %t\nisolated_pages %d\n", r.Keystore, r.AuthFile, r.ACLFile, r.Isolated)
 	fmt.Fprintf(w, "\ncompatibility catalog (this binary reads Min..Max):\n")
-	for _, s := range Catalog() {
+	for _, s := range compat.Catalog() {
 		fmt.Fprintf(w, "  %-14s magic=%-4s current=%d min=%d max=%d  %s\n",
 			s.Family, s.Magic, s.Current, s.MinReadable, s.MaxReadable, s.Notes)
 	}

@@ -30,40 +30,55 @@ import (
 // maxHTTPBody bounds every response body this package will read.
 const maxHTTPBody = 1 << 20 // 1 MiB
 
+const maxBrokerRequest = 64 << 10 // matches authbroker's request cap
+
 // Doer is the subset of *http.Client this package needs; tests inject a fake.
 type Doer interface {
 	Do(*http.Request) (*http.Response, error)
 }
 
 // DefaultHTTP returns an HTTP client suitable for talking to an IdP and broker:
-// a bounded timeout and no automatic credential-leaking redirects to other
-// hosts.
+// a bounded timeout and no automatic redirects. In particular, a 307/308 from
+// a token endpoint must never replay an authorization code, refresh token, or
+// client secret to a second URL.
 func DefaultHTTP() *http.Client {
 	return &http.Client{
 		Timeout: 30 * time.Second,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			if len(via) >= 5 {
-				return nerr.New(nerr.Protocol, "oidcclient", "too many redirects")
-			}
-			return nil
+			return http.ErrUseLastResponse
 		},
 	}
 }
 
 // IdPProfile is a resolved external identity provider the CLI can log in to.
 type IdPProfile struct {
-	Name         string
-	Issuer       string
-	ClientID     string
-	ClientSecret string // empty => public client (PKCE only)
-	BrokerURL    string
-	Scopes       []string
+	Name             string
+	Issuer           string
+	ClientID         string
+	ClientSecretFile string
+	ClientSecret     string // empty => public client (PKCE only)
+	BrokerURL        string
+	Scopes           []string
 }
 
 func (p IdPProfile) scopeParam() string {
 	seen := map[string]bool{}
 	out := []string{"openid"}
 	seen["openid"] = true
+	for _, s := range p.Scopes {
+		s = strings.TrimSpace(s)
+		if s == "" || seen[s] {
+			continue
+		}
+		seen[s] = true
+		out = append(out, s)
+	}
+	return strings.Join(out, " ")
+}
+
+func (p IdPProfile) clientCredentialsScopeParam() string {
+	seen := map[string]bool{}
+	var out []string
 	for _, s := range p.Scopes {
 		s = strings.TrimSpace(s)
 		if s == "" || seen[s] {
@@ -86,7 +101,7 @@ type ProviderMetadata struct {
 // Discover fetches and validates `<issuer>/.well-known/openid-configuration`.
 func Discover(ctx context.Context, hc Doer, issuer string) (ProviderMetadata, error) {
 	const op = "oidcclient.Discover"
-	if !strings.HasPrefix(issuer, "https://") {
+	if !isHTTPS(issuer) {
 		return ProviderMetadata{}, nerr.New(nerr.InvalidArgument, op, "issuer must be an https URL")
 	}
 	u := strings.TrimRight(issuer, "/") + "/.well-known/openid-configuration"
@@ -98,7 +113,7 @@ func Discover(ctx context.Context, hc Doer, issuer string) (ProviderMetadata, er
 	if err := json.Unmarshal(body, &md); err != nil {
 		return ProviderMetadata{}, nerr.Wrap(nerr.InvalidFormat, op, "decode discovery document", err)
 	}
-	if strings.TrimRight(md.Issuer, "/") != strings.TrimRight(issuer, "/") {
+	if md.Issuer != issuer {
 		return ProviderMetadata{}, nerr.New(nerr.InvalidFormat, op, "discovery issuer does not match configured issuer")
 	}
 	if !isHTTPS(md.AuthorizationEndpoint) || !isHTTPS(md.TokenEndpoint) {
@@ -176,7 +191,7 @@ func RedeemCode(ctx context.Context, hc Doer, md ProviderMetadata, p IdPProfile,
 	form.Set("redirect_uri", redirectURI)
 	form.Set("client_id", p.ClientID)
 	form.Set("code_verifier", verifier)
-	return postTokenForm(ctx, hc, md.TokenEndpoint, p, form, "oidcclient.RedeemCode")
+	return postTokenForm(ctx, hc, md.TokenEndpoint, p, form, "oidcclient.RedeemCode", true)
 }
 
 // RefreshTokens obtains a fresh token set from a refresh token. A response that
@@ -187,7 +202,7 @@ func RefreshTokens(ctx context.Context, hc Doer, md ProviderMetadata, p IdPProfi
 	form.Set("refresh_token", refreshToken)
 	form.Set("client_id", p.ClientID)
 	form.Set("scope", p.scopeParam())
-	ts, err := postTokenForm(ctx, hc, md.TokenEndpoint, p, form, "oidcclient.RefreshTokens")
+	ts, err := postTokenForm(ctx, hc, md.TokenEndpoint, p, form, "oidcclient.RefreshTokens", true)
 	if err != nil {
 		return TokenSet{}, err
 	}
@@ -197,7 +212,23 @@ func RefreshTokens(ctx context.Context, hc Doer, md ProviderMetadata, p IdPProfi
 	return ts, nil
 }
 
-func postTokenForm(ctx context.Context, hc Doer, endpoint string, p IdPProfile, form url.Values, op string) (TokenSet, error) {
+// ObtainClientCredentials obtains a JWT access token with the OAuth2
+// client_credentials grant. The client secret is sent only through HTTP Basic
+// authentication to the discovered HTTPS token endpoint.
+func ObtainClientCredentials(ctx context.Context, hc Doer, md ProviderMetadata, p IdPProfile) (TokenSet, error) {
+	const op = "oidcclient.ObtainClientCredentials"
+	if strings.TrimSpace(p.ClientSecret) == "" {
+		return TokenSet{}, nerr.New(nerr.InvalidArgument, op, "client credentials require a client secret")
+	}
+	form := url.Values{}
+	form.Set("grant_type", "client_credentials")
+	if scopes := p.clientCredentialsScopeParam(); scopes != "" {
+		form.Set("scope", scopes)
+	}
+	return postTokenForm(ctx, hc, md.TokenEndpoint, p, form, op, false)
+}
+
+func postTokenForm(ctx context.Context, hc Doer, endpoint string, p IdPProfile, form url.Values, op string, requireIDToken bool) (TokenSet, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(form.Encode()))
 	if err != nil {
 		return TokenSet{}, nerr.Wrap(nerr.Internal, op, "build request", err)
@@ -212,9 +243,9 @@ func postTokenForm(ctx context.Context, hc Doer, endpoint string, p IdPProfile, 
 		return TokenSet{}, nerr.Wrap(nerr.Unavailable, op, "contact token endpoint", err)
 	}
 	defer resp.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxHTTPBody))
+	body, err := readBoundedBody(resp.Body, op)
 	if err != nil {
-		return TokenSet{}, nerr.Wrap(nerr.IO, op, "read token response", err)
+		return TokenSet{}, err
 	}
 	var ter tokenEndpointResponse
 	_ = json.Unmarshal(body, &ter)
@@ -225,8 +256,11 @@ func postTokenForm(ctx context.Context, hc Doer, endpoint string, p IdPProfile, 
 		}
 		return TokenSet{}, nerr.New(nerr.Unauthorized, op, msg)
 	}
-	if ter.IDToken == "" {
+	if requireIDToken && ter.IDToken == "" {
 		return TokenSet{}, nerr.New(nerr.InvalidFormat, op, "token response carried no id_token")
+	}
+	if !requireIDToken && (ter.AccessToken == "" || !strings.EqualFold(ter.TokenType, "Bearer")) {
+		return TokenSet{}, nerr.New(nerr.InvalidFormat, op, "client-credentials response requires a Bearer access_token")
 	}
 	return TokenSet{
 		IDToken:      ter.IDToken,
@@ -246,11 +280,12 @@ type BrokerResult struct {
 }
 
 type brokerExchangeRequest struct {
-	IdP      string `json:"idp"`
-	IDToken  string `json:"id_token"`
-	Nonce    string `json:"nonce"`
-	Database string `json:"database,omitempty"`
-	Realm    string `json:"realm,omitempty"`
+	IdP         string `json:"idp"`
+	IDToken     string `json:"id_token,omitempty"`
+	AccessToken string `json:"access_token,omitempty"`
+	Nonce       string `json:"nonce,omitempty"`
+	Database    string `json:"database,omitempty"`
+	Realm       string `json:"realm,omitempty"`
 }
 
 type brokerExchangeResponse struct {
@@ -265,13 +300,28 @@ type brokerExchangeResponse struct {
 // ExchangeAtBroker POSTs the ID token to `<brokerURL>/v1/exchange` and returns
 // the minted credential.
 func ExchangeAtBroker(ctx context.Context, hc Doer, brokerURL, idpName, idToken, nonce, database, realm string) (BrokerResult, error) {
+	return exchangeAtBroker(ctx, hc, brokerURL, brokerExchangeRequest{
+		IdP: idpName, IDToken: idToken, Nonce: nonce, Database: database, Realm: realm,
+	})
+}
+
+// ExchangeAccessTokenAtBroker exchanges a client-credentials access token for
+// an ordinary broker-minted NSSC1 credential.
+func ExchangeAccessTokenAtBroker(ctx context.Context, hc Doer, brokerURL, idpName, accessToken, database, realm string) (BrokerResult, error) {
+	return exchangeAtBroker(ctx, hc, brokerURL, brokerExchangeRequest{
+		IdP: idpName, AccessToken: accessToken, Database: database, Realm: realm,
+	})
+}
+
+func exchangeAtBroker(ctx context.Context, hc Doer, brokerURL string, exchange brokerExchangeRequest) (BrokerResult, error) {
 	const op = "oidcclient.ExchangeAtBroker"
 	if !isHTTPS(brokerURL) && !isLoopbackHTTP(brokerURL) {
 		return BrokerResult{}, nerr.New(nerr.InvalidArgument, op, "broker_url must be an https URL")
 	}
-	reqBody, _ := json.Marshal(brokerExchangeRequest{
-		IdP: idpName, IDToken: idToken, Nonce: nonce, Database: database, Realm: realm,
-	})
+	reqBody, _ := json.Marshal(exchange)
+	if len(reqBody) > maxBrokerRequest {
+		return BrokerResult{}, nerr.New(nerr.Exhausted, op, "broker exchange request exceeds 64 KiB")
+	}
 	u := strings.TrimRight(brokerURL, "/") + "/v1/exchange"
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, strings.NewReader(string(reqBody)))
 	if err != nil {
@@ -284,9 +334,9 @@ func ExchangeAtBroker(ctx context.Context, hc Doer, brokerURL, idpName, idToken,
 		return BrokerResult{}, nerr.Wrap(nerr.Unavailable, op, "contact authentication broker", err)
 	}
 	defer resp.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxHTTPBody))
+	body, err := readBoundedBody(resp.Body, op)
 	if err != nil {
-		return BrokerResult{}, nerr.Wrap(nerr.IO, op, "read broker response", err)
+		return BrokerResult{}, err
 	}
 	var ber brokerExchangeResponse
 	_ = json.Unmarshal(body, &ber)
@@ -329,9 +379,9 @@ func httpGet(ctx context.Context, hc Doer, u string) ([]byte, error) {
 		return nil, nerr.Wrap(nerr.Unavailable, op, "fetch "+u, err)
 	}
 	defer resp.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxHTTPBody))
+	body, err := readBoundedBody(resp.Body, op)
 	if err != nil {
-		return nil, nerr.Wrap(nerr.IO, op, "read "+u, err)
+		return nil, err
 	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, nerr.New(nerr.Unavailable, op, "unexpected status fetching "+u)
@@ -339,11 +389,25 @@ func httpGet(ctx context.Context, hc Doer, u string) ([]byte, error) {
 	return body, nil
 }
 
-func isHTTPS(u string) bool { return strings.HasPrefix(u, "https://") }
+func isHTTPS(raw string) bool {
+	u, err := url.Parse(raw)
+	return err == nil && u.Scheme == "https" && u.Host != "" && u.User == nil && u.Fragment == ""
+}
+
+func readBoundedBody(r io.Reader, op string) ([]byte, error) {
+	body, err := io.ReadAll(io.LimitReader(r, maxHTTPBody+1))
+	if err != nil {
+		return nil, nerr.Wrap(nerr.IO, op, "read response", err)
+	}
+	if len(body) > maxHTTPBody {
+		return nil, nerr.New(nerr.Exhausted, op, "HTTP response exceeds 1 MiB")
+	}
+	return body, nil
+}
 
 func isLoopbackHTTP(u string) bool {
 	p, err := url.Parse(u)
-	if err != nil || p.Scheme != "http" {
+	if err != nil || p.Scheme != "http" || p.Host == "" || p.User != nil || p.Fragment != "" {
 		return false
 	}
 	host := p.Hostname()

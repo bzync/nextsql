@@ -1,6 +1,7 @@
 package replication
 
 import (
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -167,6 +168,42 @@ func TestRaftReplicateQuorum(t *testing.T) {
 	t.Fatal("followers did not apply")
 }
 
+// TestReplicateOnNonLeaderIsDefiniteNotProposed proves a Replicate call
+// rejected before raft.Apply is ever attempted (this node is not the
+// leader) is classified as definite/not-proposed — the case
+// storage.Engine.commitAndReplicate is safe to discard a held, not-yet-
+// durable local commit for, as opposed to an ambiguous in-doubt failure
+// (see TestIsRetryableApplyErr for those).
+func TestReplicateOnNonLeaderIsDefiniteNotProposed(t *testing.T) {
+	cls, _, _, _ := startRaft(t, 3)
+	lead := raftLeader(t, cls)
+	var follower *Cluster
+	for _, c := range cls {
+		if c != lead {
+			follower = c
+			break
+		}
+	}
+	if follower == nil {
+		t.Fatal("no follower found")
+	}
+	recs := []wal.Record{
+		{Type: wal.RecBegin, LSN: 1, TxnID: 1},
+		{Type: wal.RecCommit, LSN: 2, TxnID: 1, PrevLSN: 1},
+	}
+	err := follower.Replicate(recs)
+	if err == nil {
+		t.Fatal("Replicate on a follower must fail")
+	}
+	np, ok := err.(interface{ NotProposed() bool })
+	if !ok || !np.NotProposed() {
+		t.Fatalf("Replicate on a follower = %v (%T), want a NotProposed error", err, err)
+	}
+	if !nerr.HasCode(err, nerr.Unavailable) {
+		t.Fatalf("Replicate on a follower = %v, want Unavailable", err)
+	}
+}
+
 func TestRaftKillLeaderElection(t *testing.T) {
 	cls, trans, _, _ := startRaft(t, 3)
 	lead := raftLeader(t, cls)
@@ -249,6 +286,24 @@ func TestOpenRejectsFewerThanThreeVoters(t *testing.T) {
 	}
 	if !nerr.HasCode(err, nerr.InvalidArgument) {
 		t.Fatalf("%v", err)
+	}
+}
+
+func TestIsRetryableApplyErr(t *testing.T) {
+	retryable := []error{
+		raft.ErrNotLeader, raft.ErrLeadershipLost, raft.ErrEnqueueTimeout,
+		raft.ErrLeadershipTransferInProgress, raft.ErrRaftShutdown,
+	}
+	for _, err := range retryable {
+		if !isRetryableApplyErr(err) {
+			t.Errorf("%v: want retryable", err)
+		}
+	}
+	notRetryable := []error{errors.New("some other apply failure"), raft.ErrAbortedByRestore, nil}
+	for _, err := range notRetryable {
+		if isRetryableApplyErr(err) {
+			t.Errorf("%v: want not retryable", err)
+		}
 	}
 }
 

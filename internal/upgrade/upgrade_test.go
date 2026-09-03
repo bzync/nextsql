@@ -8,81 +8,8 @@ import (
 	"github.com/bzync/nextsql/internal/crypto"
 	"github.com/bzync/nextsql/internal/nerr"
 	"github.com/bzync/nextsql/internal/storage"
+	"github.com/bzync/nextsql/internal/upgrade/compat"
 )
-
-func TestCatalogCoversKnownFamilies(t *testing.T) {
-	seen := map[Family]bool{}
-	for _, s := range Catalog() {
-		if s.Family == FamilyCatalog {
-			if s.Current != 9 || s.MinReadable != 1 || s.MaxReadable != 9 {
-				t.Fatalf("%s: %+v", s.Family, s)
-			}
-		} else if s.Current != 1 || s.MinReadable != 1 || s.MaxReadable != 1 {
-			t.Fatalf("%s: %+v", s.Family, s)
-		}
-		if s.Magic == "" {
-			t.Fatalf("%s missing magic", s.Family)
-		}
-		seen[s.Family] = true
-	}
-	for _, f := range []Family{
-		FamilyPage, FamilyEnvelope, FamilyWAL, FamilyWALCtrl,
-		FamilyUNDO, FamilyUNDOCtrl, FamilyCatalog, FamilyBackup,
-		FamilyExport, FamilyProtocol, FamilyRepl, FamilyIsolated,
-	} {
-		if !seen[f] {
-			t.Fatalf("missing %s", f)
-		}
-	}
-}
-
-func TestCatalogFamilyWindow(t *testing.T) {
-	if err := Check(FamilyCatalog, 1); err != nil {
-		t.Fatal(err)
-	}
-	if err := Check(FamilyCatalog, 2); err != nil {
-		t.Fatal(err)
-	}
-	if err := Check(FamilyCatalog, 3); err != nil {
-		t.Fatal(err)
-	}
-	if err := Check(FamilyCatalog, 4); err != nil {
-		t.Fatal(err)
-	}
-	if err := Check(FamilyCatalog, 5); err != nil {
-		t.Fatal(err)
-	}
-	if err := Check(FamilyCatalog, 6); err != nil {
-		t.Fatal(err)
-	}
-	if err := Check(FamilyCatalog, 7); err != nil {
-		t.Fatal(err)
-	}
-	if err := Check(FamilyCatalog, 8); err != nil {
-		t.Fatal(err)
-	}
-	if err := Check(FamilyCatalog, 9); err != nil {
-		t.Fatal(err)
-	}
-	if err := Check(FamilyCatalog, 10); !nerr.HasCode(err, nerr.InvalidFormat) {
-		t.Fatalf("v10: %v", err)
-	}
-}
-
-func TestCheckRejectsUnknownAndOutOfRange(t *testing.T) {
-	if err := Check(FamilyPage, 1); err != nil {
-		t.Fatal(err)
-	}
-	if err := Check(FamilyPage, 0); !nerr.HasCode(err, nerr.InvalidFormat) {
-		t.Fatalf("old: %v", err)
-	}
-	if err := Check(FamilyPage, 2); !nerr.HasCode(err, nerr.InvalidFormat) {
-		t.Fatalf("new: %v", err)
-	}
-	if err := Check(Family("nope"), 1); !nerr.HasCode(err, nerr.InvalidFormat) {
-		t.Fatalf("unknown: %v", err)
-	}
-}
 
 func TestInspectMatchesCreatedDatabase(t *testing.T) {
 	dir := t.TempDir()
@@ -113,7 +40,7 @@ func TestInspectMatchesCreatedDatabase(t *testing.T) {
 	if !rep.HasIdent || rep.Identity != ident {
 		t.Fatalf("identity %+v want %+v", rep.Identity, ident)
 	}
-	if !Compatible(FamilyPage, 1) || !Compatible(FamilyWALCtrl, 1) || !Compatible(FamilyUNDOCtrl, 1) {
+	if !compat.Compatible(compat.FamilyPage, 1) || !compat.Compatible(compat.FamilyWALCtrl, 1) || !compat.Compatible(compat.FamilyUNDOCtrl, 1) {
 		t.Fatal("v1 should be compatible")
 	}
 	var sawPage, sawWAL, sawUNDO bool
@@ -125,11 +52,11 @@ func TestInspectMatchesCreatedDatabase(t *testing.T) {
 			t.Fatalf("%+v", f)
 		}
 		switch f.Family {
-		case FamilyPage:
+		case compat.FamilyPage:
 			sawPage = true
-		case FamilyWALCtrl:
+		case compat.FamilyWALCtrl:
 			sawWAL = true
-		case FamilyUNDOCtrl:
+		case compat.FamilyUNDOCtrl:
 			sawUNDO = true
 		}
 	}

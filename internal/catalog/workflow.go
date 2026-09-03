@@ -387,12 +387,17 @@ func validWorkflowExpr(expr ast.Expr) bool {
 
 func validWorkflowType(t types.Type) bool {
 	switch t.Kind {
-	case types.KindUUID, types.KindString, types.KindText, types.KindTimestampTZ,
+	case types.KindUUID, types.KindString, types.KindText, types.KindBlob, types.KindTimestampTZ,
 		types.KindJSON, types.KindBool, types.KindPoint, types.KindBox,
-		types.KindLine, types.KindPolygon:
+		types.KindLine, types.KindPolygon,
+		types.KindInt8, types.KindInt16, types.KindInt32, types.KindInt64,
+		types.KindUint8, types.KindUint16, types.KindUint32, types.KindUint64,
+		types.KindDate, types.KindTime, types.KindTimestamp, types.KindFloat32, types.KindFloat64:
 		return true
 	case types.KindDecimal:
 		return t.Precision >= 1 && t.Precision <= 38 && t.Scale <= t.Precision
+	case types.KindChar, types.KindVarchar:
+		return t.Precision >= 1 && t.Precision <= types.MaxCharLen && t.Scale == 0
 	case types.KindVector:
 		return t.VecElem == types.VecF32 && t.Precision >= 1 && t.Precision <= types.MaxVectorDim
 	default:

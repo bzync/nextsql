@@ -17,6 +17,9 @@ Pipeline: SQL → lexer → parser → binder / catalog → logical plan → rew
 |---|---|
 | `UUID` | 16 bytes. `DEFAULT UUID()` |
 | `STRING` / `TEXT` | UTF-8. Same encoding; `TEXT` is the long-form name |
+| `BLOB` | Variable-length raw bytes, no UTF-8 validation. Literal `X'<hex>'` (e.g. `X'DEADBEEF'`). Orders byte-lexicographically; usable as `PRIMARY KEY`/`ORDER BY`. Isolated from `STRING`/`TEXT` — coercion either way requires hex text |
+| `INT8` / `INT16` / `INT32` / `INT64` | Exact fixed-width signed integers (1/2/4/8 bytes). Sort numerically; narrowing (incl. an out-of-range literal) errors instead of wrapping. Arithmetic (`+ - * /`, unary `-`) promotes to `DECIMAL` |
+| `UINT8` / `UINT16` / `UINT32` / `UINT64` | Exact fixed-width unsigned integers (1/2/4/8 bytes). Sort numerically (plain unsigned order); narrowing and negative assignment error instead of wrapping. Coercible to/from `INT8..64` (range/sign checked). Arithmetic promotes to `DECIMAL` |
 | `DECIMAL(p,s)` | `1 ≤ p ≤ 38`, `s ≤ p`. Unscaled integer + scale. `DEFAULT AI()` when `s = 0` |
 | `TIMESTAMPTZ` | UTC nanoseconds. `DEFAULT NOW()` |
 | `JSON` | Compact binary `NSJB`. Insert a JSON text literal |

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -160,6 +161,58 @@ func TestOpenHostedDefaultRejectsProvisioning(t *testing.T) {
 	cfg.InstanceKeyFile = instanceKey
 	if _, _, _, err := openHostedDefault(cfg); !nerr.HasCode(err, nerr.Unavailable) {
 		t.Fatalf("provisioning registry: %v", err)
+	}
+}
+
+// TestOpenHostedDefaultAcceptsManagedLayoutDefault covers a
+// manifest-bootstrapped deployment: RegistryManifest marks every database
+// LayoutManaged, including the default. openHostedDefault must accept it
+// (nextsqld then serves it lazily through dbmanager, with no eager primary
+// handle) instead of the pre-2026-09-03 "single-database runtime" refusal.
+func TestOpenHostedDefaultAcceptsManagedLayoutDefault(t *testing.T) {
+	dir := t.TempDir()
+	secrets := t.TempDir()
+	instanceKey := filepath.Join(secrets, "instance.key")
+	instanceRoot := createTestKey(t, instanceKey)
+	createTestKey(t, filepath.Join(secrets, "main.key")).Zero()
+	instanceRoot.Zero()
+
+	manifest := filepath.Join(t.TempDir(), "hosting.yaml")
+	if err := os.WriteFile(manifest, []byte(`version: 1
+default: {realm: only, database: main}
+realms:
+  - name: only
+    databases:
+      - {name: main, key_file: `+filepath.Join(secrets, "main.key")+`}
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	bootstrap, err := hosting.LoadDeploymentBootstrap(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, err := crypto.ReadKeyFile(instanceKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reg, _, err := hosting.EnsureManifest(hosting.Path(dir), root, func(dep hosting.ID) (hosting.Manifest, error) {
+		return bootstrap.RegistryManifest(dep, hosting.StateActive)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = reg.Close()
+
+	cfg := config.Default()
+	cfg.DataDir = dir
+	cfg.InstanceKeyFile = instanceKey
+	openedReg, realm, db, err := openHostedDefault(cfg)
+	if err != nil {
+		t.Fatalf("openHostedDefault rejected a managed-layout default: %v", err)
+	}
+	defer openedReg.Close()
+	if realm.Name != "only" || db.Name != "main" || db.Layout != hosting.LayoutManaged {
+		t.Fatalf("realm=%+v db=%+v", realm, db)
 	}
 }
 

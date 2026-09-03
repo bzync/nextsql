@@ -299,9 +299,15 @@ func decodeIdempotentResult(raw []byte) (*Result, error) {
 			null := raw[off+6]
 			n := int(binary.LittleEndian.Uint32(raw[off+7 : off+11]))
 			off += 11
-			if typ.Kind <= types.KindInvalid || typ.Kind > types.KindPolygon || null > 1 || n < 0 || off+n > len(raw) || null == 1 && n != 0 {
+			if null > 1 || n < 0 || off+n > len(raw) || null == 1 && n != 0 {
 				return nil, nerr.New(nerr.InvalidFormat, "executor.decodeIdempotentResult", "invalid result value")
 			}
+			// validateIdempotentResultType is the authoritative allow-list for
+			// typ.Kind (its default case rejects KindInvalid and anything not
+			// listed), so no separate numeric bound check is needed here — the
+			// old `typ.Kind > KindPolygon` bound silently rejected every
+			// Datatype-expansion Kind (BLOB/INT*/UINT*/DATE/TIME) appended after
+			// KindPolygon.
 			if err := validateIdempotentResultType(typ); err != nil {
 				return nil, err
 			}
@@ -344,7 +350,14 @@ func validateIdempotentResultType(typ types.Type) error {
 		if typ.VecElem != types.VecF32 || typ.Precision < 1 || typ.Precision > types.MaxVectorDim {
 			return nerr.New(nerr.InvalidFormat, "executor.decodeIdempotentResult", "invalid vector result type")
 		}
-	case types.KindUUID, types.KindString, types.KindText, types.KindTimestampTZ, types.KindJSON, types.KindBool, types.KindNull, types.KindPoint, types.KindBox, types.KindLine, types.KindPolygon:
+	case types.KindChar, types.KindVarchar:
+		if typ.Precision < 1 || typ.Precision > types.MaxCharLen || typ.Scale != 0 || typ.VecElem != 0 {
+			return nerr.New(nerr.InvalidFormat, "executor.decodeIdempotentResult", "invalid char result type")
+		}
+	case types.KindUUID, types.KindString, types.KindText, types.KindBlob, types.KindTimestampTZ, types.KindJSON, types.KindBool, types.KindNull, types.KindPoint, types.KindBox, types.KindLine, types.KindPolygon,
+		types.KindInt8, types.KindInt16, types.KindInt32, types.KindInt64,
+		types.KindUint8, types.KindUint16, types.KindUint32, types.KindUint64,
+		types.KindDate, types.KindTime, types.KindTimestamp, types.KindFloat32, types.KindFloat64:
 	default:
 		return nerr.New(nerr.InvalidFormat, "executor.decodeIdempotentResult", "invalid result type")
 	}

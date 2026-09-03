@@ -112,15 +112,35 @@ func (tx *Txn) PersistMeta() error {
 	return err
 }
 
-// RestoreSnap puts the in-memory root/height back to Begin/Attach.
+// RestoreSnap invalidates this tree's cached live-row count on rollback. It
+// deliberately does NOT reset root/height back to Begin/Attach: a page split
+// this transaction triggered is a physical structure change that took
+// effect immediately and may already be relied on by another transaction's
+// own routing (see the doc comment on storage.Engine.undoTxnLogical) — it is
+// never reverted by rollback, so root/height must be left exactly as they
+// are. liveKnown is invalidated rather than restored to the pre-txn
+// snapshot because other, still-committing transactions may have changed
+// the row count in the meantime too; it is a cache, so forcing a recount is
+// simplest and always safe.
 func (tx *Txn) RestoreSnap() {
 	if tx == nil || tx.tree == nil {
 		return
 	}
 	tx.tree.mu.Lock()
-	tx.tree.root, tx.tree.height = tx.snapR, tx.snapH
-	tx.tree.liveRows, tx.tree.liveKnown = tx.snapLive, tx.snapKnown
+	tx.tree.liveKnown = false
 	tx.tree.mu.Unlock()
+}
+
+// WasEmpty reports whether this tree had no root at all when this
+// transaction attached to it (BeginTxn/Attach) — i.e. the tree is entirely
+// new to this transaction, such as a fresh CREATE TABLE/INDEX heap or a
+// standalone detached tree. Only in that case can every page the tree ends
+// up owning be safely reclaimed if the transaction rolls back: nothing
+// outside this transaction could ever have referenced a page of a tree that
+// did not exist yet, so unlike an ordinary pre-existing tree there is no
+// concurrent-writer or structural-sharing hazard to worry about.
+func (tx *Txn) WasEmpty() bool {
+	return tx != nil && tx.snapR == 0
 }
 
 func (tx *Txn) MarkDone() {
@@ -193,10 +213,10 @@ func (tx *Txn) lockWrite(key []byte) error {
 	if tx.tree.eng.TM == nil || tx.h == nil {
 		return nil
 	}
-	if tx.h.Iso < txn.Serializable && tx.tree.eng.TM.ActiveCount() <= 1 {
+	if tx.h.Iso < txn.Serializable && tx.tree.eng.TM.ActiveCount() <= 1 && !tx.tree.eng.TM.OnlineBuildActive() {
 		return nil
 	}
-	return tx.tree.eng.TM.LockKey(tx.h, key, txn.Exclusive)
+	return tx.tree.eng.TM.LockKey(tx.h, key, txn.Exclusive, tx.tree.Name())
 }
 
 // LockExclusive always takes an exclusive key lock so concurrent UPSERT
@@ -212,21 +232,21 @@ func (tx *Txn) LockExclusive(key []byte) error {
 	if tx.tree.eng.TM == nil || tx.h == nil {
 		return nil
 	}
-	return tx.tree.eng.TM.LockKey(tx.h, key, txn.Exclusive)
+	return tx.tree.eng.TM.LockKey(tx.h, key, txn.Exclusive, tx.tree.Name())
 }
 
 func (tx *Txn) lockRead(key []byte) error {
 	if tx.tree.eng.TM == nil || tx.h == nil || tx.h.Iso != txn.Serializable {
 		return nil
 	}
-	return tx.tree.eng.TM.LockKey(tx.h, key, txn.Shared)
+	return tx.tree.eng.TM.LockKey(tx.h, key, txn.Shared, tx.tree.Name())
 }
 
 func (tx *Txn) lockRange(start, end []byte) error {
 	if tx.tree.eng.TM == nil || tx.h == nil || tx.h.Iso != txn.Serializable {
 		return nil
 	}
-	return tx.tree.eng.TM.LockRange(tx.h, start, end, txn.Shared)
+	return tx.tree.eng.TM.LockRange(tx.h, start, end, txn.Shared, tx.tree.Name())
 }
 
 func (tx *Txn) withWrite(fn func() error) error {
@@ -294,10 +314,22 @@ func (tx *Txn) insertAt(key, value []byte, snap txn.Snapshot) error {
 				}
 			}
 			old := ver
-			if !has {
+			// When a real prior version occupies the slot (a tombstone, or a
+			// row invisible to this snapshot), inserting over it is an UPDATE of
+			// that slot, not a fresh insert: the prior version — and the undo
+			// chain hanging off it back to the last committed value — must be
+			// restorable on rollback. Logging KindInsert here would make undo
+			// (and visiblePayload's chain walk) treat the key as never having
+			// existed, silently dropping a committed value when this txn aborts
+			// after a delete+reinsert of the same key (e.g. an UPDATE that does
+			// not change an indexed column).
+			undoKind := undo.KindInsert
+			if has {
+				undoKind = undo.KindUpdate
+			} else {
 				old = row.Version{Payload: raw}
 			}
-			uid, err := tx.tree.eng.LogUndo(undo.KindInsert, leafID, key, old)
+			uid, err := tx.tree.eng.LogUndo(tx.tree, undoKind, leafID, key, old)
 			if err != nil {
 				return err
 			}
@@ -311,7 +343,7 @@ func (tx *Txn) insertAt(key, value []byte, snap txn.Snapshot) error {
 			tx.tree.addLive(1)
 			return nil
 		}
-		uid, err := tx.tree.eng.LogUndo(undo.KindInsert, leafID, key, row.Version{})
+		uid, err := tx.tree.eng.LogUndo(tx.tree, undo.KindInsert, leafID, key, row.Version{})
 		if err != nil {
 			return err
 		}
@@ -376,7 +408,8 @@ func (tx *Txn) Update(key, value []byte) error {
 		return err
 	}
 	tx.refreshIfRC()
-	return tx.updateAt(key, value, tx.snap())
+	_, err := tx.updateAt(key, value, tx.snap())
+	return err
 }
 
 // UpdateAt is Update using snap for visibility and write-write. It does
@@ -389,15 +422,50 @@ func (tx *Txn) UpdateAt(key, value []byte, snap txn.Snapshot) error {
 	if _, err := encodeLeaf(key, value); err != nil {
 		return err
 	}
+	_, err := tx.updateAt(key, value, snap)
+	return err
+}
+
+// UpdateAtReturningOld is UpdateAt, additionally returning the payload
+// actually found and overwritten — see UpdateReturningOld's doc comment.
+func (tx *Txn) UpdateAtReturningOld(key, value []byte, snap txn.Snapshot) ([]byte, error) {
+	if tx == nil || tx.done {
+		return nil, nerr.New(nerr.InvalidArgument, "btree.Txn.UpdateAtReturningOld", "transaction is not active")
+	}
+	if _, err := encodeLeaf(key, value); err != nil {
+		return nil, err
+	}
 	return tx.updateAt(key, value, snap)
 }
 
-func (tx *Txn) updateAt(key, value []byte, snap txn.Snapshot) error {
+// UpdateReturningOld is Update, additionally returning the payload actually
+// found and overwritten. Under ReadCommitted, refreshIfRC() takes a fresh
+// snapshot for this specific write, which can be newer than whatever
+// snapshot a caller used to read the row earlier in the same statement (e.g.
+// a scan-then-write UPDATE/DELETE) — with no write-write conflict raised for
+// RC, that means the write can silently overwrite a row a *different*,
+// concurrently committed transaction already changed since the caller's own
+// read. A caller that needs to know the row's true prior value at the exact
+// moment of this write (e.g. secondary-index maintenance, which must delete
+// the index entry that is actually there, not the one the caller expected)
+// must use the value returned here instead of its own earlier read.
+func (tx *Txn) UpdateReturningOld(key, value []byte) ([]byte, error) {
+	if tx == nil || tx.done {
+		return nil, nerr.New(nerr.InvalidArgument, "btree.Txn.UpdateReturningOld", "transaction is not active")
+	}
+	if _, err := encodeLeaf(key, value); err != nil {
+		return nil, err
+	}
+	tx.refreshIfRC()
+	return tx.updateAt(key, value, tx.snap())
+}
+
+func (tx *Txn) updateAt(key, value []byte, snap txn.Snapshot) (oldPayload []byte, err error) {
 	key, value = copyBytes(key), copyBytes(value)
 	if err := tx.lockWrite(key); err != nil {
-		return err
+		return nil, err
 	}
-	return tx.withWrite(func() error {
+	err = tx.withWrite(func() error {
 		if err := tx.tree.eng.CrashAt(wal.PointDuringUpdate); err != nil {
 			return err
 		}
@@ -428,7 +496,7 @@ func (tx *Txn) updateAt(key, value []byte, snap txn.Snapshot) error {
 				return nerr.New(nerr.Serialization, "btree.Txn.Update", "write-write conflict")
 			}
 		}
-		uid, err := tx.tree.eng.LogUndo(undo.KindUpdate, leafID, key, ver)
+		uid, err := tx.tree.eng.LogUndo(tx.tree, undo.KindUpdate, leafID, key, ver)
 		if err != nil {
 			return err
 		}
@@ -436,8 +504,13 @@ func (tx *Txn) updateAt(key, value []byte, snap txn.Snapshot) error {
 		if err := tx.tree.eng.LogLogical(wal.RecUpdate, key, value); err != nil {
 			return err
 		}
-		return tx.tree.updateLocked(key, neu)
+		if err := tx.tree.updateLocked(key, neu); err != nil {
+			return err
+		}
+		oldPayload = payload
+		return nil
 	})
+	return oldPayload, err
 }
 
 func (tx *Txn) Delete(key []byte) error {
@@ -448,7 +521,8 @@ func (tx *Txn) Delete(key []byte) error {
 		return err
 	}
 	tx.refreshIfRC()
-	return tx.deleteAt(key, tx.snap())
+	_, err := tx.deleteAt(key, tx.snap())
+	return err
 }
 
 // DeleteAt is Delete using snap for visibility and write-write. It does
@@ -461,15 +535,43 @@ func (tx *Txn) DeleteAt(key []byte, snap txn.Snapshot) error {
 	if err := checkKey(key); err != nil {
 		return err
 	}
+	_, err := tx.deleteAt(key, snap)
+	return err
+}
+
+// DeleteAtReturningOld is DeleteAt, additionally returning the payload
+// actually found and removed — see UpdateReturningOld's doc comment.
+func (tx *Txn) DeleteAtReturningOld(key []byte, snap txn.Snapshot) ([]byte, error) {
+	if tx == nil || tx.done {
+		return nil, nerr.New(nerr.InvalidArgument, "btree.Txn.DeleteAtReturningOld", "transaction is not active")
+	}
+	if err := checkKey(key); err != nil {
+		return nil, err
+	}
 	return tx.deleteAt(key, snap)
 }
 
-func (tx *Txn) deleteAt(key []byte, snap txn.Snapshot) error {
+// DeleteReturningOld is Delete, additionally returning the payload actually
+// found and removed — see UpdateReturningOld's doc comment for why a caller
+// doing its own secondary-index maintenance needs this instead of a payload
+// it read earlier in the same statement.
+func (tx *Txn) DeleteReturningOld(key []byte) ([]byte, error) {
+	if tx == nil || tx.done {
+		return nil, nerr.New(nerr.InvalidArgument, "btree.Txn.DeleteReturningOld", "transaction is not active")
+	}
+	if err := checkKey(key); err != nil {
+		return nil, err
+	}
+	tx.refreshIfRC()
+	return tx.deleteAt(key, tx.snap())
+}
+
+func (tx *Txn) deleteAt(key []byte, snap txn.Snapshot) (oldPayload []byte, err error) {
 	key = copyBytes(key)
 	if err := tx.lockWrite(key); err != nil {
-		return err
+		return nil, err
 	}
-	return tx.withWrite(func() error {
+	err = tx.withWrite(func() error {
 		if err := tx.tree.eng.CrashAt(wal.PointDuringDelete); err != nil {
 			return err
 		}
@@ -500,7 +602,7 @@ func (tx *Txn) deleteAt(key []byte, snap txn.Snapshot) error {
 				return nerr.New(nerr.Serialization, "btree.Txn.Delete", "write-write conflict")
 			}
 		}
-		uid, err := tx.tree.eng.LogUndo(undo.KindDelete, leafID, key, ver)
+		uid, err := tx.tree.eng.LogUndo(tx.tree, undo.KindDelete, leafID, key, ver)
 		if err != nil {
 			return err
 		}
@@ -516,8 +618,10 @@ func (tx *Txn) deleteAt(key []byte, snap txn.Snapshot) error {
 			return err
 		}
 		tx.tree.addLive(-1)
+		oldPayload = payload
 		return nil
 	})
+	return oldPayload, err
 }
 
 func (tx *Txn) Lookup(key []byte) ([]byte, error) {
@@ -736,14 +840,8 @@ func (tx *Txn) Rollback() error {
 	}
 	tx.done = true
 	tx.RestoreSnap()
-	if tx.tree.eng.Undo != nil {
-		recs := tx.tree.eng.Undo.Chain(tx.wal.LastUndo())
-		_ = tx.withWrite(func() error {
-			for _, rec := range recs {
-				_ = tx.tree.applyUndoRec(rec)
-			}
-			return nil
-		})
-	}
+	// RollbackTxn itself now replays the durable undo chain through
+	// UndoTarget.ApplyUndo (routed per-tree via LogUndo's recorded targets),
+	// so no separate manual replay is needed here.
 	return tx.tree.eng.RollbackTxn(tx.wal)
 }

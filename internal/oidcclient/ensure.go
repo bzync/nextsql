@@ -29,7 +29,18 @@ func NewCredential(p IdPProfile, host, database, realm string, res BrokerResult,
 		ExpiresAt:    res.ExpiresAt,
 		ObtainedAt:   now,
 		RefreshToken: ts.RefreshToken,
+		GrantType:    "authorization_code",
 	}
+}
+
+// NewClientCredential builds a storable non-interactive credential. The
+// client secret remains in its separately protected file and is never copied
+// into this credential record.
+func NewClientCredential(p IdPProfile, host, database, realm string, res BrokerResult, now time.Time) *Credential {
+	c := NewCredential(p, host, database, realm, res, TokenSet{}, now)
+	c.GrantType = "client_credentials"
+	c.ClientSecretFile = p.ClientSecretFile
+	return c
 }
 
 // RenewOptions configures EnsureFresh.
@@ -63,6 +74,28 @@ func EnsureFresh(ctx context.Context, opts RenewOptions) (*Credential, error) {
 	}
 	if cur.Fresh(now(), skew) {
 		return cur, nil
+	}
+	if cur.GrantType == "client_credentials" {
+		profile := opts.Profile
+		if profile.ClientSecret == "" && cur.ClientSecretFile != "" {
+			profile.ClientSecretFile = cur.ClientSecretFile
+			var err error
+			profile.ClientSecret, err = ReadClientSecretFile(cur.ClientSecretFile)
+			if err != nil {
+				return nil, err
+			}
+		}
+		res, _, err := ClientCredentials(ctx, ClientCredentialsOptions{
+			Profile: profile, HTTP: opts.HTTP, Database: cur.Database, Realm: cur.Realm,
+		})
+		if err != nil {
+			return nil, err
+		}
+		next := NewClientCredential(profile, opts.Host, cur.Database, cur.Realm, res, now())
+		if err := opts.Store.Save(next); err != nil {
+			return nil, err
+		}
+		return next, nil
 	}
 	if cur.RefreshToken == "" {
 		return nil, nerr.New(nerr.Unauthorized, op, "stored credential for idp "+opts.Profile.Name+" has expired and cannot be renewed without a browser; run: nextsql login --idp "+opts.Profile.Name)

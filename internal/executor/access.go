@@ -238,6 +238,9 @@ func (s *Session) scanHeapPartitions(tab *catalog.Table, partitions []uint32, lo
 			}
 			htx := s.x.use(heap)
 			if err := htx.Range(start, end, func(_, val []byte) error {
+				if err := s.budget().Check(); err != nil {
+					return err
+				}
 				row, err := s.decodeHeapRow(tab, val)
 				if err != nil {
 					return err
@@ -264,6 +267,9 @@ func (s *Session) scanHeapPartitions(tab *catalog.Table, partitions []uint32, lo
 	}
 	htx := s.x.use(heap)
 	return htx.Range(start, end, func(_, val []byte) error {
+		if err := s.budget().Check(); err != nil {
+			return err
+		}
 		row, err := s.decodeHeapRow(tab, val)
 		if err != nil {
 			return err
@@ -328,6 +334,9 @@ func (s *Session) scanIndex(n planner.IndexScan, fn func([]types.Value) error) e
 			return emit(row)
 		}
 		return htx.Range(start, end, func(_, val []byte) error {
+			if err := s.budget().Check(); err != nil {
+				return err
+			}
 			row, err := s.decodeHeapRow(tab, val)
 			if err != nil {
 				return err
@@ -343,6 +352,9 @@ func (s *Session) scanIndex(n planner.IndexScan, fn func([]types.Value) error) e
 	itx := s.x.use(ix)
 	pkTypes := pkTypeList(tab)
 	emitIndex := func(key, val []byte) error {
+		if err := s.budget().Check(); err != nil {
+			return err
+		}
 		if n.IndexOnly {
 			row, err := rowFromIndex(tab, idx, key, val)
 			if err != nil {
@@ -403,6 +415,9 @@ func (s *Session) scanPartitionedIndex(n planner.IndexScan, fn func([]types.Valu
 		htx := s.x.use(heap)
 		itx := s.x.use(local)
 		emitIndex := func(key, val []byte) error {
+			if err := s.budget().Check(); err != nil {
+				return err
+			}
 			if n.IndexOnly {
 				row, err := rowFromIndex(tab, idx, key, val)
 				if err != nil {
@@ -439,6 +454,9 @@ func (s *Session) scanPartitionedPK(n planner.IndexScan, fn func([]types.Value) 
 		return err
 	}
 	emit := func(val []byte) error {
+		if err := s.budget().Check(); err != nil {
+			return err
+		}
 		row, err := s.decodeHeapRow(tab, val)
 		if err != nil {
 			return err

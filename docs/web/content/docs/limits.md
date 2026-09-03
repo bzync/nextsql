@@ -27,8 +27,10 @@ This is still **0.1.0-dev**. Treat it as an engine under measurement, not a drop
 - Outer `JOIN` together with `SEARCH` or `NEAREST` (inner join is allowed when the rank column is on the `FROM` table)
 - Additional language analyzers beyond `simple` / `english` / `french` / `german` / `spanish` (`HIGHLIGHT` / `SNIPPET`, prefix, fuzzy matching, typo tolerance, multi-field search, field weighting, and faceting are implemented)
 - Dense+sparse+BM25 fusion (`VECTOR<F16,N>`, `VECTOR<I8,N>`, `BITVECTOR<N>`, the quantised HNSW index, compressed HNSW neighbour lists, IVF, IVF-PQ, and `SPARSEVECTOR<N>` / `USING SPARSE` are implemented)
-- Field-level `ENCRYPTED CLIENT` / server-side zero-knowledge SQL
-- External IdP and short-lived credentials (mTLS, live rotation, and X.509 CRL revocation are implemented; OCSP is not)
+- Production-gated field-level `ENCRYPTED CLIENT` (experimental core + Go
+  helper exist; non-Go drivers, PITR, and HA/failover coverage remain open)
+- OIDC opaque-token introspection/JIT and OCSP (the required external-IdP,
+  short-lived credential, mTLS, live-rotation, and X.509 CRL paths are implemented)
 - Multi-primary writes
 
 ## Known measurement notes (0.1.0-dev)

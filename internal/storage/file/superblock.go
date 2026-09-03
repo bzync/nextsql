@@ -7,6 +7,7 @@ import (
 	"github.com/bzync/nextsql/internal/nerr"
 	"github.com/bzync/nextsql/internal/storage/checksum"
 	"github.com/bzync/nextsql/internal/storage/format"
+	"github.com/bzync/nextsql/internal/upgrade/compat"
 )
 
 const (
@@ -111,8 +112,8 @@ func decodeSuperblock(buf []byte) (Superblock, []byte, error) {
 		return Superblock{}, nil, nerr.Wrap(nerr.Corruption, "file.decodeSuperblock", "checksum", err)
 	}
 	ver := encoding.U16(buf, sbOffVersion)
-	if ver != format.CurrentFormatVersion {
-		return Superblock{}, nil, nerr.New(nerr.InvalidFormat, "file.decodeSuperblock", "unsupported database format version")
+	if err := compat.Check(compat.FamilyPage, ver); err != nil {
+		return Superblock{}, nil, nerr.Wrap(nerr.InvalidFormat, "file.decodeSuperblock", "unsupported database format version", err)
 	}
 	sb := Superblock{
 		FormatVersion:       ver,

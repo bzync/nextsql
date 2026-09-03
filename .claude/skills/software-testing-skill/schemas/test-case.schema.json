@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Bzync Test Case",
+  "type": "object",
+  "required": [
+    "id",
+    "name",
+    "risk",
+    "layer",
+    "expected"
+  ],
+  "properties": {
+    "id": {
+      "type": "string"
+    },
+    "name": {
+      "type": "string"
+    },
+    "risk": {
+      "type": "string"
+    },
+    "layer": {
+      "enum": [
+        "UNIT",
+        "COMPONENT",
+        "INTEGRATION",
+        "CONTRACT",
+        "MIGRATION",
+        "E2E",
+        "ACCESSIBILITY",
+        "PERFORMANCE",
+        "RESILIENCE",
+        "SECURITY",
+        "RELEASE"
+      ]
+    },
+    "preconditions": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "steps": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "expected": {
+      "type": "string"
+    },
+    "automated": {
+      "type": "boolean"
+    },
+    "owner": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": true
+}

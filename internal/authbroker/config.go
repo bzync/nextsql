@@ -32,15 +32,16 @@ const (
 
 // IdPProfile is one named external identity provider.
 type IdPProfile struct {
-	Name        string
-	Issuer      string
-	ClientID    string
-	JWKSURI     string // optional; discovered from Issuer when empty
-	AllowedAlgs []string
-	JWKSSoftTTL time.Duration
-	JWKSHardTTL time.Duration
-	GroupClaim  string // informational; the NSIP policy owns the real group claim
-	Skew        time.Duration
+	Name                string
+	Issuer              string
+	ClientID            string
+	AccessTokenAudience string // empty disables JWT client-credentials exchange
+	JWKSURI             string // optional; discovered from Issuer when empty
+	AllowedAlgs         []string
+	JWKSSoftTTL         time.Duration
+	JWKSHardTTL         time.Duration
+	GroupClaim          string // informational; the NSIP policy owns the real group claim
+	Skew                time.Duration
 }
 
 // Config is the parsed broker configuration.
@@ -174,6 +175,8 @@ func applyProfile(p *IdPProfile, k, v string) error {
 		p.Issuer = v
 	case "client_id":
 		p.ClientID = v
+	case "access_token_audience":
+		p.AccessTokenAudience = v
 	case "jwks_uri":
 		p.JWKSURI = v
 	case "group_claim":
@@ -243,6 +246,9 @@ func (c Config) Validate() error {
 	for _, p := range c.Profiles {
 		if strings.TrimSpace(p.Issuer) == "" || strings.TrimSpace(p.ClientID) == "" {
 			return bad("each idp section needs issuer and client_id")
+		}
+		if len(p.AccessTokenAudience) > 1024 {
+			return bad("idp access_token_audience must not exceed 1024 bytes")
 		}
 		if !strings.HasPrefix(p.Issuer, "https://") {
 			return bad("idp issuer must be an https URL")

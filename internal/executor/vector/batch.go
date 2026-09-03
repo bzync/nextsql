@@ -15,23 +15,26 @@ type Batch struct {
 
 // Vector is one typed column inside a Batch.
 type Vector struct {
-	Typ    types.Type
-	Null   []bool
-	UUID   [][16]byte
-	Str    []string
-	Dec    []types.Decimal
-	Time   []int64
+	Typ       types.Type
+	Null      []bool
+	UUID      [][16]byte
+	Str       []string
+	Dec       []types.Decimal
+	Int       []int64
+	Uint      []uint64
+	Flt       []float64
+	Time      []int64
 	JSON      [][]byte
 	Vec       [][]float32
 	VecRef    []bool
 	SparseIdx [][]uint32
 	SparseVal [][]float32
 	Bool      []bool
-	Lon    []float64
-	Lat    []float64
-	Box    [][4]float64
-	Coords [][]float64
-	Rings  [][]int
+	Lon       []float64
+	Lat       []float64
+	Box       [][4]float64
+	Coords    [][]float64
+	Rings     [][]int
 }
 
 // New allocates a batch with capacity snapped to a supported size.
@@ -53,11 +56,17 @@ func newVec(t types.Type, n int) Vector {
 	switch t.Kind {
 	case types.KindUUID:
 		v.UUID = make([][16]byte, n)
-	case types.KindString, types.KindText:
+	case types.KindString, types.KindText, types.KindBlob, types.KindChar, types.KindVarchar:
 		v.Str = make([]string, n)
 	case types.KindDecimal:
 		v.Dec = make([]types.Decimal, n)
-	case types.KindTimestampTZ:
+	case types.KindInt8, types.KindInt16, types.KindInt32, types.KindInt64, types.KindDate:
+		v.Int = make([]int64, n)
+	case types.KindUint8, types.KindUint16, types.KindUint32, types.KindUint64:
+		v.Uint = make([]uint64, n)
+	case types.KindFloat32, types.KindFloat64:
+		v.Flt = make([]float64, n)
+	case types.KindTimestampTZ, types.KindTime, types.KindTimestamp:
 		v.Time = make([]int64, n)
 	case types.KindJSON:
 		v.JSON = make([][]byte, n)
@@ -112,7 +121,7 @@ func (b *Batch) ApproxBytes() int64 {
 				continue
 			}
 			switch col.Typ.Kind {
-			case types.KindString, types.KindText:
+			case types.KindString, types.KindText, types.KindBlob, types.KindChar, types.KindVarchar:
 				n += int64(len(col.Str[j]))
 			case types.KindJSON:
 				n += int64(len(col.JSON[j]))
@@ -158,11 +167,17 @@ func setAt(col *Vector, i int, v types.Value) {
 	switch col.Typ.Kind {
 	case types.KindUUID:
 		col.UUID[i] = v.UUID
-	case types.KindString, types.KindText:
+	case types.KindString, types.KindText, types.KindBlob, types.KindChar, types.KindVarchar:
 		col.Str[i] = v.Str
 	case types.KindDecimal:
 		col.Dec[i] = v.Dec
-	case types.KindTimestampTZ:
+	case types.KindInt8, types.KindInt16, types.KindInt32, types.KindInt64, types.KindDate:
+		col.Int[i] = v.Int
+	case types.KindUint8, types.KindUint16, types.KindUint32, types.KindUint64:
+		col.Uint[i] = v.Uint
+	case types.KindFloat32, types.KindFloat64:
+		col.Flt[i] = v.Flt
+	case types.KindTimestampTZ, types.KindTime, types.KindTimestamp:
 		col.Time[i] = v.Time
 	case types.KindJSON:
 		col.JSON[i] = v.JSON
@@ -221,10 +236,30 @@ func getAt(col *Vector, i int) types.Value {
 		return types.StringValue(col.Str[i])
 	case types.KindText:
 		return types.TextValue(col.Str[i])
+	case types.KindBlob:
+		return types.BlobValue([]byte(col.Str[i]))
+	case types.KindChar:
+		return types.CharValue(col.Str[i], col.Typ)
+	case types.KindVarchar:
+		return types.VarcharValue(col.Str[i], col.Typ)
 	case types.KindDecimal:
 		return types.DecimalValue(col.Dec[i], col.Typ)
+	case types.KindInt8, types.KindInt16, types.KindInt32, types.KindInt64:
+		return types.IntValue(col.Typ.Kind, col.Int[i])
+	case types.KindUint8, types.KindUint16, types.KindUint32, types.KindUint64:
+		return types.UintValue(col.Typ.Kind, col.Uint[i])
+	case types.KindFloat32:
+		return types.Float32Value(col.Flt[i])
+	case types.KindFloat64:
+		return types.Float64Value(col.Flt[i])
+	case types.KindDate:
+		return types.DateValue(int32(col.Int[i]))
 	case types.KindTimestampTZ:
 		return types.TimeValue(col.Time[i])
+	case types.KindTime:
+		return types.TimeOfDayValue(col.Time[i])
+	case types.KindTimestamp:
+		return types.NaiveTimestampValue(col.Time[i])
 	case types.KindJSON:
 		return types.JSONValue(col.JSON[i])
 	case types.KindVector:
@@ -277,11 +312,17 @@ func (b *Batch) Compact(sel []int) {
 			switch col.Typ.Kind {
 			case types.KindUUID:
 				col.UUID[d] = col.UUID[s]
-			case types.KindString, types.KindText:
+			case types.KindString, types.KindText, types.KindBlob, types.KindChar, types.KindVarchar:
 				col.Str[d] = col.Str[s]
 			case types.KindDecimal:
 				col.Dec[d] = col.Dec[s]
-			case types.KindTimestampTZ:
+			case types.KindInt8, types.KindInt16, types.KindInt32, types.KindInt64, types.KindDate:
+				col.Int[d] = col.Int[s]
+			case types.KindUint8, types.KindUint16, types.KindUint32, types.KindUint64:
+				col.Uint[d] = col.Uint[s]
+			case types.KindFloat32, types.KindFloat64:
+				col.Flt[d] = col.Flt[s]
+			case types.KindTimestampTZ, types.KindTime, types.KindTimestamp:
 				col.Time[d] = col.Time[s]
 			case types.KindJSON:
 				col.JSON[d] = col.JSON[s]
@@ -330,11 +371,17 @@ func clonePrefix(src Vector, n, cap int) Vector {
 	switch src.Typ.Kind {
 	case types.KindUUID:
 		copy(dst.UUID, src.UUID[:n])
-	case types.KindString, types.KindText:
+	case types.KindString, types.KindText, types.KindBlob, types.KindChar, types.KindVarchar:
 		copy(dst.Str, src.Str[:n])
 	case types.KindDecimal:
 		copy(dst.Dec, src.Dec[:n])
-	case types.KindTimestampTZ:
+	case types.KindInt8, types.KindInt16, types.KindInt32, types.KindInt64, types.KindDate:
+		copy(dst.Int, src.Int[:n])
+	case types.KindUint8, types.KindUint16, types.KindUint32, types.KindUint64:
+		copy(dst.Uint, src.Uint[:n])
+	case types.KindFloat32, types.KindFloat64:
+		copy(dst.Flt, src.Flt[:n])
+	case types.KindTimestampTZ, types.KindTime, types.KindTimestamp:
 		copy(dst.Time, src.Time[:n])
 	case types.KindJSON:
 		copy(dst.JSON, src.JSON[:n])

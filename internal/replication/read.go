@@ -47,9 +47,18 @@ func (r ReadConsistency) String() string {
 // A non-leader returns an unavailable error; the caller routes the read to the
 // leader. Isolating a stale leader from the quorum also fails the barrier, so a
 // partitioned former leader cannot serve a STRONG read from its own log.
+//
+// A node with an unreconciled replication orphan (ReportReplicationOrphan —
+// a local commit that could not reach quorum) also fails the barrier
+// regardless of leadership, until an operator runs CLUSTER RECONCILE
+// CONFIRM: that node's local history may contain a row no other member has,
+// so it cannot vouch for the linearizable prefix a STRONG read promises.
 func (c *Cluster) StrongReadBarrier() error {
 	if c == nil || c.raft == nil {
 		return nerr.New(nerr.Unavailable, "replication.StrongReadBarrier", "cluster is closed")
+	}
+	if c.replSuspect.Load() {
+		return nerr.New(nerr.Unavailable, "replication.StrongReadBarrier", "local commit history is unreconciled after a replication failure; run CLUSTER RECONCILE CONFIRM after verifying this node's data")
 	}
 	if c.raft.State() != raft.Leader {
 		return c.notLeader("replication.StrongReadBarrier")

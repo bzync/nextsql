@@ -146,6 +146,35 @@ func TestMigrateLegacyTenantRejectsUnexpectedDestinationState(t *testing.T) {
 	}
 }
 
+func TestMigrateLegacyTenantRejectsClientEncryptedColumns(t *testing.T) {
+	dir := t.TempDir()
+	source, err := executor.Create(filepath.Join(dir, "source.db"), migrationKeys(t), 32)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+	if _, err := source.Session().Exec(`CREATE TABLE rows (
+		tenant_id STRING NOT NULL,
+		id STRING NOT NULL,
+		secret STRING ENCRYPTED CLIENT,
+		PRIMARY KEY (tenant_id, id)
+	) PARTITION BY LIST (tenant_id) (
+		PARTITION tenant_a VALUES IN ('a')
+	)`); err != nil {
+		t.Fatal(err)
+	}
+	makeLegacyTenantDescriptor(t, source, "rows")
+
+	dest, err := executor.Create(filepath.Join(dir, "dest.db"), migrationKeys(t), 32)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dest.Close()
+	if _, err := MigrateLegacyTenant(source, dest, "a", LegacyTenantOptions{}); !nerr.HasCode(err, nerr.Conflict) {
+		t.Fatalf("context-changing migration accepted ENCRYPTED CLIENT column: %v", err)
+	}
+}
+
 func migrationKeys(t *testing.T) *crypto.MemoryKeyProvider {
 	t.Helper()
 	dek, err := crypto.GenerateDEK(1)

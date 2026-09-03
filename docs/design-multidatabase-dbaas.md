@@ -1,6 +1,8 @@
 # Proposed Multi-Database Hosting and Subscription Isolation
 
-> Status: **ACCEPTED DESIGN — M1 FOUNDATION PARTIAL; NOT PRODUCTION-GATED**
+> Status: **ACCEPTED DESIGN — M1 FOUNDATION COMPLETE, M2-1/M2-2/M2-3a/
+> M2-3b-1/M2-3b-2/M2-3b-3a/M2-3b-3b/M2-4a/M2-4b-1/M2-5/M2-6 LANDED; NOT
+> PRODUCTION-GATED**
 >
 > This document is a design and delivery plan. `TODO.md` remains authoritative
 > for implementation status and sequencing. Nothing in this document changes a
@@ -13,9 +15,57 @@ lifecycle validation, durable nonce high-water publication, restartable
 verification of the active default database. The server, init, and explicit
 offline legacy-default adoption path share an exclusive deployment lock;
 adoption preserves and recovery-verifies the existing file identity before
-activation and never discovers sibling files. ID-layout migration/rollback,
-multi-database engine routing, realm-local auth stores, quotas, HA replication,
-and independent operational lifecycle remain open.
+activation and never discovers sibling files.
+
+**M2-1 landed 2026-09-02**: `Registry.CreateRealm`/`CreateDatabase` and
+`nextsql realm create`/`nextsql database create` register and physically
+provision an additional managed database (§16 below).
+
+**M2-2 landed 2026-09-02**: `Hello.Realm`, an additive opt-in wire field
+letting a client identify which realm it intends to reach, validated by
+`nextsqld` as a flat-string check against the one realm it serves (§8, §16
+below). This is routing/identity validation only, not live multi-database
+routing.
+
+**M2-3a landed 2026-09-02**: `internal/dbmanager.Manager` gives `nextsqld`
+its first live multi-database routing — a connection's `Hello.Realm`/
+`Hello.Database` can now reach a genuinely different, already-registered
+database, not just validate identity against the one primary database
+(§9, §16 below). Bounded to a small fixed open-database limit, and
+secondary databases are single-node only (no Raft attachment).
+
+**M2-3b-1 landed 2026-09-02**: a secondary database now closes when idle
+(its last connection disconnects) and reopens cleanly on the next one,
+instead of staying open forever once opened; a database that repeatedly
+fails to open is quarantined with exponential backoff instead of being
+retried in a tight loop (§9, §16 below). The Preloaded primary is pinned
+and never evicted.
+
+**M2-3b-2 landed 2026-09-03**: a process-wide `buffer.Budget` now optionally
+caps the total buffer-pool frames committed across every database `nextsqld`
+has open at once (`max_total_buffer_pages`, 0 = unbounded default); a
+database's reservation releases the moment it closes, including M2-3b-1 idle
+eviction (§9, §16 below).
+
+**M2-3b-3a landed 2026-09-03**: every open database's scheduled-task
+execution now submits to one shared, fixed-size `executor.TaskPool`
+(`task_workers` config key) instead of each database spawning its own
+worker set — task-execution goroutine count no longer scales with the
+number of open databases. Each database still polled its own due
+tasks/schedules independently at this point (§9, §16 below).
+
+**M2-3b-3b landed 2026-09-03**: the polling itself is now centralized too —
+one process-wide `executor.CentralScheduler` enumerates every open
+database each tick (via a new `dbmanager.Manager.Snapshot`) instead of one
+poll loop per database, reducing polling goroutines from O(open databases)
+to O(1) on top of 3a's shared workers (§9, §16 below). M2-3b-3c retired
+the already-dead-in-production `TaskRuntime.Cancel`/`running` registry
+(2026-09-03) — with that, M2-3b (and the whole M2 selectable-hosting
+milestone) is complete.
+
+ID-layout migration/rollback of the *existing* legacy default database,
+realm-local auth stores (§5.2, M2-4), quotas, HA replication, and
+independent operational lifecycle remain open.
 
 ## 1. Purpose
 
@@ -137,6 +187,23 @@ path-traversal validation before persistence.
 
 Each realm has its own principal namespace, password/identity store, roles, and
 grants. The same username may exist independently in two realms.
+
+**M2-4b-1 landed 2026-09-02**: `auth.Store`/`security.ACL` gained a `RealmID`
+dimension (`hosting.ID{}` for deployment-wide, unioned with a realm's own
+grants/roles for ordinary privileges — authorization is additive) covering
+the principal namespace, password store, roles, and grants exactly as
+described above, in a single composite-keyed file (not the per-realm-file
+layout §7 originally sketched — that remains open as M2-4b-2, needed only
+for isolation-at-rest/crypto-shred, not for correctness). The authorization
+tuple below does not yet carry a `DatabaseID` dimension — every grant so far
+is realm-scoped, not additionally database-scoped within a realm; that
+remains open. `PrivAdmin+ScopeCluster`/`PrivAdmin+ScopeAdmin` always mean
+deployment-wide regardless of the realm a grant names — a first, narrow
+instance of "deployment administration is separate from realm
+administration" below; a distinct **realm-admin** privilege (bounded to one
+realm, e.g. a future `ScopeRealm`) is not yet implemented. See
+`docs/design-multidatabase-dbaas.md` §16 and `TODO.md` log #76 for the full
+implementation writeup.
 
 The authorization tuple is at least:
 
@@ -285,8 +352,27 @@ used and explicitly reported.
 
 ## 8. Connection Protocol and Drivers
 
-Add a capability/version-negotiated protocol revision. The Hello selection
-becomes logically:
+**M2-2 landed 2026-09-02**: `Hello.Realm`, an additive opt-in trailing
+field (not the negotiated protocol revision this section originally
+envisioned — see §19 item 7 for why that turned out unnecessary: the frame
+header's `Version` is a hard equality gate with no negotiation, so realm
+selection is added the same way `NSCT` catalog records add a field, not via
+a version bump). See `docs/protocol.md`'s Hello section for the wire-level
+detail.
+
+**M2-5 landed 2026-09-02**: a non-empty `Hello.Realm` is now validated
+against the deployment's actual registry (`hosting.Registry.LookupRealm`,
+rejecting an unknown name `not_found`) whenever a `HostingRegistry` is
+configured — not just flat equality against one pinned default realm, which
+was M2-2's original, narrower behavior (a legacy/non-hosted deployment,
+with no `HostingRegistry` at all, keeps that exact flat-equality behavior
+unchanged). Combined with M2-3a's `dbmanager` routing and M2-4b-1's
+realm-scoped authorization, a Hello may now legitimately select any real
+realm/database pair in the deployment, routed and isolated correctly. The
+rest of this section (capability negotiation, the batch-manifest bootstrap
+below) remains open.
+
+The Hello selection is logically (partially landed, see above):
 
 ```text
 realm
@@ -319,8 +405,29 @@ file paths. Init validates the complete document before mutation, provisions
 independent catalog/WAL/key domains, and publishes one registry generation
 atomically. Reapplying an identical manifest is idempotent; partial creation,
 duplicate names, missing key paths, and attempts to mutate immutable IDs fail
-closed. This batch bootstrap and live multi-database router are planned, not
-part of the current default-pair runtime.
+closed.
+
+**Landed (2026-09-03):** `nextsql init --hosting-manifest FILE` (or
+`NEXTSQL_HOSTING_MANIFEST_FILE`, or a dotenv key) takes this path.
+`hosting.EnsureBootstrapManifestKeyFiles` first creates any missing
+per-database root key file (a fresh independent AES-256 root, mode 0600),
+then `LoadDeploymentBootstrap` validates the whole document,
+`EnsureManifest` publishes one `PROVISIONING` generation covering every
+realm/database, and each managed database is physically created and set
+`ACTIVE` (reusing the same `activateManagedDatabase` path as
+`nextsql database create`). Re-running with an identical manifest is a
+clean no-op; a partial run resumes.
+
+`nextsqld` serves a manifest-bootstrapped deployment directly: since its
+default is `LayoutManaged` (a manifest gives every database, the default
+included, its own key file), `openHostedDefault` accepts it and the eager
+primary open at `DATA-DIR/nextsql.db` is skipped — the process starts with
+no primary handle and `dbmanager` opens and serves the default realm/
+database lazily on the first connection, the same path every non-default
+managed database already uses. Such a deployment needs only
+`--instance-key-file` (no `--key-file`), and does not support
+`--require-client-key`. It has no WAL archiver / PITR / Raft for any
+database yet — the same M3 gap every managed database shares.
 
 Local init/adoption and `nextsqld` support process environment plus discovered
 or explicit dotenv files with explicit flags taking precedence. Environment
@@ -349,10 +456,313 @@ the same server-authoritative routing and capability negotiation.
 
 ## 9. Bounded Database Engine Manager
 
+**Decomposed 2026-09-02** into two sub-increments, following the same
+"smallest coherent increment" discipline the M2 milestone itself was
+decomposed with (§16), after a scoping investigation found the full
+requirement list below spans subsystems with zero existing refcounting or
+pooling infrastructure to build on (no `singleflight`, no reference
+counting, and `internal/executor.TaskRuntime` spawns its own goroutine set
+per instance today — exactly the per-database pool this section asks to
+centralize):
+
+- **M2-3a — DatabaseManager exists, connections route through it, small
+  fixed open-database limit** (landed 2026-09-02). Correctness-first, per
+  this section's own allowance below ("initial correctness-first policy
+  may keep a small fixed open-database limit"). `internal/dbmanager.Manager`:
+  a keyed (registry database ID), mutex-guarded map of open handles with
+  hand-rolled single-flight (no `x/sync` dependency exists in this repo) —
+  deliberately *not* built on `scheduler.Admission` as originally sketched,
+  since that type is a per-request acquire/release queueing gate, the
+  wrong shape for "permanently consume one of N slots, never released,"
+  which is this slice's actual (no-eviction) access pattern; flagged as a
+  reality-vs-sketch deviation rather than forced to fit. Connections route
+  through `Acquire(realm, database)` at the one narrow seam identified in
+  `protocol.Server.serveConn` (confirmed by investigation that
+  `Server.DB`/`Server.Tasks` are each touched in only a handful of places,
+  not smeared across request handling) — additively, via a new
+  `Server.Databases` field alongside the unchanged `DB`/`Tasks` (nil means
+  every connection uses the pre-M2-3a path, byte-for-byte). Also
+  restructured the Phase 27 WAL-retention/disk-watermark/replica-lag
+  monitors (`cmd/nextsqld/main.go`) into per-DB start-on-open — their tick
+  functions were confirmed already pure/DB-parameterized, so only the
+  `start*` wrapper lifecycle changed, one call site per monitor inside the
+  `Opener` closure that opens an additional registered `LayoutManaged`
+  database (single-node only: no `startCluster`/`installArchiver` for a
+  secondary database, out of scope until M2-3b or later). **No** reference
+  counting, **no** idle eviction, **no** memory budget, **no** central
+  bounded background pools — those are M2-3b.
+
+  Three real bugs were caught building this, each by an end-to-end test
+  actually exercising the new path rather than by inspection: (1) database
+  resolution originally ran *after* `TypeReady` was sent — the wire
+  protocol's definitive "handshake succeeded" signal, read once by
+  `drivers/go`'s `Conn.handshake` with no further reads — so a routing
+  failure would never reach the client, which would see success despite
+  the server internally rejecting the connection; fixed by moving
+  resolution before `TypeReady`. (2) a secondary managed database's
+  `KeyRef` is a standalone *root* key that unlocks an *envelope* keystore
+  next to the database file (exactly like the primary), not a key usable
+  directly on the database file — the `Opener` originally used it
+  directly, surfaced only once verified live against a real `nextsql
+  database create`-provisioned database (the test fixture had made the
+  identical mistake in both creating and opening the test database, so it
+  was self-consistently wrong and didn't catch this). (3) in the test
+  fixture only, the envelope was closed before the database it protects,
+  backwards from the correct order.
+- **M2-3b — Full §9 spec.** **Decomposed 2026-09-02** into three further
+  sub-increments after a scoping investigation found the pieces have very
+  different risk/readiness levels — correcting this section's own earlier
+  "none of these subsystems expose an incrementable/decrementable ref
+  today" framing along the way: sessions (`DB.sessions`/`RegisterSession`/
+  `UnregisterSession`, `internal/executor/db.go`), CDC
+  (`db.cdcSubs`/`registerCDCSubscription`, same file), and tasks
+  (`TaskRuntime.running`, `internal/executor/task_runtime.go`) already
+  have live, incrementable/decrementable registries — they were simply
+  never consulted by anything DB-lifecycle-related. Backup and replication
+  are confirmed vacuous for now: backup never touches a manager-opened
+  database (still fully offline/CLI-only), and M2-3a deliberately never
+  attaches replication to a secondary database at all, so there is nothing
+  to count for either until later work reaches them.
+  - **M2-3b-1 — Connection/session reference counting + idle eviction +
+    open-failure quarantine** (landed 2026-09-02). The smallest,
+    independently-landable slice, and the actual headline capability this
+    section promises: it's what turns M2-3a from "opens and never closes"
+    into "opens and closes when idle." Every `entry` in
+    `internal/dbmanager.Manager`'s open map now carries a `refs` counter
+    and a `pinned` flag; `Acquire` returns a release closure (idempotent,
+    mirroring `scheduler.Admission.enter()`'s "once" guard) paired 1:1 with
+    the existing single `Acquire` call site
+    (`internal/protocol/server.go`'s `serveConn`, in the same
+    per-connection defer that already calls `DB.UnregisterSession`).
+    Eviction triggers once refs reaches zero on a non-pinned entry —
+    the Preloaded primary is `pinned` and deliberately never evicted, since
+    `Opener` only ever handles `LayoutManaged` databases and would refuse
+    to reopen the primary's `LayoutLegacyDefault`, making eviction of the
+    primary unrecoverable. Eviction safely reuses `DB.Close()` as-is (via a
+    per-entry `cleanup` closure `Opener` now also returns), since
+    `Engine.Close()` (`internal/storage/engine.go`) already
+    checkpoints/flushes/closes the WAL durably — no new durability
+    mechanism needed, only orchestration, and `nextsqld`'s real `Opener`
+    closes its `TaskRuntime` *before* the database (so no background task
+    call races the close) and its envelope *after* (the final
+    checkpoint/flush needs the key material). No explicit
+    `PauseMaintenance` wiring was needed after all — refcount reaching
+    zero already implies no session/task could be mid-`MAINTAIN`
+    synchronously for that database, so maintenance rides along for free,
+    same as CDC. Quarantine + backoff on a failed open landed in the same
+    `Acquire`/open path, an independent exponential-backoff implementation
+    (same overflow-safe-shift shape as `internal/executor/task.go`'s
+    task-retry logic, not a shared call into it) — checked before the
+    open-limit check, since a quarantined database should never compete
+    for a slot. Live-verified against a real `nextsqld`: real file
+    descriptors (database file, WAL segment, undo log) confirmed open via
+    `/proc/<pid>/fd` while a secondary-database connection was live, and
+    fully closed within the poll window after disconnect, with data
+    surviving repeated evict/reopen cycles.
+  - **M2-3b-2 — Global memory budget gating buffer-page grants (landed
+    2026-09-03).** New `buffer.Budget` (`internal/storage/buffer/budget.go`):
+    a mutex-guarded frame counter with an optional cap, `Reserve`/`Release`,
+    nil-safe (a nil `*Budget` is unbounded, matching every pre-existing
+    caller exactly). Since a `Pool`'s frames are allocated in full at
+    construction — there is no dynamic per-page grant to gate at runtime,
+    only the all-or-nothing decision of whether a new database's Pool may be
+    built at all — the budget is charged once per `Engine` open and released
+    once at `Engine.Close()` (`internal/storage/engine.go`: `OpenOptions`
+    gained a `Budget *buffer.Budget` field, threaded into
+    `buffer.NewWithBudget`; `Engine` carries `budget`/`budgetFrames` to
+    release the exact reservation on close, regardless of who calls
+    `Close()` — normal shutdown, or M2-3b-1 idle eviction). New
+    `max_total_buffer_pages` config key (0 = unbounded default; rejected by
+    `Config.Validate` if positive but below `buffer_pages`, since otherwise
+    even the primary database could never open). `cmd/nextsqld/main.go`
+    constructs one `buffer.NewBudget(cfg.MaxTotalBufferPages)` shared across
+    all three of its `executor.Open` call sites (primary, dbmanager
+    secondary opener, `REQUIRE CLIENT KEY` lazy primary open) — all switched
+    to `executor.OpenWith(..., storage.OpenOptions{Budget: bufBudget})`.
+    Deliberately scoped to the long-running server process only:
+    `storage.Create`/`CreateWithIdentity` (the one-shot `nextsql database
+    create` provisioning CLI path, which exits immediately after) were left
+    unbudgeted — that process never holds more than one `Pool` open at a
+    time, so there is nothing to gate. No dedicated `system.*`/metrics
+    observability surface yet (`Budget.Used()`/`Cap()` exist but are not
+    wired to any introspection table) — deliberately deferred as a follow-on,
+    not required for the gating behavior itself. Tests:
+    `internal/storage/buffer/budget_test.go` (unit, incl. nil-safety and a
+    concurrent Reserve/Release race), `internal/storage/engine_test.go`
+    `TestBufferBudgetGatesConcurrentOpens`/`TestBufferBudgetNilUnbounded`
+    (real `Engine`s, two databases sharing a budget sized for only one),
+    `internal/config/config_test.go` (load/validate coverage for the new
+    key). `go build ./...` clean; `go vet ./...` unchanged (same
+    pre-existing unrelated `internal/executor/cdc.go` finding). All green
+    under `-race`: `internal/storage` (incl. `buffer`/`btree`, 254.9s),
+    `internal/config`, `internal/dbmanager`, `cmd/nextsqld`. **Live
+    verification against real `nextsql`/`nextsqld` binaries**: bootstrapped
+    a real deployment (`nextsql init` realm `default`/database `default`,
+    `nextsql realm create` for a second realm `r2`/database `db2`), started
+    a real `nextsqld` with `buffer_pages=8`/`max_total_buffer_pages=10`
+    (enough for the primary alone, not both) — a real client connection to
+    `db2` was rejected `exhausted: global buffer memory budget exceeded`;
+    raised to `max_total_buffer_pages=16` (exactly primary+secondary) on a
+    clean restart and the same connection to `db2` then reached real SQL
+    execution (past the budget gate entirely), confirming both the
+    rejection and the release/retry path work against a real process, not
+    just in-process fakes.
+  - **M2-3b-3 — Centralizing `TaskRuntime`'s per-database goroutine
+    pools into shared bounded pools.** Scoped 2026-09-03 (Explore fork)
+    and decomposed after confirming this is a genuine new-component
+    design, not a one-shot parameterization tweak — no existing
+    fan-out-poller/shared-worker-pool type to build on, and a real
+    correctness hazard at the M2-3b-1 eviction boundary once workers are
+    shared (see M2-3b-3a below).
+    - **M2-3b-3a — shared bounded worker pool + DB-tagged job type, per-DB
+      polling kept** (landed 2026-09-03). New `executor.TaskPool`
+      (`internal/executor/task_pool.go`): one fixed-size worker set
+      (`Workers` goroutines, `task_workers` config key, 0 = the same
+      default every individual runtime used before) shared process-wide,
+      constructed once instead of once per open database. `TaskRuntime`
+      keeps its own per-database `coordinate()`/`cycle()` poll loop
+      unchanged in shape — the harder "one scheduler enumerates every open
+      database" fan-out is deliberately **not** built here, that is
+      M2-3b-3b — but now submits claims, tagged with the submitting
+      `*TaskRuntime`, to the shared pool instead of a per-runtime `jobs`
+      channel. Total task-execution goroutines no longer scale with the
+      number of open databases (before: `Workers+1` per open database;
+      now: `Workers` once, process-wide). **The correctness hazard a
+      shared pool introduces**: closing one database's `TaskRuntime` can
+      no longer synchronously stop the exact goroutines that might touch
+      its `*DB` — a pool worker could be mid-execution of that database's
+      job, or about to pick one up from the shared queue, at the instant
+      `Close` is called. Closed by a new per-runtime `inFlight
+      sync.WaitGroup`, incremented when `cycle()` hands a claim to the
+      pool and decremented once a pool worker finishes executing it:
+      `TaskRuntime.Close()` waits it out (after stopping its own
+      coordinator) before returning, so by the time the caller (M2-3b-1
+      eviction, or shutdown) proceeds to close the database itself, no
+      pool worker holds or will pick up a reference to it.
+      `cmd/nextsqld/main.go` constructs the pool once, deliberately with a
+      background (not the signal-aware server) context, with its `Close`
+      deferred *before* every other close-related defer — so it runs
+      *last*, strictly after every `TaskRuntime` submitting to it
+      (primary via `srv.Close()`, every secondary via the `dbMgr`/cleanup
+      defer) has already closed; documented as `TaskPool.Close`'s
+      precondition. A drive-by investigation into the real `CANCEL TASK`
+      path found `TaskRuntime.Cancel`/its `running` registry are dead code
+      today — production cancellation already goes through
+      `db.RequestTaskCancellation`/`db.taskCancels`, a separate,
+      already-correctly-DB-scoped mechanism — left as-is, not removed
+      (out of this increment's scope). Tests:
+      `TestTaskPoolSharedAcrossTwoRuntimes` (two real databases share a
+      one-worker pool, both succeed),
+      `TestTaskRuntimeCloseAllowsSafeDBCloseWhilePoolShared` (mirrors real
+      M2-3b-1 eviction: one runtime closes, its database closes right
+      after, while the shared pool and another open database's runtime
+      keep running — clean under `-race`). All green under `-race`:
+      `internal/executor` (full), `internal/config`, `cmd/nextsqld`,
+      `tests/integration`. **Live verification against real
+      `nextsql`/`nextsqld` binaries**: `nextsqld` started with
+      `task_workers=1` — a primary-database `EVERY '1s'` schedule ticked
+      10 times over ~5s through the shared pool, while a second
+      realm/database's independently-scheduled workflow, kept alive via a
+      rapid-reconnect loop, also successfully executed through that same
+      single shared worker — confirming the fan-out works in a real
+      process. Docs: this section, §16, `docs/web/content/docs/config.md`
+      (`task_workers`), `TODO.md`, `CHANGELOG.md`.
+    - **M2-3b-3b — centralize the polling itself: one `CentralScheduler`
+      enumerates every open database each tick instead of one poll loop
+      per database** (landed 2026-09-03). New `executor.CentralScheduler`
+      (`internal/executor/central_scheduler.go`) replaces every
+      dbmanager-open database's own `TaskRuntime` with one process-wide
+      `coordinate()`/`cycle()` loop that, each tick, asks a
+      `DatabaseLister` — a plain function type, not a direct
+      `dbmanager.Manager` reference (`dbmanager` already imports
+      `executor`, so the reverse import would cycle) — for every currently
+      open database, and claims/dispatches/submits each one's due work to
+      the same shared `TaskPool` (M2-3b-3a). `cmd/nextsqld/main.go` bridges
+      the two with a small closure around the new `dbmanager.Manager.
+      Snapshot() []DBHandle`. Reduces polling goroutines from O(open
+      databases) to O(1), on top of 3a's already-shared execution workers.
+      `Snapshot` hands out a ref-held handle for every open entry, reusing
+      `Acquire`/`release`'s existing refcounting rather than inventing a
+      second concurrency primitive — a database with a scheduler-claimed
+      task still in flight naturally can't be evicted (M2-3b-1) until the
+      scheduler's own ref on it releases too, closing the "must coordinate
+      with eviction" hazard this item's own prior writeup flagged, with
+      zero new coordination code in `dbmanager` itself. `taskJob`
+      (M2-3b-3a's shared-pool job type) was refactored to carry
+      `(db, task, config)` directly instead of `*TaskRuntime`, so both
+      `TaskRuntime.cycle` and `CentralScheduler.cycleOne` submit compatible
+      jobs; the execution body moved to a shared `runClaimedTask` function.
+      `TaskRuntime.running`/`Cancel` (already confirmed dead in production
+      by 3a) were briefly kept working via an optional per-job `onStart`
+      hook, then deleted outright in M2-3b-3c. **A second release-timing hazard, found and closed during
+      this item's own design**: a claim submitted to the shared pool
+      executes asynchronously, so releasing a `DBRef` the moment
+      submission finishes (rather than the moment execution finishes) would
+      let the database evict out from under a still-running job. Closed
+      with a per-tick, per-database `sync.WaitGroup` plus one short-lived
+      goroutine per database per tick that waits on it before releasing —
+      cheap given ticks are infrequent (250ms default) and the open-database
+      count is small and bounded — tracked by a new `CentralScheduler.
+      inFlight`, mirrored on `TaskRuntime.inFlight`'s own guarantee, so
+      `Close()` never returns while one is still pending. `cmd/nextsqld/
+      main.go`: the primary now gets its own dedicated `TaskRuntime` only
+      when there is no hosting registry at all; once one exists, one
+      `CentralScheduler` covers the primary (via `dbMgr.Preload`) and every
+      dbmanager-opened secondary alike, and the Opener's per-secondary
+      cleanup closure no longer needs any task-runtime-specific ordering of
+      its own. `CentralScheduler.Close()` is deferred immediately after
+      it starts, inside the `hostingRegistry != nil` block (registered
+      *after* the top-level dbMgr/secondary-cleanup defer, so it runs
+      first — LIFO — and always finishes draining before `dbMgr`
+      force-closes any database at shutdown). **Deliberately scoped out**:
+      the `REQUIRE CLIENT KEY` lazy-open path's own dedicated primary
+      `TaskRuntime` is untouched — a narrow, rare deployment shape
+      (combining `REQUIRE CLIENT KEY` with hosting) that becomes
+      redundantly (not incorrectly — claiming is transactionally exclusive)
+      polled by both once that primary is later `Preload`ed. **A
+      behavioral tradeoff, also flagged rather than silently left**: 3a's
+      per-database `TaskRuntime` polled once immediately on construction,
+      so opening even a very brief connection guaranteed at least one poll
+      attempt; `CentralScheduler` has no per-connection synchronization —
+      a database opened only for a very short, bursty request may see zero
+      scheduling attempts before eviction. A realistically-held-open
+      connection is unaffected (proven live below); only extremely bursty
+      one-shot connections to a hosted secondary are affected, and only in
+      degree (delayed, not lost), not correctness. Tests:
+      `TestCentralSchedulerAcrossTwoDatabases`,
+      `TestCentralSchedulerReleasesEveryRefEventually`,
+      `TestCentralSchedulerCloseWaitsOutstandingRefs`,
+      `TestStartCentralSchedulerValidatesArgs`; `dbmanager` gained
+      `TestSnapshotEmptyWhenNothingOpen`/`TestSnapshotHoldsRefUntilReleased`.
+      All green under `-race`: `internal/executor` (full, 121.4s),
+      `internal/dbmanager`, `cmd/nextsqld`, `tests/integration`. **Live
+      verification against real `nextsql`/`nextsqld` binaries**: the
+      primary's `EVERY '1s'` schedule accumulated 16 rows over ~5s with
+      zero dedicated primary `TaskRuntime` (confirming `CentralScheduler`
+      alone drives it); the same rapid-reconnect-loop trick that worked
+      for 3a's live check produced 0 rows for the second database here —
+      exactly the documented tradeoff, reproduced live rather than only in
+      theory — while a realistically-held-open 6-second connection to that
+      same database then accumulated exactly 6 rows, confirming the
+      underlying mechanism once the tradeoff's precondition is met. Docs:
+      this section, §16, `TODO.md`, `CHANGELOG.md`.
+    - **M2-3b-3c — retired the dead `TaskRuntime.Cancel`/`running` registry**
+      (2026-09-03). Confirmed dead in production by M2-3b-3a (real
+      cancellation flows through `db.taskCancels`, populated by
+      `runClaimedTask` regardless of submitter) and had no non-test caller,
+      so deleted outright rather than DB-scoped: `TaskRuntime.Cancel`, the
+      `running map[string]context.CancelFunc` field, its `sync.Mutex` (which
+      guarded only `running`), and the `taskJob.onStart` hook that fed it.
+      `runClaimedTask` lost its now-unused `onStart` parameter.
+      Behaviour-preserving — nothing production-real used any of it.
+
+  Depends on M2-3a (landed). Not yet scheduled.
+
 Replace the single database pointer with a bounded `DatabaseManager` that maps
 authorized stable IDs to engine handles.
 
-Required behavior:
+Required behavior (M2-3a delivers the first three bullets in reduced,
+fixed-limit form; the rest is M2-3b):
 
 - hard maximum registered and simultaneously open databases;
 - single-flight open so concurrent connects do not duplicate recovery;
@@ -548,8 +958,26 @@ database object references.
 7. return the stable operation result idempotently.
 
 It remains forbidden inside a user transaction. The current sibling-file-only
-behavior must be migrated or replaced; it cannot coexist as an unregistered
-side effect in production multi-database mode.
+`CREATE DATABASE` SQL statement is unaffected and still exists for
+non-hosted/embedded use (no registry present); it must not be advertised as
+hosting support and does not interact with anything below.
+
+**M2-1, landed 2026-09-02, implements steps 2-6 above as an offline CLI
+operation** (`nextsql realm create` / `nextsql database create` — not yet
+the "authenticated administrative interface" over a live connection this
+section describes, and not yet reachable by SQL `CREATE DATABASE` at all):
+reserve a stable DatabaseID (`ID(identity.Database)`), persist
+`PROVISIONING` in one registry generation, create the identity/envelope/
+database/WAL/catalog at the ID-based `LayoutManaged` path, verify it opens,
+publish `ACTIVE`. Idempotent: a repeated call with the same names recognizes
+an in-progress or completed prior attempt and resumes/no-ops rather than
+erroring or duplicating, so a crash between any two of these steps is
+safely retryable. Step 1 (realm-level authorization) and step 7 (a
+queryable stable operation record, `system.database_operations`) remain
+open — this CLI is invoked with the same registry-root key as `nextsql
+init`, equivalent to deployment-admin authority, not a separate authorized
+principal. Live serving of the created database — steps that would make it
+reachable over the wire protocol — is M2-2/M2-3.
 
 Administrative surface should include native, machine-readable equivalents of:
 
@@ -709,17 +1137,303 @@ corruption fails closed; restart/crash/fuzz tests pass.
 
 ### M2 — Single-node multi-database routing
 
-- Add protocol v2 realm field, capability negotiation, CLI, and official driver
-  support.
-- Implement realm authentication, database-scoped `CONNECT`, and immutable
-  session routing.
-- Implement bounded DatabaseManager with a deliberately small open limit.
-- Replace sibling-file-only `CREATE DATABASE` with registered lifecycle.
-- Add system views and machine-readable operations.
+Decomposed 2026-09-02 into four independently-gated sub-increments
+(`TODO.md` "Cross-cutting track — Multi-database hosting / subscription
+isolation" carries the authoritative checklist and status):
 
-Exit: at least two realms with identical user/database names remain isolated
-across concurrent connect, prepared, cancel, DDL, DML, restart, and recovery
-tests; protocol v1 default routing remains compatible.
+- **M2-1 — Registry realm/database creation primitives.** ✅ Landed
+  2026-09-02. `Registry.CreateRealm`/`CreateDatabase` (`internal/hosting`),
+  `nextsql realm create`/`nextsql database create` CLI. Registers a new
+  managed database (reserved stable ID, durable `PROVISIONING` →
+  create/verify-open → `ACTIVE`, idempotent crash-safe retry) at the
+  already-defined `LayoutManaged` path. `nextsqld` does not yet open or
+  serve it — that is M2-3.
+- **M2-2 — Hello realm field (additive, protocol-compatible)** (2026-09-02).
+  `Hello.Realm`, a new opt-in trailing field (not a frame-version bump,
+  mirroring `NSCT`'s version-gated trailing-field pattern); `nextsqld`
+  extended its existing single-name Hello check with a parallel flat-string
+  realm check (`Server.Realm`, compared by equality against the one realm
+  the process serves) — **not yet a live `hosting.Registry` lookup**, that
+  remains M2-3 once a process can serve more than one realm/database at
+  once. All 6 official drivers updated (Go/PHP/JS-shared[Bun+Deno]/Node/
+  Python/Ruby), each gaining an optional `Realm`/`realm` config field
+  emitted on the wire only when non-empty, so an unconfigured client's
+  Hello is byte-identical to the pre-realm shape. Verified live against a
+  real `nextsqld` with two independent drivers (Go, Python).
+- **M2-3 — Bounded DatabaseManager and per-connection routing.**
+  Decomposed 2026-09-02 into M2-3a/M2-3b (see §9) after a scoping
+  investigation found the full spec spans subsystems with zero existing
+  refcounting/pooling infrastructure.
+  - **M2-3a — manager exists, small fixed open-database limit, connections
+    route through it, Phase 27 monitors become per-DB** (2026-09-02).
+    `internal/dbmanager.Manager`: keyed by registry database ID, hand-rolled
+    single-flight open, bounded to a small fixed limit with no eviction.
+    `protocol.Server.Databases` is additive alongside the unchanged
+    `DB`/`Tasks` fields — nil means every connection uses the pre-M2-3a
+    path unchanged. `nextsqld`'s `Opener` opens an additional registered
+    `LayoutManaged` database single-node only (no Raft/archiver for
+    secondaries). A real routing-order bug was caught by the new
+    end-to-end test and fixed: database resolution had to move before
+    `TypeReady` is sent, since that frame is the wire protocol's definitive
+    success signal and nothing is read after it. Live-verified against a
+    real `nextsqld` with a real `nextsql database create`-provisioned
+    second database — see `TODO.md`'s log entry for two further real bugs
+    this caught (secondary-database key material needs the same
+    root-key-unlocks-an-envelope indirection as the primary; envelope/database
+    close ordering).
+  - **M2-3b — full §9 spec.** Decomposed 2026-09-02 into M2-3b-1/2/3 (see
+    §9) after a scoping investigation found very different risk levels per
+    piece — and found sessions/CDC/tasks already have live counters to
+    reuse, correcting §9's own earlier "none of these expose a ref today."
+    - **M2-3b-1 — connection/session refcounting + idle eviction +
+      open-failure quarantine** (landed 2026-09-02). A secondary database
+      now closes when its last connection disconnects and reopens cleanly
+      on demand; the Preloaded primary is pinned and never evicted. See §9
+      for the full writeup.
+    - **M2-3b-2 — global memory budget** (landed 2026-09-03). See §9 for
+      the full writeup.
+    - **M2-3b-3a — shared bounded worker pool, per-DB polling kept**
+      (landed 2026-09-03). See §9 for the full writeup.
+    - **M2-3b-3b — centralize polling itself: one `CentralScheduler`
+      enumerates every open database each tick** (landed 2026-09-03). See
+      §9 for the full writeup.
+    - **M2-3b-3c — retired the dead `TaskRuntime.Cancel`/`running`
+      registry** (landed 2026-09-03). See §9. With this, M2-3b is complete.
+- **M2-4 — Realm-scoped auth, database-scoped `CONNECT`, system views.**
+  **Dependency corrected 2026-09-02**: the "depends on M2-1..3" note
+  predates M2-3's own split and was overbroad — access control/
+  introspection (M2-4) and resource budgeting/task-pool architecture
+  (M2-3b-2/3) are orthogonal concerns, confirmed by direct reading of §5.2
+  and the M2-3b-2/3 scope. M2-4 only needs M2-1 (registry, to resolve
+  `RealmID`/`DatabaseID`), M2-2 (`Hello.Realm`), and M2-3a (routing exists
+  to authorize against) — all landed; M2-3b-1/2/3 are not prerequisites.
+  Decomposed into three further sub-increments after a scoping
+  investigation found the same "very different sizes" shape M2-3 and
+  M2-3b each had:
+  - **M2-4a — `system.realms`/`system.databases` read-only introspection
+    (LANDED 2026-09-02).** `internal/system/schema.go` registers the two
+    tables; `internal/executor/system.go` dispatches to new
+    `systemRealmsRows`/`systemDatabasesRows`, following
+    `systemResourceGroupsRows`'s admin-only gate exactly — deployment
+    topology across realms is not tenant-visible data. The plumbing gap
+    (neither `protocol.Server` nor `executor.Session` held a
+    `hosting.Registry` reference) is closed: `Server.HostingRegistry` field
+    → `Session.SetHostingRegistry` setter → wired in `serveConn` alongside
+    the existing `SetACL`/`SetAudit`/`SetAuth` calls, same shape as those
+    setters; `cmd/nextsqld/main.go` sets `srv.HostingRegistry` alongside
+    the pre-existing `srv.Database`/`srv.Realm` assignments. A nil registry
+    (every legacy/non-hosted deployment) makes both views degrade to empty
+    rows, never an error. `hosting.State`/`hosting.Layout` have no
+    `String()` method, so two small local helpers
+    (`hostingStateName`/`hostingLayoutName`) map them to the same
+    lowercase-snake strings used elsewhere in `system.*`. Tests:
+    `internal/executor/hosting_system_test.go` (nil-registry empty-rows
+    case; RBAC + content case against a real `hosting.Registry`). Live-
+    verified against a real `nextsqld` with a real two-database deployment
+    (`nextsql init` + `nextsql database create`): admin sees the real
+    registry contents, a `CONNECT`-only non-admin sees zero rows on both
+    views. See `TODO.md` log #74 for the full writeup.
+  - **M2-4b — realm-local `auth.Store`/`security.ACL` + the
+    `(RealmID, PrincipalID, DatabaseID, privilege, scope)` authorization
+    tuple.** A dedicated scoping investigation (2026-09-02) confirmed the
+    call-site count (~10 non-test sites: `internal/executor/session.go`'s
+    `acl`/`users` fields + setters, `internal/protocol/server.go`'s
+    `Server.Auth`/`ACL` fields and `serveConn`'s verify/`AllowedScoped`
+    calls, `internal/executor/task.go`+`task_runtime.go`,
+    `cmd/nextsqld/main.go`'s `auth.OpenOrCreate`/`startEmbeddedAuthBroker`,
+    `cmd/nextsql/main.go`'s CLI-side `auth.OpenOrCreate`) and found two
+    structural facts that sharpen the earlier scoping:
+    - **`auth.Store` cannot support §5.2's "same username independently in
+      two realms" as-is** — it's a flat `map[string]record` keyed only by
+      username, not a file-layout question alone. Two real options: (i)
+      composite-key the existing single file by `(RealmID, username)` — no
+      new file-layout/lifecycle infrastructure, a version bump in the same
+      shape `auth.Store` already used once (`fileVersionV1`→`fileVersion=2`,
+      PBKDF2→Argon2id, dual-decode old/new); or (ii) fully separate
+      per-realm files under `realms/<RealmID>/security/` per §7's literal
+      layout, which needs new bounded-open/eviction infrastructure (a
+      `dbmanager`-shaped manager for realm auth stores, since realm count
+      can scale like database count) — a real blast-radius/crypto-shred
+      tradeoff against implementation cost, not a default to guess past.
+    - **A previously-unflagged concrete finding**: `cmd/nextsqld/main.go`
+      always sets `srv.Realm` to the one hosted deployment's default realm
+      name, so `serveConn`'s existing flat-equality realm check currently
+      rejects any `hello.Realm` other than that one — meaning
+      `dbmanager.Manager.Acquire`'s `realmName` parameter, despite already
+      accepting arbitrary realm names since M2-3a, is **unreachable with
+      any other value today**. Every current deployment is "multi-database
+      within one fixed realm," not yet multi-realm. M2-4b is therefore a
+      genuine prerequisite for real multi-realm routing to ever activate,
+      not only an authorization nicety.
+    - `security.ACL`'s `Grant{Grantee, Priv, Scope, Object}` has no
+      `RealmID` field either; adding one (zero value = deployment-wide,
+      backward compatible) is a precedented format bump, same shape as
+      above — not a novel problem for this codebase.
+    - `serveConn` already knows `hello.Realm` immediately after decode,
+      well before the password/ACL checks — inserting realm-aware
+      authorization there is small and localized, not scattered; the
+      `HostingRegistry == nil` legacy-fallback convention (already
+      established for M2-3a/M2-4a) extends cleanly to "today's single
+      global `Store`/`ACL`, byte-for-byte unchanged."
+    - `internal/authbroker` already threads a `Realm` field through token
+      *minting* (`exchangeRequest.Realm` → `TokenMintRequest.Realm` →
+      `TokenClaims.Realm`); the gap is narrower than originally scoped —
+      `serveConn`'s token-claim *verification* path checks `claims.Database`
+      but never `claims.Realm` (currently harmless only because of the
+      single-pinned-realm finding above). Broker realm-awareness does not
+      need its own deep scoping pass; it's a small verification-side check.
+
+    Decomposed into:
+    - **M2-4b-1 — composite-key single file (LANDED 2026-09-02).** The
+      user chose this over M2-4b-2's per-realm-file layout. `auth.Store`/
+      `security.ACL` each gained a full set of `*InRealm` sibling methods
+      (`VerifyInRealm`, `HasInRealm`, `UpsertInRealm`, `DeleteInRealm`,
+      `SnapshotInRealm`; `GrantInRealm`, `RevokeInRealm`,
+      `CreateRoleInRealm`, `DropRoleInRealm`, `GrantRoleInRealm`,
+      `RevokeRoleInRealm`, `AddUserInRealm`, `DropUserInRealm`,
+      `AllowedInRealm`, `AllowedScopedInRealm`, `RolesForInRealm`) —
+      every existing flat method (`Verify`, `Grant`, `Allowed`, ...) became
+      a one-line `hosting.ID{}` wrapper, so every pre-existing caller and
+      test outside the two packages' own suites needed **zero changes**.
+      `hosting.ID{}` means deployment-wide: for `auth.Store` it *shadows*
+      (a realm-scoped identity of the same name takes precedence — identity
+      is exclusive); for `security.ACL` ordinary grants/roles it *unions*
+      (authorization is additive) — **except** `PrivAdmin+ScopeCluster`/
+      `PrivAdmin+ScopeAdmin`, which always normalize to and match only at
+      `hosting.ID{}` regardless of the realm requested, a design decision
+      made during grounding (not in the original scoping) to prevent a
+      realm-scoped cluster-admin grant from newly leaking cross-realm
+      visibility into `isAdmin()`-gated views like M2-4a's
+      `system.realms`/`system.databases` — closing a real §5.4 "cross-realm
+      leakage tolerance is zero" regression risk by construction. On-disk
+      formats: `auth.Store`'s `fileVersion` 2→3, `security.ACL`'s
+      `aclVersion` 1→2 (its first-ever bump), both dual-decoding every
+      older format with an implicit `Realm: hosting.ID{}`. New
+      `hosting.Registry.LookupRealm(realmName)` resolves a realm name to
+      its ID without requiring a database name (needed since identity must
+      resolve before routing decides which database to open). New
+      `Session.realmID`/`SetRealmID`; `authAllowed`'s one call to
+      `AllowedScopedInRealm(s.realmID, ...)` made the entire executor RBAC
+      surface realm-aware through a single chokepoint. `serveConn` resolves
+      `realmID` via `LookupRealm` right after the existing flat
+      `s.Realm`/`hello.Realm` precheck, before any password work; added the
+      `claims.Realm` mismatch check parallel to the existing
+      `claims.Database` one. `authbroker.RoleMembershipFunc` gained a
+      leading realm-name parameter (forced by `RolesFor`'s own signature
+      change), kept the package decoupled from `internal/hosting` (name
+      only, never an ID) — `cmd/nextsqld/main.go`'s `RoleMembership`
+      closure resolves it. Live-verified against real `nextsql`/`nextsqld`
+      binaries, and a new `tests/integration/multirealm_auth_test.go`
+      proves real cross-realm password isolation over the wire using two
+      independent single-database `protocol.Server`s sharing one
+      `*auth.Store`/`*security.ACL` — two servers, not one multi-realm-
+      routed server, since the `srv.Realm`-pinning limitation this
+      increment's own scoping surfaced is not itself fixed by M2-4b-1. See
+      `TODO.md` log #76 for the full writeup.
+    - **M2-4b-2**: separate per-realm files under `realms/<RealmID>/
+      security/` (§7's literal layout) + a bounded open/eviction manager
+      for them — only worth it if/when realm count needs real
+      isolation-at-rest (crypto-shredding one realm's credentials
+      independently of others). Not required for M2-4b-1's correctness.
+      Not yet scheduled.
+    - **M2-4b-3**: realm-aware embedded OIDC broker beyond what M2-4b-1
+      already did (deeper per-realm IdP profile/policy config) — kept
+      separate since the minting side already carried `Realm` before this
+      increment and the verification-side gap M2-4b-1 found is now closed.
+      Not yet scheduled.
+  - **M2-4c — `system.database_operations`.** Needs new operation-history
+    tracking in `internal/hosting` that doesn't exist yet (realms/
+    databases only carry a *current* `State`, not a transition log) — not
+    a pure read-through like M2-4a, and not needed by M2-4a/b. Best folded
+    into whichever future M3 lifecycle work first introduces an
+    operation-history concept, rather than built standalone here. Not yet
+    scheduled.
+- **M2-5 — multi-realm routing activation (LANDED 2026-09-02).** M2-4b-1's
+  own scoping had found `dbmanager` and its `Opener` were already fully
+  realm-agnostic since M2-3a, but `serveConn`'s flat `s.Realm != "" &&
+  hello.Realm != "" && hello.Realm != s.Realm` equality precheck
+  unconditionally rejected any Hello naming a realm other than the one
+  `cmd/nextsqld/main.go` pins `srv.Realm` to at startup — meaning
+  M2-4b-1's own `LookupRealm`-based resolution was itself still
+  unreachable for any second realm. Fixed by scoping that precheck to
+  `s.HostingRegistry == nil`, mirroring the exact existing pattern already
+  used for the analogous `s.databaseManager() == nil` guard on the
+  `s.Database` check immediately below it — once a `HostingRegistry` is
+  configured, `LookupRealm` becomes the sole, authoritative,
+  registry-backed realm check. `srv.Realm` is unchanged in meaning: still
+  the fallback used when a Hello omits `Realm`. Live verification surfaced
+  a real, separate companion gap: `internal/cli/connect.go`'s
+  `ServerConfig` resolved `Settings.Realm` (already read from `--realm`/
+  `NEXTSQL_REALM_NAME`) but never set it on the driver `Config` — silently
+  dropping it for every server-mode CLI command, not just `nextsql exec`.
+  Fixed the missing field and added an explicit `--realm` flag to
+  `nextsql exec`. New `tests/integration/multirealm_routing_test.go`
+  proves real cross-realm database routing/isolation through one server
+  (`TestMultiRealmRoutingThroughOneServer`) and that an unknown realm is
+  still rejected cleanly (`TestUnknownRealmStillRejectedCleanly`).
+  Live-verified against real `nextsql`/`nextsqld` binaries with two real
+  realms. Noted but deliberately out of scope: §5.2's "pre-authentication
+  errors must not disclose whether another realm... exists" is not met
+  today (an unknown-realm probe returns a distinguishing `NotFound` before
+  any password check) — not newly introduced by this fix (the same
+  category of exposure already existed for the one pinned realm name and
+  for unknown database names since M2-3a), but now reachable for realm
+  names too; a proper fix needs a deliberate pre-auth error-redaction pass
+  across realm/database/username together, not a side effect of this
+  activation fix. See `TODO.md` log #77 for the full writeup.
+
+- **M2-6 — Pre-authentication realm/database existence-disclosure hardening**
+  (2026-09-02). Closes the gap M2-5 flagged as deliberately out of scope.
+  `internal/protocol/server.go`'s `serveConn` had two flat-string prechecks
+  (`s.Realm`/`s.Database` mismatch, legacy non-hosted paths) and one
+  `HostingRegistry.LookupRealm` call, all three returning a distinguishing
+  `NotFound` immediately after the `Hello` frame — before `HelloOK` is even
+  sent, let alone a password read — letting an entirely unauthenticated
+  peer enumerate valid realm/database names with zero credentials.
+  Username enumeration was already closed (`auth.Store.VerifyInRealm`
+  already ran a dummy Argon2id comparison for an unknown user and returned
+  the same generic `Unauthorized "authentication failed"` either way); this
+  extends the identical treatment to realm/database names. Fix: none of the
+  three checks return early any more. A new `identityOK bool` records
+  whether the requested realm/database actually resolve; the connection
+  still proceeds through the full `HelloOK` → `Auth` round trip regardless,
+  runs the real (or dummy) password verification exactly as it would for a
+  valid realm, and only *after* that folds `!identityOK` into the same
+  generic `Unauthorized "authentication failed"` outcome a wrong password
+  produces — same nerr code, same message, same cost (the real/dummy hash
+  comparison already ran), so an unauthenticated prober cannot distinguish
+  "wrong realm"/"wrong database" from "wrong password" by response content
+  or timing. `realmID` still resolves to *some* value (`hosting.ID{}` on an
+  unresolvable realm) purely so the verification call has something to run
+  against; `identityOK`, not `realmID`'s value, decides the outcome, so an
+  unknown realm can never authenticate via `VerifyInRealm`'s existing
+  same-name deployment-wide fallback. Deliberately out of scope: the
+  post-authentication database-not-found rejection from `dbmanager.Manager.Acquire`
+  (reachable only with already-valid credentials in the resolved realm — a
+  materially weaker, already-accepted disclosure since M2-3a, not a
+  credential-free oracle) and the mTLS service-identity checks (a separate
+  identity mechanism, unrelated to realm/database/username confidentiality).
+  Tests: `tests/integration/protocol_test.go` `TestRealmMismatchRejected`
+  and `TestUnknownRealmStillRejectedCleanly` updated to assert `Unauthorized`
+  (previously `NotFound`) — both deliberately use a *correct* password so
+  the rejection can only be attributed to the realm name, proving the fix
+  rather than merely not regressing; new
+  `TestDatabaseNameMismatchRejectedGenerically` gives the legacy
+  single-pinned-database precheck its first-ever coverage (same
+  correct-password-but-wrong-name shape). All green under `-race`:
+  `internal/protocol`, `tests/integration` (full), `internal/auth`,
+  `internal/security`, `internal/dbmanager`, `internal/hosting`,
+  `cmd/nextsqld`, `cmd/nextsql`. See `TODO.md` log #78 for the full writeup.
+
+Exit (unchanged): at least two realms with identical user/database names
+remain isolated across concurrent connect, prepared, cancel, DDL, DML,
+restart, and recovery tests; protocol v1 default routing remains
+compatible. Not yet met — M2-5/M2-6's isolation proof is real-database-level
+across two genuinely different realms (two distinct databases, table
+visibility, over one live server) but not yet the full adversarial matrix
+(§17) this exit criterion describes. Pre-authentication existence
+disclosure for realm/database names is now closed (M2-6); the
+post-authentication database-not-found case noted above remains open.
 
 ### M3 — Independent operational lifecycle
 
@@ -827,13 +1541,48 @@ RBAC, realm/database isolation, protocol/driver, resource-limit, and benchmark s
 
 1. Approve `REALM` (recommended) versus `ACCOUNT` or `PROJECT` as the external
    subscription-boundary term.
-2. Decide whether realm users/roles are shared across all realm databases or
-   database-local principals are also required in v1. Recommended: realm
-   identities and roles with database-scoped grants.
+2. **DECIDED 2026-09-02 (before starting M2-2):** realm identities and roles
+   with database-scoped grants — the recommended option — is formally
+   adopted. This was already the assumption throughout §5.2 ("Each realm has
+   its own principal namespace... authorization tuple is at least `(RealmID,
+   PrincipalID, DatabaseID, privilege, object scope)`") and what M2-1's
+   registry model (`internal/hosting.Registry`) already assumes; this entry
+   just records it as no longer open. **Scoping note for M2-2 specifically**:
+   the realm-local principal namespace and the `(RealmID, PrincipalID,
+   DatabaseID, ...)` authorization tuple are *not* implemented by M2-2 — that
+   is M2-4's job. M2-2 adds only a `Hello.Realm` field used purely for
+   *routing/identity validation* (does the connecting client's requested
+   realm+database match what this `nextsqld` process actually has open);
+   authentication and authorization for a Hello carrying a realm selection
+   still resolve through today's single deployment-wide `auth.Store`/ACL,
+   completely unchanged, until M2-4 lands.
 3. Approve realm-root sharing with a per-database-root dedicated-tier override.
 4. Approve the deployment-level Raft v1 model versus another bounded consensus
    design.
 5. Define exact shared-tier hard limits and the first measured capacity target.
 6. Define suspension, retention, deletion, and crypto-shred policies.
-7. Decide the protocol v1 compatibility window and downgrade point of no return.
+7. **DECIDED 2026-09-02 (before starting M2-2):** there is no protocol
+   version bump and therefore no "downgrade point of no return" in the
+   traditional sense — §8's `Hello.Realm` field is added as a single
+   additive, *opt-in* trailing field on the wire (mirroring the `NSCT`
+   catalog record's V1 special case: read one more length-prefixed field
+   only if bytes remain past `User`, default to absent otherwise), not a
+   frame-header `Version` bump, per M2-1's own finding that the frame
+   header's `Version` is a hard equality gate with no negotiation. Concrete
+   compatibility rule: **a driver emits the trailing `Realm` field on the
+   wire only when the caller actually configured a non-empty realm** — an
+   unconfigured/default-pair client sends byte-for-byte the same Hello it
+   always has, so it is permanently, unconditionally compatible with any
+   server (this is the actual "compatibility window": unbounded for clients
+   not opting into realm selection). A client that *does* select a
+   non-default realm requires a server new enough to decode the trailing
+   field; against an older server, `DecodeHello`'s strict trailing-byte
+   check makes this fail closed with a decode error rather than silently
+   ignoring the selection and connecting to whatever the old server happens
+   to have open — deliberate, since silently falling through to the wrong
+   database on a security/isolation-relevant field would be worse than a
+   clear connection failure. There is therefore no deprecation deadline to
+   define: old, unpatched clients are supported forever by construction, and
+   new clients simply require a new-enough server the moment they actually
+   use the feature.
 8. Assign the authoritative roadmap phase and sequencing dependencies.

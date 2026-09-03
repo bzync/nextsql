@@ -10,8 +10,9 @@ import (
 )
 
 const (
-	testIssuer = "https://idp.example/realm"
-	testClient = "nextsql-client-abc"
+	testIssuer   = "https://idp.example/realm"
+	testClient   = "nextsql-client-abc"
+	testResource = "api://nextsql-broker"
 )
 
 func newVerifier(t *testing.T, idp *oidctest.IdP, now func() time.Time) (*oidc.IDTokenVerifier, *oidctest.Fetcher) {
@@ -37,6 +38,23 @@ func newVerifier(t *testing.T, idp *oidctest.IdP, now func() time.Time) (*oidc.I
 	return v, f
 }
 
+func newAccessVerifier(t *testing.T, idp *oidctest.IdP, now func() time.Time) *oidc.AccessTokenVerifier {
+	t.Helper()
+	cache, err := oidc.NewJWKSCache(oidc.JWKSCacheConfig{
+		Fetcher: idp.Fetcher(), Issuer: idp.Issuer, JWKSURI: idp.JWKSURI(), Now: now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	v, err := oidc.NewAccessTokenVerifier(oidc.AccessTokenConfig{
+		Issuer: idp.Issuer, ClientID: testClient, Audience: testResource, Now: now,
+	}, cache)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return v
+}
+
 func TestIDTokenVerifyHappyPath(t *testing.T) {
 	now := time.Now()
 	clock := func() time.Time { return now }
@@ -60,6 +78,50 @@ func TestIDTokenVerifyES256(t *testing.T) {
 	tok := idp.Sign(t, idp.StandardClaims(testClient, "user-ec", "n", now, time.Hour))
 	if _, err := v.Verify(context.Background(), tok, "n"); err != nil {
 		t.Fatalf("verify ES256: %v", err)
+	}
+}
+
+func TestAccessTokenVerifyHappyPath(t *testing.T) {
+	now := time.Now()
+	idp := oidctest.NewRSA(t, testIssuer)
+	v := newAccessVerifier(t, idp, func() time.Time { return now })
+	claims := idp.StandardClaims(testResource, "workload-1", "", now, time.Hour)
+	claims["client_id"] = testClient
+	claims["jti"] = "access-1"
+	got, err := v.Verify(context.Background(), idp.Sign(t, claims))
+	if err != nil {
+		t.Fatalf("verify access token: %v", err)
+	}
+	if got.Subject != "workload-1" || len(got.Audience) != 1 || got.Audience[0] != testResource {
+		t.Fatalf("verified access token = %+v", got)
+	}
+}
+
+func TestAccessTokenVerifyRequiresResourceAndClientBinding(t *testing.T) {
+	now := time.Now()
+	idp := oidctest.NewRSA(t, testIssuer)
+	v := newAccessVerifier(t, idp, func() time.Time { return now })
+	base := func() map[string]any {
+		c := idp.StandardClaims(testResource, "workload-1", "", now, time.Hour)
+		c["client_id"] = testClient
+		return c
+	}
+	for _, tc := range []struct {
+		name string
+		edit func(map[string]any)
+	}{
+		{"wrong resource audience", func(c map[string]any) { c["aud"] = "api://other" }},
+		{"missing client binding", func(c map[string]any) { delete(c, "client_id") }},
+		{"wrong client binding", func(c map[string]any) { c["client_id"] = "other-client" }},
+		{"conflicting azp", func(c map[string]any) { c["azp"] = "other-client" }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := base()
+			tc.edit(c)
+			if _, err := v.Verify(context.Background(), idp.Sign(t, c)); err == nil {
+				t.Fatal("expected access token to be rejected")
+			}
+		})
 	}
 }
 

@@ -77,6 +77,69 @@ func TestStrongReadBarrierRejectsIsolatedLeader(t *testing.T) {
 	}
 }
 
+// ReportReplicationOrphan blocks STRONG reads even on a node that remains
+// leader and remains verified by quorum — the failure mode a leadership
+// check alone cannot catch (e.g. a Replicate call that failed for a reason
+// other than losing leadership). ClearReplicationSuspect (the executor-side
+// effect of CLUSTER RECONCILE CONFIRM) reverses it.
+func TestStrongReadBarrierBlockedByReplicationOrphanUntilReconciled(t *testing.T) {
+	cls, _, _, _ := startRaft(t, 3)
+	lead := raftLeader(t, cls)
+
+	if err := lead.StrongReadBarrier(); err != nil {
+		t.Fatalf("leader barrier before orphan: %v", err)
+	}
+	if lead.ReplicationSuspect() {
+		t.Fatal("leader reports suspect before any orphan")
+	}
+
+	lead.ReportReplicationOrphan()
+	if !lead.ReplicationSuspect() {
+		t.Fatal("ReportReplicationOrphan did not set the suspect flag")
+	}
+
+	err := lead.StrongReadBarrier()
+	if err == nil {
+		t.Fatal("suspect leader served a strong read")
+	}
+	if !nerr.HasCode(err, nerr.Unavailable) {
+		t.Fatalf("suspect leader barrier: want unavailable, got %v", err)
+	}
+
+	// A different, un-suspect node is unaffected: the flag is node-local,
+	// not cluster-wide, so a clean node never wrongly refuses.
+	for _, c := range cls {
+		if c == lead {
+			continue
+		}
+		if c.ReplicationSuspect() {
+			t.Fatalf("node-local suspect flag leaked to another node")
+		}
+	}
+
+	lead.ClearReplicationSuspect()
+	if lead.ReplicationSuspect() {
+		t.Fatal("ClearReplicationSuspect did not clear the flag")
+	}
+	if err := lead.StrongReadBarrier(); err != nil {
+		t.Fatalf("leader barrier after reconcile: %v", err)
+	}
+}
+
+// A nil *Cluster is a no-op for the orphan-reporting methods, matching
+// every other Cluster method's nil-receiver convention (so
+// storage.Engine's optional ReplicationOrphanReporter type assertion can
+// never panic even against a nil Replicator value wrapped in the
+// interface).
+func TestReplicationOrphanMethodsNilSafe(t *testing.T) {
+	var c *Cluster
+	c.ReportReplicationOrphan()
+	c.ClearReplicationSuspect()
+	if c.ReplicationSuspect() {
+		t.Fatal("nil Cluster reports suspect")
+	}
+}
+
 func TestReadConsistencyString(t *testing.T) {
 	cases := map[ReadConsistency]string{
 		ReadStrong:            "strong",

@@ -1,0 +1,18 @@
+[
+  {
+    "code": "DEPED",
+    "name": "Department of Education",
+    "official_urls": [
+      "https://www.deped.gov.ph/",
+      "https://www.deped.gov.ph/category/issuances/"
+    ]
+  },
+  {
+    "code": "CHED",
+    "name": "Commission on Higher Education",
+    "official_urls": [
+      "https://ched.gov.ph/",
+      "https://legacy.ched.gov.ph/issuances/"
+    ]
+  }
+]

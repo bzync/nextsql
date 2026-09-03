@@ -128,6 +128,11 @@ export const docsNav: NavGroup[] = [
         slug: "ops",
         description: "status, diagnose, nextsql-bench --slo, and official tests.",
       },
+      {
+        title: "System catalog",
+        slug: "system-catalog",
+        description: "system.* introspection: capabilities, tables, sessions, and live queries.",
+      },
     ],
   },
   {
@@ -152,6 +157,16 @@ export const docsNav: NavGroup[] = [
         title: "PHP",
         slug: "drivers-php",
         description: "NextSQL\\Client::connect for PHP 8.1+.",
+      },
+      {
+        title: "Python",
+        slug: "drivers-python",
+        description: "nextsql.connect for Python 3.10+, stdlib only.",
+      },
+      {
+        title: "Ruby",
+        slug: "drivers-ruby",
+        description: "NextSQL.connect for Ruby 3.0+, stdlib only.",
       },
     ],
   },

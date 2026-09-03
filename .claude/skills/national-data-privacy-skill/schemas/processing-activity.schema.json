@@ -1,0 +1,76 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Philippine Privacy Processing Activity",
+  "type": "object",
+  "required": [
+    "id",
+    "purpose",
+    "data_subjects",
+    "data_categories",
+    "role",
+    "retention",
+    "owner"
+  ],
+  "properties": {
+    "id": {
+      "type": "string"
+    },
+    "purpose": {
+      "type": "string",
+      "minLength": 1
+    },
+    "data_subjects": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "minItems": 1
+    },
+    "data_categories": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "minItems": 1
+    },
+    "role": {
+      "enum": [
+        "PIC",
+        "PIP",
+        "JOINT_OR_OTHER_REVIEW_REQUIRED"
+      ]
+    },
+    "authority_or_basis": {
+      "type": "string"
+    },
+    "recipients": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "locations": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "retention": {
+      "type": "string"
+    },
+    "pia_required": {
+      "type": "boolean"
+    },
+    "owner": {
+      "type": "string"
+    },
+    "source_verified_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date"
+    }
+  },
+  "additionalProperties": true
+}

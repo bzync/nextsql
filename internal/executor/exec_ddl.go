@@ -95,6 +95,9 @@ func (s *Session) execDropTable(p planner.DropTable) (*Result, error) {
 	if catalog.ReservedName(name) && !catalog.IsHistoryTable(name) {
 		return nil, nerr.New(nerr.InvalidArgument, "executor.DropTable", "table name prefix nsql_ is reserved")
 	}
+	if s.db.anyOnlineBuildForTable(name) {
+		return nil, nerr.New(nerr.Unavailable, "executor.DropTable", "an online index rebuild is in progress on this table")
+	}
 	if len(s.inboundFKs(p.Table)) > 0 {
 		return nil, nerr.New(nerr.ForeignKey, "executor.DropTable", "table is referenced by a foreign key")
 	}
@@ -263,6 +266,9 @@ func (s *Session) execDropIndex(p planner.DropIndex) (*Result, error) {
 	if !ok {
 		return nil, nerr.New(nerr.NotFound, "executor.DropIndex", "unknown table")
 	}
+	if s.db.anyOnlineBuildForTable(tab.Name) {
+		return nil, nerr.New(nerr.Unavailable, "executor.DropIndex", "an online index rebuild is in progress on this table")
+	}
 	pos := -1
 	for i, idx := range tab.Indexes {
 		if idx.Name == p.Name {
@@ -331,6 +337,9 @@ func (s *Session) execRebuildIndex(p planner.RebuildIndex) (res *Result, err err
 	tab, ok := s.lookup(p.Table.Name)
 	if !ok {
 		return nil, nerr.New(nerr.NotFound, "executor.RebuildIndex", "unknown table")
+	}
+	if s.db.anyOnlineBuildForTable(tab.Name) {
+		return nil, nerr.New(nerr.Unavailable, "executor.RebuildIndex", "an online index rebuild is already in progress on this table")
 	}
 	pos := -1
 	for i, idx := range tab.Indexes {
@@ -490,6 +499,9 @@ func sameOrdinals(a, b []int) bool {
 func (s *Session) execAlterTable(p planner.AlterTable) (*Result, error) {
 	if p.Table == nil || p.Result == nil {
 		return nil, nerr.New(nerr.Internal, "executor.AlterTable", "missing table")
+	}
+	if s.db.anyOnlineBuildForTable(p.Table.Name) {
+		return nil, nerr.New(nerr.Unavailable, "executor.AlterTable", "an online index rebuild is in progress on this table")
 	}
 	old := p.Table
 	neu := p.Result.Clone()

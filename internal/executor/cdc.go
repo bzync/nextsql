@@ -106,13 +106,6 @@ func (s *Session) execSubscribe(parent context.Context, p planner.Subscribe) (*R
 	if parent == nil {
 		parent = context.Background()
 	}
-	ctx := parent
-	cancel := func() {}
-	if timeout := s.limitsOrDefault().Time; timeout > 0 {
-		ctx, cancel = context.WithTimeout(parent, timeout)
-	} else {
-		ctx, cancel = context.WithCancel(parent)
-	}
 	filter := cdcstream.Filter{TableIDs: map[uint32]struct{}{p.Table.ID: {}}}
 	if p.Operation != "" {
 		filter.Operations = make(map[wal.ChangeOperation]struct{}, 1)
@@ -127,18 +120,27 @@ func (s *Session) execSubscribe(parent context.Context, p planner.Subscribe) (*R
 			return nil, nerr.New(nerr.Internal, "executor.Subscribe", "invalid bound operation filter")
 		}
 	}
+	ctx := parent
+	cancel := func() {}
+	if timeout := s.limitsOrDefault().Time; timeout > 0 {
+		ctx, cancel = context.WithTimeout(parent, timeout)
+	} else {
+		ctx, cancel = context.WithCancel(parent)
+	}
 	sub, err := cdcstream.Subscribe(s.db.Eng.WAL, format.LSN(p.After), filter, cdcstream.Limits{})
 	if err != nil {
 		cancel()
 		return nil, err
 	}
 	s.db.metrics.AddCDCSubscription()
+	subID := s.db.registerCDCSubscription(p.Table.Name, uint64(p.After))
 	var cleanupOnce sync.Once
 	cleanup := func() {
 		cleanupOnce.Do(func() {
 			cancel()
 			sub.Close()
 			s.db.metrics.CloseCDCSubscription()
+			s.db.unregisterCDCSubscription(subID)
 		})
 	}
 	typesOut := make([]types.Type, len(subscribeColumns))
@@ -174,6 +176,7 @@ func (s *Session) execSubscribe(parent context.Context, p planner.Subscribe) (*R
 				}
 				currentEvent = 0
 				transactions++
+				s.db.updateCDCSubscriptionLSN(subID, uint64(current.Token))
 			}
 			e := current.Events[currentEvent]
 			currentEvent++

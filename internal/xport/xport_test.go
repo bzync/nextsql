@@ -1,12 +1,14 @@
 package xport
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/bzync/nextsql/internal/catalog"
+	"github.com/bzync/nextsql/internal/clientenc"
 	"github.com/bzync/nextsql/internal/config"
 	"github.com/bzync/nextsql/internal/crypto"
 	"github.com/bzync/nextsql/internal/executor"
@@ -14,6 +16,18 @@ import (
 	"github.com/bzync/nextsql/internal/sql/types"
 	"github.com/bzync/nextsql/internal/storage/format"
 )
+
+type xportFieldKeys struct{ key clientenc.Key }
+
+func (p xportFieldKeys) CurrentFieldKey(context.Context, string, string, string) (clientenc.Key, error) {
+	return p.key, nil
+}
+func (p xportFieldKeys) FieldKey(_ context.Context, _, _, _, id string) (clientenc.Key, error) {
+	if id != p.key.ID {
+		return clientenc.Key{}, nerr.New(nerr.NotFound, "test", "field key missing")
+	}
+	return p.key, nil
+}
 
 func setupSQL(t *testing.T, dir string) (dataDir, dbPath string, root *crypto.DEK, env *crypto.Envelope) {
 	t.Helper()
@@ -169,6 +183,63 @@ func TestExportImportRoundTrip(t *testing.T) {
 	}
 	if len(res4.Rows) != 1 || res4.Rows[0][0].Str != "alpha" {
 		t.Fatalf("json path %+v", res4.Rows)
+	}
+}
+
+func TestExportImportPreservesClientEncryptedCiphertext(t *testing.T) {
+	dir := t.TempDir()
+	dataDir, dbPath, root, env := setupSQL(t, dir)
+	db, err := executor.Open(dbPath, env, 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Session().Exec(`CREATE TABLE accounts (id STRING PRIMARY KEY, secret TEXT ENCRYPTED CLIENT NOT NULL)`); err != nil {
+		t.Fatal(err)
+	}
+	fieldKey := clientenc.Key{ID: "export-v1"}
+	for i := range fieldKey.Material {
+		fieldKey.Material[i] = 6
+	}
+	provider := xportFieldKeys{key: fieldKey}
+	ciphertext, err := clientenc.Encrypt(context.Background(), provider, "app", "accounts", "secret", types.TextValue("export-secret"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Session().ExecContext(context.Background(), `INSERT INTO accounts (id, secret) VALUES ('1', $1)`, []executor.Param{{Value: types.StringValue(ciphertext)}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	dump := filepath.Join(dir, "clientenc.nsex")
+	result, err := Export(dataDir, dump, env, Options{Root: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Verified || !result.ImportTest || result.Tables != 2 || result.Rows != 3 {
+		t.Fatalf("export result %+v", result)
+	}
+	_ = env.Close()
+
+	outDir := filepath.Join(dir, "imported-clientenc")
+	dest := destKeys(t, outDir, root)
+	defer dest.Close()
+	if _, err := Import(dump, outDir, dest, ImportOptions{Root: root}); err != nil {
+		t.Fatal(err)
+	}
+	restored, err := executor.Open(filepath.Join(outDir, config.DataFileName), dest, 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restored.Close()
+	got, err := restored.Session().Exec(`SELECT secret FROM accounts WHERE id = '1'`)
+	if err != nil || len(got.Rows) != 1 || got.Rows[0][0].Str != ciphertext {
+		t.Fatalf("imported ciphertext=%+v err=%v", got.Rows, err)
+	}
+	plain, err := clientenc.Decrypt(context.Background(), provider, "app", "accounts", "secret", got.Rows[0][0].Str)
+	if err != nil || plain.Str != "export-secret" {
+		t.Fatalf("imported decrypt=%+v err=%v", plain, err)
 	}
 }
 
@@ -386,5 +457,23 @@ func TestCreateTableSQLForeignKey(t *testing.T) {
 	}
 	if ordered[0].Table.Name != "customers" || ordered[1].Table.Name != "orders" {
 		t.Fatalf("order %s then %s", ordered[0].Table.Name, ordered[1].Table.Name)
+	}
+}
+
+func TestCreateTableSQLClientEncryptedLogicalType(t *testing.T) {
+	tab := &catalog.Table{
+		Name: "accounts",
+		Columns: []catalog.Column{
+			{Name: "id", Type: types.String(), NotNull: true, Primary: true},
+			{Name: "secret", Type: types.String(), ClientType: types.Text(), NotNull: true},
+		},
+		PK: []int{0},
+	}
+	sql, err := createTableSQL(tab)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(sql, `"secret" TEXT ENCRYPTED CLIENT NOT NULL`) {
+		t.Fatalf("client encryption metadata lost: %s", sql)
 	}
 }

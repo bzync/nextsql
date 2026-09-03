@@ -33,8 +33,8 @@ const (
 	// StorageCapBytes.
 	manifestVersionKeyRef = 2
 	manifestVersionCaps   = 3
-	fileMagic              = "NSRE"
-	fileVersion            = 1
+	fileMagic             = "NSRE"
+	fileVersion           = 1
 
 	maxNameLen       = 63
 	maxKeyRefLen     = 1024
@@ -393,6 +393,64 @@ func (r *Registry) Default() (Realm, Database, error) {
 	return Realm{}, Database{}, nerr.New(nerr.Corruption, "hosting.Default", "default realm/database does not resolve")
 }
 
+// Lookup returns detached copies of the named realm and one of its
+// databases. Names are matched case-insensitively via normalizeName,
+// mirroring every other name-taking Registry method. Used by dbmanager
+// (M2-3a) to resolve a connection's Hello-selected realm/database to the
+// registry records needed to open it.
+func (r *Registry) Lookup(realmName, databaseName string) (Realm, Database, error) {
+	if r == nil {
+		return Realm{}, Database{}, nerr.New(nerr.InvalidArgument, "hosting.Lookup", "nil registry")
+	}
+	rName, err := normalizeName(realmName, nerr.InvalidArgument)
+	if err != nil {
+		return Realm{}, Database{}, err
+	}
+	dName, err := normalizeName(databaseName, nerr.InvalidArgument)
+	if err != nil {
+		return Realm{}, Database{}, err
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, realm := range r.manifest.Realms {
+		if realm.Name != rName {
+			continue
+		}
+		for _, db := range realm.Databases {
+			if db.Name == dName {
+				realm.Databases = append([]Database(nil), realm.Databases...)
+				return realm, db, nil
+			}
+		}
+		return Realm{}, Database{}, nerr.New(nerr.NotFound, "hosting.Lookup", "unknown database")
+	}
+	return Realm{}, Database{}, nerr.New(nerr.NotFound, "hosting.Lookup", "unknown realm")
+}
+
+// LookupRealm returns a detached copy of the named realm, without requiring
+// a database name. Mirrors Lookup's name matching (case-insensitive via
+// normalizeName). Used by realm-scoped authorization (M2-4b-1) to resolve a
+// connection's Hello-selected realm to its stable ID before any auth check.
+func (r *Registry) LookupRealm(realmName string) (Realm, error) {
+	if r == nil {
+		return Realm{}, nerr.New(nerr.InvalidArgument, "hosting.LookupRealm", "nil registry")
+	}
+	rName, err := normalizeName(realmName, nerr.InvalidArgument)
+	if err != nil {
+		return Realm{}, err
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, realm := range r.manifest.Realms {
+		if realm.Name != rName {
+			continue
+		}
+		realm.Databases = append([]Database(nil), realm.Databases...)
+		return realm, nil
+	}
+	return Realm{}, nerr.New(nerr.NotFound, "hosting.LookupRealm", "unknown realm")
+}
+
 // SetDatabaseState durably applies one validated lifecycle transition.
 func (r *Registry) SetDatabaseState(realmID, databaseID ID, state State) error {
 	if r == nil {
@@ -625,6 +683,165 @@ func (r *Registry) SetRealmStorageCap(realmID ID, capBytes uint64) error {
 		return r.persistLocked(next)
 	}
 	return nerr.New(nerr.NotFound, "hosting.SetRealmStorageCap", "unknown realm")
+}
+
+// CreateRealm durably creates a new realm together with its first database
+// in one registry generation — a realm may never have zero databases (see
+// validateManifest), so realm and database creation cannot be split into
+// two independent operations the way SetDatabaseState mutates one already
+// present. The database starts in StateProvisioning; the caller is
+// responsible for physically creating the database file at
+// ManagedDatabasePath(dataDir, realm.ID, database.ID) and then calling
+// SetDatabaseState to publish StateActive once it has verified the file
+// opens (see cmd/nextsql's createOrResumeDatabase for the established
+// create-or-resume pattern this is meant to be paired with).
+//
+// The realm identity is derived deterministically from its name
+// (deriveRealmID), like the declarative-bootstrap path already does, so a
+// retried call with the same name always targets the same realm instead of
+// risking an orphaned duplicate. If the realm already exists, this call
+// forwards to the same idempotent database-append logic CreateDatabase
+// uses: reapplying with a database of the same name and identity, already
+// in StateProvisioning or StateActive, returns the existing records with
+// created=false rather than erroring — matching EnsureBootstrap's reapply
+// semantics — so a caller that crashes between this call and physically
+// creating the database file can safely retry from scratch.
+func (r *Registry) CreateRealm(realmName, databaseName string, identity format.Identity, keyRef string) (Realm, Database, bool, error) {
+	const op = "hosting.CreateRealm"
+	if r == nil {
+		return Realm{}, Database{}, false, nerr.New(nerr.InvalidArgument, op, "nil registry")
+	}
+	rName, err := normalizeName(realmName, nerr.InvalidArgument)
+	if err != nil {
+		return Realm{}, Database{}, false, err
+	}
+	dName, err := normalizeName(databaseName, nerr.InvalidArgument)
+	if err != nil {
+		return Realm{}, Database{}, false, err
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return Realm{}, Database{}, false, nerr.New(nerr.Unavailable, op, "registry is closed")
+	}
+	for _, realm := range r.manifest.Realms {
+		if realm.Name != rName {
+			continue
+		}
+		db, created, err := r.addDatabaseLocked(op, realm.ID, dName, identity, keyRef)
+		if err != nil {
+			return Realm{}, Database{}, false, err
+		}
+		for _, updated := range r.manifest.Realms {
+			if updated.ID == realm.ID {
+				return updated, db, created, nil
+			}
+		}
+		return Realm{}, Database{}, false, nerr.New(nerr.Internal, op, "realm not found after update")
+	}
+	realmID := deriveRealmID(r.manifest.DeploymentID, rName)
+	next := cloneManifest(r.manifest)
+	next.Realms = append(next.Realms, Realm{
+		ID:    realmID,
+		Name:  rName,
+		State: StateActive,
+		Databases: []Database{{
+			ID:       ID(identity.Database),
+			Name:     dName,
+			State:    StateProvisioning,
+			Layout:   LayoutManaged,
+			Identity: identity,
+			KeyRef:   keyRef,
+		}},
+	})
+	if err := r.persistLocked(next); err != nil {
+		return Realm{}, Database{}, false, err
+	}
+	for _, realm := range r.manifest.Realms {
+		if realm.ID == realmID {
+			return realm, realm.Databases[0], true, nil
+		}
+	}
+	return Realm{}, Database{}, false, nerr.New(nerr.Internal, op, "created realm not found after persist")
+}
+
+// CreateDatabase durably adds a new database (StateProvisioning) to an
+// existing, active realm. Same create-or-resume responsibility split and
+// idempotent-reapply semantics as CreateRealm's database-append path.
+func (r *Registry) CreateDatabase(realmID ID, databaseName string, identity format.Identity, keyRef string) (Database, bool, error) {
+	const op = "hosting.CreateDatabase"
+	if r == nil {
+		return Database{}, false, nerr.New(nerr.InvalidArgument, op, "nil registry")
+	}
+	dName, err := normalizeName(databaseName, nerr.InvalidArgument)
+	if err != nil {
+		return Database{}, false, err
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return Database{}, false, nerr.New(nerr.Unavailable, op, "registry is closed")
+	}
+	return r.addDatabaseLocked(op, realmID, dName, identity, keyRef)
+}
+
+// addDatabaseLocked appends a new database to realmID, or — if a database
+// with this normalized name already exists in that realm — validates it
+// matches (same identity, State in {Provisioning, Active}) and returns it
+// unchanged (created=false) rather than erroring. r.mu is held; dName is
+// already normalized.
+func (r *Registry) addDatabaseLocked(op string, realmID ID, dName string, identity format.Identity, keyRef string) (Database, bool, error) {
+	for ri := range r.manifest.Realms {
+		realm := &r.manifest.Realms[ri]
+		if realm.ID != realmID {
+			continue
+		}
+		if realm.State != StateActive {
+			return Database{}, false, nerr.New(nerr.Conflict, op, "realm is not active")
+		}
+		for _, db := range realm.Databases {
+			if db.Name != dName {
+				continue
+			}
+			if db.Identity != identity {
+				return Database{}, false, nerr.New(nerr.AlreadyExists, op, "database name is already registered with a different identity")
+			}
+			switch db.State {
+			case StateProvisioning, StateActive:
+				return db, false, nil
+			default:
+				return Database{}, false, nerr.New(nerr.Conflict, op, "database exists but is not resumable from its current state")
+			}
+		}
+		databaseID := ID(identity.Database)
+		for _, otherRealm := range r.manifest.Realms {
+			for _, db := range otherRealm.Databases {
+				if db.ID == databaseID {
+					return Database{}, false, nerr.New(nerr.Conflict, op, "database identity collides with an existing registration")
+				}
+			}
+		}
+		next := cloneManifest(r.manifest)
+		newDB := Database{
+			ID:       databaseID,
+			Name:     dName,
+			State:    StateProvisioning,
+			Layout:   LayoutManaged,
+			Identity: identity,
+			KeyRef:   keyRef,
+		}
+		for nri := range next.Realms {
+			if next.Realms[nri].ID == realmID {
+				next.Realms[nri].Databases = append(next.Realms[nri].Databases, newDB)
+				break
+			}
+		}
+		if err := r.persistLocked(next); err != nil {
+			return Database{}, false, err
+		}
+		return newDB, true, nil
+	}
+	return Database{}, false, nerr.New(nerr.NotFound, op, "unknown realm")
 }
 
 // Close zeros the unlocked registry keys.

@@ -20,6 +20,10 @@ import type {
   Value,
   VectorRef,
   SparseVector,
+  FieldKey,
+  FieldKeyProvider,
+  FieldKeyInfo,
+  FieldTypeDescriptor,
 } from '../js/types';
 
 export type {
@@ -44,6 +48,10 @@ export type {
   Value,
   VectorRef,
   SparseVector,
+  FieldKey,
+  FieldKeyProvider,
+  FieldKeyInfo,
+  FieldTypeDescriptor,
 };
 
 export {
@@ -63,4 +71,11 @@ export {
   formatUUID,
   isLoopback,
   validateConfig,
+  FieldType,
+  MemoryFieldKeyring,
+  FileFieldKeyring,
+  decryptField,
+  encryptField,
+  generateFieldKey,
+  inspectField,
 } from '../js/types';

@@ -84,17 +84,19 @@ func (p *Parser) stmt() (ast.Stmt, error) {
 	case lexer.KwMaintain:
 		return p.maintain()
 	case lexer.KwSet:
-		return nil, nerr.New(nerr.Syntax, "sql.parser", "SET TENANT was removed; provision an isolated database with nextsql hosting")
+		return p.setStmt()
 	case lexer.KwReset:
-		return nil, nerr.New(nerr.Syntax, "sql.parser", "RESET TENANT was removed; provision an isolated database with nextsql hosting")
+		return p.resetStmt()
 	case lexer.KwRun:
 		return p.runWorkflow()
 	case lexer.KwShow:
-		return p.showTasks()
+		return p.show()
 	case lexer.KwCancel:
 		return p.cancelTask()
 	case lexer.KwSubscribe:
 		return p.subscribe()
+	case lexer.KwCluster:
+		return p.clusterStmt()
 	case lexer.KwCommit:
 		p.next()
 		if p.tok.Kind == lexer.KwTransaction {
@@ -163,8 +165,48 @@ func (p *Parser) subscribe() (ast.Stmt, error) {
 	return out, nil
 }
 
-func (p *Parser) showTasks() (ast.Stmt, error) {
+// show parses bounded convenience aliases over the canonical system schema.
+// Returning an ordinary system-table SELECT keeps execution, RBAC, redaction,
+// and column definitions on the same source of truth as direct system.*
+// queries. SHOW TASKS retains its existing pagination-specific surface.
+func (p *Parser) show() (ast.Stmt, error) {
 	p.next()
+	switch p.tok.Lit {
+	case "tasks":
+		return p.showTasks()
+	case "databases":
+		p.next()
+		return ast.Select{
+			Table: "system.storage",
+			List:  []ast.SelectItem{{Expr: ast.Ident{Name: "database"}}},
+		}, nil
+	case "tables":
+		return p.showSystemTable("system.tables")
+	case "indexes":
+		return p.showSystemTable("system.indexes")
+	case "connections":
+		return p.showSystemTable("system.sessions")
+	case "queries":
+		return p.showSystemTable("system.active_queries")
+	case "transactions":
+		return p.showSystemTable("system.transactions")
+	case "locks":
+		return p.showSystemTable("system.locks")
+	case "cluster":
+		return p.showSystemTable("system.replication")
+	case "storage":
+		return p.showSystemTable("system.storage")
+	default:
+		return nil, nerr.New(nerr.Syntax, "sql.parser", "unsupported SHOW object")
+	}
+}
+
+func (p *Parser) showSystemTable(name string) (ast.Stmt, error) {
+	p.next()
+	return ast.Select{Table: name, Star: true}, nil
+}
+
+func (p *Parser) showTasks() (ast.Stmt, error) {
 	if err := p.expect(lexer.KwTasks, "TASKS"); err != nil {
 		return nil, err
 	}
@@ -190,6 +232,103 @@ func (p *Parser) showTasks() (ast.Stmt, error) {
 		p.next()
 	}
 	return out, nil
+}
+
+// clusterStmt parses the cluster admin surface:
+//
+//	CLUSTER TRANSFER LEADER
+//	CLUSTER DRAIN [WITH (TIMEOUT_MS = n)]
+//	CLUSTER MAINTENANCE ENABLE|DISABLE
+//
+// setStmt parses SET RESOURCE GROUP <name>, the one surviving form of SET
+// after SET TENANT (multi-tenancy) was removed; every other spelling is
+// still rejected with the same removal message as before.
+func (p *Parser) setStmt() (ast.Stmt, error) {
+	p.next()
+	if p.tok.Kind != lexer.KwResource {
+		return nil, nerr.New(nerr.Syntax, "sql.parser", "SET TENANT was removed; provision an isolated database with nextsql hosting")
+	}
+	p.next()
+	if err := p.expect(lexer.KwGroup, "GROUP"); err != nil {
+		return nil, err
+	}
+	name, err := p.ident()
+	if err != nil {
+		return nil, err
+	}
+	return ast.SetResourceGroup{Name: name}, nil
+}
+
+// resetStmt parses RESET RESOURCE GROUP, the one surviving form of RESET
+// after RESET TENANT was removed; every other spelling is still rejected
+// with the same removal message as before.
+func (p *Parser) resetStmt() (ast.Stmt, error) {
+	p.next()
+	if p.tok.Kind != lexer.KwResource {
+		return nil, nerr.New(nerr.Syntax, "sql.parser", "RESET TENANT was removed; provision an isolated database with nextsql hosting")
+	}
+	p.next()
+	if err := p.expect(lexer.KwGroup, "GROUP"); err != nil {
+		return nil, err
+	}
+	return ast.ResetResourceGroup{}, nil
+}
+
+func (p *Parser) clusterStmt() (ast.Stmt, error) {
+	p.next()
+	switch p.tok.Kind {
+	case lexer.KwTransfer:
+		p.next()
+		if err := p.expect(lexer.KwLeader, "LEADER"); err != nil {
+			return nil, err
+		}
+		return ast.TransferLeader{}, nil
+	case lexer.KwDrain:
+		p.next()
+		var timeoutMS int64
+		if p.tok.Kind == lexer.KwWith {
+			p.next()
+			if err := p.expect(lexer.LParen, "("); err != nil {
+				return nil, err
+			}
+			if !p.identIs("timeout_ms") {
+				return nil, nerr.New(nerr.Syntax, "sql.parser", "expected TIMEOUT_MS")
+			}
+			p.next()
+			if err := p.expect(lexer.Eq, "="); err != nil {
+				return nil, err
+			}
+			n, err := p.uint64Lit()
+			if err != nil {
+				return nil, err
+			}
+			timeoutMS = int64(n)
+			if err := p.expect(lexer.RParen, ")"); err != nil {
+				return nil, err
+			}
+		}
+		return ast.ClusterDrain{TimeoutMS: timeoutMS}, nil
+	case lexer.KwMaintenance:
+		p.next()
+		switch p.tok.Kind {
+		case lexer.KwEnable:
+			p.next()
+			return ast.ClusterMaintenance{Enable: true}, nil
+		case lexer.KwDisable:
+			p.next()
+			return ast.ClusterMaintenance{Enable: false}, nil
+		default:
+			return nil, nerr.New(nerr.Syntax, "sql.parser", "expected ENABLE or DISABLE after CLUSTER MAINTENANCE")
+		}
+	case lexer.KwReconcile:
+		p.next()
+		if err := p.expect(lexer.KwConfirm, "CONFIRM"); err != nil {
+			return nil, err
+		}
+		return ast.ClusterReconcileConfirm{}, nil
+	default:
+		return nil, nerr.New(nerr.Syntax, "sql.parser", "expected TRANSFER, DRAIN, MAINTENANCE, or RECONCILE after CLUSTER")
+	}
 }
 
 func (p *Parser) cancelTask() (ast.Stmt, error) {
@@ -342,7 +481,12 @@ func (p *Parser) rebuild() (ast.Stmt, error) {
 	if err != nil {
 		return nil, err
 	}
-	return ast.RebuildIndex{Name: name}, nil
+	online := false
+	if p.tok.Kind == lexer.Ident && p.tok.Lit == "online" {
+		online = true
+		p.next()
+	}
+	return ast.RebuildIndex{Name: name, Online: online}, nil
 }
 
 func (p *Parser) create() (ast.Stmt, error) {
@@ -388,8 +532,10 @@ func (p *Parser) create() (ast.Stmt, error) {
 		return p.createTrigger()
 	case lexer.KwSchedule:
 		return p.createSchedule()
+	case lexer.KwResource:
+		return p.createResourceGroup()
 	default:
-		return nil, nerr.New(nerr.Syntax, "sql.parser", "expected TABLE, INDEX, DATABASE, WORKFLOW, TRIGGER, or SCHEDULE")
+		return nil, nerr.New(nerr.Syntax, "sql.parser", "expected TABLE, INDEX, DATABASE, WORKFLOW, TRIGGER, SCHEDULE, or RESOURCE GROUP")
 	}
 }
 
@@ -416,8 +562,10 @@ func (p *Parser) createSchedule() (ast.Stmt, error) {
 		kind = ast.ScheduleEvery
 	case lexer.KwAt:
 		kind = ast.ScheduleAt
+	case lexer.KwCron:
+		kind = ast.ScheduleCron
 	default:
-		return nil, nerr.New(nerr.Syntax, "sql.parser", "expected EVERY or AT")
+		return nil, nerr.New(nerr.Syntax, "sql.parser", "expected EVERY, AT, or CRON")
 	}
 	p.next()
 	if p.tok.Kind != lexer.String {
@@ -474,6 +622,187 @@ func scheduleLiteral(expr ast.Expr) bool {
 	default:
 		return false
 	}
+}
+
+// resourceGroupOptions holds the outcome of a RESOURCE GROUP WITH (...)
+// clause: which options were given (Has*) and their parsed values. CREATE
+// applies given options over zero defaults; ALTER applies given options
+// over the group's current stored values, leaving the rest untouched.
+type resourceGroupOptions struct {
+	maxConcurrency    uint64
+	hasMaxConcurrency bool
+	memoryBytes       uint64
+	hasMemoryBytes    bool
+	workers           uint64
+	hasWorkers        bool
+	priority          uint64
+	hasPriority       bool
+}
+
+// resourceGroupWith parses WITH (MAX_CONCURRENCY = n, MEMORY = n, WORKERS =
+// n, PRIORITY = n), any subset in any order, each key at most once. Range
+// checks against catalog.MaxResourceGroup* happen later, at the catalog
+// layer, matching how CREATE VECTOR INDEX ... WITH (LISTS = n, ...) leaves
+// range validation to the caller instead of the parser.
+func (p *Parser) resourceGroupWith() (resourceGroupOptions, error) {
+	var opt resourceGroupOptions
+	if err := p.expect(lexer.LParen, "("); err != nil {
+		return opt, err
+	}
+	for {
+		switch {
+		case p.identIs("max_concurrency"):
+			if opt.hasMaxConcurrency {
+				return opt, nerr.New(nerr.Syntax, "sql.parser", "duplicate MAX_CONCURRENCY option")
+			}
+			p.next()
+			if err := p.expect(lexer.Eq, "="); err != nil {
+				return opt, err
+			}
+			n, err := p.uintLit()
+			if err != nil {
+				return opt, err
+			}
+			opt.maxConcurrency, opt.hasMaxConcurrency = n, true
+		case p.identIs("memory"):
+			if opt.hasMemoryBytes {
+				return opt, nerr.New(nerr.Syntax, "sql.parser", "duplicate MEMORY option")
+			}
+			p.next()
+			if err := p.expect(lexer.Eq, "="); err != nil {
+				return opt, err
+			}
+			n, err := p.uint64Lit()
+			if err != nil {
+				return opt, err
+			}
+			opt.memoryBytes, opt.hasMemoryBytes = n, true
+		case p.identIs("workers"):
+			if opt.hasWorkers {
+				return opt, nerr.New(nerr.Syntax, "sql.parser", "duplicate WORKERS option")
+			}
+			p.next()
+			if err := p.expect(lexer.Eq, "="); err != nil {
+				return opt, err
+			}
+			n, err := p.uintLit()
+			if err != nil {
+				return opt, err
+			}
+			opt.workers, opt.hasWorkers = n, true
+		case p.identIs("priority"):
+			if opt.hasPriority {
+				return opt, nerr.New(nerr.Syntax, "sql.parser", "duplicate PRIORITY option")
+			}
+			p.next()
+			if err := p.expect(lexer.Eq, "="); err != nil {
+				return opt, err
+			}
+			n, err := p.uintLit()
+			if err != nil {
+				return opt, err
+			}
+			opt.priority, opt.hasPriority = n, true
+		default:
+			return opt, nerr.New(nerr.Syntax, "sql.parser", "expected MAX_CONCURRENCY, MEMORY, WORKERS, or PRIORITY")
+		}
+		if p.tok.Kind == lexer.Comma {
+			p.next()
+			continue
+		}
+		break
+	}
+	if err := p.expect(lexer.RParen, ")"); err != nil {
+		return opt, err
+	}
+	return opt, nil
+}
+
+func (p *Parser) createResourceGroup() (ast.Stmt, error) {
+	p.next()
+	if err := p.expect(lexer.KwGroup, "GROUP"); err != nil {
+		return nil, err
+	}
+	ifNot := false
+	if p.tok.Kind == lexer.KwIf {
+		p.next()
+		if err := p.expect(lexer.KwNot, "NOT"); err != nil {
+			return nil, err
+		}
+		if err := p.expect(lexer.KwExists, "EXISTS"); err != nil {
+			return nil, err
+		}
+		ifNot = true
+	}
+	name, err := p.ident()
+	if err != nil {
+		return nil, err
+	}
+	out := ast.CreateResourceGroup{Name: name, IfNotExists: ifNot}
+	if p.tok.Kind == lexer.KwWith {
+		p.next()
+		opt, err := p.resourceGroupWith()
+		if err != nil {
+			return nil, err
+		}
+		out.MaxConcurrency = int(opt.maxConcurrency)
+		out.MemoryBytes = int64(opt.memoryBytes)
+		out.Workers = int(opt.workers)
+		out.Priority = int(opt.priority)
+	}
+	return out, nil
+}
+
+func (p *Parser) alterResourceGroup() (ast.Stmt, error) {
+	p.next()
+	if err := p.expect(lexer.KwGroup, "GROUP"); err != nil {
+		return nil, err
+	}
+	name, err := p.ident()
+	if err != nil {
+		return nil, err
+	}
+	if err := p.expect(lexer.KwWith, "WITH"); err != nil {
+		return nil, err
+	}
+	opt, err := p.resourceGroupWith()
+	if err != nil {
+		return nil, err
+	}
+	if !opt.hasMaxConcurrency && !opt.hasMemoryBytes && !opt.hasWorkers && !opt.hasPriority {
+		return nil, nerr.New(nerr.Syntax, "sql.parser", "ALTER RESOURCE GROUP WITH requires at least one option")
+	}
+	return ast.AlterResourceGroup{
+		Name:              name,
+		MaxConcurrency:    int(opt.maxConcurrency),
+		HasMaxConcurrency: opt.hasMaxConcurrency,
+		MemoryBytes:       int64(opt.memoryBytes),
+		HasMemoryBytes:    opt.hasMemoryBytes,
+		Workers:           int(opt.workers),
+		HasWorkers:        opt.hasWorkers,
+		Priority:          int(opt.priority),
+		HasPriority:       opt.hasPriority,
+	}, nil
+}
+
+func (p *Parser) dropResourceGroup() (ast.Stmt, error) {
+	p.next()
+	if err := p.expect(lexer.KwGroup, "GROUP"); err != nil {
+		return nil, err
+	}
+	ifExists := false
+	if p.tok.Kind == lexer.KwIf {
+		p.next()
+		if err := p.expect(lexer.KwExists, "EXISTS"); err != nil {
+			return nil, err
+		}
+		ifExists = true
+	}
+	name, err := p.ident()
+	if err != nil {
+		return nil, err
+	}
+	return ast.DropResourceGroup{Name: name, IfExists: ifExists}, nil
 }
 
 func (p *Parser) createTrigger() (ast.Stmt, error) {
@@ -1016,8 +1345,10 @@ func (p *Parser) drop() (ast.Stmt, error) {
 			return nil, err
 		}
 		return ast.DropSchedule{Name: name, IfExists: ifExists}, nil
+	case lexer.KwResource:
+		return p.dropResourceGroup()
 	default:
-		return nil, nerr.New(nerr.Syntax, "sql.parser", "expected TABLE, INDEX, USER, ROLE, WORKFLOW, TRIGGER, or SCHEDULE")
+		return nil, nerr.New(nerr.Syntax, "sql.parser", "expected TABLE, INDEX, USER, ROLE, WORKFLOW, TRIGGER, SCHEDULE, or RESOURCE GROUP")
 	}
 }
 
@@ -1076,6 +1407,9 @@ func (p *Parser) alter() (ast.Stmt, error) {
 			return nil, err
 		}
 		return ast.AlterSchedule{Name: name, NewName: newName}, nil
+	}
+	if p.tok.Kind == lexer.KwResource {
+		return p.alterResourceGroup()
 	}
 	if err := p.expect(lexer.KwTable, "TABLE"); err != nil {
 		return nil, err
@@ -1343,6 +1677,13 @@ func (p *Parser) scope() (string, string, error) {
 		p.next()
 		n, err := p.ident()
 		return "function", n, err
+	case lexer.KwResource:
+		p.next()
+		if err := p.expect(lexer.KwGroup, "GROUP"); err != nil {
+			return "", "", err
+		}
+		n, err := p.ident()
+		return "resourcegroup", n, err
 	case lexer.KwBackup:
 		p.next()
 		return "backup", "", nil
@@ -1710,6 +2051,15 @@ func (p *Parser) columnDef() (ast.ColumnDef, error) {
 	col := ast.ColumnDef{Name: name, Type: typ}
 	for {
 		switch p.tok.Kind {
+		case lexer.KwEncrypted:
+			if col.EncryptedClient {
+				return ast.ColumnDef{}, nerr.New(nerr.Syntax, "sql.parser", "multiple ENCRYPTED CLIENT clauses")
+			}
+			p.next()
+			if err := p.expect(lexer.KwClient, "CLIENT"); err != nil {
+				return ast.ColumnDef{}, err
+			}
+			col.EncryptedClient = true
 		case lexer.KwNot:
 			p.next()
 			if err := p.expect(lexer.KwNull, "NULL"); err != nil {
@@ -1916,9 +2266,87 @@ func (p *Parser) colType() (types.Type, error) {
 	case lexer.KwText:
 		p.next()
 		return types.Text(), nil
+	case lexer.KwBlob:
+		p.next()
+		return types.Blob(), nil
+	case lexer.KwInt8:
+		p.next()
+		return types.Int8(), nil
+	case lexer.KwInt16:
+		p.next()
+		return types.Int16(), nil
+	case lexer.KwInt32:
+		p.next()
+		return types.Int32(), nil
+	case lexer.KwInt64:
+		p.next()
+		return types.Int64(), nil
+	case lexer.KwUint8:
+		p.next()
+		return types.Uint8(), nil
+	case lexer.KwUint16:
+		p.next()
+		return types.Uint16(), nil
+	case lexer.KwUint32:
+		p.next()
+		return types.Uint32(), nil
+	case lexer.KwUint64:
+		p.next()
+		return types.Uint64(), nil
+	case lexer.KwChar:
+		p.next()
+		n, err := p.charLen()
+		if err != nil {
+			return types.Type{}, err
+		}
+		return types.CharType(n)
+	case lexer.KwVarchar:
+		p.next()
+		n, err := p.charLen()
+		if err != nil {
+			return types.Type{}, err
+		}
+		return types.VarcharType(n)
 	case lexer.KwTimestamptz:
 		p.next()
 		return types.TimestampTZ(), nil
+	case lexer.KwTimestamp:
+		p.next()
+		return types.Timestamp(), nil
+	case lexer.KwFloat32:
+		p.next()
+		return types.Float32(), nil
+	case lexer.KwFloat64:
+		p.next()
+		return types.Float64(), nil
+	case lexer.KwEnum:
+		p.next()
+		if err := p.expect(lexer.LParen, "("); err != nil {
+			return types.Type{}, err
+		}
+		var labels []string
+		for {
+			if p.tok.Kind != lexer.String {
+				return types.Type{}, nerr.New(nerr.Syntax, "sql.parser", "expected a quoted ENUM label")
+			}
+			labels = append(labels, p.tok.Lit)
+			p.next()
+			if p.tok.Kind == lexer.Comma {
+				p.next()
+				continue
+			}
+			break
+		}
+		if err := p.expect(lexer.RParen, ")"); err != nil {
+			return types.Type{}, err
+		}
+		return types.EnumType(labels)
+	case lexer.KwDate:
+		p.next()
+		return types.Date(), nil
+	case lexer.KwTime:
+		p.next()
+		return types.TimeOfDay(), nil
 	case lexer.KwJson:
 		p.next()
 		return types.JSON(), nil
@@ -2013,6 +2441,24 @@ func (p *Parser) colType() (types.Type, error) {
 	default:
 		return types.Type{}, nerr.New(nerr.Syntax, "sql.parser", "expected a type")
 	}
+}
+
+// charLen parses the mandatory "(n)" length argument of CHAR(n) / VARCHAR(n).
+func (p *Parser) charLen() (uint16, error) {
+	if err := p.expect(lexer.LParen, "("); err != nil {
+		return 0, err
+	}
+	n, err := p.uintLit()
+	if err != nil {
+		return 0, err
+	}
+	if err := p.expect(lexer.RParen, ")"); err != nil {
+		return 0, err
+	}
+	if n < 1 || n > uint64(types.MaxCharLen) {
+		return 0, nerr.New(nerr.InvalidArgument, "sql.parser", "CHAR/VARCHAR length out of range")
+	}
+	return uint16(n), nil
 }
 
 func (p *Parser) createIndex(unique, spatial, fulltext, vector bool) (ast.Stmt, error) {
@@ -3247,6 +3693,10 @@ func (p *Parser) primary() (ast.Expr, error) {
 		v := types.StringValue(p.tok.Lit)
 		p.next()
 		return ast.Literal{Value: v}, nil
+	case lexer.HexLit:
+		v := types.BlobValue([]byte(p.tok.Lit))
+		p.next()
+		return ast.Literal{Value: v}, nil
 	case lexer.Number:
 		d, err := types.ParseDecimal(p.tok.Lit)
 		if err != nil {
@@ -3632,6 +4082,20 @@ func (p *Parser) uintLit() (uint64, error) {
 		return 0, nerr.New(nerr.Syntax, "sql.parser", "expected number")
 	}
 	n, err := strconv.ParseUint(p.tok.Lit, 10, 32)
+	if err != nil {
+		return 0, nerr.New(nerr.Syntax, "sql.parser", "invalid integer")
+	}
+	p.next()
+	return n, nil
+}
+
+// uint64Lit is uintLit without the 32-bit ceiling, for fields such as byte
+// counts that legitimately exceed it.
+func (p *Parser) uint64Lit() (uint64, error) {
+	if p.tok.Kind != lexer.Number {
+		return 0, nerr.New(nerr.Syntax, "sql.parser", "expected number")
+	}
+	n, err := strconv.ParseUint(p.tok.Lit, 10, 64)
 	if err != nil {
 		return 0, nerr.New(nerr.Syntax, "sql.parser", "invalid integer")
 	}

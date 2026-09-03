@@ -17,15 +17,18 @@ const (
 	AuthPassword    = 1
 	AuthPasswordKey = 2
 
-	DefaultMaxPacket      = 1 << 20
-	DefaultMaxSQL         = 1 << 20
-	DefaultMaxParams      = 256
-	DefaultMaxPrepared    = 64
-	DefaultMaxSessions    = 128
-	DefaultMaxResultBytes = 64 << 20
-	DefaultMaxName        = 256
-	DefaultIdleTimeout    = 60 * time.Second
-	DefaultBatchRows      = 256
+	DefaultMaxPacket              = 1 << 20
+	DefaultMaxSQL                 = 1 << 20
+	DefaultMaxParams              = 256
+	DefaultMaxPrepared            = 64
+	DefaultMaxSessions            = 128
+	DefaultMaxSessionsPerUser     = 0 // 0 = unlimited
+	DefaultMaxSessionsPerDatabase = 0 // 0 = unlimited
+	DefaultMaxSessionsPerRealm    = 0 // 0 = unlimited
+	DefaultMaxResultBytes         = 64 << 20
+	DefaultMaxName                = 256
+	DefaultIdleTimeout            = 60 * time.Second
+	DefaultBatchRows              = 256
 )
 
 // Type is a framed message type. Unknown types are protocol errors.
@@ -69,28 +72,67 @@ const (
 
 // Limits bound every untrusted length on the wire.
 type Limits struct {
-	MaxPacket      int
-	MaxSQL         int
-	MaxParams      int
-	MaxPrepared    int
-	MaxSessions    int
-	MaxResultBytes int64
-	MaxName        int
-	Idle           time.Duration
-	Query          scheduler.Limits
+	MaxPacket   int
+	MaxSQL      int
+	MaxParams   int
+	MaxPrepared int
+	MaxSessions int
+	// MaxSessionsPerUser caps concurrent authenticated connections held by a
+	// single user name. 0 means unlimited, matching other zero-means-uncapped
+	// fields in this codebase (e.g. hosting storage caps).
+	MaxSessionsPerUser int
+	// MaxSessionsPerDatabase and MaxSessionsPerRealm (P27's own last open
+	// exit-gate item, closed once selectable multi-database hosting — the
+	// M2 track — shipped live routing to more than one database per
+	// process) cap concurrent connections resolved to one specific
+	// (realm, database) pair, and to one realm across all its databases,
+	// respectively. Both 0 (unlimited) by default; a single-database
+	// legacy deployment can still set either — the pair collapses to the
+	// one pinned database/realm, making it equivalent to (a finer-grained
+	// alternative to) MaxSessions there.
+	MaxSessionsPerDatabase int
+	MaxSessionsPerRealm    int
+	MaxResultBytes         int64
+	MaxName                int
+	Idle                   time.Duration
+	Query                  scheduler.Limits
+	// TxnTimeout bounds the total wall-clock lifetime of one open transaction
+	// (from BEGIN, or the first statement of an implicit autocommit
+	// transaction, to COMMIT/ROLLBACK), checked lazily at the start of each
+	// statement dispatched inside it. 0 means unbounded (pre-P27 behavior) —
+	// unlike Idle/MaxSessions this has no historical non-zero default, so it
+	// stays opt-in rather than silently aborting existing long-running
+	// transactions (e.g. bulk loads) once an operator upgrades.
+	TxnTimeout time.Duration
+	// IdleTxn bounds how long a connection may sit with an open transaction
+	// and no traffic before its next frame read is force-timed-out and the
+	// transaction released. Unlike TxnTimeout (which bounds a transaction's
+	// total lifetime and is only checked lazily when the next statement
+	// arrives) IdleTxn is enforced by the connection's own socket read
+	// deadline, so it actively reclaims a transaction's locks even if the
+	// client never sends another statement — the general per-frame Idle
+	// deadline does the same thing today, but only at the (typically much
+	// longer) Idle bound, which is sized for ordinary connection keep-alive,
+	// not for capping how long a transaction may hold locks while idle. 0
+	// (the default) applies no distinct bound: an idle transaction is then
+	// governed only by Idle, matching pre-P27 behavior.
+	IdleTxn time.Duration
 }
 
 func DefaultLimits() Limits {
 	return Limits{
-		MaxPacket:      DefaultMaxPacket,
-		MaxSQL:         DefaultMaxSQL,
-		MaxParams:      DefaultMaxParams,
-		MaxPrepared:    DefaultMaxPrepared,
-		MaxSessions:    DefaultMaxSessions,
-		MaxResultBytes: DefaultMaxResultBytes,
-		MaxName:        DefaultMaxName,
-		Idle:           DefaultIdleTimeout,
-		Query:          scheduler.DefaultLimits(),
+		MaxPacket:              DefaultMaxPacket,
+		MaxSQL:                 DefaultMaxSQL,
+		MaxParams:              DefaultMaxParams,
+		MaxPrepared:            DefaultMaxPrepared,
+		MaxSessions:            DefaultMaxSessions,
+		MaxSessionsPerUser:     DefaultMaxSessionsPerUser,
+		MaxSessionsPerDatabase: DefaultMaxSessionsPerDatabase,
+		MaxSessionsPerRealm:    DefaultMaxSessionsPerRealm,
+		MaxResultBytes:         DefaultMaxResultBytes,
+		MaxName:                DefaultMaxName,
+		Idle:                   DefaultIdleTimeout,
+		Query:                  scheduler.DefaultLimits(),
 	}
 }
 
@@ -111,6 +153,15 @@ func (l Limits) normalized() Limits {
 	if l.MaxSessions < 1 {
 		l.MaxSessions = d.MaxSessions
 	}
+	if l.MaxSessionsPerUser < 0 {
+		l.MaxSessionsPerUser = 0
+	}
+	if l.MaxSessionsPerDatabase < 0 {
+		l.MaxSessionsPerDatabase = 0
+	}
+	if l.MaxSessionsPerRealm < 0 {
+		l.MaxSessionsPerRealm = 0
+	}
 	if l.MaxResultBytes < 1 {
 		l.MaxResultBytes = d.MaxResultBytes
 	}
@@ -119,6 +170,12 @@ func (l Limits) normalized() Limits {
 	}
 	if l.Idle <= 0 {
 		l.Idle = d.Idle
+	}
+	if l.TxnTimeout < 0 {
+		l.TxnTimeout = 0
+	}
+	if l.IdleTxn < 0 {
+		l.IdleTxn = 0
 	}
 	return l
 }
@@ -156,7 +213,12 @@ func ReadFrame(r io.Reader, max int) (Type, []byte, error) {
 	}
 	var hdr [HeaderSize]byte
 	if _, err := io.ReadFull(r, hdr[:]); err != nil {
-		return 0, nil, nerr.Wrap(nerr.Protocol, "protocol.ReadFrame", "header", err)
+		// A read failure (EOF, connection reset, deadline) means the
+		// transport broke, not that the peer sent something invalid — the
+		// same distinction WriteFrame's own io.Writer failures already draw
+		// with nerr.IO below. Nothing about the frame's contents has been
+		// examined yet, so this can never be a protocol violation.
+		return 0, nil, nerr.Wrap(nerr.IO, "protocol.ReadFrame", "header", err)
 	}
 	if string(hdr[0:4]) != Magic {
 		return 0, nil, nerr.New(nerr.Protocol, "protocol.ReadFrame", "bad magic")
@@ -177,7 +239,9 @@ func ReadFrame(r io.Reader, max int) (Type, []byte, error) {
 	}
 	payload := make([]byte, n)
 	if _, err := io.ReadFull(r, payload); err != nil {
-		return 0, nil, nerr.Wrap(nerr.Protocol, "protocol.ReadFrame", "payload", err)
+		// Same reasoning as the header read above: a broken transport, not a
+		// malformed payload (the header was already validated by this point).
+		return 0, nil, nerr.Wrap(nerr.IO, "protocol.ReadFrame", "payload", err)
 	}
 	return typ, payload, nil
 }

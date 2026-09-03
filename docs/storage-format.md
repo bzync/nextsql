@@ -199,10 +199,11 @@ Table descriptors live in the primary tree (key `T` + name). Magic `NSCT`.
 | 6 | Readable. v5 payload, then one `u8` HNSW traversal-quantisation tag per index (`0` none, `2` F16, `3` I8), in `Indexes` order. |
 | 7 | Readable. v6 payload, then per-index vector-ANN method + IVF `LISTS` / `PROBES`. |
 | 8 | Readable. v7 payload, then per-index IVF-PQ `SUBSPACES`. |
-| 9 | Current write format. v8 payload, then per-index full-text analyzer id (`u8`) + revision (`u16`). `0/0` is simple v1; `1/1` is english stem-only; `1/2` is english stem plus stop-word dictionary v1; `1/3` is english v2 plus synonym dictionary v1 (query-time OR expansion); `2/1` french, `3/1` german, `4/1` spanish (Snowball stemmer + stop-word dictionary v1). Unknown id/revision pairs fail closed. Leftover bytes are `invalid_format`. |
+| 9 | Readable. v8 payload, then per-index full-text analyzer id (`u8`) + revision (`u16`). `0/0` is simple v1; `1/1` is english stem-only; `1/2` is english stem plus stop-word dictionary v1; `1/3` is english v2 plus synonym dictionary v1 (query-time OR expansion); `2/1` french, `3/1` german, `4/1` spanish (Snowball stemmer + stop-word dictionary v1). Unknown id/revision pairs fail closed. |
+| 10 | Current write format. v9 payload, then one `u8` flag per column in column order. `0` means ordinary. `1` means `ENCRYPTED CLIENT` and is followed by its logical plaintext type (`kind u8`, `vector tag u8`, `precision u16le`, `scale u16le`); the stored physical type is `STRING`. Unknown flags/types, inconsistent metadata, or leftover bytes fail closed. |
 | other | Fail closed (`unsupported catalog version`). |
 
-Compatibility window (`internal/upgrade` `FamilyCatalog`): current 9, readable 1..9. `nextsql diagnose` prints that window. Old binaries cannot open v9 rows. Any catalog rewrite upgrades a readable older descriptor to v9 (older descriptors decode with every index unquantised, every vector index as HNSW unless a later trailer says otherwise, and every full-text index as the simple analyzer). v6 adds a per-index HNSW traversal-quantisation byte; v7 adds a per-index vector-ANN-method byte plus the IVF `LISTS` / `PROBES` counts; v8 adds a per-index IVF-PQ `SUBSPACES` count; v9 adds a per-index full-text analyzer id + revision.
+Compatibility window (`internal/upgrade` `FamilyCatalog`): current 10, readable 1..10. `nextsql diagnose` prints that window. Old binaries cannot open v10 rows. Any catalog rewrite upgrades a readable older descriptor to v10 (older descriptors decode with every index unquantised, every vector index as HNSW unless a later trailer says otherwise, every full-text index as the simple analyzer, and no client-encrypted columns). v6 adds a per-index HNSW traversal-quantisation byte; v7 adds a per-index vector-ANN-method byte plus the IVF `LISTS` / `PROBES` counts; v8 adds a per-index IVF-PQ `SUBSPACES` count; v9 adds a per-index full-text analyzer id + revision; v10 adds per-column client-encryption metadata.
 
 The v4/v5 partition section begins with a kind byte (`0` none, `1` RANGE, `2`
 HASH, `3` LIST, `4` legacy TENANT). A nonzero kind carries at most 8 column ordinals
@@ -368,6 +369,76 @@ seconds)` pairs. Both decoders bound every count and length and reject
 duplicates, trailing bytes, and more than one current key. The credential wire
 blob itself (`NSSC` v1, claims + 64-byte Ed25519 signature) is never persisted
 server-side.
+
+## Format and catalog migration strategy (Phase 27)
+
+`CurrentFormatVersion` has never been bumped past 1 — every physical page
+and superblock in the field is v1. `internal/upgrade/compat.Catalog()` is
+the single source of truth for what version of each family (`page`,
+`envelope`, `wal`, `undo`, `catalog`, `backup`, `export`, `protocol`,
+`replication`, `isolated` — see the const block in that package) this
+binary can open; `nextsql diagnose` prints it verbatim, and `decodeSuperblock`
+(`internal/storage/file`) and `catalog.DecodeTable` (`internal/catalog`) call
+`compat.Check` directly rather than each re-deriving their own version
+window, so the printed compatibility window and actual enforcement cannot
+drift apart. `compat.Check`'s error names the actual and supported version
+numbers, so an operator can immediately tell a too-old file (needs the
+offline migration below) from a too-new one (needs a newer `nextsqld`
+binary) without cross-referencing the catalog by hand. (`page.Validate`/
+`page.CheckID` — the per-page hot path, executed on every page read — keep
+their own inline `!= CurrentFormatVersion` check rather than calling
+`compat.Check`: `FamilyPage` has `MinReadable == MaxReadable == Current`
+today, so the two checks are equivalent, and the superblock read already
+gates DB open before any page is read, making the per-page check pure
+defense in depth. Route it through `compat.Check` too if `FamilyPage` ever
+gains a real multi-version window.)
+
+**Catalog-level changes are safe to migrate online — and this already
+works today**, no new mechanism needed. The pattern, demonstrated across
+ten `NSCT` revisions above: bump the record's version constant, teach the
+decoder to read every prior version (each with a defined default for
+fields that didn't exist yet), and never remove an old version's decode
+branch. A record written by older code keeps decoding correctly forever;
+there is no eager rewrite step, no downtime, and no version-gated
+maintenance window. Any subsequent *write* of that record (the next
+`ALTER TABLE`, `ANALYZE`, etc.) naturally upgrades it to the current
+version as a side effect of being rewritten at all. This is the sanctioned
+recipe for every future catalog-record change (`NSCT`, `NSST`, and the
+smaller task/schedule/workflow/resource-group/idempotency records in
+`internal/catalog`) and needs no exception process — just: widen
+`MaxReadable` in `compat.Catalog()` in the same change that adds the new
+version, and never delete an old branch.
+
+**Format-level (page/superblock binary layout) changes are not safe to
+migrate online, in general**, and no online mechanism is planned for them
+speculatively — fixed-offset headers, AEAD-sealed content, and
+checksum-covered bytes make an in-place physical rewrite unsafe to attempt
+against a database that may be serving traffic or mid-WAL-replay. The safe
+path for a breaking format change is offline, and it already exists using
+tools that ship today: `nextsql backup` (a full physical-then-logical
+snapshot) or a plain `SELECT`/`INSERT` copy through the SQL layer, into a
+freshly `nextsql init`'d database running the new binary. Both paths cross
+the *logical* row layer (`internal/sql/types`), not the raw physical page
+bytes, so neither cares what physical format version either database is
+using — this is why it works today with zero new code, and will keep
+working the same way after a real format bump. A future increment that
+actually proposes a breaking format change should document a `nextsql
+migrate` operational sequence in `docs/ops.md` built from these existing
+primitives (mirroring how "Rolling upgrade", `docs/ops.md`, is itself a
+documented sequence of pre-existing primitives, not new mechanism), rather
+than inventing an in-place converter.
+
+A middle case is worth naming for when it actually arises rather than
+building for now: a genuinely *additive-only* format change (a new
+optional trailing header field with a safe, well-defined zero-value
+default) could in principle follow the same forward-compatible-read
+pattern the catalog already uses — an old binary ignores unknown trailing
+bytes it already skips today, a new binary supplies the default for
+absent ones. This is deliberately not built speculatively; evaluate it in
+good faith against the actual proposed change when a real format bump is
+next on the table, the same way each `NSCT` version above was decided on
+its own concrete merits, not designed in advance of having a version to
+add.
 
 ## What this version does not store
 

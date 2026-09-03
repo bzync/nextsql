@@ -28,16 +28,22 @@ type Hash struct {
 	nAdds  uint64
 }
 
+// aggAcc is the running accumulator for one Spec. Each Spec gets its own so
+// that e.g. SELECT SUM(x), AVG(y), MIN(x) never share a slot (a prior version
+// kept a single sum/nval/min/max on state, which double-counted whenever two
+// specs used the same slot).
+type aggAcc struct {
+	sum    types.Decimal // sum / avg
+	nval   int64         // non-null count for count(col) / avg denominator
+	val    types.Value   // running min or max
+	hasVal bool
+}
+
 type state struct {
-	key    []types.Value
-	raw    []byte
-	n      int64
-	nval   int64
-	sum    types.Decimal
-	min    types.Value
-	max    types.Value
-	hasMin bool
-	hasMax bool
+	key  []types.Value
+	raw  []byte
+	n    int64
+	accs []aggAcc // one per Hash.specs entry
 }
 
 func New(groups []int, specs []Spec, outTypes []types.Type, b *scheduler.Budget) *Hash {
@@ -97,8 +103,9 @@ func (h *Hash) AddCountStarBytes(b []byte, null bool, typ types.Type) error {
 	}
 	raw := append([]byte(nil), b...)
 	st := &state{
-		key: []types.Value{{Typ: typ, Str: string(raw)}},
-		raw: raw,
+		key:  []types.Value{{Typ: typ, Str: string(raw)}},
+		raw:  raw,
+		accs: make([]aggAcc, len(h.specs)),
 	}
 	ks := "\x01" + st.key[0].Str
 	est := int64(64 + len(ks) + 32*len(h.specs))
@@ -143,7 +150,7 @@ func (h *Hash) addKeyed(keyVals []types.Value, row []types.Value) error {
 	}
 	st, ok := h.table[ks]
 	if !ok {
-		st = &state{key: cloneRow(keyVals)}
+		st = &state{key: cloneRow(keyVals), accs: make([]aggAcc, len(h.specs))}
 		est := int64(64 + len(ks) + 32*len(h.specs))
 		if err := h.budget.ChargeMem(est); err != nil {
 			if err := h.spillOne(ks, st); err != nil {
@@ -164,8 +171,8 @@ func (h *Hash) addKeyed(keyVals []types.Value, row []types.Value) error {
 	if row == nil {
 		return nil
 	}
-	for _, sp := range h.specs {
-		if err := acc(st, sp, row); err != nil {
+	for i, sp := range h.specs {
+		if err := acc(&st.accs[i], sp, row); err != nil {
 			return err
 		}
 	}
@@ -192,14 +199,14 @@ func groupMapKey(keyVals []types.Value) (string, error) {
 	return string(enc), nil
 }
 
-func acc(st *state, sp Spec, row []types.Value) error {
+func acc(a *aggAcc, sp Spec, row []types.Value) error {
 	switch sp.Fun {
 	case "count":
 		if sp.Col < 0 {
 			return nil // COUNT(*) uses st.n
 		}
 		if sp.Col < len(row) && !row[sp.Col].Null {
-			st.nval++
+			a.nval++
 		}
 	case "sum", "avg":
 		if sp.Col < 0 || sp.Col >= len(row) {
@@ -216,39 +223,39 @@ func acc(st *state, sp Spec, row []types.Value) error {
 			}
 			v = c
 		}
-		st.sum = types.AddDec(st.sum, v.Dec)
-		st.nval++
+		a.sum = types.AddDec(a.sum, v.Dec)
+		a.nval++
 	case "min":
 		if sp.Col < 0 || sp.Col >= len(row) || row[sp.Col].Null {
 			return nil
 		}
-		if !st.hasMin {
-			st.min = row[sp.Col].Clone()
-			st.hasMin = true
+		if !a.hasVal {
+			a.val = row[sp.Col].Clone()
+			a.hasVal = true
 			return nil
 		}
-		c, err := row[sp.Col].Cmp(st.min)
+		c, err := row[sp.Col].Cmp(a.val)
 		if err != nil {
 			return err
 		}
 		if c < 0 {
-			st.min = row[sp.Col].Clone()
+			a.val = row[sp.Col].Clone()
 		}
 	case "max":
 		if sp.Col < 0 || sp.Col >= len(row) || row[sp.Col].Null {
 			return nil
 		}
-		if !st.hasMax {
-			st.max = row[sp.Col].Clone()
-			st.hasMax = true
+		if !a.hasVal {
+			a.val = row[sp.Col].Clone()
+			a.hasVal = true
 			return nil
 		}
-		c, err := row[sp.Col].Cmp(st.max)
+		c, err := row[sp.Col].Cmp(a.val)
 		if err != nil {
 			return err
 		}
 		if c > 0 {
-			st.max = row[sp.Col].Clone()
+			a.val = row[sp.Col].Clone()
 		}
 	default:
 		return nerr.New(nerr.InvalidArgument, "aggregate.acc", "unknown aggregate")
@@ -259,44 +266,39 @@ func acc(st *state, sp Spec, row []types.Value) error {
 func (h *Hash) emit(st *state) []types.Value {
 	out := make([]types.Value, 0, len(h.groups)+len(h.specs))
 	out = append(out, st.key...)
-	for _, sp := range h.specs {
+	for i, sp := range h.specs {
+		a := st.accs[i]
 		switch sp.Fun {
 		case "count":
 			n := st.n
 			if sp.Col >= 0 {
-				n = st.nval
+				n = a.nval
 			}
 			d, _ := types.ParseDecimal(itoa64(n))
 			out = append(out, types.DecimalValue(d, types.Type{Kind: types.KindDecimal}))
 		case "sum":
-			if st.nval == 0 {
+			if a.nval == 0 {
 				out = append(out, types.Null(types.Type{Kind: types.KindDecimal}))
 			} else {
-				out = append(out, types.DecimalValue(st.sum, types.Type{Kind: types.KindDecimal, Scale: uint16(st.sum.Scale)}))
+				out = append(out, types.DecimalValue(a.sum, types.Type{Kind: types.KindDecimal, Scale: uint16(a.sum.Scale)}))
 			}
 		case "avg":
-			if st.nval == 0 {
+			if a.nval == 0 {
 				out = append(out, types.Null(types.Type{Kind: types.KindDecimal}))
 			} else {
-				den, _ := types.ParseDecimal(itoa64(st.nval))
-				q, err := types.QuoDec(st.sum, den)
+				den, _ := types.ParseDecimal(itoa64(a.nval))
+				q, err := types.QuoDec(a.sum, den)
 				if err != nil {
 					out = append(out, types.Null(types.Type{Kind: types.KindDecimal}))
 				} else {
 					out = append(out, types.DecimalValue(q, types.Type{Kind: types.KindDecimal, Scale: uint16(q.Scale)}))
 				}
 			}
-		case "min":
-			if !st.hasMin {
+		case "min", "max":
+			if !a.hasVal {
 				out = append(out, types.Null(types.String()))
 			} else {
-				out = append(out, st.min)
-			}
-		case "max":
-			if !st.hasMax {
-				out = append(out, types.Null(types.String()))
-			} else {
-				out = append(out, st.max)
+				out = append(out, a.val)
 			}
 		}
 	}
@@ -341,20 +343,33 @@ func (h *Hash) Merge(other *Hash) error {
 			continue
 		}
 		cur.n += st.n
-		cur.nval += st.nval
-		cur.sum = types.AddDec(cur.sum, st.sum)
-		if st.hasMin {
-			if !cur.hasMin {
-				cur.min, cur.hasMin = st.min, true
-			} else if c, err := st.min.Cmp(cur.min); err == nil && c < 0 {
-				cur.min = st.min
-			}
+		if len(cur.accs) != len(st.accs) {
+			return nerr.New(nerr.Internal, "aggregate.Merge", "spec count mismatch")
 		}
-		if st.hasMax {
-			if !cur.hasMax {
-				cur.max, cur.hasMax = st.max, true
-			} else if c, err := st.max.Cmp(cur.max); err == nil && c > 0 {
-				cur.max = st.max
+		for i := range st.accs {
+			sa, ca := st.accs[i], &cur.accs[i]
+			ca.nval += sa.nval
+			ca.sum = types.AddDec(ca.sum, sa.sum)
+			if !sa.hasVal {
+				continue
+			}
+			if !ca.hasVal {
+				ca.val, ca.hasVal = sa.val, true
+				continue
+			}
+			c, err := sa.val.Cmp(ca.val)
+			if err != nil {
+				continue
+			}
+			// The spec's fun decides the direction; Merge does not have it
+			// here, so keep both extremes candidate-correct: for MIN we want
+			// the smaller, for MAX the larger. Distinguish via h.specs[i].
+			if h.specs[i].Fun == "max" {
+				if c > 0 {
+					ca.val = sa.val
+				}
+			} else if c < 0 {
+				ca.val = sa.val
 			}
 		}
 	}

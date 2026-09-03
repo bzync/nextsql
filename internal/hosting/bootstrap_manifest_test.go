@@ -137,6 +137,75 @@ realms:
 	}
 }
 
+func TestEnsureBootstrapManifestKeyFiles(t *testing.T) {
+	dir := t.TempDir()
+	keysDir := filepath.Join(dir, "keys")
+	if err := os.MkdirAll(keysDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// b.key pre-exists; a.key and c.key are created by the call.
+	createRootFile(t, filepath.Join(keysDir, "b.key"))
+	manifest := filepath.Join(dir, "hosting.yaml")
+	if err := os.WriteFile(manifest, []byte(`version: 1
+default: {realm: a, database: one}
+realms:
+  - name: a
+    databases:
+      - {name: one, key_file: keys/a.key}
+      - {name: two, key_file: keys/b.key}
+  - name: c
+    databases:
+      - {name: three, key_file: keys/c.key}
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	created, err := EnsureBootstrapManifestKeyFiles(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{filepath.Join(keysDir, "a.key"), filepath.Join(keysDir, "c.key")}
+	if len(created) != 2 || created[0] != want[0] || created[1] != want[1] {
+		t.Fatalf("created=%v want %v", created, want)
+	}
+	for _, p := range []string{"a.key", "b.key", "c.key"} {
+		root, err := crypto.ReadKeyFile(filepath.Join(keysDir, p))
+		if err != nil {
+			t.Fatalf("%s not a valid key file: %v", p, err)
+		}
+		root.Zero()
+	}
+	// The full document now validates, and the created keys are independent.
+	if _, err := LoadDeploymentBootstrap(manifest); err != nil {
+		t.Fatalf("manifest did not validate after key creation: %v", err)
+	}
+	// Idempotent: a second call creates nothing.
+	again, err := EnsureBootstrapManifestKeyFiles(manifest)
+	if err != nil || len(again) != 0 {
+		t.Fatalf("second call created %v err=%v", again, err)
+	}
+}
+
+func TestEnsureBootstrapManifestKeyFilesRejectsBadManifest(t *testing.T) {
+	dir := t.TempDir()
+	manifest := filepath.Join(dir, "m.yaml")
+	if err := os.WriteFile(manifest, []byte(`version: 1
+default: {realm: a, database: one}
+realms:
+  - name: a
+    databases:
+      - {name: one, key_file: ""}
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := EnsureBootstrapManifestKeyFiles(manifest); !nerr.HasCode(err, nerr.InvalidArgument) {
+		t.Fatalf("blank key_file: %v", err)
+	}
+	if _, err := EnsureBootstrapManifestKeyFiles(filepath.Join(dir, "missing.yaml")); !nerr.HasCode(err, nerr.IO) {
+		t.Fatalf("missing manifest: %v", err)
+	}
+}
+
 func TestManagedDatabasePathUsesOnlyStableIDs(t *testing.T) {
 	deployment, err := newID()
 	if err != nil {

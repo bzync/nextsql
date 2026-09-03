@@ -68,6 +68,15 @@ export const Kind = {
   Box: 11,
   Line: 12,
   Polygon: 13,
+  Blob: 14,
+  Int8: 15,
+  Int16: 16,
+  Int32: 17,
+  Int64: 18,
+  Uint8: 19,
+  Uint16: 20,
+  Uint32: 21,
+  Uint64: 22,
 };
 
 export class NextSQLError extends Error {
@@ -465,6 +474,63 @@ function encodeUUID(raw) {
   return concat([Uint8Array.of(Kind.UUID, 0), new Uint8Array(5), raw]);
 }
 
+function encodeBlob(raw) {
+  return concat([Uint8Array.of(Kind.Blob, 0), new Uint8Array(5), appendU32Bytes(raw, MAX_PACKET)]);
+}
+
+const INT_RANGES = {
+  int8: [-0x80n, 0x7fn, Kind.Int8, 1],
+  int16: [-0x8000n, 0x7fffn, Kind.Int16, 2],
+  int32: [-0x80000000n, 0x7fffffffn, Kind.Int32, 4],
+  int64: [-0x8000000000000000n, 0x7fffffffffffffffn, Kind.Int64, 8],
+};
+
+// encodeInt builds an explicit fixed-width int parameter (D2, Datatype
+// expansion track). A bare JS number/bigint still defaults to Kind.Decimal
+// (see encodeParam) and coerces server-side into any numeric column, so
+// this wrapper is only needed to pin an exact wire width.
+function encodeInt(which, value) {
+  const range = INT_RANGES[which];
+  if (!range) {
+    throw new NextSQLError('invalid_argument', 'unknown int kind: ' + which);
+  }
+  const [lo, hi, kind, width] = range;
+  const n = BigInt(value);
+  if (n < lo || n > hi) {
+    throw new NextSQLError('invalid_argument', which + ' out of range');
+  }
+  // Little-endian: the low `width` bytes of the 8-byte encoding are exactly
+  // the narrow two's-complement encoding for any value in range.
+  const full = new Uint8Array(8);
+  new DataView(full.buffer).setBigInt64(0, n, true);
+  return concat([Uint8Array.of(kind, 0), new Uint8Array(5), full.subarray(0, width)]);
+}
+
+const UINT_RANGES = {
+  uint8: [0xffn, Kind.Uint8, 1],
+  uint16: [0xffffn, Kind.Uint16, 2],
+  uint32: [0xffffffffn, Kind.Uint32, 4],
+  uint64: [0xffffffffffffffffn, Kind.Uint64, 8],
+};
+
+// encodeUint builds an explicit fixed-width unsigned int parameter (D3,
+// Datatype expansion track). Mirrors encodeInt; a bare JS number/bigint
+// still defaults to Kind.Decimal (see encodeParam).
+function encodeUint(which, value) {
+  const range = UINT_RANGES[which];
+  if (!range) {
+    throw new NextSQLError('invalid_argument', 'unknown uint kind: ' + which);
+  }
+  const [hi, kind, width] = range;
+  const n = BigInt(value);
+  if (n < 0n || n > hi) {
+    throw new NextSQLError('invalid_argument', which + ' out of range');
+  }
+  const full = new Uint8Array(8);
+  new DataView(full.buffer).setBigUint64(0, n, true);
+  return concat([Uint8Array.of(kind, 0), new Uint8Array(5), full.subarray(0, width)]);
+}
+
 function encodeTimestamp(ns) {
   return concat([Uint8Array.of(Kind.TimestampTZ, 0), new Uint8Array(5), putU64(ns)]);
 }
@@ -520,8 +586,11 @@ export function encodeParam(v) {
   if (v instanceof Date) {
     return encodeTimestamp(BigInt(v.getTime()) * 1000000n);
   }
-  if (v instanceof Uint8Array && v.length === 16) {
-    return encodeUUID(v);
+  if (v instanceof Uint8Array) {
+    // A bare 16-byte Uint8Array keeps its pre-existing meaning (UUID) for
+    // compatibility; any other length is a BLOB. A 16-byte BLOB needs the
+    // explicit { kind: 'blob', value } wrapper below to disambiguate.
+    return v.length === 16 ? encodeUUID(v) : encodeBlob(v);
   }
   if (Array.isArray(v) && v.length > 0 && v.every((x) => typeof x === 'number')) {
     return encodeVector(v);
@@ -538,6 +607,15 @@ export function encodeParam(v) {
     }
     if (v.kind === 'decimal') {
       return concat([Uint8Array.of(Kind.Decimal, 0), new Uint8Array(5), encodeDecimalString(v.value)]);
+    }
+    if (v.kind === 'blob') {
+      return encodeBlob(v.value instanceof Uint8Array ? v.value : Uint8Array.from(v.value));
+    }
+    if (v.kind === 'int8' || v.kind === 'int16' || v.kind === 'int32' || v.kind === 'int64') {
+      return encodeInt(v.kind, v.value);
+    }
+    if (v.kind === 'uint8' || v.kind === 'uint16' || v.kind === 'uint32' || v.kind === 'uint64') {
+      return encodeUint(v.kind, v.value);
     }
     return encodeString(JSON.stringify(v));
   }
@@ -566,6 +644,10 @@ export function decodeValue(buf, off) {
       const got = readU32Bytes(buf, off, MAX_PACKET);
       return { value: td.decode(got.value), next: got.next, kind };
     }
+    case Kind.Blob: {
+      const got = readU32Bytes(buf, off, MAX_PACKET);
+      return { value: got.value, next: got.next, kind };
+    }
     case Kind.JSON: {
       const got = readU32Bytes(buf, off, MAX_PACKET);
       return { value: decodeNSJB(got.value), next: got.next, kind };
@@ -586,6 +668,59 @@ export function decodeValue(buf, off) {
         throw new NextSQLError('protocol', 'truncated bool');
       }
       return { value: buf[off] !== 0, next: off + 1, kind };
+    }
+    case Kind.Int8: {
+      if (off + 1 > buf.length) {
+        throw new NextSQLError('protocol', 'truncated int8');
+      }
+      const raw = buf[off];
+      return { value: raw >= 0x80 ? raw - 0x100 : raw, next: off + 1, kind };
+    }
+    case Kind.Int16: {
+      if (off + 2 > buf.length) {
+        throw new NextSQLError('protocol', 'truncated int16');
+      }
+      return { value: view(buf, off, 2).getInt16(0, true), next: off + 2, kind };
+    }
+    case Kind.Int32: {
+      if (off + 4 > buf.length) {
+        throw new NextSQLError('protocol', 'truncated int32');
+      }
+      return { value: view(buf, off, 4).getInt32(0, true), next: off + 4, kind };
+    }
+    case Kind.Int64: {
+      if (off + 8 > buf.length) {
+        throw new NextSQLError('protocol', 'truncated int64');
+      }
+      // Exposed as BigInt, not number: the full int64 range does not fit
+      // safely in a JS double (see docs/design-datatypes.md D2).
+      return { value: view(buf, off, 8).getBigInt64(0, true), next: off + 8, kind };
+    }
+    case Kind.Uint8: {
+      if (off + 1 > buf.length) {
+        throw new NextSQLError('protocol', 'truncated uint8');
+      }
+      return { value: buf[off], next: off + 1, kind };
+    }
+    case Kind.Uint16: {
+      if (off + 2 > buf.length) {
+        throw new NextSQLError('protocol', 'truncated uint16');
+      }
+      return { value: view(buf, off, 2).getUint16(0, true), next: off + 2, kind };
+    }
+    case Kind.Uint32: {
+      if (off + 4 > buf.length) {
+        throw new NextSQLError('protocol', 'truncated uint32');
+      }
+      return { value: view(buf, off, 4).getUint32(0, true), next: off + 4, kind };
+    }
+    case Kind.Uint64: {
+      if (off + 8 > buf.length) {
+        throw new NextSQLError('protocol', 'truncated uint64');
+      }
+      // Exposed as BigInt, not number: the full uint64 range does not fit
+      // safely in a JS double (see docs/design-datatypes.md D3).
+      return { value: view(buf, off, 8).getBigUint64(0, true), next: off + 8, kind };
     }
     case Kind.Vector: {
       const dim = u16(buf, off);
@@ -664,13 +799,20 @@ export function decodeValue(buf, off) {
 }
 
 export function encodeHello(h) {
-  return concat([
+  const parts = [
     putU16(h.version),
     putU16(h.flags || 0),
     putU64(h.secret || 0n),
     appendU16String(h.database || '', MAX_NAME),
     appendU16String(h.user || '', MAX_NAME),
-  ]);
+  ];
+  // Realm is an optional trailing field (M2-2): emitted only when
+  // selected, so a Hello with no realm is byte-identical to the pre-realm
+  // wire shape.
+  if (h.realm) {
+    parts.push(appendU16String(h.realm, MAX_NAME));
+  }
+  return concat(parts);
 }
 
 export function decodeHelloOK(b) {

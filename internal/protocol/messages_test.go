@@ -1,12 +1,110 @@
 package protocol
 
 import (
+	"bytes"
 	"testing"
 
+	"github.com/bzync/nextsql/internal/encoding"
 	"github.com/bzync/nextsql/internal/executor"
 	"github.com/bzync/nextsql/internal/nerr"
 	"github.com/bzync/nextsql/internal/sql/types"
 )
+
+// TestHelloRealmRoundTrip proves the new M2-2 trailing field round-trips.
+func TestHelloRealmRoundTrip(t *testing.T) {
+	lim := DefaultLimits()
+	h := Hello{Version: Version, Database: "production", User: "app", Realm: "tenant-a"}
+	raw, err := EncodeHello(h, lim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := DecodeHello(raw, lim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Realm != "tenant-a" || got.Database != "production" || got.User != "app" {
+		t.Fatalf("%+v", got)
+	}
+}
+
+// TestHelloWithoutRealmIsByteIdenticalToOldShape is the concrete regression
+// guard for the M2-2 compatibility promise: an unconfigured client's Hello
+// must be byte-for-byte the same wire shape as before Realm existed, not
+// merely "decodes to the same values."
+func TestHelloWithoutRealmIsByteIdenticalToOldShape(t *testing.T) {
+	lim := DefaultLimits()
+	withRealmField, err := EncodeHello(Hello{Version: Version, Database: "production", User: "app"}, lim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	noRealmField, err := EncodeHello(Hello{Version: Version, Database: "production", User: "app", Realm: ""}, lim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(withRealmField, noRealmField) {
+		t.Fatalf("Realm-unset encodings differ: %x vs %x", withRealmField, noRealmField)
+	}
+}
+
+// TestDecodeHelloOldShapeNoTrailingBytes decodes a literal old-shape byte
+// sequence (no bytes at all past User, not just "Realm encoded as empty")
+// to prove backward compatibility at the byte level, not just the API level.
+func TestDecodeHelloOldShapeNoTrailingBytes(t *testing.T) {
+	lim := DefaultLimits()
+	var hdr [12]byte
+	encoding.PutU16(hdr[:], 0, Version)
+	buf := append([]byte{}, hdr[:]...)
+	buf, err := appendU16String(buf, "production", lim.MaxName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	buf, err = appendU16String(buf, "app", lim.MaxName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := DecodeHello(buf, lim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Realm != "" || got.Database != "production" || got.User != "app" {
+		t.Fatalf("%+v", got)
+	}
+}
+
+// TestDecodeHelloRejectsCorruptTrailingBytes proves the tail-sniff is not a
+// blanket "accept anything past User" hole: a well-formed trailing Realm
+// field followed by extra garbage bytes must still be rejected.
+func TestDecodeHelloRejectsCorruptTrailingBytes(t *testing.T) {
+	lim := DefaultLimits()
+	h := Hello{Version: Version, Database: "production", User: "app", Realm: "tenant-a"}
+	raw, err := EncodeHello(h, lim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw = append(raw, 0xDE, 0xAD, 0xBE, 0xEF)
+	if _, err := DecodeHello(raw, lim); !nerr.HasCode(err, nerr.Protocol) {
+		t.Fatalf("want a protocol decode error, got %v", err)
+	}
+}
+
+// TestDecodeHelloRejectsTruncatedRealmLength proves corruption *within* the
+// optional field itself (a length prefix claiming more bytes than exist) is
+// still caught, not silently truncated or accepted.
+func TestDecodeHelloRejectsTruncatedRealmLength(t *testing.T) {
+	lim := DefaultLimits()
+	h := Hello{Version: Version, Database: "production", User: "app"}
+	raw, err := EncodeHello(h, lim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A realm length prefix claiming 10 bytes with none actually present.
+	var n [2]byte
+	encoding.PutU16(n[:], 0, 10)
+	raw = append(raw, n[:]...)
+	if _, err := DecodeHello(raw, lim); !nerr.HasCode(err, nerr.Protocol) {
+		t.Fatalf("want a protocol decode error, got %v", err)
+	}
+}
 
 func TestHelloAuthQueryRoundTrip(t *testing.T) {
 	lim := DefaultLimits()

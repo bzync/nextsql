@@ -22,6 +22,13 @@ export {
   isReadOnlySQL,
   txnControl,
   validateConfig,
+  FieldType,
+  MemoryFieldKeyring,
+  FileFieldKeyring,
+  decryptField,
+  encryptField,
+  generateFieldKey,
+  inspectField,
 } from './mod.js';
 
 export type {
@@ -46,4 +53,8 @@ export type {
   Value,
   VectorRef,
   SparseVector,
+  FieldKey,
+  FieldKeyProvider,
+  FieldKeyInfo,
+  FieldTypeDescriptor,
 } from '../js/types.d.ts';

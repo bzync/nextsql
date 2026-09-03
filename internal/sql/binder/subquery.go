@@ -4,6 +4,7 @@ import (
 	"strings"
 
 	"github.com/bzync/nextsql/internal/catalog"
+	"github.com/bzync/nextsql/internal/nerr"
 	"github.com/bzync/nextsql/internal/sql/ast"
 )
 
@@ -80,6 +81,9 @@ func flattenIn(in ast.InSubquery, outer *catalog.Table, outerAlias string, looku
 	col, ok := inOutputColumn(sel, tab)
 	if !ok {
 		return BoundSubjoin{}, false, nil
+	}
+	if col.ClientEncrypted() {
+		return BoundSubjoin{}, false, nerr.New(nerr.InvalidArgument, "sql.binder", "ENCRYPTED CLIENT column cannot be used in a subquery predicate")
 	}
 	if in.Not && !col.NotNull {
 		return BoundSubjoin{}, false, nil

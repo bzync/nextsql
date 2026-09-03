@@ -1,0 +1,65 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Cybersecurity Risk",
+  "type": "object",
+  "required": [
+    "id",
+    "scenario",
+    "asset",
+    "impact",
+    "likelihood",
+    "owner",
+    "treatment"
+  ],
+  "properties": {
+    "id": {
+      "type": "string"
+    },
+    "scenario": {
+      "type": "string"
+    },
+    "asset": {
+      "type": "string"
+    },
+    "impact": {
+      "type": "string"
+    },
+    "likelihood": {
+      "type": "string"
+    },
+    "controls": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "residual_risk": {
+      "type": "string"
+    },
+    "owner": {
+      "type": "string"
+    },
+    "treatment": {
+      "enum": [
+        "MITIGATE",
+        "AVOID",
+        "TRANSFER",
+        "ACCEPT"
+      ]
+    },
+    "review_date": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date"
+    },
+    "evidence": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "additionalProperties": true
+}

@@ -1,0 +1,42 @@
+{
+  "snapshot_date": "2026-09-01",
+  "warning": "Seed source map only. Verify applicability, amendments and effective dates before implementation.",
+  "jurisdictions": [
+    {
+      "code": "PH",
+      "framework": "Data Privacy Act of 2012 + NPC issuances",
+      "authority": "National Privacy Commission",
+      "official": "https://privacy.gov.ph/"
+    },
+    {
+      "code": "EU-EEA",
+      "framework": "GDPR",
+      "authority": "European Data Protection Board / supervisory authorities",
+      "official": "https://www.edpb.europa.eu/"
+    },
+    {
+      "code": "US-CA",
+      "framework": "CCPA as amended by CPRA",
+      "authority": "California Privacy Protection Agency / Attorney General",
+      "official": "https://privacy.ca.gov/"
+    },
+    {
+      "code": "SG",
+      "framework": "Personal Data Protection Act",
+      "authority": "Personal Data Protection Commission",
+      "official": "https://www.pdpc.gov.sg/"
+    },
+    {
+      "code": "BR",
+      "framework": "Lei Geral de Protecao de Dados (LGPD)",
+      "authority": "Agencia Nacional de Protecao de Dados",
+      "official": "https://www.gov.br/anpd/"
+    },
+    {
+      "code": "IN",
+      "framework": "Digital Personal Data Protection Act 2023 + Rules 2025",
+      "authority": "MeitY / Data Protection Board",
+      "official": "https://www.meity.gov.in/"
+    }
+  ]
+}

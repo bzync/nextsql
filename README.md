@@ -333,6 +333,8 @@ Official drivers speak the native NSQL protocol. **Keys and passwords never go i
 | Deno | [`drivers/deno`](drivers/deno) | `import { connect } from "./mod.ts"` |
 
 | PHP 8.1+ | [`drivers/php`](drivers/php) | `NextSQL\Client::connect([…])` |
+| Python 3.10+ | [`drivers/python`](drivers/python) | `nextsql.connect(nextsql.Config(…))` |
+| Ruby 3.0+ | [`drivers/ruby`](drivers/ruby) | `NextSQL.connect(NextSQL::Config.new(…))` |
 
 Shared TypeScript types live in [`drivers/js`](drivers/js).
 
@@ -415,6 +417,10 @@ Also in the production surface:
 - Hosted realm/database registry foundation; legacy shared-tenant tables fail closed for non-`ADMIN` migration safety
 
 - Online DEK rotation, key-version revocation (kills sessions), crypto-shred of the keystore
+
+- Experimental `ENCRYPTED CLIENT`: randomized server-opaque `NSCE1.` fields
+  with Go, Node.js/TypeScript, Bun, Deno, and PHP helpers; PITR and HA coverage
+  remain open
 
 - TLS 1.3 required for non-loopback listen addresses
 
@@ -731,9 +737,16 @@ crash-during-merge recovers `Check()`-clean; 100M analytics `< 60 s`; 10M
 INSERT/UPDATE published; security sign-off). The terminal 100M-operation B+Tree
 invariant soak is a deferred standalone measurement, not a release gate — paper-
 closed 2026-08-30 with the same disposition as P18. P23 Vector Engine 2.0 is
-complete (production-gating sign-off 2026-08-31). P24 Full-text Search 2.0 is the
-current release gate (stemming, stop-word dictionaries, french/german/spanish
-analyzers, english synonym dictionary v1, prefix search, fuzzy matching, typo tolerance, HIGHLIGHT/SNIPPET, multi-field search, field weighting, and faceting landed; exit gate next).
+complete (production-gating sign-off 2026-08-31). P24 Full-text Search 2.0 is
+complete (exit gate closed 2026-08-31). P25 Security 2.0 is complete (exit
+gate closed 2026-09-02): mTLS, short-lived credentials, the external-IdP
+broker, field-level client encryption (including all official drivers, PITR,
+HA/failover, and durable key rotation/revocation), Argon2id password hashing,
+and audit-chain hardening are all production-gated. P26 System Catalog /
+Introspection 2.0 is complete (exit gate closed 2026-09-02): the virtual
+`system` schema, live session/security-administration tables, `SHOW`
+aliases, and an authoritative capability registry are all production-gated.
+The current release gate is P27 Operational Maturity / Workload Governance.
 
 Large sequential `DELETE` is correct after the leaf-merge fix and its 10M timing methodology is published. The tracker also records published 100M analytics results.
 
@@ -759,7 +772,7 @@ separate future phase. The roadmap then continues through follower reads, Vector
 Engine 2.0, Full-text Search 2.0, Security 2.0, system introspection, workload
 governance, Installer/Manager, web-based Studio, and NextSQL Intelligence/RAG.
 
-P22+ capabilities remain planned until their `TODO.md` gates are green. P19
+P22–P26 are complete; P27+ capabilities remain open until their `TODO.md` gates are green. P19
 syntax and semantics are documented in `docs/workflows.md`; P20 and P21 are
 documented in `docs/cdc.md` and `docs/partitioning.md`.
 

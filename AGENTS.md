@@ -62,27 +62,29 @@ P21      complete
 P22      complete
 P23      complete — Vector Engine 2.0; production-gating sign-off 2026-08-31
 P24      complete — Full-text Search 2.0; exit gate closed 2026-08-31
-P25      open — Security 2.0
-P26–P30 planned/open
+P25      complete — Security 2.0; exit gate closed 2026-09-02, security review sign-off in docs/security.md
+P26      open — System catalog / introspection 2.0; virtual schema core + all 5 live tables + all 9 SHOW aliases landed, exit gate open
+P27–P30 planned/open
 ```
 
-Until P25 is closed, prioritize:
+P26 is the current release gate. Prioritize:
 
 ```text
-1. Remaining P25 targets in order: external IdP, field-level client encryption,
-   password-hash evolution, audit hardening
-2. Fix any correctness regression
-3. Close P25 only when its exit gate is green
+1. Audit designed vs implemented vs tested vs production-gated status for
+   whatever surface is being extended, the way P25's audit table did.
+2. Fix any correctness regression first.
+3. Close a phase only when its exit gate is green.
 ```
 
-P25 implemented so far: mTLS / service identity / certificate + trust rotation /
+P25 Security 2.0 is complete (exit gate closed 2026-09-02): mTLS / service identity / certificate + trust rotation /
 X.509 CRL revocation, and signed short-lived credentials (`NSSC1.` Ed25519
 credential in place of the password; expiry + audience/database/realm/role
 scope; `NSTK` rotatable signing keyset + verify-only server copy; `NSTR`
 fail-closed revocation by token id or per-principal cutoff; `SIGHUP` reload;
 `nextsql token` CLI; `ACL.AllowedScoped` role narrowing with no escalation;
 session closed at credential expiry; `identity_source` `token` / `mtls+token`).
-Config: `token_verify_keyset` / `token_revocations` / `token_audience`.
+Config: `token_verify_keyset` / `token_revocations` / `token_audience` /
+`token_identity_source_hint`.
 
 P25 external IdP: OIDC design is accepted (`docs/design-oidc-external-idp.md`) —
 a brokered token exchange that validates an OIDC token against a cached JWKS and
@@ -91,13 +93,43 @@ identity policy whose group→role mapping is intersected with real RBAC (no
 escalation). Implemented and tested: the `NSIP` policy engine (`internal/auth`)
 and the authentication **broker** — `internal/oidc` (JWS/JWKS/ID-token
 validation), `internal/authbroker`, `cmd/nextsql-auth-broker` (`POST /v1/exchange`
-→ verify ID token → map → mint `NSSC1.`). Next increment: the `nextsql login`
-client flow, then the `oidc` / `mtls+oidc` server audit source, client
-credentials, embedded broker mode, and optional JIT provisioning.
+→ verify ID token → map → mint `NSSC1.`), plus `internal/oidcclient` and
+`nextsql login` / `logout` / `whoami` (Authorization Code + PKCE, bounded
+loopback callback, strict local credential storage, silent refresh, `--idp`
+connection plumbing). Key-derived server audit labeling is implemented:
+operator-mapped, successfully verified broker key ids produce `oidc` /
+`mtls+oidc`; forged/unverified tokens remain generic. JWT client credentials
+are implemented with protected secret-file input, explicit broker resource
+audience + client binding, and non-interactive renewal. Embedded single-node
+mode is implemented on a separate bounded listener with issuer/verifier checks
+and a live native-user/ACL membership feed. Optional opaque introspection and
+JIT remain off. Field-level client encryption has an experimental
+SQL/catalog/server slice, official-driver helpers in Go/Node.js/TypeScript/
+Bun/Deno/PHP, and tested PITR + HA/failover; durable key-rotation/revocation
+KMS lifecycle remains before production gating. Password hashing has migrated
+to Argon2id (versioned records, PBKDF2 backward compatibility, transparent
+login rehash, DoS benchmarks). Audit hardening is implemented: `nextsql.audit`
+carries a versioned `NSAC` hash chain with optional `NSAK` Ed25519 signatures
+(rotatable keyset, fail-closed signed-transition rule), verified by the
+`nextsql audit` CLI. The phase-wide exit gate — a dated security review
+sign-off (`docs/security.md` "P25 security review sign-off") — closed
+2026-09-02, so every item above is production-gated. `ENCRYPTED CLIENT`
+stays labeled `experimental` in `system.capabilities` only because no
+searchable/deterministic mode ships (a deliberate scope decision, not an
+open blocker). OCSP, optional OIDC opaque-token introspection, and JIT
+principal provisioning remain off by design, not as open blockers.
 
 Stemming, stop-word dictionaries, versioned language analyzers, english synonym dictionary v1, prefix search, fuzzy matching, typo tolerance, highlight/snippet generation, multi-field search, field weighting, and faceting landed: `NSCT` v9 analyzer metadata, `WITH (ANALYZER = 'simple' | 'english' | 'french' | 'german' | 'spanish')`, english v3 = Porter2 + stop-word dictionary v1 + query-time synonym dictionary v1, french/german/spanish v1 = Snowball stemmer + stop list, trailing `*` prefix queries and trailing `~` fuzzy queries, automatic typo tolerance on missing unadorned tokens (fail-closed expansion caps), `HIGHLIGHT`/`SNIPPET` on SEARCH SELECT lists (bounded markers/width), `CREATE FULLTEXT INDEX` / `SEARCH` on 1–8 columns (phrases stay per-field), optional `SEARCH col WEIGHT n` (query-time BM25 tf scale, `(0, 64]`, default 1), `SELECT * … SEARCH … FACET col [, col …]` independent histograms over the full match set (per-facet `LIMIT`, 8 columns / 1024 values fail closed), default BM25/phrase behaviour preserved.
 
-Do not let later feature work destabilize an earlier release gate.
+Do not let later feature work destabilize an earlier release gate. P26 System
+catalog / introspection 2.0 is the current release gate. The virtual `system`
+schema core (capabilities/tables/columns/indexes/storage/replication/raft/
+workflows/tasks/partitions/stats, RBAC-filtered) landed first; all 5 live
+tables — `system.sessions`/`system.active_queries`/`system.transactions`/
+`system.change_streams`/`system.locks` (node-local, in-memory,
+RBAC-filtered — see `docs/system-catalog.md`) — landed 2026-09-01.
+All nine planned `SHOW` convenience aliases landed 2026-09-02; the exit gate
+remains open.
 
 Always verify the latest status in `TODO.md` before acting.
 
@@ -401,15 +433,13 @@ Do not convert targets into claims without measured evidence.
 Expected future phases are:
 
 ```text
-P25 Security 2.0
-P26 System catalog / introspection 2.0
 P27 Operational maturity + workload governance
 P28 Professional Installer + NextSQL Manager
 P29 NextSQL Studio
 P30 NextSQL Intelligence + built-in RAG
 ```
 
-P0–P24 are complete (P16's terminal 100M B+Tree soak and P17's `REBUILD INDEX
+P0–P26 are complete (P16's terminal 100M B+Tree soak and P17's `REBUILD INDEX
 … ONLINE` remain documented deferred follow-ons, not open gates).
 
 Preserve these principles:

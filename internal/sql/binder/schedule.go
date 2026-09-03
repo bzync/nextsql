@@ -4,6 +4,7 @@ import (
 	"time"
 
 	"github.com/bzync/nextsql/internal/catalog"
+	"github.com/bzync/nextsql/internal/cron"
 	"github.com/bzync/nextsql/internal/nerr"
 	"github.com/bzync/nextsql/internal/sql/ast"
 )
@@ -55,7 +56,12 @@ func bindSchedule(stmt ast.Stmt, workflows WorkflowLookup, schedules ScheduleLoo
 		if len(s.Args) != len(workflow.Params) {
 			return nil, true, nerr.New(nerr.InvalidArgument, "sql.binder", "schedule workflow argument count mismatch")
 		}
-		var specNS int64
+		createdNS := time.Now().UTC().UnixNano()
+		var (
+			specNS     int64
+			cronExpr   string
+			nextFireNS int64
+		)
 		switch s.Kind {
 		case ast.ScheduleEvery:
 			d, err := time.ParseDuration(s.Spec)
@@ -63,23 +69,32 @@ func bindSchedule(stmt ast.Stmt, workflows WorkflowLookup, schedules ScheduleLoo
 				return nil, true, nerr.New(nerr.InvalidArgument, "sql.binder", "EVERY must be between 1s and 8760h")
 			}
 			specNS = int64(d)
+			nextFireNS = createdNS + specNS
 		case ast.ScheduleAt:
 			at, err := time.Parse(time.RFC3339Nano, s.Spec)
 			if err != nil || at.UnixNano() <= 0 {
 				return nil, true, nerr.New(nerr.InvalidArgument, "sql.binder", "AT must be an RFC3339 timestamp after the Unix epoch")
 			}
 			specNS = at.UTC().UnixNano()
+			nextFireNS = specNS
+			if nextFireNS <= createdNS {
+				return nil, true, nerr.New(nerr.InvalidArgument, "sql.binder", "AT timestamp must be in the future")
+			}
+		case ast.ScheduleCron:
+			expr, err := cron.Parse(s.Spec)
+			if err != nil {
+				return nil, true, nerr.New(nerr.InvalidArgument, "sql.binder", "invalid CRON expression: "+err.Error())
+			}
+			next, err := expr.Next(time.Unix(0, createdNS).UTC())
+			if err != nil {
+				return nil, true, nerr.New(nerr.InvalidArgument, "sql.binder", "CRON expression has no upcoming match")
+			}
+			cronExpr = expr.String()
+			nextFireNS = next.UnixNano()
 		default:
 			return nil, true, nerr.New(nerr.InvalidArgument, "sql.binder", "invalid schedule kind")
 		}
-		createdNS := time.Now().UTC().UnixNano()
-		nextFireNS := specNS
-		if s.Kind == ast.ScheduleEvery {
-			nextFireNS = createdNS + specNS
-		} else if nextFireNS <= createdNS {
-			return nil, true, nerr.New(nerr.InvalidArgument, "sql.binder", "AT timestamp must be in the future")
-		}
-		schedule := &catalog.Schedule{ID: nextID, Name: s.Name, Owner: owner, Kind: s.Kind, SpecNS: specNS, WorkflowID: workflow.ID, Workflow: workflow.Name, Args: s.Args, CreatedNS: createdNS, NextFireNS: nextFireNS, Enabled: true}
+		schedule := &catalog.Schedule{ID: nextID, Name: s.Name, Owner: owner, Kind: s.Kind, SpecNS: specNS, Cron: cronExpr, WorkflowID: workflow.ID, Workflow: workflow.Name, Args: s.Args, CreatedNS: createdNS, NextFireNS: nextFireNS, Enabled: true}
 		if _, err := catalog.EncodeSchedule(schedule); err != nil {
 			return nil, true, err
 		}

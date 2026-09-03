@@ -9,6 +9,7 @@ import (
 
 	"github.com/bzync/nextsql/internal/crypto"
 	"github.com/bzync/nextsql/internal/nerr"
+	"github.com/bzync/nextsql/internal/storage/buffer"
 	"github.com/bzync/nextsql/internal/storage/format"
 )
 
@@ -118,6 +119,65 @@ func TestStorageCapBlocksGrowthAllowsReuse(t *testing.T) {
 	if _, err := e.Alloc.Alloc(); err != nil {
 		t.Fatalf("growth after cap lifted: %v", err)
 	}
+}
+
+// TestBufferBudgetGatesConcurrentOpens proves M2-3b-2's shared frame budget
+// gates a *second* Engine's Pool construction, not just one Engine's own
+// growth (that's the pre-existing per-Engine StorageCapBytes, a different
+// mechanism entirely): two databases with bufferPages=4 each against a
+// shared budget capped at 4 total frames can never both be open at once.
+func TestBufferBudgetGatesConcurrentOpens(t *testing.T) {
+	path1 := filepath.Join(t.TempDir(), "nextsql.db")
+	path2 := filepath.Join(t.TempDir(), "nextsql.db")
+	keys := testKeys(t)
+
+	for _, p := range []string{path1, path2} {
+		e, err := Create(p, keys, 4)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := e.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	budget := buffer.NewBudget(4)
+	eng1, err := OpenWith(path1, keys, 4, OpenOptions{Budget: budget})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := budget.Used(); got != 4 {
+		t.Fatalf("budget.Used() = %d, want 4", got)
+	}
+	if _, err := OpenWith(path2, keys, 4, OpenOptions{Budget: budget}); !nerr.HasCode(err, nerr.Exhausted) {
+		t.Fatalf("second open past budget: got %v, want Exhausted", err)
+	}
+
+	if err := eng1.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if got := budget.Used(); got != 0 {
+		t.Fatalf("budget.Used() after close = %d, want 0", got)
+	}
+	eng2, err := OpenWith(path2, keys, 4, OpenOptions{Budget: budget})
+	if err != nil {
+		t.Fatalf("open after release: %v", err)
+	}
+	if err := eng2.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestBufferBudgetNilUnbounded proves a nil Budget (the default for every
+// pre-M2-3b-2 caller, including Create/CreateWithIdentity which never set
+// OpenOptions.Budget at all) never gates anything.
+func TestBufferBudgetNilUnbounded(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "nextsql.db")
+	e, err := Create(path, testKeys(t), 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
 }
 
 func TestFreelistMetadataTailRemainsReachable(t *testing.T) {

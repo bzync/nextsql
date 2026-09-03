@@ -78,6 +78,56 @@ func TestTaskOwnerIsolationAndInvokerRights(t *testing.T) {
 	}
 }
 
+// TestExecuteClaimedTaskObeysAdmission proves the Phase 27 resource-group
+// audit's fix: a claimed task's workflow body now shares the same
+// process-wide admission gate as a client's own RUN WORKFLOW, rather than
+// running unbounded whenever TaskRuntime has a free worker slot regardless
+// of query-admission pressure. Mirrors TestMaintainSQLObeysAdmission's
+// saturate-then-assert-rejected shape.
+func TestExecuteClaimedTaskObeysAdmission(t *testing.T) {
+	db := testDB(t)
+	s := db.Session()
+	execOK(t, s, `CREATE TABLE sink_admit (id STRING PRIMARY KEY)`)
+	execOK(t, s, `CREATE WORKFLOW record_admit(id STRING) AS BEGIN INSERT INTO sink_admit (id) VALUES ($id); END`)
+	execOK(t, s, `CREATE SCHEDULE admit_sched EVERY '1h' RUN WORKFLOW record_admit('admit')`)
+	schedule, _ := createDueScheduledTask(t, db, "admit_sched")
+	claim := claimOneTask(t, db, schedule.NextFireNS)
+
+	db.SetAdmission(scheduler.NewAdmission(scheduler.AdmissionConfig{MaxInflight: 1, MaxQueue: 0, QueueWait: time.Millisecond}))
+	release, err := db.Admission().Acquire(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = db.ExecuteClaimedTask(context.Background(), claim, nil, nil, scheduler.DefaultLimits())
+	release()
+	if !nerr.HasCode(err, nerr.Unavailable) {
+		t.Fatalf("task execution bypassed admission: %v", err)
+	}
+	if db.Metrics().Snapshot().Rejected != 1 {
+		t.Fatal("task admission rejection not counted")
+	}
+	// Rejected before any task-state mutation: the row must still show
+	// TaskRunning with its original lease, not be marked failed — a
+	// transient overload should let the lease expire and be reclaimed
+	// later, exactly like the pre-existing db.gate.AllowWrite() rejection
+	// path just above it in executeClaimedTask.
+	task, ok, err := db.task(claim.ID)
+	if err != nil || !ok {
+		t.Fatalf("task lookup: ok=%v err=%v", ok, err)
+	}
+	if task.State != catalog.TaskRunning {
+		t.Fatalf("admission-rejected task must not be marked failed: %+v", task)
+	}
+
+	// With admission free again, the same claim now succeeds.
+	if err := db.ExecuteClaimedTask(context.Background(), claim, nil, nil, scheduler.DefaultLimits()); err != nil {
+		t.Fatal(err)
+	}
+	if rows := execOK(t, s, `SELECT id FROM sink_admit WHERE id = 'admit'`); len(rows.Rows) != 1 {
+		t.Fatalf("rows=%+v", rows.Rows)
+	}
+}
+
 func makeScheduleDue(t *testing.T, db *DB, scheduleName string) *catalog.Schedule {
 	t.Helper()
 	schedule, ok := db.schedule(scheduleName)
@@ -123,8 +173,13 @@ func TestTaskRuntimeAutomaticallyDispatchesAndExecutes(t *testing.T) {
 	schedule := makeScheduleDue(t, db, "automatic")
 	id := scheduledTaskID(schedule.ID, schedule.NextFireNS)
 	errCh := make(chan error, 8)
-	runtime, err := StartTaskRuntime(context.Background(), db, TaskRuntimeConfig{
-		Workers: 1, Batch: 1, PollInterval: 10 * time.Millisecond, PurgeEvery: time.Hour,
+	pool, err := NewTaskPool(context.Background(), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	runtime, err := StartTaskRuntime(context.Background(), db, pool, TaskRuntimeConfig{
+		Batch: 1, PollInterval: 10 * time.Millisecond, PurgeEvery: time.Hour,
 		OnError: func(err error) { errCh <- err },
 	})
 	if err != nil {
@@ -155,10 +210,126 @@ func TestTaskRuntimeAutomaticallyDispatchesAndExecutes(t *testing.T) {
 	}
 }
 
+// TestTaskPoolSharedAcrossTwoRuntimes proves M2-3b-3a's actual point: two
+// databases' TaskRuntimes, sharing one TaskPool sized to a single worker,
+// both get their due task executed — claims from either database compete
+// for, and run on, the same shared worker rather than each database having
+// its own independent goroutine.
+func TestTaskPoolSharedAcrossTwoRuntimes(t *testing.T) {
+	dbA := testDB(t)
+	dbB := testDB(t)
+	for i, db := range []*DB{dbA, dbB} {
+		s := db.Session()
+		execOK(t, s, `CREATE TABLE sink (id STRING PRIMARY KEY)`)
+		execOK(t, s, `CREATE WORKFLOW record(id STRING) AS BEGIN INSERT INTO sink (id) VALUES ($id); END`)
+		name := []string{"a", "b"}[i]
+		execOK(t, s, `CREATE SCHEDULE `+name+` EVERY '1h' RUN WORKFLOW record('`+name+`')`)
+	}
+	scheduleA := makeScheduleDue(t, dbA, "a")
+	scheduleB := makeScheduleDue(t, dbB, "b")
+	idA := scheduledTaskID(scheduleA.ID, scheduleA.NextFireNS)
+	idB := scheduledTaskID(scheduleB.ID, scheduleB.NextFireNS)
+
+	pool, err := NewTaskPool(context.Background(), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	runtimeA, err := StartTaskRuntime(context.Background(), dbA, pool, TaskRuntimeConfig{Batch: 1, PollInterval: 10 * time.Millisecond, PurgeEvery: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtimeA.Close()
+	runtimeB, err := StartTaskRuntime(context.Background(), dbB, pool, TaskRuntimeConfig{Batch: 1, PollInterval: 10 * time.Millisecond, PurgeEvery: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtimeB.Close()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		taskA, okA, errA := dbA.task(idA)
+		if errA != nil {
+			t.Fatal(errA)
+		}
+		taskB, okB, errB := dbB.task(idB)
+		if errB != nil {
+			t.Fatal(errB)
+		}
+		if okA && taskA.State == catalog.TaskSucceeded && okB && taskB.State == catalog.TaskSucceeded {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("tasks did not both succeed: a=%+v(ok=%v) b=%+v(ok=%v)", taskA, okA, taskB, okB)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// TestTaskRuntimeCloseAllowsSafeDBCloseWhilePoolShared mirrors the real
+// M2-3b-1 eviction shutdown sequence: one database's TaskRuntime closes and
+// that database closes right after, while the shared TaskPool and another
+// database's still-open TaskRuntime keep running. Close's inFlight wait
+// must have already released any pool-worker reference to the closing
+// database's *DB by the time it returns, or -race (run with -race in CI for
+// this package) would catch the closing database racing a worker.
+func TestTaskRuntimeCloseAllowsSafeDBCloseWhilePoolShared(t *testing.T) {
+	dbPrimary := testDB(t)
+	dbSecondary, err := Create(filepath.Join(t.TempDir(), "nextsql.db"), testKeys(t), 32)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := dbSecondary.Session()
+	execOK(t, s, `CREATE TABLE sink (id STRING PRIMARY KEY)`)
+	execOK(t, s, `CREATE WORKFLOW record(id STRING) AS BEGIN INSERT INTO sink (id) VALUES ($id); END`)
+	execOK(t, s, `CREATE SCHEDULE evict EVERY '1h' RUN WORKFLOW record('evict')`)
+	schedule := makeScheduleDue(t, dbSecondary, "evict")
+	id := scheduledTaskID(schedule.ID, schedule.NextFireNS)
+
+	pool, err := NewTaskPool(context.Background(), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	runtimePrimary, err := StartTaskRuntime(context.Background(), dbPrimary, pool, TaskRuntimeConfig{Batch: 1, PollInterval: 10 * time.Millisecond, PurgeEvery: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtimePrimary.Close()
+	runtimeSecondary, err := StartTaskRuntime(context.Background(), dbSecondary, pool, TaskRuntimeConfig{Batch: 1, PollInterval: 10 * time.Millisecond, PurgeEvery: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		task, ok, taskErr := dbSecondary.task(id)
+		if taskErr != nil {
+			t.Fatal(taskErr)
+		}
+		if ok && task.State == catalog.TaskSucceeded {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("task did not succeed: %+v ok=%v", task, ok)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err := runtimeSecondary.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := dbSecondary.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestTaskRuntimeBoundsAndFollowerDoNotDispatch(t *testing.T) {
 	db := testDB(t)
-	if _, err := StartTaskRuntime(context.Background(), db, TaskRuntimeConfig{Workers: maxTaskWorkers + 1}); !nerr.HasCode(err, nerr.InvalidArgument) {
-		t.Fatalf("unbounded workers err=%v", err)
+	if _, err := NewTaskPool(context.Background(), maxTaskWorkers+1); !nerr.HasCode(err, nerr.InvalidArgument) {
+		t.Fatalf("unbounded pool workers err=%v", err)
+	}
+	if _, err := StartTaskRuntime(context.Background(), db, nil, TaskRuntimeConfig{}); !nerr.HasCode(err, nerr.InvalidArgument) {
+		t.Fatalf("nil pool err=%v", err)
 	}
 	s := db.Session()
 	execOK(t, s, `CREATE TABLE sink (id STRING PRIMARY KEY)`)
@@ -166,7 +337,12 @@ func TestTaskRuntimeBoundsAndFollowerDoNotDispatch(t *testing.T) {
 	execOK(t, s, `CREATE SCHEDULE follower EVERY '1h' RUN WORKFLOW record('follower')`)
 	schedule := makeScheduleDue(t, db, "follower")
 	db.SetGate(denyWriteGate{})
-	runtime, err := StartTaskRuntime(context.Background(), db, TaskRuntimeConfig{Workers: 1, Batch: 1, PollInterval: 10 * time.Millisecond, PurgeEvery: time.Hour})
+	pool, err := NewTaskPool(context.Background(), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	runtime, err := StartTaskRuntime(context.Background(), db, pool, TaskRuntimeConfig{Batch: 1, PollInterval: 10 * time.Millisecond, PurgeEvery: time.Hour})
 	if err != nil {
 		t.Fatal(err)
 	}

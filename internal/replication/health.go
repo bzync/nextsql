@@ -46,6 +46,11 @@ type ReplicaHealth struct {
 	// now: leader, or a follower that sees a leader and was contacted within
 	// HealthyContactWindow.
 	Healthy bool
+	// ReplicationSuspect reports whether this node has an unreconciled
+	// replication orphan (see Cluster.ReportReplicationOrphan) and is
+	// therefore refusing STRONG reads until an operator runs CLUSTER
+	// RECONCILE CONFIRM.
+	ReplicationSuspect bool
 }
 
 // ReplicaHealth returns this node's current replication health snapshot.
@@ -55,6 +60,7 @@ func (c *Cluster) ReplicaHealth() ReplicaHealth {
 		return h
 	}
 	h.NodeID = c.cfg.NodeID
+	h.ReplicationSuspect = c.replSuspect.Load()
 	state := c.raft.State()
 	h.Role = raftRoleName(state)
 	_, id := c.raft.LeaderWithID()

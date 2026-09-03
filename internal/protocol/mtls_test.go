@@ -43,3 +43,27 @@ func TestMatchServiceIdentity(t *testing.T) {
 		t.Fatal("unverified certificate accepted")
 	}
 }
+
+func TestTokenIdentitySourceIsDerivedFromVerifiedKey(t *testing.T) {
+	hints := map[uint32]string{7: "oidc", 8: "attacker-value"}
+	for _, tc := range []struct {
+		name     string
+		base     string
+		keyID    uint32
+		verified bool
+		want     string
+	}{
+		{name: "native token", base: "native", keyID: 6, verified: true, want: "token"},
+		{name: "mtls token", base: "mtls+native", keyID: 6, verified: true, want: "mtls+token"},
+		{name: "oidc", base: "native", keyID: 7, verified: true, want: "oidc"},
+		{name: "mtls oidc", base: "mtls+native", keyID: 7, verified: true, want: "mtls+oidc"},
+		{name: "unverified cannot self label", base: "native", keyID: 7, verified: false, want: "token"},
+		{name: "unknown configured value fails generic", base: "native", keyID: 8, verified: true, want: "token"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tokenIdentitySource(tc.base, tc.keyID, tc.verified, hints); got != tc.want {
+				t.Fatalf("source=%q want %q", got, tc.want)
+			}
+		})
+	}
+}

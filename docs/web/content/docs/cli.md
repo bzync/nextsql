@@ -21,7 +21,12 @@ nextsql hosting set-database-cap --data-dir DIR --key-file FILE
                  [--instance-key-file FILE] --realm NAME --database NAME
                  [--realm-secret-file FILE] --cap-bytes N --confirm
 nextsql hosting show --data-dir DIR --key-file FILE [--instance-key-file FILE]
-nextsql exec     [--addr HOST:PORT] [--user NAME] [--password-file FILE]
+nextsql login    --idp NAME [--addr HOST:PORT] [--idp-config FILE]
+                 [--database NAME] [--realm NAME] [--no-browser]
+                 [--client-credentials [--client-secret-file FILE]]
+nextsql logout   (--idp NAME --addr HOST:PORT | --all)
+nextsql whoami   --idp NAME [--addr HOST:PORT] [--idp-config FILE] [--json]
+nextsql exec     [--addr HOST:PORT] [--user NAME] [--password-file FILE | --idp NAME]
                  [--database NAME] [--tls-ca FILE | --insecure]
                  [--env-file PATH | --no-env]
                  [-c SQL | SQL]
@@ -30,13 +35,15 @@ nextsql migrate  status|pending|version|validate|create|up|down|force|repair
                  [--password-file FILE] [--tls-ca FILE | --insecure]
                  [--env-file PATH | --no-env]
 nextsql backup   --data-dir DIR --key-file FILE --out DIR
+nextsql backup list  --base-dir DIR
+nextsql backup prune --base-dir DIR (--keep-count N | --keep-days N) [--confirm]
 nextsql restore  --from DIR --data-dir DIR --key-file FILE
                  [--wal-archive DIR] [--until-lsn N | --until RFC3339]
 nextsql verify   --from DIR --key-file FILE
 nextsql export   --data-dir DIR --key-file FILE --out DIR
 nextsql import   --from DIR --data-dir DIR --key-file FILE
 nextsql diagnose --data-dir DIR
-nextsql status   [--addr HOST:PORT] [--user NAME] [--password-file FILE]
+nextsql status   [--addr HOST:PORT] [--user NAME] [--password-file FILE | --idp NAME]
                  [--database NAME] [--tls-ca FILE | --insecure]
                  [--env-file PATH | --no-env]
 nextsql status --local [--data-dir DIR] [--key-file FILE]
@@ -53,6 +60,45 @@ manage the Ed25519 signing keyset, `mint` issues a credential
 `--role`), `revoke` edits the revocation file (`--token-id` or `--principal`
 `--before`), and `verify` inspects a credential. Servers enable verification
 with `token_verify_keyset` / `token_revocations` / `token_audience`.
+
+Interactive external identity uses a named profile in
+`~/.config/nextsql/config.toml`:
+
+```toml
+[idp.corp]
+issuer = "https://corp.okta.com/oauth2/abc"
+client_id = "0oa..."
+client_secret_file = "/run/secrets/nextsql-oidc-client" # confidential workloads only
+broker_url = "https://auth.db.internal"
+scopes = ["openid", "profile", "email", "groups"]
+```
+
+```bash
+nextsql login --idp corp --addr db.internal:7210 --database production
+nextsql whoami --idp corp --addr db.internal:7210
+nextsql exec --idp corp --addr db.internal:7210 --database production \
+  --tls-ca /etc/nextsql/ca.pem -c 'SELECT 1'
+nextsql logout --idp corp --addr db.internal:7210
+```
+
+Login uses Authorization Code + PKCE S256 and a transient loopback callback;
+`--no-browser` prints the URL. The broker-minted credential and optional refresh
+token are atomically stored in a mode-`0600` file under a mode-`0700` user
+credentials directory. Expired credentials refresh silently when possible.
+Redirect replay, oversized HTTP/file responses, symlink credential paths, and
+group/other-readable credential files fail closed. `logout` removes only the
+local secret; use `nextsql token revoke` for server-side revocation. The file
+backend does not protect against a process already running as the same OS
+account; OS-keychain integration remains a follow-on.
+
+Confidential workloads whose IdP issues JWT access tokens can use
+`nextsql login --client-credentials --client-secret-file FILE`. The secret file
+must be regular, bounded, and mode `0600`; the secret is sent only to the
+discovered HTTPS IdP token endpoint and is never stored with the broker-minted
+credential. The broker profile must configure `access_token_audience`, and the
+JWT must carry that resource audience plus an exact `client_id` or `azp`
+binding. Expired workload credentials renew non-interactively from the same
+secret file. Opaque-token introspection is not implemented.
 
 `--out` for backup and export must not already exist. The tool writes a temporary directory, verifies, then publishes atomically.
 
@@ -147,7 +193,7 @@ Address is `host:port` only. Values containing `://`, `key=`, or `password=` are
 
 Every server-mode connect must set TLS (`--tls-ca` / `NEXTSQL_TLS_CA`) or `--insecure` / `NEXTSQL_INSECURE=true`, including `127.0.0.1`. `--insecure` is rejected unless the address is loopback.
 
-## Client configuration (`exec` / `migrate` / server-mode `status`)
+## Client configuration (`exec` / `migrate` / server-mode `status` / OIDC)
 
 Priority, highest wins: explicit flags (including empty strings) > non-empty process environment > `.env.local` (cwd only) > `.env` (walk from the working directory toward `/`, at most 16 levels) > defaults.
 
@@ -159,6 +205,8 @@ Priority, highest wins: explicit flags (including empty strings) > non-empty pro
 | `NEXTSQL_DATABASE_USER` | Database/client auth user | none (required) |
 | `NEXTSQL_DATABASE_PASSWORD_FILE` | Database/client password file (newline stripped) | none |
 | `NEXTSQL_DATABASE_PASS` | Inline database/client password (CI convenience) | none |
+| `NEXTSQL_IDP` | Named `[idp.NAME]` profile for a stored broker credential | none |
+| `NEXTSQL_IDP_CONFIG` | OIDC client profile file | user config dir `nextsql/config.toml` |
 | `NEXTSQL_DATABASE` | Hello database; validated against the registered default when present | empty (select default) |
 | `NEXTSQL_TLS_CA` | PEM CA / server cert | none |
 | `NEXTSQL_TLS_SERVER_NAME` | TLS certificate/SNI server name | host from `NEXTSQL_ADDR` |

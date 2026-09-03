@@ -22,7 +22,7 @@ import (
 // lastClientCAPEM is the PEM from the most recent startTLSServer call.
 var lastClientCAPEM []byte
 
-func startTLSServer(t *testing.T) (addr string, clientTLS *tls.Config) {
+func startTLSServer(t *testing.T, configure ...func(*protocol.Server)) (addr string, clientTLS *tls.Config) {
 	t.Helper()
 	dir := t.TempDir()
 	keyPath := filepath.Join(dir, "master.key")
@@ -68,12 +68,20 @@ func startTLSServer(t *testing.T) (addr string, clientTLS *tls.Config) {
 
 	srv := protocol.NewServer(db, users)
 	srv.TLS = srvTLS
+	for _, fn := range configure {
+		fn(srv)
+	}
 	ctx, cancel := context.WithCancel(context.Background())
-	tasks, err := executor.StartTaskRuntime(ctx, db, executor.TaskRuntimeConfig{Workers: 1, Batch: 4, PollInterval: 10 * time.Millisecond, PurgeEvery: time.Hour})
+	pool, err := executor.NewTaskPool(ctx, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tasks, err := executor.StartTaskRuntime(ctx, db, pool, executor.TaskRuntimeConfig{Batch: 4, PollInterval: 10 * time.Millisecond, PurgeEvery: time.Hour})
 	if err != nil {
 		t.Fatal(err)
 	}
 	srv.SetTaskRuntime(tasks)
+	t.Cleanup(func() { _ = pool.Close() })
 	t.Cleanup(cancel)
 	t.Cleanup(func() { _ = srv.Close() })
 	serveErr := make(chan error, 1)
@@ -444,6 +452,44 @@ func TestDriverScheduledTaskOverTLS(t *testing.T) {
 	}
 }
 
+func TestDriverCronScheduleOverTLS(t *testing.T) {
+	addr, tlsCfg := startTLSServer(t)
+	conn := openApp(t, addr, tlsCfg)
+	ctx := context.Background()
+	for _, sql := range []string{
+		`CREATE TABLE cron_jobs (id STRING PRIMARY KEY)`,
+		`CREATE WORKFLOW put_cron(id STRING) AS BEGIN INSERT INTO cron_jobs (id) VALUES ($id); END`,
+	} {
+		if _, err := conn.Exec(ctx, sql); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A five-field cron expression round-trips through parse, bind, and the
+	// versioned catalog descriptor over the real wire protocol.
+	if _, err := conn.Exec(ctx, `CREATE SCHEDULE cron_nightly CRON '30 3 * * 1-5' RUN WORKFLOW put_cron('nightly')`); err != nil {
+		t.Fatalf("valid cron schedule rejected: %v", err)
+	}
+	// Idempotency check proves it is durably stored.
+	if _, err := conn.Exec(ctx, `CREATE SCHEDULE cron_nightly CRON '30 3 * * 1-5' RUN WORKFLOW put_cron('nightly')`); !nerr.HasCode(err, nerr.AlreadyExists) {
+		t.Fatalf("re-create should conflict, got %v", err)
+	}
+	// An unsatisfiable expression fails closed at definition time.
+	if _, err := conn.Exec(ctx, `CREATE SCHEDULE cron_bad CRON '0 0 30 2 *' RUN WORKFLOW put_cron('bad')`); err == nil {
+		t.Fatal("unsatisfiable cron expression was accepted")
+	}
+	// A malformed expression is rejected too.
+	if _, err := conn.Exec(ctx, `CREATE SCHEDULE cron_bad CRON 'every tuesday' RUN WORKFLOW put_cron('bad')`); err == nil {
+		t.Fatal("malformed cron expression was accepted")
+	}
+	// Lifecycle works: DROP without IF EXISTS confirms the schedule existed.
+	if _, err := conn.Exec(ctx, `ALTER SCHEDULE cron_nightly RENAME TO cron_weekday`); err != nil {
+		t.Fatalf("alter cron schedule: %v", err)
+	}
+	if _, err := conn.Exec(ctx, `DROP SCHEDULE cron_weekday`); err != nil {
+		t.Fatalf("drop cron schedule: %v", err)
+	}
+}
+
 func TestDriverTriggerOverTLS(t *testing.T) {
 	addr, tlsCfg := startTLSServer(t)
 	conn := openApp(t, addr, tlsCfg)
@@ -551,6 +597,485 @@ func TestAuthFailure(t *testing.T) {
 	})
 	if !nerr.HasCode(err, nerr.Unauthorized) {
 		t.Fatalf("got %v", err)
+	}
+}
+
+// TestRealmMismatchRejected proves the M2-2 Hello.Realm field is actually
+// enforced: a client selecting a realm other than the server's configured
+// one is rejected, not silently connected to whatever the server has open.
+// It uses a real, correct password to prove the rejection is the same
+// generic Unauthorized "authentication failed" a wrong password would
+// produce, not a distinguishing NotFound — the pre-auth realm-disclosure
+// hardening: an unauthenticated peer must not be able to tell "wrong realm"
+// apart from "wrong password" by response content.
+func TestRealmMismatchRejected(t *testing.T) {
+	addr, tlsCfg := startTLSServer(t, func(srv *protocol.Server) {
+		srv.Realm = "tenant-a"
+	})
+	_, err := nextsql.Open(nextsql.Config{
+		Address:  addr,
+		Database: "production",
+		User:     "app",
+		Password: "s3cret",
+		Realm:    "tenant-b",
+		TLS:      tlsCfg,
+	})
+	if !nerr.HasCode(err, nerr.Unauthorized) {
+		t.Fatalf("got %v", err)
+	}
+}
+
+// TestRealmMatchSucceeds proves a matching realm selection connects.
+func TestRealmMatchSucceeds(t *testing.T) {
+	addr, tlsCfg := startTLSServer(t, func(srv *protocol.Server) {
+		srv.Realm = "tenant-a"
+	})
+	conn, err := nextsql.Open(nextsql.Config{
+		Address:  addr,
+		Database: "production",
+		User:     "app",
+		Password: "s3cret",
+		Realm:    "tenant-a",
+		TLS:      tlsCfg,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.Close()
+}
+
+// TestUnconfiguredClientSkipsRealmCheck is the regression test for the
+// M2-2 compatibility guarantee: a client that never selects a realm
+// connects successfully even against a server that hosts a named realm —
+// the same way an old, pre-realm client would.
+func TestUnconfiguredClientSkipsRealmCheck(t *testing.T) {
+	addr, tlsCfg := startTLSServer(t, func(srv *protocol.Server) {
+		srv.Realm = "tenant-a"
+	})
+	conn, err := nextsql.Open(nextsql.Config{
+		Address:  addr,
+		Database: "production",
+		User:     "app",
+		Password: "s3cret",
+		TLS:      tlsCfg,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.Close()
+}
+
+// TestDatabaseNameMismatchRejectedGenerically proves the legacy
+// single-pinned-database flat precheck (the non-hosted, no-DatabaseManager
+// case) no longer discloses a database-name mismatch pre-auth: it uses a
+// real, correct password so the rejection can only be attributed to the
+// wrong database name, and asserts it comes back as the same generic
+// Unauthorized "authentication failed" a wrong password would produce, not
+// a distinguishing NotFound — the pre-auth database-disclosure hardening,
+// the same discipline TestRealmMismatchRejected/TestUnknownRealmStillRejectedCleanly
+// apply to realm names.
+func TestDatabaseNameMismatchRejectedGenerically(t *testing.T) {
+	addr, tlsCfg := startTLSServer(t, func(srv *protocol.Server) {
+		srv.Database = "prod-a"
+	})
+	_, err := nextsql.Open(nextsql.Config{
+		Address:  addr,
+		Database: "prod-b",
+		User:     "app",
+		Password: "s3cret",
+		TLS:      tlsCfg,
+	})
+	if !nerr.HasCode(err, nerr.Unauthorized) {
+		t.Fatalf("got %v", err)
+	}
+}
+
+func TestPerUserConnectionLimit(t *testing.T) {
+	addr, tlsCfg := startTLSServer(t, func(srv *protocol.Server) {
+		lim := srv.Limits
+		lim.MaxSessionsPerUser = 2
+		srv.Limits = lim
+	})
+	open := func() (*nextsql.Conn, error) {
+		return nextsql.Open(nextsql.Config{
+			Address:  addr,
+			Database: "production",
+			User:     "app",
+			Password: "s3cret",
+			TLS:      tlsCfg,
+		})
+	}
+	c1, err := open()
+	if err != nil {
+		t.Fatalf("first connection: %v", err)
+	}
+	defer c1.Close()
+	c2, err := open()
+	if err != nil {
+		t.Fatalf("second connection: %v", err)
+	}
+	defer c2.Close()
+	if _, err := open(); !nerr.HasCode(err, nerr.Exhausted) {
+		t.Fatalf("third connection: got %v, want Exhausted", err)
+	}
+	if err := c1.Close(); err != nil {
+		t.Fatalf("close first: %v", err)
+	}
+	// The server observes the closed connection asynchronously (its read loop
+	// must unblock on the terminate frame/EOF before the per-user count is
+	// decremented), so poll rather than assume same-instant visibility.
+	deadline := time.Now().Add(2 * time.Second)
+	var c3 *nextsql.Conn
+	for {
+		c3, err = open()
+		if err == nil {
+			break
+		}
+		if !nerr.HasCode(err, nerr.Exhausted) || time.Now().After(deadline) {
+			t.Fatalf("connection after close: %v", err)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	defer c3.Close()
+}
+
+// TestPerDatabaseConnectionLimit (P27's own last open exit-gate item)
+// mirrors TestPerUserConnectionLimit exactly, proving MaxSessionsPerDatabase
+// works the same way on a legacy single-database (no dbmanager) deployment,
+// where it collapses to a finer-grained MaxSessions.
+func TestPerDatabaseConnectionLimit(t *testing.T) {
+	addr, tlsCfg := startTLSServer(t, func(srv *protocol.Server) {
+		lim := srv.Limits
+		lim.MaxSessionsPerDatabase = 2
+		srv.Limits = lim
+	})
+	open := func() (*nextsql.Conn, error) {
+		return nextsql.Open(nextsql.Config{
+			Address:  addr,
+			Database: "production",
+			User:     "app",
+			Password: "s3cret",
+			TLS:      tlsCfg,
+		})
+	}
+	c1, err := open()
+	if err != nil {
+		t.Fatalf("first connection: %v", err)
+	}
+	defer c1.Close()
+	c2, err := open()
+	if err != nil {
+		t.Fatalf("second connection: %v", err)
+	}
+	defer c2.Close()
+	if _, err := open(); !nerr.HasCode(err, nerr.Exhausted) {
+		t.Fatalf("third connection: got %v, want Exhausted", err)
+	}
+	if err := c1.Close(); err != nil {
+		t.Fatalf("close first: %v", err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	var c3 *nextsql.Conn
+	for {
+		c3, err = open()
+		if err == nil {
+			break
+		}
+		if !nerr.HasCode(err, nerr.Exhausted) || time.Now().After(deadline) {
+			t.Fatalf("connection after close: %v", err)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	defer c3.Close()
+}
+
+func TestTxnTimeoutAbortsOverLiveConnection(t *testing.T) {
+	addr, tlsCfg := startTLSServer(t, func(srv *protocol.Server) {
+		lim := srv.Limits
+		lim.TxnTimeout = 50 * time.Millisecond
+		srv.Limits = lim
+	})
+	conn := openApp(t, addr, tlsCfg)
+	ctx := context.Background()
+	if _, err := conn.Exec(ctx, `CREATE TABLE txn_timeout_t (id STRING PRIMARY KEY)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Exec(ctx, `BEGIN`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Exec(ctx, `INSERT INTO txn_timeout_t (id) VALUES ('1')`); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(80 * time.Millisecond)
+	if _, err := conn.Exec(ctx, `INSERT INTO txn_timeout_t (id) VALUES ('2')`); !nerr.HasCode(err, nerr.Exhausted) {
+		t.Fatalf("statement after transaction timeout = %v, want Exhausted", err)
+	}
+	// The connection itself must stay usable (a fresh autocommit statement
+	// works) — only the timed-out transaction was aborted, not the session.
+	if _, err := conn.Exec(ctx, `INSERT INTO txn_timeout_t (id) VALUES ('3')`); err != nil {
+		t.Fatalf("statement after forced abort: %v", err)
+	}
+}
+
+// TestIdleTransactionTimeoutClosesOpenTransactionConnection proves
+// idle_transaction_timeout_ms (protocol.Limits.IdleTxn) is a distinct bound
+// from the general idle_timeout_ms: it applies only while a transaction is
+// open, actively closing the connection via its own socket read deadline
+// even though the client never sends another statement — while an ordinary
+// idle connection with no open transaction survives well past IdleTxn,
+// governed only by the much longer general Idle bound.
+func TestIdleTransactionTimeoutClosesOpenTransactionConnection(t *testing.T) {
+	addr, tlsCfg := startTLSServer(t, func(s *protocol.Server) {
+		lim := s.Limits
+		lim.IdleTxn = 50 * time.Millisecond
+		lim.Idle = 5 * time.Second
+		s.Limits = lim
+	})
+	ctx := context.Background()
+
+	plain := openApp(t, addr, tlsCfg)
+	if _, err := plain.Exec(ctx, `CREATE TABLE idle_txn_plain_t (id STRING PRIMARY KEY)`); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(200 * time.Millisecond)
+	if _, err := plain.Exec(ctx, `SELECT id FROM idle_txn_plain_t`); err != nil {
+		t.Fatalf("idle connection with no open transaction was closed early: %v", err)
+	}
+
+	busy := openApp(t, addr, tlsCfg)
+	if _, err := busy.Exec(ctx, `CREATE TABLE idle_txn_close_t (id STRING PRIMARY KEY)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := busy.Exec(ctx, `BEGIN`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := busy.Exec(ctx, `INSERT INTO idle_txn_close_t (id) VALUES ('1')`); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(200 * time.Millisecond)
+	if _, err := busy.Exec(ctx, `SELECT id FROM idle_txn_close_t`); err == nil {
+		t.Fatal("expected the open-transaction connection to be closed once idle past IdleTxn")
+	}
+}
+
+// TestIdleTransactionTimeoutReleasesLocksOnDisconnect proves the idle-in-
+// transaction timeout actually reclaims the abandoned transaction's locks —
+// not just the socket. Without Session.Abort wired into the connection
+// teardown path, the torn-down connection's uncommitted INSERT would keep
+// holding its exclusive key lock forever, and the second connection's insert
+// of the same primary key below would block until lock_timeout_ms failed it
+// Exhausted instead of succeeding.
+func TestIdleTransactionTimeoutReleasesLocksOnDisconnect(t *testing.T) {
+	addr, tlsCfg := startTLSServer(t, func(s *protocol.Server) {
+		lim := s.Limits
+		lim.IdleTxn = 50 * time.Millisecond
+		s.Limits = lim
+		s.DatabaseHandle().SetLockWaitTimeout(1 * time.Second)
+	})
+	ctx := context.Background()
+
+	busy := openApp(t, addr, tlsCfg)
+	if _, err := busy.Exec(ctx, `CREATE TABLE idle_txn_lock_t (id STRING PRIMARY KEY)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := busy.Exec(ctx, `BEGIN`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := busy.Exec(ctx, `INSERT INTO idle_txn_lock_t (id) VALUES ('1')`); err != nil {
+		t.Fatal(err)
+	}
+
+	// Let the idle-in-transaction deadline fire and tear the connection down
+	// without ever sending COMMIT/ROLLBACK.
+	time.Sleep(250 * time.Millisecond)
+
+	other := openApp(t, addr, tlsCfg)
+	if _, err := other.Exec(ctx, `INSERT INTO idle_txn_lock_t (id) VALUES ('1')`); err != nil {
+		t.Fatalf("insert after idle-in-transaction disconnect should succeed once the abandoned transaction's lock is released: %v", err)
+	}
+}
+
+// TestClusterDrainOverLiveConnection wires DB.SetDrainFunc exactly as
+// cmd/nextsqld/main.go does (via Server.DatabaseHandle()), then proves
+// CLUSTER DRAIN issued over a live SQL connection actually drains the
+// server: idle connections close promptly and new connections are refused.
+func TestClusterDrainOverLiveConnection(t *testing.T) {
+	var srv *protocol.Server
+	addr, tlsCfg := startTLSServer(t, func(s *protocol.Server) {
+		srv = s
+		s.DrainTimeout = 2 * time.Second
+		db := s.DatabaseHandle()
+		db.SetDrainFunc(func(timeout time.Duration) {
+			if timeout <= 0 {
+				timeout = s.DrainTimeout
+			}
+			s.Drain(timeout)
+		})
+	})
+	idle := openApp(t, addr, tlsCfg)
+	admin := openApp(t, addr, tlsCfg)
+	ctx := context.Background()
+
+	if _, err := admin.Exec(ctx, `CLUSTER DRAIN WITH (TIMEOUT_MS = 500)`); err != nil {
+		t.Fatalf("CLUSTER DRAIN: %v", err)
+	}
+	_ = srv
+
+	deadline := time.Now().Add(1 * time.Second)
+	for {
+		if _, err := idle.Exec(ctx, `SELECT 1`); err != nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("idle connection was not closed by CLUSTER DRAIN")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	if _, err := nextsql.Open(nextsql.Config{
+		Address:  addr,
+		Database: "production",
+		User:     "app",
+		Password: "s3cret",
+		TLS:      tlsCfg,
+	}); err == nil {
+		t.Fatal("new connection succeeded after CLUSTER DRAIN began")
+	}
+}
+
+// TestClusterMaintenanceOverLiveConnection proves CLUSTER MAINTENANCE
+// ENABLE/DISABLE issued over a live SQL connection actually gates write
+// traffic server-side (not just inside a single in-process Session, unlike
+// the executor-package unit test), while leaving reads and the connection
+// itself untouched — the key behavioral difference from CLUSTER DRAIN.
+func TestClusterMaintenanceOverLiveConnection(t *testing.T) {
+	addr, tlsCfg := startTLSServer(t)
+	admin := openApp(t, addr, tlsCfg)
+	ctx := context.Background()
+
+	if _, err := admin.Exec(ctx, `CREATE TABLE maint_t (id STRING PRIMARY KEY)`); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := admin.Exec(ctx, `CLUSTER MAINTENANCE ENABLE`); err != nil {
+		t.Fatalf("CLUSTER MAINTENANCE ENABLE: %v", err)
+	}
+
+	if _, err := admin.Exec(ctx, `INSERT INTO maint_t (id) VALUES ('1')`); !nerr.HasCode(err, nerr.Unavailable) {
+		t.Fatalf("insert during maintenance mode = %v, want Unavailable", err)
+	}
+	if _, err := admin.Exec(ctx, `SELECT id FROM maint_t`); err != nil {
+		t.Fatalf("reads must keep working during maintenance mode: %v", err)
+	}
+
+	// A second, independent connection observes the same server-local state.
+	other := openApp(t, addr, tlsCfg)
+	if _, err := other.Exec(ctx, `INSERT INTO maint_t (id) VALUES ('2')`); !nerr.HasCode(err, nerr.Unavailable) {
+		t.Fatalf("insert from a different connection during maintenance mode = %v, want Unavailable", err)
+	}
+
+	if _, err := admin.Exec(ctx, `CLUSTER MAINTENANCE DISABLE`); err != nil {
+		t.Fatalf("CLUSTER MAINTENANCE DISABLE: %v", err)
+	}
+	if _, err := other.Exec(ctx, `INSERT INTO maint_t (id) VALUES ('2')`); err != nil {
+		t.Fatalf("insert after disabling maintenance mode must succeed: %v", err)
+	}
+}
+
+func TestClusterDrainRejectsUnattachedDrainFunc(t *testing.T) {
+	addr, tlsCfg := startTLSServer(t) // no SetDrainFunc wired
+	conn := openApp(t, addr, tlsCfg)
+	if _, err := conn.Exec(context.Background(), `CLUSTER DRAIN`); !nerr.HasCode(err, nerr.Unavailable) {
+		t.Fatalf("CLUSTER DRAIN with no drain function attached = %v, want Unavailable", err)
+	}
+}
+
+func TestDrainClosesIdleImmediatelyAndWaitsForOpenTransaction(t *testing.T) {
+	var srv *protocol.Server
+	addr, tlsCfg := startTLSServer(t, func(s *protocol.Server) { srv = s })
+	idle := openApp(t, addr, tlsCfg)
+	busy := openApp(t, addr, tlsCfg)
+	ctx := context.Background()
+	if _, err := busy.Exec(ctx, `CREATE TABLE drain_t (id STRING PRIMARY KEY)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := busy.Exec(ctx, `BEGIN`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := busy.Exec(ctx, `INSERT INTO drain_t (id) VALUES ('1')`); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		srv.Drain(2 * time.Second)
+		close(done)
+	}()
+
+	// The idle connection has no in-flight statement and no open transaction,
+	// so Drain must close it promptly rather than waiting for the deadline.
+	deadline := time.Now().Add(1 * time.Second)
+	for {
+		if _, err := idle.Exec(ctx, `SELECT 1`); err != nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("idle connection was not closed by Drain")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// The busy connection has an open transaction: Drain must leave it usable
+	// rather than force-closing it while other work is still to be done.
+	if _, err := busy.Exec(ctx, `SELECT id FROM drain_t WHERE id = '1'`); err != nil {
+		t.Fatalf("open transaction was closed early: %v", err)
+	}
+
+	select {
+	case <-done:
+		t.Fatal("Drain returned before the open transaction finished")
+	default:
+	}
+
+	if _, err := busy.Exec(ctx, `COMMIT`); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case <-done:
+	case <-time.After(1 * time.Second):
+		t.Fatal("Drain did not return promptly after the transaction committed")
+	}
+}
+
+func TestDrainForceClosesAtDeadline(t *testing.T) {
+	var srv *protocol.Server
+	addr, tlsCfg := startTLSServer(t, func(s *protocol.Server) { srv = s })
+	busy := openApp(t, addr, tlsCfg)
+	ctx := context.Background()
+	if _, err := busy.Exec(ctx, `CREATE TABLE drain_deadline_t (id STRING PRIMARY KEY)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := busy.Exec(ctx, `BEGIN`); err != nil {
+		t.Fatal(err)
+	}
+
+	start := time.Now()
+	done := make(chan struct{})
+	go func() {
+		srv.Drain(150 * time.Millisecond)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Drain never returned")
+	}
+	if elapsed := time.Since(start); elapsed > 1*time.Second {
+		t.Fatalf("Drain took too long to force-close: %v", elapsed)
+	}
+	if _, err := busy.Exec(ctx, `SELECT 1`); err == nil {
+		t.Fatal("expected the still-open transaction's connection to be force-closed at the deadline")
 	}
 }
 

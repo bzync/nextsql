@@ -18,7 +18,101 @@ import {
   isReadOnlySQL,
   txnControl,
   validateConfig,
+  FieldType,
+  MemoryFieldKeyring,
+  FileFieldKeyring,
+  decryptField,
+  encryptField,
 } from './mod.js';
+
+function fieldKey(id, fill) {
+  return { id, material: new Uint8Array(32).fill(fill) };
+}
+
+function stable(value) {
+  if (typeof value === 'bigint') return value.toString();
+  if (Array.isArray(value)) return value.map(stable);
+  if (value && typeof value === 'object' && !(value instanceof Date)) {
+    return Object.fromEntries(Object.keys(value).sort().map((key) => [key, stable(value[key])]));
+  }
+  return value;
+}
+
+Deno.test('NSCE1 field encryption round-trip, rotation, and revocation', async () => {
+  const v1 = fieldKey('v1', 1);
+  const ring = new MemoryFieldKeyring(v1);
+  const values = [
+    [FieldType.UUID, '00112233-4455-6677-8899-aabbccddeeff'],
+    [FieldType.String, 'secret'],
+    [FieldType.Decimal(8, 2), '-12.50'],
+    [FieldType.TimestampTZ, 1234567890123456789n],
+    [FieldType.JSON, { z: [true, null], a: 7 }],
+    [FieldType.Bool, true],
+    [FieldType.Blob, new Uint8Array([0x00, 0xff, 0xde, 0xad, 0xbe, 0xef])],
+    [FieldType.Int8, -128],
+    [FieldType.Int8, 127],
+    [FieldType.Int16, -32768],
+    [FieldType.Int32, -2147483648],
+    [FieldType.Int64, -9223372036854775808n],
+    [FieldType.Int64, 9223372036854775807n],
+    [FieldType.Uint8, 255],
+    [FieldType.Uint16, 65535],
+    [FieldType.Uint32, 4294967295],
+    [FieldType.Uint64, 18446744073709551615n],
+  ];
+  for (const [type, value] of values) {
+    const sealed = await encryptField(ring, 'app', 'accounts', 'secret', type, value);
+    assert(sealed.startsWith('NSCE1.'));
+    const plain = await decryptField(ring, 'app', 'accounts', 'secret', type, sealed);
+    assert(JSON.stringify(stable(plain)) === JSON.stringify(stable(value)));
+  }
+  const old = await encryptField(ring, 'app', 'accounts', 'secret', FieldType.Text, 'old');
+  const again = await encryptField(ring, 'app', 'accounts', 'secret', FieldType.Text, 'old');
+  assert(old !== again);
+  ring.rotate(fieldKey('v2', 2));
+  assert(await decryptField(ring, 'app', 'accounts', 'secret', FieldType.Text, old) === 'old');
+  ring.revoke('v1');
+  await assertRejects(() => decryptField(ring, 'app', 'accounts', 'secret', FieldType.Text, old));
+  await assertRejects(() => decryptField(new MemoryFieldKeyring(v1), 'app', 'accounts', 'other', FieldType.Text, old));
+  await assertRejects(() => encryptField(ring, 'app', 'accounts', 'secret', FieldType.Text, 'x'.repeat(1 << 20)));
+  const goCiphertext = 'NSCE1.AQECdjEDAAAAAABEeyxf_quGP5And9z0FmNijEp3uSiDspby_y1zIxe9L1R-llGtWQxh';
+  assert(await decryptField(new MemoryFieldKeyring(v1), 'app', 'accounts', 'secret', FieldType.Text, goCiphertext) === 'portable');
+});
+
+Deno.test('FileFieldKeyring persists rotation and revocation across reopen', async () => {
+  const dir = await Deno.makeTempDir({ prefix: 'nextsql-fk-' });
+  const path = `${dir}/keyring.nsfk`;
+  const kr = await FileFieldKeyring.create(path, fieldKey('v1', 1));
+  const old = await encryptField(kr, 'app', 'accounts', 'secret', FieldType.Text, 'old');
+
+  await assertRejects(() => FileFieldKeyring.create(path, fieldKey('v2', 2)));
+
+  await kr.rotate(fieldKey('v2', 2));
+  const reopenedAfterRotate = await FileFieldKeyring.open(path);
+  assert(await decryptField(reopenedAfterRotate, 'app', 'accounts', 'secret', FieldType.Text, old) === 'old');
+  const fresh = await encryptField(reopenedAfterRotate, 'app', 'accounts', 'secret', FieldType.Text, 'new');
+
+  await kr.revoke('v1');
+  const reopenedAfterRevoke = await FileFieldKeyring.open(path);
+  await assertRejects(() => decryptField(reopenedAfterRevoke, 'app', 'accounts', 'secret', FieldType.Text, old));
+  assert(await decryptField(reopenedAfterRevoke, 'app', 'accounts', 'secret', FieldType.Text, fresh) === 'new');
+
+  const list = reopenedAfterRevoke.list();
+  const v1Info = list.find((r) => r.id === 'v1');
+  const v2Info = list.find((r) => r.id === 'v2');
+  assert(v1Info.current === false && v1Info.revoked === true);
+  assert(v2Info.current === true && v2Info.revoked === false);
+
+  await assertRejects(() => kr.revoke('v2'));
+  await assertRejects(() => kr.rotate(fieldKey('v1', 9)));
+
+  const raw = await Deno.readFile(path);
+  await Deno.writeTextFile(path, 'not a keyring');
+  await assertRejects(() => kr.reload());
+  const stillCurrent = await kr.currentFieldKey('app', 'accounts', 'secret');
+  assert(stillCurrent.id === 'v2');
+  await Deno.writeFile(path, raw);
+});
 
 function assert(cond, msg) {
   if (!cond) {
@@ -98,12 +192,95 @@ Deno.test('hello encode / decode', () => {
   assert(got.secret === 99n);
 });
 
+Deno.test('hello realm is an opt-in trailing field (M2-2)', () => {
+  const noRealm = encodeHello({ version: 1, database: 'prod', user: 'app' });
+  const emptyRealm = encodeHello({ version: 1, database: 'prod', user: 'app', realm: '' });
+  assert(noRealm.length === emptyRealm.length);
+  assert(noRealm.every((b, i) => b === emptyRealm[i]));
+  const withRealm = encodeHello({ version: 1, database: 'prod', user: 'app', realm: 'tenant-a' });
+  assert(withRealm.length === noRealm.length + 2 + 'tenant-a'.length);
+  assert(noRealm.every((b, i) => b === withRealm[i]));
+});
+
 Deno.test('round-trip string and bool params', () => {
   const d = decodeValue(encodeParam('hello'), 0);
   assert(d.value === 'hello');
   assert(d.kind === Kind.String);
   assert(decodeValue(encodeParam(true), 0).value === true);
   assert(decodeValue(encodeParam(null), 0).value === null);
+});
+
+Deno.test('blob param round-trip (D1)', () => {
+  const raw = new Uint8Array([0x00, 0xff, 0xfe, 0x00, 0xde, 0xad, 0xbe, 0xef]);
+  const dec = decodeValue(encodeParam(raw), 0);
+  assert(dec.kind === Kind.Blob);
+  assert(dec.value.length === raw.length && dec.value.every((b, i) => b === raw[i]));
+
+  // A 16-byte Uint8Array keeps its pre-existing UUID meaning; the explicit
+  // wrapper forces BLOB for that length.
+  const raw16 = new Uint8Array(16).fill(7);
+  assert(decodeValue(encodeParam(raw16), 0).kind === Kind.UUID);
+  const wrapped = decodeValue(encodeParam({ kind: 'blob', value: raw16 }), 0);
+  assert(wrapped.kind === Kind.Blob);
+  assert(wrapped.value.length === 16 && wrapped.value.every((b) => b === 7));
+
+  const empty = decodeValue(encodeParam(new Uint8Array(0)), 0);
+  assert(empty.kind === Kind.Blob);
+  assert(empty.value.length === 0);
+});
+
+Deno.test('fixed-width int param round-trip (D2)', () => {
+  const cases = [
+    ['int8', -128, Kind.Int8],
+    ['int8', 127, Kind.Int8],
+    ['int16', -32768, Kind.Int16],
+    ['int16', 32767, Kind.Int16],
+    ['int32', -2147483648, Kind.Int32],
+    ['int32', 2147483647, Kind.Int32],
+    ['int64', -9223372036854775808n, Kind.Int64],
+    ['int64', 9223372036854775807n, Kind.Int64],
+  ];
+  for (const [which, value, kind] of cases) {
+    const dec = decodeValue(encodeParam({ kind: which, value }), 0);
+    assert(dec.kind === kind);
+    assert(dec.value.toString() === value.toString());
+  }
+  let threw = false;
+  try {
+    encodeParam({ kind: 'int8', value: 128 });
+  } catch {
+    threw = true;
+  }
+  assert(threw);
+  assert(decodeValue(encodeParam(42), 0).kind === Kind.Decimal);
+  assert(typeof decodeValue(encodeParam({ kind: 'int64', value: 5n }), 0).value === 'bigint');
+});
+
+Deno.test('fixed-width uint param round-trip (D3)', () => {
+  const cases = [
+    ['uint8', 0, Kind.Uint8],
+    ['uint8', 255, Kind.Uint8],
+    ['uint16', 0, Kind.Uint16],
+    ['uint16', 65535, Kind.Uint16],
+    ['uint32', 0, Kind.Uint32],
+    ['uint32', 4294967295, Kind.Uint32],
+    ['uint64', 0n, Kind.Uint64],
+    ['uint64', 18446744073709551615n, Kind.Uint64],
+  ];
+  for (const [which, value, kind] of cases) {
+    const dec = decodeValue(encodeParam({ kind: which, value }), 0);
+    assert(dec.kind === kind);
+    assert(dec.value.toString() === value.toString());
+  }
+  let threw = false;
+  try {
+    encodeParam({ kind: 'uint8', value: 256 });
+  } catch {
+    threw = true;
+  }
+  assert(threw);
+  assert(decodeValue(encodeParam(42), 0).kind === Kind.Decimal);
+  assert(typeof decodeValue(encodeParam({ kind: 'uint64', value: 5n }), 0).value === 'bigint');
 });
 
 Deno.test('decimal encode / decode', () => {

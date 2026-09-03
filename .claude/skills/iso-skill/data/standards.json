@@ -1,0 +1,36 @@
+{
+  "snapshot_date": "2026-09-01",
+  "warning": "Verify ISO status/edition from ISO or licensed standard before formal use. This file does not reproduce standard requirements.",
+  "standards": [
+    {
+      "id": "ISO/IEC 27001:2022",
+      "topic": "Information security management systems",
+      "status": "published; Amendment 1:2024 exists",
+      "official": "https://www.iso.org/standard/27001"
+    },
+    {
+      "id": "ISO/IEC 27701:2025",
+      "topic": "Privacy information management systems",
+      "status": "published",
+      "official": "https://www.iso.org/standard/27701"
+    },
+    {
+      "id": "ISO 22301:2019",
+      "topic": "Business continuity management systems",
+      "status": "published; verify amendments before formal use",
+      "official": "https://www.iso.org/standard/75106.html"
+    },
+    {
+      "id": "ISO 9001:2015",
+      "topic": "Quality management systems",
+      "status": "ISO 9001:2015 remains published at snapshot; its 2026 successor is under publication",
+      "official": "https://www.iso.org/standard/62085.html"
+    },
+    {
+      "id": "ISO/IEC 42001:2023",
+      "topic": "Artificial intelligence management systems",
+      "status": "published",
+      "official": "https://www.iso.org/standard/81230.html"
+    }
+  ]
+}

@@ -17,7 +17,7 @@ func TestExactValues(t *testing.T) {
 		{2, 0x4000},
 		{0.5, 0x3800},
 		{-0.5, 0xb800},
-		{65504, 0x7bff},  // largest finite binary16
+		{65504, 0x7bff}, // largest finite binary16
 		{-65504, 0xfbff},
 		{math.Float32frombits(0x33800000), 0x0001}, // smallest positive subnormal 2^-24
 		{6.1035156e-05, 0x0400},                    // smallest positive normal 2^-14

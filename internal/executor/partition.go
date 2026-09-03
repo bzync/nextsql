@@ -53,6 +53,8 @@ func (db *DB) partitionHeap(table string, pid uint32) (*btree.Tree, error) {
 	if tr == nil {
 		return nil, nerr.New(nerr.NotFound, "executor.partitionHeap", "partition heap not open")
 	}
+	// Tag with the base table name (system.locks has no partition column).
+	tr.SetName(table)
 	return tr, nil
 }
 
@@ -88,6 +90,7 @@ func (db *DB) partitionVec(table string, pid uint32) (*btree.Tree, error) {
 	if tr == nil {
 		return nil, nerr.New(nerr.NotFound, "executor.partitionVec", "partition vector not open")
 	}
+	tr.SetName(table)
 	return tr, nil
 }
 func (s *Session) partitionIndex(tab *catalog.Table, pid uint32, idx catalog.Index) (*btree.Tree, error) {
@@ -107,6 +110,8 @@ func (db *DB) partitionIndex(table string, pid uint32, index string) (*btree.Tre
 	if tr == nil {
 		return nil, nerr.New(nerr.NotFound, "executor.partitionIndex", "partition index not open")
 	}
+	// Tag with the base table name (not the index name), matching db.index.
+	tr.SetName(table)
 	return tr, nil
 }
 

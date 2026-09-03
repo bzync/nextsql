@@ -73,6 +73,10 @@ and revocation list. Issue and manage credentials with `nextsql token`
 (`keygen`, `export-public`, `mint`, `revoke`, `rotate`, `retire`). See
 [security](/docs/security).
 
+For a dedicated OIDC broker signing key, optional
+`token_identity_source_hint=KEY_ID:oidc[,KEY_ID:oidc...]` labels only
+successfully verified credentials as `oidc` / `mtls+oidc` in the audit log.
+
 ## REQUIRE CLIENT KEY
 
 `nextsqld --require-client-key` does **not** load `--key-file`. After password auth the first client sends the 32-byte root over TLS (`TypeUnlock`). The host does not keep a long-lived key file.
@@ -93,7 +97,9 @@ Drivers:
 - Node / Bun / Deno: `key: <32-byte Buffer | Uint8Array>`.
 - PHP: `'key' => $clientRoot` (32-byte string).
 
-Field-level `ENCRYPTED CLIENT` columns are designed but **not implemented**.
+Field-level `ENCRYPTED CLIENT` columns are experimental: the randomized
+`NSCE1.` SQL/catalog/server path and Go, Node.js/TypeScript, Bun, Deno, and PHP
+helpers are implemented; PITR and HA/failover coverage remain open.
 mTLS service certificates, live rotation, X.509 CRL revocation, and signed
 short-lived credentials are implemented as described above; OCSP and external
 IdP integration are not.

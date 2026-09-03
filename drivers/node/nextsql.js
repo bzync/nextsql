@@ -72,6 +72,15 @@ const Kind = {
   Box: 11,
   Line: 12,
   Polygon: 13,
+  Blob: 14,
+  Int8: 15,
+  Int16: 16,
+  Int32: 17,
+  Int64: 18,
+  Uint8: 19,
+  Uint16: 20,
+  Uint32: 21,
+  Uint64: 22,
 };
 
 class NextSQLError extends Error {
@@ -81,6 +90,24 @@ class NextSQLError extends Error {
     this.code = code;
   }
 }
+
+const {
+  FieldType,
+  MemoryFieldKeyring,
+  FileFieldKeyring,
+  decryptField,
+  encryptField,
+  generateFieldKey,
+  inspectField,
+} = require('./client-encryption')({
+  NextSQLError,
+  Kind,
+  encodeDecimalString,
+  decodeDecimal,
+  decodeNSJB,
+  formatUUID,
+  parseUUID,
+});
 
 function splitHostPort(addr) {
   if (typeof addr !== 'string' || addr.length === 0) {
@@ -405,6 +432,60 @@ function encodeUUID(raw) {
   return Buffer.concat([Buffer.from([Kind.UUID, 0]), Buffer.alloc(5), raw]);
 }
 
+function encodeBlob(raw) {
+  return Buffer.concat([Buffer.from([Kind.Blob, 0]), Buffer.alloc(5), appendU32Bytes(raw, MAX_PACKET)]);
+}
+
+const INT_RANGES = {
+  int8: [-0x80n, 0x7fn, Kind.Int8, 1],
+  int16: [-0x8000n, 0x7fffn, Kind.Int16, 2],
+  int32: [-0x80000000n, 0x7fffffffn, Kind.Int32, 4],
+  int64: [-0x8000000000000000n, 0x7fffffffffffffffn, Kind.Int64, 8],
+};
+
+// encodeInt builds an explicit fixed-width int parameter (D2, Datatype
+// expansion track). A bare JS number/bigint still defaults to Kind.Decimal
+// (see encodeParam) and coerces server-side into any numeric column, so
+// this wrapper is only needed to pin an exact wire width.
+function encodeInt(which, value) {
+  const range = INT_RANGES[which];
+  if (!range) {
+    throw new NextSQLError('invalid_argument', 'unknown int kind: ' + which);
+  }
+  const [lo, hi, kind, width] = range;
+  const n = BigInt(value);
+  if (n < lo || n > hi) {
+    throw new NextSQLError('invalid_argument', which + ' out of range');
+  }
+  const full = Buffer.alloc(8);
+  full.writeBigInt64LE(n, 0);
+  return Buffer.concat([Buffer.from([kind, 0]), Buffer.alloc(5), full.subarray(0, width)]);
+}
+
+const UINT_RANGES = {
+  uint8: [0xffn, Kind.Uint8, 1],
+  uint16: [0xffffn, Kind.Uint16, 2],
+  uint32: [0xffffffffn, Kind.Uint32, 4],
+  uint64: [0xffffffffffffffffn, Kind.Uint64, 8],
+};
+
+// encodeUint builds an explicit fixed-width unsigned int parameter (D3,
+// Datatype expansion track). Mirrors encodeInt.
+function encodeUint(which, value) {
+  const range = UINT_RANGES[which];
+  if (!range) {
+    throw new NextSQLError('invalid_argument', 'unknown uint kind: ' + which);
+  }
+  const [hi, kind, width] = range;
+  const n = BigInt(value);
+  if (n < 0n || n > hi) {
+    throw new NextSQLError('invalid_argument', which + ' out of range');
+  }
+  const full = Buffer.alloc(8);
+  full.writeBigUInt64LE(n, 0);
+  return Buffer.concat([Buffer.from([kind, 0]), Buffer.alloc(5), full.subarray(0, width)]);
+}
+
 function encodeTimestamp(ns) {
   return Buffer.concat([Buffer.from([Kind.TimestampTZ, 0]), Buffer.alloc(5), putU64(ns)]);
 }
@@ -466,8 +547,11 @@ function encodeParam(v) {
   if (v instanceof Date) {
     return encodeTimestamp(BigInt(v.getTime()) * 1000000n);
   }
-  if (Buffer.isBuffer(v) && v.length === 16) {
-    return encodeUUID(v);
+  if (Buffer.isBuffer(v) || v instanceof Uint8Array) {
+    // A bare 16-byte buffer keeps its pre-existing meaning (UUID) for
+    // compatibility; any other length is a BLOB. A 16-byte BLOB needs the
+    // explicit { kind: 'blob', value } wrapper below to disambiguate.
+    return v.length === 16 ? encodeUUID(v) : encodeBlob(v);
   }
   if (Array.isArray(v) && v.length > 0 && v.every((x) => typeof x === 'number')) {
     return encodeVector(v);
@@ -484,6 +568,15 @@ function encodeParam(v) {
     }
     if (v.kind === 'decimal') {
       return Buffer.concat([Buffer.from([Kind.Decimal, 0]), Buffer.alloc(5), encodeDecimalString(v.value)]);
+    }
+    if (v.kind === 'blob') {
+      return encodeBlob(Buffer.isBuffer(v.value) ? v.value : Buffer.from(v.value));
+    }
+    if (v.kind === 'int8' || v.kind === 'int16' || v.kind === 'int32' || v.kind === 'int64') {
+      return encodeInt(v.kind, v.value);
+    }
+    if (v.kind === 'uint8' || v.kind === 'uint16' || v.kind === 'uint32' || v.kind === 'uint64') {
+      return encodeUint(v.kind, v.value);
     }
     // JSON object → UTF-8 text; the server coerces STRING to JSON.
     return encodeString(JSON.stringify(v));
@@ -515,6 +608,10 @@ function decodeValue(buf, off) {
       const got = readU32Bytes(buf, off, MAX_PACKET);
       return { value: got.value.toString('utf8'), next: got.next, kind };
     }
+    case Kind.Blob: {
+      const got = readU32Bytes(buf, off, MAX_PACKET);
+      return { value: Buffer.from(got.value), next: got.next, kind };
+    }
     case Kind.JSON: {
       const got = readU32Bytes(buf, off, MAX_PACKET);
       return { value: decodeNSJB(got.value), next: got.next, kind };
@@ -535,6 +632,58 @@ function decodeValue(buf, off) {
         throw new NextSQLError('protocol', 'truncated bool');
       }
       return { value: buf[off] !== 0, next: off + 1, kind };
+    }
+    case Kind.Int8: {
+      if (off + 1 > buf.length) {
+        throw new NextSQLError('protocol', 'truncated int8');
+      }
+      return { value: buf.readInt8(off), next: off + 1, kind };
+    }
+    case Kind.Int16: {
+      if (off + 2 > buf.length) {
+        throw new NextSQLError('protocol', 'truncated int16');
+      }
+      return { value: buf.readInt16LE(off), next: off + 2, kind };
+    }
+    case Kind.Int32: {
+      if (off + 4 > buf.length) {
+        throw new NextSQLError('protocol', 'truncated int32');
+      }
+      return { value: buf.readInt32LE(off), next: off + 4, kind };
+    }
+    case Kind.Int64: {
+      if (off + 8 > buf.length) {
+        throw new NextSQLError('protocol', 'truncated int64');
+      }
+      // Exposed as BigInt, not number: the full int64 range does not fit
+      // safely in a JS double (see docs/design-datatypes.md D2).
+      return { value: buf.readBigInt64LE(off), next: off + 8, kind };
+    }
+    case Kind.Uint8: {
+      if (off + 1 > buf.length) {
+        throw new NextSQLError('protocol', 'truncated uint8');
+      }
+      return { value: buf.readUInt8(off), next: off + 1, kind };
+    }
+    case Kind.Uint16: {
+      if (off + 2 > buf.length) {
+        throw new NextSQLError('protocol', 'truncated uint16');
+      }
+      return { value: buf.readUInt16LE(off), next: off + 2, kind };
+    }
+    case Kind.Uint32: {
+      if (off + 4 > buf.length) {
+        throw new NextSQLError('protocol', 'truncated uint32');
+      }
+      return { value: buf.readUInt32LE(off), next: off + 4, kind };
+    }
+    case Kind.Uint64: {
+      if (off + 8 > buf.length) {
+        throw new NextSQLError('protocol', 'truncated uint64');
+      }
+      // Exposed as BigInt, not number: the full uint64 range does not fit
+      // safely in a JS double (see docs/design-datatypes.md D3).
+      return { value: buf.readBigUInt64LE(off), next: off + 8, kind };
     }
     case Kind.Vector: {
       const dim = u16(buf, off);
@@ -610,13 +759,20 @@ function decodeValue(buf, off) {
 }
 
 function encodeHello(h) {
-  return Buffer.concat([
+  const parts = [
     putU16(h.version),
     putU16(h.flags || 0),
     putU64(h.secret || 0n),
     appendU16String(h.database || '', MAX_NAME),
     appendU16String(h.user || '', MAX_NAME),
-  ]);
+  ];
+  // Realm is an optional trailing field (M2-2): emitted only when
+  // selected, so a Hello with no realm is byte-identical to the pre-realm
+  // wire shape.
+  if (h.realm) {
+    parts.push(appendU16String(h.realm, MAX_NAME));
+  }
+  return Buffer.concat(parts);
 }
 
 function decodeHelloOK(b) {
@@ -973,7 +1129,7 @@ class Rows {
       this._finish();
       return;
     }
-    throw c.unexpected(msg);
+    throw await c.unexpected(msg);
   }
 
   async close() {
@@ -1041,7 +1197,7 @@ class Stmt {
     await c.wire.writeFrame(Type.CloseStmt, putU32(this.id));
     const msg = await c.wire.readFrame();
     if (msg.type !== Type.CloseOK) {
-      throw c.unexpected(msg);
+      throw await c.unexpected(msg);
     }
     await c.expectReady();
     this.id = 0;
@@ -1061,17 +1217,18 @@ class Conn {
       version: VERSION,
       database: this.cfg.database || '',
       user: this.cfg.user,
+      realm: this.cfg.realm || '',
     }));
     let msg = await this.wire.readFrame();
     if (msg.type !== Type.HelloOK) {
-      throw this.unexpected(msg);
+      throw await this.unexpected(msg);
     }
     const ok = decodeHelloOK(msg.payload);
     this.secret = ok.secret;
     await this.wire.writeFrame(Type.Auth, encodeAuth(this.cfg.password || ''));
     msg = await this.wire.readFrame();
     if (msg.type !== Type.AuthOK) {
-      throw this.unexpected(msg);
+      throw await this.unexpected(msg);
     }
     if (ok.authMethod === AuthPasswordKey) {
       if (!this.cfg.key) {
@@ -1087,18 +1244,35 @@ class Conn {
       await this.wire.writeFrame(Type.Unlock, mat);
       msg = await this.wire.readFrame();
       if (msg.type !== Type.UnlockOK) {
-        throw this.unexpected(msg);
+        throw await this.unexpected(msg);
       }
     }
     msg = await this.wire.readFrame();
     if (msg.type !== Type.Ready) {
-      throw this.unexpected(msg);
+      throw await this.unexpected(msg);
     }
   }
 
-  unexpected(msg) {
+  // Decodes an out-of-band Error frame (or reports a genuine protocol
+  // violation) for a call site checking "did I get what I expected?".
+  // writeErrReady on the server always sends Error then Ready — every call
+  // site funnels through here specifically so that trailing Ready is
+  // always drained in one place, rather than each of
+  // query/prepare/closeStatement/etc. having to remember to do it
+  // individually (a per-call-site version of this was exactly the shape of
+  // a real bug: _readRows/prepare/close never drained it, leaving the
+  // connection permanently desynced after the first query error).
+  async unexpected(msg) {
     if (msg.type === Type.Error) {
-      return decodeError(msg.payload);
+      const err = decodeError(msg.payload);
+      try {
+        await this.expectReady();
+      } catch {
+        // Best-effort: surface the original application error even if
+        // draining the trailing Ready itself fails (e.g. the connection
+        // is now genuinely broken).
+      }
+      return err;
     }
     return new NextSQLError('protocol', 'unexpected message type');
   }
@@ -1106,22 +1280,18 @@ class Conn {
   async expectReady() {
     const msg = await this.wire.readFrame();
     if (msg.type !== Type.Ready) {
-      throw this.unexpected(msg);
+      throw await this.unexpected(msg);
     }
   }
 
-  // readAck reads a single control acknowledgement: Ready, or Error followed by
-  // Ready (which is drained so the session stays usable).
+  // readAck reads a single control acknowledgement: Ready, or Error
+  // (unexpected() drains the trailing Ready so the session stays usable).
   async readAck() {
     const msg = await this.wire.readFrame();
     if (msg.type === Type.Ready) {
       return;
     }
-    const err = this.unexpected(msg);
-    if (msg.type === Type.Error) {
-      await this.expectReady();
-    }
-    throw err;
+    throw await this.unexpected(msg);
   }
 
   // setReadConsistency sets this connection's read-consistency mode for
@@ -1149,11 +1319,7 @@ class Conn {
     await this.wire.writeFrame(Type.NodeStatus, null);
     const msg = await this.wire.readFrame();
     if (msg.type !== Type.NodeStatusResp) {
-      const err = this.unexpected(msg);
-      if (msg.type === Type.Error) {
-        await this.expectReady();
-      }
-      throw err;
+      throw await this.unexpected(msg);
     }
     const st = decodeNodeStatus(msg.payload);
     await this.expectReady();
@@ -1175,7 +1341,7 @@ class Conn {
       return rows;
     }
     this.busy = false;
-    throw this.unexpected(msg);
+    throw await this.unexpected(msg);
   }
 
   async query(sql, params) {
@@ -1200,6 +1366,14 @@ class Conn {
     return collect(rows);
   }
 
+  async encryptField(table, column, type, value) {
+    return encryptField(this.cfg.fieldKeys, this.cfg.database || '', table, column, type, value);
+  }
+
+  async decryptField(table, column, type, ciphertext) {
+    return decryptField(this.cfg.fieldKeys, this.cfg.database || '', table, column, type, ciphertext);
+  }
+
   async prepare(sql) {
     if (!this.wire) {
       throw new NextSQLError('unavailable', 'connection closed');
@@ -1210,7 +1384,7 @@ class Conn {
     await this.wire.writeFrame(Type.Prepare, encodePrepare(sql));
     const msg = await this.wire.readFrame();
     if (msg.type !== Type.PrepareOK) {
-      throw this.unexpected(msg);
+      throw await this.unexpected(msg);
     }
     if (msg.payload.length !== 4) {
       throw new NextSQLError('protocol', 'bad prepare-ok length');
@@ -1253,7 +1427,7 @@ class Conn {
       }));
       const msg = await side.readFrame();
       if (msg.type !== Type.Ready) {
-        throw this.unexpected(msg);
+        throw await this.unexpected(msg);
       }
     } finally {
       side.close();
@@ -1488,4 +1662,11 @@ module.exports = {
   formatUUID,
   encodeDecimalString,
   decodeDecimal,
+  FieldType,
+  MemoryFieldKeyring,
+  FileFieldKeyring,
+  decryptField,
+  encryptField,
+  generateFieldKey,
+  inspectField,
 };

@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Policy Relationship",
+  "$comment": "Standalone relationship form. Relations embedded in a policy record omit source because the containing policy ID is the source.",
+  "type": "object",
+  "required": [
+    "source",
+    "type",
+    "target"
+  ],
+  "properties": {
+    "source": {
+      "type": "string"
+    },
+    "type": {
+      "type": "string",
+      "minLength": 1
+    },
+    "target": {
+      "type": "string"
+    },
+    "scope": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "verified": {
+      "type": "boolean"
+    }
+  },
+  "additionalProperties": false
+}

@@ -26,6 +26,7 @@ import {
   toBytes,
   u32,
 } from './protocol.mjs';
+import { decryptField, encryptField } from './client-encryption.mjs';
 
 export { ReadConsistency };
 
@@ -206,7 +207,7 @@ export class Rows {
       this._finish();
       return;
     }
-    throw c.unexpected(msg);
+    throw await c.unexpected(msg);
   }
 
   async close() {
@@ -274,7 +275,7 @@ export class Stmt {
     await c.wire.writeFrame(Type.CloseStmt, putU32Local(this.id));
     const msg = await c.wire.readFrame();
     if (msg.type !== Type.CloseOK) {
-      throw c.unexpected(msg);
+      throw await c.unexpected(msg);
     }
     await c.expectReady();
     this.id = 0;
@@ -301,17 +302,18 @@ export class Conn {
       version: VERSION,
       database: this.cfg.database || '',
       user: this.cfg.user,
+      realm: this.cfg.realm || '',
     }));
     let msg = await this.wire.readFrame();
     if (msg.type !== Type.HelloOK) {
-      throw this.unexpected(msg);
+      throw await this.unexpected(msg);
     }
     const ok = decodeHelloOK(msg.payload);
     this.secret = ok.secret;
     await this.wire.writeFrame(Type.Auth, encodeAuth(this.cfg.password || ''));
     msg = await this.wire.readFrame();
     if (msg.type !== Type.AuthOK) {
-      throw this.unexpected(msg);
+      throw await this.unexpected(msg);
     }
     if (ok.authMethod === AuthPasswordKey) {
       if (!this.cfg.key) {
@@ -327,18 +329,35 @@ export class Conn {
       await this.wire.writeFrame(Type.Unlock, mat);
       msg = await this.wire.readFrame();
       if (msg.type !== Type.UnlockOK) {
-        throw this.unexpected(msg);
+        throw await this.unexpected(msg);
       }
     }
     msg = await this.wire.readFrame();
     if (msg.type !== Type.Ready) {
-      throw this.unexpected(msg);
+      throw await this.unexpected(msg);
     }
   }
 
-  unexpected(msg) {
+  // Decodes an out-of-band Error frame (or reports a genuine protocol
+  // violation) for a call site checking "did I get what I expected?".
+  // writeErrReady on the server always sends Error then Ready — every call
+  // site funnels through here specifically so that trailing Ready is
+  // always drained in one place, rather than each of
+  // query/prepare/closeStatement/etc. having to remember to do it
+  // individually (a per-call-site version of this was exactly the shape of
+  // a real bug: _readRows/prepare/close never drained it, leaving the
+  // connection permanently desynced after the first query error).
+  async unexpected(msg) {
     if (msg.type === Type.Error) {
-      return decodeError(msg.payload);
+      const err = decodeError(msg.payload);
+      try {
+        await this.expectReady();
+      } catch {
+        // Best-effort: surface the original application error even if
+        // draining the trailing Ready itself fails (e.g. the connection
+        // is now genuinely broken).
+      }
+      return err;
     }
     return new NextSQLError('protocol', 'unexpected message type');
   }
@@ -346,22 +365,18 @@ export class Conn {
   async expectReady() {
     const msg = await this.wire.readFrame();
     if (msg.type !== Type.Ready) {
-      throw this.unexpected(msg);
+      throw await this.unexpected(msg);
     }
   }
 
-  // readAck reads a single control acknowledgement: Ready, or Error followed by
-  // Ready (which is drained so the session stays usable).
+  // readAck reads a single control acknowledgement: Ready, or Error
+  // (unexpected() drains the trailing Ready so the session stays usable).
   async readAck() {
     const msg = await this.wire.readFrame();
     if (msg.type === Type.Ready) {
       return;
     }
-    const err = this.unexpected(msg);
-    if (msg.type === Type.Error) {
-      await this.expectReady();
-    }
-    throw err;
+    throw await this.unexpected(msg);
   }
 
   // setReadConsistency sets this connection's read-consistency mode for
@@ -389,11 +404,7 @@ export class Conn {
     await this.wire.writeFrame(Type.NodeStatus, null);
     const msg = await this.wire.readFrame();
     if (msg.type !== Type.NodeStatusResp) {
-      const err = this.unexpected(msg);
-      if (msg.type === Type.Error) {
-        await this.expectReady();
-      }
-      throw err;
+      throw await this.unexpected(msg);
     }
     const st = decodeNodeStatus(msg.payload);
     await this.expectReady();
@@ -415,7 +426,7 @@ export class Conn {
       return rows;
     }
     this.busy = false;
-    throw this.unexpected(msg);
+    throw await this.unexpected(msg);
   }
 
   async query(sql, params) {
@@ -440,6 +451,18 @@ export class Conn {
     return collect(rows);
   }
 
+  // encryptField returns the opaque STRING parameter accepted by an
+  // ENCRYPTED CLIENT column. NULL passes through without an envelope.
+  async encryptField(table, column, type, value) {
+    return encryptField(this.cfg.fieldKeys, this.cfg.database || '', table, column, type, value);
+  }
+
+  // decryptField authenticates the context-bound opaque result before
+  // returning its logical value.
+  async decryptField(table, column, type, ciphertext) {
+    return decryptField(this.cfg.fieldKeys, this.cfg.database || '', table, column, type, ciphertext);
+  }
+
   async prepare(sql) {
     if (!this.wire) {
       throw new NextSQLError('unavailable', 'connection closed');
@@ -450,7 +473,7 @@ export class Conn {
     await this.wire.writeFrame(Type.Prepare, encodePrepare(sql));
     const msg = await this.wire.readFrame();
     if (msg.type !== Type.PrepareOK) {
-      throw this.unexpected(msg);
+      throw await this.unexpected(msg);
     }
     if (msg.payload.length !== 4) {
       throw new NextSQLError('protocol', 'bad prepare-ok length');
@@ -495,7 +518,7 @@ export class Conn {
       }));
       const msg = await side.readFrame();
       if (msg.type !== Type.Ready) {
-        throw this.unexpected(msg);
+        throw await this.unexpected(msg);
       }
     } finally {
       side.close();

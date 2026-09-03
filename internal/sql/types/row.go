@@ -299,7 +299,7 @@ func skipScalar(raw []byte, off int, t Type) (int, error) {
 			return 0, nerr.New(nerr.InvalidFormat, "types.skipScalar", "truncated uuid")
 		}
 		return off + 16, nil
-	case KindString, KindText, KindJSON, KindDecimal:
+	case KindString, KindText, KindBlob, KindJSON, KindDecimal, KindChar, KindVarchar:
 		n, err := encoding.ReadU32(raw, off)
 		if err != nil {
 			return 0, err
@@ -309,9 +309,74 @@ func skipScalar(raw []byte, off int, t Type) (int, error) {
 			return 0, nerr.New(nerr.InvalidFormat, "types.skipScalar", "truncated bytes")
 		}
 		return end, nil
-	case KindTimestampTZ:
+	case KindTimestampTZ, KindTimestamp:
 		if off+8 > len(raw) {
 			return 0, nerr.New(nerr.InvalidFormat, "types.skipScalar", "truncated timestamp")
+		}
+		return off + 8, nil
+	case KindEnum:
+		if off+2 > len(raw) {
+			return 0, nerr.New(nerr.InvalidFormat, "types.skipScalar", "truncated enum")
+		}
+		return off + 2, nil
+	case KindFloat32:
+		if off+4 > len(raw) {
+			return 0, nerr.New(nerr.InvalidFormat, "types.skipScalar", "truncated float32")
+		}
+		return off + 4, nil
+	case KindFloat64:
+		if off+8 > len(raw) {
+			return 0, nerr.New(nerr.InvalidFormat, "types.skipScalar", "truncated float64")
+		}
+		return off + 8, nil
+	case KindInt8:
+		if off+1 > len(raw) {
+			return 0, nerr.New(nerr.InvalidFormat, "types.skipScalar", "truncated int8")
+		}
+		return off + 1, nil
+	case KindInt16:
+		if off+2 > len(raw) {
+			return 0, nerr.New(nerr.InvalidFormat, "types.skipScalar", "truncated int16")
+		}
+		return off + 2, nil
+	case KindInt32:
+		if off+4 > len(raw) {
+			return 0, nerr.New(nerr.InvalidFormat, "types.skipScalar", "truncated int32")
+		}
+		return off + 4, nil
+	case KindInt64:
+		if off+8 > len(raw) {
+			return 0, nerr.New(nerr.InvalidFormat, "types.skipScalar", "truncated int64")
+		}
+		return off + 8, nil
+	case KindUint8:
+		if off+1 > len(raw) {
+			return 0, nerr.New(nerr.InvalidFormat, "types.skipScalar", "truncated uint8")
+		}
+		return off + 1, nil
+	case KindUint16:
+		if off+2 > len(raw) {
+			return 0, nerr.New(nerr.InvalidFormat, "types.skipScalar", "truncated uint16")
+		}
+		return off + 2, nil
+	case KindUint32:
+		if off+4 > len(raw) {
+			return 0, nerr.New(nerr.InvalidFormat, "types.skipScalar", "truncated uint32")
+		}
+		return off + 4, nil
+	case KindUint64:
+		if off+8 > len(raw) {
+			return 0, nerr.New(nerr.InvalidFormat, "types.skipScalar", "truncated uint64")
+		}
+		return off + 8, nil
+	case KindDate:
+		if off+4 > len(raw) {
+			return 0, nerr.New(nerr.InvalidFormat, "types.skipScalar", "truncated date")
+		}
+		return off + 4, nil
+	case KindTime:
+		if off+8 > len(raw) {
+			return 0, nerr.New(nerr.InvalidFormat, "types.skipScalar", "truncated time")
 		}
 		return off + 8, nil
 	case KindVector:
@@ -378,7 +443,7 @@ func encodeScalar(v Value) ([]byte, error) {
 	switch v.Typ.Kind {
 	case KindUUID:
 		return append([]byte(nil), v.UUID[:]...), nil
-	case KindString, KindText:
+	case KindString, KindText, KindBlob, KindChar, KindVarchar:
 		return encodeBytes([]byte(v.Str)), nil
 	case KindJSON:
 		if err := nsjson.Validate(v.JSON); err != nil {
@@ -388,7 +453,58 @@ func encodeScalar(v Value) ([]byte, error) {
 	case KindDecimal:
 		body := encodeDecimal(v.Dec)
 		return encodeBytes(body), nil
-	case KindTimestampTZ:
+	case KindTimestampTZ, KindTimestamp:
+		buf := make([]byte, 8)
+		encoding.PutU64(buf, 0, uint64(v.Time))
+		return buf, nil
+	case KindEnum:
+		if v.Int < 0 || v.Int > 0xFFFF {
+			return nil, nerr.New(nerr.InvalidArgument, "types.encodeScalar", "ENUM ordinal out of range")
+		}
+		buf := make([]byte, 2)
+		encoding.PutU16(buf, 0, uint16(v.Int))
+		return buf, nil
+	case KindFloat32:
+		buf := make([]byte, 4)
+		binary.LittleEndian.PutUint32(buf, math.Float32bits(float32(canonFloat(v.Flt))))
+		return buf, nil
+	case KindFloat64:
+		buf := make([]byte, 8)
+		binary.LittleEndian.PutUint64(buf, math.Float64bits(canonFloat(v.Flt)))
+		return buf, nil
+	case KindInt8:
+		return []byte{byte(int8(v.Int))}, nil
+	case KindInt16:
+		buf := make([]byte, 2)
+		encoding.PutU16(buf, 0, uint16(int16(v.Int)))
+		return buf, nil
+	case KindInt32:
+		buf := make([]byte, 4)
+		encoding.PutU32(buf, 0, uint32(int32(v.Int)))
+		return buf, nil
+	case KindInt64:
+		buf := make([]byte, 8)
+		encoding.PutU64(buf, 0, uint64(v.Int))
+		return buf, nil
+	case KindUint8:
+		return []byte{byte(v.Uint)}, nil
+	case KindUint16:
+		buf := make([]byte, 2)
+		encoding.PutU16(buf, 0, uint16(v.Uint))
+		return buf, nil
+	case KindUint32:
+		buf := make([]byte, 4)
+		encoding.PutU32(buf, 0, uint32(v.Uint))
+		return buf, nil
+	case KindUint64:
+		buf := make([]byte, 8)
+		encoding.PutU64(buf, 0, v.Uint)
+		return buf, nil
+	case KindDate:
+		buf := make([]byte, 4)
+		encoding.PutU32(buf, 0, uint32(int32(v.Int)))
+		return buf, nil
+	case KindTime:
 		buf := make([]byte, 8)
 		encoding.PutU64(buf, 0, uint64(v.Time))
 		return buf, nil
@@ -460,7 +576,7 @@ func decodeScalar(raw []byte, off int, t Type) (Value, int, error) {
 		var u [16]byte
 		copy(u[:], b)
 		return UUIDValue(u), off + 16, nil
-	case KindString, KindText:
+	case KindString, KindText, KindBlob, KindChar, KindVarchar:
 		b, n, err := decodeBytes(raw, off)
 		if err != nil {
 			return Value{}, 0, err
@@ -489,6 +605,92 @@ func decodeScalar(raw []byte, off int, t Type) (Value, int, error) {
 			return Value{}, 0, err
 		}
 		return TimeValue(int64(u)), off + 8, nil
+	case KindTimestamp:
+		u, err := encoding.ReadU64(raw, off)
+		if err != nil {
+			return Value{}, 0, err
+		}
+		return NaiveTimestampValue(int64(u)), off + 8, nil
+	case KindEnum:
+		u, err := encoding.ReadU16(raw, off)
+		if err != nil {
+			return Value{}, 0, err
+		}
+		v, err := EnumValueByOrdinal(int(u), t)
+		if err != nil {
+			return Value{}, 0, err
+		}
+		return v, off + 2, nil
+	case KindFloat32:
+		b, err := encoding.ReadBytes(raw, off, 4)
+		if err != nil {
+			return Value{}, 0, err
+		}
+		return Float32Value(float64(math.Float32frombits(binary.LittleEndian.Uint32(b)))), off + 4, nil
+	case KindFloat64:
+		b, err := encoding.ReadBytes(raw, off, 8)
+		if err != nil {
+			return Value{}, 0, err
+		}
+		return Float64Value(math.Float64frombits(binary.LittleEndian.Uint64(b))), off + 8, nil
+	case KindInt8:
+		if off >= len(raw) {
+			return Value{}, 0, nerr.New(nerr.InvalidFormat, "types.decodeScalar", "truncated int8")
+		}
+		return IntValue(KindInt8, int64(int8(raw[off]))), off + 1, nil
+	case KindInt16:
+		u, err := encoding.ReadU16(raw, off)
+		if err != nil {
+			return Value{}, 0, err
+		}
+		return IntValue(KindInt16, int64(int16(u))), off + 2, nil
+	case KindInt32:
+		u, err := encoding.ReadU32(raw, off)
+		if err != nil {
+			return Value{}, 0, err
+		}
+		return IntValue(KindInt32, int64(int32(u))), off + 4, nil
+	case KindInt64:
+		u, err := encoding.ReadU64(raw, off)
+		if err != nil {
+			return Value{}, 0, err
+		}
+		return IntValue(KindInt64, int64(u)), off + 8, nil
+	case KindUint8:
+		if off >= len(raw) {
+			return Value{}, 0, nerr.New(nerr.InvalidFormat, "types.decodeScalar", "truncated uint8")
+		}
+		return UintValue(KindUint8, uint64(raw[off])), off + 1, nil
+	case KindUint16:
+		u, err := encoding.ReadU16(raw, off)
+		if err != nil {
+			return Value{}, 0, err
+		}
+		return UintValue(KindUint16, uint64(u)), off + 2, nil
+	case KindUint32:
+		u, err := encoding.ReadU32(raw, off)
+		if err != nil {
+			return Value{}, 0, err
+		}
+		return UintValue(KindUint32, uint64(u)), off + 4, nil
+	case KindUint64:
+		u, err := encoding.ReadU64(raw, off)
+		if err != nil {
+			return Value{}, 0, err
+		}
+		return UintValue(KindUint64, u), off + 8, nil
+	case KindDate:
+		u, err := encoding.ReadU32(raw, off)
+		if err != nil {
+			return Value{}, 0, err
+		}
+		return DateValue(int32(u)), off + 4, nil
+	case KindTime:
+		u, err := encoding.ReadU64(raw, off)
+		if err != nil {
+			return Value{}, 0, err
+		}
+		return TimeOfDayValue(int64(u)), off + 8, nil
 	case KindVector:
 		dim, err := encoding.ReadU16(raw, off)
 		if err != nil {
@@ -637,17 +839,85 @@ func encodeSortable(v Value) ([]byte, error) {
 	switch v.Typ.Kind {
 	case KindUUID:
 		return append([]byte(nil), v.UUID[:]...), nil
-	case KindString, KindText:
+	case KindString, KindText, KindBlob, KindChar, KindVarchar:
+		// CHAR values are already space-padded to exactly n runes at Coerce
+		// time, so the zero-escaped byte-lexicographic order over the stored
+		// bytes is the canonical CHAR(n) order (docs/design-datatypes.md D4).
 		return encodeSortableBytes([]byte(v.Str)), nil
 	case KindJSON:
 		return encodeSortableBytes(v.JSON), nil
 	case KindDecimal:
 		return encodeSortableDecimal(v.Dec)
-	case KindTimestampTZ:
-		// Bias so unsigned compare matches signed time.
+	case KindTimestampTZ, KindTimestamp:
+		// Bias so unsigned compare matches signed time (a naive TIMESTAMP can
+		// also be negative for pre-1970 civil times — same flip as TIMESTAMPTZ).
 		u := uint64(v.Time) ^ (1 << 63)
 		buf := make([]byte, 8)
 		binary.BigEndian.PutUint64(buf, u)
+		return buf, nil
+	case KindEnum:
+		// Declaration-order: plain unsigned big-endian ordinal, no flip (the
+		// ordinal is always >= 0), mirroring UINT16 (docs/design-datatypes.md D11).
+		buf := make([]byte, 2)
+		binary.BigEndian.PutUint16(buf, uint16(v.Int))
+		return buf, nil
+	case KindFloat32:
+		buf := make([]byte, 4)
+		binary.BigEndian.PutUint32(buf, sortableFloat32Bits(v.Flt))
+		return buf, nil
+	case KindFloat64:
+		buf := make([]byte, 8)
+		binary.BigEndian.PutUint64(buf, sortableFloat64Bits(v.Flt))
+		return buf, nil
+	case KindInt8:
+		// Flip the sign bit so unsigned byte compare matches signed order
+		// (two's-complement byte order alone sorts negatives after
+		// positives — see docs/design-datatypes.md D2).
+		return []byte{byte(v.Int) ^ 0x80}, nil
+	case KindInt16:
+		u := uint16(int16(v.Int)) ^ (1 << 15)
+		buf := make([]byte, 2)
+		binary.BigEndian.PutUint16(buf, u)
+		return buf, nil
+	case KindInt32:
+		u := uint32(int32(v.Int)) ^ (1 << 31)
+		buf := make([]byte, 4)
+		binary.BigEndian.PutUint32(buf, u)
+		return buf, nil
+	case KindInt64:
+		u := uint64(v.Int) ^ (1 << 63)
+		buf := make([]byte, 8)
+		binary.BigEndian.PutUint64(buf, u)
+		return buf, nil
+	case KindUint8:
+		// No sign-bit flip needed — plain unsigned byte order already sorts
+		// correctly (see docs/design-datatypes.md D3).
+		return []byte{byte(v.Uint)}, nil
+	case KindUint16:
+		buf := make([]byte, 2)
+		binary.BigEndian.PutUint16(buf, uint16(v.Uint))
+		return buf, nil
+	case KindUint32:
+		buf := make([]byte, 4)
+		binary.BigEndian.PutUint32(buf, uint32(v.Uint))
+		return buf, nil
+	case KindUint64:
+		buf := make([]byte, 8)
+		binary.BigEndian.PutUint64(buf, v.Uint)
+		return buf, nil
+	case KindDate:
+		// Signed day count, same sign-bit-flip trick as KindInt32 (see
+		// docs/design-datatypes.md D5).
+		u := uint32(int32(v.Int)) ^ (1 << 31)
+		buf := make([]byte, 4)
+		binary.BigEndian.PutUint32(buf, u)
+		return buf, nil
+	case KindTime:
+		// Nanoseconds-since-midnight is always non-negative, so plain
+		// unsigned byte order already sorts correctly — no sign-bit flip
+		// needed (mirrors KindUint64, see docs/design-datatypes.md D5).
+		buf := make([]byte, 8)
+		binary.BigEndian.PutUint64(buf, uint64(v.Time))
 		return buf, nil
 	case KindVector:
 		buf := make([]byte, 2+4*len(v.Vec))
@@ -673,6 +943,60 @@ func encodeSortable(v Value) ([]byte, error) {
 	default:
 		return nil, nerr.New(nerr.InvalidArgument, "types.encodeSortable", "unsupported key type")
 	}
+}
+
+// sortableFloat64Bits maps a float64 to a uint64 whose unsigned big-endian
+// byte order is the canonical float total order (docs/design-datatypes.md D8):
+// -Inf < negative reals < ±0 < positive reals < +Inf < NaN. -0.0 and NaN are
+// already canonicalized on write; this also folds them defensively here.
+func sortableFloat64Bits(f float64) uint64 {
+	if math.IsNaN(f) {
+		return ^uint64(0)
+	}
+	if f == 0 {
+		f = 0 // -0 -> +0
+	}
+	b := math.Float64bits(f)
+	if b&(1<<63) != 0 {
+		return ^b
+	}
+	return b ^ (1 << 63)
+}
+
+func decodeSortableFloat64(u uint64) float64 {
+	if u == ^uint64(0) {
+		return math.NaN()
+	}
+	if u&(1<<63) != 0 {
+		return math.Float64frombits(u ^ (1 << 63))
+	}
+	return math.Float64frombits(^u)
+}
+
+// sortableFloat32Bits is sortableFloat64Bits at 32-bit width.
+func sortableFloat32Bits(f float64) uint32 {
+	if math.IsNaN(f) {
+		return ^uint32(0)
+	}
+	g := float32(f)
+	if g == 0 {
+		g = 0
+	}
+	b := math.Float32bits(g)
+	if b&(1<<31) != 0 {
+		return ^b
+	}
+	return b ^ (1 << 31)
+}
+
+func decodeSortableFloat32(u uint32) float64 {
+	if u == ^uint32(0) {
+		return math.NaN()
+	}
+	if u&(1<<31) != 0 {
+		return float64(math.Float32frombits(u ^ (1 << 31)))
+	}
+	return float64(math.Float32frombits(^u))
 }
 
 func encodeSortableF64(f float64) []byte {
@@ -802,7 +1126,7 @@ func decodeSortable(raw []byte, off int, t Type) (Value, int, error) {
 		var u [16]byte
 		copy(u[:], b)
 		return UUIDValue(u), off + 16, nil
-	case KindString, KindText, KindJSON:
+	case KindString, KindText, KindBlob, KindJSON, KindChar, KindVarchar:
 		b, next, err := decodeSortableBytes(raw, off)
 		if err != nil {
 			return Value{}, 0, err
@@ -821,6 +1145,99 @@ func decodeSortable(raw []byte, off int, t Type) (Value, int, error) {
 		}
 		u := binary.BigEndian.Uint64(b) ^ (1 << 63)
 		return TimeValue(int64(u)), off + 8, nil
+	case KindTimestamp:
+		b, err := encoding.ReadBytes(raw, off, 8)
+		if err != nil {
+			return Value{}, 0, err
+		}
+		u := binary.BigEndian.Uint64(b) ^ (1 << 63)
+		return NaiveTimestampValue(int64(u)), off + 8, nil
+	case KindEnum:
+		b, err := encoding.ReadBytes(raw, off, 2)
+		if err != nil {
+			return Value{}, 0, err
+		}
+		v, err := EnumValueByOrdinal(int(binary.BigEndian.Uint16(b)), t)
+		if err != nil {
+			return Value{}, 0, err
+		}
+		return v, off + 2, nil
+	case KindFloat32:
+		b, err := encoding.ReadBytes(raw, off, 4)
+		if err != nil {
+			return Value{}, 0, err
+		}
+		return Float32Value(decodeSortableFloat32(binary.BigEndian.Uint32(b))), off + 4, nil
+	case KindFloat64:
+		b, err := encoding.ReadBytes(raw, off, 8)
+		if err != nil {
+			return Value{}, 0, err
+		}
+		return Float64Value(decodeSortableFloat64(binary.BigEndian.Uint64(b))), off + 8, nil
+	case KindInt8:
+		b, err := encoding.ReadBytes(raw, off, 1)
+		if err != nil {
+			return Value{}, 0, err
+		}
+		return IntValue(KindInt8, int64(int8(b[0]^0x80))), off + 1, nil
+	case KindInt16:
+		b, err := encoding.ReadBytes(raw, off, 2)
+		if err != nil {
+			return Value{}, 0, err
+		}
+		u := binary.BigEndian.Uint16(b) ^ (1 << 15)
+		return IntValue(KindInt16, int64(int16(u))), off + 2, nil
+	case KindInt32:
+		b, err := encoding.ReadBytes(raw, off, 4)
+		if err != nil {
+			return Value{}, 0, err
+		}
+		u := binary.BigEndian.Uint32(b) ^ (1 << 31)
+		return IntValue(KindInt32, int64(int32(u))), off + 4, nil
+	case KindInt64:
+		b, err := encoding.ReadBytes(raw, off, 8)
+		if err != nil {
+			return Value{}, 0, err
+		}
+		u := binary.BigEndian.Uint64(b) ^ (1 << 63)
+		return IntValue(KindInt64, int64(u)), off + 8, nil
+	case KindUint8:
+		b, err := encoding.ReadBytes(raw, off, 1)
+		if err != nil {
+			return Value{}, 0, err
+		}
+		return UintValue(KindUint8, uint64(b[0])), off + 1, nil
+	case KindUint16:
+		b, err := encoding.ReadBytes(raw, off, 2)
+		if err != nil {
+			return Value{}, 0, err
+		}
+		return UintValue(KindUint16, uint64(binary.BigEndian.Uint16(b))), off + 2, nil
+	case KindUint32:
+		b, err := encoding.ReadBytes(raw, off, 4)
+		if err != nil {
+			return Value{}, 0, err
+		}
+		return UintValue(KindUint32, uint64(binary.BigEndian.Uint32(b))), off + 4, nil
+	case KindUint64:
+		b, err := encoding.ReadBytes(raw, off, 8)
+		if err != nil {
+			return Value{}, 0, err
+		}
+		return UintValue(KindUint64, binary.BigEndian.Uint64(b)), off + 8, nil
+	case KindDate:
+		b, err := encoding.ReadBytes(raw, off, 4)
+		if err != nil {
+			return Value{}, 0, err
+		}
+		u := binary.BigEndian.Uint32(b) ^ (1 << 31)
+		return DateValue(int32(u)), off + 4, nil
+	case KindTime:
+		b, err := encoding.ReadBytes(raw, off, 8)
+		if err != nil {
+			return Value{}, 0, err
+		}
+		return TimeOfDayValue(int64(binary.BigEndian.Uint64(b))), off + 8, nil
 	case KindVector:
 		dim, err := encoding.ReadU16(raw, off)
 		if err != nil {

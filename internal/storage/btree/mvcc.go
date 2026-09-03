@@ -3,6 +3,7 @@ package btree
 import (
 	"github.com/bzync/nextsql/internal/maintenance"
 	"github.com/bzync/nextsql/internal/nerr"
+	"github.com/bzync/nextsql/internal/storage"
 	"github.com/bzync/nextsql/internal/storage/format"
 	"github.com/bzync/nextsql/internal/storage/row"
 	"github.com/bzync/nextsql/internal/txn"
@@ -280,4 +281,30 @@ func (t *Tree) applyUndoRec(rec undo.Record) error {
 	default:
 		return nil
 	}
+}
+
+// ApplyUndo implements storage.UndoTarget: it reverses one durable undo
+// record against this tree's live, in-memory state, taking the same
+// tree-mutex + engine page-mutation section every ordinary DML mutation
+// takes (see Txn.withWrite). rec.Key is looked up by a fresh top-down
+// descend from the tree's current root (applyUndoRec -> {delete,update,
+// insert}Locked), so this is correct even if a concurrent split moved the
+// key to a different physical page since rec was logged; rec.PageID itself
+// is not consulted here (only crash recovery's undo.Apply, which runs
+// before any buffer pool exists, needs it). liveKnown is invalidated rather
+// than adjusted precisely: it is a row-count cache, not a correctness
+// value, and forcing a recount is simplest and always safe.
+func (t *Tree) ApplyUndo(stx *storage.Txn, rec undo.Record) error {
+	if t == nil {
+		return nerr.New(nerr.InvalidArgument, "btree.Tree.ApplyUndo", "nil tree")
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.eng.Enter(stx)
+	err := t.applyUndoRec(rec)
+	t.eng.Leave(stx)
+	if err == nil {
+		t.liveKnown = false
+	}
+	return err
 }

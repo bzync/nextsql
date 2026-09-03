@@ -124,15 +124,19 @@ func (cl *Cluster) Query(ctx context.Context, sql string, params ...types.Value)
 
 	if routable {
 		if fc, ok := cl.followerConn(ctx); ok {
-			rows, err := fc.Query(ctx, sql, params...)
+			rows, err := fc.conn.Query(ctx, sql, params...)
 			if err == nil {
 				return rows, nil
 			}
-			if !nerr.HasCode(err, nerr.Unavailable) {
+			if isTransportFailure(err) {
+				cl.invalidate(fc)
+			} else if !nerr.HasCode(err, nerr.Unavailable) {
 				return nil, err
 			}
-			// The follower lost the leader or fell outside the bound; the
-			// leader can always answer, so fall through.
+			// The follower lost the leader, fell outside the bound, or its
+			// connection just broke (e.g. a graceful drain closing it out
+			// from under an in-flight request); the leader can always
+			// answer, so fall through.
 		}
 	}
 
@@ -140,8 +144,21 @@ func (cl *Cluster) Query(ctx context.Context, sql string, params ...types.Value)
 	if err != nil {
 		return nil, err
 	}
-	rows, err := lc.Query(ctx, sql, params...)
+	rows, err := lc.conn.Query(ctx, sql, params...)
 	if err != nil {
+		if isTransportFailure(err) {
+			// The connection we cached as "the leader" just broke — most
+			// commonly because that node lost leadership and was then
+			// drained or restarted for planned maintenance before our
+			// statusTTL-bounded cache caught up. Stop trusting that cached
+			// role so the next call re-probes for the real leader, and
+			// surface Unavailable (not the raw transport error) so a
+			// caller's standard retry-on-Unavailable convention — the same
+			// one already used for a genuine leader failover — catches
+			// this and retries instead of failing the statement outright.
+			cl.invalidate(lc)
+			return nil, nerr.Wrap(nerr.Unavailable, "nextsql.Cluster", "leader connection failed", err)
+		}
 		return nil, err
 	}
 	if begin || end {
@@ -152,19 +169,19 @@ func (cl *Cluster) Query(ctx context.Context, sql string, params ...types.Value)
 	return rows, nil
 }
 
-func (cl *Cluster) leaderConn(ctx context.Context) (*Conn, error) {
+func (cl *Cluster) leaderConn(ctx context.Context) (*clusterConn, error) {
 	cl.refresh(ctx)
 	cl.mu.Lock()
 	defer cl.mu.Unlock()
 	for _, cc := range cl.conns {
 		if cc.status.Role == "leader" || cc.status.Role == "standalone" {
-			return cc.conn, nil
+			return cc, nil
 		}
 	}
 	return nil, nerr.New(nerr.Unavailable, "nextsql.Cluster", "no reachable leader")
 }
 
-func (cl *Cluster) followerConn(ctx context.Context) (*Conn, bool) {
+func (cl *Cluster) followerConn(ctx context.Context) (*clusterConn, bool) {
 	cl.refresh(ctx)
 	cl.mu.Lock()
 	defer cl.mu.Unlock()
@@ -189,12 +206,34 @@ func (cl *Cluster) followerConn(ctx context.Context) (*Conn, bool) {
 	}
 	cc := pick[cl.rr%len(pick)]
 	cl.rr++
-	return cc.conn, true
+	return cc, true
+}
+
+// isTransportFailure reports whether err represents a broken connection
+// (dial/read/write failure) rather than an application-level rejection the
+// server sent back deliberately. Server-sent errors always decode with the
+// server's own nerr code (see unexpected/DecodeError), never nerr.IO, so
+// this check cannot misclassify a legitimate query error as a dead
+// connection.
+func isTransportFailure(err error) bool {
+	return nerr.HasCode(err, nerr.IO)
+}
+
+// invalidate forces cc's cached NodeStatus stale so the next refresh
+// re-probes it instead of continuing to trust a routing decision that just
+// proved wrong (its connection broke).
+func (cl *Cluster) invalidate(cc *clusterConn) {
+	cl.mu.Lock()
+	cc.seen = time.Time{}
+	cl.mu.Unlock()
 }
 
 // refresh re-probes every node whose cached status is older than statusTTL and
-// is not currently pinned by an open *Rows. Probe failures keep the last known
-// status.
+// is not currently pinned by an open *Rows. A probe that fails on a genuine
+// transport error clears the cached status (see the loop body) so a
+// permanently broken connection stops being selected as though it were still
+// the last role it reported; any other probe failure (e.g. context
+// cancellation) keeps the last known status, unchanged from before.
 func (cl *Cluster) refresh(ctx context.Context) {
 	cl.mu.Lock()
 	targets := make([]*clusterConn, 0, len(cl.conns))
@@ -207,8 +246,20 @@ func (cl *Cluster) refresh(ctx context.Context) {
 	for _, cc := range targets {
 		st, err := cc.conn.NodeStatus(ctx)
 		cl.mu.Lock()
-		if err == nil {
+		switch {
+		case err == nil:
 			cc.status = st
+			cc.seen = time.Now()
+		case isTransportFailure(err):
+			// The underlying *Conn does not reconnect on its own, so a
+			// transport failure here is permanent for the lifetime of this
+			// Cluster: stop trusting whatever role it last reported (most
+			// dangerously "leader", which would otherwise keep winning
+			// leaderConn's selection forever and starve every other node)
+			// rather than leaving stale data in place. It stays a refresh
+			// target so a future probe still gets attempted, at the normal
+			// statusTTL cadence, in case that ever changes.
+			cc.status = NodeStatus{}
 			cc.seen = time.Now()
 		}
 		cl.mu.Unlock()

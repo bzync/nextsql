@@ -21,6 +21,15 @@ const (
 	pageLSNOffset      = 16
 )
 
+// ErrHoldBlocksRotation is returned by an append that would need to rotate
+// segments while a commit record is held pending replication (AppendHeld).
+// A held record's bytes are tied to a specific segment offset — rotating
+// out from under it would strand it at the wrong physical position. This
+// bounds a hold to at most one segment's worth of unrelated concurrent
+// writes, which is expected to comfortably outlast one replication round
+// trip; callers should surface this as a retryable condition.
+var ErrHoldBlocksRotation = nerr.New(nerr.Unavailable, "wal.rotate", "cannot rotate segment while a commit record is held pending replication")
+
 // Archiver is the PITR hook. Implementations may copy a recycled segment
 // elsewhere. The log never deletes a segment that has not been archived
 // when an Archiver is installed; without one, fully-recycled segments
@@ -76,6 +85,17 @@ type Log struct {
 
 	retentionPins map[uint64]format.LSN
 	nextPin       uint64
+
+	// held is a single-slot durability barrier: a committing transaction's
+	// CommitRec may be appended via AppendHeld and kept out of the durable
+	// prefix flushLocked ever writes until ReleaseHold decides its fate.
+	// Only one record may be held at a time — callers serialize this
+	// through Engine.replMu, one replicated commit in flight at a time.
+	held         bool
+	heldOffset   int
+	heldLen      int
+	heldLSN      format.LSN
+	heldPrevLast format.LSN
 }
 
 func (o Options) withDefaults() Options {
@@ -513,12 +533,92 @@ func (l *Log) appendLocked(rec Record) (format.LSN, error) {
 	return lsn, nil
 }
 
+// AppendHeld appends rec (typically a transaction's CommitRec) but keeps it
+// out of the durable prefix flushLocked will write until ReleaseHold
+// resolves it — so a caller can replicate rec (and whatever it depends on)
+// to Raft quorum before deciding whether it ever becomes durable. Only one
+// record may be held at a time; callers must serialize appends through
+// Engine.replMu the same way commitAndReplicate already does.
+func (l *Log) AppendHeld(rec Record) (format.LSN, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.held {
+		return 0, nerr.New(nerr.Internal, "wal.AppendHeld", "a record is already held")
+	}
+	if l.seg == nil {
+		return 0, nerr.New(nerr.Internal, "wal.AppendHeld", "log is closed")
+	}
+	lsn := l.nextLSN
+	rec.LSN = lsn
+	payload := encodePayload(rec)
+	gen, err := l.nextNonceLocked()
+	if err != nil {
+		return 0, err
+	}
+	phys, err := encodePhysical(l.dek, lsn, gen, payload)
+	if err != nil {
+		return 0, err
+	}
+	if l.segOff+int64(len(l.buf))+int64(len(phys)) > l.segmentSize && (l.segOff > SegmentHeaderSize || len(l.buf) > 0) {
+		if err := l.rotateLocked(); err != nil {
+			return 0, err
+		}
+	}
+	prevLast := l.bufLast
+	offset := len(l.buf)
+	l.buf = append(l.buf, phys...)
+	l.bufLast = lsn
+	l.nextLSN = lsn + 1
+	l.held = true
+	l.heldOffset = offset
+	l.heldLen = len(phys)
+	l.heldLSN = lsn
+	l.heldPrevLast = prevLast
+	return lsn, nil
+}
+
+// ReleaseHold resolves the record previously appended via AppendHeld. If
+// commit is true, its bytes stay exactly where they are and become
+// flushable like any other record on the next Flush. If commit is false,
+// its bytes are spliced back out of the buffer — they never reach disk —
+// and its LSN becomes a permanent gap (tolerated the same way an aborted
+// transaction's LSNs already are); any unrelated records appended after it
+// while it was held are left untouched and still pending their own flush.
+// A no-op if nothing is currently held.
+func (l *Log) ReleaseHold(commit bool) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if !l.held {
+		return nil
+	}
+	if !commit {
+		l.buf = append(l.buf[:l.heldOffset], l.buf[l.heldOffset+l.heldLen:]...)
+		if l.bufLast == l.heldLSN {
+			l.bufLast = l.heldPrevLast
+		}
+	}
+	l.held = false
+	l.heldOffset = 0
+	l.heldLen = 0
+	l.heldLSN = 0
+	l.heldPrevLast = 0
+	l.cv.Broadcast()
+	return nil
+}
+
 // Flush group-commits until lsn is durable. Commit must not be acknowledged
 // until this returns nil.
 func (l *Log) Flush(lsn format.LSN) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	for l.durableLSN < lsn {
+		if l.held && l.heldLSN <= lsn {
+			// The target LSN needs bytes flushLocked won't write while
+			// held. Wait for ReleaseHold's broadcast rather than spinning
+			// on flushLocked calls that can make no further progress.
+			l.cv.Wait()
+			continue
+		}
 		if l.flushing {
 			l.cv.Wait()
 			if l.flushErr != nil && l.durableLSN < lsn {
@@ -538,27 +638,39 @@ func (l *Log) Flush(lsn format.LSN) error {
 }
 
 func (l *Log) flushLocked() error {
-	if len(l.buf) == 0 {
+	toFlush := len(l.buf)
+	last := l.bufLast
+	if l.held {
+		toFlush = l.heldOffset
+		last = l.heldPrevLast
+	}
+	if toFlush == 0 {
 		return nil
 	}
 	if err := l.hit(PointBeforeWALWrite); err != nil {
 		return err
 	}
-	n, err := l.seg.WriteAt(l.buf, l.segOff)
-	if n < len(l.buf) && err == nil {
+	buf := l.buf[:toFlush]
+	n, err := l.seg.WriteAt(buf, l.segOff)
+	if n < len(buf) && err == nil {
 		err = io.ErrShortWrite
 	}
 	if err != nil {
 		if n > 0 {
 			l.segOff += int64(n)
 			l.buf = l.buf[n:]
+			if l.held {
+				l.heldOffset -= n
+			}
 		}
 		return nerr.Wrap(nerr.IO, "wal.Flush", "write", err)
 	}
-	l.segOff += int64(len(l.buf))
-	l.written += int64(len(l.buf))
-	last := l.bufLast
-	l.buf = l.buf[:0]
+	l.segOff += int64(len(buf))
+	l.written += int64(len(buf))
+	l.buf = l.buf[len(buf):]
+	if l.held {
+		l.heldOffset = 0
+	}
 	if err := l.hit(PointAfterWALWriteBeforeSync); err != nil {
 		return err
 	}
@@ -571,6 +683,9 @@ func (l *Log) flushLocked() error {
 }
 
 func (l *Log) rotateLocked() error {
+	if l.held {
+		return ErrHoldBlocksRotation
+	}
 	if err := l.hit(PointBeforeRotation); err != nil {
 		return err
 	}
@@ -1063,7 +1178,11 @@ func (l *Log) walProvider() crypto.KeyProvider {
 	return p
 }
 
-// Close flushes and persists the control file.
+// Close flushes and persists the control file. Callers must never call
+// this while a record is held (AppendHeld/ReleaseHold) — Engine.replMu
+// already guarantees this in production; a hold still active here would
+// have its bytes, and any unrelated bytes appended after it, dropped
+// rather than flushed.
 func (l *Log) Close() error {
 	if l == nil {
 		return nil
@@ -1095,6 +1214,11 @@ func (l *Log) CrashClose() {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.buf = nil
+	l.held = false
+	l.heldOffset = 0
+	l.heldLen = 0
+	l.heldLSN = 0
+	l.heldPrevLast = 0
 	if l.seg != nil {
 		_ = l.seg.Truncate(l.syncOff)
 		_ = l.seg.Close()

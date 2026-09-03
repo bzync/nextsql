@@ -1,0 +1,161 @@
+[
+  {
+    "id": "DEPED-BEC-2002",
+    "agency": "DEPED",
+    "name": "2002 Basic Education Curriculum",
+    "status": "HISTORICAL_PRE_K12",
+    "education_levels": [
+      "ELEMENTARY",
+      "SECONDARY"
+    ],
+    "effective_from": "2002-2003",
+    "effective_until": null,
+    "grade_rollout": {},
+    "legal_bases": [
+      "DEPED-DO-025-S-2002",
+      "DEPED-DO-043-S-2002"
+    ],
+    "notes": "Historical pre-K-to-12 curriculum; preserve for old learner records and legacy school databases."
+  },
+  {
+    "id": "CHED-GEC-CMO20-2013",
+    "agency": "CHED",
+    "name": "Revised General Education Curriculum under CMO 20 s.2013",
+    "status": "ACTIVE_HISTORY_WITH_IMPLEMENTATION_ADVISORIES",
+    "education_levels": [
+      "UNDERGRADUATE"
+    ],
+    "effective_from": "2018-2019",
+    "effective_until": null,
+    "grade_rollout": {},
+    "legal_bases": [
+      "CHED-CMO-020-S-2013"
+    ],
+    "notes": "Higher-education GE component; use with program PSG and admission cohort rather than as a complete degree curriculum."
+  },
+  {
+    "id": "DEPED-K12-BEC-2012",
+    "agency": "DEPED",
+    "name": "K to 12 Basic Education Curriculum rollout",
+    "status": "HISTORICAL_VERSIONED",
+    "education_levels": [
+      "ELEMENTARY",
+      "JUNIOR_HIGH_SCHOOL"
+    ],
+    "effective_from": "2012-2013",
+    "effective_until": null,
+    "grade_rollout": {
+      "2012-2013": [
+        1,
+        7
+      ]
+    },
+    "legal_bases": [
+      "DEPED-DO-031-S-2012"
+    ],
+    "notes": "Use later curriculum guides/issuances to resolve each grade/year."
+  },
+  {
+    "id": "DEPED-MELCS-2020",
+    "agency": "DEPED",
+    "name": "MELCs-based learning reference",
+    "status": "HISTORICAL_CONTEXTUAL",
+    "education_levels": [
+      "ELEMENTARY",
+      "JUNIOR_HIGH_SCHOOL",
+      "SENIOR_HIGH_SCHOOL"
+    ],
+    "effective_from": "2020-2021",
+    "effective_until": null,
+    "grade_rollout": {},
+    "legal_bases": [],
+    "notes": "Pandemic-era primary reference for adapting learning delivery; do not model MELCs as a timeless replacement curriculum without context."
+  },
+  {
+    "id": "DEPED-MATATAG-K10",
+    "agency": "DEPED",
+    "name": "MATATAG / Revised K to 10 Curriculum",
+    "status": "ACTIVE_PHASED_WITH_AMENDMENTS",
+    "education_levels": [
+      "KINDERGARTEN",
+      "ELEMENTARY",
+      "JUNIOR_HIGH_SCHOOL"
+    ],
+    "effective_from": "2024-2025",
+    "effective_until": null,
+    "grade_rollout": {
+      "2024-2025": [
+        0,
+        1,
+        4,
+        7
+      ],
+      "2025-2026": [
+        2,
+        5,
+        8
+      ],
+      "2026-2027": [
+        3,
+        6,
+        9
+      ],
+      "2027-2028": [
+        10
+      ]
+    },
+    "legal_bases": [
+      "DEPED-DM-054-S-2023",
+      "DEPED-DO-010-S-2024",
+      "DEPED-DO-012-S-2024",
+      "DEPED-DO-020-S-2025"
+    ],
+    "notes": "Rollout map reflects published phase schedule in official MATATAG materials. Always check later implementation issuances for cohort/grade changes before treating the schedule as final current truth."
+  },
+  {
+    "id": "DEPED-SSHS-2025-PILOT",
+    "agency": "DEPED",
+    "name": "Strengthened Senior High School Pilot",
+    "status": "PILOT",
+    "education_levels": [
+      "SENIOR_HIGH_SCHOOL"
+    ],
+    "effective_from": "2025-2026",
+    "effective_until": "2026-2027",
+    "grade_rollout": {
+      "2025-2026": [
+        11
+      ],
+      "2026-2027": [
+        12
+      ]
+    },
+    "legal_bases": [
+      "DEPED-DM-048-S-2025",
+      "DEPED-DM-074-S-2025",
+      "DEPED-DM-036-S-2026"
+    ],
+    "notes": "Pilot schools/cohorts only."
+  },
+  {
+    "id": "DEPED-SSHS-2026",
+    "agency": "DEPED",
+    "name": "Strengthened Senior High School Curriculum",
+    "status": "ACTIVE_TRANSITIONAL",
+    "education_levels": [
+      "SENIOR_HIGH_SCHOOL"
+    ],
+    "effective_from": "2026-2027",
+    "effective_until": null,
+    "grade_rollout": {
+      "2026-2027": [
+        11
+      ]
+    },
+    "legal_bases": [
+      "DEPED-DM-012-S-2026",
+      "DEPED-DO-017-S-2026"
+    ],
+    "notes": "For SY 2026-2027, incoming Grade 11 is under SSHS; non-pilot Grade 12 remains on existing SHS while pilot Grade 12 continues SSHS. Model learner cohort/pilot status."
+  }
+]

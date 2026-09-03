@@ -3,6 +3,7 @@ package txn
 import (
 	"bytes"
 	"sync"
+	"time"
 
 	"github.com/bzync/nextsql/internal/nerr"
 	"github.com/bzync/nextsql/internal/storage/format"
@@ -21,6 +22,7 @@ type waiter struct {
 	mode Mode
 	key  string
 	rng  *keyRange
+	tag  string
 	ch   chan error
 }
 
@@ -29,8 +31,17 @@ type keyRange struct {
 	end   []byte // nil = unbounded
 }
 
+// keyState.tag is a caller-supplied label (table name) for introspection
+// (system.locks). It is set once from the first Acquire that supplies a
+// non-empty tag and never overwritten, so it survives the lock being
+// re-acquired by other holders. The lock table's key namespace is shared
+// across every table in one storage engine, so two different tables can in
+// principle collide on identical raw key bytes; the tag reflects whichever
+// caller happened to create the entry, a pre-existing, documented sharp edge
+// (see TODO.md Phase 26), not something this introspection layer can fix.
 type keyState struct {
 	holders map[format.TxnID]Mode
+	tag     string
 }
 
 // LockManager is a key / range lock table with wait-for deadlock detection.
@@ -40,6 +51,10 @@ type LockManager struct {
 	ranges  []heldRange
 	waiters []*waiter
 	waitFor map[format.TxnID]map[format.TxnID]struct{}
+	// waitTimeout bounds how long Acquire/AcquireRange block on a contended,
+	// non-deadlocking wait. 0 (the default) blocks indefinitely — only
+	// deadlock cycles are ever detected without configuring this.
+	waitTimeout time.Duration
 }
 
 type heldRange struct {
@@ -47,6 +62,16 @@ type heldRange struct {
 	mode  Mode
 	start []byte
 	end   []byte
+	tag   string
+}
+
+// LockInfo is a snapshot of one held key or range lock, for introspection
+// (system.locks). Range is empty for a single-key lock.
+type LockInfo struct {
+	Txn   format.TxnID
+	Mode  Mode
+	Tag   string
+	Range bool
 }
 
 func NewLockManager() *LockManager {
@@ -56,15 +81,15 @@ func NewLockManager() *LockManager {
 	}
 }
 
-func (lm *LockManager) Acquire(txn format.TxnID, key []byte, mode Mode) error {
+func (lm *LockManager) Acquire(txn format.TxnID, key []byte, mode Mode, tag string) error {
 	k := string(key)
 	lm.mu.Lock()
 	if lm.canGrantKey(txn, k, key, mode) {
-		lm.grantKey(txn, k, mode)
+		lm.grantKey(txn, k, mode, tag)
 		lm.mu.Unlock()
 		return nil
 	}
-	w := &waiter{txn: txn, mode: mode, key: k, ch: make(chan error, 1)}
+	w := &waiter{txn: txn, mode: mode, key: k, tag: tag, ch: make(chan error, 1)}
 	lm.waiters = append(lm.waiters, w)
 	lm.setWait(txn, lm.blockersKey(txn, k, key, mode))
 	if lm.hasCycle(txn) {
@@ -73,15 +98,16 @@ func (lm *LockManager) Acquire(txn format.TxnID, key []byte, mode Mode) error {
 		lm.mu.Unlock()
 		return nerr.New(nerr.Deadlock, "txn.Lock", "deadlock detected")
 	}
+	wait := lm.waitTimeout
 	lm.mu.Unlock()
-	return <-w.ch
+	return lm.await(w, txn, wait)
 }
 
 // AcquireRange locks [start, end). A nil end is unbounded.
-func (lm *LockManager) AcquireRange(txn format.TxnID, start, end []byte, mode Mode) error {
+func (lm *LockManager) AcquireRange(txn format.TxnID, start, end []byte, mode Mode, tag string) error {
 	lm.mu.Lock()
 	if lm.canGrantRange(txn, start, end, mode) {
-		lm.grantRange(txn, start, end, mode)
+		lm.grantRange(txn, start, end, mode, tag)
 		lm.mu.Unlock()
 		return nil
 	}
@@ -89,6 +115,7 @@ func (lm *LockManager) AcquireRange(txn format.TxnID, start, end []byte, mode Mo
 		txn:  txn,
 		mode: mode,
 		rng:  &keyRange{start: append([]byte(nil), start...), end: append([]byte(nil), end...)},
+		tag:  tag,
 		ch:   make(chan error, 1),
 	}
 	lm.waiters = append(lm.waiters, w)
@@ -99,8 +126,76 @@ func (lm *LockManager) AcquireRange(txn format.TxnID, start, end []byte, mode Mo
 		lm.mu.Unlock()
 		return nerr.New(nerr.Deadlock, "txn.Lock", "deadlock detected")
 	}
+	wait := lm.waitTimeout
 	lm.mu.Unlock()
-	return <-w.ch
+	return lm.await(w, txn, wait)
+}
+
+// await blocks until w is granted (wake() sends nil on w.ch) or wait
+// elapses. wait <= 0 blocks indefinitely, matching pre-timeout behavior.
+// On timeout it removes w from the waiter set so no other transaction stays
+// blocked behind an abandoned wait — but only if w has not already been
+// granted: wake() removes a waiter from lm.waiters and sends on its channel
+// atomically under lm.mu, so re-checking membership under the same mutex
+// after the timer fires distinguishes "really timed out" from "granted the
+// instant before the timer fired," where the grant must be honored (the
+// lock is really held; failing here without releasing it would leak it).
+func (lm *LockManager) await(w *waiter, txn format.TxnID, wait time.Duration) error {
+	if wait <= 0 {
+		return <-w.ch
+	}
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case err := <-w.ch:
+		return err
+	case <-timer.C:
+		lm.mu.Lock()
+		stillWaiting := false
+		for _, x := range lm.waiters {
+			if x == w {
+				stillWaiting = true
+				break
+			}
+		}
+		if !stillWaiting {
+			lm.mu.Unlock()
+			return <-w.ch
+		}
+		lm.removeWaiter(w)
+		lm.clearWait(txn)
+		lm.mu.Unlock()
+		return nerr.New(nerr.Exhausted, "txn.Lock", "lock wait timeout exceeded")
+	}
+}
+
+// SetWaitTimeout changes the contended-lock wait bound for future
+// Acquire/AcquireRange calls. d <= 0 disables the bound (blocks
+// indefinitely, subject only to deadlock-cycle detection).
+func (lm *LockManager) SetWaitTimeout(d time.Duration) {
+	if d < 0 {
+		d = 0
+	}
+	lm.mu.Lock()
+	lm.waitTimeout = d
+	lm.mu.Unlock()
+}
+
+// Snapshot returns every currently held key/range lock, for introspection
+// (system.locks). Waiting (not-yet-granted) lock requests are not included.
+func (lm *LockManager) Snapshot() []LockInfo {
+	lm.mu.Lock()
+	defer lm.mu.Unlock()
+	out := make([]LockInfo, 0, len(lm.keys)+len(lm.ranges))
+	for _, st := range lm.keys {
+		for id, mode := range st.holders {
+			out = append(out, LockInfo{Txn: id, Mode: mode, Tag: st.tag})
+		}
+	}
+	for _, r := range lm.ranges {
+		out = append(out, LockInfo{Txn: r.txn, Mode: r.mode, Tag: r.tag, Range: true})
+	}
+	return out
 }
 
 func (lm *LockManager) ReleaseAll(txn format.TxnID) {
@@ -176,23 +271,27 @@ func (lm *LockManager) canGrantRange(txn format.TxnID, start, end []byte, mode M
 	return true
 }
 
-func (lm *LockManager) grantKey(txn format.TxnID, k string, mode Mode) {
+func (lm *LockManager) grantKey(txn format.TxnID, k string, mode Mode, tag string) {
 	st := lm.keys[k]
 	if st == nil {
 		st = &keyState{holders: make(map[format.TxnID]Mode)}
 		lm.keys[k] = st
+	}
+	if st.tag == "" && tag != "" {
+		st.tag = tag
 	}
 	if have, ok := st.holders[txn]; !ok || mode == Exclusive || have == Exclusive {
 		st.holders[txn] = mode
 	}
 }
 
-func (lm *LockManager) grantRange(txn format.TxnID, start, end []byte, mode Mode) {
+func (lm *LockManager) grantRange(txn format.TxnID, start, end []byte, mode Mode, tag string) {
 	lm.ranges = append(lm.ranges, heldRange{
 		txn:   txn,
 		mode:  mode,
 		start: append([]byte(nil), start...),
 		end:   append([]byte(nil), end...),
+		tag:   tag,
 	})
 }
 
@@ -317,9 +416,9 @@ func (lm *LockManager) wake() {
 				continue
 			}
 			if w.rng != nil {
-				lm.grantRange(w.txn, w.rng.start, w.rng.end, w.mode)
+				lm.grantRange(w.txn, w.rng.start, w.rng.end, w.mode, w.tag)
 			} else {
-				lm.grantKey(w.txn, w.key, w.mode)
+				lm.grantKey(w.txn, w.key, w.mode, w.tag)
 			}
 			lm.clearWait(w.txn)
 			w.ch <- nil

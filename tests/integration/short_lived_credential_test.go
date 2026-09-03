@@ -2,7 +2,10 @@ package integration
 
 import (
 	"context"
+	"encoding/hex"
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -16,13 +19,18 @@ import (
 )
 
 type slcHarness struct {
-	addr   string
-	issuer *auth.TokenKeyset
-	acl    *security.ACL
-	rev    *auth.TokenRevocations
+	addr      string
+	issuer    *auth.TokenKeyset
+	acl       *security.ACL
+	rev       *auth.TokenRevocations
+	auditPath string
 }
 
 func startSLCServer(t *testing.T, audience string) slcHarness {
+	return startSLCServerWithIdentityHints(t, audience, nil)
+}
+
+func startSLCServerWithIdentityHints(t *testing.T, audience string, hints map[uint32]string) slcHarness {
 	t.Helper()
 	dir := t.TempDir()
 	keyPath := filepath.Join(dir, "master.key")
@@ -84,19 +92,32 @@ func startSLCServer(t *testing.T, audience string) slcHarness {
 	if err != nil {
 		t.Fatal(err)
 	}
+	auditPath := filepath.Join(dir, "nextsql.audit")
+	audit, err := security.OpenAudit(auditPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = audit.Close() })
 
 	srv := protocol.NewServer(db, users)
 	srv.ACL = acl
+	srv.Audit = audit
 	srv.Registry = security.NewRegistry()
 	srv.Tokens = auth.NewTokenVerifier(issuer.PublicOnly(), rev, audience)
+	srv.TokenIdentitySourceHints = hints
 
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	t.Cleanup(func() { _ = srv.Close() })
-	go func() { _ = srv.ListenAndServe(ctx, "127.0.0.1:0") }()
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- srv.ListenAndServe(ctx, "127.0.0.1:0") }()
 	deadline := time.Now().Add(2 * time.Second)
 	for srv.Addr() == nil && time.Now().Before(deadline) {
-		time.Sleep(5 * time.Millisecond)
+		select {
+		case err := <-serveErr:
+			t.Fatalf("server failed to start: %v", err)
+		case <-time.After(5 * time.Millisecond):
+		}
 	}
 	if srv.Addr() == nil {
 		t.Fatal("server did not start")
@@ -110,7 +131,7 @@ func startSLCServer(t *testing.T, audience string) slcHarness {
 		t.Fatal(err)
 	}
 	_ = seed.Close()
-	return slcHarness{addr: addr, issuer: issuer, acl: acl, rev: rev}
+	return slcHarness{addr: addr, issuer: issuer, acl: acl, rev: rev, auditPath: auditPath}
 }
 
 func slcConn(t *testing.T, addr, user, secret string) (*nextsql.Conn, error) {
@@ -135,6 +156,78 @@ func TestShortLivedCredentialAuth(t *testing.T) {
 	defer conn.Close()
 	if _, err := conn.Exec(context.Background(), `CREATE TABLE t (id STRING PRIMARY KEY)`); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestShortLivedCredentialOIDCAuditSourceIsKeyDerivedAndSecretFree(t *testing.T) {
+	h := startSLCServerWithIdentityHints(t, "prod", map[uint32]string{1: "oidc"})
+	tok, id, _, err := h.issuer.Mint(auth.TokenMintRequest{Principal: "app", Audience: "prod", TTL: 10 * time.Minute}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn, err := slcConn(t, h.addr, "app", tok)
+	if err != nil {
+		t.Fatalf("OIDC-key credential rejected: %v", err)
+	}
+	_ = conn.Close()
+
+	var body []byte
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		body, err = os.ReadFile(h.auditPath)
+		if err == nil && strings.Contains(string(body), `"identity_source":"oidc"`) {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(body)
+	if !strings.Contains(text, `"identity_source":"oidc"`) {
+		t.Fatalf("OIDC identity source missing: %s", text)
+	}
+	if strings.Contains(text, tok) || strings.Contains(text, hex.EncodeToString(id[:])) {
+		t.Fatalf("credential or token id leaked to server audit: %s", text)
+	}
+}
+
+func TestForgedOIDCKeyIDCannotUpgradeAuditSource(t *testing.T) {
+	h := startSLCServerWithIdentityHints(t, "prod", map[uint32]string{1: "oidc"})
+	other, err := auth.CreateTokenKeyset(filepath.Join(t.TempDir(), "other.nstk"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Both keysets begin at id 1. The presented id is hinted as OIDC, but the
+	// credential is signed by a different key and therefore must remain a
+	// generic token failure in the server audit.
+	forged, _, _, err := other.Mint(auth.TokenMintRequest{Principal: "app", Audience: "prod", TTL: time.Minute}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := slcConn(t, h.addr, "app", forged); err == nil {
+		t.Fatal("credential signed by an untrusted key was accepted")
+	}
+
+	var body []byte
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		body, err = os.ReadFile(h.auditPath)
+		text := string(body)
+		if err == nil && strings.Contains(text, `"action":"auth.failure"`) && strings.Contains(text, `"identity_source":"token"`) {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(body)
+	if !strings.Contains(text, `"action":"auth.failure"`) || !strings.Contains(text, `"identity_source":"token"`) {
+		t.Fatalf("generic token failure audit missing: %s", text)
+	}
+	if strings.Contains(text, `"identity_source":"oidc"`) || strings.Contains(text, forged) {
+		t.Fatalf("forged credential upgraded its audit source or leaked: %s", text)
 	}
 }
 

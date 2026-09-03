@@ -186,6 +186,9 @@ func bindCreateIndex(s ast.CreateIndex, lookup Lookup) (Bound, error) {
 		if !ok {
 			return nil, nerr.New(nerr.NotFound, "sql.binder", "unknown index column")
 		}
+		if tab.Columns[col].ClientEncrypted() {
+			return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "indexes cannot use an ENCRYPTED CLIENT column")
+		}
 		if s.Spatial && tab.Columns[col].Type.Kind != types.KindPoint {
 			return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "SPATIAL INDEX requires a POINT column")
 		}
@@ -327,6 +330,9 @@ func bindIndexInclude(idx *catalog.Index, tab *catalog.Table, names []string) er
 		if !ok {
 			return nerr.New(nerr.NotFound, "sql.binder", "unknown INCLUDE column")
 		}
+		if tab.Columns[ord].ClientEncrypted() {
+			return nerr.New(nerr.InvalidArgument, "sql.binder", "INCLUDE cannot store an ENCRYPTED CLIENT column")
+		}
 		if _, dup := seen[ord]; dup {
 			return nerr.New(nerr.InvalidArgument, "sql.binder", "duplicate INCLUDE column")
 		}
@@ -361,6 +367,9 @@ func checkIndexExpr(e ast.Expr, tab *catalog.Table) error {
 	}
 	if containsIndexForbiddenCall(e) {
 		return nerr.New(nerr.InvalidArgument, "sql.binder", "index expression cannot use a mutating or geo function")
+	}
+	if err := rejectClientEncryptedExpr(e, tab, "an index expression or predicate"); err != nil {
+		return err
 	}
 	return checkExpr(e, tab, types.Type{}, false)
 }

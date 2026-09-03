@@ -39,7 +39,7 @@ type prunePred struct {
 	eval func(key []string, noise string) bool
 }
 
-func lit(s string) ast.Expr  { return ast.Literal{Value: types.StringValue(s)} }
+func lit(s string) ast.Expr { return ast.Literal{Value: types.StringValue(s)} }
 func bin(op string, l, r ast.Expr) ast.Expr {
 	return ast.Binary{Op: op, Left: l, Right: r}
 }

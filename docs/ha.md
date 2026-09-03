@@ -127,7 +127,7 @@ leader's.
 ### Why `STRONG` reads are linearizable
 
 A `STRONG` read runs only after `Cluster.StrongReadBarrier`
-(`internal/replication/read.go`), which requires both:
+(`internal/replication/read.go`), which requires all of:
 
 1. **This node is the Raft leader.** Raft's election safety and leader
    completeness guarantee that a leader's log contains every entry that was
@@ -141,6 +141,25 @@ A `STRONG` read runs only after `Cluster.StrongReadBarrier`
    the term change. This blocks the **stale-leader anomaly**: a leader
    partitioned away from the quorum fails `VerifyLeader` and cannot answer a
    `STRONG` read from its now-possibly-stale log.
+3. **No unreconciled replication orphan on this node.** `commitAndReplicate`
+   (`internal/storage/engine.go`) holds a transaction's commit record
+   unresolved — not yet durable, visible, or lock-released — until Raft's
+   outcome is known. A **definite** rejection (this node was not the leader
+   when it tried to propose the entry, so it never reached Raft at all —
+   the common case, e.g. a write racing a leadership transfer) discards the
+   held record and rolls the transaction back: no local commit, no orphan.
+   An **ambiguous** failure (the entry *was* proposed, but the quorum wait
+   itself failed or timed out — lost leadership, an enqueue timeout, a
+   mid-flight shutdown) is structurally undecidable, since the WAL's LSN
+   counter has already moved past the record: discarding it could later
+   cause a legitimate replay of an entry that *did* reach quorum to be
+   silently skipped as already-seen. So this one residual case keeps the
+   commit local and sets a node-local flag, `Cluster.ReportReplicationOrphan`,
+   that fails the barrier regardless of the two conditions above — since
+   leadership alone doesn't prove this node's log matches the cluster's, only
+   that quorum recognizes it as leader. An operator clears it with `CLUSTER
+   RECONCILE CONFIRM` after verifying the node's data. See `docs/ops.md`
+   "Correctness note" under Rolling upgrade for the full writeup.
 
 Between the barrier returning and the read executing, the node cannot have
 silently lost and regained leadership without a term change that a subsequent
@@ -189,6 +208,9 @@ mode:
 |---|---|
 | Leader serves `STRONG`; every follower rejects it routably | `TestStrongReadBarrierLeaderOnly` |
 | Partitioned former leader cannot serve `STRONG` from its own log | `TestStrongReadBarrierRejectsIsolatedLeader` |
+| A replication orphan blocks `STRONG` reads on that node (not others) until `CLUSTER RECONCILE CONFIRM` | `TestStrongReadBarrierBlockedByReplicationOrphanUntilReconciled` |
+| A definite (never-proposed) `Replicate` failure leaves no local orphan at all | `TestInsertDiscardsLocalCommitOnDefiniteReplicateFailure`, `TestReplicateOnNonLeaderIsDefiniteNotProposed` |
+| A real leadership transfer racing live writes loses no acknowledged write and leaves no orphan | `TestRollingUpgradeDrainWithLeaderTransferNoTransactionLoss` |
 | `BOUNDED` served only within the freshness bound, rejected once outside it | `TestHABoundedFollowerRead` |
 | `STALE` is a distinct opt-in mode, never the default, never relabelled | `TestHAThreeNodeQuorumCommit`, `TestReadConsistencyModes` |
 | `STRONG` session keeps read-your-writes + monotonic reads across a leader failover | `TestFollowerReadFailoverSessionGuarantee` |
@@ -230,6 +252,26 @@ was contacted within that bound. A rejected node returns `unavailable` so the
 caller can route elsewhere. `STALE` reads do **not** call this gate; they are
 unbounded by definition.
 
+### Replica-lag monitoring (Phase 27)
+
+`apply_backlog` above is readable on demand via `system.replica_health`, but
+by default nothing watches it proactively. Setting `replica_lag_check_ms`
+(config, default 0 = disabled) makes `nextsqld` periodically read its own
+`apply_backlog` and log a warning once it reaches `replica_lag_warn_entries`
+(default 1000), with a matching recovery line once it drops back below —
+edge-triggered, so a steady-state lag condition logs once, not on every
+check. Current backlog and the cumulative warn count are also exposed via
+the metrics registry (`ReplicaApplyBacklog`/`ReplicaLagWarns`).
+
+This is purely an alerting signal, not an admission-control gate: unlike
+[disk watermarks](ops.md#disk-watermarks), there is no reject/blocking
+counterpart, and none is needed — a lagging follower does not affect the
+leader's ability to accept writes, and `FollowerReadHealthy` above already
+refuses to route a read to a follower that has fallen too far behind
+regardless of whether this monitor is enabled. It runs on every node but is
+only ever meaningful on a follower: the leader's own `apply_backlog` is
+always 0, and a single-node deployment (no cluster attached) is a no-op.
+
 ## Follower-read routing
 
 The native protocol carries two additive messages for routing:
@@ -256,6 +298,23 @@ follower that rejects a routed read with `unavailable` is retried on the
 leader. Node roles are re-probed with a 500 ms TTL via `NodeStatus`. Explicit
 transactions and `EXPLAIN` always run on the leader. The router is a client
 convenience — the server independently enforces every barrier.
+
+A statement routed to a node the client's cache believed was the leader (or
+a healthy follower) can still hit a connection that just broke — most
+commonly because that node lost leadership and was then drained or
+restarted for planned maintenance (see `docs/ops.md` "Rolling upgrade")
+faster than the 500 ms cache caught up. The Go router (and every other
+driver's equivalent) distinguishes this from an application-level rejection
+the server sent back deliberately: a transport failure (the connection
+itself, not the query) both invalidates that node's cached role — so the
+next call re-probes instead of continuing to trust a routing decision that
+just proved wrong, and, critically, so a connection that dies for good
+(the underlying transport has no automatic reconnect) permanently stops
+being selected rather than being retried forever — and is itself reported
+to the caller as `unavailable`, the same retryable code a genuine leader
+failover already produces, rather than a raw I/O error. A caller already
+retrying on `unavailable` (the standard pattern for surviving a real
+failover) transparently survives this case too.
 
 ### Writes
 

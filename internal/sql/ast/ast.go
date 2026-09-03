@@ -92,7 +92,43 @@ type (
 		Name     string
 		IfExists bool
 	}
-	ShowTasks struct {
+	// CreateResourceGroup declares a named workload-governance descriptor.
+	// Zero-valued options mean "unbounded" / "unset", the same convention
+	// used by protocol.Limits.MaxSessionsPerUser and hosting storage caps.
+	CreateResourceGroup struct {
+		Name           string
+		MaxConcurrency int
+		MemoryBytes    int64
+		Workers        int
+		Priority       int
+		IfNotExists    bool
+	}
+	// AlterResourceGroup replaces only the options whose Has* flag is set;
+	// omitted options keep the group's current stored value.
+	AlterResourceGroup struct {
+		Name              string
+		MaxConcurrency    int
+		HasMaxConcurrency bool
+		MemoryBytes       int64
+		HasMemoryBytes    bool
+		Workers           int
+		HasWorkers        bool
+		Priority          int
+		HasPriority       bool
+	}
+	DropResourceGroup struct {
+		Name     string
+		IfExists bool
+	}
+	// SetResourceGroup assigns the issuing session's workload governance
+	// class for every statement it runs until RESET or the session ends.
+	SetResourceGroup struct {
+		Name string
+	}
+	// ResetResourceGroup clears a session's resource group assignment,
+	// returning it to unbounded/process-default scheduling.
+	ResetResourceGroup struct{}
+	ShowTasks          struct {
 		After string
 		Limit int
 	}
@@ -104,7 +140,44 @@ type (
 		Operation string
 		After     uint64
 	}
-	DropTable struct {
+	// TransferLeader asks this Raft cluster's current leader to step down in
+	// favor of another voter (CLUSTER TRANSFER LEADER). A no-op on a
+	// single-node deployment's caller sees Unavailable instead.
+	TransferLeader struct{}
+	// ClusterDrain asks the server this connection reached to begin a
+	// graceful drain of itself (CLUSTER DRAIN [WITH (TIMEOUT_MS = n)]) —
+	// stop accepting new connections, close idle ones immediately, wait up
+	// to the timeout for busy ones, then force-close whatever remains.
+	// Purely local to the node the client connected to; unlike
+	// TransferLeader it needs no Raft cluster and works the same on a
+	// single-node deployment. TimeoutMS 0 means "use the server's
+	// configured shutdown_drain_ms".
+	ClusterDrain struct {
+		TimeoutMS int64
+	}
+	// ClusterMaintenance asks the server this connection reached to enter or
+	// leave maintenance mode (CLUSTER MAINTENANCE ENABLE|DISABLE). While
+	// enabled, the node rejects every mutating statement (DML, DDL, and
+	// BEGIN — the same classification requireLeader already uses) with
+	// Unavailable; reads keep working so operators can still inspect state.
+	// Purely local to the node the client connected to, like ClusterDrain:
+	// it is not Raft-replicated, so a leader failover during maintenance
+	// does not carry the flag to the new leader.
+	ClusterMaintenance struct {
+		Enable bool
+	}
+	// ClusterReconcileConfirm asks the server this connection reached to
+	// clear its local replication-suspect flag (CLUSTER RECONCILE CONFIRM).
+	// That flag is set automatically when a local commit could not be
+	// replicated to quorum (see storage.Engine's ReplicationOrphanReporter)
+	// and, while set, blocks this node from serving STRONG reads — an
+	// operator must run this only after verifying/repairing the node's
+	// divergence. The CONFIRM keyword is mandatory, not optional, so the
+	// statement can't be fat-fingered as a bare CLUSTER RECONCILE. Purely
+	// local to the node this connection reached, like ClusterMaintenance:
+	// not Raft-replicated.
+	ClusterReconcileConfirm struct{}
+	DropTable               struct {
 		Name     string
 		IfExists bool
 	}
@@ -114,8 +187,9 @@ type (
 		IfExists bool
 	}
 	RebuildIndex struct {
-		Name  string
-		Table string // resolved before binding; SQL syntax names only the index
+		Name   string
+		Table  string // resolved before binding; SQL syntax names only the index
+		Online bool   // REBUILD INDEX ... ONLINE: build without blocking concurrent writes
 	}
 	AlterTable struct {
 		Table string
@@ -314,6 +388,7 @@ const (
 const (
 	ScheduleEvery ScheduleKind = iota + 1
 	ScheduleAt
+	ScheduleCron
 )
 
 const (
@@ -335,45 +410,54 @@ const (
 	BoundUnboundedFollowing
 )
 
-func (CreateTable) stmt()    {}
-func (CreateDatabase) stmt() {}
-func (CreateWorkflow) stmt() {}
-func (RunWorkflow) stmt()    {}
-func (AlterWorkflow) stmt()  {}
-func (DropWorkflow) stmt()   {}
-func (CreateTrigger) stmt()  {}
-func (AlterTrigger) stmt()   {}
-func (DropTrigger) stmt()    {}
-func (CreateSchedule) stmt() {}
-func (AlterSchedule) stmt()  {}
-func (DropSchedule) stmt()   {}
-func (ShowTasks) stmt()      {}
-func (CancelTask) stmt()     {}
-func (Subscribe) stmt()      {}
-func (CreateIndex) stmt()    {}
-func (DropTable) stmt()      {}
-func (DropIndex) stmt()      {}
-func (RebuildIndex) stmt()   {}
-func (AlterTable) stmt()     {}
-func (Insert) stmt()         {}
-func (Upsert) stmt()         {}
-func (Select) stmt()         {}
-func (SetOperation) stmt()   {}
-func (With) stmt()           {}
-func (Update) stmt()         {}
-func (Delete) stmt()         {}
-func (Begin) stmt()          {}
-func (Commit) stmt()         {}
-func (Rollback) stmt()       {}
-func (Explain) stmt()        {}
-func (Analyze) stmt()        {}
-func (Maintain) stmt()       {}
-func (CreateUser) stmt()     {}
-func (DropUser) stmt()       {}
-func (CreateRole) stmt()     {}
-func (DropRole) stmt()       {}
-func (Grant) stmt()          {}
-func (Revoke) stmt()         {}
+func (CreateTable) stmt()             {}
+func (CreateDatabase) stmt()          {}
+func (CreateWorkflow) stmt()          {}
+func (RunWorkflow) stmt()             {}
+func (AlterWorkflow) stmt()           {}
+func (DropWorkflow) stmt()            {}
+func (CreateTrigger) stmt()           {}
+func (AlterTrigger) stmt()            {}
+func (DropTrigger) stmt()             {}
+func (CreateSchedule) stmt()          {}
+func (AlterSchedule) stmt()           {}
+func (DropSchedule) stmt()            {}
+func (CreateResourceGroup) stmt()     {}
+func (AlterResourceGroup) stmt()      {}
+func (DropResourceGroup) stmt()       {}
+func (SetResourceGroup) stmt()        {}
+func (ResetResourceGroup) stmt()      {}
+func (ShowTasks) stmt()               {}
+func (CancelTask) stmt()              {}
+func (Subscribe) stmt()               {}
+func (TransferLeader) stmt()          {}
+func (ClusterDrain) stmt()            {}
+func (ClusterMaintenance) stmt()      {}
+func (ClusterReconcileConfirm) stmt() {}
+func (CreateIndex) stmt()             {}
+func (DropTable) stmt()               {}
+func (DropIndex) stmt()               {}
+func (RebuildIndex) stmt()            {}
+func (AlterTable) stmt()              {}
+func (Insert) stmt()                  {}
+func (Upsert) stmt()                  {}
+func (Select) stmt()                  {}
+func (SetOperation) stmt()            {}
+func (With) stmt()                    {}
+func (Update) stmt()                  {}
+func (Delete) stmt()                  {}
+func (Begin) stmt()                   {}
+func (Commit) stmt()                  {}
+func (Rollback) stmt()                {}
+func (Explain) stmt()                 {}
+func (Analyze) stmt()                 {}
+func (Maintain) stmt()                {}
+func (CreateUser) stmt()              {}
+func (DropUser) stmt()                {}
+func (CreateRole) stmt()              {}
+func (DropRole) stmt()                {}
+func (Grant) stmt()                   {}
+func (Revoke) stmt()                  {}
 
 // AlterCmd is one ALTER TABLE action.
 type AlterCmd interface{ alterCmd() }
@@ -447,12 +531,15 @@ type ForeignKeyDef struct {
 }
 
 type ColumnDef struct {
-	Name       string
-	Type       types.Type
-	NotNull    bool
-	Primary    bool
-	Default    Expr
-	References *ForeignKeyDef
+	Name string
+	Type types.Type
+	// EncryptedClient stores only randomized client ciphertext on the server.
+	// Type remains the logical plaintext type in the AST.
+	EncryptedClient bool
+	NotNull         bool
+	Primary         bool
+	Default         Expr
+	References      *ForeignKeyDef
 }
 
 // Expr is a parsed expression.

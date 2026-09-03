@@ -44,6 +44,35 @@ func TestReadFrameRejectsBadMagic(t *testing.T) {
 	}
 }
 
+// TestReadFrameClassifiesTransportFailureAsIO asserts a genuine transport
+// failure (connection closed mid-read) is reported as nerr.IO, not
+// nerr.Protocol — nothing about the frame's contents was ever examined, so
+// it cannot be a protocol violation. This distinction matters to callers
+// like nextsql.Cluster's router, which uses the IO code specifically to
+// recognize "this connection just broke, stop trusting it and retry
+// elsewhere" without risking misclassifying a real protocol error (bad
+// magic, unsupported version, oversized packet — all still nerr.Protocol,
+// see the tests above) as a transient, retryable condition.
+func TestReadFrameClassifiesTransportFailureAsIO(t *testing.T) {
+	// Header short-read: fewer bytes than HeaderSize, so io.ReadFull fails
+	// with io.ErrUnexpectedEOF before any header field is examined.
+	short := make([]byte, HeaderSize-1)
+	if _, _, err := ReadFrame(bytes.NewReader(short), 1024); !nerr.HasCode(err, nerr.IO) {
+		t.Fatalf("header short-read: got %v, want nerr.IO", err)
+	}
+
+	// Payload short-read: a valid, fully-formed header declaring a payload
+	// longer than what's actually available.
+	hdr := make([]byte, HeaderSize)
+	copy(hdr[0:4], Magic)
+	hdr[4] = byte(Version)
+	hdr[6] = byte(TypeQuery)
+	hdr[8], hdr[9], hdr[10], hdr[11] = 10, 0, 0, 0 // declares 10 payload bytes (little-endian u32)
+	if _, _, err := ReadFrame(bytes.NewReader(hdr), 1024); !nerr.HasCode(err, nerr.IO) {
+		t.Fatalf("payload short-read: got %v, want nerr.IO", err)
+	}
+}
+
 func FuzzReadFrame(f *testing.F) {
 	var buf bytes.Buffer
 	_ = WriteFrame(&buf, TypeHello, []byte{1, 2, 3}, DefaultMaxPacket)

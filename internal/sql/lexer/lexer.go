@@ -1,6 +1,7 @@
 package lexer
 
 import (
+	"encoding/hex"
 	"strings"
 	"unicode"
 	"unicode/utf8"
@@ -16,6 +17,7 @@ const (
 	String
 	Number
 	Param
+	HexLit // X'...' BLOB literal; Lit holds the decoded raw bytes
 	// keywords
 	KwCreate
 	KwTable
@@ -58,8 +60,25 @@ const (
 	KwUuid
 	KwString
 	KwText
+	KwBlob
+	KwInt8
+	KwInt16
+	KwInt32
+	KwInt64
+	KwUint8
+	KwUint16
+	KwUint32
+	KwUint64
+	KwChar
+	KwVarchar
+	KwEnum
+	KwFloat32
+	KwFloat64
 	KwDecimal
 	KwTimestamptz
+	KwTimestamp
+	KwDate
+	KwTime
 	KwJson
 	KwVector
 	KwF32
@@ -154,11 +173,23 @@ const (
 	KwSchedule
 	KwEvery
 	KwAt
+	KwCron
 	KwShow
 	KwTask
 	KwTasks
 	KwCancel
 	KwSubscribe
+	KwEncrypted
+	KwClient
+	KwTransfer
+	KwLeader
+	KwResource
+	KwDrain
+	KwMaintenance
+	KwEnable
+	KwDisable
+	KwReconcile
+	KwConfirm
 	// symbols
 	LParen
 	RParen
@@ -185,7 +216,7 @@ func (k Kind) String() string {
 }
 
 var kindNames = map[Kind]string{
-	EOF: "EOF", Ident: "ident", String: "string", Number: "number", Param: "param",
+	EOF: "EOF", Ident: "ident", String: "string", Number: "number", Param: "param", HexLit: "hex literal",
 	LParen: "(", RParen: ")", Comma: ",", Dot: ".", Star: "*", Eq: "=", Neq: "<>",
 	Lt: "<", Gt: ">", Lte: "<=", Gte: ">=", Plus: "+", Minus: "-", Slash: "/", Semi: ";",
 }
@@ -285,6 +316,9 @@ func (l *Lexer) Next() Token {
 	if isDigit(c) {
 		return l.number(pos)
 	}
+	if (c == 'x' || c == 'X') && l.i+1 < len(l.src) && l.src[l.i+1] == '\'' {
+		return l.hexLiteral(pos)
+	}
 	if isIdentStart(c) {
 		return l.ident(pos)
 	}
@@ -341,6 +375,28 @@ func (l *Lexer) string(pos int) Token {
 	}
 	l.fail("unterminated string")
 	return Token{Kind: EOF, Pos: pos}
+}
+
+// hexLiteral scans an X'...' BLOB literal. The body must be an even number
+// of hex digits (0-9, a-f, A-F); X” is the empty blob.
+func (l *Lexer) hexLiteral(pos int) Token {
+	l.i += 2 // 'x'/'X' and opening '
+	start := l.i
+	for l.i < len(l.src) && l.src[l.i] != '\'' {
+		l.i++
+	}
+	if l.i >= len(l.src) {
+		l.fail("unterminated hex literal")
+		return Token{Kind: EOF, Pos: pos}
+	}
+	digits := l.src[start:l.i]
+	l.i++ // closing '
+	raw, err := hex.DecodeString(digits)
+	if err != nil {
+		l.fail("invalid hex literal")
+		return Token{Kind: EOF, Pos: pos}
+	}
+	return Token{Kind: HexLit, Lit: string(raw), Pos: pos}
 }
 
 func (l *Lexer) quotedIdent(pos int) Token {
@@ -443,7 +499,10 @@ var keywords = map[string]Kind{
 	"between": KwBetween, "in": KwIn, "is": KwIs, "limit": KwLimit, "offset": KwOffset, "as": KwAs, "true": KwTrue,
 	"false": KwFalse, "transaction": KwTransaction, "read": KwRead, "committed": KwCommitted,
 	"snapshot": KwSnapshot, "serializable": KwSerializable, "uuid": KwUuid, "string": KwString,
-	"text": KwText, "decimal": KwDecimal, "timestamptz": KwTimestamptz, "json": KwJson,
+	"text": KwText, "blob": KwBlob, "int8": KwInt8, "int16": KwInt16, "int32": KwInt32, "int64": KwInt64,
+	"uint8": KwUint8, "uint16": KwUint16, "uint32": KwUint32, "uint64": KwUint64,
+	"char": KwChar, "varchar": KwVarchar, "enum": KwEnum, "float32": KwFloat32, "float64": KwFloat64,
+	"decimal": KwDecimal, "timestamptz": KwTimestamptz, "timestamp": KwTimestamp, "date": KwDate, "time": KwTime, "json": KwJson,
 	"vector": KwVector, "bitvector": KwBitvector, "sparsevector": KwSparsevector, "f32": KwF32, "f16": KwF16, "i8": KwI8, "explain": KwExplain, "analyze": KwAnalyze, "maintain": KwMaintain,
 	"point": KwPoint, "box": KwBox, "location": KwLocation,
 	"linestring": KwLineString, "polygon": KwPolygon, "spatial": KwSpatial,
@@ -466,9 +525,18 @@ var keywords = map[string]Kind{
 	"union":     KwUnion,
 	"intersect": KwIntersect, "except": KwExcept,
 	"with": KwWith, "over": KwOver,
-	"schedule": KwSchedule, "every": KwEvery, "at": KwAt,
+	"schedule": KwSchedule, "every": KwEvery, "at": KwAt, "cron": KwCron,
 	"upsert": KwUpsert, "returning": KwReturning,
 	"workflow": KwWorkflow, "run": KwRun, "trigger": KwTrigger,
 	"before": KwBefore, "after": KwAfter, "each": KwEach,
 	"show": KwShow, "task": KwTask, "tasks": KwTasks, "cancel": KwCancel, "subscribe": KwSubscribe,
+	"encrypted": KwEncrypted, "client": KwClient,
+	"transfer": KwTransfer, "leader": KwLeader,
+	"resource":    KwResource,
+	"drain":       KwDrain,
+	"maintenance": KwMaintenance,
+	"enable":      KwEnable,
+	"disable":     KwDisable,
+	"reconcile":   KwReconcile,
+	"confirm":     KwConfirm,
 }

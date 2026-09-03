@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Bzync Codebase Profile",
+  "type": "object",
+  "required": ["schema_version", "generator", "company", "root_name", "scan", "structure"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "generator": {"const": "bzync-skill"},
+    "company": {"const": "Bzync Software Development Services"},
+    "root_name": {"type": "string", "minLength": 1},
+    "scan": {
+      "type": "object",
+      "required": [
+        "file_count_scanned",
+        "max_files",
+        "truncated",
+        "ignored_directories",
+        "sensitive_paths_excluded",
+        "symlinks_excluded",
+        "content_redaction_applied"
+      ],
+      "properties": {
+        "file_count_scanned": {"type": "integer", "minimum": 0},
+        "max_files": {"type": "integer", "minimum": 1},
+        "truncated": {"type": "boolean"},
+        "ignored_directories": {
+          "type": "array",
+          "items": {"type": "string"},
+          "uniqueItems": true
+        },
+        "sensitive_paths_excluded": {"const": true},
+        "symlinks_excluded": {"const": true},
+        "content_redaction_applied": {"const": true}
+      },
+      "additionalProperties": true
+    },
+    "structure": {
+      "type": "object",
+      "required": ["top_level_directories", "top_level_files"],
+      "properties": {
+        "top_level_directories": {"type": "array", "items": {"type": "string"}},
+        "top_level_files": {"type": "array", "items": {"type": "string"}}
+      },
+      "additionalProperties": false
+    },
+    "languages": {"type": "array"},
+    "frameworks": {"type": "array"},
+    "software": {"type": "object"},
+    "ui_ux": {"type": "object"},
+    "infrastructure": {"type": "object"},
+    "quality": {"type": "object"},
+    "commands": {
+      "type": "object",
+      "additionalProperties": {"type": "string"}
+    }
+  },
+  "additionalProperties": true
+}

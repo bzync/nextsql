@@ -89,11 +89,23 @@ func (p *Pool) SetHooks(h Hooks) {
 }
 
 func New(f *file.Manager, n int) (*Pool, error) {
+	return NewWithBudget(f, n, nil)
+}
+
+// NewWithBudget is New, additionally charging n frames against budget before
+// allocating them. A nil budget behaves exactly like New. The caller must
+// release the same n frames (via budget.Release) when the pool's owning
+// Engine closes — Pool itself has no lifecycle hook for this, since a Pool
+// is never closed independently of its Engine.
+func NewWithBudget(f *file.Manager, n int, budget *Budget) (*Pool, error) {
 	if f == nil {
 		return nil, nerr.New(nerr.InvalidArgument, "buffer.New", "nil file manager")
 	}
 	if n < 1 {
 		return nil, nerr.New(nerr.InvalidArgument, "buffer.New", "buffer pool must have at least one frame")
+	}
+	if err := budget.Reserve(n); err != nil {
+		return nil, err
 	}
 	p := &Pool{
 		file:   f,

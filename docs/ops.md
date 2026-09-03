@@ -13,15 +13,23 @@ measurement, not optional footnotes.
 ## Upgrade / format compatibility
 
 Every persisted family has a version and a compatibility window in
-`internal/upgrade.Catalog`. This binary reads only versions in
+`internal/upgrade/compat.Catalog`. This binary reads only versions in
 `[MinReadable, MaxReadable]`. There is no silent rewrite of an unknown
 version. A newer file fails closed; an older-than-min file fails closed.
+The superblock (`internal/storage/file.decodeSuperblock`) and catalog
+table decoder (`catalog.DecodeTable`) enforce this same catalog directly
+(`compat.Check`), so what `nextsql diagnose` prints below is guaranteed to
+match what actually opens — not a separately maintained number that could
+drift. The error names the actual and required version numbers.
 
-Most families are **v1**; the catalog descriptor (`NSCT`) is at **v9**
-(readable 1..9). Opening a data directory this binary can read is the
+Most families are **v1**; the catalog descriptor (`NSCT`) is at **v10**
+(readable 1..10). Opening a data directory this binary can read is the
 supported path. A future format bump must either widen
 `MaxReadable` or add an explicit rewrite increment — not an in-place
-guess.
+guess. See `docs/storage-format.md` "Format and catalog migration
+strategy" for what's safe to migrate online (catalog-record changes, via
+the existing multi-version-decode pattern) versus what requires the
+offline dump/reload path (physical page/superblock layout changes).
 
 ```text
 nextsql diagnose --data-dir DIR
@@ -57,6 +65,15 @@ unreachable; it never automatically frees a suspected orphan.
 - `fk_checks`, `fk_violations`, `fk_cascade_rows`, `fk_cascade_reject` (no keys or payloads)
 - index rebuild attempts, failures, rows scanned, entries produced, and total duration
 - maintenance runs, failures, physical tombstones removed, and total duration
+- replication orphans: a transaction that committed locally after an
+  ambiguous/in-doubt `Replicate` failure — the one residual case that still
+  commits locally without confirmed quorum (see "Rolling upgrade" below for
+  the full writeup); 0 in normal operation, a growing count is the
+  operator-visible signal of that narrow, structurally-unavoidable case
+- disk total/free bytes and cumulative warn/reject counts (see "Disk
+  watermarks" above)
+- this node's replication apply backlog and cumulative lag-warn count (see
+  "Replica-lag monitoring" in `docs/ha.md`)
 - heap, total alloc, goroutines, CPU
 
 Page encrypt/decrypt in `crypto.SealPage` / `OpenPage` observe the
@@ -113,6 +130,409 @@ cancels or fails closed (`exhausted`) instead of growing without bound.
 `nextsqld` installs the gate from config after open (including
 `--require-client-key` unlock). Protocol `MaxSessions` still bounds
 accepted connections.
+
+A session assigned to a resource group (`SET RESOURCE GROUP name`, see
+"RESOURCE GROUP" in `docs/sql.md`) with a non-zero `MAX_CONCURRENCY` gets a
+**second** admission gate on top of the one above — never instead of it. Both
+must admit a query; a group can only add a tighter ceiling, never a looser
+or independent one, so per-workload concurrency limits cannot bypass the
+process-wide `max_inflight_queries`/`max_query_queue` limits. A group's
+`WORKERS`/`MEMORY` similarly override the assigned session's per-query
+budget (`WORKERS` still clamped to the process worker ceiling).
+
+## Connection limits
+
+Five node-local, process-wide `protocol.Limits` fields, configurable and
+distinct from the admission gate above (which bounds concurrent query
+*execution*, not connection count):
+
+```text
+max_connections=128
+max_connections_per_user=0
+max_connections_per_database=0
+max_connections_per_realm=0
+idle_timeout_ms=60000
+```
+
+`max_connections` (default 128) rejects a new TCP/TLS accept once the
+process-wide connection count is reached — before any bytes are read, so it
+never returns a wire-level error, the connection is simply closed.
+`max_connections_per_user` (default 0 = unlimited) rejects a connection
+*after* authentication succeeds but before a session is created, once that
+user name already holds the configured number of concurrent connections;
+the client sees `exhausted` ("too many connections for user"). Closing one
+of the user's connections frees a slot for a subsequent connection.
+`max_connections_per_database`/`max_connections_per_realm` (default 0 =
+unlimited, P27's own last exit-gate item, closed once multi-database
+hosting shipped selectable per-process databases) work the same way, keyed
+on the resolved `(realm, database)` pair or realm name instead of the user
+name — `too many connections for database`/`too many connections for
+realm`. A database's counter and its realm's counter are independent:
+exhausting one database's own limit never blocks a connection to a
+different database in the same realm, but every database in a realm shares
+that realm's own counter. On a single-database (non-hosted) deployment
+these still work, just against the one pinned database/realm — a
+finer-grained alternative to `max_connections` there.
+`idle_timeout_ms` (default 60000) overrides the per-read socket deadline
+applied between frames on every connection (Hello, Auth, and every
+subsequent request); a connection that sends nothing within the window is
+dropped. None of these three are synchronized across a Raft cluster — each
+node enforces its own accepted-connection state.
+
+## Statement, transaction, lock, and idle-transaction timeouts
+
+```text
+statement_timeout_ms=30000
+transaction_timeout_ms=0
+lock_timeout_ms=0
+idle_transaction_timeout_ms=0
+```
+
+`statement_timeout_ms` overrides the per-statement `scheduler.Budget` wall-clock
+bound (`scheduler.DefaultTimeout`, 30 s, when unset). This budget is checked
+throughout query execution — scans, index lookups, ANALYZE, vector/full-text
+search, DDL rebuilds, workflows/triggers — so an over-budget statement fails
+`exhausted` rather than running unbounded; 0/unset leaves the 30 s default in
+place. `transaction_timeout_ms` (default 0 = unbounded) bounds a transaction's
+total open lifetime, from `BEGIN` (or the first statement of an implicit
+autocommit transaction) to `COMMIT`/`ROLLBACK`: once exceeded, the *next*
+statement dispatched inside it — even `COMMIT` — force-aborts the transaction
+and fails `exhausted` instead of being allowed to complete; the connection
+itself stays usable for a fresh transaction afterward. Unlike
+`idle_timeout_ms`/the statement timeout, this has no historical non-zero
+default, so upgrading never starts aborting already-long-running transactions
+(e.g. bulk loads) unless an operator opts in. `lock_timeout_ms` (default 0 =
+block indefinitely) bounds how long a contended, non-deadlocking key/range
+lock wait blocks before failing `exhausted`; only deadlock *cycles* are
+detected without this — a two-party non-cyclic wait (one transaction holding
+a row another wants, with no wait-for cycle) blocks forever unless
+`lock_timeout_ms` is set. It is process-wide, not per-connection (unlike the
+other two): the lock table has no per-caller identity to key a limit off, so
+one operator-configured bound applies to every contended wait engine-wide.
+`idle_transaction_timeout_ms` (default 0 = no distinct bound) bounds how long
+a connection may sit with an open transaction and no traffic between frames
+before it is force-timed-out and the transaction released — distinct from
+`transaction_timeout_ms` above in *how* it is enforced: `transaction_timeout_ms`
+is only checked lazily when the next statement arrives, so a connection that
+never sends another statement keeps the transaction (and its locks) open
+indefinitely regardless of that setting; `idle_transaction_timeout_ms` is
+instead enforced by the connection's own socket read deadline (the same
+mechanism as `idle_timeout_ms`, just with its own, typically tighter, bound
+that applies only while a transaction is open), so it actively reclaims the
+transaction even if the client goes silent. 0 leaves an idle transaction
+governed only by the general `idle_timeout_ms` deadline, matching pre-P27
+behavior. Closing a connection this way — or any other way while a
+transaction is still open, including a forced close at the drain deadline —
+now always force-rolls-back that transaction first, so its locks are never
+left held by a session nothing will ever resume.
+
+None of these four are synchronized across a Raft cluster — each node
+enforces its own configured bound against its own local wall-clock/lock
+state.
+
+## Graceful shutdown (drain)
+
+```text
+shutdown_drain_ms=30000
+```
+
+On SIGINT/SIGTERM, `nextsqld` stops accepting new connections immediately,
+then closes each existing connection as soon as it is idle — no in-flight
+statement and no open transaction — instead of force-aborting whatever is
+mid-flight. A connection sitting inside an open, otherwise-idle transaction
+(`BEGIN` with no `COMMIT`/`ROLLBACK` yet) counts as busy and is left open
+until it finishes or the deadline arrives — and so does a connection whose
+just-finished statement's response is still being written back to it, even
+after the statement itself has completed (this matters most for a
+`CLUSTER DRAIN` connection specifically, since its own trigger and the idle
+check are otherwise synchronous). Any connection still busy once
+`shutdown_drain_ms` (default 30000) elapses is force-closed, same as before
+this existed. `shutdown_drain_ms=0` disables waiting for busy connections
+(immediate hard close, matching pre-P27 behavior); the process still exits
+once the (now instant) drain finishes.
+
+This is `protocol.Server.Drain`, a Go-level primitive. It runs automatically
+inside `nextsqld`'s own signal handling, and — see "Remote drain" below — can
+also be triggered over a live connection without a restart or a signal.
+
+## Remote drain
+
+```text
+nextsql cluster drain [--timeout-ms N] [--addr HOST:PORT] [--user NAME] [--password-file FILE]
+```
+
+Issues `CLUSTER DRAIN [WITH (TIMEOUT_MS = n)]` over a live connection to the
+node at `--addr`, asking that node's own `protocol.Server` to begin the same
+graceful drain described above — immediately, no signal or restart required.
+`--timeout-ms` (0, the default, uses that node's configured
+`shutdown_drain_ms`) is how long it waits for busy connections before
+force-closing them. Requires cluster `ADMIN`. Unlike `CLUSTER TRANSFER
+LEADER`, this needs no Raft cluster and is not gated on being issued against
+the leader — draining is purely local to whichever node the connection
+reaches, so a follower is exactly as drainable as a leader (the common case:
+drain one node for maintenance without disturbing leadership elsewhere).
+`nextsql cluster drain` is equivalent to `nextsql exec -c 'CLUSTER DRAIN'`
+with the same connection flags. The drain itself runs in the background on
+the target node, so the issuing connection gets an immediate
+`drain_initiated` acknowledgment rather than blocking for the full timeout —
+that connection will itself be closed once it goes idle, like any other.
+
+## Leader transfer
+
+```text
+nextsql cluster transfer-leader [--addr HOST:PORT] [--user NAME] [--password-file FILE]
+```
+
+Issues the `CLUSTER TRANSFER LEADER` admin statement over a live connection
+to a Raft-clustered deployment's current leader, asking it to hand off to
+another voter (`replication.Cluster.TransferLeadership`, wrapping
+`raft.Raft.LeadershipTransfer`). Requires `ADMIN ON CLUSTER`. It is a planned
+handoff — unlike a crashed-leader failover, callers see no write
+unavailability window — and is the tool to reach for before restarting or
+taking a leader node down for maintenance so the new leader is already
+serving before the old one stops. It fails `Unavailable` on a single-node
+deployment (no cluster attached) and `InvalidArgument` if issued inside an
+open transaction. `nextsql cluster transfer-leader` is equivalent to
+`nextsql exec -c 'CLUSTER TRANSFER LEADER'` with the same connection flags;
+either prints the result as the usual tab-separated `nextsql exec` output.
+There is no way to target a specific destination voter yet — Raft picks the
+best-caught-up one — matching the current `TransferLeadership()` library
+call.
+
+## Maintenance mode
+
+```text
+nextsql cluster maintenance enable|disable [--addr HOST:PORT] [--user NAME] [--password-file FILE]
+```
+
+Issues `CLUSTER MAINTENANCE ENABLE` / `DISABLE` over a live connection to the
+node at `--addr`. While enabled, that node rejects every mutating statement —
+`INSERT`/`UPSERT`/`UPDATE`/`DELETE`, every DDL statement, and `BEGIN` — with
+`Unavailable`, using the same write/no-write classification `requireLeader`
+already applies for leader routing (so a transaction is blocked at `BEGIN`
+regardless of whether it would have only read; there is no way to know in
+advance). Reads keep working — autocommit `SELECT`, `SHOW`, and `system.*`
+queries are unaffected — so operators can still confirm state and drive the
+maintenance work itself over the same connection. Requires cluster `ADMIN`
+and cannot be issued inside a transaction.
+
+Like remote drain and unlike leader transfer, this is purely local to
+whichever node the connection reaches — not Raft-replicated — so it works
+the same on a single-node deployment and needs no attached cluster. On a
+Raft-clustered deployment this means enabling it on the current leader is
+what actually blocks writes cluster-wide (since only the leader accepts
+writes in the first place); enabling it on a follower is a no-op for write
+traffic (followers already reject writes via the leader-routing gate) but
+still blocks that follower's own read-write transaction attempts and reads
+`system.replication.maintenance_mode = true` locally. **The flag does not
+survive a leader failover** — if leadership moves during a maintenance
+window (a crash, or a `CLUSTER TRANSFER LEADER` issued while maintenance is
+still enabled), the new leader is not automatically in maintenance mode;
+re-issue `CLUSTER MAINTENANCE ENABLE` against it. The intended sequence for
+planned per-node maintenance that must not race a concurrent write is:
+enable maintenance mode on the leader, perform the maintenance step (a
+schema change, a `nextsql cluster drain` / restart of a follower, etc.),
+then disable it — `CLUSTER TRANSFER LEADER` and `CLUSTER DRAIN` remain
+usable while maintenance mode is enabled, since both are handled before the
+mutating-statement classification is reached.
+
+Current state is visible via `SHOW CLUSTER` / `SELECT maintenance_mode FROM
+system.replication` on any node. Not to be confused with the unrelated
+`MAINTAIN` statement or `DB.PauseMaintenance`/`ResumeMaintenance` documented
+above — those pause the background dead-version cleanup scheduler, not
+client query traffic. `nextsql cluster maintenance enable` is equivalent to
+`nextsql exec -c 'CLUSTER MAINTENANCE ENABLE'` with the same connection
+flags.
+
+## Disk watermarks
+
+```
+disk_watermark_check_ms=60000
+disk_watermark_warn_percent=85
+disk_watermark_reject_percent=95
+```
+
+Optional, off by default (`disk_watermark_check_ms=0`). When enabled and
+`--data-dir` is set, `nextsqld` runs a background goroutine that periodically
+statfs's the volume holding the data directory
+(`internal/diskspace.Stat` — `statfs(2)`/`GetDiskFreeSpaceEx`, so it reports
+the physical filesystem, not NextSQL's own logical `storage_cap_bytes`) and
+acts on used-space percentage:
+
+- At or above `disk_watermark_warn_percent` (default 85), logs a warning.
+- At or above `disk_watermark_reject_percent` (default 95), additionally
+  rejects every mutating statement with `Unavailable` — the same
+  classification and enforcement point as [maintenance mode](#maintenance-mode)
+  above, but a **separate, independent flag**: an operator's `CLUSTER
+  MAINTENANCE DISABLE` does not clear a disk-watermark trip, and a
+  disk-watermark recovery does not clear an operator's maintenance window.
+  Reads keep working throughout, same as maintenance mode.
+
+The two thresholds use hysteresis to avoid flapping right at one boundary:
+once tripped, the reject state only clears after usage drops back **below
+the warn line**, not merely below the (higher) reject line. `Validate()`
+requires `disk_watermark_warn_percent < disk_watermark_reject_percent`.
+
+This is node-local and not Raft-replicated (like maintenance mode and
+remote drain) — on a cluster, only the leader accepting writes matters for
+write traffic; a tripped follower still blocks its own local write
+attempts. It is a last-resort backstop against actually running out of disk
+mid-write, not a substitute for capacity planning or WAL/backup retention
+policies (see [WAL retention](wal.md#automatic-time-based-retention-wal_retention_ms)
+and `nextsql backup prune`) — configure those first so this trips rarely if
+ever. Current disk usage and cumulative warn/reject counters are exposed via
+the metrics registry (`internal/metrics.Snapshot.DiskTotalBytes`/
+`DiskFreeBytes`/`DiskWatermarkWarns`/`DiskWatermarkRejects`).
+
+## Rolling upgrade
+
+Procedure for taking one node of a Raft-clustered deployment down for a
+binary upgrade (or any other maintenance that requires stopping its
+process) without an availability or data-loss window, repeated once per
+node:
+
+1. If the node is the current leader, issue `nextsql cluster
+   transfer-leader` against it first. This is a planned handoff — unlike a
+   crashed-leader failover, callers see no write-unavailability window at
+   all (see "Leader transfer" above). Wait for a new leader to be confirmed
+   (`SHOW CLUSTER` / `system.replication.has_leader` on a remaining node)
+   before continuing; skip this step entirely for a node that is already a
+   follower.
+2. Issue `nextsql cluster drain [--timeout-ms N]` against the node. This
+   stops it accepting new connections, closes idle ones immediately, and
+   waits up to `N` (default: its configured `shutdown_drain_ms`) for busy
+   ones to finish before force-closing whatever remains and closing its
+   listener — see "Remote drain" above. Choose `N` generously enough that
+   ordinary statements on this deployment finish comfortably inside it; a
+   connection still busy exactly at the deadline is force-closed like any
+   other drain (see the correctness note below).
+3. Stop the process, upgrade the binary, and restart it. It rejoins the
+   Raft cluster as a follower and replays from where it left off; wait for
+   it to catch up (`system.replica_health.apply_backlog` back to 0, or
+   `applied_lsn` matching the leader's) before moving on to the next node.
+4. Repeat for the next node. A 3-voter deployment keeps quorum (2 of 3)
+   throughout every single node's cycle, so writes never stop landing
+   cluster-wide during a properly sequenced rolling upgrade — only the node
+   being upgraded itself is briefly unreachable.
+
+`CLUSTER MAINTENANCE ENABLE` (see above) is not part of this sequence by
+default — draining and restarting one node at a time is already safe on its
+own, since the surviving majority keeps serving writes. Reach for
+maintenance mode in addition to this sequence only when the upgrade is
+paired with something that specifically must not race a concurrent write
+cluster-wide (an online schema change, say): enable it on the leader before
+step 1 of the *first* node's cycle, leave it enabled across every node's
+cycle, and disable it only after the last node rejoins — remembering to
+re-issue `CLUSTER MAINTENANCE ENABLE` against whichever node ends up leader
+after each `CLUSTER TRANSFER LEADER`, since the flag is node-local and does
+not follow leadership (see the maintenance-mode section above).
+
+**Tested by** `tests/integration/rolling_upgrade_test.go`
+`TestRollingUpgradeDrainWithLeaderTransferNoTransactionLoss`: a 3-node
+cluster under continuous write load goes through steps 1–3 for one node
+(transfer leadership away, drain — which also closes its listener — take
+its Raft transport down to stand in for the process restart, then bring it
+back), and the test asserts every acknowledged write survives and the
+rolled node converges back to the cluster's state once it rejoins. This is
+the first Phase 27 exit-gate line, "planned maintenance can drain without
+unnecessary transaction loss."
+
+**Correctness note (structural fix landed 2026-09-03; see TODO.md's Phase 27
+exit gate and log #79 for the full history and design):**
+`storage.Engine.commitAndReplicate` used to commit a transaction to local
+storage *before* calling `Cluster.Replicate` for Raft quorum. If a write
+raced a leader transition (`CLUSTER TRANSFER LEADER` in step 1 above being
+the in-scope case, but a crash failover has the identical race) such that
+`Replicate` failed after the local commit already succeeded, that local
+commit was never rolled back — the client correctly saw the write fail
+(`Unavailable`, safe to retry), but the node could be left holding one
+un-replicated local row that ordinary Raft log-replication catch-up never
+reconciled away. This was deferred twice, each time in favor of a
+mitigation, before the structural fix below finally landed.
+
+**The fix**: a transaction's commit record is now held — appended to the
+WAL but kept out of the durable prefix, not yet visible, locks not yet
+released — via a new `wal.Log.AppendHeld`/`ReleaseHold` durability-barrier
+primitive, until `Replicate`'s outcome is known. The outcome splits in two:
+
+- **Definite failure** — this node was rejected before it could even
+  propose the entry to Raft (`raft.State() != Leader`, checked before
+  `raft.Apply` is called). This is the common, in-scope case above: any
+  write landing during a leadership-transfer window. The held record is
+  discarded and the transaction rolled back cleanly. No local commit ever
+  happened, so there is nothing to reconcile and no orphan.
+- **Ambiguous/in-doubt failure** — the entry *was* proposed (`raft.Apply`
+  was called) but the quorum wait itself failed or timed out (lost
+  leadership mid-flight, an enqueue timeout, a shutdown racing the call).
+  Whether the entry actually reached quorum before the failure can't be
+  known from here, and the WAL's LSN counter has already moved past the
+  held record — discarding it would risk a *worse* outcome than today's
+  known orphan: if the entry did reach quorum, a later legitimate replay of
+  it would be silently skipped as already-seen rather than applied,
+  producing a permanent, undetectable divergence instead of an observable
+  one. So this one residual case keeps this project's original fail-open
+  behavior exactly as before: the commit stays local, and the
+  detection/mitigation below is unchanged and remains the answer for it.
+
+Closing the ambiguous case for real is not a matter of more engineering
+effort within this design — it's inherent to `raft.Apply`'s own contract,
+which does not distinguish "definitely didn't commit" from "unknown" on
+failure. A fundamentally different replication protocol would be needed to
+close it, which was judged out of scope here.
+
+**Detection and mitigation for the residual ambiguous case** (unchanged
+from before this fix, and still in effect): `metrics.Snapshot.ReplicationOrphans`
+(additive-only, see "Metrics" above) makes an ambiguous-failure orphan
+observable. The leader also tells its `Cluster` (via the
+`storage.ReplicationOrphanReporter` hook) to bar itself from serving STRONG
+reads — `Cluster.StrongReadBarrier()` fails `Unavailable` regardless of
+leadership until an operator explicitly runs `CLUSTER RECONCILE CONFIRM`.
+This is deliberately narrower than a leadership transfer: the affected row
+is only ever visible to reads under this exact orphan-triggering timing
+window, and STRONG is the one consistency mode that promises linearizable,
+read-after-acknowledged-write behavior — the mode most harmed by silently
+serving a row about to diverge from the rest of the cluster. `BOUNDED`/
+`STALE` reads are unaffected (both already accept some staleness by
+contract). The flag is node-local (like maintenance mode), not
+Raft-replicated: a clean node elected leader afterward is never affected by
+another node's divergence. `system.replica_health.replication_suspect`
+surfaces the flag for monitoring.
+
+**Operator runbook**: after `metrics.Snapshot.ReplicationOrphans` increases
+(or a client/log shows a `Replicate` failure), and STRONG reads on the
+affected node start failing `Unavailable` with a "local commit history is
+unreconciled" message, an operator should verify the node's data (compare
+against a known-good replica, or accept that the orphaned row will simply
+be overwritten or become irrelevant) and then run `nextsql cluster reconcile
+confirm` (or `CLUSTER RECONCILE CONFIRM` directly) against that node to
+resume serving STRONG reads. There is no automatic clearing — this is a
+data-integrity flag, and only an operator who has actually looked should
+clear it.
+
+## Machine-readable operation output
+
+```text
+nextsql exec --json -c 'CLUSTER DRAIN'
+nextsql cluster status --data-dir DIR --json
+nextsql cluster transfer-leader --json
+nextsql cluster drain --json
+nextsql cluster maintenance enable --json
+nextsql cluster reconcile confirm --json
+```
+
+`--json` on `nextsql exec` and every `nextsql cluster` subcommand prints a
+single JSON object on stdout instead of the default tab-separated text, for
+scripts that would rather decode structured output than parse TSV
+positionally. `exec`, `cluster transfer-leader`, `cluster drain`, and
+`cluster maintenance enable|disable` all print
+`{"columns": [...], "rows": [[...]], "affected": N}` — cell values are
+stringified the same way the TSV path renders them (no attempt is made to
+reproduce native JSON types per SQL type, keeping the shape stable across
+every result kind). `cluster status` instead prints its own status object
+(`{"node_id", "state", "leader_id", "leader_addr", "voters", "applied_lsn",
+"has_leader", "apply_backlog", ...}`, the same fields printed as plain text
+by default), since it reads a local status file rather than running SQL.
+Without `--json`, output is unchanged from before this existed.
 
 ## `nextsql-bench`
 

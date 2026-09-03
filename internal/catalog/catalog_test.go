@@ -69,7 +69,7 @@ func TestTableEncodeRoundTrip(t *testing.T) {
 	// count), and v9 a further 3 bytes per index (full-text analyzer id +
 	// revision); strip all of that plus the partitioning byte to synthesise a
 	// legacy v3 body, and one more for v2.
-	trailer := len(got.Indexes)*17 + 1
+	trailer := len(got.Indexes)*17 + 1 + len(got.Columns) // v10 adds one zero flag per unencrypted column
 	v3 := append([]byte(nil), raw[:len(raw)-trailer]...)
 	v3[4], v3[5] = byte(tableVersionV3), 0
 	legacyV3, err := DecodeTable(v3)
@@ -87,6 +87,64 @@ func TestTableEncodeRoundTrip(t *testing.T) {
 	}
 	if legacy.CDCImages != CDCImagesKeys {
 		t.Fatalf("v2 image default=%v", legacy.CDCImages)
+	}
+}
+
+func TestTableEncodeRoundTripBlobColumn(t *testing.T) {
+	stmt := ast.CreateTable{
+		Name: "files",
+		Columns: []ast.ColumnDef{
+			{Name: "id", Type: types.UUID(), Primary: true, NotNull: true, Default: ast.Call{Name: "uuid"}},
+			{Name: "payload", Type: types.Blob(), NotNull: true},
+		},
+		PK: []string{"id"},
+	}
+	tab, err := TableFromAST(1, stmt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := EncodeTable(tab)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := DecodeTable(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Columns) != 2 || got.Columns[1].Type.Kind != types.KindBlob || !got.Columns[1].NotNull {
+		t.Fatalf("blob column round trip: %+v", got.Columns)
+	}
+}
+
+func TestColumnFromASTRejectsBlobPrimaryKeyElsewhereUnaffected(t *testing.T) {
+	// BLOB is allowed as a PRIMARY KEY (byte-lexicographic order is total),
+	// unlike VECTOR. Confirms TableFromAST does not reject it.
+	stmt := ast.CreateTable{
+		Name:    "blobpk",
+		Columns: []ast.ColumnDef{{Name: "k", Type: types.Blob(), Primary: true, NotNull: true}},
+		PK:      []string{"k"},
+	}
+	if _, err := TableFromAST(1, stmt); err != nil {
+		t.Fatalf("BLOB primary key should be allowed: %v", err)
+	}
+}
+
+func TestColumnFromASTEncryptedClientBlob(t *testing.T) {
+	stmt := ast.CreateTable{
+		Name: "secrets",
+		Columns: []ast.ColumnDef{
+			{Name: "id", Type: types.UUID(), Primary: true, NotNull: true, Default: ast.Call{Name: "uuid"}},
+			{Name: "secret", Type: types.Blob(), EncryptedClient: true},
+		},
+		PK: []string{"id"},
+	}
+	tab, err := TableFromAST(1, stmt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	col := tab.Columns[1]
+	if !col.ClientEncrypted() || col.ClientType.Kind != types.KindBlob || col.Type.Kind != types.KindString {
+		t.Fatalf("ENCRYPTED CLIENT BLOB column: %+v", col)
 	}
 }
 
@@ -162,7 +220,7 @@ func TestTableEncodeFulltextAnalyzerV9(t *testing.T) {
 	}
 	// v8 ended after the IVF-PQ subspace counts; strip the 3-byte analyzer
 	// trailer per index and the descriptor still decodes as simple.
-	v8 := append([]byte(nil), raw[:len(raw)-3]...)
+	v8 := append([]byte(nil), raw[:len(raw)-3-len(tab.Columns)]...)
 	v8[4], v8[5] = byte(tableVersionV8), 0
 	legacy, err := DecodeTable(v8)
 	if err != nil {
@@ -172,7 +230,7 @@ func TestTableEncodeFulltextAnalyzerV9(t *testing.T) {
 		t.Fatalf("v8 analyzer %+v", legacy.Indexes[0])
 	}
 	bad := append([]byte(nil), raw...)
-	bad[len(bad)-3] = 99
+	bad[len(bad)-len(tab.Columns)-3] = 99
 	if _, err := DecodeTable(bad); err == nil {
 		t.Fatal("expected unknown analyzer")
 	}

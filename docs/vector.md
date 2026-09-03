@@ -293,10 +293,11 @@ tracks an unquantised IVF; without them the ADC ranking stands.
   committed `NEAREST` reloads the quantiser from the index tree per query (a
   documented follow-on, matching plain IVF's first increment).
 
-The catalog table descriptor is format **v9**. v8 stored one `SUBSPACES` `u32`
+The catalog table descriptor is format **v10**. v8 stored one `SUBSPACES` `u32`
 per index after the v7 ANN-method byte and IVF `LISTS` / `PROBES` counts
 (`0` for HNSW, plain IVF, and non-vector indexes). v9 appends a per-index
-full-text analyzer id + revision after that trailer.
+full-text analyzer id + revision after that trailer; v10's per-column
+client-encryption metadata does not change vector-index encoding.
 
 The portable core (`TrainIVFPQ`, `AddIVFPQ`, `RemoveIVFPQ`, `SearchIVFPQ`, the
 `IVFPQStore` interface and `PQCodebook`, the `NSPQ` / `NSPC` / `NSPL` encodings)

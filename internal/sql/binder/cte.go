@@ -151,8 +151,9 @@ func fillCTETypes(tab *catalog.Table, query Bound) {
 			}
 			if id, ok := ex.(ast.Ident); ok {
 				if j, found := q.Schema.ColIndex(id.Name); found {
-					tab.Columns[i].Type = q.Schema.Columns[j].Type
-					tab.Columns[i].NotNull = q.Schema.Columns[j].NotNull
+					name := tab.Columns[i].Name
+					tab.Columns[i] = q.Schema.Columns[j]
+					tab.Columns[i].Name = name
 				}
 			}
 		}

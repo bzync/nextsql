@@ -485,6 +485,26 @@ func TestServerConfigIgnoresKeyFileFromEnv(t *testing.T) {
 	}
 }
 
+// TestServerConfigThreadsRealm proves a resolved Settings.Realm (via
+// --realm or NEXTSQL_REALM_NAME, already merged by Resolve) actually
+// reaches the driver Config — ServerConfig previously built the Config
+// literal without a Realm field at all, silently dropping it regardless of
+// how it was supplied.
+func TestServerConfigThreadsRealm(t *testing.T) {
+	s := Defaults()
+	s.User = "app"
+	s.Password = "x"
+	s.Insecure = true
+	s.Realm = "acme"
+	cfg, err := ServerConfig(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Realm != "acme" {
+		t.Fatalf("cfg.Realm = %q, want %q", cfg.Realm, "acme")
+	}
+}
+
 func TestServerConfigRejectsLocalFlags(t *testing.T) {
 	s := Defaults()
 	s.User = "app"

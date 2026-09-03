@@ -252,6 +252,9 @@ func (s *Session) collectStats(tab *catalog.Table) (*catalog.TableStats, error) 
 				nulls[i]++
 				continue
 			}
+			if tab.Columns[i].ClientEncrypted() {
+				continue
+			}
 			if !tab.Columns[i].Type.Comparable() {
 				continue
 			}
@@ -307,7 +310,7 @@ func (s *Session) collectStats(tab *catalog.Table) (*catalog.TableStats, error) 
 		if hasMM[i] {
 			cs.Min, cs.Max = mins[i], maxs[i]
 		}
-		if tab.Columns[i].Type.Comparable() {
+		if !tab.Columns[i].ClientEncrypted() && tab.Columns[i].Type.Comparable() {
 			cs.NDV, cs.Histogram, cs.MCV = colSketch(sample, i, scale)
 			cs.Correlation = spearman(sample, i, tab)
 		}
@@ -344,6 +347,7 @@ type analyzeAccumulator struct {
 	sample [][]types.Value
 	limit  int
 	rng    *rand.Rand
+	skip   []bool
 }
 
 func newAnalyzeAccumulator(tab *catalog.Table, limit int, seed int64) *analyzeAccumulator {
@@ -351,7 +355,7 @@ func newAnalyzeAccumulator(tab *catalog.Table, limit int, seed int64) *analyzeAc
 	if tab != nil {
 		ncols = len(tab.Columns)
 	}
-	return &analyzeAccumulator{
+	a := &analyzeAccumulator{
 		nulls: make([]uint64, ncols),
 		mins:  make([]types.Value, ncols),
 		maxs:  make([]types.Value, ncols),
@@ -359,6 +363,13 @@ func newAnalyzeAccumulator(tab *catalog.Table, limit int, seed int64) *analyzeAc
 		limit: limit,
 		rng:   rand.New(rand.NewSource(seed)),
 	}
+	if tab != nil {
+		a.skip = make([]bool, ncols)
+		for i := range tab.Columns {
+			a.skip[i] = tab.Columns[i].ClientEncrypted()
+		}
+	}
+	return a
 }
 
 func (a *analyzeAccumulator) consume(row []types.Value) {
@@ -369,6 +380,12 @@ func (a *analyzeAccumulator) consume(row []types.Value) {
 	for i, value := range row {
 		if i >= len(a.nulls) {
 			break
+		}
+		if i < len(a.skip) && a.skip[i] {
+			if value.Null {
+				a.nulls[i]++
+			}
+			continue
 		}
 		if value.Null {
 			a.nulls[i]++
@@ -416,7 +433,7 @@ func (s *Session) finishPartitionStats(tab *catalog.Table, id uint32, a *analyze
 		if col.HasMinMax {
 			col.Min, col.Max = a.mins[ord].Clone(), a.maxs[ord].Clone()
 		}
-		if tab.Columns[ord].Type.Comparable() {
+		if !tab.Columns[ord].ClientEncrypted() && tab.Columns[ord].Type.Comparable() {
 			col.NDV, _, _ = colSketch(a.sample, ord, scale)
 			col.Correlation = spearman(a.sample, ord, tab)
 		}
@@ -797,7 +814,7 @@ func buildSegments(sample [][]types.Value, tab *catalog.Table, scale float64) []
 		has := make([]bool, len(tab.Columns))
 		for _, row := range part {
 			for c, v := range row {
-				if v.Null || !tab.Columns[c].Type.Comparable() {
+				if v.Null || tab.Columns[c].ClientEncrypted() || !tab.Columns[c].Type.Comparable() {
 					continue
 				}
 				if !has[c] {

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 
+	"github.com/bzync/nextsql/internal/cron"
 	"github.com/bzync/nextsql/internal/nerr"
 	"github.com/bzync/nextsql/internal/security"
 	"github.com/bzync/nextsql/internal/sql/ast"
@@ -11,7 +12,7 @@ import (
 
 const (
 	scheduleMagic        = "NSSC"
-	scheduleVersion      = 1
+	scheduleVersion      = 2 // v2 adds the Cron expression field; v1 still decodes
 	KeySchedule     byte = 'Q'
 	KeyScheduleDue  byte = 'R'
 
@@ -20,8 +21,10 @@ const (
 )
 
 // Schedule is a durable invocation definition. SpecNS is an interval for
-// ScheduleEvery and an absolute Unix nanosecond timestamp for ScheduleAt.
-// WorkflowID is the stable dependency identity; Workflow is diagnostic.
+// ScheduleEvery and an absolute Unix nanosecond timestamp for ScheduleAt;
+// it is zero for ScheduleCron, whose recurrence lives in Cron (a validated
+// 5-field cron expression, empty for the other kinds). WorkflowID is the
+// stable dependency identity; Workflow is diagnostic.
 type Schedule struct {
 	ID         uint32
 	Name       string
@@ -29,6 +32,7 @@ type Schedule struct {
 	Tenant     string
 	Kind       ast.ScheduleKind
 	SpecNS     int64
+	Cron       string
 	WorkflowID uint32
 	Workflow   string
 	Args       []ast.Expr
@@ -101,6 +105,7 @@ func EncodeSchedule(s *Schedule) ([]byte, error) {
 	buf = appendU64(buf, uint64(s.SpecNS))
 	buf = appendU32(buf, s.WorkflowID)
 	buf = appendString(buf, s.Workflow)
+	buf = appendString(buf, s.Cron)
 	buf = appendU16(buf, uint16(len(s.Args)))
 	for _, arg := range s.Args {
 		var err error
@@ -129,7 +134,7 @@ func DecodeSchedule(raw []byte) (*Schedule, error) {
 	}
 	off := len(scheduleMagic)
 	version, off, err := takeU16(raw, off)
-	if err != nil || version != scheduleVersion {
+	if err != nil || version < 1 || version > scheduleVersion {
 		return nil, nerr.New(nerr.InvalidFormat, "catalog.DecodeSchedule", "unsupported schedule version")
 	}
 	s := &Schedule{}
@@ -168,6 +173,12 @@ func DecodeSchedule(raw []byte) (*Schedule, error) {
 	if err != nil {
 		return nil, err
 	}
+	if version >= 2 {
+		s.Cron, off, err = takeString(raw, off)
+		if err != nil {
+			return nil, err
+		}
+	}
 	var n uint16
 	n, off, err = takeU16(raw, off)
 	if err != nil || n > MaxScheduleArgs {
@@ -205,7 +216,7 @@ func DecodeSchedule(raw []byte) (*Schedule, error) {
 }
 
 func validateSchedule(s *Schedule) error {
-	if s == nil || s.ID == 0 || s.Name == "" || s.Owner == "" || s.WorkflowID == 0 || s.Workflow == "" || s.SpecNS <= 0 {
+	if s == nil || s.ID == 0 || s.Name == "" || s.Owner == "" || s.WorkflowID == 0 || s.Workflow == "" {
 		return nerr.New(nerr.InvalidArgument, "catalog.EncodeSchedule", "invalid schedule identity")
 	}
 	for _, value := range []string{s.Name, s.Owner, s.Tenant, s.Workflow} {
@@ -213,7 +224,25 @@ func validateSchedule(s *Schedule) error {
 			return nerr.New(nerr.InvalidArgument, "catalog.EncodeSchedule", "schedule text exceeds limit")
 		}
 	}
-	if s.Kind != ast.ScheduleEvery && s.Kind != ast.ScheduleAt {
+	switch s.Kind {
+	case ast.ScheduleEvery, ast.ScheduleAt:
+		if s.SpecNS <= 0 {
+			return nerr.New(nerr.InvalidArgument, "catalog.EncodeSchedule", "invalid schedule specification")
+		}
+		if s.Cron != "" {
+			return nerr.New(nerr.InvalidArgument, "catalog.EncodeSchedule", "cron expression set on a non-cron schedule")
+		}
+	case ast.ScheduleCron:
+		if s.SpecNS != 0 {
+			return nerr.New(nerr.InvalidArgument, "catalog.EncodeSchedule", "interval specification set on a cron schedule")
+		}
+		if len(s.Cron) == 0 || len(s.Cron) > cron.MaxExprBytes {
+			return nerr.New(nerr.InvalidArgument, "catalog.EncodeSchedule", "invalid cron expression length")
+		}
+		if _, err := cron.Parse(s.Cron); err != nil {
+			return nerr.New(nerr.InvalidArgument, "catalog.EncodeSchedule", err.Error())
+		}
+	default:
 		return nerr.New(nerr.InvalidArgument, "catalog.EncodeSchedule", "invalid schedule kind")
 	}
 	if len(s.Args) > MaxScheduleArgs {

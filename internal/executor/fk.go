@@ -154,6 +154,22 @@ func (s *Session) fkWriteSnap() (txn.Snapshot, bool, error) {
 	return tm.Capture(h.ID), true, nil
 }
 
+// freshTreeSnap captures a brand-new MVCC snapshot rather than reusing this
+// transaction's own (possibly stale) one. A REBUILD INDEX ... ONLINE backfill
+// populates its shadow tree as a concurrent, independent transaction; once
+// that tree is swapped in as an index's real tree, a transaction whose own
+// snapshot predates the backfill's commit cannot see entries the backfill
+// wrote, so an ordinary tx.Delete/tx.Insert (which use that stale snapshot)
+// can silently miss them. See maintainIndexes' online-rebuild branch and
+// mirrorOnlineIndex, which has the same requirement for the same reason.
+func (s *Session) freshTreeSnap() (txn.Snapshot, error) {
+	h, tm, err := s.fkTM()
+	if err != nil {
+		return txn.Snapshot{}, err
+	}
+	return tm.Capture(h.ID), nil
+}
+
 func (s *Session) treeDelete(tx *btree.Txn, key []byte) error {
 	snap, ok, err := s.fkWriteSnap()
 	if err != nil {
@@ -211,6 +227,38 @@ func (s *Session) heapDelete(htx *btree.Txn, pk []byte) error {
 
 func (s *Session) heapUpdate(htx *btree.Txn, pk, payload []byte) error {
 	return s.treeUpdate(htx, pk, payload)
+}
+
+// heapDeleteReturningOld is heapDelete, additionally returning the row
+// payload actually found and removed in the heap at the moment of this
+// write — which can differ from any row a caller read earlier in the same
+// statement (see btree.Txn.DeleteReturningOld's doc comment). Callers that
+// go on to maintain secondary indexes for this row must use the returned
+// payload for that, not an earlier read, or a concurrently-committed
+// update to the same row can leave a stale, orphaned index entry.
+func (s *Session) heapDeleteReturningOld(htx *btree.Txn, pk []byte) ([]byte, error) {
+	snap, ok, err := s.fkWriteSnap()
+	if err != nil {
+		return nil, err
+	}
+	if ok {
+		return htx.DeleteAtReturningOld(pk, snap)
+	}
+	return htx.DeleteReturningOld(pk)
+}
+
+// heapUpdateReturningOld is heapUpdate, additionally returning the row
+// payload actually found and overwritten — see heapDeleteReturningOld's
+// doc comment.
+func (s *Session) heapUpdateReturningOld(htx *btree.Txn, pk, payload []byte) ([]byte, error) {
+	snap, ok, err := s.fkWriteSnap()
+	if err != nil {
+		return nil, err
+	}
+	if ok {
+		return htx.UpdateAtReturningOld(pk, payload, snap)
+	}
+	return htx.UpdateReturningOld(pk, payload)
 }
 
 func sameEncodedPK(tab *catalog.Table, a, b []types.Value) bool {
@@ -402,7 +450,7 @@ func (s *Session) checkOutboundFK(child *catalog.Table, fk catalog.ForeignKey, r
 	if err != nil {
 		return err
 	}
-	if err := tm.LockKey(h, refKey, txn.Shared); err != nil {
+	if err := tm.LockKey(h, refKey, txn.Shared, parent.Name); err != nil {
 		return err
 	}
 	probe := tm.Capture(h.ID)
@@ -501,7 +549,7 @@ func (s *Session) collectInbound(parent *catalog.Table, old, neu []types.Value, 
 		if err != nil {
 			return nil, err
 		}
-		if err := tm.LockKey(h, refKey, txn.Exclusive); err != nil {
+		if err := tm.LockKey(h, refKey, txn.Exclusive, parent.Name); err != nil {
 			return nil, err
 		}
 		probe := tm.Capture(h.ID)

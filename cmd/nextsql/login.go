@@ -15,7 +15,7 @@ import (
 )
 
 // loginProfile resolves the named `[idp.<name>]` profile from the client config.
-func loginProfile(s cli.Settings) (oidcclient.IdPProfile, string, error) {
+func loginProfile(s cli.Settings, clientSecretFile string) (oidcclient.IdPProfile, string, error) {
 	if strings.TrimSpace(s.IdP) == "" {
 		return oidcclient.IdPProfile{}, "", nerr.New(nerr.InvalidArgument, "nextsql login", "--idp is required")
 	}
@@ -34,6 +34,9 @@ func loginProfile(s cli.Settings) (oidcclient.IdPProfile, string, error) {
 	if !ok {
 		return oidcclient.IdPProfile{}, "", nerr.New(nerr.NotFound, "nextsql login", "no [idp."+s.IdP+"] section in "+cfgPath)
 	}
+	if clientSecretFile = strings.TrimSpace(clientSecretFile); clientSecretFile != "" {
+		prof.ClientSecretFile = clientSecretFile
+	}
 	ip, err := prof.Resolve()
 	if err != nil {
 		return oidcclient.IdPProfile{}, "", err
@@ -46,8 +49,10 @@ func loginCmd(args []string) error {
 	fs.String("addr", "", "server address the credential is for (host:port)")
 	fs.String("idp", "", "identity provider profile name from the client config")
 	fs.String("idp-config", "", "client identity-provider config file (default ~/.config/nextsql/config.toml)")
-	database := fs.String("database", "", "restrict the minted credential to this database")
-	realm := fs.String("realm", "", "realm scope for hosted routing")
+	fs.String("database", "", "restrict the minted credential to this database")
+	fs.String("realm", "", "realm scope for hosted routing")
+	clientCredentials := fs.Bool("client-credentials", false, "use the non-interactive OAuth2 client_credentials grant")
+	clientSecretFile := fs.String("client-secret-file", "", "mode-0600 OAuth2 client secret file (overrides the profile)")
 	noBrowser := fs.Bool("no-browser", false, "print the sign-in URL instead of opening a browser")
 	timeout := fs.Duration("timeout", 3*time.Minute, "how long to wait for the browser sign-in")
 	if err := fs.Parse(args); err != nil {
@@ -61,23 +66,30 @@ func loginCmd(args []string) error {
 	if addr == "" {
 		return nerr.New(nerr.InvalidArgument, "nextsql login", "--addr (the server this credential is for) is required")
 	}
-	ip, _, err := loginProfile(s)
+	ip, _, err := loginProfile(s, *clientSecretFile)
 	if err != nil {
 		return err
 	}
 
-	opts := oidcclient.LoginOptions{
-		Profile:  ip,
-		Progress: os.Stderr,
-		Database: strings.TrimSpace(*database),
-		Realm:    strings.TrimSpace(*realm),
-		Timeout:  *timeout,
+	var res oidcclient.BrokerResult
+	var ts oidcclient.TokenSet
+	if *clientCredentials {
+		res, ts, err = oidcclient.ClientCredentials(context.Background(), oidcclient.ClientCredentialsOptions{
+			Profile: ip, Database: strings.TrimSpace(s.Database), Realm: strings.TrimSpace(s.Realm),
+		})
+	} else {
+		opts := oidcclient.LoginOptions{
+			Profile:  ip,
+			Progress: os.Stderr,
+			Database: strings.TrimSpace(s.Database),
+			Realm:    strings.TrimSpace(s.Realm),
+			Timeout:  *timeout,
+		}
+		if !*noBrowser {
+			opts.Browser = oidcclient.DefaultBrowserOpener
+		}
+		res, ts, err = oidcclient.Login(context.Background(), opts)
 	}
-	if !*noBrowser {
-		opts.Browser = oidcclient.DefaultBrowserOpener
-	}
-
-	res, ts, err := oidcclient.Login(context.Background(), opts)
 	if err != nil {
 		return err
 	}
@@ -85,7 +97,10 @@ func loginCmd(args []string) error {
 	if err != nil {
 		return err
 	}
-	cred := oidcclient.NewCredential(ip, addr, strings.TrimSpace(*database), strings.TrimSpace(*realm), res, ts, time.Now())
+	cred := oidcclient.NewCredential(ip, addr, strings.TrimSpace(s.Database), strings.TrimSpace(s.Realm), res, ts, time.Now())
+	if *clientCredentials {
+		cred = oidcclient.NewClientCredential(ip, addr, strings.TrimSpace(s.Database), strings.TrimSpace(s.Realm), res, time.Now())
+	}
 	if err := store.Save(cred); err != nil {
 		return err
 	}
@@ -96,7 +111,9 @@ func loginCmd(args []string) error {
 		fmt.Printf("token id:   %s\n", res.TokenID)
 	}
 	fmt.Printf("stored:     %s\n", store.Path(ip.Name, addr))
-	if ts.RefreshToken == "" {
+	if *clientCredentials {
+		fmt.Fprintln(os.Stderr, "note: this workload credential renews non-interactively from the protected client secret file")
+	} else if ts.RefreshToken == "" {
 		fmt.Fprintln(os.Stderr, "note: the identity provider issued no refresh token; re-run `nextsql login` when the credential expires")
 	}
 	fmt.Fprintf(os.Stderr, "\nconnect with: nextsql exec --addr %s --idp %s -c '<sql>'\n", addr, ip.Name)
@@ -120,7 +137,7 @@ func whoamiCmd(args []string) error {
 	if addr == "" {
 		return nerr.New(nerr.InvalidArgument, "nextsql whoami", "--addr is required")
 	}
-	ip, _, err := loginProfile(s)
+	ip, _, err := loginProfile(s, "")
 	if err != nil {
 		return err
 	}
@@ -146,7 +163,8 @@ func whoamiCmd(args []string) error {
 			"realm":      cred.Realm,
 			"expires_at": cred.ExpiresAt.Format(time.RFC3339),
 			"token_id":   cred.TokenID,
-			"renewable":  cred.RefreshToken != "",
+			"renewable":  cred.RefreshToken != "" || cred.GrantType == "client_credentials",
+			"grant_type": cred.GrantType,
 		}
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
@@ -164,7 +182,7 @@ func whoamiCmd(args []string) error {
 	if cred.TokenID != "" {
 		fmt.Printf("token id:   %s\n", cred.TokenID)
 	}
-	fmt.Printf("renewable:  %t\n", cred.RefreshToken != "")
+	fmt.Printf("renewable:  %t\n", cred.RefreshToken != "" || cred.GrantType == "client_credentials")
 	return nil
 }
 

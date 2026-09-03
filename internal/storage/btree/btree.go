@@ -2,6 +2,7 @@ package btree
 
 import (
 	"sync"
+	"sync/atomic"
 
 	"github.com/bzync/nextsql/internal/nerr"
 	"github.com/bzync/nextsql/internal/storage"
@@ -31,6 +32,36 @@ type Tree struct {
 	// liveKnown is false after Open of an existing tree until a full count.
 	liveRows  int64
 	liveKnown bool
+
+	// name is an optional introspection label (typically a table name),
+	// set by SetName and read by lock acquisition to tag held locks for
+	// system.locks. Deliberately its own atomic, not guarded by mu: it is
+	// set once (idempotently) by executor resolver code and read on every
+	// lock acquisition, which must not risk nesting under mu.
+	name atomic.Pointer[string]
+}
+
+// SetName labels this tree for introspection (system.locks) — typically a
+// table name. Idempotent: the first non-empty name wins, so later calls
+// (e.g. a cache re-resolving the same tree) are no-ops. Safe to call
+// concurrently. A tree with no name reports "" from Name.
+func (t *Tree) SetName(name string) {
+	if t == nil || name == "" {
+		return
+	}
+	t.name.CompareAndSwap(nil, &name)
+}
+
+// Name returns the label set by SetName, or "" if none was set.
+func (t *Tree) Name() string {
+	if t == nil {
+		return ""
+	}
+	p := t.name.Load()
+	if p == nil {
+		return ""
+	}
+	return *p
 }
 
 // Create allocates an empty clustered tree and records it in the superblock.

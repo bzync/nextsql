@@ -88,6 +88,82 @@ func LoadDeploymentBootstrap(path string) (DeploymentBootstrap, error) {
 	return ParseDeploymentBootstrap(raw, filepath.Dir(abs))
 }
 
+// EnsureBootstrapManifestKeyFiles creates any per-database root key file
+// named in the manifest that does not exist yet, each a fresh independent
+// AES-256 root (mode 0600), and returns the absolute paths it created.
+// It performs the same bounded read and YAML-shape validation as
+// LoadDeploymentBootstrap but does not fully normalize the document — full
+// validation (including key independence and the default-pair check) still
+// happens in the subsequent LoadDeploymentBootstrap call, which is what a
+// caller must run before mutating any deployment state. Parent directories
+// are not created; a missing directory fails closed. Existing key files are
+// left untouched, so re-running against an already-provisioned deployment
+// creates nothing.
+func EnsureBootstrapManifestKeyFiles(path string) ([]string, error) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return nil, nerr.New(nerr.InvalidArgument, "hosting.EnsureBootstrapManifestKeyFiles", "manifest path is required")
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, nerr.Wrap(nerr.IO, "hosting.EnsureBootstrapManifestKeyFiles", "stat manifest", err)
+	}
+	if !info.Mode().IsRegular() || info.Size() < 1 || info.Size() > maxBootstrapBytes {
+		return nil, nerr.New(nerr.InvalidFormat, "hosting.EnsureBootstrapManifestKeyFiles", "invalid manifest file size")
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, nerr.Wrap(nerr.IO, "hosting.EnsureBootstrapManifestKeyFiles", "read manifest", err)
+	}
+	if err := validateYAMLShape(raw); err != nil {
+		return nil, err
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return nil, nerr.Wrap(nerr.IO, "hosting.EnsureBootstrapManifestKeyFiles", "resolve manifest path", err)
+	}
+	baseDir := filepath.Dir(abs)
+	dec := yaml.NewDecoder(bytes.NewReader(raw))
+	dec.KnownFields(true)
+	var in bootstrapYAML
+	if err := dec.Decode(&in); err != nil {
+		return nil, nerr.Wrap(nerr.InvalidFormat, "hosting.EnsureBootstrapManifestKeyFiles", "decode manifest", err)
+	}
+	seen := make(map[string]struct{})
+	var created []string
+	for _, realm := range in.Realms {
+		for _, database := range realm.Databases {
+			keyPath := strings.TrimSpace(database.KeyFile)
+			if keyPath == "" || strings.IndexByte(keyPath, 0) >= 0 {
+				return created, nerr.New(nerr.InvalidArgument, "hosting.EnsureBootstrapManifestKeyFiles", "database key_file is required")
+			}
+			if !filepath.IsAbs(keyPath) {
+				keyPath = filepath.Join(baseDir, keyPath)
+			}
+			keyPath = filepath.Clean(keyPath)
+			if len(keyPath) > maxKeyRefLen {
+				return created, nerr.New(nerr.InvalidArgument, "hosting.EnsureBootstrapManifestKeyFiles", "database key_file path exceeds limit")
+			}
+			if _, dup := seen[keyPath]; dup {
+				continue
+			}
+			seen[keyPath] = struct{}{}
+			if _, err := os.Stat(keyPath); err == nil {
+				continue
+			} else if !os.IsNotExist(err) {
+				return created, nerr.Wrap(nerr.IO, "hosting.EnsureBootstrapManifestKeyFiles", "stat database key_file", err)
+			}
+			dek, err := crypto.CreateKeyFile(keyPath, 1)
+			if err != nil {
+				return created, err
+			}
+			dek.Zero()
+			created = append(created, keyPath)
+		}
+	}
+	return created, nil
+}
+
 // ParseDeploymentBootstrap validates bounded YAML bytes. baseDir resolves
 // relative key-file paths and is primarily exposed for fuzz and unit tests.
 func ParseDeploymentBootstrap(raw []byte, baseDir string) (DeploymentBootstrap, error) {

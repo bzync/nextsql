@@ -12,6 +12,7 @@ import (
 	"github.com/bzync/nextsql/internal/auth"
 	"github.com/bzync/nextsql/internal/catalog"
 	"github.com/bzync/nextsql/internal/nerr"
+	"github.com/bzync/nextsql/internal/scheduler"
 	"github.com/bzync/nextsql/internal/security"
 	"github.com/bzync/nextsql/internal/sql/ast"
 	"github.com/bzync/nextsql/internal/txn"
@@ -330,6 +331,115 @@ func TestDispatchOneShotDisablesAndSkipsMissedIntervals(t *testing.T) {
 	once, _ = db.schedule("once")
 	if once.Enabled || once.NextFireNS != 0 || once.LastFireNS == 0 {
 		t.Fatalf("one-shot schedule=%+v", once)
+	}
+}
+
+func TestDispatchCronAdvancesToNextBoundaryAndSkipsMissed(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "nextsql.db")
+	keys := testKeys(t)
+	db, err := Create(path, keys, 32)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := db.Session()
+	execOK(t, s, `CREATE TABLE sink (id STRING PRIMARY KEY)`)
+	execOK(t, s, `CREATE WORKFLOW record(id STRING) AS BEGIN INSERT INTO sink (id) VALUES ($id); END`)
+	// Every hour on the hour.
+	execOK(t, s, `CREATE SCHEDULE hourly CRON '0 * * * *' RUN WORKFLOW record('cron')`)
+	sched, _ := s.lookupSchedule("hourly")
+	if sched.Kind != ast.ScheduleCron || sched.Cron != "0 * * * *" || sched.SpecNS != 0 {
+		t.Fatalf("schedule=%+v", sched)
+	}
+	due := sched.NextFireNS
+	firstBoundary := time.Unix(0, due).UTC()
+	if firstBoundary.Minute() != 0 {
+		t.Fatalf("first boundary %s not on the hour", firstBoundary.Format(time.RFC3339))
+	}
+
+	// Dispatch several hours late: exactly one task for the oldest due
+	// boundary, and the cursor jumps straight to the first future boundary.
+	lateBy := 3*time.Hour + 20*time.Minute
+	now := due + int64(lateBy)
+	if got, err := db.DispatchDueSchedules(context.Background(), time.Unix(0, now), 16); err != nil || got != 1 {
+		t.Fatalf("cron dispatch got=%d err=%v", got, err)
+	}
+	id := scheduledTaskID(sched.ID, due)
+	if task, ok, err := db.task(id); err != nil || !ok || task.State != catalog.TaskPending || task.ScheduleID != sched.ID {
+		t.Fatalf("task=%+v ok=%v err=%v", task, ok, err)
+	}
+	advanced, _ := db.schedule("hourly")
+	if advanced.LastFireNS != due || !advanced.Enabled {
+		t.Fatalf("advanced schedule=%+v", advanced)
+	}
+	next := time.Unix(0, advanced.NextFireNS).UTC()
+	if !next.After(time.Unix(0, now).UTC()) || next.Minute() != 0 {
+		t.Fatalf("cursor %s did not skip to the next future boundary after %s", next.Format(time.RFC3339), time.Unix(0, now).UTC().Format(time.RFC3339))
+	}
+	// A burst was NOT emitted — the missed boundaries produced no extra rows.
+	if got, err := db.DispatchDueSchedules(context.Background(), time.Unix(0, now), 16); err != nil || got != 0 {
+		t.Fatalf("duplicate cron dispatch got=%d err=%v", got, err)
+	}
+
+	// Survives restart with the cron cursor intact.
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err = Open(path, keys, 32)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if reloaded, ok := db.schedule("hourly"); !ok || reloaded.Cron != "0 * * * *" || reloaded.NextFireNS != advanced.NextFireNS {
+		t.Fatalf("reloaded schedule=%+v ok=%v", reloaded, ok)
+	}
+}
+
+func TestDispatchCronFiresConsecutiveBoundaries(t *testing.T) {
+	db := testDB(t)
+	s := db.Session()
+	execOK(t, s, `CREATE TABLE runs (id STRING PRIMARY KEY, hits DECIMAL(10,0))`)
+	// Idempotent body so a boundary that re-runs is the workflow's problem to
+	// absorb, never the scheduler's: this test is about cron advancing the
+	// cursor, not about workflow write semantics.
+	execOK(t, s, `CREATE WORKFLOW bump(tag STRING) AS BEGIN UPSERT INTO runs (id, hits) VALUES ($tag, 1) ON UNIQUE (id) SET hits = runs.hits + 1; END`)
+	execOK(t, s, `CREATE SCHEDULE tick CRON '* * * * *' RUN WORKFLOW bump('t')`)
+	sched, _ := s.lookupSchedule("tick")
+	b1 := sched.NextFireNS
+
+	fire := func(boundary int64) {
+		t.Helper()
+		at := boundary + 200*int64(time.Millisecond)
+		if got, err := db.DispatchDueSchedules(context.Background(), time.Unix(0, at), 16); err != nil || got != 1 {
+			t.Fatalf("dispatch at %d got=%d err=%v", boundary, got, err)
+		}
+		claim := claimOneTask(t, db, at)
+		if claim.ID != scheduledTaskID(sched.ID, boundary) {
+			t.Fatalf("claim=%+v want due %d", claim, boundary)
+		}
+		execAt := time.Unix(0, claim.UpdatedNS+1)
+		if err := db.executeClaimedTask(context.Background(), claim, nil, nil, scheduler.DefaultLimits(), func() time.Time { return execAt }); err != nil {
+			t.Fatalf("execute task for boundary %d: %v", boundary, err)
+		}
+	}
+
+	fire(b1)
+	advanced, _ := db.schedule("tick")
+	b2 := advanced.NextFireNS
+	if b2 != b1+int64(time.Minute) {
+		t.Fatalf("cursor advanced to %d, want %d", b2, b1+int64(time.Minute))
+	}
+
+	// The next minute dispatches and executes cleanly — the first task is
+	// terminal and its FORBID reservation released, and the cron cursor
+	// advances again by exactly one minute.
+	fire(b2)
+	after, _ := db.schedule("tick")
+	if after.NextFireNS != b2+int64(time.Minute) {
+		t.Fatalf("cursor after boundary 2 = %d, want %d", after.NextFireNS, b2+int64(time.Minute))
+	}
+	if got := execOK(t, s, `SELECT hits FROM runs WHERE id = 't'`); len(got.Rows) != 1 || got.Rows[0][0].Dec.String() != "2" {
+		t.Fatalf("runs=%+v (want hits=2 after two firings)", got.Rows)
 	}
 }
 

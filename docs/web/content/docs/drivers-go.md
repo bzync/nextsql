@@ -89,6 +89,15 @@ For `--require-client-key`, set `Config.KeyProvider` (never a URL). Remote conne
 To authenticate with a signed short-lived credential, put the `NSSC1.` value in
 `Config.Password` — no other change. See [security](/docs/security).
 
+Experimental `ENCRYPTED CLIENT` columns use the separate `Config.FieldKeys`
+provider. Call `EncryptField(ctx, table, column, logicalValue)` before binding
+and `DecryptField(ctx, table, column, logicalType, resultValue)` after a bare
+projection. `MemoryFieldKeyring` is bounded convenience storage for keys already
+loaded from a secret manager; it is not a durable KMS. The field key is never
+sent to `nextsqld`. Equivalent helpers now ship in Node.js/TypeScript, Bun,
+Deno, and PHP; PITR and HA coverage remain open, so this capability is not
+production-gated.
+
 Multi-statement transactions are a session of `BEGIN` / statements / `COMMIT` on the same connection:
 
 ```go

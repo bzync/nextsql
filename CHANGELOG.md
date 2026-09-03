@@ -23,6 +23,1404 @@ A roadmap item is not recorded as completed here until its implementation, tests
 
 ## [Unreleased]
 
+### Fixed — silent data loss repairing a replica from backup + `AddVoter` (2026-09-03)
+
+- Writing the previously-missing regression test for the documented
+  "wiped replica restored from `nextsql backup`/`restore`, rejoined with
+  `AddVoter`" repair procedure (`docs/ha.md` "Replica repair and rolling
+  maintenance") surfaced a real bug: a repaired replica could permanently,
+  silently lose any write that happened between the backup and the
+  rejoin, with no error and no detectable divergence signal — it reported
+  itself fully caught up.
+- Root cause: `internal/backup`'s `Create`/`Restore` each open the data
+  file directly and run their own checkpoint, which durably consumed
+  several WAL LSN numbers as local housekeeping unrelated to replication
+  (measured: one checkpoint alone advanced a small table's `NextLSN()` by
+  9). `internal/storage/engine.go`'s `ApplyReplicated` treats that same,
+  now-inflated counter as "how far into the replicated stream have I
+  gotten" (`if last < e.WAL.NextLSN() { return nil }`), so a legitimate
+  not-yet-applied write whose leader-assigned LSN now fell below the
+  locally-inflated counter was silently treated as already-applied and
+  never replayed.
+- This was a second, more easily reached trigger for a class of risk
+  `internal/storage/engine.go`'s own `prepareCommitLocked` already
+  documents for a narrower case (an ambiguous replication-failure race,
+  see the "Fixed a general transaction-attribution race" entry below's
+  neighbor in `TODO.md` log #79).
+- Considered a dedicated, durably-persisted "replicated progress" watermark
+  (an on-disk superblock format change) but found a narrower, non-invasive
+  fix instead: `Engine.Checkpoint()` — the only two callers are `Close()`
+  and `backup.Create` — unconditionally wrote a fresh checkpoint record
+  even when nothing had happened since the engine was opened. New
+  `Engine.openNextLSN` field (`WAL.NextLSN()` captured once at open) lets
+  `Checkpoint()` skip entirely when there's no in-progress transaction and
+  nothing has been appended since — `backup.Create`'s checkpoint of an
+  already-cleanly-closed file is now a true no-op, so it no longer
+  perturbs the file's LSN numbering. No on-disk format change.
+- `TestHAReplicaRepairFromBackupAddVoter` (`tests/ha/ha_test.go`) —
+  20/20 clean under `-race`, previously reliably failing. Regression
+  swept: full `tests/ha`, `internal/storage/...` (incl. `btree`),
+  `internal/backup`, `internal/recovery`, `internal/wal`,
+  `internal/executor/...`, all under `-race`, all green. See `TODO.md`
+  log #95 for the full investigation and fix writeup.
+
+### Fixed — REBUILD INDEX ... ONLINE orphaned index entry under concurrent UPDATE (2026-09-03)
+
+- An independent, skeptical production-readiness re-audit of Phase 0–27 (run
+  at explicit user request, rather than trusting the existing checkmarks)
+  reproduced a real, intermittent (~5% of runs) data-integrity race in
+  `REBUILD INDEX name ONLINE`: an `UPDATE` executing after the rebuild's
+  catalog swap could silently fail to remove the row's old index entry from
+  the newly-swapped-in tree, leaving it as a permanent orphan alongside the
+  correct new entry. Root cause: the ordinary (non-mirror) index-maintenance
+  path deleted via the transaction's own snapshot captured at `BEGIN`, which
+  cannot see an entry the online rebuild's backfill committed after that
+  snapshot was taken; the delete's "not found" result was — correctly, in
+  the ordinary case — tolerated as a no-op, so it silently vanished instead
+  of erroring.
+- Fixed in `internal/executor/exec.go`/`fk.go`: while an online rebuild is
+  registered for an index (armed or swapped-but-not-yet-disarmed), ordinary
+  index writes now use a freshly captured snapshot, extending the same
+  protection `mirrorOnlineIndex` already had to the post-swap path.
+  Verified clean across 60 `-race` runs and 300 non-`-race` runs of the
+  regression (previously ~5% failure), plus the full `internal/executor`
+  and `tests/integration` suites. See `TODO.md` log #93 for the full
+  root-cause writeup.
+
+### Datatype expansion — D3 fixed-width unsigned integers (2026-09-03)
+
+- New first-class scalar column types `UINT8`/`UINT16`/`UINT32`/`UINT64`:
+  exact unsigned integers (1/2/4/8 bytes). Index keys use plain unsigned
+  big-endian bytes — no sign-bit flip needed, unlike `INT8..64`. Narrowing
+  and assigning a negative value both error rather than wrapping. `+ - * /`
+  and unary `-` promote to `DECIMAL`, same as `INT8..64`; `SUM`/`AVG` reuse
+  the same DECIMAL-promotion accumulator, `MIN`/`MAX` stay in the column's
+  own uint kind. Ordinary FK-eligible scalars. `ENCRYPTED CLIENT` supported.
+  `INT8..64` and `UINT8..64` are directly coercible into each other
+  (range/sign checked either way) — treated as one exact-integer group
+  rather than isolated families. Catalog wire tags are plain appended enum
+  values — no `NSCT` version bump. Updated all 7 official drivers (Go
+  needed no code change; JS/Bun/Deno via the shared `drivers/js` core; Node;
+  PHP; Python; Ruby), each exposing every width with its own round-trip
+  test. PHP's `UINT64` decodes as a decimal digit string once a value
+  reaches or exceeds `PHP_INT_MAX` (mirroring how `DECIMAL` is already
+  represented in that driver), since PHP's native `int` has no unsigned
+  64-bit counterpart. Also fixed, while implementing this increment, a
+  pre-existing gap unrelated to D3 itself: the Node driver's
+  `ENCRYPTED CLIENT` (NSCE1) implementation had never picked up D2's
+  `INT8..64` support at all — it now supports the full
+  `INT8..64`/`UINT8..64` set, same as every other driver. See
+  `docs/design-datatypes.md` D3 and `docs/sql.md`.
+
+### Datatype expansion — D1 `BLOB` type (2026-09-03)
+
+- New first-class scalar column type `BLOB`: variable-length raw bytes,
+  `u32`-length-prefixed on disk (same shape as `STRING`/`TEXT`, no UTF-8
+  validation), with its own `X'<hex>'` literal syntax (`X''` for empty).
+  Orders byte-lexicographically, so `BLOB` is usable as a `PRIMARY KEY` or
+  `ORDER BY`/`GROUP BY` column. Deliberately isolated from `STRING`/`TEXT`:
+  coercion either way requires hex text, never an implicit byte-for-byte
+  reinterpretation. `ENCRYPTED CLIENT` is supported (the existing opaque
+  ciphertext path is fully generic over scalar encode/decode, so this
+  needed no new crypto code). Catalog wire tag is a plain appended enum
+  value — no `NSCT` version bump. Updated all 7 official drivers
+  (Go needed no code change — it shares `internal/sql/types`/`internal/protocol`
+  directly; JS/Bun/Deno via the shared `drivers/js` core; Node; PHP; Python;
+  Ruby), each exposing `BLOB` as its native byte-string type (`[]byte`,
+  `Uint8Array`/`Buffer`, PHP/Ruby byte-safe `String`, Python `bytes`) with
+  its own round-trip test. See `docs/design-datatypes.md` D1 and
+  `docs/sql.md`/`docs/client-encryption.md`.
+
+### Datatype expansion — D2 fixed-width signed integers (2026-09-03)
+
+- New first-class scalar column types `INT8`/`INT16`/`INT32`/`INT64`: exact
+  two's-complement signed integers (1/2/4/8 bytes). Index keys (clustered
+  `PRIMARY KEY` and secondary `ORDER BY`/`GROUP BY`) flip the sign bit
+  before storing big-endian unsigned bytes, so they sort numerically —
+  naive two's-complement byte order would otherwise sort every negative
+  value after every positive one. Narrowing — including a literal or an
+  arithmetic result that doesn't fit — errors rather than wrapping.
+  `+ - * /` and unary `-` always promote both operands to `DECIMAL`
+  (arbitrary precision, matching the pre-D2 behavior where `DECIMAL` was
+  the only arithmetic type), so the operation itself can never overflow;
+  only assigning/coercing the result back into a fixed-width column
+  re-checks range. `SUM`/`AVG` inherit the same DECIMAL-promotion
+  accumulator DECIMAL columns already used; `MIN`/`MAX` stay in the
+  column's own int kind. Ordinary FK-eligible scalars (unlike `BLOB`/
+  `VECTOR`/`JSON`). `ENCRYPTED CLIENT` is supported. Catalog wire tags are
+  plain appended enum values — no `NSCT` version bump. Updated all 7
+  official drivers (Go needed no code change; JS/Bun/Deno via the shared
+  `drivers/js` core; Node; PHP; Python; Ruby), each exposing every width
+  with its own round-trip test — a bare host-language integer still
+  defaults to the wire's `DECIMAL` encoding and coerces server-side into
+  any numeric column, so an explicit wrapper (`{kind:'int32',...}` /
+  `FieldType::int32()` / `Int32(...)`) is only needed to pin an exact wire
+  width or for `ENCRYPTED CLIENT`. Also fixed, while implementing this
+  increment, a latent float-overflow bug in the PHP driver's 64-bit
+  integer decoder (`Protocol::i64`) that silently corrupted values at/above
+  magnitude 2^63 (e.g. exactly `PHP_INT_MIN`) — replaced with a direct
+  `pack('P')`/`unpack('P')` reinterpretation, which also benefits the
+  existing `TIMESTAMPTZ` decode path. See `docs/design-datatypes.md` D2 and
+  `docs/sql.md`.
+
+### Fixed a transaction-rollback data-corruption bug in the core storage engine (2026-09-03)
+
+- `ROLLBACK` (explicit or autocommit-statement-failure) could silently
+  discard another transaction's already-committed row if it happened to
+  share a physical B+Tree page with the rolling-back transaction — the
+  engine restored the whole page to a pre-transaction image instead of
+  reversing only its own row-level changes. A related variant could also
+  destroy pre-existing committed rows that a page split (triggered by the
+  now-aborting transaction's own insert) had physically relocated onto a
+  newly allocated sibling page. Neither required a crash to trigger — both
+  were live, in-process bugs under ordinary concurrent write load.
+- Fixed by replaying each transaction's already-existing, durable
+  per-transaction UNDO chain (previously used only by crash recovery)
+  against the live buffer pool on rollback, routed through the exact
+  B+Tree each record came from, instead of restoring whole pages.
+  Structural changes (page splits, root promotion) are now correctly never
+  reverted by rollback, matching standard B+Tree engine practice — only
+  logical row content is undone.
+- This was the blocker for `REBUILD INDEX ... ONLINE` (an already-built,
+  uncommitted feature) reaching a testable state; un-skipping its own
+  concurrency test in turn surfaced a second, initially-unexplained
+  correctness issue — resolved below, and `ONLINE` rebuild is now
+  supported. See `TODO.md` log #89.
+
+### Fixed a general transaction-attribution race in the storage engine, corrupting secondary indexes under concurrent writes (2026-09-03)
+
+- Any workload with a secondary index and real concurrent
+  `INSERT`/`UPDATE`/`DELETE` traffic could silently corrupt that index —
+  entries left stale in their old bucket, duplicated across old and new
+  buckets, or missing entirely — with no error raised. Present since before
+  this changelog's fixes above (reproduced against the last commit prior to
+  this development cycle, with none of today's changes applied) and
+  unrelated to either of them; it just happened to be what was actually
+  breaking `REBUILD INDEX ... ONLINE`'s own concurrency test after the
+  rollback fix above landed.
+- Root cause: `Engine.beginLocked` set the engine's "currently active
+  writer" bookkeeping field for every new transaction immediately on
+  begin, synchronized only briefly and independently of the lock that
+  protects a transaction's actual page-mutating work — so a transaction
+  newly beginning could silently steal that attribution out from under a
+  *different*, concurrently in-flight transaction's own write, before that
+  writer's own next step (e.g. the index-maintenance half of an `UPDATE`,
+  after its heap-update half already ran) executed. That step's effects
+  then got attributed to the wrong transaction entirely, so neither
+  transaction's eventual commit or rollback bookkeeping matched what it
+  had actually done.
+- Fixed by making a transaction's own `Enter`/`Leave` bracket (already
+  correctly synchronized with the page-mutation lock) the only setter of
+  this attribution for ordinary concurrent transactions; internal
+  single-writer maintenance paths, where nothing else can be concurrently
+  active by construction, are unaffected.
+- Verified via a dedicated concurrent-write stress harness (3 writers,
+  ~230 successful statements per run against a non-unique secondary
+  index): 14/20 runs still failing with only the rollback fix above
+  applied, 0/20 failing across 240 iterations (6 full runs) after this
+  fix. `REBUILD INDEX ... ONLINE` is now genuinely safe; its capability
+  row is `"supported"`. With this, **Phase 0–27 has zero remaining
+  deferrals.** See `TODO.md` log #91.
+
+### Multi-database hosting — M2 complete; dead `TaskRuntime.Cancel` retired (2026-09-03)
+
+- Removed `TaskRuntime.Cancel` and its private `running` cancel registry —
+  dead code since task execution moved to a shared worker pool. `CANCEL
+  TASK` is unchanged: it has always taken effect through the per-database
+  `db.taskCancels` registry, which every task-execution path wires up
+  regardless of which worker or scheduler ran the task. Internal only, no
+  behaviour change.
+- With this, the M2 "single-node selectable multi-database routing"
+  milestone is complete: realm/database routing, realm-scoped auth,
+  per-connection idle eviction, process-wide buffer-memory and
+  task-scheduling budgets, declarative manifest bootstrap, and serving a
+  fully-managed deployment. Production-grade multi-database hosting
+  (per-database WAL/PITR/Raft, quotas, registry DR) remains M3+ scope.
+
+### Multi-database hosting — declarative bootstrap manifest wired into `nextsql init` (2026-09-03)
+
+- `nextsql init --hosting-manifest FILE` (or `NEXTSQL_HOSTING_MANIFEST_FILE`,
+  or a dotenv key) bootstraps a whole multi-realm deployment from one
+  validated YAML document: every declared realm and database is registered
+  and physically created in a single run.
+- Any per-database root key file named in the manifest that does not exist
+  yet is created first (a fresh independent AES-256 root, mode 0600), so a
+  fresh deployment needs only the manifest.
+- The whole document (and every key file) is validated before any state is
+  mutated. Re-running with an identical manifest is a clean no-op;
+  a partial run resumes.
+- New `hosting.EnsureBootstrapManifestKeyFiles`. The bootstrap-user logic is
+  now shared between the single-pair and manifest init paths.
+- `nextsqld` now serves a manifest-bootstrapped deployment: its startup no
+  longer requires a legacy-layout default database. When the registry's
+  default is managed-layout (as a manifest always produces), the server
+  starts with no eager primary handle and serves the default realm/database
+  lazily through the database manager, exactly like every non-default
+  managed database. `--key-file` is not required for such a deployment —
+  only `--instance-key-file`. (`require_client_key` is not supported with a
+  managed-layout default.)
+
+### Phase 19 — `CRON` schedule expressions (2026-09-03)
+
+- `CREATE SCHEDULE name CRON '<expr>' RUN WORKFLOW ...` — a standard
+  five-field cron expression (`minute hour day-of-month month
+  day-of-week`), evaluated in UTC. Each field takes `*`, a value, a range
+  `a-b`, a comma list, or a step `*/n` / `a-b/n`; day-of-week is 0–6 with
+  Sunday 0 (`7` also accepted). When both day fields are restricted, a day
+  matches if either matches (Vixie-cron semantics).
+- Numeric only — month/weekday names, `@`-macros, seconds, and
+  `L`/`W`/`#` are deliberately out of scope.
+- Expressions are validated at definition time, including a bounded
+  forward search that rejects an unsatisfiable spec (e.g. `0 0 30 2 *`),
+  and stored in canonical single-space form.
+- Recurrence: on each firing the cursor advances to the next matching
+  minute strictly after now, so a leader clock that jumped past several
+  boundaries emits one task and skips straight to the next future
+  boundary — the same forward-jump rule `EVERY` already uses. `FORBID`
+  concurrency is unchanged.
+- New leaf package `internal/cron`. Schedule catalog descriptor is now
+  `NSSC` v2 (adds the cron expression); v1 descriptors still decode.
+- Closes the last deferred item under Phase 19's SCHEDULE surface; the
+  deferral was gated on "the core scheduler is proven", which the
+  centralized task scheduler work (logs #81/#83) established.
+
+### Housekeeping — P0–P27 status audit, flaky-test and `go vet` fixes (2026-09-03)
+
+- Audited Phase 0–Phase 27: every phase and every exit gate is complete.
+  The only unchecked items in that span are three intentional non-gate
+  follow-ons, each blocked on a separate prerequisite: `REBUILD INDEX …
+  ONLINE` (P17), cron `SCHEDULE` syntax (P19), and the terminal 100M
+  B+Tree soak measurement (P16).
+- Refreshed the stale summary blocks in `TODO.md` (header table, progress
+  paragraph, roadmap summary, "Next action") that still described P27 as
+  open after it closed on 2026-09-03.
+- Fixed a flaky test: `TestCentralSchedulerReleasesEveryRefEventually`
+  sampled the outstanding-ref counter once at an arbitrary instant, but
+  that counter legitimately oscillates 0→1→0 within each poll tick; it now
+  polls for the counter to settle at zero, matching the test's intent. No
+  production code change — not a real ref leak.
+- Fixed the one `go vet ./...` finding: `internal/executor/cdc.go`
+  `execSubscribe` built its cancellable context before validating the
+  operation filter, leaking the context on the invalid-filter error path.
+  Filter validation now runs first. `go vet ./...` is clean.
+
+### Multi-database hosting — M2-3b-3b centralized task scheduling (2026-09-03)
+
+- Task polling itself is now centralized: one process-wide scheduler
+  enumerates every open database each tick and claims/dispatches its due
+  work, instead of each database running its own poll loop. Combined with
+  M2-3b-3a's shared worker pool, task-scheduling goroutine count is now
+  O(1) regardless of how many databases a hosting `nextsqld` has open,
+  down from one poll loop plus its own workers per database.
+- A database with a scheduler-claimed task still executing can't be
+  evicted out from under it — reuses the existing connection refcounting
+  mechanism rather than adding a second one.
+- Known, deliberate tradeoff: a database connected to only very briefly
+  (materially shorter than the poll interval) may see its own schedule
+  fire later than before, since polling no longer happens automatically on
+  every connect. A normally-held-open connection is unaffected. Delayed,
+  never lost.
+- Not part of the Phase 27 release gate.
+
+### Phase 27 complete — per-realm and per-database connection limits (2026-09-03)
+
+- Closed Phase 27's last open exit-gate item. Its original deferral no
+  longer held: it assumed one `nextsqld` process could only ever open one
+  database, but the multi-database hosting track had since shipped live,
+  concurrent, selectable routing to more than one database per process.
+- New `max_connections_per_database`/`max_connections_per_realm` config
+  keys (both default 0 = unlimited), enforced the same way
+  `max_connections_per_user` already was: rejected after authentication,
+  before a session is created, with `exhausted`.
+- A database's own connection count and its realm's are independent —
+  exhausting one database's limit never blocks a connection to a different
+  database in the same realm, while every database in a realm shares that
+  realm's own counter.
+- A single-database (non-hosted) deployment can still set either knob
+  meaningfully — it collapses to a finer-grained `max_connections`.
+- **Phase 27 — Operational maturity + workload governance — is now
+  complete.**
+
+### Multi-database hosting — M2-3b-3a shared task-execution worker pool (2026-09-03)
+
+- Scheduled-task execution across every database `nextsqld` has open now
+  shares one fixed-size worker pool, instead of each database spawning its
+  own independent worker set — task-execution goroutine count no longer
+  scales with the number of open databases. New `task_workers` config key
+  (default 0 = the same built-in default each database used before).
+- Each database still polls its own due tasks/schedules independently;
+  only the goroutines that execute claimed work moved to the shared pool.
+  Centralizing the polling itself is a separate, not-yet-built follow-on.
+- Closing one database's task runtime (including the existing idle
+  eviction of a secondary database) now correctly waits out any
+  already-submitted work before returning, so the database can be safely
+  closed right after — a new correctness requirement introduced by sharing
+  workers across databases, closed as part of this change rather than left
+  for later.
+- Live-verified against a real `nextsqld` process with the shared pool
+  sized to a single worker: two independently-scheduled databases both
+  successfully executed through that one worker.
+- Not part of the Phase 27 release gate.
+
+### Multi-database hosting — M2-3b-2 global memory budget gating buffer-page grants (2026-09-03)
+
+- A hosting `nextsqld` process can now cap the total buffer-pool memory
+  committed across every database it has open at once (the primary plus
+  every dbmanager-opened secondary), instead of each database's buffer
+  pool growing unaccounted for against the others. New `max_total_buffer_pages`
+  config key (default 0 = unbounded, unchanged behavior).
+- Since a buffer pool's frames are allocated in full at open — there is no
+  per-page runtime grant to gate, unlike the existing per-database disk
+  storage cap — the new shared `buffer.Budget` is charged once when a
+  database opens and released once when it closes, including on M2-3b-1's
+  idle eviction.
+- An open that would exceed the budget fails `exhausted` rather than
+  growing process memory without bound; live-verified against a real
+  `nextsqld` and a real second-database connection, both the rejection and
+  the release-on-close/retry path.
+- Deliberately scoped to the long-running server process: the one-shot
+  `nextsql database create`/`nextsql init` provisioning CLI is unaffected
+  (it never holds more than one buffer pool open at a time).
+- Not part of the Phase 27 release gate.
+
+### Phase 27 exit gate closed — local-commit-before-replication-ack structural fix (2026-09-03)
+
+- Fixed the last open Phase 27 exit-gate item: `storage.Engine` used to
+  commit a transaction to local storage (durable, visible, locks released)
+  *before* confirming Raft quorum, so a `Replicate` failure — most commonly
+  a write racing `CLUSTER TRANSFER LEADER` — could leave one un-replicated
+  local row no ordinary Raft catch-up ever reconciled. Deferred twice
+  before in favor of mitigations; the full structural fix has now landed.
+- A transaction's commit record is now held — durable, visible, and
+  lock-released only once Raft's outcome is known — via a new WAL
+  durability-barrier primitive (`wal.Log.AppendHeld`/`ReleaseHold`).
+- A **definite** replication failure (this node was rejected before ever
+  being able to propose the entry — e.g. any write landing during a
+  leadership transfer) now discards the held commit and rolls the
+  transaction back cleanly: no orphaned local row, nothing for an operator
+  to reconcile.
+- An **ambiguous** failure (the entry was proposed, but the quorum wait
+  itself failed or timed out) is structurally undecidable and keeps this
+  project's existing fail-open behavior: the commit stays local, and the
+  pre-existing `replSuspect` node-local flag plus `CLUSTER RECONCILE
+  CONFIRM` operator workflow — unchanged — remains the answer for that
+  narrower residual case, which cannot be closed without changing Raft's
+  own apply contract.
+- No wire-protocol or on-disk-format change.
+
+### Multi-database hosting — M2-6 pre-authentication existence-disclosure hardening (2026-09-02)
+
+- Closed the gap the M2-5 entry below flagged as open: connecting with an
+  unknown realm name, or (in a legacy single-database deployment) an
+  unknown database name, no longer returns a distinguishing error before a
+  password is even checked. The handshake now always completes the full
+  round trip and, only after running the real (or dummy, for an unknown
+  username) password comparison, rejects an unresolved realm/database with
+  the exact same generic authentication-failure response a wrong password
+  produces — no distinguishing content or timing, matching the protection
+  username enumeration already had.
+- Deliberately not addressed here: a database-not-found error is still
+  possible after successful authentication in a genuinely multi-database
+  realm (it requires valid credentials already, a materially weaker,
+  pre-existing gap).
+
+### Multi-database hosting — M2-5 multi-realm routing activation (2026-09-02)
+
+- A hosted deployment's `nextsqld` can now serve more than one realm from a
+  single process: a connection may select any real realm/database pair in
+  the deployment, not just the one realm pinned at startup. `dbmanager`'s
+  routing (M2-3a) and realm-scoped authorization (M2-4b-1) already
+  supported this; only a leftover flat equality check was blocking it.
+- Fixed a real, separate bug found during live verification: the CLI's
+  `ServerConfig` resolved a `--realm`/`NEXTSQL_REALM_NAME` setting but
+  never actually passed it to the driver, so no server-mode command could
+  select a non-default realm. `nextsql exec` gained an explicit `--realm`
+  flag.
+- An unrecognized realm name is still cleanly rejected.
+- Not part of the Phase 27 release gate. Pre-authentication realm-name
+  existence disclosure (an unknown realm returns a distinguishing error
+  before any password check) remains an open, pre-existing gap, now more
+  reachable than before — noted for a future dedicated hardening pass.
+
+### Multi-database hosting — M2-4b-1 realm-scoped auth.Store/security.ACL (2026-09-02)
+
+- `auth.Store` and `security.ACL` gained a realm dimension: every method now
+  has a realm-scoped `*InRealm` sibling (`VerifyInRealm`, `GrantInRealm`,
+  `AllowedScopedInRealm`, etc.); every pre-existing flat method is unchanged
+  behavior (a deployment-wide `hosting.ID{}` wrapper), so this is additive
+  for every non-hosted deployment.
+- The same username can now exist independently, with independent
+  passwords and grants, in two different realms of a hosted deployment.
+- A deployment-wide `PrivAdmin`+`ScopeCluster` grant (the kind created by
+  `nextsql init --user`) continues to authorize across every realm; a
+  cluster-admin grant can never be narrowed to one realm, by design.
+- `system.users`/`system.roles`/`system.grants` now show only the
+  connected session's own realm's principals, instead of only ever showing
+  deployment-wide ones once realms exist.
+- New `hosting.Registry.LookupRealm`. Two on-disk credential file formats
+  bumped (`auth.Store` v2→v3, `security.ACL` v1→v2); both still read every
+  older version.
+- Live-verified against real `nextsql`/`nextsqld` binaries and a new
+  two-realm, two-server integration test proving real cross-realm password
+  isolation over the wire.
+- `nextsqld` still pins its wire-protocol realm to one name — this lands
+  the authorization layer, not multi-realm routing activation, which
+  remains open. M2-4b-2 (per-realm credential files) and M2-4b-3 (deeper
+  OIDC broker realm-awareness) remain open. Not part of the Phase 27
+  release gate.
+
+### Multi-database hosting — M2-4b scoping (2026-09-02)
+
+- No code changes — scoping and documentation only.
+- Found `auth.Store` (flat `map[string]record` keyed by username) cannot
+  represent per-realm usernames without a real structural change; two
+  options identified (composite-key one file vs. fully separate per-realm
+  files needing a new eviction manager) — a genuine design decision, not
+  yet made.
+- Found `nextsqld` currently pins its realm to one fixed name, so
+  `dbmanager`'s multi-realm routing (accepted since M2-3a) cannot actually
+  be reached today — M2-4b is a real prerequisite for multi-realm routing,
+  not only an authorization feature.
+- Decomposed M2-4b into M2-4b-1 (composite-key single file — recommended
+  first slice), M2-4b-2 (per-realm files + eviction manager), M2-4b-3
+  (OIDC broker realm-awareness, narrower than first scoped since token
+  minting already carries a realm claim).
+
+### Multi-database hosting — M2-4a `system.realms`/`system.databases` introspection (2026-09-02)
+
+- Two new admin-only read-only system views expose the hosted deployment
+  registry over SQL: `system.realms` (`realm_id`, `name`, `state`,
+  `database_count`, `storage_cap_bytes`, `realm_root_delegated`) and
+  `system.databases` (`realm_id`, `realm_name`, `database_id`, `name`,
+  `state`, `layout`, `storage_cap_bytes`).
+- New `Session.SetHostingRegistry`/`Server.HostingRegistry` plumbing wires
+  `internal/hosting.Registry` into the query path, mirroring the existing
+  `SetACL`/`SetAudit`/`SetAuth` setters; `nextsqld` wires it in alongside
+  the pre-existing `srv.Database`/`srv.Realm` assignments.
+- On a legacy/non-hosted deployment (no registry configured), or for a
+  non-admin caller, both views return zero rows rather than erroring —
+  same gating convention as `system.resource_groups`.
+- Live-verified against a real `nextsqld` with a real two-database
+  deployment: an admin session sees the real registry contents; a
+  `CONNECT`-only non-admin session sees empty result sets on both views.
+- No WAL/catalog/wire-protocol change; `SchemaVersion` not bumped. M2-4b
+  (realm-local auth/ACL store) and M2-4c (`system.database_operations`)
+  remain open. Not part of the Phase 27 release gate.
+
+### Multi-database hosting — M2-4 dependency correction and scoping (2026-09-02)
+
+- No code changes — scoping and documentation only.
+- Corrected a stale dependency note: M2-4 (realm-scoped auth,
+  `system.realms`/`system.databases`/`system.database_operations`
+  introspection) does not actually depend on M2-3b-2/3 (resource
+  budgeting, task-pool centralization) — those are orthogonal concerns.
+  M2-4's real dependencies (M2-1, M2-2, M2-3a) are all already landed.
+- Decomposed M2-4 into three further sub-increments in
+  `docs/design-multidatabase-dbaas.md` §16: M2-4a (`system.realms`/
+  `system.databases` — small, follows the established `system.*`
+  pattern), M2-4b (realm-local auth/ACL store + the
+  `(RealmID, PrincipalID, DatabaseID, privilege, scope)` authorization
+  tuple — the real architectural work), M2-4c (`system.database_operations`
+  — needs new operation-history tracking that doesn't exist yet).
+
+### Multi-database hosting — M2-3b-1 reference counting + idle eviction + open-failure quarantine (2026-09-02)
+
+- A secondary database opened via `internal/dbmanager.Manager` now closes
+  when its last connection disconnects, instead of staying open until
+  process exit, and reopens cleanly on the next connection. The primary
+  database is pinned and never evicted.
+- `Manager.Acquire` now returns an idempotent release closure, wired into
+  the connection teardown path (`internal/protocol/server.go`); eviction
+  reuses the already-durable `DB.Close()`, closing a secondary database's
+  task runtime before it and its key envelope after, in the correct order.
+- A database that repeatedly fails to open is now quarantined with
+  exponential backoff (200ms base, doubling, capped at 30s) instead of
+  being retried in a tight loop.
+- Live-verified against a real `nextsqld`: real file descriptors
+  (database file, WAL segment, undo log) confirmed open during a live
+  secondary-database connection and fully closed after disconnect via
+  `/proc/<pid>/fd`, with data surviving repeated evict/reopen cycles.
+- No WAL/catalog/wire-protocol change. M2-3b-2 (cross-database memory
+  budget) and M2-3b-3 (centralizing background task pools) remain open.
+  Not part of the Phase 27 release gate.
+
+### Multi-database hosting — M2-3b scoping and decomposition (2026-09-02)
+
+- No code changes — scoping and documentation only.
+- Investigated M2-3b's full spec (reference counting across 7 subsystems,
+  idle eviction, a global memory budget, centralizing background pools)
+  and decomposed it into three further sub-increments in
+  `docs/design-multidatabase-dbaas.md` §9: M2-3b-1 (connection/session
+  refcounting + idle eviction + open-failure quarantine — small, reuses
+  existing hooks), M2-3b-2 (cross-database memory budget, larger, no
+  existing infrastructure), M2-3b-3 (`TaskRuntime` centralization, a
+  genuine internal redesign).
+- Corrected a stale claim in the design doc: sessions, CDC, and tasks
+  already have live reference registries (`DB.sessions`, `db.cdcSubs`,
+  `TaskRuntime.running`) that were simply never consulted for DB
+  lifecycle purposes — not "no subsystem exposes a ref today" as
+  previously stated.
+- Confirmed backup and replication are vacuous for this track for now:
+  backup never touches a manager-opened database, and M2-3a never
+  attaches replication to a secondary database.
+
+### Multi-database hosting — M2-3a bounded DatabaseManager (2026-09-02)
+
+- `nextsqld` can now genuinely serve more than one database: a
+  connection's `Hello.Realm`/`Hello.Database` can route to a distinct,
+  already-registered (`nextsql database create`) database, not just
+  validate identity against the one primary database.
+- New `internal/dbmanager.Manager`: a bounded, keyed (by durable database
+  ID) map of open handles with single-flight open (concurrent requests
+  for the same not-yet-open database share one open, never duplicate it),
+  a small fixed open-database limit (`max_open_databases`, default 8),
+  and no eviction — an opened database stays open until process exit.
+- Secondary databases open single-node only (no Raft/replication
+  attachment, no PITR archiving) and, once opened, get their own
+  `TaskRuntime` and their own copies of the WAL-retention/disk-watermark/
+  replica-lag monitors.
+- Fixed a real bug caught by testing, not inspection: database-routing
+  resolution ran after `TypeReady` was already sent to the client — the
+  wire protocol's definitive success signal, read once with no further
+  reads — so a routing failure would never reach the client, which would
+  see a successful connection despite server-side rejection. Moved
+  resolution to before `TypeReady`.
+- Fixed a second real bug, caught only by live verification against a
+  real `nextsql database create`d database: a managed database's key file
+  unlocks an *envelope* keystore next to the database file (like the
+  primary), it isn't usable directly as the database's own key.
+- No reference counting, idle eviction, memory budget, or central bounded
+  background pools yet — that's M2-3b, not scheduled. Not part of the
+  Phase 27 release gate.
+
+### Multi-database hosting — M2-2 Hello realm field (2026-09-02)
+
+- Added `Hello.Realm`, an additive opt-in trailing field on the wire
+  protocol handshake, so a client can identify which hosted realm it
+  intends to reach. `nextsqld` validates it as a flat-string check against
+  the one realm the process serves; a mismatch fails cleanly with
+  `unknown realm`.
+- No frame-version bump: a client that never configures a realm sends the
+  exact same Hello it always has, so old/unconfigured clients remain
+  permanently compatible with any server. A client that does select a
+  realm requires a new-enough server and fails closed against an old one.
+- Updated all 6 official drivers (Go, PHP, JS-shared[Bun+Deno], Node,
+  Python, Ruby) with an optional `Realm`/`realm` config field.
+- Verified live against a real `nextsqld` with two independent drivers.
+- Routing/identity validation only — not yet a live `hosting.Registry`
+  lookup or selectable multi-database routing (that's M2-3); not
+  realm-scoped authorization (that's M2-4). Not part of the Phase 27
+  release gate.
+
+### P27 Operational maturity + workload governance — replication-orphan STRONG-read mitigation (2026-09-02)
+
+- Investigated the "local commit precedes replication acknowledgment"
+  structural fix in depth and found it needs new WAL flush-barrier
+  semantics plus crash-recovery changes (a durably-flushed commit record
+  can't currently be voided by a later abort record, and two unrelated
+  call sites — `Checkpoint()`, and the Raft FSM-apply path — can flush a
+  pending commit as a side effect) — bigger than previously scoped. Landed
+  a stronger mitigation instead of the full redesign, at the user's choice.
+- A local commit that fails to replicate now marks the node
+  replication-suspect (new `storage.ReplicationOrphanReporter` hook,
+  implemented by `*replication.Cluster`). `Cluster.StrongReadBarrier` fails
+  `Unavailable` while suspect, regardless of leadership — closing the case
+  a leadership check alone can't (a `Replicate` failure that isn't a
+  leadership loss). Scoped to `STRONG` reads only; `BOUNDED`/`STALE` are
+  unaffected, and no leadership transfer is forced.
+- New `CLUSTER RECONCILE CONFIRM` SQL (cluster `ADMIN`, not in a
+  transaction, node-local, `CONFIRM` mandatory) clears the flag once an
+  operator has verified/repaired the node; new `nextsql cluster reconcile
+  confirm` CLI subcommand. New `system.replica_health.replication_suspect`
+  column for monitoring. No automatic clearing.
+- Phase 27's "local commit precedes replication acknowledgment" checklist
+  line stays open — this is a stronger mitigation, not the structural fix.
+- No WAL/catalog/wire-protocol change.
+
+### P27 Operational maturity + workload governance — resource-group Priority enforcement (2026-09-02)
+
+- `RESOURCE GROUP ... WITH (PRIORITY = n)` is now enforced. `internal/scheduler/admit.go`'s
+  `Admission` gate replaced its channel-semaphore wait path with a
+  mutex-protected `container/heap` priority queue: when a slot frees up and
+  more than one caller is queued for it, the highest-priority waiter is
+  admitted first (FIFO among equal priorities).
+- New `Admission.AcquireWithPriority(ctx, priority)`; the plain `Acquire(ctx)`
+  entrypoint and every existing caller (per-resource-group gates, claimed-task
+  execution) are unchanged and behaviorally identical.
+- Only `Session.ExecContext`'s process-wide acquire now threads through the
+  session's assigned resource group's `Priority` — the only gate shared
+  across groups, hence the only place cross-group ordering is meaningful.
+- Ordering only, never preemption: an already-admitted lower-priority query
+  is never interrupted, and a waiter's own `QueueWait` timeout is unaffected
+  by priority — a priority-0 caller sees identical behavior to before.
+  Starvation under sustained high-priority contention is an accepted,
+  unmitigated tradeoff, not a new fairness mechanism.
+- Closes Phase 27's last open resource-group checklist line; one Phase 27
+  exit-gate item remains (local-commit-before-replicate-ack, deliberately
+  deferred).
+- No WAL/catalog/wire-protocol change.
+
+### P27 Operational maturity + workload governance — resource-group scheduler-class-integration + unbounded-pools audit (2026-09-02)
+
+- Fixed a real gap: claimed-task/scheduled-workflow execution
+  (`executor.executeClaimedTask`) ran outside the process-wide
+  `scheduler.Admission` gate entirely, bounded only by `TaskRuntime`'s own
+  separate worker limit. It now acquires the shared gate exactly like a
+  regular query does, including the same reject-before-any-state-mutation
+  behavior so a rejected task's lease simply expires and is retried later.
+- Audited every other background-work class (API, `ANALYZE`, `MAINTAIN`,
+  `SUBSCRIBE`, backup) and confirmed no independent unbounded pools exist
+  in the live server.
+- Resource-group **Priority** remains deliberately unenforced: real
+  priority-ordered admission needs a `scheduler.Admission`
+  concurrency-primitive redesign, judged too risky to rush into this audit.
+- Closes 2 of Phase 27's last 3 open resource-group checklist lines.
+- No WAL/catalog/wire-protocol change.
+
+### Multi-database hosting — M2-1 registry realm/database creation primitives (2026-09-02)
+
+- New `Registry.CreateRealm`/`CreateDatabase` (`internal/hosting`) and
+  `nextsql realm create` / `nextsql database create` CLI: registers and
+  physically provisions an additional managed database (durable
+  `PROVISIONING` → create/verify-open → `ACTIVE`, idempotent and
+  crash-safe on retry) at the previously-unused `LayoutManaged` path
+  scheme.
+- The M2 "single-node multi-database routing" milestone of the
+  Multi-database hosting cross-cutting track (`docs/design-multidatabase-dbaas.md`)
+  is decomposed into four gated sub-increments (M2-1..4); this is M2-1.
+- `nextsqld` does not yet open or serve a database created this way — that
+  is a later sub-increment (M2-3).
+- Not part of the Phase 27 release gate; a separate cross-cutting track.
+
+### P27 Operational maturity + workload governance — online format/catalog migration strategy (2026-09-02)
+
+- New `docs/storage-format.md` "Format and catalog migration strategy"
+  section: catalog-record changes (`NSCT` and friends) are safe to migrate
+  online today via the existing multi-version-decode pattern; physical
+  format (page/superblock) changes require the offline dump/reload path
+  (`nextsql backup`/SQL copy into a freshly created database).
+- Extracted `internal/upgrade/compat` — a dependency-free leaf package
+  holding the format-compatibility catalog (`Family`/`Spec`/`Catalog`/
+  `Check`/`Compatible`), split out of `internal/upgrade` to break an
+  import cycle that had prevented it from ever being used outside its own
+  package.
+- `internal/storage/file.decodeSuperblock` and `catalog.DecodeTable` now
+  enforce this catalog directly instead of each re-implementing their own
+  version-range check, so what `nextsql diagnose` prints can no longer
+  drift from what's actually enforced. The version-mismatch error now
+  names the actual and supported version numbers.
+- Closes the Phase 27 "Online format/catalog migration strategy where
+  safe" checklist item.
+- No wire-protocol change; every currently-valid superblock/catalog
+  version still opens identically.
+
+### P27 Operational maturity + workload governance — replica-lag management (2026-09-02)
+
+- New `replica_lag_check_ms` / `replica_lag_warn_entries` config keys
+  (default 0/1000). When enabled, `nextsqld` periodically reads this node's
+  own `system.replica_health.apply_backlog` and logs an edge-triggered
+  warning once it reaches the threshold, plus a recovery line once it drops
+  back below.
+- Alerting only, by design: unlike disk watermarks, nothing is rejected —
+  a lagging follower doesn't affect the leader's ability to accept writes,
+  and `Cluster.FollowerReadHealthy` already keeps a too-stale follower out
+  of bounded-staleness read routing regardless of this setting.
+- Current backlog and cumulative warn count are exposed via the metrics
+  registry (`ReplicaApplyBacklog`/`ReplicaLagWarns`).
+- Closes the Phase 27 "Replica-lag management" checklist item.
+- No WAL/catalog/wire-format change.
+
+### P27 Operational maturity + workload governance — disk watermark policies + capacity warnings (2026-09-02)
+
+- New `internal/diskspace` package: cross-platform filesystem capacity check
+  (`statfs`/`GetDiskFreeSpaceEx`) — physical disk space, distinct from
+  `storage.Engine`'s logical per-database `StorageCapBytes`.
+- New `disk_watermark_check_ms` / `disk_watermark_warn_percent` /
+  `disk_watermark_reject_percent` config keys (default 0/85/95). When
+  enabled, `nextsqld` periodically checks free space on the volume holding
+  `--data-dir`: at the warn threshold it logs (the capacity warning); at the
+  reject threshold it additionally rejects new mutating statements with
+  `Unavailable`, using hysteresis so the reject state only clears once usage
+  drops back below the warn threshold, not merely below the reject one.
+- The reject state is a new node-local flag, independent of `CLUSTER
+  MAINTENANCE ENABLE`/`DISABLE`: neither can clear the other.
+- Current usage and cumulative warn/reject counts are exposed via the
+  metrics registry.
+- Closes the Phase 27 "Disk watermark policies" and "Capacity warnings"
+  checklist items.
+- No WAL/catalog/wire-format change.
+
+### P27 Operational maturity + workload governance — backup retention management (2026-09-02)
+
+- New `nextsql backup list --base-dir DIR` and `nextsql backup prune
+  --base-dir DIR (--keep-count N | --keep-days N) [--confirm]`. Each
+  immediate subdirectory of `--base-dir` with a valid backup header counts
+  as one backup (anything else is silently skipped); `prune` selects
+  backups older than the policy, oldest first, but never the single newest
+  backup regardless of age. Without `--confirm` it only previews; nothing
+  is deleted until you pass it.
+- Purely additive: the existing flag-first `nextsql backup --data-dir ...
+  --out ...` invocation is unchanged.
+- Closes the Phase 27 "Backup retention management" checklist item.
+- No WAL/catalog/wire-format change.
+
+### P27 Operational maturity + workload governance — WAL retention management (2026-09-02)
+
+- New `wal_retention_ms` config key: when positive and `wal_archive` is also
+  set, `nextsqld` periodically advances `DB.SetWALRetentionHorizon` to the
+  newest archived segment's LSN at or before `now - wal_retention_ms`,
+  reusing the same PITR lookup (`backup.ResolveUntilTime`) `nextsql restore
+  --until` already relies on. 0 (default) leaves the horizon unmanaged,
+  matching prior behavior. A no-op without `wal_archive` — pruning without
+  an archiver would destroy the only copy of that history.
+- This only maintains the horizon; pruning itself is unchanged — still
+  only happens during a `MAINTAIN DATABASE` you run or schedule yourself.
+  `nextsqld` has no automatic maintenance scheduler.
+- Closes the Phase 27 "WAL retention management" checklist item.
+- No WAL/catalog/wire-format change.
+
+### Official Python and Ruby drivers (2026-09-02)
+
+- New `drivers/python` (stdlib only — `socket`/`ssl`/`decimal`/`json`;
+  Python 3.10+) and `drivers/ruby` (stdlib only — `socket`/`openssl`/
+  `bigdecimal`/`json`; Ruby 3.0+). Not published as packages — import from
+  the tree directly, matching every other official driver. Full NSQL v1
+  surface: `Connection`/`Cluster` (leader routing + follower reads),
+  streaming `Rows`, prepared statements, idempotent exec, `node_status`,
+  `set_read_consistency`, `cancel`, and every value kind (UUID, STRING/
+  TEXT, DECIMAL, TIMESTAMPTZ, dense/sparse VECTOR, JSON, POINT/BOX/LINE/
+  POLYGON). Field-level `ENCRYPTED CLIENT` support is not yet ported
+  (tracked as a follow-on).
+- Verified against a real, locally-built `nextsqld` (plaintext and TLS),
+  not just unit-tested — this caught and fixed two real encode/decode bugs
+  before shipping: a row-descriptor column-type entry is 6 bytes, not 7;
+  and a VECTOR parameter's wire payload repeats `dim`+flag as its own
+  leading bytes separately from the generic value header's metadata,
+  which an initial pass had collapsed into one.
+- **Found and fixed a real, previously-latent bug in the existing PHP,
+  Node, Bun, and Deno drivers** (not present in Go, which already had it
+  right): a failed query permanently desynced the connection, because the
+  server always sends `Error` then `Ready` and these drivers never drained
+  that trailing `Ready` outside a couple of call sites — the next call on
+  the same connection then misreads the stale `Ready` and fails with a
+  spurious "unexpected message type." Any application that caught a query
+  error and kept using the connection was silently broken. Fixed in all
+  four by centralizing the drain in each driver's shared "unexpected
+  message" helper. Verified live against `nextsqld` through `php`, `node`,
+  `bun`, and `deno` before and after; every existing driver test suite
+  re-run clean.
+- No WAL/catalog/wire-protocol format change.
+
+### P27 Operational maturity + workload governance — replication-orphan detection (2026-09-02)
+
+- New `metrics.Registry.AddReplicationOrphan()` / `Snapshot.ReplicationOrphans`
+  counts a transaction that committed to local storage but then failed to
+  reach Raft quorum (see the "local commit precedes replication
+  acknowledgment" item below) — pure additive observability, no behavior
+  change. Previously silent; now a growing count is an operator-visible
+  signal.
+- The underlying gap itself — a bounded, latent local/cluster data
+  divergence, not an acknowledged-write loss — remains open. A design
+  review found the structural fix (deferring MVCC visibility until Raft
+  quorum) too large to safely attempt as a rushed change, and a post-hoc
+  compensating rollback unsound in general (another transaction can already
+  have observed the data by the time a quorum failure is known). See
+  `TODO.md`'s Phase 27 exit gate for the full writeup and the design
+  review's findings.
+
+### P27 Operational maturity + workload governance — rolling upgrade procedure + router/replication robustness fixes (2026-09-02)
+
+- Documented the rolling-upgrade procedure (`docs/ops.md` "Rolling
+  upgrade"): transfer leadership away from a node before draining it, drain
+  it (stops accepting connections and closes its listener), restart it for
+  the binary swap, wait for it to catch up, repeat per node — quorum stays
+  intact throughout on a 3+-voter deployment, so writes never stop landing
+  cluster-wide.
+- New end-to-end integration test proving the procedure's core claim (the
+  first Phase 27 exit-gate line, "planned maintenance can drain without
+  unnecessary transaction loss"): `tests/integration/rolling_upgrade_test.go`
+  runs a 3-node cluster under continuous write load through a full
+  transfer-leader → drain → simulated-restart → rejoin cycle and asserts no
+  acknowledged write is lost.
+- **Building that test surfaced and fixed three real robustness gaps**, all
+  in code that predates this session:
+  - `nextsql.Cluster` (the Go driver's routing client): a write or read
+    routed to a connection that broke mid-flight (e.g. the node it targeted
+    was just drained) surfaced a raw, non-retryable I/O error instead of the
+    same retryable `unavailable` a genuine leader failover already produces;
+    and a connection that died for good could be selected forever afterward
+    (its last-known "leader" role was never invalidated), permanently
+    breaking routing to the rest of the cluster. Both fixed: a transport
+    failure now clears the affected connection's cached routing status and
+    is reported as `unavailable`. Every other official driver has the
+    equivalent client-side contract; only the Go driver's implementation
+    needed the fix.
+  - `protocol.ReadFrame` classified every read failure (EOF, connection
+    reset) as `nerr.Protocol` (implying a malformed peer) instead of
+    `nerr.IO` (a broken transport) — inconsistent with `WriteFrame`'s own
+    failures, which were already `nerr.IO`. Fixed to match; genuine protocol
+    violations (bad magic, unsupported version, oversized packet) are
+    unaffected.
+  - `replication.Cluster.Replicate` classified a `raft.Raft.Apply()` failure
+    as `Internal` (non-retryable) unless it was exactly one of three
+    sentinel errors. `raft.ErrLeadershipTransferInProgress` — exactly what a
+    write racing `CLUSTER TRANSFER LEADER` produces — and
+    `raft.ErrRaftShutdown` were missing from that list. Both added; both are
+    transient, retryable conditions, not evidence of a bug.
+- **Found, documented, not fixed** (tracked, out of this increment's scope):
+  `storage.Engine.commitAndReplicate` commits a transaction to local storage
+  before achieving Raft quorum; if quorum then fails (the same leader-
+  transition race above), the local commit is not rolled back, leaving at
+  most one un-replicated local row per affected node that ordinary catch-up
+  never reconciles. No acknowledged write is ever lost from this — the
+  property the exit gate and this increment's test depend on — but it is a
+  real, latent divergence with no existing detection or repair path. See
+  `docs/ops.md` "Rolling upgrade" and the TODO.md log entry for the full
+  writeup.
+- No WAL/catalog/wire-format change.
+
+### P27 Operational maturity + workload governance — machine-readable operational CLI output (2026-09-02)
+
+- New `--json` flag on `nextsql exec` and every `nextsql cluster` subcommand
+  (`status`, `transfer-leader`, `drain`, `maintenance enable|disable`),
+  printing a single JSON object instead of tab-separated text —
+  `{"columns": [...], "rows": [[...]], "affected": N}` for the four
+  SQL-backed commands, the `replication.Status` fields for `cluster
+  status`. Cell values are stringified the same way the existing TSV output
+  already rendered them.
+- Closes the Phase 27 "Machine-readable operation status" Operational-CLI
+  checklist item.
+- No server-side change — pure CLI output formatting.
+
+### P27 Operational maturity + workload governance — maintenance mode (2026-09-02)
+
+- New `CLUSTER MAINTENANCE ENABLE|DISABLE` admin SQL statement and
+  `nextsql cluster maintenance enable|disable` CLI wrapper. While enabled,
+  the node this connection reached rejects every mutating statement
+  (`INSERT`/`UPSERT`/`UPDATE`/`DELETE`, all DDL, and `BEGIN`) with
+  `Unavailable`, reusing the same write/no-write classification
+  `CLUSTER TRANSFER LEADER`'s leader-routing gate already applies; reads
+  (autocommit `SELECT`, `SHOW`, `system.*`) keep working.
+- Requires cluster `ADMIN`; cannot run inside a transaction. Like
+  `CLUSTER DRAIN` and unlike `CLUSTER TRANSFER LEADER`, it is purely
+  node-local — not Raft-replicated — so it needs no attached cluster and a
+  leader failover during a maintenance window does not carry the flag to the
+  new leader (documented in `docs/ops.md` "Maintenance mode" alongside the
+  intended enable-drain/upgrade-disable sequence).
+- New `system.replication.maintenance_mode` column (also `system.raft`,
+  `SHOW CLUSTER`) surfaces the current node-local state.
+- Closes the Phase 27 "Maintenance mode" Server-lifecycle checklist item.
+- No WAL/catalog/wire-format change.
+
+### P27 Operational maturity + workload governance — idle transaction timeout (2026-09-02)
+
+- New `idle_transaction_timeout_ms` config key (default 0 = no distinct
+  bound) bounds how long a connection may sit with an open transaction and no
+  traffic between frames before it is force-timed-out. Distinct from
+  `transaction_timeout_ms` in *how* it is enforced, not just in name:
+  `transaction_timeout_ms` is checked lazily at the start of the next
+  statement, so a connection that never sends another statement keeps its
+  transaction (and locks) open indefinitely regardless of that setting; the
+  new `idle_transaction_timeout_ms` is instead enforced by the connection's
+  own socket read deadline (`protocol.Limits.IdleTxn`) — the same mechanism
+  `idle_timeout_ms` already used, just with its own, typically tighter, bound
+  that applies only while a transaction is open — so it actively reclaims an
+  abandoned transaction even if the client goes silent.
+- **Real gap found and fixed while implementing this**: tearing down a
+  connection with an open transaction — by this new timeout, by the existing
+  general `idle_timeout_ms`, or by a forced close at the `Drain` deadline —
+  never actually rolled the transaction back. Nothing released its locks;
+  they stayed held by a `*executor.Session` nothing would ever resume again
+  until the whole process restarted. New `executor.Session.Abort` (an
+  exported force-rollback, no-op with nothing open) is now called from the
+  protocol server's connection-teardown path whenever a session still has a
+  transaction open, so every disconnect path releases it deterministically.
+- Closes the Phase 27 "Idle transaction timeout" Session-controls checklist
+  item.
+- No WAL/catalog/wire-format change.
+
+### P27 Operational maturity + workload governance — resource group assignment + enforcement (2026-09-02)
+
+- `SET RESOURCE GROUP name` / `RESET RESOURCE GROUP` assign/clear a session's
+  workload-governance class — the one surviving `SET`/`RESET` spelling after
+  `SET TENANT` was removed. Assignment requires `USAGE` on the group
+  (`GRANT USAGE ON RESOURCE GROUP name TO grantee` / `REVOKE ...`, new
+  `ScopeResourceGroup` RBAC scope); cluster `ADMIN` bypasses like every other
+  privilege check. A name that doesn't exist fails `NotFound` for anyone.
+- Resource groups are now enforced, not just stored: a non-zero
+  `MAX_CONCURRENCY` adds a second, strictly additional admission gate layered
+  on top of the existing process-wide `scheduler.Admission` — a query in a
+  bounded group must clear both gates, so a group can restrict concurrency
+  further but never exceed the process-wide safety limit. Non-zero
+  `WORKERS`/`MEMORY` override the session's per-query `scheduler.Limits`
+  while the assignment lasts (`WORKERS` still clamped to the process ceiling
+  by `Limits.normalized()`).
+- Closes the Phase 27 "Workload max concurrency" and "Workload memory budget"
+  / "Workload CPU/worker budget" checklist items. Remaining open: `PRIORITY`
+  enforcement, integrating the API/analytics/workflow/maintenance/backup task
+  classes with this same scheduler, and the "no independent unbounded pools"
+  audit.
+
+### P27 Operational maturity + workload governance — remote drain (2026-09-02)
+
+- New `CLUSTER DRAIN [WITH (TIMEOUT_MS = n)]` admin SQL statement asks the
+  node a connection reached to begin gracefully draining itself — the same
+  `protocol.Server.Drain` mechanism `nextsqld` already runs on
+  SIGINT/SIGTERM, now reachable without a restart or signal. Unlike
+  `CLUSTER TRANSFER LEADER` this needs no Raft cluster and is not gated on
+  the target being the current leader — draining is purely local to
+  whichever node the connection reaches, so a follower is exactly as
+  drainable as a leader. Runs in the background on the target node; the
+  statement returns a `drain_initiated` acknowledgment immediately.
+- New `nextsql cluster drain [--timeout-ms N] [--addr ...] [--user ...] ...`
+  CLI subcommand.
+- Closes the Phase 27 "`nextsql cluster drain <node>`" Operational-CLI
+  checklist item.
+- New `executor.DB.SetDrainFunc`/`Drain` (nil-safe no-op → `Unavailable` in
+  embedded/CLI use with no listening server); wired in `cmd/nextsqld/main.go`
+  to `protocol.Server.Drain`.
+- **Bug fix found while verifying this under load**: `protocol.Server`'s
+  idle-connection detection (used by `Drain` since the P27 second increment)
+  could hard-close a connection while its own just-finished statement's
+  response was still being written back — a latent race made far more
+  likely to trigger by a self-triggered `CLUSTER DRAIN` than by an
+  externally-triggered SIGINT drain. Fixed by also treating a connection as
+  busy while its response is mid-flight (`backend.queryConn != nil`), not
+  just while a statement is executing or a transaction is open.
+- No WAL/catalog/wire-format change; new lexer
+  keyword `DRAIN`.
+
+### P27 Operational maturity + workload governance — statement, transaction, and lock timeouts (2026-09-02)
+
+- New `statement_timeout_ms` config key makes the existing per-statement
+  `scheduler.Budget` wall-clock bound (`scheduler.DefaultTimeout`, 30s)
+  operator-configurable — it was previously hardcoded.
+- **Real gap found and fixed while auditing this**: the per-statement time
+  budget was wired into a real deadline context, but the base
+  SeqScan/IndexScan row-emission loops (`internal/executor/access.go`) never
+  actually checked it — only specialized paths (ANALYZE, vector/full-text
+  search, index rebuild, partition maintenance) did. A plain `SELECT` could
+  run past its statement timeout unbounded. All six physical scan callbacks
+  now check the budget per row, matching the convention already used
+  elsewhere in the executor.
+- New `transaction_timeout_ms` config key (default 0 = unbounded, unlike the
+  statement/idle timeouts this has no historical non-zero default) bounds a
+  transaction's total open lifetime; once exceeded, the next statement
+  dispatched inside it — even `COMMIT` — force-aborts the transaction and
+  fails `exhausted`, while the connection itself stays usable afterward.
+- New `lock_timeout_ms` config key (default 0 = block indefinitely) bounds
+  how long a contended, non-deadlocking key/range lock wait blocks before
+  failing `exhausted`; only deadlock cycles were ever detected without this.
+  Process-wide, not per-connection — the shared lock table has no
+  per-connection identity to key a limit off.
+- Closes the Phase 27 "Statement timeout", "Transaction timeout", and "Lock
+  timeout" Session-controls checklist items. "Idle transaction timeout"
+  remains open and distinct (an idle-while-in-a-transaction-specific timer,
+  separate from both `idle_timeout_ms` and `transaction_timeout_ms`).
+- No WAL/catalog/wire-format change.
+
+### P27 Operational maturity + workload governance — RESOURCE GROUP design (2026-09-02)
+
+- New `CREATE`/`ALTER`/`DROP RESOURCE GROUP` admin SQL statements declare a
+  durable, catalog-persisted, WAL-recovered workload-governance descriptor
+  (`MAX_CONCURRENCY`, `MEMORY`, `WORKERS`, `PRIORITY`; zero means
+  unset/unbounded), gated on cluster `ADMIN` like `CREATE ROLE`/`CREATE
+  USER`. New admin-only `system.resource_groups` introspection view and
+  `system.capabilities` row (`resource_groups`, status `experimental`).
+- **Descriptor only**: no session or user can yet be assigned to a resource
+  group, and `internal/scheduler`'s process-wide admission gate and per-query
+  budgets are untouched by it. This increment closes the Phase 27 "Design
+  RESOURCE GROUP" checklist item; workload assignment and scheduler
+  enforcement are later increments.
+- No WAL/wire-format change beyond the new catalog key prefix (`U`); new
+  lexer keyword `RESOURCE`.
+
+### P27 Operational maturity + workload governance — leader transfer (2026-09-02)
+
+- New `CLUSTER TRANSFER LEADER` admin SQL statement wraps the existing
+  `replication.Cluster.TransferLeadership()` library call (previously
+  reachable only from Go code) so a planned handoff ahead of a restart or
+  maintenance window no longer has to wait for a crash to trigger failover.
+  Cannot run inside a transaction, requires cluster `ADMIN`, fails
+  `Unavailable` on a single-node deployment.
+- New `nextsql cluster transfer-leader [--addr ...] [--user ...] ...` CLI
+  subcommand connects to a live server and issues the statement, printing
+  the same machine-readable tab-separated output as `nextsql exec`.
+- No persistent, catalog, WAL, or NSQL wire-format change; new lexer
+  keywords `TRANSFER`/`LEADER` and AST node `ast.TransferLeader`.
+
+### P27 Operational maturity + workload governance — graceful shutdown (drain) (2026-09-02)
+
+- New `protocol.Server.Drain(timeout)`: stops accepting new connections
+  immediately, then closes each existing connection as soon as it is idle
+  (no in-flight statement, no open transaction) instead of force-aborting
+  whatever is mid-flight; anything still busy at `timeout` is force-closed.
+- `nextsqld` now drains on SIGINT/SIGTERM instead of hard-closing every
+  connection outright. New `shutdown_drain_ms` config key (default 30000,
+  `0` disables waiting for busy connections).
+- No persistent, catalog, WAL, or NSQL wire-format change.
+
+### P27 Operational maturity + workload governance — connection/idle limits (2026-09-02)
+
+- `max_connections` and `idle_timeout_ms` config keys make the previously
+  hardcoded 128-session cap and 60 s idle deadline (`protocol.Limits`)
+  operator-configurable per node.
+- New `max_connections_per_user` (default 0 = unlimited) rejects a
+  connection after authentication succeeds but before a session is
+  created, once a user name already holds the configured number of
+  concurrent connections; the client sees `exhausted`. Closing one of the
+  user's connections frees a slot.
+- All three are node-local and not synchronized across a Raft cluster. No
+  persistent, catalog, WAL, or NSQL wire-format change.
+
+### P26 System catalog / introspection 2.0 — exit gate closed (2026-09-02)
+
+- Added admin-only `system.users` (`name, password_algo`), `system.roles`
+  (`role, members`), and `system.grants` (`grantee, privilege, scope,
+  object`) — closing the one real gap the exit-gate audit found: listing
+  users, roles, or grants had no official SQL-level answer before this, so a
+  Studio/Manager security dashboard would have had to read the `auth.Store`
+  or `security.ACL` files directly. Never exposes a password hash or salt.
+- Added nine missing `system.capabilities` rows for previously-undiscoverable
+  P23/P25 surfaces: `mtls`, `token_credentials`, `oidc_broker`,
+  `audit_chain`, `storage_caps`, `vector_ivf`, `vector_ivfpq`,
+  `vector_sparse`, `quantized_vector_index`. Corrected a stale `fulltext`
+  description missing WEIGHT/FACET.
+- Closed an RBAC test-coverage gap (`system.table_stats`/`index_stats`/
+  `partitions`/`workflows` previously had no dedicated RBAC test of their
+  own) and confirmed realm/database visibility is a structural guarantee of
+  the current single-database-per-process architecture, not a filter that
+  could silently regress.
+- **P26 System catalog / introspection 2.0 is now complete.** See
+  `docs/system-catalog.md` "P26 exit gate closure (2026-09-02)". The current
+  release gate is P27 Operational maturity + workload governance.
+
+### P26 System catalog / introspection 2.0 — SHOW aliases (2026-09-02)
+
+- Added `SHOW DATABASES`, `SHOW TABLES`, `SHOW INDEXES`, `SHOW CONNECTIONS`,
+  `SHOW QUERIES`, `SHOW TRANSACTIONS`, `SHOW LOCKS`, `SHOW CLUSTER`, and
+  `SHOW STORAGE`.
+- Each command is parsed as a read from its canonical `system.*` source, so
+  system-table RBAC, visibility, redaction, and stable columns remain
+  authoritative. The aliases accept no clauses; filtered/paginated consumers
+  use direct system-table queries.
+- Corrected stale capability metadata: completed RANGE/HASH/LIST partitioning
+  is `supported`; follower-read metadata now describes live
+  STRONG/BOUNDED/STALE routing; client-field-encryption metadata lists every
+  official driver. Added `system_schema_v2` and `system_show_aliases` rows.
+- Fixed `system.storage.database` (and therefore `SHOW DATABASES`) to return
+  only the configured logical database name. It no longer exposes the engine
+  filesystem path; unnamed embedded databases report `default`.
+- No persistent, catalog, WAL, Raft, wire-format, or system-schema-version
+  change.
+
+### P26 System catalog / introspection 2.0 — live locks (2026-09-01)
+
+- `system.locks` now reports every currently held key/range lock in the
+  storage engine instead of always returning zero rows.
+- `internal/txn.LockManager` gained a `Snapshot()` method and a `tag string`
+  parameter on `Acquire`/`AcquireRange` (table-name label, best-effort —
+  the lock key namespace is shared across every table in one engine).
+  `Manager.LockKey`/`LockRange` and `btree.Tree` (`Name`/`SetName`) thread
+  the tag from the executor's table/index/vector/partition tree resolvers
+  down to the lock table.
+- `mode` is `shared`/`exclusive`; `granted` is always `true` (waiting
+  requests are not surfaced). Visibility matches `system.transactions`:
+  non-admins see only locks held by their own user's transactions.
+- Docs: `docs/system-catalog.md` and its web/USAGE counterparts updated.
+
+### P26 System catalog / introspection 2.0 — live session/query/transaction/change-stream rows (2026-09-01)
+
+- `system.sessions`, `system.active_queries`, `system.transactions`, and
+  `system.change_streams` now report real, node-local, in-memory state
+  instead of always returning zero rows.
+- New process-local registries on `executor.DB`: `RegisterSession` /
+  `UnregisterSession` / `LiveSessions` (keyed by an atomic session-id
+  counter; the protocol server registers/unregisters around each
+  connection's lifetime — a `Session()` obtained directly for
+  embedded/CLI/test use is never registered and stays invisible to these
+  tables) and `CDCSubscriptions` / `registerCDCSubscription` /
+  `unregisterCDCSubscription` / `updateCDCSubscriptionLSN` for open
+  `SUBSCRIBE` streams.
+- New mutex-guarded snapshot state on `executor.Session` —
+  `CurrentQuery`/`beginQuery`/`endQuery` and
+  `TxnSnapshot`/`setTxnActive`/`clearTxnActive` — published at existing
+  statement/transaction boundaries so another session's introspection query
+  can read them safely; the session's own unsynchronized `execSQL`/`s.x`
+  fields stay same-goroutine-only, as before. The CDC subscription LSN is
+  published the same way, via `atomic.Uint64`, since `cdc.Subscription`
+  itself is not safe to read cross-goroutine.
+- RBAC: a non-admin sees only their own sessions/queries/transactions
+  (matching the existing `system.tasks` owner-filter pattern);
+  `change_streams` is filtered by table visibility (matching
+  `system.columns`/`system.indexes`).
+- `system.locks` is intentionally still a stub (always empty): the shared
+  `txn.LockManager` has no table attribution for held key/range locks today.
+  See `TODO.md` Phase 26 for the scoped follow-on.
+- New docs: `docs/system-catalog.md` and
+  `docs/web/content/docs/system-catalog.md` — the first documentation for
+  the whole `system.*` schema.
+
+### P25 Security 2.0 — exit gate closed: security review sign-off (2026-09-02)
+
+- Added `## P25 security review sign-off (2026-09-02)` to `docs/security.md`,
+  in the same dated surface-by-surface review format as the existing "P16
+  security review": scope is everything landed since P16 (mTLS/service
+  identity, short-lived credentials, the external-IdP broker, field-level
+  client encryption, password-hash evolution, audit-chain hardening).
+- This is the production-gating decision for the "P25 Security 2.0 audit"
+  table: every row was already `yes`/`yes`/`yes` for
+  designed/implemented/tested, and this sign-off flips the production-gated
+  column to `yes` except the design-only `OIDC design` row and a small set of
+  explicit, documented non-goals (OCSP, optional OIDC opaque-token
+  introspection, JIT provisioning, searchable/deterministic client-side
+  encryption, and local-audit-file suffix-truncation detection without an
+  external WORM/transparency system).
+- Updated `docs/client-encryption.md`'s "Production-gating sign-off (Phase
+  25)" to drop its "awaits phase-wide gate" hedge — `ENCRYPTED CLIENT` stays
+  labeled `experimental` in `system.capabilities` only because no
+  searchable/deterministic mode ships (a deliberate scope decision), not
+  because of any open blocker.
+- All four `Phase 25 exit gate` items in `TODO.md` are now checked; the
+  phase-level `P25 Security 2.0` checkbox and roadmap summary are checked;
+  every "current release gate" reference across `TODO.md`, `ROADMAP.md`,
+  `SKILLS.md`, `AGENTS.md`, and `USAGE.md` now points at **P26 System
+  catalog / introspection 2.0**.
+- No code change in this entry — documentation and gate closure only, on top
+  of the audit-hardening, field-encryption KMS-lifecycle, and Argon2id
+  increments below.
+
+### P25 Security 2.0 — audit hardening: tamper-evident/signed audit chain + verification tooling (2026-09-02)
+
+- Every new `nextsql.audit` record now carries a versioned `NSAC` v1 chain
+  trailer: `chain_version`, a monotonically increasing `seq`, `prev_hash`, and
+  `hash = SHA-256("NSAC\x01" || prev_hash || seq-u64le || canonical-event-json)`.
+  The canonical event JSON clears `seq`/`prev_hash`/`hash`/`sig`/`key_id`
+  before hashing, so a caller cannot forge chain fields through the `Event`
+  struct. Pre-chain JSON lines are accepted only as one contiguous legacy
+  prefix; `OpenAudit` verifies the retained chain before allowing an append,
+  rejects an incomplete final line, and fails closed on a symlink, non-regular
+  file, or a file readable by group/others.
+- Added `internal/security/auditkeys.go`: `NSAK` v1, a bounded (64-key)
+  Ed25519 signing keyset with one current key, rotation overlap, retirement
+  (drops the private seed, keeps the public key so historical records still
+  verify), atomic mode-`0600` writes, a verify-only `WritePublic` export, and
+  last-known-good reload — the same lifecycle shape as the existing `NSTK`
+  short-lived-credential signing keys.
+- The first configured signer appends a signed `audit.signing.enabled`
+  transition record; every chained record from that point on must be signed,
+  so the start of the signed segment cannot be silently moved by stripping
+  the earliest signature.
+- Added `internal/security/auditverify.go`: `VerifyFile` streams an audit log
+  one line at a time (1 MiB line cap), classifies each line as
+  legacy/chained/signed, verifies the hash chain and (given a keyset) every
+  signature, and reports the first bad line and why.
+- Added the `nextsql audit` CLI (`cmd/nextsql/audit.go`): `keygen`, `rotate`,
+  `retire`, `list-keys`, `export-public`, and
+  `verify --file F [--keyset F | --pubkey F] [--json]`.
+- `nextsqld` gains `--audit-signing-keyset` / `audit_signing_keyset`: it
+  refuses to start against an existing signed chain without a configured
+  signer, verifies the keyset before signing, reloads it on `SIGHUP` with
+  last-known-good fallback, and records `audit.signing.reload` as a
+  security-setting event on both success and failure.
+- No NSQL wire-format, catalog, or WAL change. This closes the last open P25
+  implementable-scope checklist item; only the phase-wide exit gate (a dated
+  security review sign-off) remains before P25 closes.
+- Tests: `TestAuditChainVerifiesCleanLog`, `TestAuditChainDetectsTamperedLine`,
+  `TestAuditChainDetectsDeletedLine`, `TestAuditChainDetectsReorderedLines`,
+  `TestAuditSigningRoundTrip`, `TestAuditSigningTransitionCannotLoseSignature`,
+  `TestSignedAuditCannotResumeUnsigned`, `TestAuditKeysetRotationOverlap`,
+  `TestAuditKeysetReloadLastKnownGood`, `TestOpenAuditKeysetBoundsAndRejectsSymlink`,
+  `FuzzDecodeAuditKeys`, `TestAuditKeygenRotateRetireListExportPublicCLI`,
+  `TestAuditVerifyCLI`, `TestAuditVerifyLegacyFileCLI`.
+- While verifying the full repository-wide suite for this increment, fixed
+  `tests/integration/drivers_test.go`'s `TestDenoDriverUnit`: it invoked
+  `deno test` with only `--allow-net`, so the Deno `FileFieldKeyring` unit
+  test added by the prior increment failed closed (`NotCapable`) on
+  `Deno.makeTempDir` under the full-suite run despite passing standalone;
+  added `--allow-read --allow-write`.
+
+### P25 Security 2.0 — password hashing: Argon2id migration (2026-09-02)
+
+- Added `golang.org/x/crypto/argon2` (pinned to `v0.33.0`, the newest
+  version whose own `go.mod` stays compatible with this module's `go 1.22`
+  directive — no toolchain-version bump). Every new `internal/auth` login
+  record (`Store.Upsert`) now hashes with Argon2id (time cost 1, memory
+  64 MiB, parallelism 4, 32-byte output — the package documentation's
+  recommended parameters) instead of the hand-rolled PBKDF2-HMAC-SHA256.
+- `NSAU` bumped to v2: each record carries an explicit algorithm byte plus
+  Argon2id's memory/parallelism fields (zero for a legacy PBKDF2 record).
+  `Decode` still reads v1 files unchanged; `Encode` always writes v2, so a
+  v1 file upgrades in place the next time the store persists.
+- `Store.Verify` transparently re-hashes an already-confirmed-correct
+  legacy password with Argon2id and persists the upgrade before returning;
+  a failed verify never rehashes, and a concurrent delete/re-upsert of the
+  same user is detected and skipped rather than clobbered.
+- Added `internal/auth/store_bench_test.go`
+  (`BenchmarkVerifyPBKDF2`/`BenchmarkVerifyArgon2id`/
+  `BenchmarkConcurrentLoginAttempts`) as the "Authentication DoS benchmark"
+  tracker item — Argon2id's ~64 MiB-per-attempt memory cost is documented
+  in `docs/security.md` "Password hashing" as the load-bearing number for
+  sizing concurrent-login capacity limits.
+- Tests: `TestV1FormatDecodesAndVerifies`, `TestNewRecordsAreArgon2idFromCreation`,
+  `TestTransparentRehashUpgradesToArgon2id`; extended `FuzzDecode` seed corpus.
+
+### P25 Security 2.0 — client-encrypted fields: durable key-rotation/revocation KMS lifecycle (2026-09-02)
+
+- Added `FileFieldKeyring` to every official driver (Go, Node.js, Bun, Deno,
+  PHP): a durable, atomic, versioned, 0600 file-backed `FieldKeyProvider`
+  implementing the `NSFK1` on-disk format (mirrors the server's own `NSTK`
+  signing-key lifecycle). Rotation makes a new key current while retaining
+  every prior live key for overlap reads, persisted across process restart.
+  Revocation overwrites the revoked key's material with zeros on disk,
+  refuses to resolve the id afterward, rejects revoking the current key
+  directly, and a revoked id can never be reused. Corrupt, truncated, or
+  structurally invalid keyring files fail closed on decode.
+- The `NSFK1` format is identical across every driver: a Go-produced fixture
+  opens correctly in the Node driver, proving cross-language interop.
+- This closes the last open item ("durable key-rotation/revocation KMS
+  lifecycle") blocking `ENCRYPTED CLIENT` field-level encryption from being
+  fully production-gated; see `docs/client-encryption.md`
+  "Production-gating sign-off (Phase 25)". Formal production-gating still
+  awaits the single phase-wide P25 exit gate (password hashing and audit
+  hardening remain open), not any `ENCRYPTED CLIENT`-specific blocker.
+- Tests: `drivers/go/nextsql_test.go`, `drivers/bun/nextsql.test.js`,
+  `drivers/deno/nextsql_test.js`, `drivers/node/nextsql.test.js`,
+  `drivers/php/tests/unit.php`.
+
+### P25 Security 2.0 — client-encrypted fields: PITR + replication/failover (2026-09-01)
+
+- Added `TestEncryptedClientPITRRestoresExactCiphertextAtTarget`
+  (`internal/backup`): a base backup plus archived WAL restored to a target
+  LSN before a later `UPDATE` retains `TEXT ENCRYPTED CLIENT`, returns the
+  exact pre-target `NSCE1.` ciphertext byte-for-byte, excludes the later
+  archived write, and decrypts correctly only through the client-side
+  `clientenc` helper — the restored server never sees a field key.
+- Added `TestHAEncryptedClientCiphertextSurvivesLeaderFailover` (`tests/ha`):
+  a three-voter Raft cluster commits an encrypted-client write on the leader,
+  confirms the identical acknowledged ciphertext replicates to every
+  follower, kills the leader, confirms the new leader still serves and can
+  decrypt the acknowledged ciphertext (no lost commit), commits a second
+  ciphertext after failover, and confirms it — and its decrypt — on the
+  remaining follower.
+- These close the last two open field-level client-encryption gate items.
+  No catalog/WAL/wire-format change. The capability remains `experimental` in
+  `system.capabilities`: durable key-rotation/revocation KMS lifecycle is the
+  remaining item before production gating.
+
+### P25 Security 2.0 — experimental client-encrypted fields (2026-09-01)
+
+- Added `type ENCRYPTED CLIENT` for bounded scalar UUID, STRING, TEXT, DECIMAL,
+  TIMESTAMPTZ, JSON, and BOOL columns. `NSCT` v10 stores the logical plaintext
+  type while rows and NSQL use an opaque physical STRING. Older v1–v9 catalog
+  descriptors remain readable; unknown/truncated v10 metadata fails closed.
+- Added portable randomized `NSCE1.` AES-256-GCM values. The authenticated
+  context binds the exact database, table, column, public key id/type header,
+  and random nonce. Wrong/revoked keys, context changes, type mismatch,
+  truncation, and tampering return no plaintext. The server receives no field
+  key and performs bounded structural/type validation only.
+- Added fail-closed opaque-only SQL semantics: parameters, NULL, same-column
+  ciphertext copies, and bare projection/RETURNING are allowed. Predicates,
+  joins, expressions/subqueries, defaults, PK/FK/partition keys, indexes,
+  SEARCH/FACET, grouping, ordering, DISTINCT, set operations, context-changing
+  rename/partition transfer, and legacy-tenant migration are rejected.
+- Added provider contracts, bounded in-memory overlap keyrings, key generation,
+  and encrypt/decrypt helpers across Go, Node.js/TypeScript, Bun, Deno, and PHP.
+  Every runtime uses the same `NSCE1.` scalar and canonical NSJB encoding;
+  Go↔non-Go ciphertext fixtures verify portability. In-memory keyrings remain
+  non-durable conveniences rather than KMS storage.
+- Added encrypted close/reopen/plaintext scans, exact-ciphertext physical
+  backup/restore, and logical export/import coverage. PITR and
+  replication/failover are now covered too (see the entry below); durable
+  key-rotation/revocation KMS lifecycle remains open, so `system.capabilities`
+  labels the feature `experimental`, not supported or production-gated. There
+  is no deterministic/searchable mode and no NSQL frame/version change.
+  Format, leakage, migration, backup, and key lifecycle contracts are in
+  `docs/client-encryption.md`.
+- Repository build, focused functional/race tests, and 5-second `FuzzInspect`
+  plus `FuzzDecodePartitionedTable` are green. The serialized all-package run
+  passed through crash and HA but saw one transient Bun live-test page-isolation
+  failure; that test then passed 5 consecutive isolated runs and the complete
+  integration package passed on rerun.
+
+### P25 Security 2.0 — embedded authentication broker (2026-09-01)
+
+- Added `nextsqld --auth-broker-listen ADDR [--auth-broker-config FILE]` for
+  single-node/non-HA deployments. It serves the existing broker handler on a
+  separate bounded HTTP(S) listener; the config defaults to
+  `DATA-DIR/nextsql-auth-broker.conf` and uses the standalone format.
+- Embedded startup requires `token_verify_keyset` and proves that the broker's
+  private current issuer key is accepted by it. `SIGHUP` reloads the verifier
+  before the issuer and validates the candidate issuer key before publication.
+  Raft/HA rejects embedded mode; HA deployments keep the standalone broker.
+- Embedded exchanges consult the live native user store and direct/transitive
+  ACL role membership. Missing users and empty policy-mapped∩held role sets
+  deny immediately; the SQL server still applies `ACL.AllowedScoped` on every
+  statement.
+- Standalone and embedded modes now share `internal/authbroker.HTTPServer`,
+  including TLS 1.3, off-loopback TLS enforcement, bounded timeouts, and
+  graceful shutdown. The shared runtime removes a possible double TLS wrapping
+  composition in the former standalone path.
+- No credential, database persistent/catalog/WAL/Raft, or NSQL wire-format
+  change. Optional opaque introspection and JIT provisioning remain off.
+
+### P25 Security 2.0 — OAuth2 client credentials (2026-08-31)
+
+- Added `nextsql login --client-credentials [--client-secret-file FILE]` for
+  confidential workloads. It performs exact-issuer discovery, obtains a
+  Bearer access token from the discovered HTTPS token endpoint, exchanges it
+  at the existing broker, stores no client secret, and renews expired `NSSC1.`
+  credentials non-interactively from the protected secret file.
+- Added per-broker-profile `access_token_audience`. The broker accepts exactly
+  one of `id_token` or `access_token`; JWT access tokens require the configured
+  resource audience and exact `client_id`/`azp` binding in addition to the
+  existing asymmetric signature, issuer, expiry, JWKS, replay, `NSIP`, RBAC,
+  and TTL boundaries. Opaque access tokens/RFC 7662 remain unimplemented.
+- Client-secret reads are capped at 64 KiB and reject empty, symlink,
+  non-regular, or group/other-readable files. Redirects and HTTP bodies retain
+  the existing fail-closed bounds. No database persistent/catalog/WAL/Raft or
+  NSQL wire-format change.
+
+### P25 Security 2.0 — key-derived OIDC audit source (2026-08-31)
+
+- Added bounded `token_identity_source_hint=KEY_ID:oidc[,KEY_ID:oidc...]`
+  configuration. After an `NSSC1.` signature verifies under a mapped broker
+  key, `nextsqld` records `identity_source` `oidc` or `mtls+oidc`.
+- The label is derived from the authenticated key id, not a client claim.
+  Forged signatures, unverified/unknown keys, and unknown configured values
+  stay generic or fail configuration loading; no credential/token id is logged.
+- Fixed the audit redactor so its closed identity-source enum preserves the
+  already-documented `token` / `mtls+token` values while unknown or
+  secret-shaped values remain redacted.
+- No `NSSC1.` credential-format, database persistent/catalog/WAL/Raft, or NSQL
+  wire change. Targeted config, protocol, integration, forged-key-id,
+  secret-leak, and race tests plus the serialized repository-wide functional
+  gate are green.
+
+### P25 Security 2.0 — interactive OIDC CLI (2026-08-31)
+
+- Added `internal/oidcclient` and `nextsql login` / `logout` / `whoami`:
+  exact-issuer discovery, Authorization Code + PKCE S256, random state/nonce,
+  a transient bounded loopback callback, browser/manual URL handling, code
+  redemption, broker exchange, and silent refresh.
+- `nextsql exec --idp NAME` and server-mode `nextsql status --idp NAME` resolve
+  the stored broker credential into the mapped native principal and existing
+  `NSSC1.` password slot. `nextsqld`, the database formats, and NSQL wire format
+  are unchanged.
+- The versioned local credential/refresh-token store uses collision-resistant
+  IdP+host names, random temporary files plus atomic rename, mode `0600` under a
+  real mode-`0700` directory, 1 MiB file bounds, and fail-closed permission,
+  symlink, and embedded-identity validation.
+- The OIDC HTTP client refuses redirects so 307/308 cannot replay an
+  authorization code, refresh token, or client secret; responses are capped at
+  1 MiB and endpoints are parsed/validated. Wrong-state callbacks cannot
+  consume the legitimate callback, and concurrent callbacks publish once.
+- `TestLoginEndToEnd` covers fake IdP → PKCE client → real broker → real
+  `auth.TokenVerifier`; targeted functional and race suites plus adversarial
+  redirect, callback, response-bound, and credential-store tests are green.
+  Server `oidc` / `mtls+oidc` audit labeling landed in the subsequent increment
+  recorded above.
+
 ### P25 Security 2.0 — authentication broker skeleton (2026-08-31)
 
 - New package `internal/oidc`: pure, offline OpenID Connect primitives — compact
@@ -58,9 +1456,9 @@ A roadmap item is not recorded as completed here until its implementation, tests
   MAC alg / wrong `iss` / wrong `aud` / bad `nonce` / unmapped subject /
   unmapped groups / missing group claim, JWKS outage fails closed, credential
   TTL bounded by the IdP token expiry, reload keeps last known-good.
-- Not built yet: the client `nextsql login` flow, the `oidc` / `mtls+oidc`
-  audit `identity_source`, client credentials, the embedded broker mode
-  (`nextsqld --auth-broker-listen`), and optional JIT provisioning.
+- After the subsequent interactive CLI and audit-labeling increments, client
+  credentials, the embedded broker mode (`nextsqld --auth-broker-listen`), and
+  optional JIT provisioning remain open.
 
 ### P25 Security 2.0 — `NSIP` identity-policy engine (2026-08-31)
 

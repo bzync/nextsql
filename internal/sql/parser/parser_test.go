@@ -43,6 +43,111 @@ CREATE TABLE products (
 	}
 }
 
+func TestParseBlobColumnAndHexLiteral(t *testing.T) {
+	stmt, err := Parse(`CREATE TABLE files (id UUID PRIMARY KEY, payload BLOB NOT NULL)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ct := stmt.(ast.CreateTable)
+	if ct.Columns[1].Type.Kind != types.KindBlob {
+		t.Fatalf("blob column type %+v", ct.Columns[1].Type)
+	}
+	if ct.Columns[1].Type.String() != "BLOB" {
+		t.Fatalf("blob type string %q", ct.Columns[1].Type.String())
+	}
+
+	ins, err := Parse(`INSERT INTO files (id, payload) VALUES (UUID(), X'DEADbeef00')`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	it := ins.(ast.Insert)
+	lit, ok := it.Rows[0][1].(ast.Literal)
+	if !ok {
+		t.Fatalf("%T", it.Rows[0][1])
+	}
+	if lit.Value.Typ.Kind != types.KindBlob {
+		t.Fatalf("literal kind %v", lit.Value.Typ.Kind)
+	}
+	want := []byte{0xDE, 0xAD, 0xBE, 0xEF, 0x00}
+	if lit.Value.Str != string(want) {
+		t.Fatalf("literal bytes = %x want %x", []byte(lit.Value.Str), want)
+	}
+
+	empty, err := Parse(`SELECT X'' AS b FROM files`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sel := empty.(ast.Select)
+	elit := sel.List[0].Expr.(ast.Literal)
+	if elit.Value.Str != "" || elit.Value.Typ.Kind != types.KindBlob {
+		t.Fatalf("empty blob literal = %+v", elit.Value)
+	}
+
+	if _, err := Parse(`SELECT X'zz' FROM files`); err == nil {
+		t.Fatal("expected error for invalid hex literal")
+	}
+	if _, err := Parse(`SELECT X'abc' FROM files`); err == nil {
+		t.Fatal("expected error for odd-length hex literal")
+	}
+}
+
+// TestParseIntColumnTypes covers D2 (Datatype expansion track): the 4
+// fixed-width integer column-type keywords.
+func TestParseCharColumnTypes(t *testing.T) {
+	stmt, err := Parse(`CREATE TABLE t (code CHAR(4) PRIMARY KEY, name VARCHAR(255))`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ct := stmt.(ast.CreateTable)
+	if ct.Columns[0].Type.Kind != types.KindChar || ct.Columns[0].Type.Precision != 4 {
+		t.Fatalf("CHAR: %+v", ct.Columns[0].Type)
+	}
+	if ct.Columns[0].Type.String() != "CHAR(4)" {
+		t.Fatalf("CHAR string: %q", ct.Columns[0].Type.String())
+	}
+	if ct.Columns[1].Type.Kind != types.KindVarchar || ct.Columns[1].Type.Precision != 255 {
+		t.Fatalf("VARCHAR: %+v", ct.Columns[1].Type)
+	}
+	if ct.Columns[1].Type.String() != "VARCHAR(255)" {
+		t.Fatalf("VARCHAR string: %q", ct.Columns[1].Type.String())
+	}
+	for _, bad := range []string{
+		`CREATE TABLE t (c CHAR PRIMARY KEY)`,
+		`CREATE TABLE t (c CHAR(0) PRIMARY KEY)`,
+		`CREATE TABLE t (c VARCHAR(99999) PRIMARY KEY)`,
+	} {
+		if _, err := Parse(bad); err == nil {
+			t.Fatalf("expected parse error for %q", bad)
+		}
+	}
+}
+
+func TestParseIntColumnTypes(t *testing.T) {
+	stmt, err := Parse(`CREATE TABLE t (id INT64 PRIMARY KEY, a INT8, b INT16, c INT32, d INT64)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ct := stmt.(ast.CreateTable)
+	want := []struct {
+		kind types.Kind
+		str  string
+	}{
+		{types.KindInt64, "INT64"},
+		{types.KindInt8, "INT8"},
+		{types.KindInt16, "INT16"},
+		{types.KindInt32, "INT32"},
+		{types.KindInt64, "INT64"},
+	}
+	for i, w := range want {
+		if ct.Columns[i].Type.Kind != w.kind {
+			t.Fatalf("column %d kind = %v want %v", i, ct.Columns[i].Type.Kind, w.kind)
+		}
+		if ct.Columns[i].Type.String() != w.str {
+			t.Fatalf("column %d type string = %q want %q", i, ct.Columns[i].Type.String(), w.str)
+		}
+	}
+}
+
 func TestParseSparsevector(t *testing.T) {
 	stmt, err := Parse(`CREATE TABLE docs (id UUID PRIMARY KEY, emb SPARSEVECTOR<30522>)`)
 	if err != nil {
@@ -187,6 +292,7 @@ func TestParseStatements(t *testing.T) {
 		{`DROP INDEX ix_items_name`, ast.DropIndex{}},
 		{`DROP INDEX IF EXISTS ix_items_name`, ast.DropIndex{}},
 		{`REBUILD INDEX ix_items_name`, ast.RebuildIndex{}},
+		{`CLUSTER TRANSFER LEADER`, ast.TransferLeader{}},
 		{`ALTER TABLE items ADD name STRING`, ast.AlterTable{}},
 		{`ALTER TABLE items ADD COLUMN note TEXT`, ast.AlterTable{}},
 		{`ALTER TABLE items DROP COLUMN note`, ast.AlterTable{}},
@@ -533,11 +639,112 @@ func TestParseRebuildIndex(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := stmt.(ast.RebuildIndex)
-	if r.Name != "ix_items_name" || r.Table != "" {
+	if r.Name != "ix_items_name" || r.Table != "" || r.Online {
 		t.Fatalf("%+v", r)
 	}
-	if _, err := Parse(`REBUILD INDEX ix_items_name ONLINE`); err == nil {
-		t.Fatal("ONLINE must remain unsupported until concurrent-write safety is implemented")
+	on, err := Parse(`REBUILD INDEX ix_items_name ONLINE`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ro := on.(ast.RebuildIndex)
+	if ro.Name != "ix_items_name" || !ro.Online {
+		t.Fatalf("%+v", ro)
+	}
+}
+
+func TestParseClusterTransferLeader(t *testing.T) {
+	stmt, err := Parse(`CLUSTER TRANSFER LEADER`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := stmt.(ast.TransferLeader); !ok {
+		t.Fatalf("%T", stmt)
+	}
+	if _, err := Parse(`CLUSTER TRANSFER`); err == nil {
+		t.Fatal("CLUSTER TRANSFER without LEADER must be a syntax error")
+	}
+	if _, err := Parse(`CLUSTER`); err == nil {
+		t.Fatal("bare CLUSTER must be a syntax error")
+	}
+}
+
+func TestParseClusterDrain(t *testing.T) {
+	stmt, err := Parse(`CLUSTER DRAIN`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	drain, ok := stmt.(ast.ClusterDrain)
+	if !ok || drain.TimeoutMS != 0 {
+		t.Fatalf("%#v", stmt)
+	}
+
+	stmt, err = Parse(`CLUSTER DRAIN WITH (TIMEOUT_MS = 5000)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	drain, ok = stmt.(ast.ClusterDrain)
+	if !ok || drain.TimeoutMS != 5000 {
+		t.Fatalf("%#v", stmt)
+	}
+
+	for _, sql := range []string{
+		`CLUSTER DRAIN WITH ()`,
+		`CLUSTER DRAIN WITH (BOGUS = 1)`,
+		`CLUSTER DRAIN WITH (TIMEOUT_MS = 'x')`,
+	} {
+		if _, err := Parse(sql); err == nil {
+			t.Fatalf("accepted invalid: %s", sql)
+		}
+	}
+}
+
+func TestParseClusterMaintenance(t *testing.T) {
+	stmt, err := Parse(`CLUSTER MAINTENANCE ENABLE`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, ok := stmt.(ast.ClusterMaintenance)
+	if !ok || !m.Enable {
+		t.Fatalf("%#v", stmt)
+	}
+
+	stmt, err = Parse(`CLUSTER MAINTENANCE DISABLE`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, ok = stmt.(ast.ClusterMaintenance)
+	if !ok || m.Enable {
+		t.Fatalf("%#v", stmt)
+	}
+
+	for _, sql := range []string{
+		`CLUSTER MAINTENANCE`,
+		`CLUSTER MAINTENANCE ON`,
+		`CLUSTER MAINTAIN ENABLE`,
+	} {
+		if _, err := Parse(sql); err == nil {
+			t.Fatalf("accepted invalid: %s", sql)
+		}
+	}
+}
+
+func TestParseClusterReconcileConfirm(t *testing.T) {
+	stmt, err := Parse(`CLUSTER RECONCILE CONFIRM`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := stmt.(ast.ClusterReconcileConfirm); !ok {
+		t.Fatalf("%#v", stmt)
+	}
+
+	for _, sql := range []string{
+		`CLUSTER RECONCILE`,
+		`CLUSTER RECONCILE ENABLE`,
+		`CLUSTER RECONCILE CONFIRMED`,
+	} {
+		if _, err := Parse(sql); err == nil {
+			t.Fatalf("accepted invalid: %s", sql)
+		}
 	}
 }
 
@@ -742,6 +949,17 @@ func TestParseSecurityStatements(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := Parse(`REVOKE SELECT ON products FROM analyst`); err != nil {
+		t.Fatal(err)
+	}
+	rg, err := Parse(`GRANT USAGE ON RESOURCE GROUP reporting TO analyst`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	grg, ok := rg.(ast.Grant)
+	if !ok || grg.Grantee != "analyst" || grg.Scope != "resourcegroup" || grg.Object != "reporting" || len(grg.Privileges) != 1 || grg.Privileges[0] != "usage" {
+		t.Fatalf("%+v", rg)
+	}
+	if _, err := Parse(`REVOKE USAGE ON RESOURCE GROUP reporting FROM analyst`); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := Parse(`DROP USER app`); err != nil {
@@ -1365,6 +1583,13 @@ func TestParseScheduleStatements(t *testing.T) {
 	if got := stmt.(ast.CreateSchedule); got.Kind != ast.ScheduleAt || got.Spec != "2026-08-25T00:00:00Z" {
 		t.Fatalf("schedule=%#v", got)
 	}
+	stmt, err = Parse(`CREATE SCHEDULE nightly CRON '30 3 * * 1-5' RUN WORKFLOW rollup('night')`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := stmt.(ast.CreateSchedule); got.Kind != ast.ScheduleCron || got.Spec != "30 3 * * 1-5" || got.Workflow != "rollup" || len(got.Args) != 1 {
+		t.Fatalf("schedule=%#v", got)
+	}
 	if stmt, err = Parse(`ALTER SCHEDULE hourly RENAME TO every_hour`); err != nil {
 		t.Fatal(err)
 	} else if got := stmt.(ast.AlterSchedule); got.Name != "hourly" || got.NewName != "every_hour" {
@@ -1401,6 +1626,60 @@ func TestParseTaskStatements(t *testing.T) {
 	}
 }
 
+func TestParseSystemShowAliases(t *testing.T) {
+	tests := []struct {
+		sql   string
+		table string
+		cols  []string
+	}{
+		{`SHOW DATABASES`, "system.storage", []string{"database"}},
+		{`SHOW TABLES`, "system.tables", nil},
+		{`SHOW INDEXES`, "system.indexes", nil},
+		{`SHOW CONNECTIONS`, "system.sessions", nil},
+		{`SHOW QUERIES`, "system.active_queries", nil},
+		{`SHOW TRANSACTIONS`, "system.transactions", nil},
+		{`SHOW LOCKS`, "system.locks", nil},
+		{`SHOW CLUSTER`, "system.replication", nil},
+		{`SHOW STORAGE`, "system.storage", nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.sql, func(t *testing.T) {
+			stmt, err := Parse(tt.sql)
+			if err != nil {
+				t.Fatal(err)
+			}
+			sel, ok := stmt.(ast.Select)
+			if !ok {
+				t.Fatalf("statement = %T, want ast.Select", stmt)
+			}
+			if sel.Table != tt.table {
+				t.Fatalf("table = %q, want %q", sel.Table, tt.table)
+			}
+			if tt.cols == nil {
+				if !sel.Star || len(sel.List) != 0 {
+					t.Fatalf("projection = star:%v list:%v, want star", sel.Star, sel.List)
+				}
+				return
+			}
+			if sel.Star || len(sel.List) != len(tt.cols) {
+				t.Fatalf("projection = star:%v list:%v", sel.Star, sel.List)
+			}
+			for i, want := range tt.cols {
+				id, ok := sel.List[i].Expr.(ast.Ident)
+				if !ok || id.Name != want {
+					t.Fatalf("projection[%d] = %#v, want %q", i, sel.List[i].Expr, want)
+				}
+			}
+		})
+	}
+
+	for _, sql := range []string{`SHOW`, `SHOW SESSIONS`, `SHOW TABLE`, `SHOW TABLES EXTRA`} {
+		if _, err := Parse(sql); err == nil {
+			t.Fatalf("accepted %q", sql)
+		}
+	}
+}
+
 func TestParseScheduleRejectsInvalid(t *testing.T) {
 	for _, sql := range []string{
 		`CREATE SCHEDULE s RUN WORKFLOW w()`,
@@ -1408,9 +1687,99 @@ func TestParseScheduleRejectsInvalid(t *testing.T) {
 		`CREATE SCHEDULE s EVERY '1h' RUN WORKFLOW w($1)`,
 		`CREATE SCHEDULE s AT 'now' RUN WORKFLOW w(column_name)`,
 		`CREATE SCHEDULE s EVERY '1h' RUN WORKFLOW w(1,)`,
+		`CREATE SCHEDULE s CRON RUN WORKFLOW w()`,
+		`CREATE SCHEDULE s WEEKLY '1h' RUN WORKFLOW w()`,
 	} {
 		if _, err := Parse(sql); err == nil {
 			t.Fatalf("accepted invalid schedule: %s", sql)
+		}
+	}
+}
+
+func TestParseResourceGroupStatements(t *testing.T) {
+	stmt, err := Parse(`CREATE RESOURCE GROUP IF NOT EXISTS reporting WITH (MAX_CONCURRENCY = 8, MEMORY = 1073741824, WORKERS = 2, PRIORITY = 3)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	create, ok := stmt.(ast.CreateResourceGroup)
+	if !ok || create.Name != "reporting" || !create.IfNotExists || create.MaxConcurrency != 8 || create.MemoryBytes != 1073741824 || create.Workers != 2 || create.Priority != 3 {
+		t.Fatalf("create=%#v", stmt)
+	}
+
+	stmt, err = Parse(`CREATE RESOURCE GROUP bare`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := stmt.(ast.CreateResourceGroup); got.Name != "bare" || got.IfNotExists || got.MaxConcurrency != 0 || got.MemoryBytes != 0 || got.Workers != 0 || got.Priority != 0 {
+		t.Fatalf("create bare=%#v", got)
+	}
+
+	stmt, err = Parse(`ALTER RESOURCE GROUP reporting WITH (WORKERS = 4, PRIORITY = 1)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	alter, ok := stmt.(ast.AlterResourceGroup)
+	if !ok || alter.Name != "reporting" || !alter.HasWorkers || alter.Workers != 4 || !alter.HasPriority || alter.Priority != 1 || alter.HasMaxConcurrency || alter.HasMemoryBytes {
+		t.Fatalf("alter=%#v", stmt)
+	}
+
+	stmt, err = Parse(`DROP RESOURCE GROUP IF EXISTS reporting`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	drop, ok := stmt.(ast.DropResourceGroup)
+	if !ok || drop.Name != "reporting" || !drop.IfExists {
+		t.Fatalf("drop=%#v", stmt)
+	}
+}
+
+func TestParseSetResetResourceGroup(t *testing.T) {
+	stmt, err := Parse(`SET RESOURCE GROUP reporting`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	set, ok := stmt.(ast.SetResourceGroup)
+	if !ok || set.Name != "reporting" {
+		t.Fatalf("set=%#v", stmt)
+	}
+
+	stmt, err = Parse(`RESET RESOURCE GROUP`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := stmt.(ast.ResetResourceGroup); !ok {
+		t.Fatalf("reset=%#v", stmt)
+	}
+
+	// Every other SET/RESET spelling stays rejected exactly as before
+	// RESOURCE GROUP was the one form carved out.
+	for _, sql := range []string{
+		`SET TENANT = '11111111-1111-1111-1111-111111111111'`,
+		`RESET TENANT`,
+		`SET RESOURCE`,
+		`SET RESOURCE GROUP`,
+		`RESET RESOURCE`,
+		`SET x = 1`,
+	} {
+		if _, err := Parse(sql); err == nil {
+			t.Fatalf("accepted invalid SET/RESET form: %s", sql)
+		}
+	}
+}
+
+func TestParseResourceGroupRejectsInvalid(t *testing.T) {
+	for _, sql := range []string{
+		`CREATE RESOURCE GROUP`,
+		`CREATE RESOURCE GROUP g WITH ()`,
+		`CREATE RESOURCE GROUP g WITH (BOGUS = 1)`,
+		`CREATE RESOURCE GROUP g WITH (WORKERS = 1, WORKERS = 2)`,
+		`CREATE RESOURCE GROUP g WITH (WORKERS = 'four')`,
+		`ALTER RESOURCE GROUP g`,
+		`ALTER RESOURCE GROUP g WITH ()`,
+		`DROP RESOURCE GROUP`,
+	} {
+		if _, err := Parse(sql); err == nil {
+			t.Fatalf("accepted invalid resource group statement: %s", sql)
 		}
 	}
 }

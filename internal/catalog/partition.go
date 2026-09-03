@@ -286,7 +286,7 @@ func AlignedPartitionJoin(left, right *Table, leftKeys, rightKeys []int) ([]Part
 		if lc < 0 || lc >= len(lt) || rc < 0 || rc >= len(rt) {
 			return nil, false
 		}
-		if lt[lc] != rt[rc] {
+		if !lt[lc].Equals(rt[rc]) {
 			return nil, false
 		}
 		aligned := false

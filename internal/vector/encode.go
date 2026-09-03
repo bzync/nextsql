@@ -35,10 +35,10 @@ const (
 	// space, several leading bytes — compress well. v1 nodes still decode.
 	nodeVersionC = 2
 
-	kindMeta  byte = 0x00
-	kindNode  byte = 0x01
-	kindVec   byte = 0x01
-	kindQVec  byte = 0x02
+	kindMeta byte = 0x00
+	kindNode byte = 0x01
+	kindVec  byte = 0x01
+	kindQVec byte = 0x02
 
 	// MaxDim is the abuse limit for VECTOR<F32,N>.
 	MaxDim = 8192

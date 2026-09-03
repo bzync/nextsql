@@ -120,8 +120,18 @@ func (s *Session) eval(e ast.Expr, tab *catalog.Table, row []types.Value) (types
 			if v.Null {
 				return v, nil
 			}
+			if !isNumericKind(v.Typ.Kind) {
+				return types.Value{}, nerr.New(nerr.InvalidArgument, "executor.eval", "unary minus requires a numeric type")
+			}
+			if types.IsFloat(v.Typ.Kind) {
+				return types.FloatValue(v.Typ.Kind, -v.Flt), nil
+			}
 			if v.Typ.Kind != types.KindDecimal {
-				return types.Value{}, nerr.New(nerr.InvalidArgument, "executor.eval", "unary minus requires DECIMAL")
+				c, err := types.Coerce(v, types.Type{Kind: types.KindDecimal})
+				if err != nil {
+					return types.Value{}, err
+				}
+				v = c
 			}
 			v.Dec = v.Dec.Negate()
 			return v, nil
@@ -861,6 +871,17 @@ func evalStringFn(name string, args []types.Value) (types.Value, bool, error) {
 			return types.Null(types.String()), true, nil
 		}
 	}
+	// CHAR/VARCHAR flow through the string builtins as plain STRING — CHAR's
+	// trailing-space padding is not significant content
+	// (docs/design-datatypes.md D4).
+	for i, v := range args {
+		switch v.Typ.Kind {
+		case types.KindChar:
+			args[i] = types.StringValue(strings.TrimRight(v.Str, " "))
+		case types.KindVarchar:
+			args[i] = types.StringValue(v.Str)
+		}
+	}
 	requireString := func(v types.Value) error {
 		if v.Typ.Kind != types.KindString && v.Typ.Kind != types.KindText {
 			return nerr.New(nerr.InvalidArgument, "executor.eval", name+" requires STRING or TEXT")
@@ -1240,12 +1261,48 @@ func (s *Session) evalLogic(x ast.Binary, tab *catalog.Table, row []types.Value)
 	return types.BoolValue(l.Bool || r.Bool), nil
 }
 
+// isNumericKind reports whether k participates in arithmetic (+ - * / and
+// unary -): DECIMAL, or any fixed-width signed or unsigned integer kind
+// (D2/D3, Datatype expansion track). Deliberately narrow — STRING/TEXT/BLOB/
+// etc. stay rejected exactly as before D2/D3, so this only widens scope to
+// the 8 int kinds.
+func isNumericKind(k types.Kind) bool {
+	return k == types.KindDecimal || types.IsInt(k) || types.IsUint(k) || types.IsFloat(k)
+}
+
 func evalArith(op string, l, r types.Value) (types.Value, error) {
 	if l.Null || r.Null {
 		return types.Null(types.Type{Kind: types.KindDecimal}), nil
 	}
-	if l.Typ.Kind != types.KindDecimal || r.Typ.Kind != types.KindDecimal {
-		return types.Value{}, nerr.New(nerr.InvalidArgument, "executor.eval", "arithmetic requires DECIMAL")
+	if !isNumericKind(l.Typ.Kind) || !isNumericKind(r.Typ.Kind) {
+		return types.Value{}, nerr.New(nerr.InvalidArgument, "executor.eval", "arithmetic requires a numeric type")
+	}
+	// If either operand is an IEEE-754 float, the whole operation evaluates in
+	// float64 and yields FLOAT64 — DECIMAL is exact and cannot represent an
+	// arbitrary float result (docs/design-datatypes.md D8). Assigning the
+	// result back into a FLOAT32 column re-rounds via Coerce.
+	if types.IsFloat(l.Typ.Kind) || types.IsFloat(r.Typ.Kind) {
+		return evalFloatArith(op, l, r)
+	}
+	// Binary arithmetic always evaluates in DECIMAL (arbitrary-precision)
+	// space, even when an operand is a fixed-width int column — mirroring
+	// the pre-D2 behavior where DECIMAL was the only arithmetic type, so the
+	// operation itself can never overflow. An out-of-range result only
+	// errors if the caller assigns/coerces it back into a fixed-width int
+	// column (see docs/design-datatypes.md D2).
+	if l.Typ.Kind != types.KindDecimal {
+		c, err := types.Coerce(l, types.Type{Kind: types.KindDecimal})
+		if err != nil {
+			return types.Value{}, err
+		}
+		l = c
+	}
+	if r.Typ.Kind != types.KindDecimal {
+		c, err := types.Coerce(r, types.Type{Kind: types.KindDecimal})
+		if err != nil {
+			return types.Value{}, err
+		}
+		r = c
 	}
 	var (
 		d   types.Decimal
@@ -1265,6 +1322,34 @@ func evalArith(op string, l, r types.Value) (types.Value, error) {
 		}
 	}
 	return types.DecimalValue(d, types.Type{Kind: types.KindDecimal, Scale: uint16(d.Scale)}), nil
+}
+
+// evalFloatArith computes op in float64 space. Non-float operands (int, uint,
+// decimal, decimal text) are widened via Coerce to FLOAT64 first. Division by
+// zero follows IEEE-754 (±Inf / NaN), not a SQL error.
+func evalFloatArith(op string, l, r types.Value) (types.Value, error) {
+	f64 := types.Type{Kind: types.KindFloat64}
+	lc, err := types.Coerce(l, f64)
+	if err != nil {
+		return types.Value{}, err
+	}
+	rc, err := types.Coerce(r, f64)
+	if err != nil {
+		return types.Value{}, err
+	}
+	a, b := lc.Flt, rc.Flt
+	var out float64
+	switch op {
+	case "+":
+		out = a + b
+	case "-":
+		out = a - b
+	case "*":
+		out = a * b
+	case "/":
+		out = a / b
+	}
+	return types.Float64Value(out), nil
 }
 
 func (s *Session) match(pred ast.Expr, tab *catalog.Table, row []types.Value) (bool, error) {

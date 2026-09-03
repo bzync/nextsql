@@ -67,6 +67,15 @@ func FuzzVerify(f *testing.F) {
 		if _, err := v.Verify(context.Background(), tok, ""); err == nil {
 			t.Fatalf("fuzz token was accepted: %q", tok)
 		}
+		av, err := NewAccessTokenVerifier(AccessTokenConfig{
+			Issuer: "https://i.example", ClientID: "c", Audience: "api://nextsql",
+			Now: func() time.Time { return time.Unix(1700000000, 0) },
+		}, cache)
+		if err == nil {
+			if _, err := av.Verify(context.Background(), tok); err == nil {
+				t.Fatalf("fuzz access token was accepted: %q", tok)
+			}
+		}
 	})
 }
 

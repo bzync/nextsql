@@ -54,6 +54,15 @@ type Registry struct {
 	cdcEvents           atomic.Int64
 	cdcErrors           atomic.Int64
 	cdcLagLSN           atomic.Uint64
+	replOrphans         atomic.Int64
+
+	diskTotalBytes      atomic.Uint64
+	diskFreeBytes       atomic.Uint64
+	diskWatermarkWarn   atomic.Int64
+	diskWatermarkReject atomic.Int64
+
+	replicaApplyBacklog atomic.Uint64
+	replicaLagWarn      atomic.Int64
 
 	mu   sync.Mutex
 	ring []int64
@@ -107,6 +116,13 @@ type Snapshot struct {
 	CDCEvents            int64
 	CDCErrors            int64
 	CDCLagLSN            uint64
+	ReplicationOrphans   int64
+	DiskTotalBytes       uint64
+	DiskFreeBytes        uint64
+	DiskWatermarkWarns   int64
+	DiskWatermarkRejects int64
+	ReplicaApplyBacklog  uint64
+	ReplicaLagWarns      int64
 	HeapAlloc            uint64
 	TotalAlloc           uint64
 	Sys                  uint64
@@ -202,6 +218,67 @@ func (r *Registry) ObserveOpen(n int64, d time.Duration) {
 func (r *Registry) AddWAL(n int64) {
 	if r != nil && n > 0 {
 		r.walBytes.Add(n)
+	}
+}
+
+// AddReplicationOrphan counts a transaction that committed to local storage
+// but then failed to reach Raft quorum (e.g. a write racing a leader
+// transition). The client already sees this as a clean, retryable
+// Unavailable — no acknowledged write is lost — but the local commit itself
+// is not rolled back, so this node can be left holding data the rest of the
+// cluster never agreed to. See internal/storage/engine.go
+// commitAndReplicate and docs/ops.md "Rolling upgrade" for the full
+// writeup; a nonzero, growing count here is the operator-visible signal of
+// this known, tracked gap (TODO.md Phase 27 exit gate, "Local commit
+// precedes replication acknowledgment").
+func (r *Registry) AddReplicationOrphan() {
+	if r != nil {
+		r.replOrphans.Add(1)
+	}
+}
+
+// SetDiskUsage records the most recent filesystem capacity snapshot for the
+// data directory, taken by cmd/nextsqld's disk-watermark monitor (see
+// internal/diskspace.Stat).
+func (r *Registry) SetDiskUsage(total, free uint64) {
+	if r == nil {
+		return
+	}
+	r.diskTotalBytes.Store(total)
+	r.diskFreeBytes.Store(free)
+}
+
+// AddDiskWatermarkWarn counts a disk-watermark warn-threshold crossing
+// (edge-triggered — once per trip, not once per check tick).
+func (r *Registry) AddDiskWatermarkWarn() {
+	if r != nil {
+		r.diskWatermarkWarn.Add(1)
+	}
+}
+
+// AddDiskWatermarkReject counts a disk-watermark reject-threshold crossing
+// (edge-triggered — once per trip, not once per rejected statement).
+func (r *Registry) AddDiskWatermarkReject() {
+	if r != nil {
+		r.diskWatermarkReject.Add(1)
+	}
+}
+
+// SetReplicaApplyBacklog records this node's current replication apply
+// backlog (replication.ReplicaHealth.ApplyBacklog — entries known committed
+// but not yet applied locally), taken by cmd/nextsqld's replica-lag
+// monitor. A gauge, not a counter: each tick overwrites the prior value.
+func (r *Registry) SetReplicaApplyBacklog(n uint64) {
+	if r != nil {
+		r.replicaApplyBacklog.Store(n)
+	}
+}
+
+// AddReplicaLagWarn counts a replica-lag warn-threshold crossing
+// (edge-triggered — once per trip, not once per check tick).
+func (r *Registry) AddReplicaLagWarn() {
+	if r != nil {
+		r.replicaLagWarn.Add(1)
 	}
 }
 
@@ -352,6 +429,13 @@ func (r *Registry) Snapshot() Snapshot {
 		CDCEvents:            r.cdcEvents.Load(),
 		CDCErrors:            r.cdcErrors.Load(),
 		CDCLagLSN:            r.cdcLagLSN.Load(),
+		ReplicationOrphans:   r.replOrphans.Load(),
+		DiskTotalBytes:       r.diskTotalBytes.Load(),
+		DiskFreeBytes:        r.diskFreeBytes.Load(),
+		DiskWatermarkWarns:   r.diskWatermarkWarn.Load(),
+		DiskWatermarkRejects: r.diskWatermarkReject.Load(),
+		ReplicaApplyBacklog:  r.replicaApplyBacklog.Load(),
+		ReplicaLagWarns:      r.replicaLagWarn.Load(),
 		NumCPU:               runtime.NumCPU(),
 		GOMAXPROCS:           runtime.GOMAXPROCS(0),
 		NumGoroutine:         runtime.NumGoroutine(),

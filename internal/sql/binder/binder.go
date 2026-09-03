@@ -49,8 +49,9 @@ type (
 		IfExists bool
 	}
 	RebuildIndex struct {
-		Table *catalog.Table
-		Index catalog.Index
+		Table  *catalog.Table
+		Index  catalog.Index
+		Online bool
 	}
 	AlterTable struct {
 		Table          *catalog.Table
@@ -272,6 +273,9 @@ func bind(stmt ast.Stmt, lookup Lookup, nextID uint32, ctes map[string]*CTE) (Bo
 		if len(ln) != len(rn) {
 			return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "set-operation column count mismatch")
 		}
+		if boundHasClientEncryptedOutput(left) || boundHasClientEncryptedOutput(right) {
+			return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "set operations cannot include ENCRYPTED CLIENT columns")
+		}
 		return SetOperation{Left: left, Right: right, Op: s.Op, All: s.All, Names: ln}, nil
 	case ast.CreateTable:
 		t, err := catalog.TableFromAST(nextID, s)
@@ -366,7 +370,7 @@ func bind(stmt ast.Stmt, lookup Lookup, nextID uint32, ctes map[string]*CTE) (Bo
 		}
 		for _, idx := range tab.Indexes {
 			if idx.Name == s.Name {
-				return RebuildIndex{Table: tab, Index: idx}, nil
+				return RebuildIndex{Table: tab, Index: idx, Online: s.Online}, nil
 			}
 		}
 		return nil, nerr.New(nerr.NotFound, "sql.binder", "unknown index")
@@ -375,6 +379,18 @@ func bind(stmt ast.Stmt, lookup Lookup, nextID uint32, ctes map[string]*CTE) (Bo
 	case ast.CreateIndex:
 		return bindCreateIndex(s, lookup)
 	case ast.Insert:
+		for _, row := range s.Rows {
+			for _, ex := range row {
+				if err := rejectClientEncryptedSubqueryExpr(ex, lookup, ctes); err != nil {
+					return nil, err
+				}
+			}
+		}
+		for _, item := range s.Returning {
+			if err := rejectClientEncryptedSubqueryExpr(item.Expr, lookup, ctes); err != nil {
+				return nil, err
+			}
+		}
 		tab, cols, err := bindInsertRows(s.Table, s.Columns, s.Rows, lookup, "INSERT")
 		if err != nil {
 			return nil, err
@@ -389,6 +405,19 @@ func bind(stmt ast.Stmt, lookup Lookup, nextID uint32, ctes map[string]*CTE) (Bo
 	case ast.Select:
 		return bindSelect(s, lookup, ctes)
 	case ast.Update:
+		if err := rejectClientEncryptedSubqueryExpr(s.Where, lookup, ctes); err != nil {
+			return nil, err
+		}
+		for _, set := range s.Sets {
+			if err := rejectClientEncryptedSubqueryExpr(set.Expr, lookup, ctes); err != nil {
+				return nil, err
+			}
+		}
+		for _, item := range s.Returning {
+			if err := rejectClientEncryptedSubqueryExpr(item.Expr, lookup, ctes); err != nil {
+				return nil, err
+			}
+		}
 		tab, err := mustTable(lookup, s.Table)
 		if err != nil {
 			return nil, err
@@ -407,6 +436,9 @@ func bind(stmt ast.Stmt, lookup Lookup, nextID uint32, ctes map[string]*CTE) (Bo
 				return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "duplicate update column")
 			}
 			seen[i] = struct{}{}
+			if err := checkClientEncryptedAssignment(a.Expr, tab, tab.Columns[i]); err != nil {
+				return nil, err
+			}
 			if err := checkExpr(a.Expr, tab, tab.Columns[i].Type, false); err != nil {
 				return nil, err
 			}
@@ -418,6 +450,9 @@ func bind(stmt ast.Stmt, lookup Lookup, nextID uint32, ctes map[string]*CTE) (Bo
 		if err := checkExpr(s.Where, tab, types.Bool(), true); err != nil {
 			return nil, err
 		}
+		if err := rejectClientEncryptedExpr(s.Where, tab, "WHERE"); err != nil {
+			return nil, err
+		}
 		if err := rejectSearchHL(s.Where); err != nil {
 			return nil, err
 		}
@@ -427,11 +462,22 @@ func bind(stmt ast.Stmt, lookup Lookup, nextID uint32, ctes map[string]*CTE) (Bo
 		}
 		return Update{Table: tab, Sets: sets, Where: s.Where, Limit: s.Limit, Returning: ret}, nil
 	case ast.Delete:
+		if err := rejectClientEncryptedSubqueryExpr(s.Where, lookup, ctes); err != nil {
+			return nil, err
+		}
+		for _, item := range s.Returning {
+			if err := rejectClientEncryptedSubqueryExpr(item.Expr, lookup, ctes); err != nil {
+				return nil, err
+			}
+		}
 		tab, err := mustTable(lookup, s.Table)
 		if err != nil {
 			return nil, err
 		}
 		if err := checkExpr(s.Where, tab, types.Bool(), true); err != nil {
+			return nil, err
+		}
+		if err := rejectClientEncryptedExpr(s.Where, tab, "WHERE"); err != nil {
 			return nil, err
 		}
 		if err := rejectSearchHL(s.Where); err != nil {
@@ -783,6 +829,9 @@ func checkGeoCall(x ast.Call) error {
 }
 
 func bindSelect(s ast.Select, lookup Lookup, ctes map[string]*CTE) (Bound, error) {
+	if err := rejectClientEncryptedSubqueriesInSelect(s, lookup, ctes); err != nil {
+		return nil, err
+	}
 	var left *catalog.Table
 	var input Bound
 	if s.FromQuery != nil {
@@ -802,6 +851,7 @@ func bindSelect(s ast.Select, lookup Lookup, ctes map[string]*CTE) (Bound, error
 		for i, name := range names {
 			left.Columns[i] = catalog.Column{Name: name, Type: types.Type{Kind: types.KindInvalid}}
 		}
+		fillCTETypes(left, input)
 	} else if c := ctes[s.Table]; c != nil {
 		c.Refs++
 		input = CTERef{Name: c.Name, ID: c.ID, Schema: c.Schema}
@@ -861,6 +911,9 @@ func bindSelect(s ast.Select, lookup Lookup, ctes map[string]*CTE) (Bound, error
 		if err := checkExpr(joinOn, schema, types.Bool(), true); err != nil {
 			return nil, err
 		}
+		if err := rejectClientEncryptedExpr(joinOn, schema, "JOIN"); err != nil {
+			return nil, err
+		}
 		if err := rejectSearchHL(joinOn); err != nil {
 			return nil, err
 		}
@@ -878,6 +931,9 @@ func bindSelect(s ast.Select, lookup Lookup, ctes map[string]*CTE) (Bound, error
 		return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "window functions are not allowed in WHERE")
 	}
 	if err := checkExpr(where, schema, types.Bool(), true); err != nil {
+		return nil, err
+	}
+	if err := rejectClientEncryptedExpr(where, schema, "WHERE"); err != nil {
 		return nil, err
 	}
 	if err := rejectSearchHL(where); err != nil {
@@ -939,6 +995,9 @@ func bindSelect(s ast.Select, lookup Lookup, ctes map[string]*CTE) (Bound, error
 				return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "duplicate SEARCH column")
 			}
 			k := left.Columns[ord].Type.Kind
+			if left.Columns[ord].ClientEncrypted() {
+				return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "SEARCH cannot use an ENCRYPTED CLIENT column")
+			}
 			if k != types.KindString && k != types.KindText {
 				return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "SEARCH requires a STRING or TEXT column")
 			}
@@ -997,6 +1056,9 @@ func bindSelect(s ast.Select, lookup Lookup, ctes map[string]*CTE) (Bound, error
 		if len(s.Group) > 0 {
 			return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "SELECT * with GROUP BY is not supported")
 		}
+		if s.Distinct && tableHasClientEncrypted(schema) {
+			return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "SELECT DISTINCT cannot include ENCRYPTED CLIENT columns")
+		}
 		for i, c := range schema.Columns {
 			out.OutCols = append(out.OutCols, i)
 			out.OutExprs = append(out.OutExprs, ast.Ident{Name: c.Name})
@@ -1021,6 +1083,9 @@ func bindSelect(s ast.Select, lookup Lookup, ctes map[string]*CTE) (Bound, error
 		if err := checkExpr(s.Group[i], schema, types.Type{}, false); err != nil {
 			return nil, err
 		}
+		if err := rejectClientEncryptedExpr(s.Group[i], schema, "GROUP BY"); err != nil {
+			return nil, err
+		}
 		if err := rejectSearchHL(s.Group[i]); err != nil {
 			return nil, err
 		}
@@ -1031,6 +1096,9 @@ func bindSelect(s ast.Select, lookup Lookup, ctes map[string]*CTE) (Bound, error
 		ex := rewriteQual(item.Expr, schema)
 		if err := checkExpr(ex, schema, types.Type{}, false); err != nil {
 			return nil, err
+		}
+		if exprUsesClientEncrypted(ex, schema) && !bareClientEncryptedColumn(ex, schema) {
+			return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "ENCRYPTED CLIENT select item must be a bare column")
 		}
 		if containsSearchHL(ex) && len(out.SearchCols) == 0 {
 			return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "HIGHLIGHT/SNIPPET requires SEARCH")
@@ -1083,6 +1151,13 @@ func bindSelect(s ast.Select, lookup Lookup, ctes map[string]*CTE) (Bound, error
 		out.OutCols = append(out.OutCols, ord)
 		out.OutExprs = append(out.OutExprs, ex)
 		out.OutNames = append(out.OutNames, name)
+	}
+	if s.Distinct {
+		for _, ex := range out.OutExprs {
+			if exprUsesClientEncrypted(ex, schema) {
+				return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "SELECT DISTINCT cannot include ENCRYPTED CLIENT columns")
+			}
+		}
 	}
 	if hasAgg && hasBare && len(s.Group) == 0 {
 		return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "aggregate mixed with columns requires GROUP BY")
@@ -1168,12 +1243,18 @@ func bindOrder(out *Select, s ast.Select, schema *catalog.Table) error {
 	hiddenStart := len(out.OutNames)
 	for _, item := range s.Order {
 		ex := rewriteQual(item.Expr, schema)
+		if err := rejectClientEncryptedExpr(ex, schema, "ORDER BY"); err != nil {
+			return err
+		}
 		if containsSearchHL(ex) && len(out.SearchCols) == 0 {
 			return nerr.New(nerr.InvalidArgument, "sql.binder", "HIGHLIGHT/SNIPPET requires SEARCH")
 		}
 		if n, ok := orderOrdinal(ex); ok {
 			if n < 1 || n > len(out.OutNames) {
 				return nerr.New(nerr.InvalidArgument, "sql.binder", "ORDER BY position out of range")
+			}
+			if n-1 < len(out.OutExprs) && exprUsesClientEncrypted(out.OutExprs[n-1], schema) {
+				return nerr.New(nerr.InvalidArgument, "sql.binder", "ORDER BY cannot use an ENCRYPTED CLIENT column")
 			}
 			out.Order = append(out.Order, OrderKey{Col: n - 1, Desc: item.Desc})
 			continue
@@ -1189,6 +1270,9 @@ func bindOrder(out *Select, s ast.Select, schema *catalog.Table) error {
 				}
 			}
 			if found >= 0 {
+				if found < len(out.OutExprs) && exprUsesClientEncrypted(out.OutExprs[found], schema) {
+					return nerr.New(nerr.InvalidArgument, "sql.binder", "ORDER BY cannot use an ENCRYPTED CLIENT column")
+				}
 				out.Order = append(out.Order, OrderKey{Col: found, Desc: item.Desc})
 				continue
 			}
@@ -1338,6 +1422,9 @@ func bindFacet(out *Select, s ast.Select, left *catalog.Table) error {
 		if _, dup := seen[ord]; dup {
 			return nerr.New(nerr.InvalidArgument, "sql.binder", "duplicate FACET column")
 		}
+		if left.Columns[ord].ClientEncrypted() {
+			return nerr.New(nerr.InvalidArgument, "sql.binder", "FACET cannot use an ENCRYPTED CLIENT column")
+		}
 		if !facetable(left.Columns[ord].Type.Kind) {
 			return nerr.New(nerr.InvalidArgument, "sql.binder", "FACET requires a STRING, TEXT, DECIMAL, BOOL, UUID, or TIMESTAMPTZ column")
 		}
@@ -1354,7 +1441,10 @@ func bindFacet(out *Select, s ast.Select, left *catalog.Table) error {
 
 func facetable(k types.Kind) bool {
 	switch k {
-	case types.KindString, types.KindText, types.KindDecimal, types.KindBool, types.KindUUID, types.KindTimestampTZ:
+	case types.KindString, types.KindText, types.KindChar, types.KindVarchar, types.KindDecimal, types.KindBool, types.KindUUID, types.KindTimestampTZ,
+		types.KindInt8, types.KindInt16, types.KindInt32, types.KindInt64,
+		types.KindUint8, types.KindUint16, types.KindUint32, types.KindUint64,
+		types.KindDate, types.KindTime, types.KindTimestamp, types.KindFloat32, types.KindFloat64:
 		return true
 	default:
 		return false
@@ -1647,6 +1737,9 @@ func bindAlter(s ast.AlterTable, lookup Lookup, nextID uint32) (Bound, error) {
 		if !ok {
 			return nil, nerr.New(nerr.NotFound, "sql.binder", "unknown column")
 		}
+		if neu.Columns[idx].ClientEncrypted() && cmd.New != cmd.Old {
+			return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "rename of an ENCRYPTED CLIENT column requires client-side decrypt/re-encrypt migration")
+		}
 		if cmd.New == "" {
 			return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "empty column name")
 		}
@@ -1662,6 +1755,9 @@ func bindAlter(s ast.AlterTable, lookup Lookup, nextID uint32) (Bound, error) {
 		}
 		neu.Columns[idx].Name = cmd.New
 	case ast.AlterRenameTable:
+		if tableHasClientEncrypted(neu) && cmd.New != tab.Name {
+			return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "rename of a table with ENCRYPTED CLIENT columns requires client-side decrypt/re-encrypt migration")
+		}
 		if catalog.ReservedName(cmd.New) {
 			return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "table name prefix nsql_ is reserved")
 		}
@@ -1709,6 +1805,9 @@ func bindAlter(s ast.AlterTable, lookup Lookup, nextID uint32) (Bound, error) {
 			return nil, err
 		}
 	case ast.AlterAttachPartition:
+		if tableHasClientEncrypted(neu) {
+			return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "ATTACH PARTITION with ENCRYPTED CLIENT columns requires client-side decrypt/re-encrypt migration")
+		}
 		source, err := mustTable(lookup, cmd.Partition.Name)
 		if err != nil {
 			return nil, err
@@ -1733,6 +1832,9 @@ func bindAlter(s ast.AlterTable, lookup Lookup, nextID uint32) (Bound, error) {
 		}
 		transfer = source
 	case ast.AlterDetachPartition:
+		if tableHasClientEncrypted(neu) {
+			return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "DETACH PARTITION with ENCRYPTED CLIENT columns requires client-side decrypt/re-encrypt migration")
+		}
 		if _, exists := lookup(cmd.Name); exists {
 			return nil, nerr.New(nerr.AlreadyExists, "sql.binder", "detached table already exists")
 		}
@@ -1954,6 +2056,9 @@ func attachPartitioning(t *catalog.Table, spec *ast.PartitionSpec) error {
 			return nerr.New(nerr.InvalidArgument, "sql.binder", "duplicate partition column")
 		}
 		seen[ord] = struct{}{}
+		if t.Columns[ord].ClientEncrypted() {
+			return nerr.New(nerr.InvalidArgument, "sql.binder", "ENCRYPTED CLIENT column cannot be a partition key")
+		}
 		if t.Columns[ord].Type.Kind == types.KindVector {
 			return nerr.New(nerr.InvalidArgument, "sql.binder", "VECTOR partition key")
 		}

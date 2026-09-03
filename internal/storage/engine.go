@@ -45,13 +45,55 @@ type Engine struct {
 	replMu  sync.Mutex
 	replLSN format.LSN
 
+	// openNextLSN is WAL.NextLSN() as of the moment this Engine finished
+	// opening (after any redo), never modified afterward. Checkpoint uses it
+	// to detect "nothing has happened since this Engine was opened" and, in
+	// that case, skip writing a new checkpoint record rather than
+	// unconditionally consuming fresh WAL LSN numbers. See Checkpoint's
+	// comment for why that distinction matters.
+	openNextLSN format.LSN
+
 	iso *integrity.Registry
+
+	// budget/budgetFrames mirror what NewWithBudget reserved against
+	// opt.Budget at open, released exactly once in Close.
+	budget       *buffer.Budget
+	budgetFrames int
 }
 
 // Replicator is the quorum-commit hook (Phase 15). Commit is not
 // acknowledged until Replicate returns. A nil Replicator is single-node.
 type Replicator interface {
 	Replicate(recs []wal.Record) error
+}
+
+// ReplicationOrphanReporter is an optional capability of a Replicator: it
+// lets commitAndReplicate report that a local commit could not be
+// replicated to quorum, so the Replicator can protect linearizable
+// ("STRONG") reads until an operator confirms the node's divergence has
+// been checked/reconciled. Implemented by *replication.Cluster; a test
+// double that doesn't implement it just isn't notified (the type
+// assertion at the call site fails harmlessly).
+type ReplicationOrphanReporter interface {
+	ReportReplicationOrphan()
+}
+
+// NotProposedError is an optional capability a Replicate error can
+// implement: NotProposed reports whether the entry is known to have never
+// reached the Raft log at all (rejected before being proposed — e.g. this
+// node was not the leader), as opposed to an ambiguous in-doubt outcome
+// (proposed, but the quorum wait itself failed/timed out/lost leadership
+// mid-flight). commitAndReplicate only discards a held, not-yet-durable
+// local commit on the definite case; an error that doesn't implement this
+// is always treated as ambiguous — the safe default, matching this
+// package's pre-existing fail-open behavior. Implemented by
+// *replication.Cluster's not-leader rejection; a test double that doesn't
+// implement it just isn't recognized as definite (the type assertion at
+// the call site fails harmlessly, same convention as
+// ReplicationOrphanReporter above).
+type NotProposedError interface {
+	error
+	NotProposed() bool
 }
 
 // Txn is a write transaction. WAL records, UNDO, and page dirtiness are
@@ -62,6 +104,7 @@ type Txn struct {
 	prev         format.LSN
 	first        format.LSN
 	lastUndo     format.UndoID
+	liveTargets  []UndoTarget
 	dirty        map[format.PageID]*undoPage
 	snap         map[format.PageID][]byte
 	created      map[format.PageID]struct{}
@@ -69,6 +112,18 @@ type Txn struct {
 	changeBytes  int
 	changeBroken bool
 	done         bool
+}
+
+// UndoTarget reverses one logical undo record against the live, in-memory
+// tree it originated from. Implemented by *btree.Tree (btree imports
+// storage, so the interface lives here to avoid a cycle). LogUndo records
+// the target alongside each durable undo.Record it appends, in the same
+// order, so a rollback can replay every record through the exact tree that
+// produced it — required once a single SQL transaction spans several trees
+// (heap + indexes), where a raw undo.Record alone does not say which tree
+// its Key belongs to.
+type UndoTarget interface {
+	ApplyUndo(txn *Txn, rec undo.Record) error
 }
 
 const (
@@ -151,6 +206,11 @@ func Open(path string, keys crypto.KeyProvider, bufferPages int) (*Engine, error
 type OpenOptions struct {
 	UntilLSN format.LSN
 	Archiver wal.Archiver
+	// Budget, if non-nil, gates this Engine's buffer pool against a
+	// process-wide shared frame ceiling (M2-3b-2) instead of allocating its
+	// bufferPages frames unconditionally. Reserved once at open, released
+	// once at Close.
+	Budget *buffer.Budget
 }
 
 // OpenWith opens an existing database and optionally stops redo at UntilLSN.
@@ -257,7 +317,7 @@ func open(path string, keys crypto.KeyProvider, bufferPages int, id format.Ident
 		_ = fm.Close()
 		return nil, err
 	}
-	pool, err := buffer.New(fm, bufferPages)
+	pool, err := buffer.NewWithBudget(fm, bufferPages, opt.Budget)
 	if err != nil {
 		_ = ul.Close()
 		_ = lg.Close()
@@ -272,14 +332,17 @@ func open(path string, keys crypto.KeyProvider, bufferPages int, id format.Ident
 		return nil, err
 	}
 	e := &Engine{
-		File:    fm,
-		Alloc:   alloc,
-		Buffer:  pool,
-		WAL:     lg,
-		Undo:    ul,
-		TM:      txn.NewManager(lg.NextTxn()),
-		writers: make(map[format.TxnID]*Txn),
-		iso:     iso,
+		File:         fm,
+		Alloc:        alloc,
+		Buffer:       pool,
+		WAL:          lg,
+		Undo:         ul,
+		TM:           txn.NewManager(lg.NextTxn()),
+		writers:      make(map[format.TxnID]*Txn),
+		iso:          iso,
+		budget:       opt.Budget,
+		budgetFrames: bufferPages,
+		openNextLSN:  lg.NextLSN(),
 	}
 	if !create {
 		uncommitted, uerr := recovery.UncommittedUntil(lg, opt.UntilLSN)
@@ -548,6 +611,7 @@ func (e *Engine) Close() error {
 	if active != nil {
 		_ = e.Rollback()
 	}
+	e.budget.Release(e.budgetFrames)
 	var first error
 	if e.Alloc != nil {
 		if err := e.Alloc.Flush(); err != nil && first == nil {
@@ -651,7 +715,34 @@ func (e *Engine) beginLocked(legacy bool) (*Txn, error) {
 	if legacy || e.txn == nil {
 		e.txn = t
 	}
-	e.opTxn = t
+	// opTxn identifies whichever transaction currently holds pageMu and is
+	// actively mutating pages — Enter/Leave are its only correct setter and
+	// clearer, since every hook that reads opTxn as attribution (LogUndo,
+	// OnDirty, OnInstall, ...) assumes the assignment is synchronized with
+	// pageMu, not merely with e.mu. Setting it here unconditionally, for a
+	// brand new transaction that has not called Enter yet, raced a
+	// different, concurrently-still-entered transaction: beginLocked only
+	// takes e.mu (briefly), never pageMu, so a StartTxn() for txn B could
+	// run to completion — including this assignment — while txn A was still
+	// inside its own Enter..Leave section with pageMu held, silently
+	// overwriting opTxn out from under A. Every subsequent hook call A made
+	// before its own Leave (e.g. LogUndo for a later step of the same
+	// statement) then misattributed A's own work to B: undo records ended
+	// up chained onto B's lastUndo/liveTargets instead of A's, so neither
+	// A's nor B's rollback correctly reversed the transaction that actually
+	// produced them. Confirmed live via a 3-writer concurrent UPDATE/INSERT/
+	// DELETE stress test: LogUndo's txnID for an index write repeatedly
+	// diverged from the *btree.Txn that issued it. legacy callers (a
+	// maintenance operation via BeginWrite, or OnDirty's implicit auto-begin
+	// when no transaction is active at all) are unaffected: by construction
+	// nothing else can be concurrently entered when they run, so keep
+	// setting opTxn immediately for them; only the normal StartTxn (SQL
+	// transaction, legacy=false) path — the one genuinely used
+	// concurrently — drops the premature assignment and relies solely on
+	// this transaction's own later Enter() call.
+	if legacy {
+		e.opTxn = t
+	}
 	return t, nil
 }
 
@@ -684,22 +775,62 @@ func (e *Engine) commitAndReplicate(t *Txn) error {
 	e.replMu.Lock()
 	defer e.replMu.Unlock()
 	e.mu.Lock()
-	err := e.commitLocked(t, false)
-	recs, rerr := e.takeReplLocked()
+	recs, lsn, preReplLSN, err := e.prepareCommitLocked(t, false, true)
 	repl := e.repl
 	e.mu.Unlock()
 	if err != nil {
 		return err
 	}
-	if rerr != nil {
+
+	rerr := repl.Replicate(recs)
+	if rerr == nil {
+		e.mu.Lock()
+		ferr := e.finishCommitOK(t, lsn)
+		e.mu.Unlock()
+		return ferr
+	}
+	if np, ok := rerr.(NotProposedError); ok && np.NotProposed() {
+		// The entry never reached Raft at all (this node was not the
+		// leader when Replicate was called) — the held CommitRec is still
+		// unflushed and t's writes are neither visible nor lock-released,
+		// so it's safe to discard: no acknowledged write is lost, and now
+		// no local orphan is left behind either.
+		if ferr := e.finishCommitDiscarded(t, preReplLSN); ferr != nil {
+			return ferr
+		}
 		return rerr
 	}
-	if repl != nil && len(recs) > 0 {
-		return repl.Replicate(recs)
+	// Ambiguous/in-doubt failure (Replicate was actually proposed to Raft
+	// but the quorum wait itself failed — see isRetryableApplyErr):
+	// discarding here would be worse than today's known orphan, because
+	// the WAL's LSN counter has already moved past this record, so if the
+	// entry *did* reach quorum, a later replay of it via ApplyReplicated
+	// would be silently skipped as already-seen (LSN < nextLSN) rather
+	// than applied — a permanent, undetectable divergence. So this case
+	// keeps this package's original fail-open behavior byte for byte:
+	// commit, surface an observable orphan count, and tell the Replicator
+	// so it can bar this node from serving STRONG reads until an operator
+	// confirms the divergence is checked/reconciled
+	// (CLUSTER RECONCILE CONFIRM). See TODO.md's Phase 27 exit gate,
+	// "Local commit precedes replication acknowledgment", for the full
+	// writeup of why this residual case can't be closed by this fix.
+	e.mu.Lock()
+	ferr := e.finishCommitOK(t, lsn)
+	e.mu.Unlock()
+	if ferr != nil {
+		return ferr
 	}
-	return nil
+	metrics.Default().AddReplicationOrphan()
+	if reporter, ok := repl.(ReplicationOrphanReporter); ok {
+		reporter.ReportReplicationOrphan()
+	}
+	return rerr
 }
 
+// takeReplLocked returns every WAL record since the last call (tracked by
+// e.replLSN), read back from disk — so it only sees what's already been
+// flushed. Called by prepareCommitLocked's hold branch after flushing
+// everything up to (but not including) the held CommitRec.
 func (e *Engine) takeReplLocked() ([]wal.Record, error) {
 	if e.WAL == nil {
 		return nil, nil
@@ -719,45 +850,147 @@ func (e *Engine) takeReplLocked() ([]wal.Record, error) {
 }
 
 func (e *Engine) commitLocked(txn *Txn, pageWriteHeld bool) error {
+	_, _, _, err := e.prepareCommitLocked(txn, pageWriteHeld, false)
+	return err
+}
+
+// prepareCommitLocked runs a transaction's commit through appending its
+// CommitRec. Called with e.mu held.
+//
+// If hold is false (the e.repl == nil path, and every commit before this
+// fix existed), the CommitRec is appended and flushed immediately and the
+// transaction is fully finished before returning — byte for byte the
+// original commitLocked behavior; recs and preReplLSN are always zero
+// (nothing needs them).
+//
+// If hold is true, the CommitRec is appended via WAL.AppendHeld and left
+// unresolved: t's writes are not yet durable, visible, or lock-released.
+// recs is every WAL record appended since the last replicated LSN — not
+// just this transaction's own — because other, unrelated transactions'
+// records can interleave into the WAL between replication rounds (e.g.
+// flushDirtyImages briefly releases e.mu mid-commit) and a follower's
+// InstallRecords requires a gap-free LSN sequence; omitting any of them
+// here would make a later, correctly-quorum-committed batch silently
+// unappliable on a follower. Building recs this way needs
+// e.takeReplLocked's disk-reading scan (the held CommitRec's own bytes are
+// the one thing it can't see — appended onto the end manually below), so
+// this transaction's own AllocState/Change/page-image records are flushed
+// right here too, ahead of the point they'd ordinarily be flushed at, to
+// make that scan see them. preReplLSN is the scan's watermark from just
+// before it ran; if this batch is later discarded (finishCommitDiscarded),
+// none of it — including the swept-up unrelated records, which stay
+// durable — ever reached Raft, so the watermark must roll back to
+// preReplLSN or those records would never be offered for replication
+// again. The caller must replicate recs and then call finishCommitOK or
+// finishCommitDiscarded to resolve it.
+func (e *Engine) prepareCommitLocked(txn *Txn, pageWriteHeld, hold bool) (recs []wal.Record, lsn, preReplLSN format.LSN, err error) {
 	if txn.changeBroken {
-		return nerr.New(nerr.Conflict, "storage.CommitTxn", "transaction change stream is incomplete; rollback required")
+		return nil, 0, 0, nerr.New(nerr.Conflict, "storage.CommitTxn", "transaction change stream is incomplete; rollback required")
 	}
 	if e.Undo != nil {
 		if err := e.Undo.Flush(); err != nil {
-			return err
+			return nil, 0, 0, err
 		}
 	}
 	if err := e.flushDirtyImages(txn, pageWriteHeld); err != nil {
-		return err
+		return nil, 0, 0, err
 	}
-	if err := e.Alloc.Flush(); err != nil {
-		return err
-	}
+	// Alloc.Flush is deliberately NOT called here: unlike WAL records
+	// (gated by AppendHeld/ReleaseHold) and buffer-pool pages (gated by
+	// AllowFlush refusing eviction while txn is still in e.writers),
+	// Allocator.Flush persists directly to the data file's
+	// superblock/freelist pages with no durability gate of its own and no
+	// undo log — Alloc.Reload() only re-reads whatever is already on disk,
+	// it cannot revert a persist that already happened. Calling it before
+	// a hold resolves would make finishCommitDiscarded's Alloc.Reload()
+	// silently fail to undo the discarded transaction's page allocations
+	// (it would just reload the same, already-persisted state back). It
+	// runs instead in finishCommitOK, once the transaction is known to be
+	// actually committing (both here for the non-replicated path, where
+	// this is the very next call, and after a hold resolves) — see
+	// AllocState's own record below, which reads Allocator's in-memory
+	// mirror (SetAllocStateMem) and is therefore already correct
+	// regardless of when the physical persist happens.
 	if err := e.hitLocked(wal.PointBeforeCommitRecord); err != nil {
-		return err
+		return nil, 0, 0, err
 	}
 	next, head, count := e.File.AllocState()
-	lsn, err := e.WAL.Append(wal.AllocState(txn.id, txn.prev, next, head, count))
+	allocLSN, err := e.WAL.Append(wal.AllocState(txn.id, txn.prev, next, head, count))
 	if err != nil {
-		return err
+		return nil, 0, 0, err
 	}
-	txn.prev = lsn
+	txn.prev = allocLSN
 	for _, change := range txn.changes {
 		rec, err := wal.ChangeRec(txn.id, txn.prev, change)
 		if err != nil {
-			return err
+			return nil, 0, 0, err
 		}
-		lsn, err = e.WAL.Append(rec)
+		changeLSN, err := e.WAL.Append(rec)
 		if err != nil {
-			return err
+			return nil, 0, 0, err
 		}
-		txn.prev = lsn
+		txn.prev = changeLSN
 	}
-	lsn, err = e.WAL.Append(wal.CommitRec(txn.id, txn.prev))
+	commitRec := wal.CommitRec(txn.id, txn.prev)
+	if hold {
+		commitLSN, err := e.WAL.AppendHeld(commitRec)
+		if err != nil {
+			return nil, 0, 0, err
+		}
+		txn.prev = commitLSN
+		commitRec.LSN = commitLSN
+		if err := e.hitLocked(wal.PointAfterCommitRecordHeld); err != nil {
+			return nil, 0, 0, err
+		}
+		if err := e.WAL.Flush(commitLSN - 1); err != nil {
+			return nil, 0, 0, err
+		}
+		// preReplLSN is the watermark from before this scan: if the batch
+		// this transaction's CommitRec ends up part of is discarded
+		// (finishCommitDiscarded), nothing in it — including the other,
+		// unrelated records takeReplLocked just swept up — ever reached
+		// Raft, so the watermark must roll back to here too, or those
+		// records would never be offered for replication again.
+		preReplLSN = e.replLSN
+		recs, err = e.takeReplLocked()
+		if err != nil {
+			return nil, 0, 0, err
+		}
+		recs = append(recs, commitRec)
+		return recs, commitLSN, preReplLSN, nil
+	}
+	commitLSN, err := e.WAL.Append(commitRec)
 	if err != nil {
+		return nil, 0, 0, err
+	}
+	txn.prev = commitLSN
+	if err := e.finishCommitOK(txn, commitLSN); err != nil {
+		return nil, 0, 0, err
+	}
+	return nil, commitLSN, 0, nil
+}
+
+// finishCommitOK makes a transaction durable, visible, and unlocked: it
+// releases any WAL hold (a no-op if prepareCommitLocked was called with
+// hold == false, since nothing is held), flushes through lsn, and runs
+// today's original commitLocked tail. Called with e.mu held.
+func (e *Engine) finishCommitOK(txn *Txn, lsn format.LSN) error {
+	if err := e.Alloc.Flush(); err != nil {
 		return err
 	}
-	txn.prev = lsn
+	if err := e.WAL.ReleaseHold(true); err != nil {
+		return err
+	}
+	// The held CommitRec itself was never seen by takeReplLocked's scan
+	// (it wasn't durable yet), so the watermark sits one short; advance it
+	// past this record now that it's known to be staying, so a later
+	// takeReplLocked call doesn't needlessly re-scan and resend it (a
+	// follower would just no-op the duplicate, but there's no reason to
+	// pay for it). A no-op for the non-replicated path (lsn's value there
+	// is never read back by anything replication-related).
+	if lsn > e.replLSN {
+		e.replLSN = lsn
+	}
 	if err := e.hitLocked(wal.PointAfterCommitRecordBeforeSync); err != nil {
 		return err
 	}
@@ -779,6 +1012,53 @@ func (e *Engine) commitLocked(txn *Txn, pageWriteHeld bool) error {
 		e.Undo.ForgetTxn(txn.id)
 	}
 	return nil
+}
+
+// finishCommitDiscarded undoes a held commit whose replication is known to
+// have never reached Raft: it splices the held CommitRec back out (it
+// never touches disk) and then runs the same buffer-pool/allocator undo
+// and WAL-abort sequence RollbackTxn uses for an ordinary ROLLBACK,
+// including running the buffer/allocator undo without e.mu held — Buffer
+// callbacks (Pin → OnPin) re-enter e.mu, so holding it here would
+// deadlock, exactly the reason RollbackTxn already drops it first.
+// preReplLSN is prepareCommitLocked's pre-scan watermark: since nothing in
+// this batch reached Raft, it must be restored so the other, unrelated
+// records takeReplLocked swept up alongside the discarded CommitRec — they
+// stayed durable, this only undoes txn's own effects — are offered for
+// replication again by a later commit, instead of being silently skipped
+// forever because the watermark had already passed them.
+func (e *Engine) finishCommitDiscarded(txn *Txn, preReplLSN format.LSN) error {
+	if err := e.WAL.ReleaseHold(false); err != nil {
+		return err
+	}
+	if err := e.hitLocked(wal.PointAfterHoldReleaseDiscardBeforeAbortAppend); err != nil {
+		return err
+	}
+	e.mu.Lock()
+	if e.txn == txn {
+		e.txn = nil
+	}
+	if e.opTxn == txn {
+		e.opTxn = nil
+	}
+	delete(e.writers, txn.id)
+	e.replLSN = preReplLSN
+	e.mu.Unlock()
+
+	// Best-effort: see the doc comment on undoTxnLogical for why a failure
+	// here does not abort the discard itself.
+	_ = e.undoTxnLogical(txn)
+
+	if _, err := e.WAL.Append(wal.AbortRec(txn.id, txn.prev)); err != nil {
+		if e.TM != nil {
+			e.TM.Abort(txn.id)
+		}
+		return err
+	}
+	if e.TM != nil {
+		e.TM.Abort(txn.id)
+	}
+	return e.Alloc.Reload()
 }
 
 func (e *Engine) Rollback() error {
@@ -803,53 +1083,12 @@ func (e *Engine) RollbackTxn(txn *Txn) error {
 		e.opTxn = nil
 	}
 	delete(e.writers, txn.id)
-	others := make([]*Txn, 0, len(e.writers))
-	for _, o := range e.writers {
-		others = append(others, o)
-	}
 	e.mu.Unlock()
 
-	for id, u := range txn.dirty {
-		shared := false
-		for _, o := range others {
-			if _, ok := o.dirty[id]; ok {
-				shared = true
-				break
-			}
-		}
-		if shared {
-			continue
-		}
-		if u.created {
-			_ = e.Buffer.Drop(id)
-			_ = e.Alloc.Free(id)
-			continue
-		}
-		if u.before != nil {
-			_ = e.Buffer.Restore(id, u.before)
-		}
-	}
-	for id := range txn.created {
-		if _, ok := txn.dirty[id]; ok {
-			continue
-		}
-		shared := false
-		for _, o := range others {
-			if _, ok := o.dirty[id]; ok {
-				shared = true
-				break
-			}
-			if _, ok := o.created[id]; ok {
-				shared = true
-				break
-			}
-		}
-		if shared {
-			continue
-		}
-		_ = e.Buffer.Drop(id)
-		_ = e.Alloc.Free(id)
-	}
+	// Best-effort: see the doc comment on undoTxnLogical for why a failure
+	// here does not abort the rollback itself.
+	_ = e.undoTxnLogical(txn)
+
 	if _, err := e.WAL.Append(wal.AbortRec(txn.id, txn.prev)); err != nil {
 		if e.TM != nil {
 			e.TM.Abort(txn.id)
@@ -861,6 +1100,58 @@ func (e *Engine) RollbackTxn(txn *Txn) error {
 	}
 	_ = e.Alloc.Reload()
 	return e.CrashAt(wal.PointAfterRollback)
+}
+
+// undoTxnLogical reverses txn's row-level changes by replaying its durable
+// undo chain (newest -> oldest) through the exact tree each record came
+// from (txn.liveTargets, appended by LogUndo in the same order the chain
+// itself was built). Each reversal runs through the tree's ordinary
+// key-based mutation path (see btree.Tree.ApplyUndo / applyUndoRec), which
+// re-descends from the tree's live root — so it finds a key's current
+// location even if a concurrent split relocated it after this record was
+// logged, unlike a raw page-image restore.
+//
+// Deliberately does NOT touch page-level structure (splits, new sibling
+// pages, separator insertions, root promotion): those are physical facts
+// that took effect immediately when they happened, are potentially visible
+// to and built upon by other transactions the moment they occur, and are
+// never reverted by a rollback — the standard "structure modifications are
+// physiological, not logical" design used by every mainstream B+Tree engine
+// (e.g. ARIES nested top actions). The previous implementation
+// (undoTxnBuffers, removed) restored whole dirty pages to a pre-transaction
+// image and freed pages the transaction had created; both were unsound
+// under concurrency: a dirty leaf page is shared row storage, so restoring
+// its pre-image silently discarded any other transaction's row committed to
+// that page in the meantime (the corruption undoTxnLogical replaces), and a
+// "created" page from a leaf split holds rows *relocated* from the
+// pre-existing page by the split, not just this transaction's own new row,
+// so freeing it destroyed committed data outright.
+//
+// Failure here is intentionally best-effort and never aborts the rollback:
+// this only fixes up the *live* buffer pool for transactions still running
+// in this process. If the process crashes before txn's WAL abort record
+// becomes durable, crash recovery's own undo.Apply independently redoes the
+// identical reversal from the durable undo log against the on-disk file,
+// so nothing durable depends on this call succeeding.
+func (e *Engine) undoTxnLogical(txn *Txn) error {
+	if e.Undo == nil || len(txn.liveTargets) == 0 {
+		return nil
+	}
+	recs := e.Undo.Chain(txn.lastUndo) // newest -> oldest
+	n := len(txn.liveTargets)
+	if len(recs) != n {
+		return nerr.New(nerr.Internal, "storage.undoTxnLogical", "undo chain length does not match recorded targets")
+	}
+	for i, rec := range recs {
+		target := txn.liveTargets[n-1-i] // liveTargets is oldest -> newest; align with recs
+		if target == nil {
+			continue
+		}
+		if err := target.ApplyUndo(txn, rec); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (e *Engine) currentWriter() *Txn {
@@ -944,6 +1235,27 @@ func (e *Engine) Checkpoint() error {
 		prev = e.txn.prev
 	}
 	e.mu.Unlock()
+
+	// Nothing has happened on this Engine instance since it was opened (no
+	// transaction touched it, and — since a checkpoint call is the only
+	// other thing that appends WAL records outside a transaction — nothing
+	// else advanced NextLSN either): writing a fresh checkpoint record here
+	// would be redundant, and worse, would consume WAL LSN numbers purely as
+	// local housekeeping. That matters beyond wasted space: a caller that
+	// opens a data file only to produce a consistent snapshot for backup
+	// (internal/backup.Create/Restore, which do not otherwise touch this
+	// engine at all) must not perturb its LSN numbering — on a replica,
+	// that numbering is also what ApplyReplicated uses to know how far the
+	// replicated stream has already been caught up to, and an LSN advance
+	// with no corresponding applied data would make it silently skip real,
+	// not-yet-applied writes replayed into it later (found via an
+	// independent audit, TODO.md log #95). A normal Close() or any session
+	// that actually wrote something always has txnID != 0 at some point or
+	// has already advanced NextLSN past openNextLSN, so this only ever
+	// short-circuits a checkpoint that would have had nothing to record.
+	if txnID == 0 && e.WAL.NextLSN() == e.openNextLSN {
+		return nil
+	}
 
 	root, height := e.File.PrimaryTree()
 	next, head, count := e.File.AllocState()
@@ -1146,7 +1458,7 @@ func (e *Engine) AllowFlush(id format.PageID, lsn format.LSN) bool {
 	return lsn <= e.WAL.DurableLSN()
 }
 
-func (e *Engine) LogUndo(kind undo.Kind, pageID format.PageID, key []byte, old row.Version) (format.UndoID, error) {
+func (e *Engine) LogUndo(target UndoTarget, kind undo.Kind, pageID format.PageID, key []byte, old row.Version) (format.UndoID, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	t := e.opTxn
@@ -1169,6 +1481,7 @@ func (e *Engine) LogUndo(kind undo.Kind, pageID format.PageID, key []byte, old r
 		return 0, err
 	}
 	t.lastUndo = id
+	t.liveTargets = append(t.liveTargets, target)
 	// Fresh inserts are undone from the UNDO file / in-memory chain.
 	// A second WAL RecUndo doubles AEAD work and is not required for redo.
 	if kind == undo.KindInsert {

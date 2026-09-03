@@ -1,4 +1,7 @@
 import { expect, test } from 'bun:test';
+import { mkdtemp, readFile, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import {
   Kind,
   NextSQLError,
@@ -19,7 +22,88 @@ import {
   isReadOnlySQL,
   txnControl,
   validateConfig,
+  FieldType,
+  MemoryFieldKeyring,
+  FileFieldKeyring,
+  decryptField,
+  encryptField,
 } from './nextsql.js';
+
+function fieldKey(id, fill) {
+  return { id, material: new Uint8Array(32).fill(fill) };
+}
+
+test('NSCE1 field encryption round-trip, rotation, and revocation', async () => {
+  const v1 = fieldKey('v1', 1);
+  const ring = new MemoryFieldKeyring(v1);
+  const values = [
+    [FieldType.UUID, '00112233-4455-6677-8899-aabbccddeeff'],
+    [FieldType.String, 'secret'],
+    [FieldType.Decimal(8, 2), '-12.50'],
+    [FieldType.TimestampTZ, 1234567890123456789n],
+    [FieldType.JSON, { z: [true, null], a: 7 }],
+    [FieldType.Bool, true],
+    [FieldType.Blob, new Uint8Array([0x00, 0xff, 0xde, 0xad, 0xbe, 0xef])],
+    [FieldType.Int8, -128],
+    [FieldType.Int8, 127],
+    [FieldType.Int16, -32768],
+    [FieldType.Int32, -2147483648],
+    [FieldType.Int64, -9223372036854775808n],
+    [FieldType.Int64, 9223372036854775807n],
+    [FieldType.Uint8, 255],
+    [FieldType.Uint16, 65535],
+    [FieldType.Uint32, 4294967295],
+    [FieldType.Uint64, 18446744073709551615n],
+  ];
+  for (const [type, value] of values) {
+    const sealed = await encryptField(ring, 'app', 'accounts', 'secret', type, value);
+    expect(sealed.startsWith('NSCE1.')).toBe(true);
+    expect(await decryptField(ring, 'app', 'accounts', 'secret', type, sealed)).toEqual(value);
+  }
+  const old = await encryptField(ring, 'app', 'accounts', 'secret', FieldType.Text, 'old');
+  const again = await encryptField(ring, 'app', 'accounts', 'secret', FieldType.Text, 'old');
+  expect(old).not.toBe(again);
+  ring.rotate(fieldKey('v2', 2));
+  expect(await decryptField(ring, 'app', 'accounts', 'secret', FieldType.Text, old)).toBe('old');
+  ring.revoke('v1');
+  await expect(decryptField(ring, 'app', 'accounts', 'secret', FieldType.Text, old)).rejects.toBeInstanceOf(NextSQLError);
+  await expect(decryptField(new MemoryFieldKeyring(v1), 'app', 'accounts', 'other', FieldType.Text, old)).rejects.toBeInstanceOf(NextSQLError);
+  await expect(encryptField(ring, 'app', 'accounts', 'secret', FieldType.Text, 'x'.repeat(1 << 20))).rejects.toBeInstanceOf(NextSQLError);
+  const goCiphertext = 'NSCE1.AQECdjEDAAAAAABEeyxf_quGP5And9z0FmNijEp3uSiDspby_y1zIxe9L1R-llGtWQxh';
+  expect(await decryptField(new MemoryFieldKeyring(v1), 'app', 'accounts', 'secret', FieldType.Text, goCiphertext)).toBe('portable');
+});
+
+test('FileFieldKeyring persists rotation and revocation across reopen', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'nextsql-fk-'));
+  const path = join(dir, 'keyring.nsfk');
+  const kr = await FileFieldKeyring.create(path, fieldKey('v1', 1));
+  const old = await encryptField(kr, 'app', 'accounts', 'secret', FieldType.Text, 'old');
+
+  await expect(FileFieldKeyring.create(path, fieldKey('v2', 2))).rejects.toBeInstanceOf(NextSQLError);
+
+  await kr.rotate(fieldKey('v2', 2));
+  const reopenedAfterRotate = await FileFieldKeyring.open(path);
+  expect(await decryptField(reopenedAfterRotate, 'app', 'accounts', 'secret', FieldType.Text, old)).toBe('old');
+  const fresh = await encryptField(reopenedAfterRotate, 'app', 'accounts', 'secret', FieldType.Text, 'new');
+
+  await expect(kr.revoke('v1')).resolves.toBeUndefined();
+  const reopenedAfterRevoke = await FileFieldKeyring.open(path);
+  await expect(decryptField(reopenedAfterRevoke, 'app', 'accounts', 'secret', FieldType.Text, old)).rejects.toBeInstanceOf(NextSQLError);
+  expect(await decryptField(reopenedAfterRevoke, 'app', 'accounts', 'secret', FieldType.Text, fresh)).toBe('new');
+
+  const list = reopenedAfterRevoke.list();
+  expect(list.find((r) => r.id === 'v1')).toEqual(expect.objectContaining({ current: false, revoked: true }));
+  expect(list.find((r) => r.id === 'v2')).toEqual(expect.objectContaining({ current: true, revoked: false }));
+
+  await expect(kr.revoke('v2')).rejects.toBeInstanceOf(NextSQLError);
+  await expect(kr.rotate(fieldKey('v1', 9))).rejects.toBeInstanceOf(NextSQLError);
+
+  const raw = await readFile(path);
+  await writeFile(path, 'not a keyring');
+  await expect(kr.reload()).rejects.toBeInstanceOf(NextSQLError);
+  expect(await kr.currentFieldKey()).toEqual({ id: 'v2', material: fieldKey('v2', 2).material });
+  await writeFile(path, raw);
+});
 
 test('rejects keys and passwords in a URL', () => {
   expect(() => validateConfig({
@@ -69,6 +153,16 @@ test('hello encode / decode', () => {
   expect(got.secret).toBe(99n);
 });
 
+test('hello realm is an opt-in trailing field (M2-2)', () => {
+  const noRealm = encodeHello({ version: 1, database: 'prod', user: 'app' });
+  const emptyRealm = encodeHello({ version: 1, database: 'prod', user: 'app', realm: '' });
+  expect(noRealm.length).toBe(emptyRealm.length);
+  expect(Buffer.from(noRealm).equals(Buffer.from(emptyRealm))).toBe(true);
+  const withRealm = encodeHello({ version: 1, database: 'prod', user: 'app', realm: 'tenant-a' });
+  expect(withRealm.length).toBe(noRealm.length + 2 + 'tenant-a'.length);
+  expect(Buffer.from(withRealm.slice(0, noRealm.length)).equals(Buffer.from(noRealm))).toBe(true);
+});
+
 test('round-trip string and bool params', () => {
   const s = encodeParam('hello');
   const d = decodeValue(s, 0);
@@ -76,6 +170,70 @@ test('round-trip string and bool params', () => {
   expect(d.kind).toBe(Kind.String);
   expect(decodeValue(encodeParam(true), 0).value).toBe(true);
   expect(decodeValue(encodeParam(null), 0).value).toBe(null);
+});
+
+test('blob param round-trip (D1)', () => {
+  const raw = new Uint8Array([0x00, 0xff, 0xfe, 0x00, 0xde, 0xad, 0xbe, 0xef]);
+  const enc = encodeParam(raw);
+  const dec = decodeValue(enc, 0);
+  expect(dec.kind).toBe(Kind.Blob);
+  expect(dec.value).toEqual(raw);
+
+  // A 16-byte Uint8Array keeps its pre-existing UUID meaning; use the
+  // explicit wrapper to force BLOB for that length.
+  const raw16 = new Uint8Array(16).fill(7);
+  expect(decodeValue(encodeParam(raw16), 0).kind).toBe(Kind.UUID);
+  const wrapped = decodeValue(encodeParam({ kind: 'blob', value: raw16 }), 0);
+  expect(wrapped.kind).toBe(Kind.Blob);
+  expect(wrapped.value).toEqual(raw16);
+
+  const empty = decodeValue(encodeParam(new Uint8Array(0)), 0);
+  expect(empty.kind).toBe(Kind.Blob);
+  expect(empty.value).toEqual(new Uint8Array(0));
+});
+
+test('fixed-width int param round-trip (D2)', () => {
+  const cases = [
+    ['int8', -128, Kind.Int8],
+    ['int8', 127, Kind.Int8],
+    ['int16', -32768, Kind.Int16],
+    ['int16', 32767, Kind.Int16],
+    ['int32', -2147483648, Kind.Int32],
+    ['int32', 2147483647, Kind.Int32],
+    ['int64', -9223372036854775808n, Kind.Int64],
+    ['int64', 9223372036854775807n, Kind.Int64],
+  ];
+  for (const [which, value, kind] of cases) {
+    const dec = decodeValue(encodeParam({ kind: which, value }), 0);
+    expect(dec.kind).toBe(kind);
+    expect(dec.value.toString()).toBe(value.toString());
+  }
+  expect(() => encodeParam({ kind: 'int8', value: 128 })).toThrow();
+  expect(() => encodeParam({ kind: 'int8', value: -129 })).toThrow();
+  expect(decodeValue(encodeParam(42), 0).kind).toBe(Kind.Decimal);
+  expect(typeof decodeValue(encodeParam({ kind: 'int64', value: 5n }), 0).value).toBe('bigint');
+});
+
+test('fixed-width uint param round-trip (D3)', () => {
+  const cases = [
+    ['uint8', 0, Kind.Uint8],
+    ['uint8', 255, Kind.Uint8],
+    ['uint16', 0, Kind.Uint16],
+    ['uint16', 65535, Kind.Uint16],
+    ['uint32', 0, Kind.Uint32],
+    ['uint32', 4294967295, Kind.Uint32],
+    ['uint64', 0n, Kind.Uint64],
+    ['uint64', 18446744073709551615n, Kind.Uint64],
+  ];
+  for (const [which, value, kind] of cases) {
+    const dec = decodeValue(encodeParam({ kind: which, value }), 0);
+    expect(dec.kind).toBe(kind);
+    expect(dec.value.toString()).toBe(value.toString());
+  }
+  expect(() => encodeParam({ kind: 'uint8', value: 256 })).toThrow();
+  expect(() => encodeParam({ kind: 'uint8', value: -1 })).toThrow();
+  expect(decodeValue(encodeParam(42), 0).kind).toBe(Kind.Decimal);
+  expect(typeof decodeValue(encodeParam({ kind: 'uint64', value: 5n }), 0).value).toBe('bigint');
 });
 
 test('decimal encode / decode', () => {

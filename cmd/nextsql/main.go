@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -52,10 +54,14 @@ func run(args []string) error {
 		return initDB(args[1:])
 	case "hosting":
 		return hostingCmd(args[1:])
+	case "realm":
+		return realmCmd(args[1:])
+	case "database":
+		return databaseCmd(args[1:])
 	case "exec":
 		return execSQL(args[1:])
 	case "backup":
-		return backupDB(args[1:])
+		return backupCmd(args[1:])
 	case "restore":
 		return restoreDB(args[1:])
 	case "verify":
@@ -74,6 +80,8 @@ func run(args []string) error {
 		return migrateCmd(args[1:])
 	case "token":
 		return tokenCmd(args[1:])
+	case "audit":
+		return auditCmd(args[1:])
 	case "login":
 		return loginCmd(args[1:])
 	case "logout":
@@ -106,6 +114,248 @@ func hostingCmd(args []string) error {
 	default:
 		return nerr.New(nerr.InvalidArgument, "nextsql hosting", "unknown hosting command")
 	}
+}
+
+// realmCmd and databaseCmd are the M2-1 slice of the multi-database hosting
+// cross-cutting track (docs/design-multidatabase-dbaas.md §11.2): a
+// registered realm/database creation primitive, independent of the wire
+// protocol and the bounded DatabaseManager that later M2 increments add.
+// nextsqld does not yet open or serve anything created here — see the
+// design doc for the full sequence.
+func realmCmd(args []string) error {
+	if len(args) == 0 {
+		return nerr.New(nerr.InvalidArgument, "nextsql realm", "expected create")
+	}
+	switch args[0] {
+	case "create":
+		return createRealm(args[1:])
+	default:
+		return nerr.New(nerr.InvalidArgument, "nextsql realm", "unknown realm command")
+	}
+}
+
+func databaseCmd(args []string) error {
+	if len(args) == 0 {
+		return nerr.New(nerr.InvalidArgument, "nextsql database", "expected create")
+	}
+	switch args[0] {
+	case "create":
+		return createDatabase(args[1:])
+	default:
+		return nerr.New(nerr.InvalidArgument, "nextsql database", "unknown database command")
+	}
+}
+
+func createRealm(args []string) error {
+	const op = "nextsql realm create"
+	fs := flag.NewFlagSet("realm create", flag.ContinueOnError)
+	fs.String("data-dir", "", "deployment data directory")
+	fs.String("key-file", "", "database root unlock key file (used to locate KEY-FILE.instance)")
+	fs.String("instance-key-file", "", "deployment registry root key file (default KEY-FILE.instance)")
+	realmName := fs.String("realm", "", "new realm name")
+	databaseName := fs.String("database", "", "new realm's first database name")
+	databaseKeyFile := fs.String("database-key-file", "", "root unlock key file for the new database (created if missing)")
+	bufferPages := fs.Int("buffer-pages", config.DefaultBufferPages, "buffer pool pages for the new database")
+	fs.String("env-file", "", "load only this dotenv file")
+	fs.Bool("no-env", false, "do not load .env files")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	reg, ddl, settings, err := openHostingRegistryForCLI(op, fs, args, true)
+	if err != nil {
+		return err
+	}
+	defer reg.Close()
+	defer ddl.Close()
+	if settings.Supplied["realm"] {
+		*realmName = settings.Realm
+	}
+	if settings.Supplied["database"] {
+		*databaseName = settings.Database
+	}
+	if *realmName == "" || *databaseName == "" {
+		return cli.LocalMissing(op, "--realm and --database are required")
+	}
+	if *databaseKeyFile == "" {
+		return cli.LocalMissing(op, "--database-key-file is required")
+	}
+	if *bufferPages < 1 {
+		return nerr.New(nerr.InvalidArgument, op, "--buffer-pages must be positive")
+	}
+
+	m := reg.Manifest()
+	ident, alreadyActive, err := resolveManagedDatabaseIdentity(m, *realmName, *databaseName)
+	if err != nil {
+		return err
+	}
+	if alreadyActive {
+		fmt.Printf("realm %s database %s already active\n", *realmName, *databaseName)
+		return nil
+	}
+	root, err := ensureDatabaseKeyFile(*databaseKeyFile)
+	if err != nil {
+		return err
+	}
+	defer root.Zero()
+
+	realm, db, created, err := reg.CreateRealm(*realmName, *databaseName, ident, *databaseKeyFile)
+	if err != nil {
+		auditLocal(settings.DataDir, security.ActionRealmCreate, *realmName+"/"+*databaseName, err)
+		return err
+	}
+	if err := activateManagedDatabase(reg, settings.DataDir, realm.ID, db.ID, ident, root, *bufferPages); err != nil {
+		auditLocal(settings.DataDir, security.ActionRealmCreate, *realmName+"/"+*databaseName, err)
+		return err
+	}
+	auditLocal(settings.DataDir, security.ActionRealmCreate, *realmName+"/"+*databaseName, nil)
+	verb := "created"
+	if !created {
+		verb = "resumed"
+	}
+	fmt.Printf("realm %s %s database %s %s %s\n", realm.Name, realm.ID.String(), db.Name, db.ID.String(), verb)
+	return nil
+}
+
+func createDatabase(args []string) error {
+	const op = "nextsql database create"
+	fs := flag.NewFlagSet("database create", flag.ContinueOnError)
+	fs.String("data-dir", "", "deployment data directory")
+	fs.String("key-file", "", "database root unlock key file (used to locate KEY-FILE.instance)")
+	fs.String("instance-key-file", "", "deployment registry root key file (default KEY-FILE.instance)")
+	realmName := fs.String("realm", "", "existing realm name")
+	databaseName := fs.String("name", "", "new database name")
+	databaseKeyFile := fs.String("database-key-file", "", "root unlock key file for the new database (created if missing)")
+	bufferPages := fs.Int("buffer-pages", config.DefaultBufferPages, "buffer pool pages for the new database")
+	fs.String("env-file", "", "load only this dotenv file")
+	fs.Bool("no-env", false, "do not load .env files")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	reg, ddl, settings, err := openHostingRegistryForCLI(op, fs, args, true)
+	if err != nil {
+		return err
+	}
+	defer reg.Close()
+	defer ddl.Close()
+	if settings.Supplied["realm"] {
+		*realmName = settings.Realm
+	}
+	if *realmName == "" || *databaseName == "" {
+		return cli.LocalMissing(op, "--realm and --name are required")
+	}
+	if *databaseKeyFile == "" {
+		return cli.LocalMissing(op, "--database-key-file is required")
+	}
+	if *bufferPages < 1 {
+		return nerr.New(nerr.InvalidArgument, op, "--buffer-pages must be positive")
+	}
+
+	m := reg.Manifest()
+	realmID, err := resolveRealmID(m, *realmName)
+	if err != nil {
+		return err
+	}
+	ident, alreadyActive, err := resolveManagedDatabaseIdentity(m, *realmName, *databaseName)
+	if err != nil {
+		return err
+	}
+	if alreadyActive {
+		fmt.Printf("database %s already active\n", *databaseName)
+		return nil
+	}
+	root, err := ensureDatabaseKeyFile(*databaseKeyFile)
+	if err != nil {
+		return err
+	}
+	defer root.Zero()
+
+	db, created, err := reg.CreateDatabase(realmID, *databaseName, ident, *databaseKeyFile)
+	if err != nil {
+		auditLocal(settings.DataDir, security.ActionDatabaseCreate, *realmName+"/"+*databaseName, err)
+		return err
+	}
+	if err := activateManagedDatabase(reg, settings.DataDir, realmID, db.ID, ident, root, *bufferPages); err != nil {
+		auditLocal(settings.DataDir, security.ActionDatabaseCreate, *realmName+"/"+*databaseName, err)
+		return err
+	}
+	auditLocal(settings.DataDir, security.ActionDatabaseCreate, *realmName+"/"+*databaseName, nil)
+	verb := "created"
+	if !created {
+		verb = "resumed"
+	}
+	fmt.Printf("database %s %s %s\n", db.Name, db.ID.String(), verb)
+	return nil
+}
+
+// resolveManagedDatabaseIdentity looks for realmName/databaseName already
+// registered in m. When found and StateActive, alreadyActive is true (the
+// caller should treat this as a successful no-op — createRealm/
+// createDatabase are not re-run). When found and StateProvisioning (a
+// crash-and-retry case), it returns that record's own already-durable
+// Identity rather than generating a new one, so the retried
+// Registry.CreateRealm/CreateDatabase call recognizes it as the same
+// resumable attempt instead of a name collision. When not found, it
+// generates a fresh identity for a first-time create.
+func resolveManagedDatabaseIdentity(m hosting.Manifest, realmName, databaseName string) (ident format.Identity, alreadyActive bool, err error) {
+	realmName = strings.ToLower(strings.TrimSpace(realmName))
+	databaseName = strings.ToLower(strings.TrimSpace(databaseName))
+	for _, realm := range m.Realms {
+		if realm.Name != realmName {
+			continue
+		}
+		for _, db := range realm.Databases {
+			if db.Name != databaseName {
+				continue
+			}
+			if db.State == hosting.StateActive {
+				return format.Identity{}, true, nil
+			}
+			return db.Identity, false, nil
+		}
+	}
+	ident, err = format.NewIdentity()
+	return ident, false, err
+}
+
+// ensureDatabaseKeyFile creates path (mode 0600) with a fresh root key if it
+// does not exist yet, matching nextsql init's own create-if-missing
+// convention, then reads and returns it either way.
+func ensureDatabaseKeyFile(path string) (*crypto.DEK, error) {
+	const op = "nextsql database create"
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		createdRoot, err := crypto.CreateKeyFile(path, 1)
+		if err != nil {
+			return nil, err
+		}
+		createdRoot.Zero()
+		fmt.Fprintf(os.Stderr, "created root key file %s (mode 0600); keep it off the data volume\n", path)
+	} else if err != nil {
+		return nil, nerr.Wrap(nerr.IO, op, "stat database key file", err)
+	}
+	return crypto.ReadKeyFile(path)
+}
+
+// activateManagedDatabase physically creates (or resumes creating) the
+// managed database file for realmID/databaseID at its ID-based path
+// (hosting.ManagedDatabasePath), then publishes it StateActive. Mirrors
+// the create/verify/publish sequence nextsql init already uses for the
+// single bootstrap default database (see createOrResumeDatabase),
+// generalized to any additional managed database.
+func activateManagedDatabase(reg *hosting.Registry, dataDir string, realmID, databaseID hosting.ID, ident format.Identity, root *crypto.DEK, bufferPages int) error {
+	path := hosting.ManagedDatabasePath(dataDir, realmID, databaseID)
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return nerr.Wrap(nerr.IO, "nextsql database create", "mkdir", err)
+	}
+	db, env, err := createOrResumeDatabase(path, ident, root, bufferPages)
+	if err != nil {
+		return err
+	}
+	if err := db.Close(); err != nil {
+		_ = env.Close()
+		return err
+	}
+	_ = env.Close()
+	return reg.SetDatabaseState(realmID, databaseID, hosting.StateActive)
 }
 
 // openHostingRegistryForCLI resolves the deployment registry root key and opens
@@ -820,6 +1070,7 @@ func initDB(args []string) error {
 	realmName := fs.String("realm", "default", "bootstrap subscription realm name")
 	databaseName := fs.String("database", "default", "bootstrap logical database name")
 	instanceKeyFile := fs.String("instance-key-file", "", "deployment registry root key file (default KEY-FILE.instance)")
+	fs.String("hosting-manifest", "", "declarative multi-realm bootstrap manifest (or NEXTSQL_HOSTING_MANIFEST_FILE)")
 	fs.String("env-file", "", "load only this dotenv file")
 	fs.Bool("no-env", false, "do not load .env files")
 	if err := fs.Parse(args); err != nil {
@@ -853,7 +1104,12 @@ func initDB(args []string) error {
 	if settings.Supplied["database"] {
 		*databaseName = settings.Database
 	}
-	if *dataDir == "" || *keyFile == "" {
+	manifestPath := settings.HostingManifest
+	if manifestPath != "" {
+		if *dataDir == "" || (*keyFile == "" && *instanceKeyFile == "") {
+			return cli.LocalMissing("nextsql init", "--data-dir and --key-file (or --instance-key-file) are required")
+		}
+	} else if *dataDir == "" || *keyFile == "" {
 		return cli.LocalMissing("nextsql init", "--data-dir and --key-file are required")
 	}
 	if err := os.MkdirAll(*dataDir, 0o755); err != nil {
@@ -867,6 +1123,9 @@ func initDB(args []string) error {
 	dbPath := filepath.Join(*dataDir, config.DataFileName)
 	if err := preflightHostingBootstrap(*dataDir, dbPath); err != nil {
 		return err
+	}
+	if manifestPath != "" {
+		return initFromManifest(manifestPath, *dataDir, *keyFile, *instanceKeyFile, *bufferPages, *user, *passwordFile, serverPass)
 	}
 	if _, err := os.Stat(*keyFile); os.IsNotExist(err) {
 		createdRoot, err := crypto.CreateKeyFile(*keyFile, 1)
@@ -922,37 +1181,8 @@ func initDB(args []string) error {
 		return err
 	}
 	_ = env.Close()
-	if *user != "" {
-		pw := serverPass
-		if *passwordFile != "" {
-			var err error
-			pw, err = auth.ReadPasswordFile(*passwordFile)
-			if err != nil {
-				return err
-			}
-		} else if pw != "" {
-			fmt.Fprintln(os.Stderr, "using NEXTSQL_SERVER_PASS from the environment; prefer NEXTSQL_SERVER_PASSWORD_FILE")
-		}
-		if pw == "" {
-			return nerr.New(nerr.InvalidArgument, "nextsql init", "--password-file, NEXTSQL_SERVER_PASSWORD_FILE, or NEXTSQL_SERVER_PASS is required with the bootstrap user")
-		}
-		store, err := auth.OpenOrCreate(filepath.Join(*dataDir, config.AuthFileName))
-		if err != nil {
-			return err
-		}
-		if err := store.Upsert(*user, pw); err != nil {
-			return err
-		}
-		acl, err := security.OpenOrCreateACL(filepath.Join(*dataDir, config.ACLFileName))
-		if err != nil {
-			return err
-		}
-		if err := acl.Grant(*user, security.PrivAdmin, security.ScopeCluster, ""); err != nil {
-			return err
-		}
-		if err := acl.Grant(*user, security.PrivConnect, security.ScopeDatabase, ""); err != nil {
-			return err
-		}
+	if err := bootstrapDeploymentUser(*dataDir, *user, *passwordFile, serverPass); err != nil {
+		return err
 	}
 	if err := registry.SetDatabaseState(defaultRealm.ID, defaultDatabase.ID, hosting.StateActive); err != nil {
 		return err
@@ -961,6 +1191,129 @@ func initDB(args []string) error {
 	fmt.Printf("initialized %s\ndatabase %s\nfile %s\ndeployment %s\nrealm %s %s\ndatabase_name %s\n",
 		dbPath, ident.DatabaseString(), ident.FileString(), manifest.DeploymentID.String(),
 		defaultRealm.Name, defaultRealm.ID.String(), defaultDatabase.Name)
+	return nil
+}
+
+// bootstrapDeploymentUser upserts the optional deployment-wide bootstrap
+// user with cluster ADMIN and database-wide CONNECT. A blank user is a
+// no-op. Shared by the single-pair and declarative-manifest init paths.
+func bootstrapDeploymentUser(dataDir, user, passwordFile, serverPass string) error {
+	if user == "" {
+		return nil
+	}
+	pw := serverPass
+	if passwordFile != "" {
+		var err error
+		pw, err = auth.ReadPasswordFile(passwordFile)
+		if err != nil {
+			return err
+		}
+	} else if pw != "" {
+		fmt.Fprintln(os.Stderr, "using NEXTSQL_SERVER_PASS from the environment; prefer NEXTSQL_SERVER_PASSWORD_FILE")
+	}
+	if pw == "" {
+		return nerr.New(nerr.InvalidArgument, "nextsql init", "--password-file, NEXTSQL_SERVER_PASSWORD_FILE, or NEXTSQL_SERVER_PASS is required with the bootstrap user")
+	}
+	store, err := auth.OpenOrCreate(filepath.Join(dataDir, config.AuthFileName))
+	if err != nil {
+		return err
+	}
+	if err := store.Upsert(user, pw); err != nil {
+		return err
+	}
+	acl, err := security.OpenOrCreateACL(filepath.Join(dataDir, config.ACLFileName))
+	if err != nil {
+		return err
+	}
+	if err := acl.Grant(user, security.PrivAdmin, security.ScopeCluster, ""); err != nil {
+		return err
+	}
+	return acl.Grant(user, security.PrivConnect, security.ScopeDatabase, "")
+}
+
+// initFromManifest is the declarative multi-realm bootstrap path: it
+// validates the whole manifest (and every referenced key file) before any
+// mutation, creates any missing per-database root key file, publishes one
+// registry generation containing every declared realm/database, then
+// physically creates and activates each managed database. Re-running with
+// an identical manifest is idempotent — already-ACTIVE databases are left
+// untouched — and a partial run resumes cleanly. The deployment registry
+// root is --instance-key-file, or KEY-FILE.instance when only --key-file is
+// given (--key-file itself is never used as a database key here; each
+// database's key comes from the manifest).
+func initFromManifest(manifestPath, dataDir, keyFile, instanceKeyFile string, bufferPages int, user, passwordFile, serverPass string) error {
+	const op = "nextsql init"
+	if instanceKeyFile == "" {
+		instanceKeyFile = keyFile + ".instance"
+	}
+	if _, err := os.Stat(instanceKeyFile); os.IsNotExist(err) {
+		createdRoot, err := crypto.CreateKeyFile(instanceKeyFile, 1)
+		if err != nil {
+			return err
+		}
+		createdRoot.Zero()
+		fmt.Fprintf(os.Stderr, "created deployment registry key file %s (mode 0600); keep it off the data volume\n", instanceKeyFile)
+	} else if err != nil {
+		return nerr.Wrap(nerr.IO, op, "stat deployment registry key", err)
+	}
+	instanceRoot, err := crypto.ReadKeyFile(instanceKeyFile)
+	if err != nil {
+		return err
+	}
+	defer instanceRoot.Zero()
+
+	createdKeys, err := hosting.EnsureBootstrapManifestKeyFiles(manifestPath)
+	if err != nil {
+		return err
+	}
+	for _, p := range createdKeys {
+		fmt.Fprintf(os.Stderr, "created database root key file %s (mode 0600); keep it off the data volume\n", p)
+	}
+	bootstrap, err := hosting.LoadDeploymentBootstrap(manifestPath)
+	if err != nil {
+		return err
+	}
+
+	reg, _, err := hosting.EnsureManifest(hosting.Path(dataDir), instanceRoot, func(deployment hosting.ID) (hosting.Manifest, error) {
+		return bootstrap.RegistryManifest(deployment, hosting.StateProvisioning)
+	})
+	if err != nil {
+		return err
+	}
+	defer reg.Close()
+
+	m := reg.Manifest()
+	for _, realm := range m.Realms {
+		for _, db := range realm.Databases {
+			if db.State == hosting.StateActive {
+				fmt.Printf("realm %s database %s already active\n", realm.Name, db.Name)
+				continue
+			}
+			if db.State != hosting.StateProvisioning {
+				return nerr.New(nerr.Conflict, op, "managed database "+realm.Name+"/"+db.Name+" is not resumable from its current state")
+			}
+			dbRoot, err := crypto.ReadKeyFile(db.KeyRef)
+			if err != nil {
+				return err
+			}
+			err = activateManagedDatabase(reg, dataDir, realm.ID, db.ID, db.Identity, dbRoot, bufferPages)
+			dbRoot.Zero()
+			if err != nil {
+				return err
+			}
+			fmt.Printf("realm %s database %s %s\n", realm.Name, db.Name, db.ID.String())
+		}
+	}
+
+	if err := bootstrapDeploymentUser(dataDir, user, passwordFile, serverPass); err != nil {
+		return err
+	}
+	defaultRealm, defaultDatabase, err := reg.Default()
+	if err != nil {
+		return err
+	}
+	fmt.Printf("initialized deployment %s\ndefault realm %s %s\ndefault database %s\n",
+		m.DeploymentID.String(), defaultRealm.Name, defaultRealm.ID.String(), defaultDatabase.Name)
 	return nil
 }
 
@@ -1104,6 +1457,7 @@ func execSQL(args []string) error {
 	fs.String("password-file", "", "password file (never a URL)")
 	fs.String("idp", "", "external identity provider profile to authenticate with (see `nextsql login`)")
 	fs.String("idp-config", "", "client identity-provider config file (default ~/.config/nextsql/config.toml)")
+	fs.String("realm", "", "hosted realm name (default: the deployment's default realm)")
 	fs.String("database", "", "database name")
 	fs.String("tls-ca", "", "PEM CA / server certificate")
 	fs.String("tls-server-name", "", "TLS certificate server name (default address host)")
@@ -1115,6 +1469,7 @@ func execSQL(args []string) error {
 	fs.String("data-dir", "", "not valid with exec (local commands only)")
 	fs.String("key-file", "", "not valid with exec (local commands only)")
 	sqlText := fs.String("c", "", "SQL to execute")
+	jsonOut := fs.Bool("json", false, "print the result as a single JSON object instead of tab-separated text")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -1141,6 +1496,26 @@ func execSQL(args []string) error {
 	if err != nil {
 		return err
 	}
+	printResult(res, *jsonOut)
+	return nil
+}
+
+// printResult renders a query result either as tab-separated text
+// (printTabularResult) or, with jsonOut, as a single JSON object
+// (printJSONResult) — shared by `nextsql exec` and the `nextsql cluster`
+// admin subcommands.
+func printResult(res *nextsql.Result, jsonOut bool) {
+	if jsonOut {
+		printJSONResultTo(os.Stdout, res)
+		return
+	}
+	printTabularResult(res)
+}
+
+// printTabularResult renders a query result as machine-readable
+// tab-separated output: an optional header/row block followed by an
+// "affected N" line.
+func printTabularResult(res *nextsql.Result) {
 	if len(res.Columns) > 0 {
 		fmt.Println(strings.Join(res.Columns, "\t"))
 		for _, row := range res.Rows {
@@ -1154,7 +1529,32 @@ func execSQL(args []string) error {
 	if res.Affected != 0 {
 		fmt.Printf("affected %d\n", res.Affected)
 	}
-	return nil
+}
+
+// printJSONResultTo renders a query result as a single JSON object
+// {"columns": [...], "rows": [[...]], "affected": N} on one line — a
+// structured counterpart to printTabularResult's TSV for scripts that would
+// rather decode JSON than parse tab-separated text positionally. Cell
+// values are stringified the same way the TSV path renders them
+// (types.Value.String()); no attempt is made to reproduce native JSON
+// types per SQL type, keeping the shape stable across every result kind.
+func printJSONResultTo(w io.Writer, res *nextsql.Result) {
+	rows := make([][]string, len(res.Rows))
+	for i, row := range res.Rows {
+		cols := make([]string, len(row))
+		for j, v := range row {
+			cols[j] = v.String()
+		}
+		rows[i] = cols
+	}
+	out := struct {
+		Columns  []string   `json:"columns"`
+		Rows     [][]string `json:"rows"`
+		Affected int64      `json:"affected"`
+	}{Columns: res.Columns, Rows: rows, Affected: res.Affected}
+	enc := json.NewEncoder(w)
+	enc.SetEscapeHTML(false)
+	_ = enc.Encode(out)
 }
 
 func execSQLText(fs *flag.FlagSet, cFlag string) (string, error) {
@@ -1176,6 +1576,100 @@ func execSQLText(fs *flag.FlagSet, cFlag string) (string, error) {
 	default:
 		return "", nerr.New(nerr.InvalidArgument, "nextsql exec", "expected a single SQL argument")
 	}
+}
+
+// backupCmd dispatches `nextsql backup ...`. A bare-word first argument
+// ("list"/"prune") is a retention-management subcommand; anything else
+// (starting with "-", or no arguments) is the original, flag-first
+// `nextsql backup --data-dir ... --out ...` invocation, preserved exactly
+// as before for backward compatibility.
+func backupCmd(args []string) error {
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		switch args[0] {
+		case "list":
+			return backupList(args[1:])
+		case "prune":
+			return backupPrune(args[1:])
+		default:
+			return nerr.New(nerr.InvalidArgument, "nextsql backup", "unknown backup command")
+		}
+	}
+	return backupDB(args)
+}
+
+// backupList enumerates the backups directly under --base-dir (each
+// immediate subdirectory ReadHeader succeeds on — see
+// backup.ListBackups), oldest first.
+func backupList(args []string) error {
+	fs := flag.NewFlagSet("backup list", flag.ContinueOnError)
+	baseDir := fs.String("base-dir", "", "directory containing one or more backups as immediate subdirectories")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *baseDir == "" {
+		return cli.LocalMissing("nextsql backup list", "--base-dir is required")
+	}
+	backups, err := backup.ListBackups(*baseDir)
+	if err != nil {
+		return err
+	}
+	fmt.Println("path\tcreated\tdatabase\tdurable_lsn")
+	for _, b := range backups {
+		fmt.Printf("%s\t%s\t%s\t%d\n", b.Path, b.Created().Format(time.RFC3339), b.Header.Identity.DatabaseString(), b.Header.DurableLSN)
+	}
+	return nil
+}
+
+// backupPrune applies a retention policy (--keep-count or --keep-days,
+// mutually exclusive) to the backups under --base-dir and, only with
+// --confirm, deletes the ones the policy selects (backup.SelectPruneCandidates
+// — oldest first, always leaving at least the single newest backup no
+// matter how it ages). Without --confirm it only previews what would be
+// removed, so the default invocation is always safe to run.
+func backupPrune(args []string) error {
+	fs := flag.NewFlagSet("backup prune", flag.ContinueOnError)
+	baseDir := fs.String("base-dir", "", "directory containing one or more backups as immediate subdirectories")
+	keepCount := fs.Int("keep-count", 0, "keep the N newest backups, prune the rest")
+	keepDays := fs.Float64("keep-days", 0, "keep backups created within this many days of now, prune the rest")
+	confirm := fs.Bool("confirm", false, "actually delete; without this, only preview what would be removed")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *baseDir == "" {
+		return cli.LocalMissing("nextsql backup prune", "--base-dir is required")
+	}
+	if (*keepCount > 0) == (*keepDays > 0) {
+		return nerr.New(nerr.InvalidArgument, "nextsql backup prune", "exactly one of --keep-count or --keep-days is required")
+	}
+	backups, err := backup.ListBackups(*baseDir)
+	if err != nil {
+		return err
+	}
+	policy := backup.RetentionPolicy{KeepCount: *keepCount, KeepFor: time.Duration(*keepDays * float64(24*time.Hour))}
+	candidates := backup.SelectPruneCandidates(backups, policy, time.Now())
+	if len(candidates) == 0 {
+		fmt.Println("nothing to prune")
+		return nil
+	}
+	if !*confirm {
+		fmt.Printf("would prune %d of %d backups (pass --confirm to delete):\n", len(candidates), len(backups))
+		for _, b := range candidates {
+			fmt.Printf("%s\t%s\n", b.Path, b.Created().Format(time.RFC3339))
+		}
+		return nil
+	}
+	pruned := 0
+	for _, b := range candidates {
+		err := os.RemoveAll(b.Path)
+		auditLocal(*baseDir, security.ActionBackupPrune, b.Path, err)
+		if err != nil {
+			return nerr.Wrap(nerr.IO, "nextsql backup prune", "remove "+b.Path, err)
+		}
+		fmt.Printf("pruned %s\n", b.Path)
+		pruned++
+	}
+	fmt.Printf("pruned %d of %d backups\n", pruned, len(backups))
+	return nil
 }
 
 func backupDB(args []string) error {
@@ -1582,12 +2076,13 @@ func auditLocal(dataDir, action, object string, err error) {
 
 func clusterCmd(args []string) error {
 	if len(args) == 0 {
-		return nerr.New(nerr.InvalidArgument, "nextsql cluster", "expected status")
+		return nerr.New(nerr.InvalidArgument, "nextsql cluster", "expected status, transfer-leader, drain, maintenance, or reconcile")
 	}
 	switch args[0] {
 	case "status":
 		fs := flag.NewFlagSet("cluster status", flag.ContinueOnError)
 		dataDir := fs.String("data-dir", "", "data directory")
+		jsonOut := fs.Bool("json", false, "print status as a single JSON object instead of plain text")
 		if err := fs.Parse(args[1:]); err != nil {
 			return err
 		}
@@ -1598,12 +2093,143 @@ func clusterCmd(args []string) error {
 		if err != nil {
 			return err
 		}
+		if *jsonOut {
+			enc := json.NewEncoder(os.Stdout)
+			enc.SetEscapeHTML(false)
+			return enc.Encode(st)
+		}
 		fmt.Printf("node %s\nstate %s\nleader %s\nleader_addr %s\napplied_lsn %d\nvoters %d\nhas_leader %t\n",
 			st.NodeID, st.State, st.LeaderID, st.Leader, st.Applied, st.Voters, st.HasLeader)
+		return nil
+	case "transfer-leader":
+		fs, jsonOut := clusterConnFlags("cluster transfer-leader")
+		s, err := resolveClusterConn(fs, args[1:])
+		if err != nil {
+			return err
+		}
+		conn, err := cli.Open(context.Background(), s)
+		if err != nil {
+			return err
+		}
+		defer conn.Close()
+		res, err := conn.Exec(context.Background(), `CLUSTER TRANSFER LEADER`)
+		if err != nil {
+			return err
+		}
+		printResult(res, *jsonOut)
+		return nil
+	case "drain":
+		fs, jsonOut := clusterConnFlags("cluster drain")
+		timeoutMS := fs.Int64("timeout-ms", 0, "drain deadline in milliseconds (0 = use the server's configured shutdown_drain_ms)")
+		s, err := resolveClusterConn(fs, args[1:])
+		if err != nil {
+			return err
+		}
+		conn, err := cli.Open(context.Background(), s)
+		if err != nil {
+			return err
+		}
+		defer conn.Close()
+		sql := "CLUSTER DRAIN"
+		if *timeoutMS > 0 {
+			sql = fmt.Sprintf("CLUSTER DRAIN WITH (TIMEOUT_MS = %d)", *timeoutMS)
+		}
+		res, err := conn.Exec(context.Background(), sql)
+		if err != nil {
+			return err
+		}
+		printResult(res, *jsonOut)
+		return nil
+	case "maintenance":
+		if len(args) < 2 {
+			return nerr.New(nerr.InvalidArgument, "nextsql cluster maintenance", "expected enable or disable")
+		}
+		var sql string
+		switch args[1] {
+		case "enable":
+			sql = "CLUSTER MAINTENANCE ENABLE"
+		case "disable":
+			sql = "CLUSTER MAINTENANCE DISABLE"
+		default:
+			return nerr.New(nerr.InvalidArgument, "nextsql cluster maintenance", "expected enable or disable")
+		}
+		fs, jsonOut := clusterConnFlags("cluster maintenance " + args[1])
+		s, err := resolveClusterConn(fs, args[2:])
+		if err != nil {
+			return err
+		}
+		conn, err := cli.Open(context.Background(), s)
+		if err != nil {
+			return err
+		}
+		defer conn.Close()
+		res, err := conn.Exec(context.Background(), sql)
+		if err != nil {
+			return err
+		}
+		printResult(res, *jsonOut)
+		return nil
+	case "reconcile":
+		if len(args) < 2 || args[1] != "confirm" {
+			return nerr.New(nerr.InvalidArgument, "nextsql cluster reconcile", "expected confirm")
+		}
+		fs, jsonOut := clusterConnFlags("cluster reconcile confirm")
+		s, err := resolveClusterConn(fs, args[2:])
+		if err != nil {
+			return err
+		}
+		conn, err := cli.Open(context.Background(), s)
+		if err != nil {
+			return err
+		}
+		defer conn.Close()
+		res, err := conn.Exec(context.Background(), `CLUSTER RECONCILE CONFIRM`)
+		if err != nil {
+			return err
+		}
+		printResult(res, *jsonOut)
 		return nil
 	default:
 		return nerr.New(nerr.InvalidArgument, "nextsql cluster", "unknown cluster command")
 	}
+}
+
+// clusterConnFlags builds the standard live-server connection flag set
+// (address, credentials, TLS, dotenv) shared by the `nextsql cluster`
+// admin subcommands that must reach a running leader over the native
+// protocol rather than reading a node's local data directory. The returned
+// *bool reports --json, parsed once resolveClusterConn runs fs.Parse.
+func clusterConnFlags(name string) (*flag.FlagSet, *bool) {
+	fs := flag.NewFlagSet(name, flag.ContinueOnError)
+	fs.String("addr", config.DefaultListenAddr, "server address")
+	fs.String("user", "", "user name")
+	fs.String("password-file", "", "password file (never a URL)")
+	fs.String("database", "", "database name")
+	fs.String("tls-ca", "", "PEM CA / server certificate")
+	fs.String("tls-server-name", "", "TLS certificate server name (default address host)")
+	fs.String("tls-client-cert", "", "mTLS client certificate (PEM)")
+	fs.String("tls-client-key", "", "mTLS client private key (PEM)")
+	fs.Bool("insecure", false, "allow plaintext on loopback only")
+	fs.String("env-file", "", "load only this dotenv file")
+	fs.Bool("no-env", false, "do not load .env files")
+	fs.String("data-dir", "", "not valid here (local commands only)")
+	fs.String("key-file", "", "not valid here (local commands only)")
+	jsonOut := fs.Bool("json", false, "print the result as a single JSON object instead of tab-separated text")
+	return fs, jsonOut
+}
+
+func resolveClusterConn(fs *flag.FlagSet, args []string) (cli.Settings, error) {
+	if err := fs.Parse(args); err != nil {
+		return cli.Settings{}, err
+	}
+	s, err := cli.Resolve(fs, args)
+	if err != nil {
+		return cli.Settings{}, err
+	}
+	if err := cli.CheckServerMode(s); err != nil {
+		return cli.Settings{}, err
+	}
+	return s, nil
 }
 
 func migrateCmd(args []string) error {
@@ -1931,9 +2557,18 @@ Usage:
   nextsql hosting migrate-tenant --source-data-dir DIR --source-key-file FILE --tenant VALUE
                --data-dir DIR --key-file FILE [--instance-key-file FILE]
                [--realm NAME --database NAME] [--batch-rows N] --confirm
-  nextsql exec [--addr HOST:PORT] [--user NAME] [--password-file FILE] [--database NAME]
+  nextsql realm create --data-dir DIR --key-file FILE [--instance-key-file FILE]
+               --realm NAME --database NAME --database-key-file FILE [--buffer-pages N]
+  nextsql database create --data-dir DIR --key-file FILE [--instance-key-file FILE]
+               --realm NAME --name NAME --database-key-file FILE [--buffer-pages N]
+  nextsql login --idp NAME [--addr HOST:PORT] [--idp-config FILE]
+	           [--database NAME] [--realm NAME] [--no-browser] [--timeout DURATION]
+	           [--client-credentials [--client-secret-file FILE]]
+  nextsql logout (--idp NAME --addr HOST:PORT | --all)
+  nextsql whoami --idp NAME [--addr HOST:PORT] [--idp-config FILE] [--json]
+  nextsql exec [--addr HOST:PORT] [--user NAME] [--password-file FILE | --idp NAME] [--realm NAME] [--database NAME]
                [--tls-ca FILE [--tls-server-name NAME] [--tls-client-cert FILE --tls-client-key FILE] | --insecure]
-               [--env-file PATH | --no-env]
+               [--env-file PATH | --no-env] [--json]
                [-c SQL | SQL]
   nextsql migrate status|pending|version [--dir DIR] [--addr HOST:PORT] [--user NAME]
                [--password-file FILE] [--database NAME]
@@ -1946,17 +2581,38 @@ Usage:
   nextsql migrate force VERSION --confirm [--dir DIR]
   nextsql migrate repair --confirm [--dir DIR]
   nextsql backup --data-dir DIR --key-file FILE --out DIR
+  nextsql backup list --base-dir DIR
+  nextsql backup prune --base-dir DIR (--keep-count N | --keep-days N) [--confirm]
   nextsql restore --from DIR --data-dir DIR --key-file FILE [--wal-archive DIR] [--until-lsn N | --until RFC3339]
   nextsql verify --from DIR --key-file FILE
   nextsql export --data-dir DIR --key-file FILE --out DIR
   nextsql import --from DIR --data-dir DIR --key-file FILE
   nextsql diagnose --data-dir DIR
-  nextsql status [--addr HOST:PORT] [--user NAME] [--password-file FILE]
+  nextsql status [--addr HOST:PORT] [--user NAME] [--password-file FILE | --idp NAME]
                  [--database NAME]
                  [--tls-ca FILE [--tls-server-name NAME] [--tls-client-cert FILE --tls-client-key FILE] | --insecure]
                  [--env-file PATH | --no-env]
   nextsql status --local [--data-dir DIR] [--key-file FILE]
-  nextsql cluster status --data-dir DIR
+  nextsql cluster status --data-dir DIR [--json]
+  nextsql cluster transfer-leader [--addr HOST:PORT] [--user NAME] [--password-file FILE]
+                 [--database NAME] [--json]
+                 [--tls-ca FILE [--tls-server-name NAME] [--tls-client-cert FILE --tls-client-key FILE] | --insecure]
+                 [--env-file PATH | --no-env]
+  nextsql cluster drain [--timeout-ms N] [--addr HOST:PORT] [--user NAME] [--password-file FILE]
+                 [--database NAME] [--json]
+                 [--tls-ca FILE [--tls-server-name NAME] [--tls-client-cert FILE --tls-client-key FILE] | --insecure]
+                 [--env-file PATH | --no-env]
+  nextsql cluster maintenance enable|disable [--addr HOST:PORT] [--user NAME] [--password-file FILE]
+                 [--database NAME] [--json]
+                 [--tls-ca FILE [--tls-server-name NAME] [--tls-client-cert FILE --tls-client-key FILE] | --insecure]
+                 [--env-file PATH | --no-env]
+  nextsql cluster reconcile confirm [--addr HOST:PORT] [--user NAME] [--password-file FILE]
+                 [--database NAME] [--json]
+                 [--tls-ca FILE [--tls-server-name NAME] [--tls-client-cert FILE --tls-client-key FILE] | --insecure]
+                 [--env-file PATH | --no-env]
+  nextsql token keygen|rotate|retire|list-keys|export-public|mint|revoke|verify
+  nextsql audit keygen|rotate|retire|list-keys|export-public --keyset FILE
+  nextsql audit verify --file FILE [--keyset FILE | --pubkey FILE] [--json]
   nextsql version
   nextsql help
 

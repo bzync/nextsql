@@ -137,6 +137,19 @@ func (s *Session) authorize(stmt ast.Stmt) error {
 		return s.require(security.PrivAlter, security.ScopeFunction, st.Name)
 	case ast.DropSchedule:
 		return s.require(security.PrivDrop, security.ScopeFunction, st.Name)
+	case ast.CreateResourceGroup, ast.AlterResourceGroup, ast.DropResourceGroup:
+		// Workload governance is a cluster-wide admin concern, like roles and
+		// users, not a per-object privilege like schedules/workflows/triggers.
+		return s.require(security.PrivAdmin, security.ScopeCluster, "")
+	case ast.SetResourceGroup:
+		// Assignment, unlike the DDL above, is per-object: a session may only
+		// switch into a resource group it was explicitly granted USAGE on
+		// (GRANT USAGE ON RESOURCE GROUP name TO ...), same shape as running a
+		// workflow requiring PrivExecute/ScopeFunction on that workflow. Cluster
+		// ADMIN still bypasses via the superuser check inside require/Allowed.
+		return s.require(security.PrivUsage, security.ScopeResourceGroup, st.Name)
+	case ast.ResetResourceGroup:
+		return s.require(security.PrivConnect, security.ScopeDatabase, "")
 	case ast.ShowTasks, ast.CancelTask:
 		return s.require(security.PrivConnect, security.ScopeDatabase, "")
 	case ast.Subscribe:
@@ -176,6 +189,14 @@ func (s *Session) authorize(stmt ast.Stmt) error {
 		return s.require(security.PrivSelect, security.ScopeTable, st.Table)
 	case ast.Maintain:
 		// Maintenance rewrites physical structures across tenant boundaries.
+		return s.require(security.PrivAdmin, security.ScopeCluster, "")
+	case ast.TransferLeader:
+		return s.require(security.PrivAdmin, security.ScopeCluster, "")
+	case ast.ClusterDrain:
+		return s.require(security.PrivAdmin, security.ScopeCluster, "")
+	case ast.ClusterMaintenance:
+		return s.require(security.PrivAdmin, security.ScopeCluster, "")
+	case ast.ClusterReconcileConfirm:
 		return s.require(security.PrivAdmin, security.ScopeCluster, "")
 	case ast.Explain:
 		return s.authorize(st.Stmt)
@@ -306,17 +327,17 @@ func (s *Session) execSecurity(stmt ast.Stmt) (*Result, error) {
 			err = nerr.New(nerr.Unavailable, "executor.CreateUser", "auth store is not configured")
 			break
 		}
-		err = s.users.Upsert(st.Name, st.Password)
+		err = s.users.UpsertInRealm(s.realmID, st.Name, st.Password)
 		if err == nil && s.acl != nil {
-			err = s.acl.AddUser(st.Name)
+			err = s.acl.AddUserInRealm(s.realmID, st.Name)
 		}
 		s.auditRecord(security.ActionUserCreate, st.Name, err)
 	case ast.DropUser:
 		if s.users != nil {
-			err = s.users.Delete(st.Name)
+			err = s.users.DeleteInRealm(s.realmID, st.Name)
 		}
 		if err == nil && s.acl != nil {
-			err = s.acl.DropUser(st.Name)
+			err = s.acl.DropUserInRealm(s.realmID, st.Name)
 		}
 		if err == nil && s.registry != nil {
 			s.registry.Terminate(st.Name)
@@ -327,14 +348,14 @@ func (s *Session) execSecurity(stmt ast.Stmt) (*Result, error) {
 			err = nerr.New(nerr.Unavailable, "executor.CreateRole", "ACL is not configured")
 			break
 		}
-		err = s.acl.CreateRole(st.Name)
+		err = s.acl.CreateRoleInRealm(s.realmID, st.Name)
 		s.auditRecord(security.ActionRoleCreate, st.Name, err)
 	case ast.DropRole:
 		if s.acl == nil {
 			err = nerr.New(nerr.Unavailable, "executor.DropRole", "ACL is not configured")
 			break
 		}
-		err = s.acl.DropRole(st.Name)
+		err = s.acl.DropRoleInRealm(s.realmID, st.Name)
 		s.auditRecord(security.ActionRoleDrop, st.Name, err)
 	case ast.Grant:
 		err = s.applyGrant(st)
@@ -356,7 +377,7 @@ func (s *Session) applyGrant(g ast.Grant) error {
 		return nerr.New(nerr.Unavailable, "executor.Grant", "ACL is not configured")
 	}
 	if g.Role != "" && len(g.Privileges) == 0 && !g.All {
-		return s.acl.GrantRole(g.Role, g.Grantee)
+		return s.acl.GrantRoleInRealm(s.realmID, g.Role, g.Grantee)
 	}
 	scope, err := security.ParseScope(g.Scope)
 	if err != nil {
@@ -371,7 +392,7 @@ func (s *Session) applyGrant(g ast.Grant) error {
 		if err != nil {
 			return err
 		}
-		if err := s.acl.Grant(g.Grantee, priv, scope, g.Object); err != nil {
+		if err := s.acl.GrantInRealm(s.realmID, g.Grantee, priv, scope, g.Object); err != nil {
 			return err
 		}
 	}
@@ -383,7 +404,7 @@ func (s *Session) applyRevoke(g ast.Revoke) error {
 		return nerr.New(nerr.Unavailable, "executor.Revoke", "ACL is not configured")
 	}
 	if g.Role != "" && len(g.Privileges) == 0 && !g.All {
-		return s.acl.RevokeRole(g.Role, g.Grantee)
+		return s.acl.RevokeRoleInRealm(s.realmID, g.Role, g.Grantee)
 	}
 	scope, err := security.ParseScope(g.Scope)
 	if err != nil {
@@ -398,7 +419,7 @@ func (s *Session) applyRevoke(g ast.Revoke) error {
 		if err != nil {
 			return err
 		}
-		if err := s.acl.Revoke(g.Grantee, priv, scope, g.Object); err != nil {
+		if err := s.acl.RevokeInRealm(s.realmID, g.Grantee, priv, scope, g.Object); err != nil {
 			return err
 		}
 	}
@@ -459,6 +480,12 @@ func sqlObject(stmt ast.Stmt) string {
 		return st.Name
 	case ast.DropSchedule:
 		return st.Name
+	case ast.CreateResourceGroup:
+		return st.Name
+	case ast.AlterResourceGroup:
+		return st.Name
+	case ast.DropResourceGroup:
+		return st.Name
 	case ast.CancelTask:
 		return st.ID
 	case ast.Subscribe:
@@ -479,6 +506,14 @@ func sqlObject(stmt ast.Stmt) string {
 		return st.Table
 	case ast.Maintain:
 		return st.Table
+	case ast.TransferLeader:
+		return ""
+	case ast.ClusterDrain:
+		return ""
+	case ast.ClusterMaintenance:
+		return ""
+	case ast.ClusterReconcileConfirm:
+		return ""
 	case ast.Select:
 		return st.Table
 	case ast.Insert:
@@ -528,6 +563,12 @@ func workflowAuditAction(stmt ast.Stmt) string {
 		return security.ActionScheduleAlter
 	case ast.DropSchedule:
 		return security.ActionScheduleDrop
+	case ast.CreateResourceGroup:
+		return security.ActionResourceGroupCreate
+	case ast.AlterResourceGroup:
+		return security.ActionResourceGroupAlter
+	case ast.DropResourceGroup:
+		return security.ActionResourceGroupDrop
 	case ast.CancelTask:
 		return security.ActionTaskCancel
 	default:

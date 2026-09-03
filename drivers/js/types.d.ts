@@ -28,11 +28,17 @@ export interface Config {
   /** Single-node entry point. Required for connect(); optional when nodes is set. */
   address?: string;
   database?: string;
+  /** Selects which hosted realm this connection targets (M2-2). Optional:
+   * an unset realm sends the exact pre-realm Hello and connects to the
+   * server's configured default. */
+  realm?: string;
   user: string;
   password?: string;
   /** 32-byte client-held root when the server requires it. Never a URL query. */
   key?: string | Uint8Array;
   keyVersion?: number;
+  /** Client-only provider for ENCRYPTED CLIENT field keys. Never sent over NSQL. */
+  fieldKeys?: FieldKeyProvider;
   tls?: TLSOptions;
   /** Plaintext is allowed only on loopback. */
   insecureNoTLS?: boolean;
@@ -42,6 +48,74 @@ export interface Config {
   readConsistency?: ReadConsistencyMode;
   /** Bounded-read staleness window in milliseconds. 0 selects the server default. */
   maxStalenessMs?: number;
+}
+
+export interface FieldKey {
+  /** Public NSCE1 key identifier (1..64 ASCII letters/digits/._-). */
+  id: string;
+  /** Exactly 32 bytes of AES-256 key material. */
+  material: Uint8Array;
+}
+
+export interface FieldKeyProvider {
+  currentFieldKey(database: string, table: string, column: string): FieldKey | Promise<FieldKey>;
+  fieldKey(database: string, table: string, column: string, keyID: string): FieldKey | Promise<FieldKey>;
+}
+
+export interface FieldTypeDescriptor {
+  kind: number;
+  precision: number;
+  scale: number;
+  vecElem: number;
+}
+
+export declare const FieldType: {
+  readonly UUID: FieldTypeDescriptor;
+  readonly String: FieldTypeDescriptor;
+  readonly Text: FieldTypeDescriptor;
+  readonly TimestampTZ: FieldTypeDescriptor;
+  readonly JSON: FieldTypeDescriptor;
+  readonly Bool: FieldTypeDescriptor;
+  Decimal(precision: number, scale: number): FieldTypeDescriptor;
+};
+
+export declare class MemoryFieldKeyring implements FieldKeyProvider {
+  constructor(current: FieldKey, ...overlap: FieldKey[]);
+  currentFieldKey(database: string, table: string, column: string): Promise<FieldKey>;
+  fieldKey(database: string, table: string, column: string, keyID: string): Promise<FieldKey>;
+  rotate(key: FieldKey): void;
+  revoke(keyID: string): void;
+}
+
+/** Material-free summary of one FileFieldKeyring record. */
+export interface FieldKeyInfo {
+  id: string;
+  /** Unix seconds. */
+  created: number;
+  current: boolean;
+  revoked: boolean;
+}
+
+/**
+ * Durable, atomic, file-backed FieldKeyProvider. Unlike MemoryFieldKeyring,
+ * rotation and revocation persist across process restarts in the versioned
+ * NSFK1 on-disk format (see docs/client-encryption.md). A revoked key's
+ * material is overwritten with zeros on disk and its id can never be reused.
+ * Production applications with an existing secret manager or KMS should
+ * still prefer implementing FieldKeyProvider directly against that system.
+ */
+export declare class FileFieldKeyring implements FieldKeyProvider {
+  private constructor();
+  static create(path: string, current: FieldKey): Promise<FileFieldKeyring>;
+  static open(path: string): Promise<FileFieldKeyring>;
+  readonly path: string;
+  currentFieldKey(database: string, table: string, column: string): Promise<FieldKey>;
+  fieldKey(database: string, table: string, column: string, keyID: string): Promise<FieldKey>;
+  rotate(key: FieldKey): Promise<void>;
+  revoke(keyID: string): Promise<void>;
+  /** Re-reads the keyring file; on error the in-memory keyring is unchanged. */
+  reload(): Promise<void>;
+  list(): FieldKeyInfo[];
 }
 
 /** Key-free replication health snapshot for follower-read routing. */
@@ -131,6 +205,10 @@ export interface Conn {
   setReadConsistency(mode: ReadConsistencyMode, maxStalenessMs?: number): Promise<void>;
   /** This server node's key-free replication health. */
   nodeStatus(): Promise<NodeStatus>;
+  /** Seal a logical value into an opaque NSCE1 STRING; null passes through. */
+  encryptField(table: string, column: string, type: FieldTypeDescriptor, value: unknown): Promise<string | null>;
+  /** Authenticate and decode an opaque NSCE1 STRING; null passes through. */
+  decryptField(table: string, column: string, type: FieldTypeDescriptor, ciphertext: string | null): Promise<unknown>;
 }
 
 /** Routing client over every node of a NextSQL HA cluster. */
@@ -148,6 +226,7 @@ export interface Hello {
   secret?: bigint;
   database?: string;
   user?: string;
+  realm?: string;
 }
 
 export interface HelloOK {
@@ -182,6 +261,15 @@ export declare const Kind: {
   readonly Box: 11;
   readonly Line: 12;
   readonly Polygon: 13;
+  readonly Blob: 14;
+  readonly Int8: 15;
+  readonly Int16: 16;
+  readonly Int32: 17;
+  readonly Int64: 18;
+  readonly Uint8: 19;
+  readonly Uint16: 20;
+  readonly Uint32: 21;
+  readonly Uint64: 22;
 };
 
 export declare const Type: {
@@ -213,6 +301,10 @@ export declare const Type: {
 
 export declare function connect(cfg: Config): Promise<Conn>;
 export declare function connectCluster(cfg: Config): Promise<Cluster>;
+export declare function generateFieldKey(id: string): FieldKey;
+export declare function inspectField(ciphertext: string): { keyID: string; type: FieldTypeDescriptor };
+export declare function encryptField(provider: FieldKeyProvider, database: string, table: string, column: string, type: FieldTypeDescriptor, value: unknown): Promise<string | null>;
+export declare function decryptField(provider: FieldKeyProvider, database: string, table: string, column: string, type: FieldTypeDescriptor, ciphertext: string | null): Promise<unknown>;
 export declare function validateConfig(cfg: Config): void;
 export declare function isLoopback(addr: string): boolean;
 export declare function encodeParam(v: Param): Uint8Array;

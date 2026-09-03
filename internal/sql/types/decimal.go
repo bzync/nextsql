@@ -98,6 +98,12 @@ func DecimalFromInt64(n int64) Decimal {
 	return Decimal{Coef: new(big.Int).SetInt64(n), Scale: 0}
 }
 
+// DecimalFromUint64 is a non-negative integer with scale 0, for magnitudes
+// that may exceed math.MaxInt64 (D3, Datatype expansion track).
+func DecimalFromUint64(n uint64) Decimal {
+	return Decimal{Coef: new(big.Int).SetUint64(n), Scale: 0}
+}
+
 func ParseDecimal(s string) (Decimal, error) {
 	s = strings.TrimSpace(s)
 	if s == "" {

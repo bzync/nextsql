@@ -95,10 +95,7 @@ function Hero() {
       />
       <div className="relative mx-auto grid max-w-6xl items-center gap-10 px-4 pt-12 pb-12 sm:px-5 sm:pt-16 sm:pb-16 lg:grid-cols-2 lg:gap-12 lg:pt-24 lg:pb-20">
         <div className="flex flex-col items-center text-center lg:items-start lg:text-left">
-          <Badge variant="default" dot pulse>
-            Encrypted by default
-          </Badge>
-          <h1 className="mt-5 max-w-[560px] text-[2.35rem] font-bold leading-[1.08] tracking-[-0.035em] sm:mt-6 sm:text-5xl sm:leading-[1.06] lg:text-[64px]">
+          <h1 className="max-w-[560px] text-[2.35rem] font-bold leading-[1.08] tracking-[-0.035em] sm:text-5xl sm:leading-[1.06] lg:text-[64px]">
             One engine for SQL, JSON,{" "}
             <span className="text-blue-600 dark:text-blue-400">vectors, and search.</span>
           </h1>

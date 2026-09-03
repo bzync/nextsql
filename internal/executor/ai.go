@@ -39,7 +39,7 @@ func (s *Session) nextAI(tab *catalog.Table, col int) (types.Value, error) {
 	if err != nil {
 		return types.Value{}, err
 	}
-	if err := s.lockAI(key); err != nil {
+	if err := s.lockAI(tab.Name, key); err != nil {
 		return types.Value{}, err
 	}
 	probe, err := s.aiProbe()
@@ -69,7 +69,7 @@ func (s *Session) bumpAI(tab *catalog.Table, col int, v types.Value) error {
 	if err != nil {
 		return err
 	}
-	if err := s.lockAI(key); err != nil {
+	if err := s.lockAI(tab.Name, key); err != nil {
 		return err
 	}
 	probe, err := s.aiProbe()
@@ -87,12 +87,12 @@ func (s *Session) bumpAI(tab *catalog.Table, col int, v types.Value) error {
 	return s.writeAINext(key, need, probe)
 }
 
-func (s *Session) lockAI(key []byte) error {
+func (s *Session) lockAI(tag string, key []byte) error {
 	h, tm, err := s.fkTM()
 	if err != nil {
 		return err
 	}
-	return tm.LockKey(h, key, txn.Exclusive)
+	return tm.LockKey(h, key, txn.Exclusive, tag)
 }
 
 func (s *Session) aiProbe() (txn.Snapshot, error) {

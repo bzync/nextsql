@@ -37,12 +37,12 @@ func TestLockKeySoleWriter(t *testing.T) {
 	if m.ActiveCount() != 1 {
 		t.Fatalf("active %d", m.ActiveCount())
 	}
-	if err := m.LockKey(h, []byte("parent-pk"), Exclusive); err != nil {
+	if err := m.LockKey(h, []byte("parent-pk"), Exclusive, "parent"); err != nil {
 		t.Fatal(err)
 	}
 	h2 := m.Attach(2, SnapshotIsolation)
 	got := make(chan error, 1)
-	go func() { got <- m.LockKey(h2, []byte("parent-pk"), Shared) }()
+	go func() { got <- m.LockKey(h2, []byte("parent-pk"), Shared, "parent") }()
 	time.Sleep(20 * time.Millisecond)
 	select {
 	case err := <-got:

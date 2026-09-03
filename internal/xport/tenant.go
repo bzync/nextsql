@@ -184,6 +184,11 @@ func prepareLegacyTenantTables(source *executor.DB, tenant string) ([]legacyTena
 		if !legacy {
 			continue
 		}
+		for _, col := range table.Columns {
+			if col.ClientEncrypted() {
+				return nil, false, nerr.New(nerr.Conflict, "xport.MigrateLegacyTenant", "legacy tenant table "+table.Name+" contains ENCRYPTED CLIENT column "+col.Name+"; decrypt and re-encrypt for the destination database context before migration")
+			}
+		}
 		if _, collision := table.ColIndex(LegacyTenantDestinationColumn); collision {
 			return nil, false, nerr.New(nerr.Conflict, "xport.MigrateLegacyTenant", "legacy_tenant_id column already exists")
 		}

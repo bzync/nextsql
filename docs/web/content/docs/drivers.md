@@ -9,6 +9,8 @@ Official drivers speak the native **NSQL v1** protocol. **Do not put keys or pas
 | Bun | [`drivers/bun`](https://github.com/bzync/nextsql/tree/main/drivers/bun) | same shape as Node |
 | Deno | [`drivers/deno`](https://github.com/bzync/nextsql/tree/main/drivers/deno) | `import { connect } from "./mod.ts"` |
 | PHP 8.1+ | [`drivers/php`](https://github.com/bzync/nextsql/tree/main/drivers/php) | `NextSQL\Client::connect([…])` |
+| Python 3.10+ | [`drivers/python`](https://github.com/bzync/nextsql/tree/main/drivers/python) | `nextsql.connect(nextsql.Config(…))` |
+| Ruby 3.0+ | [`drivers/ruby`](https://github.com/bzync/nextsql/tree/main/drivers/ruby) | `NextSQL.connect(NextSQL::Config.new(…))` |
 
 Shared TypeScript types: [`drivers/js/types.d.ts`](https://github.com/bzync/nextsql/blob/main/drivers/js/types.d.ts).
 
@@ -25,5 +27,7 @@ When `nextsqld` is started with `--require-client-key`, the first authenticated 
 - [Go](/docs/drivers-go)
 - [Node, Bun, Deno](/docs/drivers-js)
 - [PHP](/docs/drivers-php)
+- [Python](/docs/drivers-python)
+- [Ruby](/docs/drivers-ruby)
 
 Engine note: [`docs/protocol.md`](https://github.com/bzync/nextsql/blob/main/docs/protocol.md).

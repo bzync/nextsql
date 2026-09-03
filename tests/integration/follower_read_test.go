@@ -28,6 +28,7 @@ type clusterNode struct {
 	id       string
 	db       *executor.DB
 	cluster  *replication.Cluster
+	srv      *protocol.Server
 	addr     string
 	trans    *raft.InmemTransport
 	raftAddr raft.ServerAddress
@@ -116,6 +117,12 @@ func startProtocolCluster3(t *testing.T) ([]*clusterNode, *tls.Config) {
 		}
 		srv := protocol.NewServer(db, users)
 		srv.TLS = srvTLS
+		db.SetDrainFunc(func(timeout time.Duration) {
+			if timeout <= 0 {
+				timeout = srv.DrainTimeout
+			}
+			srv.Drain(timeout)
+		})
 		ctx, cancel := context.WithCancel(context.Background())
 		t.Cleanup(cancel)
 		t.Cleanup(func() { _ = srv.Close() })
@@ -131,6 +138,7 @@ func startProtocolCluster3(t *testing.T) ([]*clusterNode, *tls.Config) {
 			id:       peers[i].ID,
 			db:       db,
 			cluster:  cl,
+			srv:      srv,
 			addr:     srv.Addr().String(),
 			trans:    trans[i],
 			raftAddr: addrs[i],

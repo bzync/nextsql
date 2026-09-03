@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/hashicorp/go-hclog"
@@ -86,6 +87,46 @@ type Cluster struct {
 	keys   crypto.KeyProvider
 	trans  raft.Transport
 	status string
+
+	// replSuspect is set by ReportReplicationOrphan when a local commit on
+	// this node could not be replicated to quorum (storage.Engine's
+	// ReplicationOrphanReporter hook), and cleared only by an operator via
+	// CLUSTER RECONCILE CONFIRM (ClearReplicationSuspect). While set,
+	// StrongReadBarrier refuses to serve STRONG reads from this node.
+	// Node-local, like maintenance mode: not Raft-replicated, so a clean
+	// node elected leader afterward is unaffected.
+	replSuspect atomic.Bool
+}
+
+// ReportReplicationOrphan records that a local commit on this node could
+// not be replicated to quorum, so StrongReadBarrier refuses STRONG reads
+// here until ClearReplicationSuspect is called. Safe to call on a nil
+// Cluster (a no-op, mirroring every other Cluster method's nil-receiver
+// convention).
+func (c *Cluster) ReportReplicationOrphan() {
+	if c == nil {
+		return
+	}
+	c.replSuspect.Store(true)
+}
+
+// ClearReplicationSuspect reverses ReportReplicationOrphan: it is the
+// executor-side effect of CLUSTER RECONCILE CONFIRM, run only after an
+// operator has verified/repaired this node's divergence.
+func (c *Cluster) ClearReplicationSuspect() {
+	if c == nil {
+		return
+	}
+	c.replSuspect.Store(false)
+}
+
+// ReplicationSuspect reports whether this node currently has an
+// unreconciled replication orphan (see ReportReplicationOrphan).
+func (c *Cluster) ReplicationSuspect() bool {
+	if c == nil {
+		return false
+	}
+	return c.replSuspect.Load()
 }
 
 // Open starts Raft. The caller must Close the cluster.
@@ -268,13 +309,27 @@ func (c *Cluster) JoinPeers(peers []Peer) error {
 	return nil
 }
 
+// notProposedError marks a Replicate failure as definite: the entry is
+// known to have never reached the Raft log at all (rejected before
+// raft.Apply was ever called), as opposed to an ambiguous in-doubt outcome
+// (proposed, but the quorum wait itself failed/timed out/lost leadership
+// mid-flight — see isRetryableApplyErr). It implements the storage package's
+// NotProposedError optional-capability interface (checked via type
+// assertion by Engine.commitAndReplicate, the same pattern already used
+// for ReplicationOrphanReporter) so storage can safely discard a held,
+// not-yet-durable local commit only on this definite case.
+type notProposedError struct{ error }
+
+func (e notProposedError) NotProposed() bool { return true }
+func (e notProposedError) Unwrap() error     { return e.error }
+
 // Replicate proposes a WAL batch and waits for quorum commit.
 func (c *Cluster) Replicate(recs []wal.Record) error {
 	if c == nil || c.raft == nil {
 		return nerr.New(nerr.Unavailable, "replication.Replicate", "cluster is closed")
 	}
 	if c.raft.State() != raft.Leader {
-		return c.notLeader("replication.Replicate")
+		return notProposedError{c.notLeader("replication.Replicate")}
 	}
 	data, err := EncodeCommand(c.dek, recs)
 	if err != nil {
@@ -284,7 +339,7 @@ func (c *Cluster) Replicate(recs []wal.Record) error {
 	c.fsm.markLocal(last)
 	f := c.raft.Apply(data, c.cfg.ApplyTimeout)
 	if err := f.Error(); err != nil {
-		if err == raft.ErrNotLeader || err == raft.ErrLeadershipLost || err == raft.ErrEnqueueTimeout {
+		if isRetryableApplyErr(err) {
 			return nerr.Wrap(nerr.Unavailable, "replication.Replicate", "quorum commit failed", err)
 		}
 		return nerr.Wrap(nerr.Internal, "replication.Replicate", "apply", err)
@@ -295,6 +350,25 @@ func (c *Cluster) Replicate(recs []wal.Record) error {
 		}
 	}
 	return nil
+}
+
+// isRetryableApplyErr reports whether a raft.Raft.Apply() failure is a
+// transient, operator- or protocol-driven condition a caller should retry
+// (elsewhere, or shortly after) rather than evidence of a bug.
+// ErrLeadershipTransferInProgress in particular is expected during the
+// documented rolling-upgrade sequence (CLUSTER TRANSFER LEADER), where a
+// write can race the transfer itself; ErrRaftShutdown covers the same race
+// against a node actually stopping (e.g. mid CLUSTER DRAIN / process
+// restart). Any other Apply error is treated as Internal — evidence of an
+// actual fault, not a routing/timing condition a client retry can fix.
+func isRetryableApplyErr(err error) bool {
+	switch err {
+	case raft.ErrNotLeader, raft.ErrLeadershipLost, raft.ErrEnqueueTimeout,
+		raft.ErrLeadershipTransferInProgress, raft.ErrRaftShutdown:
+		return true
+	default:
+		return false
+	}
 }
 
 // AllowWrite rejects writes when this node is not the leader or no

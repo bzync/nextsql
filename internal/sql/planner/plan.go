@@ -58,6 +58,19 @@ type (
 		Schedule *catalog.Schedule
 		IfExists bool
 	}
+	CreateResourceGroup struct {
+		Group       *catalog.ResourceGroup
+		IfNotExists bool
+		Existing    bool
+	}
+	AlterResourceGroup struct {
+		Group  *catalog.ResourceGroup
+		Result *catalog.ResourceGroup
+	}
+	DropResourceGroup struct {
+		Group    *catalog.ResourceGroup
+		IfExists bool
+	}
 	ShowTasks struct {
 		After string
 		Limit int
@@ -86,8 +99,9 @@ type (
 		IfExists bool
 	}
 	RebuildIndex struct {
-		Table *catalog.Table
-		Index catalog.Index
+		Table  *catalog.Table
+		Index  catalog.Index
+		Online bool
 	}
 	AlterTable struct {
 		Table          *catalog.Table
@@ -350,55 +364,58 @@ type (
 	}
 )
 
-func (CreateTable) logical()    {}
-func (CreateWorkflow) logical() {}
-func (RunWorkflow) logical()    {}
-func (AlterWorkflow) logical()  {}
-func (DropWorkflow) logical()   {}
-func (CreateTrigger) logical()  {}
-func (AlterTrigger) logical()   {}
-func (DropTrigger) logical()    {}
-func (CreateSchedule) logical() {}
-func (AlterSchedule) logical()  {}
-func (DropSchedule) logical()   {}
-func (ShowTasks) logical()      {}
-func (CancelTask) logical()     {}
-func (Subscribe) logical()      {}
-func (CreateDatabase) logical() {}
-func (DropTable) logical()      {}
-func (DropIndex) logical()      {}
-func (RebuildIndex) logical()   {}
-func (AlterTable) logical()     {}
-func (CreateIndex) logical()    {}
-func (Insert) logical()         {}
-func (Upsert) logical()         {}
-func (SetOperation) logical()   {}
-func (Scan) logical()           {}
-func (SeqScan) logical()        {}
-func (IndexScan) logical()      {}
-func (Search) logical()         {}
-func (Facet) logical()          {}
-func (Nearest) logical()        {}
-func (Candidates) logical()     {}
-func (Rerank) logical()         {}
-func (Filter) logical()         {}
-func (Project) logical()        {}
-func (Limit) logical()          {}
-func (Sort) logical()           {}
-func (Join) logical()           {}
-func (Aggregate) logical()      {}
-func (Window) logical()         {}
-func (Empty) logical()          {}
-func (Update) logical()         {}
-func (Delete) logical()         {}
-func (Begin) logical()          {}
-func (Commit) logical()         {}
-func (Rollback) logical()       {}
-func (Explain) logical()        {}
-func (Analyze) logical()        {}
-func (Maintain) logical()       {}
-func (With) logical()           {}
-func (CTEScan) logical()        {}
+func (CreateTable) logical()         {}
+func (CreateWorkflow) logical()      {}
+func (RunWorkflow) logical()         {}
+func (AlterWorkflow) logical()       {}
+func (DropWorkflow) logical()        {}
+func (CreateTrigger) logical()       {}
+func (AlterTrigger) logical()        {}
+func (DropTrigger) logical()         {}
+func (CreateSchedule) logical()      {}
+func (AlterSchedule) logical()       {}
+func (DropSchedule) logical()        {}
+func (CreateResourceGroup) logical() {}
+func (AlterResourceGroup) logical()  {}
+func (DropResourceGroup) logical()   {}
+func (ShowTasks) logical()           {}
+func (CancelTask) logical()          {}
+func (Subscribe) logical()           {}
+func (CreateDatabase) logical()      {}
+func (DropTable) logical()           {}
+func (DropIndex) logical()           {}
+func (RebuildIndex) logical()        {}
+func (AlterTable) logical()          {}
+func (CreateIndex) logical()         {}
+func (Insert) logical()              {}
+func (Upsert) logical()              {}
+func (SetOperation) logical()        {}
+func (Scan) logical()                {}
+func (SeqScan) logical()             {}
+func (IndexScan) logical()           {}
+func (Search) logical()              {}
+func (Facet) logical()               {}
+func (Nearest) logical()             {}
+func (Candidates) logical()          {}
+func (Rerank) logical()              {}
+func (Filter) logical()              {}
+func (Project) logical()             {}
+func (Limit) logical()               {}
+func (Sort) logical()                {}
+func (Join) logical()                {}
+func (Aggregate) logical()           {}
+func (Window) logical()              {}
+func (Empty) logical()               {}
+func (Update) logical()              {}
+func (Delete) logical()              {}
+func (Begin) logical()               {}
+func (Commit) logical()              {}
+func (Rollback) logical()            {}
+func (Explain) logical()             {}
+func (Analyze) logical()             {}
+func (Maintain) logical()            {}
+func (With) logical()                {}
+func (CTEScan) logical()             {}
 
 func applySubjoins(p Logical, joins []binder.BoundSubjoin) (Logical, error) {
 	for _, j := range joins {
@@ -522,6 +539,12 @@ func Plan(b binder.Bound) (Logical, error) {
 		return AlterSchedule{Schedule: s.Schedule, Result: s.Result}, nil
 	case binder.DropSchedule:
 		return DropSchedule{Schedule: s.Schedule, IfExists: s.IfExists}, nil
+	case binder.CreateResourceGroup:
+		return CreateResourceGroup{Group: s.Group, IfNotExists: s.IfNotExists, Existing: s.Existing}, nil
+	case binder.AlterResourceGroup:
+		return AlterResourceGroup{Group: s.Group, Result: s.Result}, nil
+	case binder.DropResourceGroup:
+		return DropResourceGroup{Group: s.Group, IfExists: s.IfExists}, nil
 	case binder.ShowTasks:
 		return ShowTasks{After: s.After, Limit: s.Limit}, nil
 	case binder.CancelTask:
@@ -535,7 +558,7 @@ func Plan(b binder.Bound) (Logical, error) {
 	case binder.DropIndex:
 		return DropIndex{Name: s.Name, Table: s.Table, Index: s.Index, IfExists: s.IfExists}, nil
 	case binder.RebuildIndex:
-		return RebuildIndex{Table: s.Table, Index: s.Index}, nil
+		return RebuildIndex{Table: s.Table, Index: s.Index, Online: s.Online}, nil
 	case binder.AlterTable:
 		return AlterTable{
 			Table:          s.Table,
@@ -833,8 +856,8 @@ func outputSchema(p Logical) *catalog.Table {
 			col := catalog.Column{Name: name}
 			if in != nil && i < len(n.Cols) && n.Cols[i] >= 0 && n.Cols[i] < len(in.Columns) {
 				src := in.Columns[n.Cols[i]]
-				col.Type = src.Type
-				col.NotNull = src.NotNull
+				col = src
+				col.Name = name
 			}
 			tab.Columns[i] = col
 		}

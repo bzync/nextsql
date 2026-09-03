@@ -3,6 +3,7 @@
 // Transport uses Bun's node:net / node:tls (same framing as the Node driver).
 
 import { X509Certificate } from 'node:crypto';
+import { rename, stat, readFile, writeFile } from 'node:fs/promises';
 import net from 'node:net';
 import tls from 'node:tls';
 import {
@@ -31,6 +32,16 @@ import {
   txnControl,
 } from '../js/client.mjs';
 import { decodeNodeStatus, encodeSetReadConsistency } from '../js/protocol.mjs';
+import {
+  FieldType,
+  MemoryFieldKeyring,
+  decodeFieldKeyring,
+  decryptField,
+  encodeFieldKeyring,
+  encryptField,
+  generateFieldKey,
+  inspectField,
+} from '../js/client-encryption.mjs';
 
 export {
   Kind,
@@ -51,7 +62,127 @@ export {
   isReadOnlySQL,
   txnControl,
   validateConfig,
+  FieldType,
+  MemoryFieldKeyring,
+  FileFieldKeyring,
+  decryptField,
+  encryptField,
+  generateFieldKey,
+  inspectField,
 };
+
+// FileFieldKeyring is a durable, atomic, file-backed FieldKeyProvider for
+// Bun: rotation and revocation persist across process restarts using the
+// NSFK1 format (drivers/js/client-encryption.mjs). It uses node:fs/promises,
+// which Bun implements natively. Production applications with an existing
+// secret manager or KMS should implement the provider contract directly
+// against that system instead.
+class FileFieldKeyring {
+  constructor(path, records) {
+    this._path = path;
+    this._records = records;
+  }
+
+  static async create(path, current) {
+    try {
+      await stat(path);
+      throw new NextSQLError('already_exists', 'keyring file exists');
+    } catch (err) {
+      if (!(err && err.code === 'ENOENT')) throw err;
+    }
+    const material = current.material instanceof Uint8Array
+      ? current.material
+      : new Uint8Array(current.material || []);
+    const record = {
+      id: current.id,
+      created: Math.floor(Date.now() / 1000),
+      current: true,
+      revoked: false,
+      material,
+    };
+    const kr = new FileFieldKeyring(path, [record]);
+    await kr._persist();
+    return kr;
+  }
+
+  static async open(path) {
+    const raw = await readFile(path);
+    const records = decodeFieldKeyring(new Uint8Array(raw));
+    return new FileFieldKeyring(path, records);
+  }
+
+  get path() {
+    return this._path;
+  }
+
+  async currentFieldKey() {
+    const rec = this._records.find((r) => r.current && !r.revoked);
+    if (!rec) throw new NextSQLError('crypto', 'current field key unavailable');
+    return { id: rec.id, material: rec.material.slice() };
+  }
+
+  async fieldKey(_database, _table, _column, id) {
+    const rec = this._records.find((r) => r.id === id);
+    if (!rec || rec.revoked) {
+      throw new NextSQLError('crypto', 'field key unavailable or revoked');
+    }
+    return { id: rec.id, material: rec.material.slice() };
+  }
+
+  async rotate(key) {
+    const material = key.material instanceof Uint8Array
+      ? key.material
+      : new Uint8Array(key.material || []);
+    let rec = this._records.find((r) => r.id === key.id);
+    if (rec && rec.revoked) {
+      throw new NextSQLError('conflict', 'cannot reuse a revoked field key id');
+    }
+    if (!rec) {
+      if (this._records.length >= 64) {
+        throw new NextSQLError('exhausted', 'field key limit reached');
+      }
+      rec = { id: key.id, created: Math.floor(Date.now() / 1000), current: false, revoked: false, material };
+      this._records.push(rec);
+    }
+    for (const r of this._records) r.current = false;
+    rec.current = true;
+    rec.material = material;
+    await this._persist();
+  }
+
+  async revoke(id) {
+    const rec = this._records.find((r) => r.id === id);
+    if (!rec) throw new NextSQLError('not_found', 'unknown field key id');
+    if (rec.current) {
+      throw new NextSQLError('conflict', 'cannot revoke the current field key');
+    }
+    if (rec.revoked) return;
+    rec.revoked = true;
+    rec.material = new Uint8Array(32);
+    await this._persist();
+  }
+
+  async reload() {
+    const raw = await readFile(this._path);
+    this._records = decodeFieldKeyring(new Uint8Array(raw));
+  }
+
+  list() {
+    return this._records.map((r) => ({
+      id: r.id,
+      created: r.created,
+      current: r.current,
+      revoked: r.revoked,
+    }));
+  }
+
+  async _persist() {
+    const raw = encodeFieldKeyring(this._records);
+    const tmp = `${this._path}.tmp`;
+    await writeFile(tmp, raw, { mode: 0o600 });
+    await rename(tmp, this._path);
+  }
+}
 
 function verifyPeer(sock, ca, servername) {
   if (ca === undefined || ca === null) {

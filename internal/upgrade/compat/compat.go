@@ -1,9 +1,20 @@
-// Package upgrade is the format-compatibility catalog for persisted
-// NextSQL encodings. A binary opens only versions in [Min, Max]. There
-// is no silent rewrite of an unknown version.
-package upgrade
+// Package compat is the format-compatibility catalog for persisted NextSQL
+// encodings — the single source of truth for what version of each on-disk
+// or on-wire family this binary can open. A binary opens only versions in
+// [MinReadable, MaxReadable]; there is no silent rewrite of an unknown
+// version. It is a leaf package (only "fmt" and internal/nerr) so that
+// version-check call sites deep in the storage/catalog stack (which
+// internal/upgrade itself cannot be imported from — it pulls in
+// internal/wal/internal/undo for its diagnose-report Inspect, which would
+// cycle back through internal/storage/file) can depend on it directly. See
+// docs/storage-format.md "Format and catalog migration strategy".
+package compat
 
-import "github.com/bzync/nextsql/internal/nerr"
+import (
+	"fmt"
+
+	"github.com/bzync/nextsql/internal/nerr"
+)
 
 // Family is one versioned on-disk or on-wire encoding.
 type Family string
@@ -44,7 +55,7 @@ func Catalog() []Spec {
 		{Family: FamilyWALCtrl, Magic: "NSWC", Current: 1, MinReadable: 1, MaxReadable: 1, Notes: "WAL control file"},
 		{Family: FamilyUNDO, Magic: "NSUD", Current: 1, MinReadable: 1, MaxReadable: 1, Notes: "encrypted UNDO records"},
 		{Family: FamilyUNDOCtrl, Magic: "NSUC", Current: 1, MinReadable: 1, MaxReadable: 1, Notes: "UNDO control file"},
-		{Family: FamilyCatalog, Magic: "NSCT", Current: 9, MinReadable: 1, MaxReadable: 9, Notes: "table descriptors; v1 empty FKs, v2 foreign keys, v3 CDC image policy, v4 partition metadata, v5 stable partition identity allocator, v6 per-index HNSW traversal quantisation, v7 per-index vector ANN method + IVF list/probe counts, v8 per-index IVF-PQ subspace count, v9 per-index full-text analyzer id+revision"},
+		{Family: FamilyCatalog, Magic: "NSCT", Current: 11, MinReadable: 1, MaxReadable: 11, Notes: "table descriptors; v1 empty FKs, v2 foreign keys, v3 CDC image policy, v4 partition metadata, v5 stable partition identity allocator, v6 per-index HNSW traversal quantisation, v7 per-index vector ANN method + IVF list/probe counts, v8 per-index IVF-PQ subspace count, v9 per-index full-text analyzer id+revision, v10 per-column ENCRYPTED CLIENT logical type, v11 per-column ENUM label list"},
 		{Family: FamilyBackup, Magic: "NSBK", Current: 1, MinReadable: 1, MaxReadable: 1, Notes: "physical backup header"},
 		{Family: FamilyExport, Magic: "NSXP", Current: 1, MinReadable: 1, MaxReadable: 1, Notes: "logical export header"},
 		{Family: FamilyProtocol, Magic: "NSQL", Current: 1, MinReadable: 1, MaxReadable: 1, Notes: "native wire protocol"},
@@ -63,17 +74,26 @@ func Lookup(family Family) (Spec, bool) {
 	return Spec{}, false
 }
 
-// Check reports whether this binary can open version of family.
+// Check reports whether this binary can open version of family. The error,
+// when non-nil, names the family and the actual/supported version numbers
+// so an operator can tell a too-old file (needs the offline dump/reload
+// migration — see docs/storage-format.md "Format and catalog migration
+// strategy") apart from a too-new one (needs a newer nextsqld binary)
+// without having to cross-reference Catalog() by hand.
 func Check(family Family, version uint16) error {
 	s, ok := Lookup(family)
 	if !ok {
-		return nerr.New(nerr.InvalidFormat, "upgrade.Check", "unknown format family")
+		return nerr.New(nerr.InvalidFormat, "compat.Check", fmt.Sprintf("unknown format family %q", family))
 	}
 	if version < s.MinReadable {
-		return nerr.New(nerr.InvalidFormat, "upgrade.Check", "format version is older than this binary can read")
+		return nerr.New(nerr.InvalidFormat, "compat.Check", fmt.Sprintf(
+			"%s format version %d is older than this binary supports (minimum %d); migrate via backup/restore into a freshly created database",
+			family, version, s.MinReadable))
 	}
 	if version > s.MaxReadable {
-		return nerr.New(nerr.InvalidFormat, "upgrade.Check", "format version is newer than this binary can read")
+		return nerr.New(nerr.InvalidFormat, "compat.Check", fmt.Sprintf(
+			"%s format version %d is newer than this binary supports (maximum %d); upgrade nextsqld",
+			family, version, s.MaxReadable))
 	}
 	return nil
 }

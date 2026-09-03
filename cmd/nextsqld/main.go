@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -12,18 +13,24 @@ import (
 	"time"
 
 	"github.com/bzync/nextsql/internal/auth"
+	"github.com/bzync/nextsql/internal/authbroker"
 	"github.com/bzync/nextsql/internal/backup"
 	"github.com/bzync/nextsql/internal/cli"
 	"github.com/bzync/nextsql/internal/config"
 	"github.com/bzync/nextsql/internal/crypto"
+	"github.com/bzync/nextsql/internal/dbmanager"
+	"github.com/bzync/nextsql/internal/diskspace"
 	"github.com/bzync/nextsql/internal/executor"
 	"github.com/bzync/nextsql/internal/hosting"
 	"github.com/bzync/nextsql/internal/logging"
+	"github.com/bzync/nextsql/internal/metrics"
 	"github.com/bzync/nextsql/internal/nerr"
 	"github.com/bzync/nextsql/internal/protocol"
 	"github.com/bzync/nextsql/internal/replication"
 	"github.com/bzync/nextsql/internal/scheduler"
 	"github.com/bzync/nextsql/internal/security"
+	"github.com/bzync/nextsql/internal/storage"
+	"github.com/bzync/nextsql/internal/storage/buffer"
 	"github.com/bzync/nextsql/internal/version"
 )
 
@@ -75,10 +82,13 @@ func run() error {
 	tlsKey := fs.String("tls-key", "", "TLS private key (PEM)")
 	tlsClientCA := fs.String("tls-client-ca", "", "PEM CA for required mTLS client certificates")
 	tlsClientCRL := fs.String("tls-client-crl", "", "PEM CRL bundle for required fail-closed mTLS revocation checks")
+	authBrokerConfig := fs.String("auth-broker-config", "", "embedded OIDC broker config (default: DATA-DIR/nextsql-auth-broker.conf)")
+	authBrokerListen := fs.String("auth-broker-listen", "", "host the OIDC broker on this separate HTTP(S) listener (single-node only)")
 	user := fs.String("user", "", "bootstrap or update this user")
 	passwordFile := fs.String("password-file", "", "password file for --user (never a URL)")
 	requireClientKey := fs.Bool("require-client-key", false, "do not load --key-file; first client must unlock")
 	auditFile := fs.String("audit-file", "", "audit log path (default: DATA-DIR/nextsql.audit)")
+	auditSigningKeyset := fs.String("audit-signing-keyset", "", "NSAK Ed25519 keyset used to sign new audit records")
 	walArchive := fs.String("wal-archive", "", "encrypted WAL archive directory for PITR")
 	nodeID := fs.String("node-id", "", "Raft node id (required with --raft-bind)")
 	raftBind := fs.String("raft-bind", "", "Raft bind address (enables HA)")
@@ -139,11 +149,20 @@ func run() error {
 	if set["tls-client-crl"] {
 		cfg.TLSClientCRL = *tlsClientCRL
 	}
+	if set["auth-broker-config"] {
+		cfg.AuthBrokerConfig = *authBrokerConfig
+	}
+	if set["auth-broker-listen"] {
+		cfg.AuthBrokerListen = *authBrokerListen
+	}
 	if set["require-client-key"] {
 		cfg.RequireClientKey = *requireClientKey
 	}
 	if set["audit-file"] {
 		cfg.AuditFile = *auditFile
+	}
+	if set["audit-signing-keyset"] {
+		cfg.AuditSigningKeyset = *auditSigningKeyset
 	}
 	if set["wal-archive"] {
 		cfg.WalArchive = *walArchive
@@ -166,8 +185,8 @@ func run() error {
 	if cfg.DataDir == "" {
 		return nerr.New(nerr.InvalidArgument, "nextsqld", "--data-dir is required (or set it in --config)")
 	}
-	if !cfg.RequireClientKey && cfg.KeyFile == "" {
-		return nerr.New(nerr.InvalidArgument, "nextsqld", "--key-file is required unless --require-client-key is set")
+	if !cfg.RequireClientKey && cfg.KeyFile == "" && cfg.InstanceKeyFile == "" {
+		return nerr.New(nerr.InvalidArgument, "nextsqld", "--key-file (or, for a manifest-bootstrapped deployment, --instance-key-file) is required unless --require-client-key is set")
 	}
 	dataDirLock, err := hosting.AcquireDataDirLock(cfg.DataDir)
 	if err != nil {
@@ -178,6 +197,32 @@ func run() error {
 	log := logging.New(cfg.LogLevel, os.Stderr)
 	dbPath := filepath.Join(cfg.DataDir, config.DataFileName)
 	ksPath := crypto.KeystorePath(dbPath)
+	// bufBudget (M2-3b-2) is shared across every database this process opens
+	// — the primary plus every dbmanager-opened secondary — so the total
+	// buffer-pool memory committed at once is bounded process-wide, not just
+	// per database. cfg.MaxTotalBufferPages == 0 (default) makes it
+	// unbounded, matching pre-M2-3b-2 behavior exactly.
+	bufBudget := buffer.NewBudget(cfg.MaxTotalBufferPages)
+	// taskPool (M2-3b-3a) is the shared, fixed-size worker set every open
+	// database's task execution submits claimed tasks to — either directly
+	// via a dedicated TaskRuntime (the legacy/non-hosted primary), or via
+	// the single CentralScheduler covering every dbmanager-open database at
+	// once (M2-3b-3b) — so task-execution goroutine count no longer scales
+	// with the number of open databases, unlike before either landed. A nil
+	// parent context (not the signal-aware ctx created below) is
+	// deliberate: taskPool's lifecycle is driven only by this defer, which
+	// is registered here — before every other close-related defer below,
+	// including srv.Close() and the dbMgr/db cleanup defer further down —
+	// specifically so it *runs last* (defers run LIFO). Every TaskRuntime
+	// and CentralScheduler submitting to taskPool must already be closed
+	// before taskPool.Close() runs, or its worker goroutines could exit out
+	// from under a still-open submitter's pending submission — see
+	// TaskPool.Close's own doc comment.
+	taskPool, err := executor.NewTaskPool(nil, cfg.TaskWorkers)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = taskPool.Close() }()
 
 	var (
 		db              *executor.DB
@@ -187,8 +232,19 @@ func run() error {
 		hostingRegistry *hosting.Registry
 		hostedRealm     hosting.Realm
 		hostedDatabase  hosting.Database
+		dbMgr           *dbmanager.Manager
+		secondaryMu     sync.Mutex
+		secondaryEnvs   []*crypto.Envelope
 	)
 	defer func() {
+		if dbMgr != nil {
+			_ = dbMgr.Close()
+		}
+		secondaryMu.Lock()
+		for _, e := range secondaryEnvs {
+			_ = e.Close()
+		}
+		secondaryMu.Unlock()
 		if db != nil {
 			_ = db.Close()
 		}
@@ -203,14 +259,28 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	if !cfg.RequireClientKey {
+	// The primary database is eager-opened at DATA-DIR/nextsql.db only for a
+	// legacy single-database deployment (no registry) or a registry whose
+	// default is LayoutLegacyDefault. A manifest-bootstrapped deployment whose
+	// default is LayoutManaged starts with no primary handle: dbMgr (set up
+	// below, since hostingRegistry != nil) opens and serves it lazily on the
+	// first connection, exactly as it already does every non-default managed
+	// database. RequireClientKey keeps its own deferred-open path regardless.
+	eagerPrimary := hostingRegistry == nil || hostedDatabase.Layout == hosting.LayoutLegacyDefault
+	if cfg.RequireClientKey && !eagerPrimary {
+		return nerr.New(nerr.InvalidArgument, "nextsqld", "require_client_key is not supported with a manifest-bootstrapped (managed-layout default) deployment")
+	}
+	if !cfg.RequireClientKey && eagerPrimary && cfg.KeyFile == "" {
+		return nerr.New(nerr.InvalidArgument, "nextsqld", "--key-file is required for this deployment (its default database is a legacy DATA-DIR/nextsql.db)")
+	}
+	if !cfg.RequireClientKey && eagerPrimary {
 		var opened *crypto.Envelope
 		keys, opened, err = openKeys(cfg.KeyFile, ksPath)
 		if err != nil {
 			return err
 		}
 		env = opened
-		db, err = executor.Open(dbPath, keys, cfg.BufferPages)
+		db, err = executor.OpenWith(dbPath, keys, cfg.BufferPages, storage.OpenOptions{Budget: bufBudget})
 		if err != nil {
 			return err
 		}
@@ -265,6 +335,31 @@ func run() error {
 		return err
 	}
 	defer func() { _ = audit.Close() }()
+	var auditSigningKeys *security.AuditKeyset
+	if cfg.AuditSigningKeyset == "" && audit.SigningRequired() {
+		return nerr.New(nerr.InvalidArgument, "nextsqld", "existing audit chain requires --audit-signing-keyset")
+	}
+	if cfg.AuditSigningKeyset != "" {
+		auditSigningKeys, err = security.OpenAuditKeyset(cfg.AuditSigningKeyset)
+		if err != nil {
+			return err
+		}
+		if err := auditSigningKeys.ValidateSigner(); err != nil {
+			return err
+		}
+		if audit.SigningRequired() {
+			report, err := security.VerifyFile(cfg.AuditPath(), auditSigningKeys)
+			if err != nil {
+				return err
+			}
+			if !report.Verified {
+				return nerr.New(nerr.InvalidFormat, "nextsqld", fmt.Sprintf("audit signature verification failed at line %d: %s", report.FirstBadLine, report.Problem))
+			}
+		}
+		if err := audit.SetSigningKeys(auditSigningKeys); err != nil {
+			return err
+		}
+	}
 	defer func() {
 		if cluster != nil {
 			_ = cluster.Shutdown()
@@ -286,18 +381,99 @@ func run() error {
 	srv.Registry = reg
 	srv.Log = log
 	srv.RequireClientKey = cfg.RequireClientKey
+	srv.DrainTimeout = time.Duration(cfg.DrainTimeoutMS) * time.Millisecond
 	if hostingRegistry != nil {
 		srv.Database = hostedDatabase.Name
+		srv.Realm = hostedRealm.Name
+		srv.HostingRegistry = hostingRegistry
+		if db != nil {
+			db.SetDatabaseName(hostedDatabase.Name)
+		}
 	}
-	if cfg.MaxResultRows > 0 {
+	if cfg.MaxResultRows > 0 || cfg.MaxConnections > 0 || cfg.MaxConnectionsPerUser > 0 || cfg.MaxConnectionsPerDatabase > 0 || cfg.MaxConnectionsPerRealm > 0 || cfg.IdleTimeoutMS > 0 || cfg.StatementTimeoutMS > 0 || cfg.TransactionTimeoutMS > 0 || cfg.IdleTransactionTimeoutMS > 0 {
 		lim := srv.Limits
-		lim.Query.ResultRows = cfg.MaxResultRows
+		if cfg.MaxResultRows > 0 {
+			lim.Query.ResultRows = cfg.MaxResultRows
+		}
+		if cfg.MaxConnections > 0 {
+			lim.MaxSessions = cfg.MaxConnections
+		}
+		if cfg.MaxConnectionsPerUser > 0 {
+			lim.MaxSessionsPerUser = cfg.MaxConnectionsPerUser
+		}
+		if cfg.MaxConnectionsPerDatabase > 0 {
+			lim.MaxSessionsPerDatabase = cfg.MaxConnectionsPerDatabase
+		}
+		if cfg.MaxConnectionsPerRealm > 0 {
+			lim.MaxSessionsPerRealm = cfg.MaxConnectionsPerRealm
+		}
+		if cfg.IdleTimeoutMS > 0 {
+			lim.Idle = time.Duration(cfg.IdleTimeoutMS) * time.Millisecond
+		}
+		if cfg.StatementTimeoutMS > 0 {
+			lim.Query.Time = time.Duration(cfg.StatementTimeoutMS) * time.Millisecond
+		}
+		if cfg.TransactionTimeoutMS > 0 {
+			lim.TxnTimeout = time.Duration(cfg.TransactionTimeoutMS) * time.Millisecond
+		}
+		if cfg.IdleTransactionTimeoutMS > 0 {
+			lim.IdleTxn = time.Duration(cfg.IdleTransactionTimeoutMS) * time.Millisecond
+		}
 		srv.Limits = lim
+	}
+	if db != nil {
+		db.SetDrainFunc(func(timeout time.Duration) {
+			if timeout <= 0 {
+				timeout = srv.DrainTimeout
+			}
+			srv.Drain(timeout)
+		})
+	}
+	if cfg.LockTimeoutMS > 0 && db != nil {
+		db.SetLockWaitTimeout(time.Duration(cfg.LockTimeoutMS) * time.Millisecond)
 	}
 	ctx, stop := serveContext()
 	defer stop()
+	if db != nil {
+		startWALRetentionUpdater(ctx, db, cfg.WalArchive, cfg.WalRetentionMS, log)
+		if cfg.DiskWatermarkCheckMS > 0 {
+			warn, reject := cfg.DiskWatermarkThresholds()
+			startDiskWatermarkMonitor(ctx, db, cfg.DataDir, cfg.DiskWatermarkCheckMS, warn, reject, log)
+		}
+		if cfg.ReplicaLagCheckMS > 0 {
+			startReplicaLagMonitor(ctx, db, cfg.ReplicaLagCheckMS, cfg.ReplicaLagWarnThreshold(), log)
+		}
+	}
+	if auditSigningKeys != nil {
+		auditReload := make(chan os.Signal, 1)
+		signal.Notify(auditReload, syscall.SIGHUP)
+		defer signal.Stop(auditReload)
+		go func() {
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-auditReload:
+					err := auditSigningKeys.Reload()
+					recordErr := audit.RecordChecked(security.Event{
+						Actor: "system", Action: security.ActionSecuritySet,
+						Object: "audit.signing.reload", Outcome: security.Outcome(err),
+					})
+					if err != nil {
+						log.Error("audit signing keyset reload failed; retaining last known-good signer", "error", err)
+						continue
+					}
+					if recordErr != nil {
+						log.Error("audit signing reload event could not be persisted", "error", recordErr)
+						continue
+					}
+					log.Info("audit signing keyset reloaded")
+				}
+			}
+		}()
+	}
 	newTaskRuntime := func(openedDB *executor.DB) (*executor.TaskRuntime, error) {
-		runtime, err := executor.StartTaskRuntime(ctx, openedDB, executor.TaskRuntimeConfig{
+		runtime, err := executor.StartTaskRuntime(ctx, openedDB, taskPool, executor.TaskRuntimeConfig{
 			ACL: acl, Audit: audit, Limits: srv.Limits.Query,
 			OnError: func(err error) { log.Error("task runtime", "error", err) },
 		})
@@ -306,12 +482,134 @@ func run() error {
 		}
 		return runtime, nil
 	}
-	if db != nil {
+	if db != nil && hostingRegistry == nil {
+		// Only when there is no hosting registry at all: once one exists,
+		// the primary is scheduled by the single CentralScheduler set up
+		// below instead (M2-3b-3b), the same as every dbmanager-opened
+		// secondary — not its own dedicated TaskRuntime.
 		runtime, err := newTaskRuntime(db)
 		if err != nil {
 			return err
 		}
 		srv.SetTaskRuntime(runtime)
+	}
+	// dbMgr (M2-3a) lets a connection's Hello.Realm/Hello.Database route to
+	// a database other than the primary one, bounded to a small fixed
+	// number of distinct open databases with no eviction (M2-3b territory).
+	// Only meaningful with a hosting registry to look additional databases
+	// up in; a legacy/non-hosted deployment leaves srv.Databases nil, so
+	// every connection uses the pre-M2-3a DatabaseHandle() path unchanged.
+	if hostingRegistry != nil {
+		opener := func(realm hosting.Realm, database hosting.Database) (*executor.DB, func() error, error) {
+			if database.Layout != hosting.LayoutManaged {
+				return nil, nil, nerr.New(nerr.Unavailable, "nextsqld", "only managed-layout databases can be opened on demand")
+			}
+			if realm.State != hosting.StateActive || database.State != hosting.StateActive {
+				return nil, nil, nerr.New(nerr.Unavailable, "nextsqld", "realm or database is not active")
+			}
+			// database.KeyRef is the standalone root key file for this managed
+			// database (nextsql database create's own --database-key-file),
+			// distinct from the deployment's --key-file. Mirrors the primary
+			// database's own open path (openKeys): the root key does not
+			// encrypt the database file directly, it unlocks an envelope
+			// keystore (crypto.KeystorePath) placed next to the database
+			// file, which activateManagedDatabase/createOrResumeDatabase
+			// already created at provisioning time.
+			secRoot, err := crypto.ReadKeyFile(database.KeyRef)
+			if err != nil {
+				return nil, nil, err
+			}
+			secPath := hosting.ManagedDatabasePath(cfg.DataDir, realm.ID, database.ID)
+			secEnv, err := crypto.OpenEnvelope(crypto.KeystorePath(secPath), secRoot)
+			if err != nil {
+				return nil, nil, err
+			}
+			secDB, err := executor.OpenWith(secPath, secEnv, cfg.BufferPages, storage.OpenOptions{Budget: bufBudget})
+			if err != nil {
+				_ = secEnv.Close()
+				return nil, nil, err
+			}
+			if err := validateHostedDatabase(hostingRegistry, database, secDB); err != nil {
+				_ = secDB.Close()
+				_ = secEnv.Close()
+				return nil, nil, err
+			}
+			secDB.SetDatabaseName(database.Name)
+			applyHostedStorageCap(secDB, realm, database)
+			applyOps(secDB, cfg)
+			// No installArchiver, no startCluster: secondary databases are
+			// single-node only in M2-3a (no PITR archiving, no Raft — running
+			// multiple independent Raft groups in one process is out of
+			// scope). Not a regression: nextsqld opened nothing beyond the
+			// primary at all before M2-3a.
+			startWALRetentionUpdater(ctx, secDB, cfg.WalArchive, cfg.WalRetentionMS, log)
+			if cfg.DiskWatermarkCheckMS > 0 {
+				warn, reject := cfg.DiskWatermarkThresholds()
+				startDiskWatermarkMonitor(ctx, secDB, cfg.DataDir, cfg.DiskWatermarkCheckMS, warn, reject, log)
+			}
+			if cfg.ReplicaLagCheckMS > 0 {
+				startReplicaLagMonitor(ctx, secDB, cfg.ReplicaLagCheckMS, cfg.ReplicaLagWarnThreshold(), log)
+			}
+			secondaryMu.Lock()
+			secondaryEnvs = append(secondaryEnvs, secEnv)
+			secondaryMu.Unlock()
+			// No task runtime to close here any more (M2-3b-3b): the single
+			// CentralScheduler set up below covers every dbmanager-open
+			// database, primary and secondary alike, and its own Close
+			// (deferred right after it's started, below) already
+			// guarantees no claim it submitted against secDB is still
+			// in flight by the time Manager.release calls this cleanup —
+			// see CentralScheduler.Close's doc comment. The envelope closes
+			// last, since the database's own final checkpoint/flush needs
+			// its key material still available.
+			cleanup := func() error {
+				dbErr := secDB.Close()
+				_ = secEnv.Close()
+				return dbErr
+			}
+			return secDB, cleanup, nil
+		}
+		dbMgr = dbmanager.New(cfg.MaxOpenDatabases, hostingRegistry.Lookup, opener)
+		if db != nil {
+			if err := dbMgr.Preload(hostedRealm, hostedDatabase, db); err != nil {
+				return err
+			}
+		}
+		srv.SetDatabaseManager(dbMgr)
+		// CentralScheduler (M2-3b-3b) is the single poll loop covering every
+		// database dbMgr currently has open — primary and every secondary —
+		// instead of each getting its own TaskRuntime. dbMgr.Snapshot's
+		// ref-holding is what makes this safe against M2-3b-1 eviction: a
+		// database with a claim still in flight can't be evicted mid-tick
+		// (see Snapshot's own doc comment), so the Opener's cleanup above
+		// needs no task-runtime-specific ordering of its own any more.
+		// Deliberately scoped out: the REQUIRE CLIENT KEY lazy-open path's
+		// own primary-only TaskRuntime (below, in srv.Unlock) is untouched —
+		// combining REQUIRE CLIENT KEY with hosting is a narrow, rare
+		// deployment shape, and once that primary is later Preloaded into
+		// dbMgr there, it becomes redundantly (but not incorrectly — claims
+		// are transactionally exclusive) polled by both. Not attempted here;
+		// flagged rather than silently left.
+		centralSched, err := executor.StartCentralScheduler(ctx, taskPool, func() []executor.DBRef {
+			handles := dbMgr.Snapshot()
+			refs := make([]executor.DBRef, len(handles))
+			for i, h := range handles {
+				refs[i] = executor.DBRef{DB: h.DB, Release: h.Release}
+			}
+			return refs
+		}, executor.TaskRuntimeConfig{
+			ACL: acl, Audit: audit, Limits: srv.Limits.Query,
+			OnError: func(err error) { log.Error("task scheduler", "error", err) },
+		})
+		if err != nil {
+			return err
+		}
+		// Registered here — after dbMgr exists but before the earlier master
+		// dbMgr/secondary-cleanup defer runs (defers are LIFO: this one,
+		// registered later, runs first) — so CentralScheduler always closes,
+		// draining every in-flight claim, before dbMgr force-closes any
+		// database out from under it during final shutdown.
+		defer func() { _ = centralSched.Close() }()
 	}
 	if env != nil {
 		env.OnRevoke(func(crypto.RevokeEvent) {
@@ -335,7 +633,7 @@ func run() error {
 			if err != nil {
 				return err
 			}
-			openedDB, err := executor.Open(dbPath, opened, cfg.BufferPages)
+			openedDB, err := executor.OpenWith(dbPath, opened, cfg.BufferPages, storage.OpenOptions{Budget: bufBudget})
 			if err != nil {
 				_ = opened.Close()
 				return err
@@ -373,9 +671,23 @@ func run() error {
 			if err := installArchiver(openedDB, opened, cfg.WalArchive); err != nil {
 				return err
 			}
+			startWALRetentionUpdater(ctx, openedDB, cfg.WalArchive, cfg.WalRetentionMS, log)
+			if cfg.DiskWatermarkCheckMS > 0 {
+				warn, reject := cfg.DiskWatermarkThresholds()
+				startDiskWatermarkMonitor(ctx, openedDB, cfg.DataDir, cfg.DiskWatermarkCheckMS, warn, reject, log)
+			}
 			openedCluster, err = startCluster(openedDB, opened, cfg, audit)
 			if err != nil {
 				return err
+			}
+			// Started only after startCluster returns, unlike the WAL
+			// retention/disk watermark monitors above: this one reads
+			// DB.ClusterHealth (DB.gate), which AttachCluster sets with no
+			// synchronization of its own — starting it any earlier would
+			// race that write from this goroutine against the monitor's own
+			// background goroutine.
+			if cfg.ReplicaLagCheckMS > 0 {
+				startReplicaLagMonitor(ctx, openedDB, cfg.ReplicaLagCheckMS, cfg.ReplicaLagWarnThreshold(), log)
 			}
 			openedTasks, err = newTaskRuntime(openedDB)
 			if err != nil {
@@ -386,6 +698,11 @@ func run() error {
 			cluster = openedCluster
 			srv.SetTaskRuntime(openedTasks)
 			srv.SetDatabase(openedDB)
+			if dbMgr != nil {
+				if err := dbMgr.Preload(hostedRealm, hostedDatabase, openedDB); err != nil {
+					return err
+				}
+			}
 			published = true
 			return nil
 		}
@@ -430,6 +747,7 @@ func run() error {
 		}()
 	}
 
+	var tokenVerifier *auth.TokenVerifier
 	if cfg.TokenKeyset != "" {
 		keyset, err := auth.OpenTokenKeyset(cfg.TokenKeyset)
 		if err != nil {
@@ -442,27 +760,86 @@ func run() error {
 				return err
 			}
 		}
-		verifier := auth.NewTokenVerifier(keyset, revocations, cfg.TokenAudience)
-		srv.Tokens = verifier
-		tokenReload := make(chan os.Signal, 1)
-		signal.Notify(tokenReload, syscall.SIGHUP)
-		defer signal.Stop(tokenReload)
+		tokenVerifier = auth.NewTokenVerifier(keyset, revocations, cfg.TokenAudience)
+		srv.Tokens = tokenVerifier
+		srv.TokenIdentitySourceHints = cfg.TokenIdentitySourceHints
+		if !cfg.EmbeddedAuthBrokerEnabled() {
+			tokenReload := make(chan os.Signal, 1)
+			signal.Notify(tokenReload, syscall.SIGHUP)
+			defer signal.Stop(tokenReload)
+			go func() {
+				for {
+					select {
+					case <-ctx.Done():
+						return
+					case <-tokenReload:
+						err := tokenVerifier.Reload()
+						audit.Record(security.Event{Actor: "system", Action: security.ActionSecuritySet, Object: "token.reload", Outcome: security.Outcome(err)})
+						if err != nil {
+							log.Error("short-lived credential keyset reload failed; retaining last known-good configuration", "error", err)
+							continue
+						}
+						log.Info("short-lived credential keyset and revocation list reloaded")
+					}
+				}
+			}()
+		}
+	}
+
+	var embeddedBroker *authbroker.Broker
+	var embeddedHTTP *authbroker.HTTPServer
+	if cfg.EmbeddedAuthBrokerEnabled() {
+		embeddedBroker, embeddedHTTP, err = startEmbeddedAuthBroker(cfg, users, acl, hostingRegistry, authbroker.Options{Logger: log})
+		if err != nil {
+			return err
+		}
+		defer embeddedHTTP.Close()
+		brokerReload := make(chan os.Signal, 1)
+		signal.Notify(brokerReload, syscall.SIGHUP)
+		defer signal.Stop(brokerReload)
 		go func() {
 			for {
 				select {
 				case <-ctx.Done():
 					return
-				case <-tokenReload:
-					err := verifier.Reload()
-					audit.Record(security.Event{Actor: "system", Action: security.ActionSecuritySet, Object: "token.reload", Outcome: security.Outcome(err)})
+				case <-brokerReload:
+					// Preflight both candidate files, then reload the verifier before
+					// publishing the issuer. A newly current broker key is therefore
+					// accepted before it can mint.
+					verifyKeys, err := auth.OpenTokenKeyset(cfg.TokenKeyset)
+					if err == nil {
+						err = embeddedBroker.ValidateReloadWithKeysetValidator(func(keys *auth.TokenKeyset) error {
+							return verifyEmbeddedBrokerKeyset(keys, auth.NewTokenVerifier(verifyKeys, nil, cfg.TokenAudience), cfg.TokenAudience, time.Now())
+						})
+					}
 					if err != nil {
-						log.Error("short-lived credential keyset reload failed; retaining last known-good configuration", "error", err)
+						log.Error("embedded broker reload preflight failed; retaining last-known-good verifier and issuer", "error", err)
 						continue
 					}
-					log.Info("short-lived credential keyset and revocation list reloaded")
+					err = tokenVerifier.Reload()
+					audit.Record(security.Event{Actor: "system", Action: security.ActionSecuritySet, Object: "token.reload", Outcome: security.Outcome(err)})
+					if err != nil {
+						log.Error("embedded broker reload blocked by short-lived credential reload failure; retaining last-known-good issuer", "error", err)
+						continue
+					}
+					if err := embeddedBroker.ReloadWithKeysetValidator(func(keys *auth.TokenKeyset) error {
+						verifyKeys, err := auth.OpenTokenKeyset(cfg.TokenKeyset)
+						if err != nil {
+							return err
+						}
+						return verifyEmbeddedBrokerKeyset(keys, auth.NewTokenVerifier(verifyKeys, nil, cfg.TokenAudience), cfg.TokenAudience, time.Now())
+					}); err != nil {
+						continue
+					}
+					log.Info("short-lived credential verifier and embedded broker reloaded")
 				}
 			}
 		}()
+		log.Info("embedded authentication broker configured",
+			"listen", embeddedHTTP.Addr().String(),
+			"tls", embeddedHTTP.TLS(),
+			"config", cfg.EmbeddedAuthBrokerConfigPath(),
+		)
 	}
 
 	log.Info("listening",
@@ -473,6 +850,7 @@ func run() error {
 		"tls", srv.TLS != nil,
 		"mtls", srv.RequireServiceIdentity,
 		"short_lived_credentials", srv.Tokens != nil,
+		"embedded_auth_broker", embeddedHTTP != nil,
 		"require_client_key", cfg.RequireClientKey,
 		"raft", cfg.RaftBind,
 		"node", cfg.NodeID,
@@ -480,10 +858,115 @@ func run() error {
 		"database", hostedDatabase.Name,
 	)
 
-	if err := srv.ListenAndServe(ctx, cfg.ListenAddr); err != nil {
-		return err
+	protoErr := make(chan error, 1)
+	go func() { protoErr <- srv.ListenAndServe(ctx, cfg.ListenAddr) }()
+	var embeddedErr chan error
+	if embeddedHTTP != nil {
+		embeddedErr = make(chan error, 1)
+		go func() { embeddedErr <- embeddedHTTP.Serve() }()
+	}
+	var runErr error
+	select {
+	case <-ctx.Done():
+		// srv.ListenAndServe's own ctx.Done() handler drains (bounded by
+		// srv.DrainTimeout) or hard-closes; wait for it to actually finish
+		// instead of racing it with the unconditional srv.Close() below.
+		runErr = <-protoErr
+	case runErr = <-protoErr:
+		stop()
+	case err := <-embeddedErr:
+		runErr = err
+		stop()
+	}
+	if embeddedHTTP != nil {
+		shutCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		shutdownErr := embeddedHTTP.Shutdown(shutCtx)
+		cancel()
+		if runErr == nil {
+			runErr = shutdownErr
+		}
+	}
+	_ = srv.Close()
+	if runErr != nil {
+		return runErr
 	}
 	log.Info("shutting down")
+	return nil
+}
+
+func startEmbeddedAuthBroker(cfg config.Config, users *auth.Store, acl *security.ACL, hostingRegistry *hosting.Registry, opts authbroker.Options) (*authbroker.Broker, *authbroker.HTTPServer, error) {
+	const op = "nextsqld.startEmbeddedAuthBroker"
+	brokerCfg, err := authbroker.LoadConfig(cfg.EmbeddedAuthBrokerConfigPath())
+	if err != nil {
+		return nil, nil, err
+	}
+	if cfg.AuthBrokerListen != "" {
+		brokerCfg.Listen = cfg.AuthBrokerListen
+	}
+	if cfg.TokenAudience != "" && brokerCfg.DeploymentAudience != cfg.TokenAudience {
+		return nil, nil, nerr.New(nerr.InvalidArgument, op, "embedded broker deployment_audience must match token_audience")
+	}
+
+	// Prove at startup that the configured broker signing authority is present
+	// in nextsqld's verify keyset. This prevents a healthy-looking embedded
+	// endpoint from issuing credentials the co-located SQL server cannot verify.
+	issuerKeys, err := auth.OpenTokenKeyset(brokerCfg.IssuingKeyset)
+	if err != nil {
+		return nil, nil, err
+	}
+	verifyKeys, err := auth.OpenTokenKeyset(cfg.TokenKeyset)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := verifyEmbeddedBrokerKeyset(issuerKeys, auth.NewTokenVerifier(verifyKeys, nil, cfg.TokenAudience), brokerCfg.DeploymentAudience, time.Now()); err != nil {
+		return nil, nil, nerr.Wrap(nerr.InvalidArgument, op, "broker issuing key is not accepted by token_verify_keyset", err)
+	}
+
+	if users == nil || acl == nil {
+		return nil, nil, nerr.New(nerr.InvalidArgument, op, "user store and ACL are required")
+	}
+	opts.RoleMembership = func(realmName, principal string) ([]string, error) {
+		var realmID hosting.ID
+		if hostingRegistry != nil && realmName != "" {
+			realm, err := hostingRegistry.LookupRealm(realmName)
+			if err != nil {
+				// Unknown realm: no roles, not an error — mirrors the
+				// !users.HasInRealm(...) case below.
+				return nil, nil
+			}
+			realmID = realm.ID
+		}
+		if !users.HasInRealm(realmID, principal) {
+			return nil, nil
+		}
+		return acl.RolesForInRealm(realmID, principal), nil
+	}
+	broker, err := authbroker.New(brokerCfg, opts)
+	if err != nil {
+		return nil, nil, err
+	}
+	httpServer, err := authbroker.NewHTTPServer(brokerCfg, broker.Handler())
+	if err != nil {
+		return nil, nil, err
+	}
+	return broker, httpServer, nil
+}
+
+func verifyEmbeddedBrokerKeyset(issuerKeys *auth.TokenKeyset, verifier *auth.TokenVerifier, audience string, now time.Time) error {
+	if issuerKeys == nil || verifier == nil {
+		return nerr.New(nerr.InvalidArgument, "nextsqld.verifyEmbeddedBrokerKeyset", "issuer and verifier keysets are required")
+	}
+	probe, _, _, err := issuerKeys.Mint(auth.TokenMintRequest{
+		Principal: "embedded-broker-probe",
+		Audience:  audience,
+		TTL:       time.Minute,
+	}, now)
+	if err != nil {
+		return err
+	}
+	if _, err := verifier.Verify(probe); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -559,10 +1042,13 @@ func openHostedDefault(cfg config.Config) (*hosting.Registry, hosting.Realm, hos
 		_ = registry.Close()
 		return nil, hosting.Realm{}, hosting.Database{}, nerr.New(nerr.Unavailable, "nextsqld", "default realm/database is not active")
 	}
-	if database.Layout != hosting.LayoutLegacyDefault {
-		_ = registry.Close()
-		return nil, hosting.Realm{}, hosting.Database{}, nerr.New(nerr.Unavailable, "nextsqld", "default database layout is not supported by the single-database runtime")
-	}
+	// A LayoutLegacyDefault default is eager-opened below (DATA-DIR/nextsql.db
+	// under --key-file). A LayoutManaged default — produced by a declarative
+	// manifest bootstrap, where every database including the default has its
+	// own key file — is served lazily through dbmanager exactly like every
+	// other managed database (M2-5), so the eager open is skipped and the
+	// process starts with no primary DB handle at all. Both are valid; the
+	// registry decode already rejected any other layout value.
 	return registry, realm, database, nil
 }
 
@@ -648,6 +1134,203 @@ func installArchiver(db *executor.DB, keys crypto.KeyProvider, dir string) error
 	}
 	db.Eng.SetArchiver(arch)
 	return nil
+}
+
+// walRetentionTick advances db's WAL pruning horizon to the newest archived
+// segment's LSN at or before now-retention, so a later MAINTAIN DATABASE can
+// prune local WAL history the policy no longer requires. It never prunes
+// anything itself — see docs/wal.md "Retention". A zero-value backup.Header
+// deliberately excludes any specific base backup from the resolution: this
+// is a live retention policy, not a restore-point lookup, so only archived
+// segments (never a backup that predates the archive) should ever raise the
+// horizon. Returns false, nil (not an error) when nothing has been archived
+// far enough back yet — there is simply nothing to advance to.
+func walRetentionTick(db *executor.DB, archiveDir string, retention time.Duration, now time.Time) (bool, error) {
+	horizon, err := backup.ResolveUntilTime(backup.Header{}, archiveDir, now.Add(-retention))
+	if err != nil {
+		if nerr.HasCode(err, nerr.NotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+	db.SetWALRetentionHorizon(horizon)
+	return true, nil
+}
+
+// startWALRetentionUpdater periodically calls walRetentionTick until ctx is
+// canceled. A no-op unless both retentionMS and archiveDir are set: pruning
+// without an archiver would destroy the only copy of that WAL history, so
+// there is nothing safe to advance the horizon toward without one. The
+// check interval scales with the policy window (1/24th of it, clamped to
+// [1m, 1h]) so a short test-oriented retention window still gets
+// reasonably fine-grained updates without a long real-world window ticking
+// needlessly often.
+func startWALRetentionUpdater(ctx context.Context, db *executor.DB, archiveDir string, retentionMS int, log *slog.Logger) {
+	if db == nil || archiveDir == "" || retentionMS <= 0 {
+		return
+	}
+	retention := time.Duration(retentionMS) * time.Millisecond
+	interval := retention / 24
+	if interval < time.Minute {
+		interval = time.Minute
+	}
+	if interval > time.Hour {
+		interval = time.Hour
+	}
+	tick := func() {
+		if _, err := walRetentionTick(db, archiveDir, retention, time.Now()); err != nil {
+			log.Warn("wal retention: horizon update failed", "error", err)
+		}
+	}
+	go func() {
+		tick() // apply once immediately rather than waiting a full interval
+		t := time.NewTicker(interval)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				tick()
+			}
+		}
+	}()
+}
+
+// diskWatermarkTick reads free space on the volume holding dataDir and
+// applies the warn/reject hysteresis: db.SetDiskWatermarkTripped is set once
+// usage reaches reject%, and only cleared once usage drops back below warn%
+// (not merely below reject%), so a node hovering right at reject% doesn't
+// flap between accepting and rejecting writes. Logging and the metrics
+// counters are edge-triggered — once per state transition, not once per
+// tick — so a steady-state warn/reject condition doesn't spam the log.
+func diskWatermarkTick(db *executor.DB, dataDir string, warnPercent, rejectPercent float64, log *slog.Logger) error {
+	u, err := diskspace.Stat(dataDir)
+	if err != nil {
+		return err
+	}
+	metrics.Default().SetDiskUsage(u.TotalBytes, u.FreeBytes)
+	usedPercent := u.UsedFraction() * 100
+	wasTripped := db.DiskWatermarkTripped()
+	switch {
+	case !wasTripped && usedPercent >= rejectPercent:
+		db.SetDiskWatermarkTripped(true)
+		metrics.Default().AddDiskWatermarkReject()
+		log.Warn("disk watermark: reject threshold reached; rejecting new writes",
+			"used_percent", usedPercent, "reject_percent", rejectPercent, "free_bytes", u.FreeBytes)
+	case wasTripped && usedPercent < warnPercent:
+		db.SetDiskWatermarkTripped(false)
+		log.Info("disk watermark: usage recovered below warn threshold; writes re-enabled",
+			"used_percent", usedPercent, "warn_percent", warnPercent, "free_bytes", u.FreeBytes)
+	case !wasTripped && usedPercent >= warnPercent:
+		metrics.Default().AddDiskWatermarkWarn()
+		log.Warn("disk watermark: warn threshold reached", "used_percent", usedPercent, "warn_percent", warnPercent, "free_bytes", u.FreeBytes)
+	}
+	return nil
+}
+
+// startDiskWatermarkMonitor periodically calls diskWatermarkTick until ctx is
+// canceled. A no-op unless checkMS > 0 (the feature defaults off).
+func startDiskWatermarkMonitor(ctx context.Context, db *executor.DB, dataDir string, checkMS int, warnPercent, rejectPercent float64, log *slog.Logger) {
+	if db == nil || dataDir == "" || checkMS <= 0 {
+		return
+	}
+	interval := time.Duration(checkMS) * time.Millisecond
+	tick := func() {
+		if err := diskWatermarkTick(db, dataDir, warnPercent, rejectPercent, log); err != nil {
+			log.Warn("disk watermark: check failed", "error", err)
+		}
+	}
+	go func() {
+		tick() // apply once immediately rather than waiting a full interval
+		t := time.NewTicker(interval)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				tick()
+			}
+		}
+	}()
+}
+
+// replicaLagTick reads this node's current replication apply backlog
+// (replication.ReplicaHealth.ApplyBacklog — entries known committed but not
+// yet applied locally, the same figure system.replica_health exposes) and
+// records it as a gauge. attached is false on a single-node deployment (no
+// cluster attached), in which case backlog is meaningless and left 0 —
+// there is nothing to monitor.
+func replicaLagTick(db *executor.DB) (backlog uint64, attached bool) {
+	h, ok := db.ClusterHealth()
+	if !ok {
+		return 0, false
+	}
+	metrics.Default().SetReplicaApplyBacklog(h.ApplyBacklog)
+	return h.ApplyBacklog, true
+}
+
+// replicaLagEdge computes the next warned state and whether to log a
+// warning or a recovery line, given the previous state and the current
+// apply backlog. Pure and side-effect free (no metrics/logging calls) so
+// the warn/recover transition logic is unit-testable without a live Raft
+// cluster. Edge-triggered like the disk-watermark warn line — a
+// steady-state warn condition must not spam the log every tick — but with
+// a single threshold, not hysteresis: unlike the disk watermark's
+// warn/reject pair, nothing here gates write admission, so there is no
+// flapping-state risk to guard against with an asymmetric clear line.
+func replicaLagEdge(wasWarned bool, backlog, warnEntries uint64) (nowWarned, logWarn, logRecover bool) {
+	switch {
+	case !wasWarned && backlog >= warnEntries:
+		return true, true, false
+	case wasWarned && backlog < warnEntries:
+		return false, false, true
+	default:
+		return wasWarned, false, false
+	}
+}
+
+// startReplicaLagMonitor periodically calls replicaLagTick until ctx is
+// canceled, logging (and counting via metrics.AddReplicaLagWarn) an
+// edge-triggered warning when this node's apply backlog reaches
+// warnEntries, and a recovery line when it drops back below. A no-op
+// unless checkMS > 0 (the feature defaults off); also effectively idle on
+// a single-node deployment, where replicaLagTick reports attached=false.
+func startReplicaLagMonitor(ctx context.Context, db *executor.DB, checkMS int, warnEntries uint64, log *slog.Logger) {
+	if db == nil || checkMS <= 0 {
+		return
+	}
+	interval := time.Duration(checkMS) * time.Millisecond
+	warned := false
+	tick := func() {
+		backlog, attached := replicaLagTick(db)
+		if !attached {
+			return
+		}
+		var logWarn, logRecover bool
+		warned, logWarn, logRecover = replicaLagEdge(warned, backlog, warnEntries)
+		switch {
+		case logWarn:
+			metrics.Default().AddReplicaLagWarn()
+			log.Warn("replica lag: apply backlog reached warn threshold", "apply_backlog", backlog, "warn_entries", warnEntries)
+		case logRecover:
+			log.Info("replica lag: apply backlog recovered below warn threshold", "apply_backlog", backlog, "warn_entries", warnEntries)
+		}
+	}
+	go func() {
+		tick() // apply once immediately rather than waiting a full interval
+		t := time.NewTicker(interval)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				tick()
+			}
+		}
+	}()
 }
 
 func openKeys(keyFile, keystore string) (crypto.KeyProvider, *crypto.Envelope, error) {

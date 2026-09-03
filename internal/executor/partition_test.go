@@ -1,8 +1,11 @@
 package executor
 
 import (
+	"fmt"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1688,5 +1691,120 @@ func TestPartitionWiseJoin(t *testing.T) {
 	defer db.Close()
 	if got := execOK(t, db.Session(), inner).Rows; len(got) != 3 {
 		t.Fatalf("reopened partition-wise join = %+v", got)
+	}
+}
+
+// TestPartitionCrossPartitionUniqueSustainedConcurrentWrites is a sustained,
+// randomized adversarial stress test for the cross-partition UNIQUE probe —
+// the same shape of test (TestRebuildIndexOnlineConcurrentWrites,
+// internal/executor/online_rebuild_test.go) that found a real
+// data-integrity bug in REBUILD INDEX ... ONLINE (TODO.md log #93).
+// TestPartitionCrossPartitionUniqueSerializedWriters above is a single,
+// hand-arranged two-writer race with one deterministic window; this instead
+// runs many goroutines for a while, forcing frequent UNIQUE collisions
+// across four partitions via a small value pool, and checks the one
+// invariant that actually matters: no duplicate ever gets committed,
+// regardless of which partition it lands in or how the races interleave.
+func TestPartitionCrossPartitionUniqueSustainedConcurrentWrites(t *testing.T) {
+	db := testDB(t)
+	s := db.Session()
+	execOK(t, s, `CREATE TABLE cpu_race (
+		shard STRING NOT NULL,
+		id DECIMAL(10,0) NOT NULL,
+		email STRING NOT NULL,
+		PRIMARY KEY (shard, id)
+	) PARTITION BY LIST (shard) (
+		PARTITION s0 VALUES IN ('0'),
+		PARTITION s1 VALUES IN ('1'),
+		PARTITION s2 VALUES IN ('2'),
+		PARTITION s3 VALUES IN ('3')
+	)`)
+	execOK(t, s, `CREATE UNIQUE INDEX ux_cpu_email ON cpu_race (email)`)
+
+	const idSpace = 400   // per-shard id range, so shard+id stays a stable PK per slot
+	const emailPool = 24  // small on purpose: forces frequent cross-shard collisions
+	var stop atomic.Bool
+	var writes atomic.Int64
+	var wg sync.WaitGroup
+	wg.Add(4)
+	for w := 0; w < 4; w++ {
+		go func(seed int) {
+			defer wg.Done()
+			ws := db.Session()
+			r := uint64(seed*2654435761 + 1)
+			tolerant := func(err error) bool {
+				return nerr.HasCode(err, nerr.Serialization) || nerr.HasCode(err, nerr.Deadlock) ||
+					nerr.HasCode(err, nerr.AlreadyExists) || nerr.HasCode(err, nerr.NotFound)
+			}
+			for !stop.Load() {
+				r = r*6364136223846793005 + 1442695040888963407
+				shard := int(r>>17) % 4
+				id := int(r>>29) % idSpace
+				email := int(r>>41) % emailPool
+				var q string
+				switch r >> 61 & 3 {
+				case 0, 1: // insert (or reinsert into a slot another writer just deleted)
+					q = fmt.Sprintf(`INSERT INTO cpu_race (shard, id, email) VALUES ('%d', %d, 'e%d@x')`, shard, id, email)
+				case 2: // update email of an existing row, possibly colliding with another shard
+					q = fmt.Sprintf(`UPDATE cpu_race SET email = 'e%d@x' WHERE shard = '%d' AND id = %d`, email, shard, id)
+				default: // delete, freeing the slot and its email for reuse
+					q = fmt.Sprintf(`DELETE FROM cpu_race WHERE shard = '%d' AND id = %d`, shard, id)
+				}
+				if _, err := ws.Exec(q); err != nil {
+					if tolerant(err) {
+						continue
+					}
+					t.Errorf("concurrent write %q: %v", q, err)
+					return
+				}
+				writes.Add(1)
+			}
+		}(w + 1)
+	}
+
+	for writes.Load() < 800 {
+		time.Sleep(time.Millisecond)
+	}
+	stop.Store(true)
+	wg.Wait()
+
+	if err := db.LastReclaimError(); err != nil {
+		t.Fatalf("reclaim error: %v", err)
+	}
+
+	plainCount := execOK(t, s, `SELECT COUNT(*) FROM cpu_race`)
+	allRaw := execOK(t, s, `SELECT shard, id, email FROM cpu_race`)
+	t.Logf("DEBUG plainCount=%v rawRowCount=%d", plainCount.Rows, len(allRaw.Rows))
+	groupSum := execOK(t, s, `SELECT email, COUNT(*) AS c FROM cpu_race GROUP BY email`)
+	sum := 0
+	for _, r := range groupSum.Rows {
+		sum += int(r[1].Dec.Coef.Int64())
+	}
+	t.Logf("DEBUG groupBy distinct emails=%d summedCount=%d", len(groupSum.Rows), sum)
+
+	dupes := execOK(t, s, `SELECT email, COUNT(*) AS c FROM cpu_race GROUP BY email HAVING c > 1`)
+	if len(dupes.Rows) != 0 {
+		for _, d := range dupes.Rows {
+			email := d[0].Str
+			rows := execOK(t, s, fmt.Sprintf(`SELECT shard, id FROM cpu_race WHERE email = '%s'`, email))
+			t.Logf("DEBUG duplicate email=%s rows=%+v", email, rows.Rows)
+		}
+		t.Fatalf("cross-partition UNIQUE admitted duplicates: %+v", dupes.Rows)
+	}
+	// Cross-check the same invariant against the index path directly, in
+	// case the aggregate query above and the UNIQUE index disagree about
+	// what's actually there.
+	all := execOK(t, s, `SELECT shard, id, email FROM cpu_race`)
+	seen := make(map[string][2]string, len(all.Rows))
+	for _, row := range all.Rows {
+		email := row[2].Str
+		if prior, ok := seen[email]; ok {
+			t.Fatalf("duplicate email %q: shard=%s id=%s and shard=%s id=%s", email, prior[0], prior[1], row[0].Str, row[1].Dec.String())
+		}
+		seen[email] = [2]string{row[0].Str, row[1].Dec.String()}
+		lookup := execOK(t, s, fmt.Sprintf(`SELECT shard, id FROM cpu_race WHERE email = '%s'`, email))
+		if len(lookup.Rows) != 1 || lookup.Rows[0][0].Str != row[0].Str || lookup.Rows[0][1].Dec.String() != row[1].Dec.String() {
+			t.Fatalf("index lookup for email %q = %+v, want the single heap row shard=%s id=%s", email, lookup.Rows, row[0].Str, row[1].Dec.String())
+		}
 	}
 }

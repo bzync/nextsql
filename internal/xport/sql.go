@@ -1,7 +1,9 @@
 package xport
 
 import (
+	"encoding/hex"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 
@@ -43,7 +45,10 @@ func createTableSQLWithParents(t *catalog.Table, parents map[string]*catalog.Tab
 		}
 		b.WriteString(quoteIdent(c.Name))
 		b.WriteByte(' ')
-		b.WriteString(sqlType(c.Type))
+		b.WriteString(sqlType(c.LogicalType()))
+		if c.ClientEncrypted() {
+			b.WriteString(" ENCRYPTED CLIENT")
+		}
 		singlePK := len(t.PK) == 1 && t.PK[0] == i
 		if singlePK {
 			b.WriteString(" PRIMARY KEY")
@@ -288,11 +293,22 @@ func sqlLiteral(v types.Value) (string, error) {
 	switch v.Typ.Kind {
 	case types.KindUUID:
 		return "'" + types.FormatUUID(v.UUID) + "'", nil
-	case types.KindString, types.KindText:
+	case types.KindString, types.KindText, types.KindChar, types.KindVarchar:
 		return "'" + strings.ReplaceAll(v.Str, "'", "''") + "'", nil
+	case types.KindBlob:
+		return "X'" + hex.EncodeToString([]byte(v.Str)) + "'", nil
 	case types.KindDecimal:
 		return v.Dec.String(), nil
-	case types.KindTimestampTZ:
+	case types.KindInt8, types.KindInt16, types.KindInt32, types.KindInt64:
+		return strconv.FormatInt(v.Int, 10), nil
+	case types.KindUint8, types.KindUint16, types.KindUint32, types.KindUint64:
+		return strconv.FormatUint(v.Uint, 10), nil
+	case types.KindFloat32, types.KindFloat64:
+		if math.IsNaN(v.Flt) || math.IsInf(v.Flt, 0) {
+			return "'" + v.String() + "'", nil
+		}
+		return v.String(), nil
+	case types.KindTimestampTZ, types.KindTimestamp, types.KindDate, types.KindTime:
 		return "'" + v.String() + "'", nil
 	case types.KindBool:
 		if v.Bool {

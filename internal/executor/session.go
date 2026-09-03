@@ -5,11 +5,13 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/bzync/nextsql/internal/auth"
 	"github.com/bzync/nextsql/internal/catalog"
 	"github.com/bzync/nextsql/internal/executor/vector"
+	"github.com/bzync/nextsql/internal/hosting"
 	"github.com/bzync/nextsql/internal/nerr"
 	"github.com/bzync/nextsql/internal/scheduler"
 	"github.com/bzync/nextsql/internal/security"
@@ -74,10 +76,20 @@ type Session struct {
 	workflowOverlay      map[string]*catalog.Workflow
 	triggerOverlay       map[string]*catalog.Trigger
 	scheduleOverlay      map[string]*catalog.Schedule
+	resourceGroupOverlay map[string]*catalog.ResourceGroup
 	pending              *pending
 	trace                *optimizer.Node
 	limits               scheduler.Limits
 	qbudget              *scheduler.Budget
+	// txnTimeout bounds an open transaction's total wall-clock lifetime; 0
+	// (the default) is unbounded. See Session.SetTxnTimeout.
+	txnTimeout time.Duration
+	// resourceGroup is this session's assigned workload-governance class
+	// (SET RESOURCE GROUP name / RESET RESOURCE GROUP), empty meaning none.
+	// Same-goroutine-use-only, like execSQL above — not published for
+	// cross-session introspection (system.sessions has no resource_group
+	// column yet).
+	resourceGroup        string
 	ftHL                 *ftHighlightState
 	params               []Param
 	subqueryResults      map[uint64]*Result
@@ -93,6 +105,15 @@ type Session struct {
 	registry  *security.Registry
 	remote    string
 	execSQL   string // current statement text; reserved history DDL matching
+	// hostingRegistry backs system.realms/system.databases (M2-4a). Nil on
+	// a legacy/non-hosted deployment — those views then return zero rows,
+	// never an error.
+	hostingRegistry *hosting.Registry
+	// realmID scopes every auth.Store/security.ACL check this session makes
+	// (M2-4b-1); the zero value hosting.ID{} means deployment-wide, which is
+	// every session that never had SetRealmID called on it (every
+	// non-hosted deployment, unchanged from before this field existed).
+	realmID hosting.ID
 
 	dirtyHNSW       bool
 	pendingHNSW     map[string]*lockedMem
@@ -120,7 +141,106 @@ type Session struct {
 	readConsistency ReadConsistency
 	// readStaleness bounds a BOUNDED read. Zero selects DefaultMaxStaleness.
 	readStaleness time.Duration
+
+	// id/connectedAt are set once by DB.RegisterSession, at network-connect
+	// time; a session never registered (embedded/CLI/test use) keeps id 0
+	// and is invisible to system.sessions.
+	id          uint64
+	connectedAt time.Time
+
+	// queryMu guards the currently-executing-statement snapshot read cross-
+	// goroutine by system.active_queries/system.sessions. s.execSQL above
+	// stays unsynchronized (same-goroutine use only, in exec.go).
+	queryMu    sync.Mutex
+	queryID    uint64
+	queryText  string
+	queryStart time.Time
+
+	// txnMu guards the open-transaction snapshot read cross-goroutine by
+	// system.transactions. s.x itself is never read/written outside this
+	// session's own goroutine.
+	txnMu       sync.Mutex
+	txnActive   bool
+	txnID       format.TxnID
+	txnIso      txn.Isolation
+	txnReadOnly bool
+	txnStart    time.Time
 }
+
+// nextQueryID assigns process-wide unique ids to executing statements, for
+// system.active_queries.
+var nextQueryID atomic.Uint64
+
+// beginQuery publishes the currently-executing statement for cross-session
+// introspection (system.active_queries). Call at the start of execAdmitted.
+func (s *Session) beginQuery(sql string) {
+	id := nextQueryID.Add(1)
+	s.queryMu.Lock()
+	s.queryID = id
+	s.queryText = sql
+	s.queryStart = time.Now()
+	s.queryMu.Unlock()
+}
+
+// endQuery clears the published currently-executing statement. Call in the
+// same defer that resets s.execSQL in execAdmitted.
+func (s *Session) endQuery() {
+	s.queryMu.Lock()
+	s.queryID = 0
+	s.queryText = ""
+	s.queryMu.Unlock()
+}
+
+// CurrentQuery reports the SQL text and start time of the statement this
+// session is presently executing, if any. Safe to call from another
+// goroutine.
+func (s *Session) CurrentQuery() (id uint64, sql string, start time.Time, running bool) {
+	s.queryMu.Lock()
+	defer s.queryMu.Unlock()
+	return s.queryID, s.queryText, s.queryStart, s.queryText != ""
+}
+
+// setTxnActive publishes an open transaction for cross-session introspection
+// (system.transactions). Call right after s.x is assigned.
+func (s *Session) setTxnActive(h *txn.Handle, readOnly bool) {
+	if h == nil {
+		return
+	}
+	s.txnMu.Lock()
+	s.txnID = h.ID
+	s.txnIso = h.Iso
+	s.txnReadOnly = readOnly
+	s.txnActive = true
+	s.txnStart = time.Now()
+	s.txnMu.Unlock()
+}
+
+// clearTxnActive clears the published open-transaction snapshot. Call
+// wherever s.x is reset to nil (commit, rollback/abort).
+func (s *Session) clearTxnActive() {
+	s.txnMu.Lock()
+	s.txnActive = false
+	s.txnMu.Unlock()
+}
+
+// TxnSnapshot reports this session's currently open transaction, if any.
+// Safe to call from another goroutine.
+func (s *Session) TxnSnapshot() (id format.TxnID, iso txn.Isolation, readOnly bool, start time.Time, active bool) {
+	s.txnMu.Lock()
+	defer s.txnMu.Unlock()
+	return s.txnID, s.txnIso, s.txnReadOnly, s.txnStart, s.txnActive
+}
+
+// SessionID is the id assigned by DB.RegisterSession (0 if never
+// registered).
+func (s *Session) SessionID() uint64 { return s.id }
+
+// ConnectedAt is when DB.RegisterSession registered this session (zero if
+// never registered).
+func (s *Session) ConnectedAt() time.Time { return s.connectedAt }
+
+// Remote is the client address set by SetRemote, if any.
+func (s *Session) Remote() string { return s.remote }
 
 // SetReadConsistency selects how this session's reads observe replicated
 // state. STRONG (the default) serves every read on the leader behind a
@@ -174,14 +294,16 @@ func (s *Session) authAllowed(user string, priv security.Privilege, scope securi
 	if s.acl == nil {
 		return true
 	}
-	return s.acl.AllowedScoped(user, s.authRoles, priv, scope, object)
+	return s.acl.AllowedScopedInRealm(s.realmID, user, s.authRoles, priv, scope, object)
 }
-func (s *Session) User() string                     { return s.user }
-func (s *Session) SetACL(a *security.ACL)           { s.acl = a }
-func (s *Session) SetAudit(l *security.Log)         { s.audit = l }
-func (s *Session) SetAuth(st *auth.Store)           { s.users = st }
-func (s *Session) SetRegistry(r *security.Registry) { s.registry = r }
-func (s *Session) SetRemote(addr string)            { s.remote = addr }
+func (s *Session) User() string                           { return s.user }
+func (s *Session) SetACL(a *security.ACL)                 { s.acl = a }
+func (s *Session) SetAudit(l *security.Log)               { s.audit = l }
+func (s *Session) SetAuth(st *auth.Store)                 { s.users = st }
+func (s *Session) SetRegistry(r *security.Registry)       { s.registry = r }
+func (s *Session) SetHostingRegistry(r *hosting.Registry) { s.hostingRegistry = r }
+func (s *Session) SetRealmID(id hosting.ID)               { s.realmID = id }
+func (s *Session) SetRemote(addr string)                  { s.remote = addr }
 
 type pending struct {
 	heaps              map[string]*btree.Tree
@@ -345,6 +467,17 @@ func (s *Session) InTxn() bool { return s.x != nil }
 
 func (s *Session) SetLimits(l scheduler.Limits) { s.limits = l }
 
+// SetTxnTimeout bounds how long a transaction opened by this session may
+// stay open (BEGIN, or the first statement of an implicit autocommit
+// transaction, to COMMIT/ROLLBACK) before the next statement dispatched
+// inside it force-aborts and fails Exhausted. d <= 0 disables the bound.
+func (s *Session) SetTxnTimeout(d time.Duration) {
+	if d < 0 {
+		d = 0
+	}
+	s.txnTimeout = d
+}
+
 func (s *Session) budget() *scheduler.Budget {
 	if s.qbudget == nil {
 		s.qbudget = scheduler.NewBudget(nil, s.limitsOrDefault())
@@ -353,11 +486,31 @@ func (s *Session) budget() *scheduler.Budget {
 }
 
 func (s *Session) limitsOrDefault() scheduler.Limits {
-	if s.limits.Workers == 0 && s.limits.Memory == 0 {
-		return scheduler.DefaultLimits()
+	lim := s.limits
+	if lim.Workers == 0 && lim.Memory == 0 {
+		lim = scheduler.DefaultLimits()
 	}
-	return s.limits
+	if s.resourceGroup != "" && s.db != nil {
+		if g, ok := s.db.resourceGroup(s.resourceGroup); ok {
+			// 0 on the group means unset/unbounded: leave the session/server
+			// value in place rather than overriding it with zero. Workers is
+			// still clamped to [1, MaxWorkers] by Limits.normalized() inside
+			// scheduler.NewBudget, so a group can never request more workers
+			// than the process-wide ceiling allows.
+			if g.Workers > 0 {
+				lim.Workers = int(g.Workers)
+			}
+			if g.MemoryBytes > 0 {
+				lim.Memory = g.MemoryBytes
+			}
+		}
+	}
+	return lim
 }
+
+// ResourceGroup returns the session's currently assigned resource group
+// name, or "" if none (SET RESOURCE GROUP / RESET RESOURCE GROUP).
+func (s *Session) ResourceGroup() string { return s.resourceGroup }
 
 func (s *Session) workers() int {
 	return s.budget().Workers()
@@ -377,7 +530,13 @@ func (s *Session) Exec(sql string) (*Result, error) {
 // ExecContext runs one statement with a parent context and typed parameters.
 func (s *Session) ExecContext(ctx context.Context, sql string, params []Param) (*Result, error) {
 	if s != nil && s.db != nil && s.db.admit != nil {
-		rel, err := s.db.admit.Acquire(ctx)
+		priority := int32(0)
+		if s.resourceGroup != "" {
+			if g, ok := s.db.resourceGroup(s.resourceGroup); ok {
+				priority = g.Priority
+			}
+		}
+		rel, err := s.db.admit.AcquireWithPriority(ctx, priority)
 		if err != nil {
 			if s.db.metrics != nil {
 				s.db.metrics.AddRejected()
@@ -387,6 +546,26 @@ func (s *Session) ExecContext(ctx context.Context, sql string, params []Param) (
 		defer rel()
 		if s.db.metrics != nil {
 			s.db.metrics.AddAdmitted()
+		}
+	}
+	// A resource group's MaxConcurrency, when set, is a second, strictly
+	// additional gate layered on top of the process-wide db.admit above —
+	// never a substitute for it. A session with no group assigned, or one
+	// assigned to an unbounded (MaxConcurrency == 0) group, sees no change
+	// here (resourceGroupGate returns nil, and scheduler.Admission.Acquire on
+	// a nil receiver is a documented no-op). This is what makes "resource
+	// groups cannot bypass global safety limits" true by construction rather
+	// than by convention.
+	if s != nil && s.db != nil && s.resourceGroup != "" {
+		if gate := s.db.resourceGroupGate(s.resourceGroup); gate != nil {
+			rel, err := gate.Acquire(ctx)
+			if err != nil {
+				if s.db.metrics != nil {
+					s.db.metrics.AddRejected()
+				}
+				return nil, err
+			}
+			defer rel()
 		}
 	}
 	start := time.Now()
@@ -411,17 +590,25 @@ func (s *Session) ExecContext(ctx context.Context, sql string, params []Param) (
 func (s *Session) execAdmitted(ctx context.Context, sql string, params []Param) (*Result, error) {
 	s.params = params
 	s.execSQL = sql
+	s.beginQuery(sql)
 	s.subqueryResults = make(map[uint64]*Result)
 	s.cteRows = make(map[uint64][][]types.Value)
 	defer func() {
 		s.params = nil
 		s.execSQL = ""
+		s.endQuery()
 		s.subqueryResults = nil
 		s.cteRows = nil
 	}()
 	stmt, err := parser.Parse(sql)
 	if err != nil {
 		return nil, err
+	}
+	if s.x != nil && s.txnTimeout > 0 {
+		if _, _, _, start, active := s.TxnSnapshot(); active && time.Since(start) > s.txnTimeout {
+			_ = s.abort()
+			return nil, nerr.New(nerr.Exhausted, "executor.Exec", "transaction timeout exceeded")
+		}
 	}
 	if st, ok := stmt.(ast.Maintain); ok {
 		if st.Index != "" {
@@ -452,6 +639,109 @@ func (s *Session) execAdmitted(ctx context.Context, sql string, params []Param) 
 		}
 		s.auditRecord(security.ActionDDL, st.Table, err)
 		return &Result{Affected: int64(n)}, err
+	}
+	if _, ok := stmt.(ast.TransferLeader); ok {
+		if err := s.authorize(stmt); err != nil {
+			s.auditRecord(security.ActionLeaderTransfer, "", err)
+			return nil, err
+		}
+		if s.InTxn() {
+			return nil, nerr.New(nerr.InvalidArgument, "executor.TransferLeader", "CLUSTER TRANSFER LEADER cannot run inside a transaction")
+		}
+		if err := s.requireLeader(true); err != nil {
+			return nil, err
+		}
+		err := s.db.TransferLeadership()
+		s.auditRecord(security.ActionLeaderTransfer, "", err)
+		if err != nil {
+			return nil, err
+		}
+		return &Result{Columns: []string{"result"}, Rows: [][]types.Value{{types.TextValue("transfer_initiated")}}}, nil
+	}
+	if st, ok := stmt.(ast.ClusterDrain); ok {
+		if err := s.authorize(stmt); err != nil {
+			s.auditRecord(security.ActionClusterDrain, "", err)
+			return nil, err
+		}
+		if s.InTxn() {
+			return nil, nerr.New(nerr.InvalidArgument, "executor.ClusterDrain", "CLUSTER DRAIN cannot run inside a transaction")
+		}
+		// No requireLeader gate: draining is purely local to the node this
+		// connection reached, unlike TransferLeader/Maintain/CreateDatabase
+		// which must go through the replicated write path. A follower is
+		// exactly as drainable as a leader — that is the common case for
+		// planned per-node maintenance in a cluster.
+		err := s.db.Drain(time.Duration(st.TimeoutMS) * time.Millisecond)
+		s.auditRecord(security.ActionClusterDrain, "", err)
+		if err != nil {
+			return nil, err
+		}
+		return &Result{Columns: []string{"result"}, Rows: [][]types.Value{{types.TextValue("drain_initiated")}}}, nil
+	}
+	if st, ok := stmt.(ast.ClusterMaintenance); ok {
+		if err := s.authorize(stmt); err != nil {
+			s.auditRecord(security.ActionClusterMaintenance, "", err)
+			return nil, err
+		}
+		if s.InTxn() {
+			return nil, nerr.New(nerr.InvalidArgument, "executor.ClusterMaintenance", "CLUSTER MAINTENANCE cannot run inside a transaction")
+		}
+		// No requireLeader gate: like ClusterDrain, this is purely local to
+		// the node this connection reached.
+		if st.Enable {
+			s.db.EnableMaintenanceMode()
+		} else {
+			s.db.DisableMaintenanceMode()
+		}
+		s.auditRecord(security.ActionClusterMaintenance, "", nil)
+		result := "maintenance_disabled"
+		if st.Enable {
+			result = "maintenance_enabled"
+		}
+		return &Result{Columns: []string{"result"}, Rows: [][]types.Value{{types.TextValue(result)}}}, nil
+	}
+	if _, ok := stmt.(ast.ClusterReconcileConfirm); ok {
+		if err := s.authorize(stmt); err != nil {
+			s.auditRecord(security.ActionClusterReconcile, "", err)
+			return nil, err
+		}
+		if s.InTxn() {
+			return nil, nerr.New(nerr.InvalidArgument, "executor.ClusterReconcileConfirm", "CLUSTER RECONCILE CONFIRM cannot run inside a transaction")
+		}
+		// No requireLeader gate: like ClusterMaintenance/ClusterDrain, this
+		// is purely local to the node this connection reached — the
+		// replication-suspect flag it clears is itself node-local.
+		err := s.db.ConfirmReplicationReconciled()
+		s.auditRecord(security.ActionClusterReconcile, "", err)
+		if err != nil {
+			return nil, err
+		}
+		return &Result{Columns: []string{"result"}, Rows: [][]types.Value{{types.TextValue("replication_reconciled")}}}, nil
+	}
+	if st, ok := stmt.(ast.SetResourceGroup); ok {
+		if err := s.authorize(stmt); err != nil {
+			s.auditRecord(security.ActionResourceGroupAssign, st.Name, err)
+			return nil, err
+		}
+		if _, ok := s.lookupResourceGroup(st.Name); !ok {
+			err := nerr.New(nerr.NotFound, "executor.SetResourceGroup", "resource group not found")
+			s.auditRecord(security.ActionResourceGroupAssign, st.Name, err)
+			return nil, err
+		}
+		s.resourceGroup = st.Name
+		s.qbudget = nil
+		s.auditRecord(security.ActionResourceGroupAssign, st.Name, nil)
+		return &Result{}, nil
+	}
+	if _, ok := stmt.(ast.ResetResourceGroup); ok {
+		if err := s.authorize(stmt); err != nil {
+			s.auditRecord(security.ActionResourceGroupAssign, "", err)
+			return nil, err
+		}
+		s.resourceGroup = ""
+		s.qbudget = nil
+		s.auditRecord(security.ActionResourceGroupAssign, "", nil)
+		return &Result{}, nil
 	}
 	if s != nil && s.db != nil && !s.txnGuard {
 		s.acquireTxnGuard()
@@ -499,6 +789,24 @@ func (s *Session) execAdmitted(ctx context.Context, sql string, params []Param) 
 		if err != nil {
 			return nil, err
 		}
+		if resolved, ok := stmt.(ast.RebuildIndex); ok && resolved.Online {
+			if err := s.authorize(resolved); err != nil {
+				s.auditRecord(security.ActionDDL, resolved.Table, err)
+				return nil, err
+			}
+			if s.InTxn() {
+				return nil, nerr.New(nerr.InvalidArgument, "executor.RebuildIndex", "REBUILD INDEX ... ONLINE cannot run inside a transaction")
+			}
+			if err := s.requireNotMaintenance(true); err != nil {
+				return nil, err
+			}
+			if err := s.requireLeader(true); err != nil {
+				return nil, err
+			}
+			res, rerr := s.rebuildIndexOnline(ctx, resolved.Table, resolved.Name)
+			s.auditRecord(security.ActionDDL, resolved.Table, rerr)
+			return res, rerr
+		}
 	}
 	if isReadStmt(stmt) {
 		if err := s.requireReadConsistency(); err != nil {
@@ -524,7 +832,7 @@ func (s *Session) execAdmitted(ctx context.Context, sql string, params []Param) 
 	}
 	nextID := s.db.Cat.PeekNext()
 	switch st := stmt.(type) {
-	case ast.CreateTable, ast.CreateWorkflow, ast.CreateTrigger, ast.CreateSchedule:
+	case ast.CreateTable, ast.CreateWorkflow, ast.CreateTrigger, ast.CreateSchedule, ast.CreateResourceGroup:
 		// Reserve a catalog identity atomically. Gaps after failed DDL are
 		// harmless; duplicate stable identities under concurrent DDL are not.
 		nextID = s.db.Cat.NextID()
@@ -535,7 +843,7 @@ func (s *Session) execAdmitted(ctx context.Context, sql string, params []Param) 
 			nextID = s.db.Cat.NextID()
 		}
 	}
-	bound, err := binder.BindAutomation(stmt, s.lookup, s.lookupWorkflow, s.listWorkflows, s.lookupTrigger, s.listTriggers, s.lookupSchedule, s.listSchedules, nextID, owner)
+	bound, err := binder.BindAutomation(stmt, s.lookup, s.lookupWorkflow, s.listWorkflows, s.lookupTrigger, s.listTriggers, s.lookupSchedule, s.listSchedules, s.lookupResourceGroup, nextID, owner)
 	if err != nil {
 		return nil, err
 	}
@@ -577,6 +885,9 @@ func (s *Session) execAdmitted(ctx context.Context, sql string, params []Param) 
 		s.qbudget.Close()
 		s.qbudget = nil
 	}()
+	if err := s.requireNotMaintenance(isMutating(out.Plan)); err != nil {
+		return nil, err
+	}
 	if err := s.requireLeader(isMutating(out.Plan)); err != nil {
 		return nil, err
 	}
@@ -593,6 +904,25 @@ func (s *Session) execAdmitted(ctx context.Context, sql string, params []Param) 
 		s.auditRecord(security.ActionCDCSubscribe, sqlObject(stmt), runErr)
 	}
 	return res, runErr
+}
+
+// requireNotMaintenance rejects a mutating statement while this node is in
+// maintenance mode (CLUSTER MAINTENANCE ENABLE) or has tripped its disk
+// watermark (see DB.SetDiskWatermarkTripped). Uses the same isMutating
+// classification as requireLeader, so BEGIN is blocked along with DML/DDL —
+// a read-only transaction cannot be distinguished from a write one before it
+// opens; run autocommit SELECTs to inspect state during maintenance.
+func (s *Session) requireNotMaintenance(write bool) error {
+	if !write || s == nil || s.db == nil {
+		return nil
+	}
+	if s.db.InMaintenanceMode() {
+		return nerr.New(nerr.Unavailable, "executor.MaintenanceMode", "server is in maintenance mode; writes are rejected until CLUSTER MAINTENANCE DISABLE")
+	}
+	if s.db.DiskWatermarkTripped() {
+		return nerr.New(nerr.Unavailable, "executor.DiskWatermark", "server is low on disk space; writes are rejected until free space recovers")
+	}
+	return nil
 }
 
 func (s *Session) requireLeader(write bool) error {
@@ -650,7 +980,7 @@ func isReadStmt(stmt ast.Stmt) bool {
 
 func isMutating(plan planner.Logical) bool {
 	switch plan.(type) {
-	case planner.CreateTable, planner.CreateDatabase, planner.CreateWorkflow, planner.AlterWorkflow, planner.DropWorkflow, planner.RunWorkflow, planner.CreateTrigger, planner.AlterTrigger, planner.DropTrigger, planner.CreateSchedule, planner.AlterSchedule, planner.DropSchedule, planner.CancelTask, planner.DropTable, planner.DropIndex, planner.RebuildIndex, planner.AlterTable, planner.CreateIndex, planner.Insert, planner.Upsert, planner.Update, planner.Delete, planner.Begin, planner.Commit, planner.Rollback:
+	case planner.CreateTable, planner.CreateDatabase, planner.CreateWorkflow, planner.AlterWorkflow, planner.DropWorkflow, planner.RunWorkflow, planner.CreateTrigger, planner.AlterTrigger, planner.DropTrigger, planner.CreateSchedule, planner.AlterSchedule, planner.DropSchedule, planner.CreateResourceGroup, planner.AlterResourceGroup, planner.DropResourceGroup, planner.CancelTask, planner.DropTable, planner.DropIndex, planner.RebuildIndex, planner.AlterTable, planner.CreateIndex, planner.Insert, planner.Upsert, planner.Update, planner.Delete, planner.Begin, planner.Commit, planner.Rollback:
 		return true
 	default:
 		return false
@@ -848,6 +1178,39 @@ func (s *Session) listSchedules() []*catalog.Schedule {
 	return out
 }
 
+func (s *Session) lookupResourceGroup(name string) (*catalog.ResourceGroup, bool) {
+	if s.resourceGroupOverlay != nil {
+		if group, ok := s.resourceGroupOverlay[name]; ok {
+			if group == nil {
+				return nil, false
+			}
+			return group.Clone(), true
+		}
+	}
+	return s.db.resourceGroup(name)
+}
+
+func (s *Session) listResourceGroups() []*catalog.ResourceGroup {
+	byName := make(map[string]*catalog.ResourceGroup)
+	for _, group := range s.db.resourceGroupList() {
+		byName[group.Name] = group
+	}
+	for name, group := range s.resourceGroupOverlay {
+		if group == nil {
+			delete(byName, name)
+			continue
+		}
+		if clone := group.Clone(); clone != nil {
+			byName[name] = clone
+		}
+	}
+	out := make([]*catalog.ResourceGroup, 0, len(byName))
+	for _, group := range byName {
+		out = append(out, group)
+	}
+	return out
+}
+
 func (s *Session) statsGen() uint64 {
 	g := s.db.Cat.Generation()
 	if s.pending != nil && len(s.pending.stats) > 0 {
@@ -942,6 +1305,7 @@ func (s *Session) startRead(iso txn.Isolation) error {
 		return err
 	}
 	s.x = newXact(owner, iso)
+	s.setTxnActive(owner.Handle(), s.x.readOnly)
 	if s.overlay == nil {
 		s.overlay = make(map[string]*catalog.Table)
 	}
@@ -953,6 +1317,9 @@ func (s *Session) startRead(iso txn.Isolation) error {
 	}
 	if s.scheduleOverlay == nil {
 		s.scheduleOverlay = make(map[string]*catalog.Schedule)
+	}
+	if s.resourceGroupOverlay == nil {
+		s.resourceGroupOverlay = make(map[string]*catalog.ResourceGroup)
 	}
 	s.pending = newPending()
 	return nil
@@ -966,6 +1333,7 @@ func (s *Session) start(iso txn.Isolation) error {
 		return err
 	}
 	s.x = newXact(owner, iso)
+	s.setTxnActive(owner.Handle(), s.x.readOnly)
 	if s.overlay == nil {
 		s.overlay = make(map[string]*catalog.Table)
 	}
@@ -977,6 +1345,9 @@ func (s *Session) start(iso txn.Isolation) error {
 	}
 	if s.scheduleOverlay == nil {
 		s.scheduleOverlay = make(map[string]*catalog.Schedule)
+	}
+	if s.resourceGroupOverlay == nil {
+		s.resourceGroupOverlay = make(map[string]*catalog.ResourceGroup)
 	}
 	s.pending = newPending()
 	return nil
@@ -1016,10 +1387,12 @@ func (s *Session) commit() (*Result, error) {
 	}
 	if err := s.x.commit(); err != nil {
 		s.x = nil
+		s.clearTxnActive()
 		s.overlay = nil
 		s.workflowOverlay = nil
 		s.triggerOverlay = nil
 		s.scheduleOverlay = nil
+		s.resourceGroupOverlay = nil
 		s.pending = nil
 		s.dirtyHNSW = false
 		s.pendingHNSW = nil
@@ -1068,6 +1441,13 @@ func (s *Session) commit() (*Result, error) {
 			continue
 		}
 		s.db.putSchedule(schedule)
+	}
+	for name, group := range s.resourceGroupOverlay {
+		if group == nil {
+			s.db.removeResourceGroup(name)
+			continue
+		}
+		s.db.putResourceGroup(group)
 	}
 	if s.pending != nil {
 		for name, tr := range s.pending.heaps {
@@ -1160,10 +1540,12 @@ func (s *Session) commit() (*Result, error) {
 		taskCancels = append(taskCancels, s.pending.taskCancels...)
 	}
 	s.x = nil
+	s.clearTxnActive()
 	s.overlay = nil
 	s.workflowOverlay = nil
 	s.triggerOverlay = nil
 	s.scheduleOverlay = nil
+	s.resourceGroupOverlay = nil
 	s.pending = nil
 	s.dirtyHNSW = false
 	s.pendingHNSW = nil
@@ -1201,18 +1583,34 @@ func (s *Session) rollback() (*Result, error) {
 	return &Result{}, err
 }
 
+// Abort force-rolls-back this session's open transaction, if any, releasing
+// its locks and resources without a client-issued ROLLBACK. It is a no-op
+// when no transaction is open. Used by the protocol server when a connection
+// is torn down (idle-in-transaction timeout, a forced drain close, or a bare
+// disconnect) while a transaction is still open, so the transaction's locks
+// are never left held by a session nothing will ever resume.
+func (s *Session) Abort() error {
+	if s == nil || s.x == nil {
+		return nil
+	}
+	return s.abort()
+}
+
 func (s *Session) abort() error {
 	var err error
 	if s.x != nil {
 		err = s.x.rollback()
+		s.reclaimEmptyTreesOnRollback()
 	}
 	s.fkBroken = false
 	s.conflictWrite = false
 	s.x = nil
+	s.clearTxnActive()
 	s.overlay = nil
 	s.workflowOverlay = nil
 	s.triggerOverlay = nil
 	s.scheduleOverlay = nil
+	s.resourceGroupOverlay = nil
 	s.pending = nil
 	s.dirtyHNSW = false
 	s.pendingHNSW = nil
@@ -1220,6 +1618,32 @@ func (s *Session) abort() error {
 	s.pendingIVF = nil
 	s.releaseTxnGuard()
 	return err
+}
+
+// reclaimEmptyTreesOnRollback frees every page of a tree this transaction
+// created from nothing (a fresh CREATE TABLE/CREATE INDEX heap, WasEmpty()
+// true — see its doc comment) once the transaction has rolled back. Nothing
+// outside this transaction could ever have referenced such a tree — its
+// catalog row was never committed — so unlike an ordinary pre-existing
+// tree there is no concurrent-writer or structural-sharing hazard, and the
+// whole tree is safe to discard wholesale via the tree's own OwnedPages
+// walk, exactly like abortOnlineBuild already does for an abandoned online
+// rebuild's shadow tree. Left unfreed on any error (OwnedPages fails closed
+// on an unexpected shape, or the tree still has no root at all because
+// nothing was ever inserted) rather than risk reclaiming the wrong pages;
+// worst case is a harmless leaked page, not corruption.
+func (s *Session) reclaimEmptyTreesOnRollback() {
+	if s == nil || s.x == nil || s.db == nil {
+		return
+	}
+	for tree, part := range s.x.parts {
+		if tree == nil || !part.WasEmpty() {
+			continue
+		}
+		if pages, perr := tree.OwnedPages(); perr == nil && len(pages) > 0 {
+			s.db.queueCommittedReclaims(pages, nil, nil)
+		}
+	}
 }
 
 func (s *Session) heapOf(t *catalog.Table) (*btree.Tree, error) {

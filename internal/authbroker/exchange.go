@@ -13,6 +13,7 @@ import (
 
 	"github.com/bzync/nextsql/internal/auth"
 	"github.com/bzync/nextsql/internal/nerr"
+	"github.com/bzync/nextsql/internal/oidc"
 )
 
 // maxExchangeBody bounds the request body the broker will read.
@@ -20,11 +21,12 @@ const maxExchangeBody = 1 << 16 // 64 KiB
 
 // exchangeRequest is the JSON body of POST /v1/exchange.
 type exchangeRequest struct {
-	IdP      string `json:"idp"`
-	IDToken  string `json:"id_token"`
-	Nonce    string `json:"nonce"`
-	Database string `json:"database"`
-	Realm    string `json:"realm"`
+	IdP         string `json:"idp"`
+	IDToken     string `json:"id_token"`
+	AccessToken string `json:"access_token"`
+	Nonce       string `json:"nonce"`
+	Database    string `json:"database"`
+	Realm       string `json:"realm"`
 }
 
 // exchangeResponse is the JSON body returned on success.
@@ -49,7 +51,12 @@ func (b *Broker) handleExchange(w http.ResponseWriter, r *http.Request) {
 	var req exchangeRequest
 	dec := json.NewDecoder(strings.NewReader(string(body)))
 	dec.DisallowUnknownFields()
-	if err := dec.Decode(&req); err != nil || dec.More() {
+	if err := dec.Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, "malformed request body")
+		return
+	}
+	var trailing any
+	if err := dec.Decode(&trailing); err != io.EOF {
 		writeErr(w, http.StatusBadRequest, "malformed request body")
 		return
 	}
@@ -89,14 +96,28 @@ func (b *Broker) exchange(ctx context.Context, req exchangeRequest) (*exchangeRe
 		return nil, aud, denyHTTP(http.StatusBadRequest, "unknown identity provider")
 	}
 	aud.Issuer = pv.profile.Issuer
-	if strings.TrimSpace(req.IDToken) == "" {
-		aud.Outcome, aud.Reason = "denied", "no id_token in request"
-		return nil, aud, denyHTTP(http.StatusBadRequest, "id_token is required")
+	hasID := strings.TrimSpace(req.IDToken) != ""
+	hasAccess := strings.TrimSpace(req.AccessToken) != ""
+	if hasID == hasAccess {
+		aud.Outcome, aud.Reason = "denied", "request did not carry exactly one token type"
+		return nil, aud, denyHTTP(http.StatusBadRequest, "exactly one of id_token or access_token is required")
 	}
 
-	tok, err := pv.idtoken.Verify(ctx, req.IDToken, req.Nonce)
+	var tok *oidc.VerifiedToken
+	var err error
+	if hasID {
+		tok, err = pv.idtoken.Verify(ctx, req.IDToken, req.Nonce)
+	} else if strings.TrimSpace(req.Nonce) != "" {
+		aud.Outcome, aud.Reason = "denied", "nonce supplied with access token"
+		return nil, aud, denyHTTP(http.StatusBadRequest, "nonce is not valid with access_token")
+	} else if pv.access == nil {
+		aud.Outcome, aud.Reason = "denied", "jwt access-token exchange is disabled for this profile"
+		return nil, aud, denyHTTP(http.StatusForbidden, "token exchange denied")
+	} else {
+		tok, err = pv.access.Verify(ctx, req.AccessToken)
+	}
 	if err != nil {
-		aud.Outcome, aud.Reason = "denied", "id token verification failed: "+errText(err)
+		aud.Outcome, aud.Reason = "denied", "identity-provider token verification failed: "+errText(err)
 		return nil, aud, denyHTTP(verifyStatus(err), "token exchange denied")
 	}
 	aud.SubjectHash = hashSubject(tok.Subject)
@@ -116,7 +137,7 @@ func (b *Broker) exchange(ctx context.Context, req exchangeRequest) (*exchangeRe
 	aud.MappedRoles = mapped.Roles
 
 	effectiveRoles := mapped.Roles
-	if held, wired, herr := b.heldRoles(mapped.Principal); wired {
+	if held, wired, herr := b.heldRoles(req.Realm, mapped.Principal); wired {
 		if herr != nil {
 			aud.Outcome, aud.Reason = "error", "rbac membership lookup failed"
 			return nil, aud, denyHTTP(http.StatusServiceUnavailable, "token exchange temporarily unavailable")
@@ -131,7 +152,7 @@ func (b *Broker) exchange(ctx context.Context, req exchangeRequest) (*exchangeRe
 
 	ttl := b.mintTTL(tok.Expiry)
 	if ttl <= 0 {
-		aud.Outcome, aud.Reason = "denied", "id token expires too soon to mint a credential"
+		aud.Outcome, aud.Reason = "denied", "identity-provider token expires too soon to mint a credential"
 		return nil, aud, denyHTTP(http.StatusForbidden, "token exchange denied")
 	}
 

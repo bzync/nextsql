@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/bzync/nextsql/internal/catalog"
+	"github.com/bzync/nextsql/internal/cron"
 	"github.com/bzync/nextsql/internal/nerr"
 	"github.com/bzync/nextsql/internal/scheduler"
 	"github.com/bzync/nextsql/internal/security"
@@ -180,6 +181,22 @@ func (db *DB) DispatchDueSchedules(ctx context.Context, now time.Time, limit int
 				return 0, nerr.New(nerr.Exhausted, "executor.DispatchDueSchedules", "schedule cursor overflow")
 			}
 			current.NextFireNS = dueNS + steps*current.SpecNS
+		case ast.ScheduleCron:
+			expr, err := cron.Parse(current.Cron)
+			if err != nil {
+				_ = s.abort()
+				return 0, nerr.New(nerr.InvalidFormat, "executor.DispatchDueSchedules", "invalid schedule cron expression")
+			}
+			// Next boundary strictly after now: a leader clock that jumped
+			// forward past several cron boundaries emits one task for the
+			// oldest due boundary (this iteration) and advances straight to
+			// the first future boundary, matching EVERY's forward-jump rule.
+			next, err := expr.Next(time.Unix(0, nowNS).UTC())
+			if err != nil {
+				_ = s.abort()
+				return 0, nerr.New(nerr.Exhausted, "executor.DispatchDueSchedules", "schedule cron has no upcoming match")
+			}
+			current.NextFireNS = next.UnixNano()
 		default:
 			_ = s.abort()
 			return 0, nerr.New(nerr.InvalidFormat, "executor.DispatchDueSchedules", "invalid schedule kind")
@@ -363,6 +380,32 @@ func (db *DB) executeClaimedTask(ctx context.Context, claimed *catalog.Task, acl
 	if db.gate != nil {
 		if err := db.gate.AllowWrite(); err != nil {
 			return err
+		}
+	}
+	// A claimed task runs the same workflow body a client's own RUN
+	// WORKFLOW would, so it must be gated by the same process-wide
+	// admission slot as any other statement (Session.ExecContext) — the
+	// Phase 27 resource-group audit found this call site running entirely
+	// outside db.admit, bounded only by the shared TaskPool's own separate
+	// Workers limit (internal/executor/task_pool.go, M2-3b-3a), so a
+	// query-admission-saturated server would still admit and
+	// run tasks unbounded by the same backpressure regular queries see.
+	// Returning early here (before any task-state mutation, exactly like
+	// the db.gate check above) leaves the task's lease to expire and be
+	// reclaimed later rather than marking it failed for a transient
+	// overload condition — TaskRuntime.execute already treats Unavailable from this
+	// function as expected/non-reportable for the same reason.
+	if db.admit != nil {
+		rel, err := db.admit.Acquire(ctx)
+		if err != nil {
+			if db.metrics != nil {
+				db.metrics.AddRejected()
+			}
+			return err
+		}
+		defer rel()
+		if db.metrics != nil {
+			db.metrics.AddAdmitted()
 		}
 	}
 	s := db.Session()

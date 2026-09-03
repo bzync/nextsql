@@ -124,7 +124,7 @@ func TestDenoDriverUnit(t *testing.T) {
 	if err != nil {
 		t.Skip("deno not installed")
 	}
-	cmd := exec.Command(deno, "test", "--allow-net", "nextsql_test.js")
+	cmd := exec.Command(deno, "test", "--allow-net", "--allow-read", "--allow-write", "nextsql_test.js")
 	cmd.Dir = filepath.Join(repoRoot(t), "drivers", "deno")
 	out, err := cmd.CombinedOutput()
 	if err != nil {

@@ -3,12 +3,14 @@ package authbroker_test
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -21,6 +23,7 @@ const (
 	issuer   = "https://idp.example/realm"
 	clientID = "nextsql-oidc-client"
 	audience = "prod-eu"
+	resource = "api://nextsql-broker"
 )
 
 func testPolicy() auth.PolicyDoc {
@@ -59,6 +62,10 @@ type brokerFixture struct {
 }
 
 func newFixture(t *testing.T, opts authbroker.Options) *brokerFixture {
+	return newFixtureWithAccessAudience(t, opts, resource)
+}
+
+func newFixtureWithAccessAudience(t *testing.T, opts authbroker.Options, accessAudience string) *brokerFixture {
 	t.Helper()
 	dir := t.TempDir()
 	policyPath := filepath.Join(dir, "idp.nsip")
@@ -99,10 +106,11 @@ func newFixture(t *testing.T, opts authbroker.Options) *brokerFixture {
 		CredentialTTL:      time.Hour,
 		LogLevel:           "error",
 		Profiles: []authbroker.IdPProfile{{
-			Name:     "corp",
-			Issuer:   issuer,
-			ClientID: clientID,
-			JWKSURI:  idp.JWKSURI(),
+			Name:                "corp",
+			Issuer:              issuer,
+			ClientID:            clientID,
+			AccessTokenAudience: accessAudience,
+			JWKSURI:             idp.JWKSURI(),
 		}},
 	}
 	b, err := authbroker.New(cfg, opts)
@@ -112,6 +120,76 @@ func newFixture(t *testing.T, opts authbroker.Options) *brokerFixture {
 	srv := httptest.NewServer(b.Handler())
 	t.Cleanup(srv.Close)
 	return &brokerFixture{broker: b, srv: srv, idp: idp, fetcher: fetcher, pubKS: pubKS, now: now}
+}
+
+func TestExchangeAccessTokenRequiresExplicitProfileAudience(t *testing.T) {
+	f := newFixtureWithAccessAudience(t, authbroker.Options{}, "")
+	claims := f.claims("robot@corp.example", "", []string{"db-readers"})
+	claims["aud"] = resource
+	claims["client_id"] = clientID
+	resp, _ := f.exchange(t, map[string]any{"idp": "corp", "access_token": f.idp.Sign(t, claims)})
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403 while access-token exchange is disabled", resp.StatusCode)
+	}
+}
+
+func TestExchangeClientCredentialsAccessToken(t *testing.T) {
+	f := newFixture(t, authbroker.Options{})
+	claims := f.claims("robot@corp.example", "", []string{"db-readers"})
+	claims["aud"] = resource
+	claims["client_id"] = clientID
+	claims["jti"] = "cc-1"
+	tok := f.idp.Sign(t, claims)
+
+	resp, out := f.exchange(t, map[string]any{"idp": "corp", "access_token": tok})
+	if resp.StatusCode != http.StatusOK || out["principal"] != "robot" {
+		t.Fatalf("status %d, body %v", resp.StatusCode, out)
+	}
+	cred, _ := out["credential"].(string)
+	verifier := auth.NewTokenVerifier(f.pubKS, nil, audience)
+	verifier.SetClock(func() time.Time { return f.now })
+	got, err := verifier.Verify(cred)
+	if err != nil {
+		t.Fatalf("verify minted credential: %v", err)
+	}
+	if got.Principal != "robot" || len(got.Roles) != 1 || got.Roles[0] != "reporting_ro" {
+		t.Fatalf("credential claims = %+v", got)
+	}
+}
+
+func TestExchangeRejectsAmbiguousOrUnboundAccessToken(t *testing.T) {
+	f := newFixture(t, authbroker.Options{})
+	claims := f.claims("robot@corp.example", "", []string{"db-readers"})
+	claims["aud"] = resource
+	claims["client_id"] = clientID
+	tok := f.idp.Sign(t, claims)
+	id := f.idp.Sign(t, f.claims("alice@corp.example", "n", []string{"db-readers"}))
+
+	for _, body := range []map[string]any{
+		{"idp": "corp"},
+		{"idp": "corp", "id_token": id, "access_token": tok, "nonce": "n"},
+		{"idp": "corp", "access_token": tok, "nonce": "not-valid-for-this-grant"},
+	} {
+		if resp, _ := f.exchange(t, body); resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("ambiguous access-token request status = %d, want 400", resp.StatusCode)
+		}
+	}
+	claims["client_id"] = "another-client"
+	if resp, _ := f.exchange(t, map[string]any{"idp": "corp", "access_token": f.idp.Sign(t, claims)}); resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("wrong-client access token status = %d, want 403", resp.StatusCode)
+	}
+}
+
+func TestExchangeRejectsTrailingJSONValue(t *testing.T) {
+	f := newFixture(t, authbroker.Options{})
+	resp, err := http.Post(f.srv.URL+"/v1/exchange", "application/json", strings.NewReader(`{"idp":"corp"}{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", resp.StatusCode)
+	}
 }
 
 func (f *brokerFixture) claims(email, nonce string, groups []string) map[string]any {
@@ -184,7 +262,7 @@ func TestExchangeHappyPathMintsVerifiableCredential(t *testing.T) {
 
 func TestExchangeRBACIntersection(t *testing.T) {
 	// Membership feed that grants alice reporting_ro but not app_admin.
-	members := func(principal string) ([]string, error) {
+	members := func(realm, principal string) ([]string, error) {
 		if principal == "alice" {
 			return []string{"reporting_ro"}, nil
 		}
@@ -366,6 +444,30 @@ func TestExchangeReloadKeepsLastKnownGoodOnBadPolicy(t *testing.T) {
 	}
 }
 
+func TestExchangeReloadKeysetValidatorKeepsLastKnownGood(t *testing.T) {
+	f := newFixture(t, authbroker.Options{})
+	reject := func(*auth.TokenKeyset) error {
+		return errors.New("candidate issuer is not trusted")
+	}
+	if err := f.broker.ValidateReloadWithKeysetValidator(reject); err == nil {
+		t.Fatal("expected candidate issuer preflight failure")
+	}
+	if err := f.broker.ValidateReloadWithKeysetValidator(nil); err == nil {
+		t.Fatal("nil preflight keyset validator accepted")
+	}
+	if err := f.broker.ReloadWithKeysetValidator(reject); err == nil {
+		t.Fatal("expected candidate issuer validation failure")
+	}
+	if err := f.broker.ReloadWithKeysetValidator(nil); err == nil {
+		t.Fatal("nil keyset validator accepted")
+	}
+	tok := f.idp.Sign(t, f.claims("reload@corp.example", "reload", []string{"db-readers"}))
+	resp, out := f.exchange(t, map[string]any{"idp": "corp", "id_token": tok, "nonce": "reload"})
+	if resp.StatusCode != http.StatusOK || out["principal"] != "reload" {
+		t.Fatalf("last-known-good broker state not retained: status=%d body=%v", resp.StatusCode, out)
+	}
+}
+
 func TestLoadConfigFile(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "broker.conf")
@@ -380,6 +482,7 @@ oidc_credential_ttl = 30m
 [idp "corp"]
 issuer = https://corp.okta.com/oauth2/abc
 client_id = 0oaABC
+access_token_audience = api://nextsql-broker
 allowed_algs = RS256, ES256
 group_claim = groups
 jwks_soft_ttl = 1h
@@ -396,7 +499,7 @@ jwks_hard_ttl = 24h
 		t.Fatalf("ttl = %s", cfg.CredentialTTL)
 	}
 	p, ok := cfg.Profile("corp")
-	if !ok || p.ClientID != "0oaABC" || len(p.AllowedAlgs) != 2 {
+	if !ok || p.ClientID != "0oaABC" || p.AccessTokenAudience != "api://nextsql-broker" || len(p.AllowedAlgs) != 2 {
 		t.Fatalf("profile = %+v", p)
 	}
 
@@ -406,5 +509,19 @@ jwks_hard_ttl = 24h
 	}
 	if _, err := authbroker.LoadConfig(path); err == nil {
 		t.Fatal("expected unknown key to be rejected")
+	}
+}
+
+func TestConfigRejectsOversizedAccessTokenAudience(t *testing.T) {
+	cfg := authbroker.Config{
+		Listen: "127.0.0.1:8645", IdentityPolicy: "/policy", IssuingKeyset: "/keys",
+		CredentialTTL: time.Hour,
+		Profiles: []authbroker.IdPProfile{{
+			Name: "corp", Issuer: issuer, ClientID: clientID,
+			AccessTokenAudience: strings.Repeat("x", 1025),
+		}},
+	}
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected oversized access-token audience to be rejected")
 	}
 }

@@ -11,9 +11,12 @@ import (
 	"slices"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/bzync/nextsql/internal/crypto"
+	"github.com/bzync/nextsql/internal/metrics"
 	"github.com/bzync/nextsql/internal/nerr"
 	"github.com/bzync/nextsql/internal/storage"
 	"github.com/bzync/nextsql/internal/storage/format"
@@ -86,6 +89,216 @@ func TestCreateOpenRejectsDuplicate(t *testing.T) {
 	}
 	if _, err := Create(e); !nerr.HasCode(err, nerr.AlreadyExists) {
 		t.Fatalf("expected already exists, got %v", err)
+	}
+}
+
+type failingReplicator struct{ err error }
+
+func (f failingReplicator) Replicate(recs []wal.Record) error { return f.err }
+
+// TestInsertOrphansLocalCommitOnReplicateFailure documents and exercises
+// the residual, deliberately-unclosable case of TODO.md's Phase 27 exit
+// gate item "Local commit precedes replication acknowledgment": a
+// Replicate failure that is ambiguous/in-doubt — raft.Apply was actually
+// called, but the quorum wait itself failed (e.g. lost leadership,
+// enqueue timeout, mid-flight shutdown) — cannot safely be told apart from
+// "it actually reached quorum after all", so storage.Engine keeps this
+// case's local commit visible rather than guessing wrong and silently
+// diverging from the cluster (see storage.NotProposedError's doc comment,
+// and Engine.commitAndReplicate, for the definite case this is NOT: a
+// rejection before raft.Apply is even attempted, e.g. this node was never
+// the leader — see TestInsertDiscardsLocalCommitOnDefiniteReplicateFailure
+// below, which is the case this fix does close). The caller correctly
+// sees the failure and can safely retry — no acknowledged write is lost —
+// and metrics.AddReplicationOrphan gives operators an observable signal
+// that it happened, which this test is the coverage for.
+func TestInsertOrphansLocalCommitOnReplicateFailure(t *testing.T) {
+	tr, e := testTree(t, 16)
+
+	before := metrics.Default().Snapshot().ReplicationOrphans
+
+	failure := nerr.New(nerr.Unavailable, "test", "quorum commit failed")
+	e.SetReplicator(failingReplicator{err: failure})
+
+	insertErr := tr.Insert([]byte("orphan"), []byte("value"))
+	if !nerr.HasCode(insertErr, nerr.Unavailable) {
+		t.Fatalf("Insert = %v, want the Replicate failure surfaced", insertErr)
+	}
+
+	after := metrics.Default().Snapshot().ReplicationOrphans
+	if after != before+1 {
+		t.Fatalf("ReplicationOrphans = %d, want %d", after, before+1)
+	}
+
+	// The ambiguous case stays open by design: despite Insert reporting
+	// failure, the key is still durably visible locally.
+	e.SetReplicator(nil)
+	got, err := tr.Lookup([]byte("orphan"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "value" {
+		t.Fatalf("got %q", got)
+	}
+}
+
+// notProposedFailure marks a test Replicator failure as definite — the
+// entry never reached Raft at all — by implementing the same NotProposed()
+// bool capability *replication.Cluster's real not-leader rejection does
+// (storage.NotProposedError, checked structurally by commitAndReplicate).
+type notProposedFailure struct{ error }
+
+func (notProposedFailure) NotProposed() bool { return true }
+func (f notProposedFailure) Unwrap() error   { return f.error }
+
+// TestInsertDiscardsLocalCommitOnDefiniteReplicateFailure proves the
+// structural fix: a Replicate failure that is definite (never reached
+// Raft — e.g. this node was rejected before raft.Apply was ever called)
+// leaves no local orphan at all, unlike the ambiguous case exercised by
+// TestInsertOrphansLocalCommitOnReplicateFailure above. The key must not
+// be visible afterward, and — since nothing was ever left in a state that
+// needs an operator to reconcile — no orphan should be reported either.
+func TestInsertDiscardsLocalCommitOnDefiniteReplicateFailure(t *testing.T) {
+	tr, e := testTree(t, 16)
+
+	before := metrics.Default().Snapshot().ReplicationOrphans
+
+	failure := notProposedFailure{nerr.New(nerr.Unavailable, "test", "not the leader")}
+	rep := &failingReplicatorReporting{err: failure}
+	e.SetReplicator(rep)
+
+	insertErr := tr.Insert([]byte("not-proposed"), []byte("value"))
+	if !nerr.HasCode(insertErr, nerr.Unavailable) {
+		t.Fatalf("Insert = %v, want the Replicate failure surfaced", insertErr)
+	}
+
+	after := metrics.Default().Snapshot().ReplicationOrphans
+	if after != before {
+		t.Fatalf("ReplicationOrphans = %d, want unchanged at %d (definite failures are not orphans)", after, before)
+	}
+	if rep.reported.Load() {
+		t.Fatal("ReportReplicationOrphan called on a definite (never-proposed) failure")
+	}
+
+	e.SetReplicator(nil)
+	if _, err := tr.Lookup([]byte("not-proposed")); !nerr.HasCode(err, nerr.NotFound) {
+		t.Fatalf("Lookup after a discarded commit = %v, want NotFound", err)
+	}
+}
+
+// blockingReplicator holds Replicate open until release is closed, so a
+// test can observe engine behavior while one commit's replication is
+// genuinely in flight.
+type blockingReplicator struct{ release chan struct{} }
+
+func (b *blockingReplicator) Replicate(recs []wal.Record) error {
+	<-b.release
+	return nil
+}
+
+// TestUnrelatedReadProceedsWhileACommitHoldsReplicate proves
+// Engine.commitAndReplicate does not hold e.mu across the Replicate
+// round-trip: this is the deadlock hazard the structural fix's design
+// explicitly had to avoid (Raft's own FSM-apply goroutine can need e.mu to
+// process an unrelated, earlier-queued entry the pending commit's own
+// raft.Apply() future may transitively depend on to resolve). An unrelated
+// read, which briefly needs e.mu to capture its MVCC snapshot, must
+// complete promptly rather than blocking on an in-flight commit whose
+// Replicate call hasn't returned yet.
+func TestUnrelatedReadProceedsWhileACommitHoldsReplicate(t *testing.T) {
+	tr, e := testTree(t, 16)
+	if err := tr.Insert([]byte("pre"), []byte("value")); err != nil {
+		t.Fatal(err)
+	}
+
+	release := make(chan struct{})
+	e.SetReplicator(&blockingReplicator{release: release})
+
+	heldDone := make(chan error, 1)
+	go func() {
+		heldDone <- tr.Insert([]byte("held"), []byte("value"))
+	}()
+
+	select {
+	case err := <-heldDone:
+		t.Fatalf("held insert returned before Replicate was released: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	lookupDone := make(chan error, 1)
+	go func() {
+		_, err := tr.Lookup([]byte("pre"))
+		lookupDone <- err
+	}()
+	select {
+	case err := <-lookupDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("unrelated read never completed — e.mu appears held across the Replicate round-trip")
+	}
+
+	close(release)
+	select {
+	case err := <-heldDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("held insert never completed after Replicate was released")
+	}
+
+	if _, err := tr.Lookup([]byte("held")); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// failingReplicatorReporting is failingReplicator plus the optional
+// storage.ReplicationOrphanReporter capability, so tests can observe
+// whether commitAndReplicate notified it.
+type failingReplicatorReporting struct {
+	err      error
+	reported atomic.Bool
+}
+
+func (f *failingReplicatorReporting) Replicate(recs []wal.Record) error { return f.err }
+func (f *failingReplicatorReporting) ReportReplicationOrphan()          { f.reported.Store(true) }
+
+// TestInsertReportsReplicationOrphanToReporter proves the mitigation landed
+// alongside the known gap above (TODO.md Phase 27 exit gate, "Local commit
+// precedes replication acknowledgment"): a Replicator that implements
+// storage.ReplicationOrphanReporter is notified on exactly the same
+// Replicate failure that increments metrics.AddReplicationOrphan, so it can
+// protect STRONG reads (see replication.Cluster.ReportReplicationOrphan)
+// until an operator reconciles the node.
+func TestInsertReportsReplicationOrphanToReporter(t *testing.T) {
+	tr, e := testTree(t, 16)
+	failure := nerr.New(nerr.Unavailable, "test", "quorum commit failed")
+	rep := &failingReplicatorReporting{err: failure}
+	e.SetReplicator(rep)
+
+	if err := tr.Insert([]byte("orphan2"), []byte("value")); !nerr.HasCode(err, nerr.Unavailable) {
+		t.Fatalf("Insert = %v, want the Replicate failure surfaced", err)
+	}
+	if !rep.reported.Load() {
+		t.Fatal("ReportReplicationOrphan was not called on a Replicator that implements it")
+	}
+}
+
+// TestInsertDoesNotReportOrphanOnSuccessfulReplicate proves the reporter is
+// only ever notified on an actual Replicate failure, never as a side
+// effect of a normal successful commit.
+func TestInsertDoesNotReportOrphanOnSuccessfulReplicate(t *testing.T) {
+	tr, e := testTree(t, 16)
+	rep := &failingReplicatorReporting{err: nil}
+	e.SetReplicator(rep)
+
+	if err := tr.Insert([]byte("ok"), []byte("value")); err != nil {
+		t.Fatal(err)
+	}
+	if rep.reported.Load() {
+		t.Fatal("ReportReplicationOrphan called despite a successful Replicate")
 	}
 }
 

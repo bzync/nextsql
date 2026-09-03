@@ -4,13 +4,17 @@ package nextsql
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/tls"
 	"net"
+	"os"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/bzync/nextsql/internal/clientenc"
 	"github.com/bzync/nextsql/internal/crypto"
+	"github.com/bzync/nextsql/internal/encoding"
 	"github.com/bzync/nextsql/internal/executor"
 	"github.com/bzync/nextsql/internal/nerr"
 	"github.com/bzync/nextsql/internal/protocol"
@@ -34,11 +38,19 @@ const (
 
 // Config is the only supported way to open a connection. Do not put keys in URLs.
 type Config struct {
-	Address       string
-	Database      string
-	User          string
-	Password      string
-	KeyProvider   crypto.KeyProvider // reserved for client-held keys; never place keys in a URL
+	Address  string
+	Database string
+	// Realm selects which hosted realm this connection targets (M2-2).
+	// Optional: an empty Realm sends the exact same Hello a pre-realm
+	// client sends and connects to the server's configured default. Set it
+	// only when the server hosts more than one realm.
+	Realm       string
+	User        string
+	Password    string
+	KeyProvider crypto.KeyProvider // reserved for client-held keys; never place keys in a URL
+	// FieldKeys is independent from KeyProvider. It supplies client-only keys
+	// for ENCRYPTED CLIENT columns and is never sent to nextsqld.
+	FieldKeys     FieldKeyProvider
 	TLS           *tls.Config
 	InsecureNoTLS bool
 
@@ -51,6 +63,512 @@ type Config struct {
 	ReadConsistency ReadConsistency
 	// MaxStaleness bounds a Bounded read. Zero selects the server default.
 	MaxStaleness time.Duration
+}
+
+// FieldKey is one AES-256 key used by ENCRYPTED CLIENT fields. ID is public
+// envelope metadata. Material must not be logged or placed in a URL.
+type FieldKey = clientenc.Key
+
+// FieldKeyProvider supports online rotation (CurrentFieldKey changes while old
+// ids remain resolvable) and revocation (FieldKey refuses a retired id).
+type FieldKeyProvider = clientenc.KeyProvider
+
+// MemoryFieldKeyring is a bounded in-process provider useful for applications
+// whose secret manager loads keys into memory. It does not persist keys.
+type MemoryFieldKeyring struct {
+	mu      sync.RWMutex
+	current string
+	keys    map[string]FieldKey
+}
+
+// GenerateFieldKey creates an AES-256 field key with cryptographic randomness.
+func GenerateFieldKey(id string) (FieldKey, error) {
+	k := FieldKey{ID: id}
+	if _, err := rand.Read(k.Material[:]); err != nil {
+		return FieldKey{}, nerr.Wrap(nerr.Crypto, "nextsql.GenerateFieldKey", "random key", err)
+	}
+	// Let the format validator enforce the public key-id contract without
+	// exposing key material or duplicating the rules here.
+	kr, err := NewMemoryFieldKeyring(k)
+	if err != nil {
+		return FieldKey{}, err
+	}
+	_ = kr
+	return k, nil
+}
+
+// NewMemoryFieldKeyring installs current and any overlap keys. The total is
+// bounded to 64 so an attacker-controlled key id cannot grow client memory.
+func NewMemoryFieldKeyring(current FieldKey, overlap ...FieldKey) (*MemoryFieldKeyring, error) {
+	all := append([]FieldKey{current}, overlap...)
+	if len(all) > 64 {
+		return nil, nerr.New(nerr.InvalidArgument, "nextsql.NewMemoryFieldKeyring", "too many field keys")
+	}
+	r := &MemoryFieldKeyring{current: current.ID, keys: make(map[string]FieldKey, len(all))}
+	for _, k := range all {
+		if k.ID == "" || len(k.ID) > clientenc.MaxKeyIDBytes {
+			return nil, nerr.New(nerr.InvalidArgument, "nextsql.NewMemoryFieldKeyring", "invalid field key id")
+		}
+		if _, exists := r.keys[k.ID]; exists {
+			return nil, nerr.New(nerr.InvalidArgument, "nextsql.NewMemoryFieldKeyring", "duplicate field key id")
+		}
+		// Inspecting a temporary encryption is unnecessary; enforce the same
+		// closed ASCII id and non-zero-material contract locally.
+		for i := range k.ID {
+			c := k.ID[i]
+			if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-') {
+				return nil, nerr.New(nerr.InvalidArgument, "nextsql.NewMemoryFieldKeyring", "invalid field key id")
+			}
+		}
+		var any byte
+		for _, b := range k.Material {
+			any |= b
+		}
+		if any == 0 {
+			return nil, nerr.New(nerr.InvalidArgument, "nextsql.NewMemoryFieldKeyring", "empty field key material")
+		}
+		r.keys[k.ID] = k
+	}
+	return r, nil
+}
+
+// CurrentFieldKey implements FieldKeyProvider.
+func (r *MemoryFieldKeyring) CurrentFieldKey(_ context.Context, _, _, _ string) (FieldKey, error) {
+	if r == nil {
+		return FieldKey{}, nerr.New(nerr.Crypto, "nextsql.MemoryFieldKeyring", "field keyring unavailable")
+	}
+	r.mu.RLock()
+	k, ok := r.keys[r.current]
+	r.mu.RUnlock()
+	if !ok {
+		return FieldKey{}, nerr.New(nerr.Crypto, "nextsql.MemoryFieldKeyring", "current field key unavailable")
+	}
+	return k, nil
+}
+
+// FieldKey implements FieldKeyProvider.
+func (r *MemoryFieldKeyring) FieldKey(_ context.Context, _, _, _, id string) (FieldKey, error) {
+	if r == nil {
+		return FieldKey{}, nerr.New(nerr.Crypto, "nextsql.MemoryFieldKeyring", "field keyring unavailable")
+	}
+	r.mu.RLock()
+	k, ok := r.keys[id]
+	r.mu.RUnlock()
+	if !ok {
+		return FieldKey{}, nerr.New(nerr.Crypto, "nextsql.MemoryFieldKeyring", "field key unavailable or revoked")
+	}
+	return k, nil
+}
+
+// Rotate makes key current while retaining existing keys for overlap reads.
+func (r *MemoryFieldKeyring) Rotate(key FieldKey) error {
+	if r == nil {
+		return nerr.New(nerr.InvalidArgument, "nextsql.MemoryFieldKeyring.Rotate", "nil keyring")
+	}
+	probe, err := NewMemoryFieldKeyring(key)
+	if err != nil {
+		return err
+	}
+	_ = probe
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, exists := r.keys[key.ID]; !exists && len(r.keys) >= 64 {
+		return nerr.New(nerr.Exhausted, "nextsql.MemoryFieldKeyring.Rotate", "field key limit reached")
+	}
+	r.keys[key.ID] = key
+	r.current = key.ID
+	return nil
+}
+
+// Revoke removes an old key. The current key must be rotated first.
+func (r *MemoryFieldKeyring) Revoke(id string) error {
+	if r == nil {
+		return nerr.New(nerr.InvalidArgument, "nextsql.MemoryFieldKeyring.Revoke", "nil keyring")
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if id == r.current {
+		return nerr.New(nerr.Conflict, "nextsql.MemoryFieldKeyring.Revoke", "cannot revoke current field key")
+	}
+	delete(r.keys, id)
+	return nil
+}
+
+const (
+	fieldKeyringMagic   = "NSFK"
+	fieldKeyringVersion = 1
+	maxFieldKeyringKeys = 64
+
+	fkFlagCurrent = 1 << 0
+	fkFlagRevoked = 1 << 1
+)
+
+type fieldKeyRecord struct {
+	ID       string
+	Created  time.Time
+	Current  bool
+	Revoked  bool
+	Material [clientenc.KeySize]byte
+}
+
+// FieldKeyInfo is a material-free summary of one FileFieldKeyring record.
+type FieldKeyInfo struct {
+	ID      string
+	Created time.Time
+	Current bool
+	Revoked bool
+}
+
+// FileFieldKeyring is a durable, atomic, file-backed FieldKeyProvider. Unlike
+// MemoryFieldKeyring, rotation and revocation persist across process
+// restarts: the on-disk "NSFK1" format is a versioned, 0600, atomically
+// written record set with exactly one live current key, mirroring the
+// internal/auth token-keyset lifecycle. A revoked key's material is
+// overwritten with zeros on disk and its id can never be reused.
+//
+// FileFieldKeyring is the reference durable implementation for a
+// local/self-hosted deployment. Production applications with an existing
+// secret manager or KMS should still prefer implementing FieldKeyProvider
+// directly against that system.
+type FileFieldKeyring struct {
+	mu   sync.RWMutex
+	path string
+	keys []fieldKeyRecord
+}
+
+// CreateFileFieldKeyring writes a new keyring file with one current key. It
+// fails if path already exists.
+func CreateFileFieldKeyring(path string, current FieldKey) (*FileFieldKeyring, error) {
+	if _, err := os.Stat(path); err == nil {
+		return nil, nerr.New(nerr.AlreadyExists, "nextsql.CreateFileFieldKeyring", "keyring file exists")
+	} else if !os.IsNotExist(err) {
+		return nil, nerr.Wrap(nerr.IO, "nextsql.CreateFileFieldKeyring", "stat", err)
+	}
+	if err := validateFieldKeyForKeyring(current); err != nil {
+		return nil, err
+	}
+	kr := &FileFieldKeyring{
+		path: path,
+		keys: []fieldKeyRecord{{ID: current.ID, Created: time.Now().UTC(), Current: true, Material: current.Material}},
+	}
+	if err := kr.persistLocked(); err != nil {
+		return nil, err
+	}
+	return kr, nil
+}
+
+// OpenFileFieldKeyring loads an existing keyring file.
+func OpenFileFieldKeyring(path string) (*FileFieldKeyring, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, nerr.Wrap(nerr.IO, "nextsql.OpenFileFieldKeyring", "read", err)
+	}
+	keys, err := decodeFieldKeyring(raw)
+	if err != nil {
+		return nil, err
+	}
+	return &FileFieldKeyring{path: path, keys: keys}, nil
+}
+
+// Path returns the backing file path.
+func (kr *FileFieldKeyring) Path() string { return kr.path }
+
+// CurrentFieldKey implements FieldKeyProvider.
+func (kr *FileFieldKeyring) CurrentFieldKey(_ context.Context, _, _, _ string) (FieldKey, error) {
+	kr.mu.RLock()
+	defer kr.mu.RUnlock()
+	for i := range kr.keys {
+		if kr.keys[i].Current && !kr.keys[i].Revoked {
+			return FieldKey{ID: kr.keys[i].ID, Material: kr.keys[i].Material}, nil
+		}
+	}
+	return FieldKey{}, nerr.New(nerr.Crypto, "nextsql.FileFieldKeyring", "current field key unavailable")
+}
+
+// FieldKey implements FieldKeyProvider.
+func (kr *FileFieldKeyring) FieldKey(_ context.Context, _, _, _, id string) (FieldKey, error) {
+	kr.mu.RLock()
+	defer kr.mu.RUnlock()
+	for i := range kr.keys {
+		if kr.keys[i].ID == id {
+			if kr.keys[i].Revoked {
+				return FieldKey{}, nerr.New(nerr.Crypto, "nextsql.FileFieldKeyring", "field key unavailable or revoked")
+			}
+			return FieldKey{ID: kr.keys[i].ID, Material: kr.keys[i].Material}, nil
+		}
+	}
+	return FieldKey{}, nerr.New(nerr.Crypto, "nextsql.FileFieldKeyring", "field key unavailable or revoked")
+}
+
+// Rotate makes key current, retaining every other live key for overlap
+// reads, and persists atomically. Reusing a previously revoked key id fails
+// closed: a revoked id can never resolve again.
+func (kr *FileFieldKeyring) Rotate(key FieldKey) error {
+	if err := validateFieldKeyForKeyring(key); err != nil {
+		return err
+	}
+	kr.mu.Lock()
+	defer kr.mu.Unlock()
+	idx := -1
+	for i := range kr.keys {
+		if kr.keys[i].ID == key.ID {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		if len(kr.keys) >= maxFieldKeyringKeys {
+			return nerr.New(nerr.Exhausted, "nextsql.FileFieldKeyring.Rotate", "field key limit reached")
+		}
+		kr.keys = append(kr.keys, fieldKeyRecord{ID: key.ID, Created: time.Now().UTC()})
+		idx = len(kr.keys) - 1
+	} else if kr.keys[idx].Revoked {
+		return nerr.New(nerr.Conflict, "nextsql.FileFieldKeyring.Rotate", "cannot reuse a revoked field key id")
+	}
+	for i := range kr.keys {
+		kr.keys[i].Current = false
+	}
+	kr.keys[idx].Current = true
+	kr.keys[idx].Material = key.Material
+	return kr.persistLocked()
+}
+
+// Revoke destroys id's material on disk and marks it permanently refused.
+// The current key cannot be revoked directly; rotate away from it first.
+func (kr *FileFieldKeyring) Revoke(id string) error {
+	kr.mu.Lock()
+	defer kr.mu.Unlock()
+	idx := -1
+	for i := range kr.keys {
+		if kr.keys[i].ID == id {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		return nerr.New(nerr.NotFound, "nextsql.FileFieldKeyring.Revoke", "unknown field key id")
+	}
+	if kr.keys[idx].Current {
+		return nerr.New(nerr.Conflict, "nextsql.FileFieldKeyring.Revoke", "cannot revoke the current field key")
+	}
+	if kr.keys[idx].Revoked {
+		return nil
+	}
+	kr.keys[idx].Revoked = true
+	kr.keys[idx].Material = [clientenc.KeySize]byte{}
+	return kr.persistLocked()
+}
+
+// Reload re-reads the keyring file. On any error the in-memory keyring is
+// left unchanged (last known good).
+func (kr *FileFieldKeyring) Reload() error {
+	kr.mu.Lock()
+	defer kr.mu.Unlock()
+	raw, err := os.ReadFile(kr.path)
+	if err != nil {
+		return nerr.Wrap(nerr.IO, "nextsql.FileFieldKeyring.Reload", "read", err)
+	}
+	keys, err := decodeFieldKeyring(raw)
+	if err != nil {
+		return err
+	}
+	kr.keys = keys
+	return nil
+}
+
+// List returns material-free summaries, oldest first.
+func (kr *FileFieldKeyring) List() []FieldKeyInfo {
+	kr.mu.RLock()
+	defer kr.mu.RUnlock()
+	out := make([]FieldKeyInfo, 0, len(kr.keys))
+	for i := range kr.keys {
+		out = append(out, FieldKeyInfo{ID: kr.keys[i].ID, Created: kr.keys[i].Created, Current: kr.keys[i].Current, Revoked: kr.keys[i].Revoked})
+	}
+	return out
+}
+
+func (kr *FileFieldKeyring) persistLocked() error {
+	raw, err := encodeFieldKeyring(kr.keys)
+	if err != nil {
+		return err
+	}
+	return atomicWriteFieldKeyring(kr.path, raw)
+}
+
+func encodeFieldKeyring(keys []fieldKeyRecord) ([]byte, error) {
+	if len(keys) > maxFieldKeyringKeys {
+		return nil, nerr.New(nerr.InvalidArgument, "nextsql.encodeFieldKeyring", "too many field keys")
+	}
+	n := 4 + 2 + 2
+	for i := range keys {
+		n += 1 + len(keys[i].ID) + 8 + 1 + clientenc.KeySize
+	}
+	buf := make([]byte, n)
+	copy(buf[0:4], fieldKeyringMagic)
+	encoding.PutU16(buf, 4, fieldKeyringVersion)
+	encoding.PutU16(buf, 6, uint16(len(keys)))
+	off := 8
+	for i := range keys {
+		if len(keys[i].ID) == 0 || len(keys[i].ID) > clientenc.MaxKeyIDBytes {
+			return nil, nerr.New(nerr.InvalidFormat, "nextsql.encodeFieldKeyring", "invalid field key id length")
+		}
+		buf[off] = byte(len(keys[i].ID))
+		off++
+		copy(buf[off:], keys[i].ID)
+		off += len(keys[i].ID)
+		encoding.PutU64(buf, off, uint64(keys[i].Created.Unix()))
+		off += 8
+		var flags byte
+		if keys[i].Current {
+			flags |= fkFlagCurrent
+		}
+		if keys[i].Revoked {
+			flags |= fkFlagRevoked
+		}
+		buf[off] = flags
+		off++
+		copy(buf[off:], keys[i].Material[:])
+		off += clientenc.KeySize
+	}
+	return buf[:off], nil
+}
+
+func decodeFieldKeyring(raw []byte) ([]fieldKeyRecord, error) {
+	bad := func(msg string) ([]fieldKeyRecord, error) {
+		return nil, nerr.New(nerr.InvalidFormat, "nextsql.decodeFieldKeyring", msg)
+	}
+	if len(raw) < 8 {
+		return bad("truncated keyring")
+	}
+	if string(raw[0:4]) != fieldKeyringMagic {
+		return bad("bad keyring magic")
+	}
+	if encoding.U16(raw, 4) != fieldKeyringVersion {
+		return bad("unsupported keyring version")
+	}
+	count := encoding.U16(raw, 6)
+	if int(count) > maxFieldKeyringKeys {
+		return bad("key count exceeds limit")
+	}
+	keys := make([]fieldKeyRecord, 0, count)
+	seen := make(map[string]struct{}, count)
+	off := 8
+	current := 0
+	for i := 0; i < int(count); i++ {
+		if off >= len(raw) {
+			return bad("truncated id length")
+		}
+		idLen := int(raw[off])
+		off++
+		if idLen < 1 || idLen > clientenc.MaxKeyIDBytes {
+			return bad("invalid field key id length")
+		}
+		idBytes, err := encoding.ReadBytes(raw, off, idLen)
+		if err != nil {
+			return bad("truncated field key id")
+		}
+		off += idLen
+		id := string(idBytes)
+		if !validFieldKeyringID(id) {
+			return bad("invalid field key id")
+		}
+		created, err := encoding.ReadU64(raw, off)
+		if err != nil {
+			return bad("truncated created time")
+		}
+		off += 8
+		if off >= len(raw) {
+			return bad("truncated flags")
+		}
+		flags := raw[off]
+		off++
+		material, err := encoding.ReadBytes(raw, off, clientenc.KeySize)
+		if err != nil {
+			return bad("truncated field key material")
+		}
+		off += clientenc.KeySize
+		if _, dup := seen[id]; dup {
+			return bad("duplicate field key id")
+		}
+		seen[id] = struct{}{}
+		rec := fieldKeyRecord{
+			ID:      id,
+			Created: time.Unix(int64(created), 0).UTC(),
+			Current: flags&fkFlagCurrent != 0,
+			Revoked: flags&fkFlagRevoked != 0,
+		}
+		copy(rec.Material[:], material)
+		if rec.Current && rec.Revoked {
+			return bad("current field key cannot be revoked")
+		}
+		if rec.Revoked {
+			if rec.Material != ([clientenc.KeySize]byte{}) {
+				return bad("revoked field key retains material")
+			}
+		} else {
+			var any byte
+			for _, b := range rec.Material {
+				any |= b
+			}
+			if any == 0 {
+				return bad("empty field key material")
+			}
+		}
+		if rec.Current {
+			current++
+		}
+		keys = append(keys, rec)
+	}
+	if off != len(raw) {
+		return bad("trailing keyring bytes")
+	}
+	if len(keys) == 0 {
+		return bad("keyring has no keys")
+	}
+	if current != 1 {
+		return bad("keyring must have exactly one current key")
+	}
+	return keys, nil
+}
+
+func validFieldKeyringID(id string) bool {
+	if len(id) < 1 || len(id) > clientenc.MaxKeyIDBytes {
+		return false
+	}
+	for i := range id {
+		c := id[i]
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func validateFieldKeyForKeyring(key FieldKey) error {
+	if !validFieldKeyringID(key.ID) {
+		return nerr.New(nerr.InvalidArgument, "nextsql.FileFieldKeyring", "invalid field key id")
+	}
+	var any byte
+	for _, b := range key.Material {
+		any |= b
+	}
+	if any == 0 {
+		return nerr.New(nerr.InvalidArgument, "nextsql.FileFieldKeyring", "empty field key material")
+	}
+	return nil
+}
+
+func atomicWriteFieldKeyring(path string, raw []byte) error {
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
+		return nerr.Wrap(nerr.IO, "nextsql.FileFieldKeyring", "write", err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return nerr.Wrap(nerr.IO, "nextsql.FileFieldKeyring", "rename", err)
+	}
+	return nil
 }
 
 // Conn is one authenticated session.
@@ -155,6 +673,7 @@ func (c *Conn) handshake() error {
 		Version:  protocol.Version,
 		Database: c.cfg.Database,
 		User:     c.cfg.User,
+		Realm:    c.cfg.Realm,
 	}, c.lim)
 	if err != nil {
 		return err
@@ -286,6 +805,48 @@ func (c *Conn) Query(ctx context.Context, sql string, params ...types.Value) (*R
 		return nil, err
 	}
 	return c.queryPayload(ctx, protocol.TypeQuery, payload)
+}
+
+// EncryptField converts one logical value into the opaque STRING parameter an
+// ENCRYPTED CLIENT column accepts. Randomized encryption intentionally provides
+// no equality/search token. SQL NULL passes through and leaks only nullness.
+func (c *Conn) EncryptField(ctx context.Context, table, column string, value types.Value) (types.Value, error) {
+	if c == nil {
+		return types.Value{}, nerr.New(nerr.InvalidArgument, "nextsql.EncryptField", "nil connection")
+	}
+	if value.Null {
+		return types.Null(types.String()), nil
+	}
+	ciphertext, err := clientenc.Encrypt(ctx, c.cfg.FieldKeys, c.cfg.Database, table, column, value)
+	if err != nil {
+		return types.Value{}, err
+	}
+	return types.StringValue(ciphertext), nil
+}
+
+// DecryptField authenticates one opaque result value and returns its logical
+// SQL value. expected is checked against the authenticated envelope type.
+func (c *Conn) DecryptField(ctx context.Context, table, column string, expected types.Type, value types.Value) (types.Value, error) {
+	if c == nil {
+		return types.Value{}, nerr.New(nerr.InvalidArgument, "nextsql.DecryptField", "nil connection")
+	}
+	if !clientenc.SupportedType(expected) {
+		return types.Value{}, nerr.New(nerr.InvalidArgument, "nextsql.DecryptField", "unsupported client-encrypted type")
+	}
+	if value.Null {
+		return types.Null(expected), nil
+	}
+	if value.Typ.Kind != types.KindString && value.Typ.Kind != types.KindText {
+		return types.Value{}, nerr.New(nerr.InvalidFormat, "nextsql.DecryptField", "client ciphertext is not a string")
+	}
+	h, err := clientenc.Inspect(value.Str)
+	if err != nil {
+		return types.Value{}, err
+	}
+	if !h.LogicalType.Equals(expected) {
+		return types.Value{}, nerr.New(nerr.InvalidFormat, "nextsql.DecryptField", "encrypted logical type mismatch")
+	}
+	return clientenc.Decrypt(ctx, c.cfg.FieldKeys, c.cfg.Database, table, column, value.Str)
 }
 
 func (c *Conn) queryPayload(ctx context.Context, typ protocol.Type, payload []byte) (*Rows, error) {

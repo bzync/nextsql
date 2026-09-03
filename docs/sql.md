@@ -22,10 +22,13 @@ The native P19 `WORKFLOW` / `TRIGGER` / `SCHEDULE` / `TASK` contract is
 specified in `docs/workflows.md`. The native v1 implementation and its targeted
 workflow, trigger, schedule, durable-task, failover, PITR, driver, and clean
 repository-wide functional gates are complete as recorded in `TODO.md`.
+`CREATE SCHEDULE` accepts `EVERY '<duration>'`, `AT '<rfc3339>'`, or
+`CRON '<minute hour day-of-month month day-of-week>'` (standard five-field,
+UTC, numeric-only); see `docs/workflows.md` for the cron grammar.
 
 ## Statements
 
-`CREATE TABLE` (including `FOREIGN KEY` / column `REFERENCES`), `CREATE DATABASE` [`IF NOT EXISTS`], `DROP TABLE` [`IF EXISTS`], `ALTER TABLE` (`ADD`/`DROP` `[COLUMN]`, bounded `ADD`/`DROP`/`ATTACH`/`DETACH PARTITION`, `RENAME` `[COLUMN]`/`TO`, `ADD`/`DROP CONSTRAINT`), `CREATE INDEX` / `CREATE UNIQUE INDEX` (including JSON paths such as `metadata.category`, `INCLUDE`, `WHERE`, and expression keys), `CREATE SPATIAL INDEX`, `CREATE FULLTEXT INDEX` [`WITH (ANALYZER = 'simple' | 'english' | 'french' | 'german' | 'spanish')`] (one to eight `STRING`/`TEXT` columns), `CREATE VECTOR INDEX … USING HNSW | IVF | IVFPQ | SPARSE`, `DROP INDEX` [`IF EXISTS`], `REBUILD INDEX`, `CREATE` / `ALTER` / `DROP WORKFLOW`, `RUN WORKFLOW`, `CREATE` / `ALTER` / `DROP TRIGGER`, `CREATE` / `ALTER` / `DROP SCHEDULE`, `SHOW TASKS`, `CANCEL TASK`, `MAINTAIN DATABASE` / `MAINTAIN TABLE` / `MAINTAIN INDEX`, `INSERT` [`RETURNING`], `UPSERT` [`ON UNIQUE`] [`SET`] [`RETURNING`], `SELECT` (including `WITH` / `WITH RECURSIVE`, `DISTINCT`, `JOIN` / `GROUP BY` / `ORDER BY` / `LIMIT` / `OFFSET` / `COUNT` `SUM` `AVG` `MIN` `MAX`, window functions with `OVER`, JSON path extract, `SEARCH col [WEIGHT n] [, col [WEIGHT n] …] FOR '…'`, `FACET col [, col …]`, and `NEAREST col TO …`), `UPDATE` [`RETURNING`], `DELETE` [`RETURNING`], `BEGIN` [`READ COMMITTED` | `SNAPSHOT` | `SERIALIZABLE`], `COMMIT`, `ROLLBACK`, `ANALYZE` [`table`], `EXPLAIN` [`ANALYZE`] `<statement>`, `CREATE USER` / `DROP USER`, `CREATE ROLE` / `DROP ROLE`, `GRANT` / `REVOKE` (`docs/security.md`). `SET TENANT`, `RESET TENANT`, and `PARTITION BY TENANT` are rejected; provision a hosted database instead.
+`CREATE TABLE` (including `FOREIGN KEY` / column `REFERENCES`), `CREATE DATABASE` [`IF NOT EXISTS`], `DROP TABLE` [`IF EXISTS`], `ALTER TABLE` (`ADD`/`DROP` `[COLUMN]`, bounded `ADD`/`DROP`/`ATTACH`/`DETACH PARTITION`, `RENAME` `[COLUMN]`/`TO`, `ADD`/`DROP CONSTRAINT`), `CREATE INDEX` / `CREATE UNIQUE INDEX` (including JSON paths such as `metadata.category`, `INCLUDE`, `WHERE`, and expression keys), `CREATE SPATIAL INDEX`, `CREATE FULLTEXT INDEX` [`WITH (ANALYZER = 'simple' | 'english' | 'french' | 'german' | 'spanish')`] (one to eight `STRING`/`TEXT` columns), `CREATE VECTOR INDEX … USING HNSW | IVF | IVFPQ | SPARSE`, `DROP INDEX` [`IF EXISTS`], `REBUILD INDEX`, `CREATE` / `ALTER` / `DROP WORKFLOW`, `RUN WORKFLOW`, `CREATE` / `ALTER` / `DROP TRIGGER`, `CREATE` / `ALTER` / `DROP SCHEDULE`, `CREATE` / `ALTER` / `DROP RESOURCE GROUP`, `SET RESOURCE GROUP name`, `RESET RESOURCE GROUP`, `SHOW TASKS`, `SHOW DATABASES` / `TABLES` / `INDEXES` / `CONNECTIONS` / `QUERIES` / `TRANSACTIONS` / `LOCKS` / `CLUSTER` / `STORAGE`, `CANCEL TASK`, `MAINTAIN DATABASE` / `MAINTAIN TABLE` / `MAINTAIN INDEX`, `CLUSTER TRANSFER LEADER`, `CLUSTER DRAIN` [`WITH (TIMEOUT_MS = n)`], `CLUSTER MAINTENANCE ENABLE` / `DISABLE`, `CLUSTER RECONCILE CONFIRM`, `INSERT` [`RETURNING`], `UPSERT` [`ON UNIQUE`] [`SET`] [`RETURNING`], `SELECT` (including `WITH` / `WITH RECURSIVE`, `DISTINCT`, `JOIN` / `GROUP BY` / `ORDER BY` / `LIMIT` / `OFFSET` / `COUNT` `SUM` `AVG` `MIN` `MAX`, window functions with `OVER`, JSON path extract, `SEARCH col [WEIGHT n] [, col [WEIGHT n] …] FOR '…'`, `FACET col [, col …]`, and `NEAREST col TO …`), `UPDATE` [`RETURNING`], `DELETE` [`RETURNING`], `BEGIN` [`READ COMMITTED` | `SNAPSHOT` | `SERIALIZABLE`], `COMMIT`, `ROLLBACK`, `ANALYZE` [`table`], `EXPLAIN` [`ANALYZE`] `<statement>`, `CREATE USER` / `DROP USER`, `CREATE ROLE` / `DROP ROLE`, `GRANT` / `REVOKE` (`docs/security.md`, including `GRANT USAGE ON RESOURCE GROUP name TO grantee`). Every other `SET`/`RESET` spelling — including `SET TENANT`, `RESET TENANT` — and `PARTITION BY TENANT` are rejected; provision a hosted database instead.
 
 Unquoted identifiers fold to lowercase. Quoted `"ident"` is preserved.
 
@@ -72,7 +75,7 @@ CREATE TABLE lines (
 - A child `CREATE TABLE` in the same transaction can reference a parent created earlier in that transaction (session overlay). `CREATE TABLE` bind and parent `DELETE` inbound probes both use overlay ∪ catalog lookup, so an uncommitted child table is visible to the same-txn parent delete.
 - `MATCH SIMPLE`: if any foreign-key column is NULL, the existence check and parent-delete probe for that constraint are skipped.
 
-Do not revert this binary after a catalog rewrite has written `NSCT` v9.
+Do not revert this binary after a catalog rewrite has written `NSCT` v10.
 Restore a pre-v5 backup or use an explicit format-aware migration first.
 
 ## Types
@@ -81,6 +84,9 @@ Restore a pre-v5 backup or use an explicit format-aware migration first.
 |---|---|---|
 | `UUID` | 16 bytes | `DEFAULT UUID()` |
 | `STRING` / `TEXT` | `u32` length + UTF-8 | same encoding |
+| `BLOB` | `u32` length + raw bytes | variable-length, no UTF-8 validation; literal syntax `X'<hex>'` (e.g. `X'DEADBEEF'`, `X''` for empty); orders byte-lexicographically (usable as `PRIMARY KEY`/`ORDER BY`); isolated from `STRING`/`TEXT` — coercion either way requires hex text, never a byte-for-byte reinterpretation; `ENCRYPTED CLIENT` supported; see `docs/design-datatypes.md` D1 |
+| `INT8` / `INT16` / `INT32` / `INT64` | 1 / 2 / 4 / 8 bytes, two's complement | exact fixed-width signed integers; index keys sign-bit-flip so `ORDER BY`/`PRIMARY KEY` sort numerically; narrowing (including a literal that doesn't fit) errors rather than wrapping; `+ - * /` and unary `-` always promote to `DECIMAL` (arbitrary precision, cannot overflow mid-operation) — only an explicit assignment back into a fixed-width column re-checks range; ordinary FK-eligible scalars; `ENCRYPTED CLIENT` supported; see `docs/design-datatypes.md` D2 |
+| `UINT8` / `UINT16` / `UINT32` / `UINT64` | 1 / 2 / 4 / 8 bytes, plain unsigned | exact fixed-width unsigned integers; index keys use plain unsigned big-endian order (no sign-bit flip needed); narrowing and negative-to-unsigned assignment error rather than wrapping; `+ - * /` and unary `-` always promote to `DECIMAL`, same as `INT8..64`; also directly coercible to/from `INT8..64` (range/sign checked either way — the two families share one coercible "exact integer" group); ordinary FK-eligible scalars; `ENCRYPTED CLIENT` supported; see `docs/design-datatypes.md` D3 |
 | `DECIMAL(p,s)` | `1 <= p <= 38`, `s <= p` | unscaled integer + scale; `DEFAULT AI()` when `s = 0` |
 | `TIMESTAMPTZ` | `int64` UTC nanos | `DEFAULT NOW()` |
 | `JSON` | compact binary `NSJB` | path extract and path indexes; see `docs/json.md` |
@@ -150,9 +156,114 @@ cluster `ADMIN` is required because maintenance crosses tenant boundaries.
 
 `CREATE DATABASE name` creates a new database file named `name` next to the current file, using the same key provider. It is not a catalog object inside the current file, is not WAL-replicated with the current database, and cannot run inside a transaction.
 
+`CLUSTER TRANSFER LEADER` asks a Raft-clustered deployment's current leader
+to hand off to another voter (`replication.Cluster.TransferLeadership`), for
+a planned handoff ahead of a restart or maintenance window rather than
+waiting for a crash to trigger failover. It cannot run inside a transaction,
+requires cluster `ADMIN`, and fails `Unavailable` on a single-node
+deployment. See `docs/ops.md` "Leader transfer" and the `nextsql cluster
+transfer-leader` CLI wrapper.
+
+`CLUSTER DRAIN [WITH (TIMEOUT_MS = n)]` asks the node this connection
+reached to begin gracefully draining itself — stop accepting new
+connections, close idle ones immediately, wait up to `TIMEOUT_MS`
+milliseconds (0, the default, uses that node's configured
+`shutdown_drain_ms`) for busy ones, then force-close whatever remains — the
+same mechanism `nextsqld` already runs on SIGINT/SIGTERM, now reachable
+without a restart or signal. It cannot run inside a transaction and requires
+cluster `ADMIN`, but unlike `CLUSTER TRANSFER LEADER` it needs no Raft
+cluster and is not gated on the target being the current leader — draining
+is purely local to whichever node the connection reaches, so it works the
+same on a single-node deployment and on any voter in a cluster. The drain
+itself runs in the background; the statement returns a `drain_initiated`
+acknowledgment immediately rather than blocking for the full timeout. See
+`docs/ops.md` "Remote drain" and the `nextsql cluster drain` CLI wrapper.
+
+`CLUSTER MAINTENANCE ENABLE|DISABLE` puts the node this connection reached
+into (or out of) maintenance mode: while enabled, every mutating statement —
+`INSERT`/`UPSERT`/`UPDATE`/`DELETE`, every DDL statement, and `BEGIN` (the
+same classification `CLUSTER TRANSFER LEADER`'s leader-routing gate already
+uses, since a transaction's eventual read/write shape is unknown at `BEGIN`
+time) — fails `Unavailable` until disabled; reads (autocommit `SELECT`,
+`SHOW`, `system.*`) keep working, so operators can still inspect state.
+Toggling itself cannot run inside a transaction and requires cluster
+`ADMIN`. Like `CLUSTER DRAIN` and unlike `CLUSTER TRANSFER LEADER`, it is
+purely local to the node the connection reached — not Raft-replicated — so
+it works the same on a single-node deployment, and a leader failover during
+maintenance does not carry the flag to the new leader (re-issue the
+statement against whichever node is leader afterward). The current state of
+this node is visible in `SHOW CLUSTER` / `system.replication.
+maintenance_mode`. Not to be confused with the unrelated `MAINTAIN`
+statement or `DB.PauseMaintenance`/`ResumeMaintenance`, which pause the
+background dead-version cleanup scheduler, not client query traffic. See
+`docs/ops.md` "Maintenance mode" and the `nextsql cluster maintenance
+enable|disable` CLI wrapper.
+
+`CLUSTER RECONCILE CONFIRM` clears the node this connection reached's
+local "replication-suspect" flag, which is set automatically (never by a
+client) when this node's own local commit could not be replicated to Raft
+quorum — see `docs/ops.md` "Correctness note" under Rolling upgrade for the
+full mechanism. While set, `StrongReadBarrier` refuses STRONG reads from
+this node regardless of leadership, since its local history may contain a
+row no other cluster member has. The `CONFIRM` keyword is mandatory (a bare
+`CLUSTER RECONCILE` is a syntax error) so the statement can't be
+fat-fingered; an operator should run it only after verifying or repairing
+this node's data. Requires cluster `ADMIN`, cannot run inside a transaction,
+and — like `CLUSTER MAINTENANCE`/`CLUSTER DRAIN` — is purely node-local, not
+Raft-replicated. Current state is visible in
+`system.replica_health.replication_suspect`. See the `nextsql cluster
+reconcile confirm` CLI wrapper.
+
+`CREATE RESOURCE GROUP name [IF NOT EXISTS] [WITH (MAX_CONCURRENCY = n, MEMORY
+= bytes, WORKERS = n, PRIORITY = n)]` declares a durable, RBAC-gated (cluster
+`ADMIN`, like `CREATE ROLE`/`CREATE USER`) workload-governance descriptor: a
+named record of options, catalog-persisted and WAL-recovered like any other
+table, visible via `system.resource_groups` (admin-only). Every option is
+optional and independently zero-defaulted ("unbounded"/"unset", the same
+convention as `max_connections_per_user` and hosting storage caps); `MEMORY`
+is bytes. `ALTER RESOURCE GROUP name WITH (...)` replaces only the options
+given, leaving the rest at their current stored value; at least one option is
+required. `DROP RESOURCE GROUP name [IF EXISTS]` removes it.
+
+A session joins a resource group with `SET RESOURCE GROUP name` — the one
+surviving spelling of `SET` after `SET TENANT` was removed, everything else
+under `SET`/`RESET` still fails with the same removal message — and leaves it
+with `RESET RESOURCE GROUP`, both of which work inside or outside an open
+transaction. Switching into a group requires `USAGE` on it
+(`GRANT USAGE ON RESOURCE GROUP name TO grantee` / `REVOKE USAGE ON RESOURCE
+GROUP name FROM grantee`, cluster `ADMIN` bypasses via the same superuser rule
+as every other privilege check); a name that doesn't exist fails `NotFound`
+regardless of privilege. `RESET RESOURCE GROUP` needs no privilege beyond
+`CONNECT`. Once assigned, the group composes with — never replaces — the
+process-wide safety limits: a non-zero `MAX_CONCURRENCY` adds a second,
+strictly additional admission gate on top of the existing process-wide
+`scheduler.Admission` (a query must clear both; an unassigned session, or one
+in an unbounded group, is unaffected), and non-zero `WORKERS`/`MEMORY`
+override the session's per-query `scheduler.Limits` for as long as the
+assignment lasts (`WORKERS` is still clamped to the process ceiling by
+`Limits.normalized()`, so a group can never request more workers than the
+process allows). `PRIORITY` (0 = normal, higher = more favored, up to 9) is
+enforced on the process-wide `scheduler.Admission` gate only — the one gate
+shared across every group and unassigned session, so it's the only place
+cross-group ordering is meaningful: when that gate's slots are contended, a
+higher-priority session's queued query is admitted ahead of an
+earlier-queued lower-priority one (FIFO among equal priorities). This is
+ordering only, never preemption — an already-admitted lower-priority query
+is never interrupted — and it never bypasses `MAX_CONCURRENCY`/`MEMORY`/
+`WORKERS` or lets a caller skip the queue-wait bound; a query still times
+out on the same `QueueWait` it always would, just with a higher chance of
+doing so under sustained higher-priority contention (an accepted tradeoff,
+not a fairness/starvation-prevention mechanism). The per-group gate
+(`MAX_CONCURRENCY`) is unaffected — it only ever holds members of one group
+sharing one priority, so there is nothing to reorder there. There is still
+no visibility into which resource group a live session is assigned to
+(`system.sessions` has no `resource_group` column). See the Phase 27
+"Resource groups" checklist in `TODO.md`. `system.capabilities` row
+`resource_groups` stays `experimental`.
+
 ## Catalog
 
-The superblock primary tree holds catalog rows. Key `T` + table name. Value is a versioned `NSCT` descriptor (columns, PK, index list, heap meta page, foreign keys, CDC image policy, and bounded P21 physical-partition metadata). `EncodeTable` writes version 9. `DecodeTable` accepts v1 (empty FK list), v2 (key-only CDC), v3 (CDC image policy), v4 (partition metadata), v5 (non-reusing partition identity allocator), v6 (per-index HNSW traversal-quantisation tag), v7 (per-index vector-ANN method + IVF `LISTS` / `PROBES`), v8 (per-index IVF-PQ `SUBSPACES`), and v9 (per-index full-text analyzer id + revision); any other version fails closed. Key `S` + table name holds a versioned `NSST` statistics snapshot from `ANALYZE`; key `J` + stable table ID + stable partition ID holds its bounded `NSPS` local sketch. Key `A` + table ID + column name holds the next `AI()` value for that column (same transaction as the insert). Each user table and secondary index is a detached B+Tree whose root/height live on a slotted meta page (`NSTM`) so splits do not rewrite the catalog row. Any catalog rewrite upgrades an older descriptor to v9. `PARTITION BY RANGE`, `PARTITION BY HASH`, and `PARTITION BY LIST` are available with one-to-eight-column keys: RANGE uses lexicographically ordered tuple bounds (`VALUES LESS THAN (a, b, ...)`), LIST uses tuple membership (`VALUES IN ((a, b), ...)`), and HASH routes on the SHA-256 digest of the canonical typed tuple. Legacy TENANT descriptors remain decodable but cannot be created or extended through SQL. Plain/covering/partial/expression/JSON-path/spatial/FULLTEXT/HNSW indexes use partition-local roots. A plain-column secondary `UNIQUE` index (optionally with `INCLUDE`) is enforced across every partition by an exclusive key lock plus a probe of every other partition's local root on write, and an ordered cross-partition scan on CREATE/REBUILD/ATTACH; partial, expression, and JSON-path `UNIQUE`, and `UNIQUE` on legacy TENANT tables, remain rejected. `UPSERT` on a RANGE/HASH/LIST table resolves its conflict against the partition-local heap (PK target) or every partition-local root (secondary `UNIQUE` target) and stays rejected only on legacy TENANT tables. Bounded ADD/DROP plus validated ownership-transfer ATTACH/DETACH lifecycle DDL is described in `docs/partitioning.md`.
+The superblock primary tree holds catalog rows. Key `T` + table name. Value is a versioned `NSCT` descriptor (columns, PK, index list, heap meta page, foreign keys, CDC image policy, and bounded P21 physical-partition metadata). `EncodeTable` writes version 10. `DecodeTable` accepts v1 (empty FK list), v2 (key-only CDC), v3 (CDC image policy), v4 (partition metadata), v5 (non-reusing partition identity allocator), v6 (per-index HNSW traversal-quantisation tag), v7 (per-index vector-ANN method + IVF `LISTS` / `PROBES`), v8 (per-index IVF-PQ `SUBSPACES`), v9 (per-index full-text analyzer id + revision), and v10 (per-column `ENCRYPTED CLIENT` logical-type metadata); any other version fails closed. Key `S` + table name holds a versioned `NSST` statistics snapshot from `ANALYZE`; key `J` + stable table ID + stable partition ID holds its bounded `NSPS` local sketch. Key `A` + table ID + column name holds the next `AI()` value for that column (same transaction as the insert). Each user table and secondary index is a detached B+Tree whose root/height live on a slotted meta page (`NSTM`) so splits do not rewrite the catalog row. Any catalog rewrite upgrades an older descriptor to v10. `PARTITION BY RANGE`, `PARTITION BY HASH`, and `PARTITION BY LIST` are available with one-to-eight-column keys: RANGE uses lexicographically ordered tuple bounds (`VALUES LESS THAN (a, b, ...)`), LIST uses tuple membership (`VALUES IN ((a, b), ...)`), and HASH routes on the SHA-256 digest of the canonical typed tuple. Legacy TENANT descriptors remain decodable but cannot be created or extended through SQL. Plain/covering/partial/expression/JSON-path/spatial/FULLTEXT/HNSW indexes use partition-local roots. A plain-column secondary `UNIQUE` index (optionally with `INCLUDE`) is enforced across every partition by an exclusive key lock plus a probe of every other partition's local root on write, and an ordered cross-partition scan on CREATE/REBUILD/ATTACH; partial, expression, and JSON-path `UNIQUE`, and `UNIQUE` on legacy TENANT tables, remain rejected. `UPSERT` on a RANGE/HASH/LIST table resolves its conflict against the partition-local heap (PK target) or every partition-local root (secondary `UNIQUE` target) and stays rejected only on legacy TENANT tables. Bounded ADD/DROP plus validated ownership-transfer ATTACH/DETACH lifecycle DDL is described in `docs/partitioning.md`.
 
 Catalog mutations use the same WAL + MVCC transaction as user data. Recovery replays WAL, applies UNDO, then the executor reloads the catalog from the primary tree.
 

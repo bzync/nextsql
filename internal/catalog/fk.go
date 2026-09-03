@@ -175,6 +175,9 @@ func validateOneFK(child *Table, fk *ForeignKey, lookup func(string) (*Table, bo
 		if r < 0 || r >= len(parent.Columns) {
 			return nerr.New(nerr.NotFound, "catalog.ValidateForeignKeys", "referenced column missing")
 		}
+		if child.Columns[c].ClientEncrypted() || parent.Columns[r].ClientEncrypted() {
+			return nerr.New(nerr.InvalidArgument, "catalog.ValidateForeignKeys", "ENCRYPTED CLIENT columns cannot participate in foreign keys")
+		}
 		ct := child.Columns[c].Type
 		pt := parent.Columns[r].Type
 		if ct.Kind == types.KindVector || ct.Kind == types.KindJSON || pt.Kind == types.KindVector || pt.Kind == types.KindJSON {

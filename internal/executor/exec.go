@@ -41,6 +41,12 @@ func (s *Session) execPlan(plan planner.Logical) (*Result, error) {
 		return s.execAlterSchedule(p)
 	case planner.DropSchedule:
 		return s.execDropSchedule(p)
+	case planner.CreateResourceGroup:
+		return s.execCreateResourceGroup(p)
+	case planner.AlterResourceGroup:
+		return s.execAlterResourceGroup(p)
+	case planner.DropResourceGroup:
+		return s.execDropResourceGroup(p)
 	case planner.ShowTasks:
 		return s.execShowTasks(p)
 	case planner.CancelTask:
@@ -352,7 +358,7 @@ func (s *Session) grantHistoryDML() error {
 	for _, p := range []security.Privilege{
 		security.PrivSelect, security.PrivInsert, security.PrivUpdate, security.PrivDelete,
 	} {
-		if err := s.acl.Grant(s.user, p, security.ScopeTable, catalog.HistoryTable); err != nil {
+		if err := s.acl.GrantInRealm(s.realmID, s.user, p, security.ScopeTable, catalog.HistoryTable); err != nil {
 			return err
 		}
 	}
@@ -892,6 +898,9 @@ func (s *Session) nextDMLBatch(tab *catalog.Table, pred ast.Expr, after []types.
 }
 
 func (s *Session) writeRow(tab *catalog.Table, htx *btree.Txn, row []types.Value, insert bool) error {
+	if err := validateClientEncryptedRow(tab, row); err != nil {
+		return err
+	}
 	event := ast.TriggerInsert
 	if !insert {
 		event = ast.TriggerUpdate
@@ -954,6 +963,9 @@ func (s *Session) writeRow(tab *catalog.Table, htx *btree.Txn, row []types.Value
 }
 
 func (s *Session) replaceRow(tab *catalog.Table, htx *btree.Txn, old, neu []types.Value) error {
+	if err := validateClientEncryptedRow(tab, neu); err != nil {
+		return err
+	}
 	if err := s.fireTriggers(tab, ast.TriggerUpdate, ast.TriggerBefore, old, neu); err != nil {
 		return err
 	}
@@ -985,12 +997,6 @@ func (s *Session) replaceRow(tab *catalog.Table, htx *btree.Txn, old, neu []type
 			return err
 		}
 		if oldPart.ID != newPart.ID {
-			if err := s.deleteVectors(tab, oldPK, old); err != nil {
-				return err
-			}
-			if err := s.putVectors(tab, newPK, neu); err != nil {
-				return err
-			}
 			payload, err := types.EncodeRow(detachVectors(tab, neu))
 			if err != nil {
 				return err
@@ -1003,13 +1009,27 @@ func (s *Session) replaceRow(tab *catalog.Table, htx *btree.Txn, old, neu []type
 			if err != nil {
 				return err
 			}
-			if err := s.heapDelete(s.x.use(oldHeap), oldPK); err != nil {
+			trueOldPayload, err := s.heapDeleteReturningOld(s.x.use(oldHeap), oldPK)
+			if err != nil {
 				return err
 			}
 			if err := s.x.use(newHeap).Insert(newPK, payload); err != nil {
 				return err
 			}
-			if err := s.maintainIndexes(tab, old, neu); err != nil {
+			// Decode/hydrate before deleteVectors: hydrate re-attaches vector
+			// data by looking it up in the vector store, which deleteVectors
+			// is about to remove.
+			trueOld, err := s.decodeHeapRow(tab, trueOldPayload)
+			if err != nil {
+				return err
+			}
+			if err := s.deleteVectors(tab, oldPK, old); err != nil {
+				return err
+			}
+			if err := s.putVectors(tab, newPK, neu); err != nil {
+				return err
+			}
+			if err := s.maintainIndexes(tab, trueOld, neu); err != nil {
 				return err
 			}
 			if err := s.applyInboundWork(tab, work, old, neu, false); err != nil {
@@ -1027,6 +1047,34 @@ func (s *Session) replaceRow(tab *catalog.Table, htx *btree.Txn, old, neu []type
 		}
 		htx = s.x.use(partHeap)
 	}
+	payload, err := types.EncodeRow(detachVectors(tab, neu))
+	if err != nil {
+		return err
+	}
+	var trueOldPayload []byte
+	if string(oldPK) != string(newPK) {
+		p, err := s.heapDeleteReturningOld(htx, oldPK)
+		if err != nil {
+			return err
+		}
+		trueOldPayload = p
+		if err := htx.Insert(newPK, payload); err != nil {
+			return err
+		}
+	} else {
+		p, err := s.heapUpdateReturningOld(htx, oldPK, payload)
+		if err != nil {
+			return err
+		}
+		trueOldPayload = p
+	}
+	// Decode/hydrate before deleteVectors: hydrate re-attaches vector data by
+	// looking it up in the vector store, which deleteVectors is about to
+	// remove.
+	trueOld, err := s.decodeHeapRow(tab, trueOldPayload)
+	if err != nil {
+		return err
+	}
 	if string(oldPK) != string(newPK) {
 		if err := s.deleteVectors(tab, oldPK, old); err != nil {
 			return err
@@ -1035,21 +1083,7 @@ func (s *Session) replaceRow(tab *catalog.Table, htx *btree.Txn, old, neu []type
 	if err := s.putVectors(tab, newPK, neu); err != nil {
 		return err
 	}
-	payload, err := types.EncodeRow(detachVectors(tab, neu))
-	if err != nil {
-		return err
-	}
-	if string(oldPK) != string(newPK) {
-		if err := s.heapDelete(htx, oldPK); err != nil {
-			return err
-		}
-		if err := htx.Insert(newPK, payload); err != nil {
-			return err
-		}
-	} else if err := s.heapUpdate(htx, oldPK, payload); err != nil {
-		return err
-	}
-	if err := s.maintainIndexes(tab, old, neu); err != nil {
+	if err := s.maintainIndexes(tab, trueOld, neu); err != nil {
 		return err
 	}
 	if err := s.applyInboundWork(tab, work, old, neu, false); err != nil {
@@ -1088,13 +1122,21 @@ func (s *Session) removeRow(tab *catalog.Table, htx *btree.Txn, row []types.Valu
 		}
 		htx = s.x.use(hheap)
 	}
-	if err := s.heapDelete(htx, pk); err != nil {
+	trueOldPayload, err := s.heapDeleteReturningOld(htx, pk)
+	if err != nil {
+		return err
+	}
+	// Decode/hydrate before deleteVectors: hydrate re-attaches vector data by
+	// looking it up in the vector store, which deleteVectors is about to
+	// remove.
+	trueOld, err := s.decodeHeapRow(tab, trueOldPayload)
+	if err != nil {
 		return err
 	}
 	if err := s.deleteVectors(tab, pk, row); err != nil {
 		return err
 	}
-	if err := s.maintainIndexes(tab, row, nil); err != nil {
+	if err := s.maintainIndexes(tab, trueOld, nil); err != nil {
 		return err
 	}
 	if err := s.stageRowChange(tab, wal.ChangeDelete, row, nil); err != nil {
@@ -1218,6 +1260,7 @@ func (s *Session) maintainIndexes(tab *catalog.Table, old, neu []types.Value) er
 			continue
 		}
 		var itx *btree.Txn
+		var realIx *btree.Tree
 		if tab.Partitioning != nil {
 			// For partitioned tables, secondary indexes are per-partition.
 			// old and neu should be in same partition for non-moving updates, but for insert/delete we have only one.
@@ -1250,7 +1293,14 @@ func (s *Session) maintainIndexes(tab *catalog.Table, old, neu []types.Value) er
 				return err
 			}
 			itx = s.x.use(ix)
+			realIx = ix
 		}
+		// While REBUILD INDEX ... ONLINE is (or was very recently) in progress
+		// for this index, realIx may be the freshly-backfilled tree; use a
+		// fresh snapshot for its writes so this transaction's own (possibly
+		// older) snapshot cannot silently miss an entry the backfill just
+		// committed. See freshTreeSnap's doc comment.
+		online := realIx != nil && s.db.onlineBuildActive(idxKey(tab.Name, idx.Name))
 		if idx.Fulltext && old != nil && neu != nil && sameFulltextRow(tab, idx, old, neu) {
 			continue
 		}
@@ -1265,6 +1315,16 @@ func (s *Session) maintainIndexes(tab *catalog.Table, old, neu []types.Value) er
 					return err
 				}
 				for _, pkv := range pairs {
+					if online {
+						snap, serr := s.freshTreeSnap()
+						if serr != nil {
+							return serr
+						}
+						if err := itx.DeleteAt(pkv.k, snap); err != nil && !nerr.HasCode(err, nerr.NotFound) {
+							return err
+						}
+						continue
+					}
 					if err := s.treeDelete(itx, pkv.k); err != nil && !nerr.HasCode(err, nerr.NotFound) {
 						return err
 					}
@@ -1285,6 +1345,16 @@ func (s *Session) maintainIndexes(tab *catalog.Table, old, neu []types.Value) er
 					return err
 				}
 				for _, pkv := range pairs {
+					if online {
+						snap, serr := s.freshTreeSnap()
+						if serr != nil {
+							return serr
+						}
+						if err := itx.InsertAt(pkv.k, pkv.v, snap); err != nil {
+							return err
+						}
+						continue
+					}
 					if err := s.treeInsert(itx, pkv.k, pkv.v); err != nil {
 						return err
 					}
@@ -1316,6 +1386,13 @@ func (s *Session) maintainIndexes(tab *catalog.Table, old, neu []types.Value) er
 			}
 			if err := adjustFulltextStats(itx, dDocs, dToks); err != nil {
 				return err
+			}
+		}
+		if realIx != nil {
+			if sh := s.db.onlineShadow(idxKey(tab.Name, idx.Name)); sh != nil && sh != realIx {
+				if err := s.mirrorOnlineIndex(tab, idx, sh, old, neu); err != nil {
+					return err
+				}
 			}
 		}
 	}
@@ -1588,12 +1665,12 @@ func projectTable(n planner.Project) *catalog.Table {
 		col := catalog.Column{Name: name}
 		if in != nil && i < len(n.Cols) && n.Cols[i] >= 0 && n.Cols[i] < len(in.Columns) {
 			src := in.Columns[n.Cols[i]]
-			col.Type = src.Type
-			col.NotNull = src.NotNull
+			col = src
+			col.Name = name
 		} else if in != nil {
 			if j, ok := in.ColIndex(name); ok {
-				col.Type = in.Columns[j].Type
-				col.NotNull = in.Columns[j].NotNull
+				col = in.Columns[j]
+				col.Name = name
 			}
 		}
 		out.Columns = append(out.Columns, col)

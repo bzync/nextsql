@@ -1,6 +1,10 @@
 package types
 
-import "github.com/bzync/nextsql/internal/nerr"
+import (
+	"math"
+
+	"github.com/bzync/nextsql/internal/nerr"
+)
 
 // Kind is a catalog / runtime type tag.
 type Kind uint8
@@ -20,6 +24,63 @@ const (
 	KindBox
 	KindLine
 	KindPolygon
+	// KindBlob is variable-length raw bytes (D1, Datatype expansion track).
+	// Appended last so the numeric tag matches across every driver's own
+	// Kind table without needing a version bump anywhere it is persisted.
+	KindBlob
+	// KindInt8/16/32/64 are fixed-width two's-complement signed integers
+	// (D2, Datatype expansion track). Appended last for the same reason as
+	// KindBlob above — no catalog/protocol version bump needed.
+	KindInt8
+	KindInt16
+	KindInt32
+	KindInt64
+	// KindUint8/16/32/64 are fixed-width unsigned integers (D3, Datatype
+	// expansion track). Appended last for the same reason as KindInt8 above —
+	// no catalog/protocol version bump needed.
+	KindUint8
+	KindUint16
+	KindUint32
+	KindUint64
+	// KindDate is a fixed-width signed day count since the Unix epoch (D5,
+	// Datatype expansion track). KindTime is fixed-width nanoseconds since
+	// midnight. Appended last for the same reason as KindInt8 above — no
+	// catalog/protocol version bump needed.
+	KindDate
+	KindTime
+	// KindChar is a fixed-width, space-padded string CHAR(n) (D4, Datatype
+	// expansion track); KindVarchar is a length-capped string VARCHAR(n).
+	// Both reuse STRING/TEXT's exact on-disk encoding (u32 byte-length prefix
+	// + UTF-8 bytes) with n (a rune count, not byte count) carried in
+	// Type.Precision, the same field DECIMAL already uses for a parameter.
+	// Appended last for the same reason as KindInt8 above — no
+	// catalog/protocol version bump needed.
+	KindChar
+	KindVarchar
+	// KindTimestamp is a plain date-and-time with no timezone (D7, Datatype
+	// expansion track): int64 nanoseconds since 1970-01-01T00:00:00, the civil
+	// value read literally with no offset applied. Reuses Value.Time, the same
+	// field TIMESTAMPTZ/TIME use, disambiguated by Value.Typ.Kind. Deliberately
+	// isolated from TIMESTAMPTZ (converting between them needs an assumed zone)
+	// — text coercion only, same as DATE/TIME. Appended last: no
+	// catalog/protocol version bump needed.
+	KindTimestamp
+	// KindFloat32/KindFloat64 are IEEE-754 binary floating point (D8, Datatype
+	// expansion track). Unlike DECIMAL they are inexact by design — added for
+	// interop with external numeric data. Canonical total order for index
+	// keys: -Inf < negative reals < 0 < positive reals < +Inf < NaN; -0.0 is
+	// canonicalized to +0.0 on write, and all NaN payloads collapse to one
+	// value. Stored in Value.Flt. Appended last: no catalog/protocol version
+	// bump needed.
+	KindFloat32
+	KindFloat64
+	// KindEnum is a named-label enumeration (D11, Datatype expansion track).
+	// Stored on disk as a u16 ordinal into the column's declared label list;
+	// ordered by declaration position, NOT lexicographically (the whole point
+	// of ENUM). The label list travels on Type.EnumLabels. Unlike every other
+	// D-type this needs new per-column catalog metadata, so it DID take a
+	// catalog version bump (NSCT v10 -> v11).
+	KindEnum
 )
 
 func (k Kind) String() string {
@@ -50,9 +111,90 @@ func (k Kind) String() string {
 		return "LINESTRING"
 	case KindPolygon:
 		return "POLYGON"
+	case KindBlob:
+		return "BLOB"
+	case KindInt8:
+		return "INT8"
+	case KindInt16:
+		return "INT16"
+	case KindInt32:
+		return "INT32"
+	case KindInt64:
+		return "INT64"
+	case KindUint8:
+		return "UINT8"
+	case KindUint16:
+		return "UINT16"
+	case KindUint32:
+		return "UINT32"
+	case KindUint64:
+		return "UINT64"
+	case KindDate:
+		return "DATE"
+	case KindTime:
+		return "TIME"
+	case KindChar:
+		return "CHAR"
+	case KindVarchar:
+		return "VARCHAR"
+	case KindTimestamp:
+		return "TIMESTAMP"
+	case KindFloat32:
+		return "FLOAT32"
+	case KindFloat64:
+		return "FLOAT64"
+	case KindEnum:
+		return "ENUM"
 	default:
 		return "INVALID"
 	}
+}
+
+// IntRange returns the inclusive representable range of a fixed-width signed
+// integer Kind. ok is false for any non-integer Kind.
+func IntRange(k Kind) (lo, hi int64, ok bool) {
+	switch k {
+	case KindInt8:
+		return math.MinInt8, math.MaxInt8, true
+	case KindInt16:
+		return math.MinInt16, math.MaxInt16, true
+	case KindInt32:
+		return math.MinInt32, math.MaxInt32, true
+	case KindInt64:
+		return math.MinInt64, math.MaxInt64, true
+	default:
+		return 0, 0, false
+	}
+}
+
+// IsInt reports whether k is one of the fixed-width signed integer kinds.
+func IsInt(k Kind) bool {
+	_, _, ok := IntRange(k)
+	return ok
+}
+
+// UintRange returns the inclusive representable range of a fixed-width
+// unsigned integer Kind. lo is always 0; ok is false for any non-unsigned-int
+// Kind.
+func UintRange(k Kind) (hi uint64, ok bool) {
+	switch k {
+	case KindUint8:
+		return math.MaxUint8, true
+	case KindUint16:
+		return math.MaxUint16, true
+	case KindUint32:
+		return math.MaxUint32, true
+	case KindUint64:
+		return math.MaxUint64, true
+	default:
+		return 0, false
+	}
+}
+
+// IsUint reports whether k is one of the fixed-width unsigned integer kinds.
+func IsUint(k Kind) bool {
+	_, ok := UintRange(k)
+	return ok
 }
 
 // Vector element encodings. VecF32 is the original full-precision layout;
@@ -109,11 +251,50 @@ func VecElemBytes(e uint8) int {
 func VecElemQuantised(e uint8) bool { return e == VecF16 || e == VecI8 || e == VecBit }
 
 // Type is a catalog column type.
+//
+// EnumLabels holds an ENUM column's ordered label list (declaration order).
+// Because it is a slice, Type is no longer comparable with ==; use Equals.
+// Every non-ENUM Type leaves it nil.
 type Type struct {
-	Kind      Kind
-	Precision uint16 // DECIMAL p or VECTOR dimension
-	Scale     uint16 // DECIMAL s
-	VecElem   uint8  // VecF32
+	Kind       Kind
+	Precision  uint16 // DECIMAL p or VECTOR dimension; ENUM label count
+	Scale      uint16 // DECIMAL s
+	VecElem    uint8  // VecF32
+	EnumLabels []string
+}
+
+// MaxEnumLabels bounds an ENUM's declared label list. The on-disk ordinal is
+// a u16, so 65535 is the hard ceiling; the practical limit is lower.
+const MaxEnumLabels = 4096
+
+// EnumType builds an ENUM column type from an ordered, non-empty, unique
+// label list (docs/design-datatypes.md D11).
+func EnumType(labels []string) (Type, error) {
+	if len(labels) == 0 || len(labels) > MaxEnumLabels {
+		return Type{}, nerr.New(nerr.InvalidArgument, "types.EnumType", "ENUM needs 1..MaxEnumLabels labels")
+	}
+	seen := make(map[string]struct{}, len(labels))
+	for _, l := range labels {
+		if l == "" || len(l) > 255 {
+			return Type{}, nerr.New(nerr.InvalidArgument, "types.EnumType", "ENUM label length is invalid")
+		}
+		if _, dup := seen[l]; dup {
+			return Type{}, nerr.New(nerr.InvalidArgument, "types.EnumType", "duplicate ENUM label")
+		}
+		seen[l] = struct{}{}
+	}
+	cp := append([]string(nil), labels...)
+	return Type{Kind: KindEnum, Precision: uint16(len(cp)), EnumLabels: cp}, nil
+}
+
+// EnumOrdinal returns the 0-based declaration position of label, or -1.
+func (t Type) EnumOrdinal(label string) int {
+	for i, l := range t.EnumLabels {
+		if l == label {
+			return i
+		}
+	}
+	return -1
 }
 
 func (t Type) String() string {
@@ -128,6 +309,19 @@ func (t Type) String() string {
 			return "SPARSEVECTOR<" + itoa(int(t.Precision)) + ">"
 		}
 		return "VECTOR<" + VecElemName(t.VecElem) + "," + itoa(int(t.Precision)) + ">"
+	case KindChar:
+		return "CHAR(" + itoa(int(t.Precision)) + ")"
+	case KindVarchar:
+		return "VARCHAR(" + itoa(int(t.Precision)) + ")"
+	case KindEnum:
+		out := "ENUM("
+		for i, l := range t.EnumLabels {
+			if i > 0 {
+				out += ", "
+			}
+			out += "'" + l + "'"
+		}
+		return out + ")"
 	default:
 		return t.Kind.String()
 	}
@@ -156,7 +350,18 @@ func itoa(n int) string {
 }
 
 func (t Type) Equals(o Type) bool {
-	return t.Kind == o.Kind && t.Precision == o.Precision && t.Scale == o.Scale && t.VecElem == o.VecElem
+	if t.Kind != o.Kind || t.Precision != o.Precision || t.Scale != o.Scale || t.VecElem != o.VecElem {
+		return false
+	}
+	if len(t.EnumLabels) != len(o.EnumLabels) {
+		return false
+	}
+	for i := range t.EnumLabels {
+		if t.EnumLabels[i] != o.EnumLabels[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func UUID() Type        { return Type{Kind: KindUUID} }
@@ -166,12 +371,62 @@ func TimestampTZ() Type { return Type{Kind: KindTimestampTZ} }
 func JSON() Type        { return Type{Kind: KindJSON} }
 func Bool() Type        { return Type{Kind: KindBool} }
 func NullType() Type    { return Type{Kind: KindNull} }
+func Blob() Type        { return Type{Kind: KindBlob} }
+func Int8() Type        { return Type{Kind: KindInt8} }
+func Int16() Type       { return Type{Kind: KindInt16} }
+func Int32() Type       { return Type{Kind: KindInt32} }
+func Int64() Type       { return Type{Kind: KindInt64} }
+func Uint8() Type       { return Type{Kind: KindUint8} }
+func Uint16() Type      { return Type{Kind: KindUint16} }
+func Uint32() Type      { return Type{Kind: KindUint32} }
+func Uint64() Type      { return Type{Kind: KindUint64} }
+func Date() Type        { return Type{Kind: KindDate} }
+
+// TimeOfDay is the TIME (no date component) column type. Named TimeOfDay,
+// not Time, to stay distinct from the pre-existing TimeValue/Value.Time
+// (TIMESTAMPTZ's UTC-epoch-nanoseconds constructor/field).
+func TimeOfDay() Type { return Type{Kind: KindTime} }
+
+// Timestamp is the plain TIMESTAMP (no timezone) column type (D7). Named
+// Timestamp, not distinguished by a suffix, with TimestampTZ carrying the
+// "with timezone" spelling.
+func Timestamp() Type { return Type{Kind: KindTimestamp} }
+
+// Float32 / Float64 are the IEEE-754 binary floating point column types (D8).
+func Float32() Type { return Type{Kind: KindFloat32} }
+func Float64() Type { return Type{Kind: KindFloat64} }
+
+// IsFloat reports whether k is one of the IEEE-754 floating point kinds.
+func IsFloat(k Kind) bool { return k == KindFloat32 || k == KindFloat64 }
 
 func DecimalType(p, s uint16) (Type, error) {
 	if p < 1 || p > 38 || s > p {
 		return Type{}, nerr.New(nerr.InvalidArgument, "types.DecimalType", "DECIMAL precision/scale out of range")
 	}
 	return Type{Kind: KindDecimal, Precision: p, Scale: s}, nil
+}
+
+// MaxCharLen bounds CHAR(n)/VARCHAR(n)'s declared length (a rune count, not a
+// byte count). Type.Precision is a uint16, so this is also its hard ceiling.
+const MaxCharLen = 65535
+
+// CharType is the CHAR(n) column type: fixed-width, space-padded on write,
+// always exactly n runes once stored (docs/design-datatypes.md D4).
+func CharType(n uint16) (Type, error) {
+	if n < 1 || n > MaxCharLen {
+		return Type{}, nerr.New(nerr.InvalidArgument, "types.CharType", "CHAR length out of range")
+	}
+	return Type{Kind: KindChar, Precision: n}, nil
+}
+
+// VarcharType is the VARCHAR(n) column type: same encoding as STRING, with a
+// declared maximum rune count enforced at write/coercion time
+// (docs/design-datatypes.md D4).
+func VarcharType(n uint16) (Type, error) {
+	if n < 1 || n > MaxCharLen {
+		return Type{}, nerr.New(nerr.InvalidArgument, "types.VarcharType", "VARCHAR length out of range")
+	}
+	return Type{Kind: KindVarchar, Precision: n}, nil
 }
 
 // MaxVectorDim is the Phase 11 abuse limit for VECTOR<F32,N>.
@@ -221,7 +476,9 @@ func vectorType(n uint16, elem uint8, op string) (Type, error) {
 
 func (t Type) Comparable() bool {
 	switch t.Kind {
-	case KindUUID, KindString, KindText, KindDecimal, KindTimestampTZ, KindBool, KindPoint, KindBox, KindLine, KindPolygon:
+	case KindUUID, KindString, KindText, KindDecimal, KindTimestampTZ, KindBool, KindPoint, KindBox, KindLine, KindPolygon, KindBlob,
+		KindInt8, KindInt16, KindInt32, KindInt64, KindUint8, KindUint16, KindUint32, KindUint64, KindDate, KindTime,
+		KindChar, KindVarchar, KindTimestamp, KindFloat32, KindFloat64, KindEnum:
 		return true
 	default:
 		return false

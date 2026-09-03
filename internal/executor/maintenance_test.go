@@ -6,6 +6,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -401,4 +403,92 @@ func TestMaintainPartitionedTableAndIndexScopesEveryLocalTree(t *testing.T) {
 	db.mu.Lock()
 	db.partIdxs[key] = missing
 	db.mu.Unlock()
+}
+
+// TestMaintainIndexConcurrentWrites is an adversarial stress test for
+// MAINTAIN INDEX/TABLE running repeatedly while ordinary DML keeps writing
+// to the same table and index — the same shape of test
+// (TestRebuildIndexOnlineConcurrentWrites, internal/executor/online_rebuild_test.go)
+// that found a real data-integrity bug in REBUILD INDEX ... ONLINE
+// (TODO.md log #93). MAINTAIN's own existing tests (above) each drive one
+// specific, hand-arranged tombstone scenario; none run it concurrently
+// against live writers the way this does.
+func TestMaintainIndexConcurrentWrites(t *testing.T) {
+	db := testDB(t)
+	s := db.Session()
+	execOK(t, s, `CREATE TABLE t (id DECIMAL(10,0) PRIMARY KEY, v DECIMAL(6,0) NOT NULL)`)
+	const rows = 1200
+	const distinct = 32
+	for i := 1; i <= rows; i++ {
+		execOK(t, s, fmt.Sprintf(`INSERT INTO t (id, v) VALUES (%d, %d)`, i, i%distinct))
+	}
+	execOK(t, s, `CREATE INDEX ix_v ON t (v)`)
+
+	var stop atomic.Bool
+	var writes atomic.Int64
+	var wg sync.WaitGroup
+	wg.Add(4)
+	for w := 0; w < 3; w++ {
+		go func(seed int) {
+			defer wg.Done()
+			ws := db.Session()
+			r := uint64(seed*2654435761 + 1)
+			tolerant := func(err error) bool {
+				return nerr.HasCode(err, nerr.Serialization) || nerr.HasCode(err, nerr.Deadlock) ||
+					nerr.HasCode(err, nerr.AlreadyExists) || nerr.HasCode(err, nerr.NotFound) ||
+					nerr.HasCode(err, nerr.Unavailable)
+			}
+			for !stop.Load() {
+				r = r*6364136223846793005 + 1442695040888963407
+				val := int(r>>17) % distinct
+				var q string
+				switch r >> 61 & 3 {
+				case 0: // insert into a churn range above the seeded rows
+					q = fmt.Sprintf(`INSERT INTO t (id, v) VALUES (%d, %d)`, rows+1+int(r>>33)%400, val)
+				case 1: // delete from the churn range
+					q = fmt.Sprintf(`DELETE FROM t WHERE id = %d`, rows+1+int(r>>33)%400)
+				default: // update a stable row
+					q = fmt.Sprintf(`UPDATE t SET v = %d WHERE id = %d`, val, int(r>>33)%rows+1)
+				}
+				if _, err := ws.Exec(q); err != nil {
+					if tolerant(err) {
+						continue
+					}
+					t.Errorf("concurrent write %q: %v", q, err)
+					return
+				}
+				writes.Add(1)
+			}
+		}(w + 1)
+	}
+	// Dedicated maintainer goroutine: MAINTAIN's own concurrency limit
+	// allows only one active pass per database, so this alone contends the
+	// real path an operator's periodic maintenance job would take.
+	go func() {
+		defer wg.Done()
+		ms := db.Session()
+		for !stop.Load() {
+			if _, err := ms.Exec(`MAINTAIN INDEX ix_v`); err != nil &&
+				!nerr.HasCode(err, nerr.Unavailable) {
+				t.Errorf("MAINTAIN INDEX ix_v: %v", err)
+				return
+			}
+			if _, err := ms.Exec(`MAINTAIN TABLE t`); err != nil &&
+				!nerr.HasCode(err, nerr.Unavailable) {
+				t.Errorf("MAINTAIN TABLE t: %v", err)
+				return
+			}
+		}
+	}()
+
+	for writes.Load() < 400 {
+		time.Sleep(time.Millisecond)
+	}
+	stop.Store(true)
+	wg.Wait()
+
+	if err := db.LastReclaimError(); err != nil {
+		t.Fatalf("reclaim error: %v", err)
+	}
+	assertIndexMatchesHeap(t, s, distinct)
 }

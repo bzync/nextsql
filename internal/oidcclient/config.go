@@ -2,8 +2,10 @@ package oidcclient
 
 import (
 	"bufio"
+	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"github.com/bzync/nextsql/internal/nerr"
@@ -131,20 +133,65 @@ func applyClientKey(p *ConfigProfile, k, v string) error {
 // secret file if one is configured.
 func (p ConfigProfile) Resolve() (IdPProfile, error) {
 	out := IdPProfile{
-		Name:      p.Name,
-		Issuer:    p.Issuer,
-		ClientID:  p.ClientID,
-		BrokerURL: p.BrokerURL,
-		Scopes:    append([]string(nil), p.Scopes...),
+		Name:             p.Name,
+		Issuer:           p.Issuer,
+		ClientID:         p.ClientID,
+		ClientSecretFile: p.ClientSecretFile,
+		BrokerURL:        p.BrokerURL,
+		Scopes:           append([]string(nil), p.Scopes...),
 	}
 	if p.ClientSecretFile != "" {
-		raw, err := os.ReadFile(p.ClientSecretFile)
+		secret, err := ReadClientSecretFile(p.ClientSecretFile)
 		if err != nil {
-			return IdPProfile{}, nerr.Wrap(nerr.IO, "oidcclient.ConfigProfile.Resolve", "read client_secret_file", err)
+			return IdPProfile{}, err
 		}
-		out.ClientSecret = strings.TrimSpace(string(raw))
+		out.ClientSecret = secret
 	}
 	return out, nil
+}
+
+const maxClientSecretBytes = 64 << 10
+
+// ReadClientSecretFile reads a confidential OAuth2 client secret from a
+// bounded, regular, host-private file. It rejects symlinks and broad Unix
+// permissions so a workload cannot accidentally source its secret from an
+// attacker-replaceable or world-readable path.
+func ReadClientSecretFile(path string) (string, error) {
+	const op = "oidcclient.ReadClientSecretFile"
+	before, err := os.Lstat(path)
+	if err != nil {
+		return "", nerr.Wrap(nerr.IO, op, "inspect client secret file", err)
+	}
+	if !before.Mode().IsRegular() || before.Mode()&os.ModeSymlink != 0 {
+		return "", nerr.New(nerr.Forbidden, op, "client secret path must be a regular file")
+	}
+	if runtime.GOOS != "windows" && before.Mode().Perm()&0o077 != 0 {
+		return "", nerr.New(nerr.Forbidden, op, "client secret file permissions are too broad; require mode 0600")
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return "", nerr.Wrap(nerr.IO, op, "open client secret file", err)
+	}
+	defer f.Close()
+	after, err := f.Stat()
+	if err != nil || !after.Mode().IsRegular() || !os.SameFile(before, after) {
+		return "", nerr.New(nerr.Forbidden, op, "client secret file changed while opening")
+	}
+	if runtime.GOOS != "windows" && after.Mode().Perm()&0o077 != 0 {
+		return "", nerr.New(nerr.Forbidden, op, "client secret file permissions changed while opening")
+	}
+	raw, err := io.ReadAll(io.LimitReader(f, maxClientSecretBytes+1))
+	if err != nil {
+		return "", nerr.Wrap(nerr.IO, op, "read client secret file", err)
+	}
+	if len(raw) > maxClientSecretBytes {
+		return "", nerr.New(nerr.Exhausted, op, "client secret file exceeds 64 KiB")
+	}
+	secret := strings.TrimSpace(string(raw))
+	if secret == "" {
+		return "", nerr.New(nerr.InvalidFormat, op, "client secret file is empty")
+	}
+	return secret, nil
 }
 
 func stripComment(s string) string {

@@ -1,6 +1,10 @@
 # Native wire protocol (Phase 8)
 
-Versioned NextSQL framing spoken by `nextsqld` and the official drivers (`drivers/go`, `drivers/node`, `drivers/bun`, `drivers/deno`, `drivers/php`). Node, Bun, and Deno ship TypeScript types (`drivers/js/types.d.ts`). Local SQL execution is unchanged (`docs/sql.md`). This document is the on-the-wire contract.
+`ENCRYPTED CLIENT` adds no NSQL frame or wire type. Clients bind and receive
+its `NSCE1.` ciphertext through the existing `STRING` value encoding; logical
+type and encryption status are catalog metadata (`NSCT` v10).
+
+Versioned NextSQL framing spoken by `nextsqld` and the official drivers (`drivers/go`, `drivers/node`, `drivers/bun`, `drivers/deno`, `drivers/php`, `drivers/python`, `drivers/ruby`). Node, Bun, and Deno ship TypeScript types (`drivers/js/types.d.ts`). Local SQL execution is unchanged (`docs/sql.md`). This document is the on-the-wire contract.
 
 ISO/IEC 9075-3:2023 SQL/CLI and ISO/IEC 9579:2000 RDA are conceptual design
 references. NextSQL does not expose those interfaces directly: NSQL remains the
@@ -126,7 +130,7 @@ A length field larger than `max_packet` is a protocol error. The implementation 
 
 | Type | Direction | Payload |
 |---|---|---|
-| Hello | C→S | version, flags, cancel secret, database, user |
+| Hello | C→S | version, flags, cancel secret, database, user, realm (optional trailing field) |
 | HelloOK | S→C | version, auth method (1 = password), cancel secret |
 | Auth | C→S | password (TLS) |
 | AuthOK | S→C | empty |
@@ -182,14 +186,32 @@ window, audience, database scope, and revocation state, requires the claimed
 principal to match the Hello user and be a known native user, applies any role
 scope, and closes the session at the credential's expiry. See
 `docs/security.md`. Drivers pass it wherever `Config.Password` would go.
+An optional bounded `token_identity_source_hint=KEY_ID:oidc,...` changes only
+the server audit label to `oidc` / `mtls+oidc` after signature verification; it
+adds no claim and does not change NSQL or the `NSSC1.` format.
 
 For deployments containing the M1 `nextsql.instance` registry, `nextsqld`
 loads the registered default logical database name into the existing Hello
 check. A matching non-empty Hello database is accepted, a different non-empty
 name is `not_found`, and an empty v1 field selects the default for compatibility.
-This is default-database validation, not multi-database routing. An explicit
-realm field and selectable engine routing require a future negotiated protocol
-revision.
+This is default-database validation, not multi-database routing.
+
+`Hello.Realm` (M2-2) works the same way, one layer up: `nextsqld` also loads
+the registered default realm's name and rejects a non-empty, non-matching
+`Hello.Realm` with `not_found` ("unknown realm"). It is an **additive
+trailing field, not a protocol version bump** — the frame header's `Version`
+remains a hard equality gate with no negotiation. A client that never
+configures a realm emits nothing past `user`, producing the exact pre-realm
+wire shape (`DecodeHello` tail-sniffs one more length-prefixed string only
+when bytes remain past `user`, mirroring `NSCT`'s V1 field-versioning
+pattern in `internal/catalog`); a client that does select a realm requires a
+server new enough to decode the trailing field, and fails closed with a
+decode error against an older one rather than silently connecting to
+whatever that server has open. This is still flat-string identity
+validation against the one realm+database pair a given `nextsqld` process
+serves, not selectable multi-database engine routing — see
+`docs/design-multidatabase-dbaas.md` §8/§16 for that still-open scope
+(M2-3/M2-4).
 
 ## Streaming and backpressure
 
@@ -210,10 +232,15 @@ HelloOK includes a 64-bit cancel secret. The driver opens a second connection, s
 | Parameters | 256 |
 | Prepared statements / session | 64 |
 | Concurrent sessions | 128 |
+| Concurrent sessions per user | unlimited |
 | Result bytes on the wire | 64 MiB |
 | Idle | 60 s |
+| Statement (per-query wall clock) | 30 s |
+| Transaction (total open lifetime) | unbounded |
+| Lock wait (contended, non-deadlocking) | unbounded |
+| Idle-in-transaction (traffic gap while open) | no distinct bound (falls back to Idle) |
 
-These sit on top of the Phase 7 per-query worker / memory / disk / I/O / time budget.
+These sit on top of the Phase 7 per-query worker / memory / disk / I/O / time budget — the statement row above *is* that budget's time bound (`scheduler.Limits.Time`), surfaced here because it is also configurable per node. Concurrent sessions, concurrent sessions per user, idle, statement, transaction, and idle-in-transaction are configurable per node (`max_connections`, `max_connections_per_user`, `idle_timeout_ms`, `statement_timeout_ms`, `transaction_timeout_ms`, `idle_transaction_timeout_ms` in `docs/ops.md` "Connection limits" / "Statement, transaction, lock, and idle-transaction timeouts") and are not synchronized across a cluster. Lock wait (`lock_timeout_ms`) is process-wide rather than per-connection — it bounds the shared engine-wide lock table, not one session's limits. An over-limit connection is rejected with `exhausted` after authentication, before a session is created; an over-budget statement or a timed-out lock wait each fail the statement in progress with `exhausted` instead; an over-timeout transaction force-aborts on the next statement dispatched inside it (`transaction_timeout_ms`) or, if none ever arrives, once the idle-in-transaction bound elapses and the connection's next frame read times out (`idle_transaction_timeout_ms`) — either way, and on any other path that tears down a connection with a transaction still open, the transaction is rolled back rather than left holding locks.
 
 ## Threat model (honest)
 

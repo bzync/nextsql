@@ -5,7 +5,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/bzync/nextsql/internal/catalog"
 	"github.com/bzync/nextsql/internal/nerr"
 	"github.com/bzync/nextsql/internal/scheduler"
 	"github.com/bzync/nextsql/internal/security"
@@ -22,7 +21,6 @@ const (
 )
 
 type TaskRuntimeConfig struct {
-	Workers      int
 	Batch        int
 	PollInterval time.Duration
 	PurgeEvery   time.Duration
@@ -33,35 +31,41 @@ type TaskRuntimeConfig struct {
 	OnError      func(error)
 }
 
-// TaskRuntime is one fixed-size worker set plus one coordinator. It uses no
-// goroutine per task and claims only work for which a worker slot is reserved.
+// TaskRuntime is one database's coordinator: it polls that database's own
+// due tasks/schedules on its own schedule and submits claims to a shared
+// TaskPool (M2-3b-3a) rather than owning any worker goroutines itself —
+// before this, each TaskRuntime spawned its own fixed worker set, so total
+// task-execution goroutines scaled with the number of open databases.
 type TaskRuntime struct {
 	db     *DB
+	pool   *TaskPool
 	config TaskRuntimeConfig
 
 	ctx    context.Context
 	cancel context.CancelFunc
-	jobs   chan *catalog.Task
-	slots  chan struct{}
 
-	mu      sync.Mutex
-	running map[string]context.CancelFunc
-	wg      sync.WaitGroup
-	once    sync.Once
+	// inFlight tracks claims this runtime has submitted to pool.jobs that a
+	// pool worker has not yet finished executing. Close waits it out after
+	// stopping its own coordinator, so by the time Close returns, no pool
+	// worker holds or will pick up a reference to this runtime's db —
+	// letting the caller safely close the database right after (this is the
+	// correctness hazard a shared pool introduces that per-runtime workers
+	// never had: Close used to synchronously stop the exact goroutines that
+	// could touch db, since they belonged to this runtime alone).
+	inFlight sync.WaitGroup
+	wg       sync.WaitGroup
+	once     sync.Once
 }
 
-func StartTaskRuntime(parent context.Context, db *DB, config TaskRuntimeConfig) (*TaskRuntime, error) {
+func StartTaskRuntime(parent context.Context, db *DB, pool *TaskPool, config TaskRuntimeConfig) (*TaskRuntime, error) {
 	if db == nil {
 		return nil, nerr.New(nerr.InvalidArgument, "executor.StartTaskRuntime", "nil database")
 	}
+	if pool == nil {
+		return nil, nerr.New(nerr.InvalidArgument, "executor.StartTaskRuntime", "nil task pool")
+	}
 	if parent == nil {
 		parent = context.Background()
-	}
-	if config.Workers == 0 {
-		config.Workers = defaultTaskWorkers
-	}
-	if config.Workers < 1 || config.Workers > maxTaskWorkers {
-		return nil, nerr.New(nerr.InvalidArgument, "executor.StartTaskRuntime", "task workers must be between 1 and 16")
 	}
 	if config.Batch == 0 {
 		config.Batch = defaultTaskBatch
@@ -86,46 +90,25 @@ func StartTaskRuntime(parent context.Context, db *DB, config TaskRuntimeConfig) 
 	}
 	ctx, cancel := context.WithCancel(parent)
 	runtime := &TaskRuntime{
-		db: db, config: config, ctx: ctx, cancel: cancel,
-		jobs: make(chan *catalog.Task, config.Workers), slots: make(chan struct{}, config.Workers),
-		running: make(map[string]context.CancelFunc),
-	}
-	for i := 0; i < config.Workers; i++ {
-		runtime.slots <- struct{}{}
-		runtime.wg.Add(1)
-		go runtime.worker()
+		db: db, pool: pool, config: config, ctx: ctx, cancel: cancel,
 	}
 	runtime.wg.Add(1)
 	go runtime.coordinate()
 	return runtime, nil
 }
 
+// Close stops this runtime's own polling and waits for every claim it has
+// already submitted to the shared pool to finish executing (see inFlight's
+// doc comment) — it does not stop the pool itself, which is shared by every
+// other open database's runtime.
 func (r *TaskRuntime) Close() error {
 	if r == nil {
 		return nil
 	}
 	r.once.Do(r.cancel)
 	r.wg.Wait()
+	r.inFlight.Wait()
 	return nil
-}
-
-// Cancel writes the durable cancellation request before signaling a local
-// worker. Failover therefore cannot lose a cancellation acknowledged here.
-func (r *TaskRuntime) Cancel(ctx context.Context, id string) (*catalog.Task, error) {
-	if r == nil || r.db == nil {
-		return nil, nerr.New(nerr.InvalidArgument, "executor.TaskRuntime.Cancel", "task runtime is not active")
-	}
-	task, err := r.db.RequestTaskCancellation(ctx, id, r.config.Now())
-	if err != nil {
-		return nil, err
-	}
-	r.mu.Lock()
-	cancel := r.running[id]
-	r.mu.Unlock()
-	if cancel != nil {
-		cancel()
-	}
-	return task, nil
 }
 
 func (r *TaskRuntime) coordinate() {
@@ -154,9 +137,9 @@ func (r *TaskRuntime) cycle() {
 	for available < r.config.Batch {
 		select {
 		case <-r.ctx.Done():
-			r.releaseSlots(available)
+			r.pool.releaseSlots(available)
 			return
-		case <-r.slots:
+		case <-r.pool.slots:
 			available++
 		default:
 			goto claimedSlots
@@ -170,7 +153,7 @@ claimedSlots:
 	now := r.config.Now()
 	claims, err := r.db.ClaimDueTasks(r.ctx, now, available)
 	if err != nil {
-		r.releaseSlots(available)
+		r.pool.releaseSlots(available)
 		if !nerr.HasCode(err, nerr.Unavailable) && !nerr.HasCode(err, nerr.Canceled) {
 			r.report(err)
 		}
@@ -193,50 +176,29 @@ claimedSlots:
 			}
 		}
 	}
-	r.releaseSlots(available - len(claims))
+	r.pool.releaseSlots(available - len(claims))
 	for i, claim := range claims {
+		// inFlight must be counted before the send resolves either way, so
+		// Close (which waits it out after stopping this coordinator) can
+		// never race a claim that is in the middle of being handed off.
+		r.inFlight.Add(1)
+		task := claim
+		job := taskJob{
+			ctx: r.ctx, db: r.db, task: task, config: r.config,
+			onDone: func(err error) {
+				defer r.inFlight.Done()
+				if err != nil && !nerr.HasCode(err, nerr.Canceled) && !nerr.HasCode(err, nerr.Unavailable) {
+					r.report(err)
+				}
+			},
+		}
 		select {
 		case <-r.ctx.Done():
-			r.releaseSlots(len(claims) - i)
+			r.inFlight.Done()
+			r.pool.releaseSlots(len(claims) - i)
 			return
-		case r.jobs <- claim:
+		case r.pool.jobs <- job:
 		}
-	}
-}
-
-func (r *TaskRuntime) worker() {
-	defer r.wg.Done()
-	for {
-		select {
-		case <-r.ctx.Done():
-			return
-		case task := <-r.jobs:
-			if task == nil {
-				r.releaseSlots(1)
-				continue
-			}
-			taskCtx, cancel := context.WithCancel(r.ctx)
-			r.db.registerTaskCancel(task.ID, cancel)
-			r.mu.Lock()
-			r.running[task.ID] = cancel
-			r.mu.Unlock()
-			err := r.db.executeClaimedTask(taskCtx, task, r.config.ACL, r.config.Audit, r.config.Limits, r.config.Now)
-			cancel()
-			r.db.unregisterTaskCancel(task.ID)
-			r.mu.Lock()
-			delete(r.running, task.ID)
-			r.mu.Unlock()
-			r.releaseSlots(1)
-			if err != nil && !nerr.HasCode(err, nerr.Canceled) && !nerr.HasCode(err, nerr.Unavailable) {
-				r.report(err)
-			}
-		}
-	}
-}
-
-func (r *TaskRuntime) releaseSlots(n int) {
-	for i := 0; i < n; i++ {
-		r.slots <- struct{}{}
 	}
 }
 

@@ -145,6 +145,31 @@ page-image repair, which scans local WAL from LSN 1. If corruption needs an
 older archived image, restore the archived WAL before repair. Deployments that
 prioritize maximum local repair history should leave the horizon unset.
 
+#### Automatic time-based retention (`wal_retention_ms`)
+
+`DB.SetWALRetentionHorizon` is a raw, point-in-time LSN setter — by itself
+it is a manual mechanism, not a policy. `nextsqld`'s `wal_retention_ms`
+config key turns it into one: when positive **and** `wal_archive` is also
+configured, `nextsqld` periodically (every 1/24th of the retention window,
+clamped to `[1m, 1h]`, plus once immediately at startup) recomputes the
+horizon as the newest archived segment's LSN at or before
+`now - wal_retention_ms`, using the same `ResolveUntilTime` lookup
+`nextsql restore --until` uses for PITR — and calls
+`SetWALRetentionHorizon` with it. `wal_retention_ms` alone does not require
+`wal_archive`: if no archiver is configured, updating the horizon has
+nothing safe to advance to (see above — pruning without an archiver
+destroys the only copy of that history), so the updater is a no-op until
+both are set together. 0 (the default) leaves the horizon unmanaged,
+matching prior behavior exactly.
+
+This only maintains the horizon — it does not prune anything itself.
+Pruning still happens only during `MAINTAIN DATABASE` (SQL) / `MAINTAIN
+TABLE`/`INDEX`, which remains a manual or externally-scheduled operation
+(e.g. cron calling `nextsql exec -c 'MAINTAIN DATABASE'`); nextsqld has no
+automatic background maintenance scheduler. A `wal_retention_ms` policy
+without a scheduled `MAINTAIN DATABASE` alongside it keeps the horizon
+current but prunes nothing.
+
 ## Recovery
 
 No-steal, no-force:

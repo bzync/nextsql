@@ -7,6 +7,46 @@ import (
 	"github.com/bzync/nextsql/internal/sql/types"
 )
 
+// TestMultiSpecNoSlotSharing guards against the regression where a single
+// shared sum/nval/min/max on state double-counted whenever two specs used the
+// same slot: SUM+AVG of one column, two MINs, COUNT(col)+SUM, etc.
+func TestMultiSpecNoSlotSharing(t *testing.T) {
+	b := scheduler.NewBudget(nil, scheduler.DefaultLimits())
+	defer b.Close()
+	dv := func(s string) types.Value {
+		d, _ := types.ParseDecimal(s)
+		return types.DecimalValue(d, types.Type{Kind: types.KindDecimal})
+	}
+	// specs: SUM(c1), AVG(c1), MIN(c1), MAX(c1), COUNT(c1)
+	h := New(nil, []Spec{
+		{Fun: "sum", Col: 0}, {Fun: "avg", Col: 0}, {Fun: "min", Col: 0},
+		{Fun: "max", Col: 0}, {Fun: "count", Col: 0},
+	}, nil, b)
+	defer h.Close()
+	for _, n := range []string{"2", "4", "6"} {
+		if err := h.Add([]types.Value{dv(n)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rows, err := h.Finish()
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := rows[0]
+	if r[0].Dec.String() != "12" {
+		t.Fatalf("SUM = %s, want 12 (double-counting regression)", r[0].Dec.String())
+	}
+	if r[1].Dec.String() != "4.000000" {
+		t.Fatalf("AVG = %s, want 4", r[1].Dec.String())
+	}
+	if r[2].Dec.String() != "2" || r[3].Dec.String() != "6" {
+		t.Fatalf("MIN/MAX = %s/%s, want 2/6", r[2].Dec.String(), r[3].Dec.String())
+	}
+	if r[4].Dec.String() != "3" {
+		t.Fatalf("COUNT = %s, want 3", r[4].Dec.String())
+	}
+}
+
 func TestHashCountSum(t *testing.T) {
 	b := scheduler.NewBudget(nil, scheduler.DefaultLimits())
 	defer b.Close()

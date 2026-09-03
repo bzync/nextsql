@@ -35,6 +35,11 @@ type Vector struct {
 	Box       [][4]float64
 	Coords    [][]float64
 	Rings     [][]int
+	// IntervalMonths/IntervalDays hold INTERVAL's calendar components (D6);
+	// the third component, nanoseconds, shares Time above (same pattern
+	// DATE/TIME/TIMESTAMP/TIMESTAMPTZ already use).
+	IntervalMonths []int32
+	IntervalDays   []int32
 }
 
 // New allocates a batch with capacity snapped to a supported size.
@@ -60,13 +65,17 @@ func newVec(t types.Type, n int) Vector {
 		v.Str = make([]string, n)
 	case types.KindDecimal:
 		v.Dec = make([]types.Decimal, n)
-	case types.KindInt8, types.KindInt16, types.KindInt32, types.KindInt64, types.KindDate:
+	case types.KindInt8, types.KindInt16, types.KindInt32, types.KindInt64, types.KindDate, types.KindEnum:
 		v.Int = make([]int64, n)
 	case types.KindUint8, types.KindUint16, types.KindUint32, types.KindUint64:
 		v.Uint = make([]uint64, n)
 	case types.KindFloat32, types.KindFloat64:
 		v.Flt = make([]float64, n)
 	case types.KindTimestampTZ, types.KindTime, types.KindTimestamp:
+		v.Time = make([]int64, n)
+	case types.KindInterval:
+		v.IntervalMonths = make([]int32, n)
+		v.IntervalDays = make([]int32, n)
 		v.Time = make([]int64, n)
 	case types.KindJSON:
 		v.JSON = make([][]byte, n)
@@ -171,13 +180,17 @@ func setAt(col *Vector, i int, v types.Value) {
 		col.Str[i] = v.Str
 	case types.KindDecimal:
 		col.Dec[i] = v.Dec
-	case types.KindInt8, types.KindInt16, types.KindInt32, types.KindInt64, types.KindDate:
+	case types.KindInt8, types.KindInt16, types.KindInt32, types.KindInt64, types.KindDate, types.KindEnum:
 		col.Int[i] = v.Int
 	case types.KindUint8, types.KindUint16, types.KindUint32, types.KindUint64:
 		col.Uint[i] = v.Uint
 	case types.KindFloat32, types.KindFloat64:
 		col.Flt[i] = v.Flt
 	case types.KindTimestampTZ, types.KindTime, types.KindTimestamp:
+		col.Time[i] = v.Time
+	case types.KindInterval:
+		col.IntervalMonths[i] = v.IntervalMonths
+		col.IntervalDays[i] = v.IntervalDays
 		col.Time[i] = v.Time
 	case types.KindJSON:
 		col.JSON[i] = v.JSON
@@ -254,12 +267,17 @@ func getAt(col *Vector, i int) types.Value {
 		return types.Float64Value(col.Flt[i])
 	case types.KindDate:
 		return types.DateValue(int32(col.Int[i]))
+	case types.KindEnum:
+		v, _ := types.EnumValueByOrdinal(int(col.Int[i]), col.Typ)
+		return v
 	case types.KindTimestampTZ:
 		return types.TimeValue(col.Time[i])
 	case types.KindTime:
 		return types.TimeOfDayValue(col.Time[i])
 	case types.KindTimestamp:
 		return types.NaiveTimestampValue(col.Time[i])
+	case types.KindInterval:
+		return types.IntervalValue(col.IntervalMonths[i], col.IntervalDays[i], col.Time[i])
 	case types.KindJSON:
 		return types.JSONValue(col.JSON[i])
 	case types.KindVector:
@@ -316,13 +334,17 @@ func (b *Batch) Compact(sel []int) {
 				col.Str[d] = col.Str[s]
 			case types.KindDecimal:
 				col.Dec[d] = col.Dec[s]
-			case types.KindInt8, types.KindInt16, types.KindInt32, types.KindInt64, types.KindDate:
+			case types.KindInt8, types.KindInt16, types.KindInt32, types.KindInt64, types.KindDate, types.KindEnum:
 				col.Int[d] = col.Int[s]
 			case types.KindUint8, types.KindUint16, types.KindUint32, types.KindUint64:
 				col.Uint[d] = col.Uint[s]
 			case types.KindFloat32, types.KindFloat64:
 				col.Flt[d] = col.Flt[s]
 			case types.KindTimestampTZ, types.KindTime, types.KindTimestamp:
+				col.Time[d] = col.Time[s]
+			case types.KindInterval:
+				col.IntervalMonths[d] = col.IntervalMonths[s]
+				col.IntervalDays[d] = col.IntervalDays[s]
 				col.Time[d] = col.Time[s]
 			case types.KindJSON:
 				col.JSON[d] = col.JSON[s]
@@ -375,13 +397,17 @@ func clonePrefix(src Vector, n, cap int) Vector {
 		copy(dst.Str, src.Str[:n])
 	case types.KindDecimal:
 		copy(dst.Dec, src.Dec[:n])
-	case types.KindInt8, types.KindInt16, types.KindInt32, types.KindInt64, types.KindDate:
+	case types.KindInt8, types.KindInt16, types.KindInt32, types.KindInt64, types.KindDate, types.KindEnum:
 		copy(dst.Int, src.Int[:n])
 	case types.KindUint8, types.KindUint16, types.KindUint32, types.KindUint64:
 		copy(dst.Uint, src.Uint[:n])
 	case types.KindFloat32, types.KindFloat64:
 		copy(dst.Flt, src.Flt[:n])
 	case types.KindTimestampTZ, types.KindTime, types.KindTimestamp:
+		copy(dst.Time, src.Time[:n])
+	case types.KindInterval:
+		copy(dst.IntervalMonths, src.IntervalMonths[:n])
+		copy(dst.IntervalDays, src.IntervalDays[:n])
 		copy(dst.Time, src.Time[:n])
 	case types.KindJSON:
 		copy(dst.JSON, src.JSON[:n])

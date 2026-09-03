@@ -293,7 +293,7 @@ func sqlLiteral(v types.Value) (string, error) {
 	switch v.Typ.Kind {
 	case types.KindUUID:
 		return "'" + types.FormatUUID(v.UUID) + "'", nil
-	case types.KindString, types.KindText, types.KindChar, types.KindVarchar:
+	case types.KindString, types.KindText, types.KindChar, types.KindVarchar, types.KindEnum:
 		return "'" + strings.ReplaceAll(v.Str, "'", "''") + "'", nil
 	case types.KindBlob:
 		return "X'" + hex.EncodeToString([]byte(v.Str)) + "'", nil
@@ -308,7 +308,7 @@ func sqlLiteral(v types.Value) (string, error) {
 			return "'" + v.String() + "'", nil
 		}
 		return v.String(), nil
-	case types.KindTimestampTZ, types.KindTimestamp, types.KindDate, types.KindTime:
+	case types.KindTimestampTZ, types.KindTimestamp, types.KindDate, types.KindTime, types.KindInterval:
 		return "'" + v.String() + "'", nil
 	case types.KindBool:
 		if v.Bool {

@@ -17,6 +17,8 @@ module NextSQL
     MAX_SQL = 1 << 20
     MAX_NAME = 256
     MAX_PARAMS = 256
+    MAX_ENUM_LABELS = 4096
+    MAX_ENUM_LABEL_BYTES = 255
 
     TYPE_HELLO = 1
     TYPE_HELLO_OK = 2
@@ -75,8 +77,17 @@ module NextSQL
     KIND_UINT16 = 20
     KIND_UINT32 = 21
     KIND_UINT64 = 22
+    KIND_DATE = 23
+    KIND_TIME = 24
+    KIND_CHAR = 25
+    KIND_VARCHAR = 26
+    KIND_TIMESTAMP = 27
+    KIND_FLOAT32 = 28
+    KIND_FLOAT64 = 29
+    KIND_ENUM = 30
+    KIND_INTERVAL = 31
 
-    Column = Struct.new(:name, :kind)
+    Column = Struct.new(:name, :kind, :labels)
     NodeStatus = Struct.new(:role, :has_leader, :healthy, :applied_lsn, :last_contact_ms, :apply_backlog)
 
     # Dense (values), reference (ref=true, dim only), or sparse
@@ -108,6 +119,50 @@ module NextSQL
     Uint16 = Struct.new(:value)
     Uint32 = Struct.new(:value)
     Uint64 = Struct.new(:value)
+
+    # EnumValue (D11, Datatype expansion track): an explicit ENUM parameter
+    # wrapper (value:, labels:). Ordinary INSERT/UPDATE params can just pass
+    # a plain String — the server coerces STRING -> ENUM against the
+    # destination column, same as a SQL string literal. This wrapper exists
+    # for explicit round-tripping and mirrors Int8/Uint8's precedent.
+    EnumValue = Struct.new(:value, :labels) do
+      def initialize(value:, labels:)
+        super(value, labels)
+      end
+    end
+
+    # NaiveTimestamp/TimeOfDay/Float32/Float64 (D7/D5/D8, Datatype expansion
+    # track): explicit wrappers for types with no unambiguous native Ruby
+    # mapping. A bare Time/DateTime already means TimestampTZ (see below), so
+    # NaiveTimestamp is required to select the no-timezone Kind instead.
+    # Ruby has no time-only stdlib class, so TimeOfDay carries nanoseconds
+    # since midnight directly. Date needs no wrapper: it is unambiguous (not
+    # a Time/DateTime superclass — DateTime is Date's *subclass*, checked
+    # first below) and has no prior meaning to conflict with.
+    NaiveTimestamp = Struct.new(:value) do
+      def initialize(value:)
+        super(value)
+      end
+    end
+    TimeOfDay = Struct.new(:nanos_since_midnight) do
+      def initialize(nanos_since_midnight:)
+        super(nanos_since_midnight)
+      end
+    end
+    Float32 = Struct.new(:value)
+    Float64 = Struct.new(:value)
+
+    # Interval (D6, Datatype expansion track): months (Integer, calendar) +
+    # days (Integer, calendar) + nanos (Integer, time-of-day component) —
+    # Postgres-style 3-field storage. A plain String still works as an
+    # INTERVAL param for INSERT/UPDATE column assignment (server-side
+    # Coerce) but not inside an arithmetic expression like `dur + $1`,
+    # which requires the actual wire Kind.
+    Interval = Struct.new(:months, :days, :nanos) do
+      def initialize(months:, days:, nanos:)
+        super(months, days, nanos)
+      end
+    end
 
     class ProtocolError < Error
       def initialize(message)
@@ -177,6 +232,33 @@ module NextSQL
       [b.byteslice(off + 4, n), off + 4 + n]
     end
 
+    # append_enum_labels/read_enum_labels carry an ENUM Type's declared
+    # label list on the wire, matching internal/protocol/value.go's
+    # appendEnumLabels/readEnumLabels exactly (docs/design-datatypes.md
+    # D11): ENUM is the first D-track type whose Type needs variable-length
+    # metadata beyond the fixed 5/6-byte Precision/Scale/VecElem shape every
+    # other type fits into.
+    def append_enum_labels(labels)
+      out = +u16le(labels.size)
+      labels.each { |l| out << u16str(l, MAX_ENUM_LABEL_BYTES) }
+      out
+    end
+
+    def read_enum_labels(b, off)
+      need!(b, off, 2, "enum label count")
+      n = u16(b, off)
+      raise ProtocolError, "enum label count exceeds limit" if n > MAX_ENUM_LABELS
+
+      off += 2
+      labels = []
+      n.times do
+        label, next_off = read_u16_string(b, off, MAX_ENUM_LABEL_BYTES)
+        labels << label
+        off = next_off
+      end
+      [labels, off]
+    end
+
     def encode_hello(version, flags, secret, database, user, realm = "")
       sec = (secret || "").b
       sec = sec[0, 8].ljust(8, "\x00")
@@ -236,6 +318,13 @@ module NextSQL
       (kind.chr + "\x00" + reserved5).b + [value].pack(pack_fmt)
     end
 
+    def encode_enum(label, labels)
+      ord = labels.index(label)
+      raise Error.new("invalid_argument", "value is not a member of the ENUM label set") if ord.nil?
+
+      (KIND_ENUM.chr + "\x00" + reserved5).b + append_enum_labels(labels) + u16le(ord)
+    end
+
     def encode_param(v)
       case v
       when nil
@@ -259,6 +348,38 @@ module NextSQL
         t = v.is_a?(DateTime) ? v.to_time : v
         ns = (t.to_r * 1_000_000_000).to_i
         (KIND_TIMESTAMPTZ.chr + "\x00" + reserved5).b + [ns].pack("q<")
+      when Date
+        # Checked after Time/DateTime above — DateTime is Date's own
+        # subclass in Ruby's stdlib, so only a bare Date reaches here.
+        day_count = (v - Date.new(1970, 1, 1)).to_i
+        (KIND_DATE.chr + "\x00" + reserved5).b + [day_count].pack("l<")
+      when NaiveTimestamp
+        # Treats v.value's own wall-clock fields as literal, ignoring
+        # whatever offset it carries — constructs a UTC Time from the same
+        # Y/M/D/H/M/S/usec fields rather than converting through the
+        # absolute instant, matching "the civil value read literally with
+        # no offset applied" (docs/design-datatypes.md D7). Converting
+        # through the absolute instant (t.to_r directly, as TimestampTZ
+        # does above) would be wrong here: a local-zoned Time's wall-clock
+        # reading is not its UTC epoch value.
+        t = v.value
+        t = t.to_time if t.is_a?(DateTime)
+        usec = (t.subsec * 1_000_000).to_i
+        utc_civil = Time.utc(t.year, t.month, t.day, t.hour, t.min, t.sec, usec)
+        ns = (utc_civil.to_r * 1_000_000_000).to_i
+        (KIND_TIMESTAMP.chr + "\x00" + reserved5).b + [ns].pack("q<")
+      when TimeOfDay
+        (KIND_TIME.chr + "\x00" + reserved5).b + [v.nanos_since_midnight].pack("Q<")
+      when Float32
+        # NaN/+-Infinity are valid FLOAT32/FLOAT64 values (unlike the bare
+        # Float -> Decimal path above, which requires finite) — the server
+        # canonicalizes -0.0 -> +0.0 and every NaN payload to one value
+        # (docs/design-datatypes.md D8).
+        (KIND_FLOAT32.chr + "\x00" + reserved5).b + [v.value].pack("e")
+      when Float64
+        (KIND_FLOAT64.chr + "\x00" + reserved5).b + [v.value].pack("E")
+      when Interval
+        (KIND_INTERVAL.chr + "\x00" + reserved5).b + [v.months, v.days].pack("l<l<") + [v.nanos].pack("q<")
       when Int8
         encode_int(KIND_INT8, v.value, -0x80, 0x7f, "c")
       when Int16
@@ -275,6 +396,8 @@ module NextSQL
         encode_uint(KIND_UINT32, v.value, 0xffffffff, "L<")
       when Uint64
         encode_uint(KIND_UINT64, v.value, 0xffffffffffffffff, "Q<")
+      when EnumValue
+        encode_enum(v.value, v.labels)
       when Point
         (KIND_POINT.chr + "\x00" + reserved5).b + [v.lon, v.lat].pack("E2")
       when Box
@@ -301,13 +424,23 @@ module NextSQL
       kind = b.getbyte(off)
       flags = b.getbyte(off + 1)
       off += 7
+      enum_labels = nil
+      if kind == KIND_ENUM
+        enum_labels, off = read_enum_labels(b, off)
+      end
       return [nil, off, kind] if flags & FLAG_NULL != 0
 
       case kind
+      when KIND_ENUM
+        need!(b, off, 2, "enum")
+        ord = u16(b, off)
+        raise ProtocolError, "ENUM ordinal out of range" if ord >= enum_labels.size
+
+        [enum_labels[ord], off + 2, kind]
       when KIND_UUID
         need!(b, off, 16, "uuid")
         [format_uuid(b.byteslice(off, 16)), off + 16, kind]
-      when KIND_STRING, KIND_TEXT
+      when KIND_STRING, KIND_TEXT, KIND_CHAR, KIND_VARCHAR
         raw, next_off = read_u32_bytes(b, off, MAX_PACKET)
         [raw.dup.force_encoding("UTF-8"), next_off, kind]
       when KIND_BLOB
@@ -323,6 +456,33 @@ module NextSQL
         ns = i64(b, off)
         sec, nsec = ns.divmod(1_000_000_000)
         [Time.at(sec, nsec, :nanosecond, in: "UTC"), off + 8, kind]
+      when KIND_TIMESTAMP
+        # Naive/no-timezone: same wire shape as TimestampTZ. Ruby has no
+        # distinct naive-time type, so this returns a UTC-tagged Time whose
+        # fields are the intended civil value — same convention as
+        # TimestampTZ's own decode above, just carrying no real zone
+        # information (docs/design-datatypes.md D7).
+        ns = i64(b, off)
+        sec, nsec = ns.divmod(1_000_000_000)
+        [Time.at(sec, nsec, :nanosecond, in: "UTC"), off + 8, kind]
+      when KIND_DATE
+        need!(b, off, 4, "date")
+        day_count = b.byteslice(off, 4).unpack1("l<")
+        [Date.new(1970, 1, 1) + day_count, off + 4, kind]
+      when KIND_TIME
+        need!(b, off, 8, "time")
+        [u64(b, off), off + 8, kind]
+      when KIND_FLOAT32
+        need!(b, off, 4, "float32")
+        [b.byteslice(off, 4).unpack1("e"), off + 4, kind]
+      when KIND_FLOAT64
+        need!(b, off, 8, "float64")
+        [b.byteslice(off, 8).unpack1("E"), off + 8, kind]
+      when KIND_INTERVAL
+        need!(b, off, 16, "interval")
+        months, days = b.byteslice(off, 8).unpack("l<l<")
+        nanos = b.byteslice(off + 8, 8).unpack1("q<")
+        [Interval.new(months: months, days: days, nanos: nanos), off + 16, kind]
       when KIND_BOOL
         need!(b, off, 1, "bool")
         [b.getbyte(off) != 0, off + 1, kind]
@@ -430,8 +590,13 @@ module NextSQL
         name, off2 = read_u16_string(b, off, MAX_NAME)
         off = off2
         need!(b, off, 6, "column type")
-        cols << Column.new(name, b.getbyte(off))
+        kind = b.getbyte(off)
         off += 6
+        labels = nil
+        if kind == KIND_ENUM
+          labels, off = read_enum_labels(b, off)
+        end
+        cols << Column.new(name, kind, labels)
       end
       cols
     end

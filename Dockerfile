@@ -10,11 +10,11 @@ RUN CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /out/nextsql ./cmd/next
 FROM debian:bookworm-slim
 
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates \
+ && apt-get install -y --no-install-recommends ca-certificates netcat-openbsd \
  && rm -rf /var/lib/apt/lists/* \
  && groupadd --system --gid 10001 nextsql \
  && useradd --system --uid 10001 --gid 10001 --home-dir /nonexistent --shell /usr/sbin/nologin nextsql \
- && install -d -o nextsql -g nextsql -m 0700 /var/lib/nextsql /run/secrets /run/bootstrap /run/tls
+ && install -d -o nextsql -g nextsql -m 0700 /var/lib/nextsql /run/secrets /run/bootstrap /run/tls /seed
 
 COPY --from=build /out/nextsql /usr/local/bin/nextsql
 COPY --from=build /out/nextsqld /usr/local/bin/nextsqld
@@ -27,7 +27,7 @@ ENV NEXTSQL_DATA_DIR=/var/lib/nextsql \
     NEXTSQL_KEY_FILE=/run/secrets/root.key \
     NEXTSQL_LISTEN=0.0.0.0:7210
 
-VOLUME ["/var/lib/nextsql", "/run/secrets"]
+VOLUME ["/var/lib/nextsql", "/run/secrets", "/seed"]
 EXPOSE 7210
 USER nextsql
 ENTRYPOINT ["/usr/local/bin/nextsql-entrypoint"]

@@ -11,7 +11,7 @@ import {
   kindLabel,
   platformLabel,
 } from "@/lib/release-model";
-import { buttonClassName } from "@/components/ui/button";
+import { Button } from "@bzync/rui";
 
 export function PlatformDownloads({ release }: { release: Release }) {
   const [platform, setPlatform] = useState<Platform>("linux-amd64");
@@ -74,9 +74,9 @@ function ArtifactRow({ version, artifact }: { version: string; artifact: Artifac
           {artifact.filename} · {formatBytes(artifact.size)} · sha256:{artifact.sha256.slice(0, 16)}
         </p>
       </div>
-      <a href={artifactUrl(version, artifact.filename)} className={buttonClassName({ size: "sm" })}>
-        Download
-      </a>
+      <Button asChild size="sm">
+        <a href={artifactUrl(version, artifact.filename)}>Download</a>
+      </Button>
     </li>
   );
 }

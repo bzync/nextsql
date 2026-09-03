@@ -379,6 +379,11 @@ func skipScalar(raw []byte, off int, t Type) (int, error) {
 			return 0, nerr.New(nerr.InvalidFormat, "types.skipScalar", "truncated time")
 		}
 		return off + 8, nil
+	case KindInterval:
+		if off+16 > len(raw) {
+			return 0, nerr.New(nerr.InvalidFormat, "types.skipScalar", "truncated interval")
+		}
+		return off + 16, nil
 	case KindVector:
 		dim, err := encoding.ReadU16(raw, off)
 		if err != nil {
@@ -507,6 +512,14 @@ func encodeScalar(v Value) ([]byte, error) {
 	case KindTime:
 		buf := make([]byte, 8)
 		encoding.PutU64(buf, 0, uint64(v.Time))
+		return buf, nil
+	case KindInterval:
+		// months(4) + days(4) + nanos(8), all little-endian, no sign-bit
+		// flip (that only applies to encodeSortable below) — docs/design-datatypes.md D6.
+		buf := make([]byte, 16)
+		encoding.PutU32(buf, 0, uint32(v.IntervalMonths))
+		encoding.PutU32(buf, 4, uint32(v.IntervalDays))
+		encoding.PutU64(buf, 8, uint64(v.Time))
 		return buf, nil
 	case KindVector:
 		if v.VecRef {
@@ -691,6 +704,23 @@ func decodeScalar(raw []byte, off int, t Type) (Value, int, error) {
 			return Value{}, 0, err
 		}
 		return TimeOfDayValue(int64(u)), off + 8, nil
+	case KindInterval:
+		if off+16 > len(raw) {
+			return Value{}, 0, nerr.New(nerr.InvalidFormat, "types.decodeScalar", "truncated interval")
+		}
+		months, err := encoding.ReadU32(raw, off)
+		if err != nil {
+			return Value{}, 0, err
+		}
+		days, err := encoding.ReadU32(raw, off+4)
+		if err != nil {
+			return Value{}, 0, err
+		}
+		nanos, err := encoding.ReadU64(raw, off+8)
+		if err != nil {
+			return Value{}, 0, err
+		}
+		return IntervalValue(int32(months), int32(days), int64(nanos)), off + 16, nil
 	case KindVector:
 		dim, err := encoding.ReadU16(raw, off)
 		if err != nil {
@@ -918,6 +948,27 @@ func encodeSortable(v Value) ([]byte, error) {
 		// needed (mirrors KindUint64, see docs/design-datatypes.md D5).
 		buf := make([]byte, 8)
 		binary.BigEndian.PutUint64(buf, uint64(v.Time))
+		return buf, nil
+	case KindInterval:
+		// Sortable key is the justified total (Cmp's own ordering, see
+		// justifiedNanos in value.go), sign-bit-flipped — NOT a
+		// field-by-field encoding of (months, days, nanos), which would not
+		// match Cmp's order (docs/design-datatypes.md D6: `1 month` sorts
+		// identically to `30 days`). Consequence: decodeSortable below
+		// cannot recover the exact original (months, days) split for an
+		// index-only-scan reconstruction — it returns a canonical (0 months,
+		// N days, remainder nanos) value with the same justified total
+		// instead. A plain heap scan (encodeScalar/decodeScalar above)
+		// always returns the exact original value; only the sortable-key
+		// path canonicalizes, the same class of deliberate, documented
+		// canonicalization as FLOAT's -0.0 -> +0.0 (docs/design-datatypes.md D8).
+		j, err := justifiedNanos(v.IntervalMonths, v.IntervalDays, v.Time)
+		if err != nil {
+			return nil, err
+		}
+		u := uint64(j) ^ (1 << 63)
+		buf := make([]byte, 8)
+		binary.BigEndian.PutUint64(buf, u)
 		return buf, nil
 	case KindVector:
 		buf := make([]byte, 2+4*len(v.Vec))
@@ -1238,6 +1289,26 @@ func decodeSortable(raw []byte, off int, t Type) (Value, int, error) {
 			return Value{}, 0, err
 		}
 		return TimeOfDayValue(int64(binary.BigEndian.Uint64(b))), off + 8, nil
+	case KindInterval:
+		// Canonical (0 months, N days, remainder nanos) reconstruction from
+		// the justified total — see the canonicalization note in
+		// encodeSortable above (docs/design-datatypes.md D6).
+		b, err := encoding.ReadBytes(raw, off, 8)
+		if err != nil {
+			return Value{}, 0, err
+		}
+		j := int64(binary.BigEndian.Uint64(b) ^ (1 << 63))
+		const dayNanos = int64(86400_000_000_000)
+		days := j / dayNanos
+		rem := j % dayNanos
+		if rem < 0 {
+			rem += dayNanos
+			days--
+		}
+		if days < math.MinInt32 || days > math.MaxInt32 {
+			return Value{}, 0, nerr.New(nerr.InvalidFormat, "types.decodeSortable", "interval day count out of range")
+		}
+		return IntervalValue(0, int32(days), rem), off + 8, nil
 	case KindVector:
 		dim, err := encoding.ReadU16(raw, off)
 		if err != nil {

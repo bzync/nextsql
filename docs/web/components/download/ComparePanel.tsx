@@ -9,7 +9,7 @@ import {
   changesBetween,
   groupChanges,
 } from "@/lib/release-model";
-import { Badge } from "@bzync/rui";
+import { Badge, Select } from "@bzync/rui";
 
 const kindBadge: Record<ChangeKind, "success" | "info" | "warning" | "muted" | "error"> = {
   added: "success",
@@ -47,34 +47,24 @@ export function ComparePanel({ releases }: { releases: Release[] }) {
         that range.
       </p>
       <div className="mt-5 grid gap-3 sm:grid-cols-2">
-        <label className="block text-sm">
+        <div className="text-sm">
           <span className="mb-1.5 block text-[11px] font-semibold uppercase tracking-[0.16em] text-faint">From</span>
-          <select
+          <Select
             value={from}
-            onChange={(event) => setFrom(event.target.value)}
-            className="h-10 w-full rounded-lg border border-black/10 bg-white px-3 text-sm dark:border-white/10 dark:bg-white/[0.04]"
-          >
-            {versions.map((version) => (
-              <option key={version} value={version}>
-                {version}
-              </option>
-            ))}
-          </select>
-        </label>
-        <label className="block text-sm">
+            onChange={(value) => setFrom(value)}
+            options={versions.map((version) => ({ value: version, label: version }))}
+            triggerClassName="h-10 w-full"
+          />
+        </div>
+        <div className="text-sm">
           <span className="mb-1.5 block text-[11px] font-semibold uppercase tracking-[0.16em] text-faint">To</span>
-          <select
+          <Select
             value={to}
-            onChange={(event) => setTo(event.target.value)}
-            className="h-10 w-full rounded-lg border border-black/10 bg-white px-3 text-sm dark:border-white/10 dark:bg-white/[0.04]"
-          >
-            {versions.map((version) => (
-              <option key={version} value={version}>
-                {version}
-              </option>
-            ))}
-          </select>
-        </label>
+            onChange={(value) => setTo(value)}
+            options={versions.map((version) => ({ value: version, label: version }))}
+            triggerClassName="h-10 w-full"
+          />
+        </div>
       </div>
 
       <p className="mt-4 text-sm text-muted">

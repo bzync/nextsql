@@ -180,6 +180,8 @@ func (p *Parser) show() (ast.Stmt, error) {
 			Table: "system.storage",
 			List:  []ast.SelectItem{{Expr: ast.Ident{Name: "database"}}},
 		}, nil
+	case "realms":
+		return p.showSystemTable("system.realms")
 	case "tables":
 		return p.showSystemTable("system.tables")
 	case "indexes":
@@ -2347,6 +2349,9 @@ func (p *Parser) colType() (types.Type, error) {
 	case lexer.KwTime:
 		p.next()
 		return types.TimeOfDay(), nil
+	case lexer.KwInterval:
+		p.next()
+		return types.Interval(), nil
 	case lexer.KwJson:
 		p.next()
 		return types.JSON(), nil
@@ -3695,6 +3700,24 @@ func (p *Parser) primary() (ast.Expr, error) {
 		return ast.Literal{Value: v}, nil
 	case lexer.HexLit:
 		v := types.BlobValue([]byte(p.tok.Lit))
+		p.next()
+		return ast.Literal{Value: v}, nil
+	case lexer.KwInterval:
+		// INTERVAL 'text' typed-literal syntax (docs/design-datatypes.md
+		// D6) — unlike DATE/TIME/TIMESTAMP (D5/D7), a bare quoted string
+		// alone is not enough: arithmetic (WHERE/SELECT expressions
+		// combining a temporal column with an interval) needs both
+		// operands' Kind tagged before evaluation, which a plain STRING
+		// literal cannot provide on its own the way column-context
+		// coercion can for an INSERT/UPDATE target.
+		p.next()
+		if p.tok.Kind != lexer.String {
+			return nil, nerr.New(nerr.Syntax, "sql.parser", "expected a quoted INTERVAL literal")
+		}
+		v, err := types.ParseInterval(p.tok.Lit)
+		if err != nil {
+			return nil, err
+		}
 		p.next()
 		return ast.Literal{Value: v}, nil
 	case lexer.Number:

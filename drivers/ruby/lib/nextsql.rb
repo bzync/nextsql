@@ -46,6 +46,12 @@ module NextSQL
   Uint16 = Protocol::Uint16
   Uint32 = Protocol::Uint32
   Uint64 = Protocol::Uint64
+  EnumValue = Protocol::EnumValue
+  NaiveTimestamp = Protocol::NaiveTimestamp
+  TimeOfDay = Protocol::TimeOfDay
+  Float32 = Protocol::Float32
+  Float64 = Protocol::Float64
+  Interval = Protocol::Interval
 
   # Opens one connection to a single node. For an HA cluster with
   # leader-failover and follower-read routing, use ::connect_cluster.

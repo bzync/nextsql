@@ -283,6 +283,54 @@ Deno.test('fixed-width uint param round-trip (D3)', () => {
   assert(typeof decodeValue(encodeParam({ kind: 'uint64', value: 5n }), 0).value === 'bigint');
 });
 
+Deno.test('ENUM param round-trip (D11)', () => {
+  const labels = ['small', 'medium', 'large'];
+  const dec = decodeValue(encodeParam({ kind: 'enum', value: 'medium', labels }), 0);
+  assert(dec.kind === Kind.Enum);
+  assert(dec.value === 'medium');
+  assert(JSON.stringify(dec.labels) === JSON.stringify(labels));
+  let threw = false;
+  try {
+    encodeParam({ kind: 'enum', value: 'huge', labels });
+  } catch {
+    threw = true;
+  }
+  assert(threw);
+});
+
+Deno.test('DATE/TIME/TIMESTAMP/FLOAT32/FLOAT64 param round-trip (D5/D7/D8)', () => {
+  const d = new Date(Date.UTC(2024, 0, 15));
+  const decDate = decodeValue(encodeParam({ kind: 'date', value: d }), 0);
+  assert(decDate.kind === Kind.Date);
+  assert(decDate.value.getTime() === d.getTime());
+
+  const nsInDay = (23 * 3600 + 59 * 60 + 59) * 1_000_000_000 + 999_000_000;
+  const decTime = decodeValue(encodeParam({ kind: 'time', value: nsInDay }), 0);
+  assert(decTime.kind === Kind.Time);
+  assert(decTime.value === nsInDay);
+
+  const ts = new Date('2024-06-15T10:30:00.000Z');
+  const decTs = decodeValue(encodeParam({ kind: 'timestamp', value: ts }), 0);
+  assert(decTs.kind === Kind.Timestamp);
+  assert(decTs.value.getTime() === ts.getTime());
+  assert(decodeValue(encodeParam(ts), 0).kind === Kind.TimestampTZ);
+
+  const decF32 = decodeValue(encodeParam({ kind: 'float32', value: 1.5 }), 0);
+  assert(decF32.kind === Kind.Float32);
+  assert(decF32.value === 1.5);
+  const decF64Nan = decodeValue(encodeParam({ kind: 'float64', value: NaN }), 0);
+  assert(decF64Nan.kind === Kind.Float64);
+  assert(Number.isNaN(decF64Nan.value));
+});
+
+Deno.test('INTERVAL param round-trip, including negative nanos (D6)', () => {
+  const dec = decodeValue(encodeParam({ kind: 'interval', months: 14, days: 3, nanos: 4n * 3_600_000_000_000n }), 0);
+  assert(dec.kind === Kind.Interval);
+  assert(dec.value.months === 14 && dec.value.days === 3 && dec.value.nanos === 4n * 3_600_000_000_000n);
+  const negDec = decodeValue(encodeParam({ kind: 'interval', months: 0, days: 0, nanos: -3_600_000_000_000n }), 0);
+  assert(negDec.value.nanos === -3_600_000_000_000n);
+});
+
 Deno.test('decimal encode / decode', () => {
   const body = encodeDecimalString('-12.50');
   assert(decodeDecimal(body.subarray(4)) === '-12.50');

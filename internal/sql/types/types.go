@@ -81,6 +81,21 @@ const (
 	// D-type this needs new per-column catalog metadata, so it DID take a
 	// catalog version bump (NSCT v10 -> v11).
 	KindEnum
+	// KindInterval is a calendar duration (D6, Datatype expansion track):
+	// Postgres-style 3-field storage — months (int32) + days (int32) + nanos
+	// (int64, time-of-day component) — chosen so that DATE/TIMESTAMP
+	// arithmetic can apply calendar-correct month/day steps (clamping to the
+	// target month's last day, e.g. Jan 31 + 1 month = Feb 28/29) before
+	// falling back to a fixed nanosecond duration for the sub-day remainder.
+	// Comparison uses Postgres's own "justified" heuristic (1 month = 30
+	// days = 24h) to give intervals a total order despite months/days/nanos
+	// being fundamentally different units — this means two intervals that
+	// are unequal in their raw fields can compare equal (e.g. `1 month` =
+	// `30 days`), matching Postgres's documented behavior exactly, not an
+	// approximation of it. Appended last: no catalog/protocol version bump
+	// needed (unlike KindEnum, INTERVAL's 3 fields fit in the existing fixed
+	// Value shape, no per-column metadata).
+	KindInterval
 )
 
 func (k Kind) String() string {
@@ -145,6 +160,8 @@ func (k Kind) String() string {
 		return "FLOAT64"
 	case KindEnum:
 		return "ENUM"
+	case KindInterval:
+		return "INTERVAL"
 	default:
 		return "INVALID"
 	}
@@ -399,6 +416,9 @@ func Float64() Type { return Type{Kind: KindFloat64} }
 // IsFloat reports whether k is one of the IEEE-754 floating point kinds.
 func IsFloat(k Kind) bool { return k == KindFloat32 || k == KindFloat64 }
 
+// Interval is the calendar-duration column type (D6).
+func Interval() Type { return Type{Kind: KindInterval} }
+
 func DecimalType(p, s uint16) (Type, error) {
 	if p < 1 || p > 38 || s > p {
 		return Type{}, nerr.New(nerr.InvalidArgument, "types.DecimalType", "DECIMAL precision/scale out of range")
@@ -478,7 +498,7 @@ func (t Type) Comparable() bool {
 	switch t.Kind {
 	case KindUUID, KindString, KindText, KindDecimal, KindTimestampTZ, KindBool, KindPoint, KindBox, KindLine, KindPolygon, KindBlob,
 		KindInt8, KindInt16, KindInt32, KindInt64, KindUint8, KindUint16, KindUint32, KindUint64, KindDate, KindTime,
-		KindChar, KindVarchar, KindTimestamp, KindFloat32, KindFloat64, KindEnum:
+		KindChar, KindVarchar, KindTimestamp, KindFloat32, KindFloat64, KindEnum, KindInterval:
 		return true
 	default:
 		return false

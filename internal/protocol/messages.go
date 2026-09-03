@@ -384,7 +384,9 @@ func EncodeRowDesc(d RowDesc, lim Limits) ([]byte, error) {
 		if buf, err = appendU16String(buf, c.Name, lim.MaxName); err != nil {
 			return nil, err
 		}
-		buf = appendType(buf, c.Type)
+		if buf, err = appendType(buf, c.Type); err != nil {
+			return nil, err
+		}
 	}
 	return buf, nil
 }

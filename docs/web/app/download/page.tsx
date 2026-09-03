@@ -1,7 +1,6 @@
 import type { Metadata } from "next";
 import Link from "next/link";
-import { buttonClassName } from "@/components/ui/button";
-import { Badge } from "@bzync/rui";
+import { Badge, Button } from "@bzync/rui";
 import { ComparePanel } from "@/components/download/ComparePanel";
 import { PlatformDownloads } from "@/components/download/PlatformDownloads";
 import { formatDate, latestRelease, listReleases } from "@/lib/releases";
@@ -103,9 +102,9 @@ export default async function DownloadPage() {
                       {formatDate(release.releasedAt)} · {release.artifacts.length} file{release.artifacts.length === 1 ? "" : "s"}
                     </p>
                   </div>
-                  <Link href={`/download/${release.version}`} className={buttonClassName({ variant: "outline", size: "sm" })}>
-                    Notes
-                  </Link>
+                  <Button asChild variant="outline" size="sm">
+                    <Link href={`/download/${release.version}`}>Notes</Link>
+                  </Button>
                 </li>
               ))}
             </ul>

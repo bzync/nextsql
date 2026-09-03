@@ -25,6 +25,7 @@ const (
 	tableVersionV8  = 8
 	tableVersionV9  = 9
 	tableVersionV10 = 10
+	tableVersionV11 = 11
 	// KeyTable prefixes durable table descriptors in the catalog tree.
 	KeyTable byte = 'T'
 	// KeyStats prefixes durable table statistics in the catalog tree.
@@ -508,7 +509,7 @@ func DecodeTable(raw []byte) (*Table, error) {
 			return nil, nerr.Wrap(nerr.InvalidFormat, "catalog.DecodeTable", "invalid ENCRYPTED CLIENT table", err)
 		}
 	}
-	if ver >= tableVersion {
+	if ver >= tableVersionV11 {
 		for i := range t.Columns {
 			var n uint16
 			n, off, err = takeU16(raw, off)

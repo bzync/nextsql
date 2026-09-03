@@ -2,8 +2,7 @@ import Link from "next/link";
 import { SearchHeader } from "@/components/SearchHeader";
 import { SiteFooter } from "@/components/SiteFooter";
 import { CodePanel, HYBRID_SQL } from "@/components/landing/CodePanel";
-import { buttonClassName } from "@/components/ui/button";
-import { Badge, Card, Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@bzync/rui";
+import { Badge, Button, Card, Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@bzync/rui";
 
 const specs = [
   { k: "Crypto", v: "AES-256-GCM envelope" },
@@ -102,16 +101,18 @@ function Hero() {
             one MVCC, and one optimizer. Install the engine and run it.
           </p>
           <div className="mt-7 grid w-full max-w-[22rem] grid-cols-2 gap-3 sm:mt-8 sm:flex sm:w-auto sm:max-w-none sm:flex-wrap sm:justify-center lg:justify-start">
-            <Link href="/docs/quick-start" className={buttonClassName({ size: "lg", className: "col-span-2 w-full sm:w-auto" })}>
-              Get started
-              <ArrowIcon />
-            </Link>
-            <Link href="/download" className={buttonClassName({ variant: "outline", size: "lg", className: "w-full sm:w-auto" })}>
-              Download
-            </Link>
-            <Link href="/docs/introduction" className={buttonClassName({ variant: "outline", size: "lg", className: "w-full sm:w-auto" })}>
-              Documentation
-            </Link>
+            <Button asChild size="lg" className="col-span-2 w-full sm:w-auto">
+              <Link href="/docs/quick-start">
+                Get started
+                <ArrowIcon />
+              </Link>
+            </Button>
+            <Button asChild variant="outline" size="lg" className="w-full sm:w-auto">
+              <Link href="/download">Download</Link>
+            </Button>
+            <Button asChild variant="outline" size="lg" className="w-full sm:w-auto">
+              <Link href="/docs/introduction">Documentation</Link>
+            </Button>
           </div>
           <p className="mt-6 max-w-md font-mono text-[12px] leading-5 text-faint">
             Not PostgreSQL, MySQL, MongoDB, or a vector-store compatibility layer.
@@ -406,10 +407,12 @@ nextsqld --data-dir /var/lib/nextsql \\
             <code className="rounded bg-bg-hover px-1 font-mono text-[12px]">--tls-cert</code> and{" "}
             <code className="rounded bg-bg-hover px-1 font-mono text-[12px]">--tls-key</code>.
           </p>
-          <Link href="/docs/quick-start" className={buttonClassName({ size: "lg", className: "mt-8" })}>
-            Full walkthrough
-            <ArrowIcon />
-          </Link>
+          <Button asChild size="lg" className="mt-8">
+            <Link href="/docs/quick-start">
+              Full walkthrough
+              <ArrowIcon />
+            </Link>
+          </Button>
         </div>
         <div className="min-w-0 px-4 pb-12 sm:px-5 lg:p-6 lg:px-0 lg:pb-0">
           <CodePanel title="sh" lang="bash">
@@ -441,16 +444,18 @@ function Status() {
             Install the binaries, initialize a data directory, and start serving NSQL.
           </p>
           <div className="mt-8 flex flex-wrap gap-2">
-            <Link href="/docs/quick-start" className={buttonClassName({ size: "sm" })}>
-              Get started
-              <ArrowIcon />
-            </Link>
-            <Link href="/docs/install" className={buttonClassName({ variant: "outline", size: "sm" })}>
-              Install
-            </Link>
-            <Link href="/docs/limits" className={buttonClassName({ variant: "outline", size: "sm" })}>
-              Limits
-            </Link>
+            <Button asChild size="sm">
+              <Link href="/docs/quick-start">
+                Get started
+                <ArrowIcon />
+              </Link>
+            </Button>
+            <Button asChild variant="outline" size="sm">
+              <Link href="/docs/install">Install</Link>
+            </Button>
+            <Button asChild variant="outline" size="sm">
+              <Link href="/docs/limits">Limits</Link>
+            </Button>
           </div>
         </Card>
       </div>

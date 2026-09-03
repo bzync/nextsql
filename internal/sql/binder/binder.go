@@ -1444,7 +1444,7 @@ func facetable(k types.Kind) bool {
 	case types.KindString, types.KindText, types.KindChar, types.KindVarchar, types.KindDecimal, types.KindBool, types.KindUUID, types.KindTimestampTZ,
 		types.KindInt8, types.KindInt16, types.KindInt32, types.KindInt64,
 		types.KindUint8, types.KindUint16, types.KindUint32, types.KindUint64,
-		types.KindDate, types.KindTime, types.KindTimestamp, types.KindFloat32, types.KindFloat64:
+		types.KindDate, types.KindTime, types.KindTimestamp, types.KindFloat32, types.KindFloat64, types.KindEnum, types.KindInterval:
 		return true
 	default:
 		return false

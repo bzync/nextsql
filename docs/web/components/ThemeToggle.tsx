@@ -1,10 +1,10 @@
 "use client";
 
 import { useEffect } from "react";
-import { useTheme } from "@bzync/rui";
+import { ThemeToggle as RuiThemeToggle, useTheme } from "@bzync/rui";
 
 export function ThemeToggle({ className = "" }: { className?: string }) {
-  const { resolvedTheme, setTheme } = useTheme();
+  const { setTheme } = useTheme();
 
   useEffect(() => {
     const requested = new URLSearchParams(window.location.search).get("theme");
@@ -15,20 +15,14 @@ export function ThemeToggle({ className = "" }: { className?: string }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const isDark = resolvedTheme === "dark";
-
   return (
-    <button
-      type="button"
-      className={`relative inline-flex h-10 w-10 items-center justify-center rounded-lg text-slate-600 transition-colors hover:bg-bg-hover hover:text-foreground sm:h-9 sm:w-9 dark:text-slate-400 ${className}`}
-      aria-label="Toggle theme"
-      aria-pressed={isDark}
-      title="Toggle theme"
-      onClick={() => setTheme(isDark ? "light" : "dark")}
-    >
-      <SunIcon className="hidden dark:block" />
-      <MoonIcon className="block dark:hidden" />
-    </button>
+    <RuiThemeToggle
+      lightIcon={<SunIcon />}
+      darkIcon={<MoonIcon />}
+      lightLabel="Toggle theme"
+      darkLabel="Toggle theme"
+      className={`h-10 w-10 rounded-lg border-transparent bg-transparent px-0 text-slate-600 shadow-none hover:border-transparent hover:bg-bg-hover hover:text-foreground sm:h-9 sm:w-9 dark:text-slate-400 ${className}`}
+    />
   );
 }
 

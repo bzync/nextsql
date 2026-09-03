@@ -2,7 +2,7 @@
 
 `ENCRYPTED CLIENT` adds no NSQL frame or wire type. Clients bind and receive
 its `NSCE1.` ciphertext through the existing `STRING` value encoding; logical
-type and encryption status are catalog metadata (`NSCT` v10).
+type and encryption status are catalog metadata (`NSCT` v11).
 
 Versioned NextSQL framing spoken by `nextsqld` and the official drivers (`drivers/go`, `drivers/node`, `drivers/bun`, `drivers/deno`, `drivers/php`, `drivers/python`, `drivers/ruby`). Node, Bun, and Deno ship TypeScript types (`drivers/js/types.d.ts`). Local SQL execution is unchanged (`docs/sql.md`). This document is the on-the-wire contract.
 

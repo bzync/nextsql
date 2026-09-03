@@ -35,20 +35,23 @@ func TestClientEncryptedColumnCatalogV10(t *testing.T) {
 		t.Fatalf("round trip = %+v", got.Columns[1])
 	}
 	bad := append([]byte(nil), raw...)
-	// The second column's flag is seven bytes from the end: flag + type(6).
-	bad[len(bad)-7] = 2
+	// The second column's flag is eleven bytes from the end: flag + type(6),
+	// then v11's 2-byte-per-column ENUM label count (0) for each of the 2
+	// columns.
+	bad[len(bad)-11] = 2
 	if _, err := DecodeTable(bad); err == nil {
 		t.Fatal("accepted unknown ENCRYPTED CLIENT flag")
 	}
 	badType := append([]byte(nil), raw...)
-	badType[len(badType)-5] = 9 // VecElem in the six-byte catalog type.
+	badType[len(badType)-9] = 9 // VecElem in the six-byte catalog type.
 	if _, err := DecodeTable(badType); err == nil {
 		t.Fatal("accepted non-canonical ENCRYPTED CLIENT logical type")
 	}
 
-	// A real v9 descriptor has no v10 flags/types. Synthesise that ending and
-	// prove it remains readable as an ordinary physical STRING column.
-	v9 := append([]byte(nil), raw[:len(raw)-8]...) // one zero flag + one flag/type
+	// A real v9 descriptor has no v10 flags/types (or v11 ENUM label counts).
+	// Synthesise that ending and prove it remains readable as an ordinary
+	// physical STRING column.
+	v9 := append([]byte(nil), raw[:len(raw)-8-4]...) // one zero flag + one flag/type, then 2 columns' worth of v11 (2 bytes each)
 	v9[4], v9[5] = byte(tableVersionV9), 0
 	legacy, err := DecodeTable(v9)
 	if err != nil {

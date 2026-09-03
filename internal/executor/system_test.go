@@ -231,6 +231,7 @@ func TestSystemShowAliases(t *testing.T) {
 		columns   []string
 	}{
 		{`SHOW DATABASES`, `SELECT * FROM system.storage`, []string{"database"}},
+		{`SHOW REALMS`, `SELECT * FROM system.realms`, []string{"realm_id", "name", "state", "database_count", "storage_cap_bytes", "realm_root_delegated"}},
 		{`SHOW TABLES`, `SELECT * FROM system.tables`, []string{"name", "id", "column_count", "pk", "legacy_tenant_column"}},
 		{`SHOW INDEXES`, `SELECT * FROM system.indexes`, []string{"table_name", "index_name", "kind", "is_unique", "columns", "include_columns", "predicate", "status"}},
 		{`SHOW CONNECTIONS`, `SELECT * FROM system.sessions`, []string{"session_id", "user", "remote", "state"}},

@@ -169,7 +169,7 @@ func SupportedType(t types.Type) bool {
 	case types.KindUUID, types.KindString, types.KindText, types.KindBlob, types.KindTimestampTZ, types.KindJSON, types.KindBool,
 		types.KindInt8, types.KindInt16, types.KindInt32, types.KindInt64,
 		types.KindUint8, types.KindUint16, types.KindUint32, types.KindUint64,
-		types.KindDate, types.KindTime, types.KindTimestamp, types.KindFloat32, types.KindFloat64:
+		types.KindDate, types.KindTime, types.KindTimestamp, types.KindFloat32, types.KindFloat64, types.KindInterval:
 		return t.Precision == 0 && t.Scale == 0 && t.VecElem == 0
 	default:
 		return false

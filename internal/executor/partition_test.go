@@ -1772,23 +1772,26 @@ func TestPartitionCrossPartitionUniqueSustainedConcurrentWrites(t *testing.T) {
 		t.Fatalf("reclaim error: %v", err)
 	}
 
-	plainCount := execOK(t, s, `SELECT COUNT(*) FROM cpu_race`)
+	// The partition-wise aggregation fast path (RangeLive, taken because this
+	// reader is now the sole snapshot) must agree with a plain heap scan: an
+	// un-purged committed tombstone left by the concurrent DELETE churn is not
+	// a live row and must not be counted.
+	rowCount := int(execOK(t, s, `SELECT COUNT(*) FROM cpu_race`).Rows[0][0].Dec.Coef.Int64())
 	allRaw := execOK(t, s, `SELECT shard, id, email FROM cpu_race`)
-	t.Logf("DEBUG plainCount=%v rawRowCount=%d", plainCount.Rows, len(allRaw.Rows))
+	if rowCount != len(allRaw.Rows) {
+		t.Fatalf("COUNT(*)=%d but heap scan returned %d rows", rowCount, len(allRaw.Rows))
+	}
 	groupSum := execOK(t, s, `SELECT email, COUNT(*) AS c FROM cpu_race GROUP BY email`)
 	sum := 0
 	for _, r := range groupSum.Rows {
 		sum += int(r[1].Dec.Coef.Int64())
 	}
-	t.Logf("DEBUG groupBy distinct emails=%d summedCount=%d", len(groupSum.Rows), sum)
+	if sum != rowCount || len(groupSum.Rows) > rowCount {
+		t.Fatalf("GROUP BY email over-counts: %d groups summing to %d, heap has %d rows", len(groupSum.Rows), sum, rowCount)
+	}
 
 	dupes := execOK(t, s, `SELECT email, COUNT(*) AS c FROM cpu_race GROUP BY email HAVING c > 1`)
 	if len(dupes.Rows) != 0 {
-		for _, d := range dupes.Rows {
-			email := d[0].Str
-			rows := execOK(t, s, fmt.Sprintf(`SELECT shard, id FROM cpu_race WHERE email = '%s'`, email))
-			t.Logf("DEBUG duplicate email=%s rows=%+v", email, rows.Rows)
-		}
 		t.Fatalf("cross-partition UNIQUE admitted duplicates: %+v", dupes.Rows)
 	}
 	// Cross-check the same invariant against the index path directly, in

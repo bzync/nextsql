@@ -40,6 +40,11 @@ type Value struct {
 	Box       [4]float64 // BOX west, south, east, north
 	Coords    []float64  // LINESTRING / POLYGON interleaved lon, lat
 	Rings     []int      // POLYGON vertex counts per ring (includes closing vertex)
+	// IntervalMonths/IntervalDays are INTERVAL's calendar components (D6);
+	// the third component, nanoseconds-of-time, reuses Time above
+	// (disambiguated by Typ.Kind, the same pattern DATE/TIME/TIMESTAMP use).
+	IntervalMonths int32
+	IntervalDays   int32
 }
 
 func Null(t Type) Value { return Value{Typ: t, Null: true} }
@@ -264,6 +269,203 @@ func ParseTimeOfDay(s string) (Value, error) {
 // trimmed fractional-seconds suffix when present.
 func FormatTimeOfDay(ns int64) string {
 	return time.Unix(0, ns).UTC().Format("15:04:05.999999999")
+}
+
+// IntervalValue constructs an INTERVAL value directly from its 3 stored
+// components (docs/design-datatypes.md D6).
+func IntervalValue(months, days int32, nanos int64) Value {
+	return Value{Typ: Interval(), IntervalMonths: months, IntervalDays: days, Time: nanos}
+}
+
+var intervalTimeUnitNanos = map[string]int64{
+	"hour": int64(time.Hour), "hours": int64(time.Hour), "hr": int64(time.Hour), "hrs": int64(time.Hour),
+	"minute": int64(time.Minute), "minutes": int64(time.Minute), "min": int64(time.Minute), "mins": int64(time.Minute),
+	"second": int64(time.Second), "seconds": int64(time.Second), "sec": int64(time.Second), "secs": int64(time.Second),
+	"millisecond": int64(time.Millisecond), "milliseconds": int64(time.Millisecond),
+	"microsecond": int64(time.Microsecond), "microseconds": int64(time.Microsecond),
+}
+
+// ParseInterval parses a Postgres-style interval literal: one or more
+// "<quantity> <unit>" pairs, e.g. "1 year 2 months 3 days 04:05:06.5"'s
+// simpler cousin "1 year 2 months 3 days 4 hours 5 minutes 6.5 seconds"
+// (docs/design-datatypes.md D6). year/month/day quantities must be whole
+// numbers — fractional calendar units are ambiguous (how many days is "1.5
+// months"?) and explicitly out of scope for this increment; hour and
+// smaller units accept a decimal quantity, converted to nanoseconds via
+// exact big.Int arithmetic (never float) so "0.1 seconds" is exactly
+// 100000000ns, not an approximation, and any sub-nanosecond remainder
+// errors rather than silently rounds.
+func ParseInterval(s string) (Value, error) {
+	fields := strings.Fields(strings.TrimSpace(s))
+	if len(fields) == 0 || len(fields)%2 != 0 {
+		return Value{}, nerr.New(nerr.InvalidArgument, "types.ParseInterval", "invalid interval")
+	}
+	var months, days, nanos int64
+	for i := 0; i < len(fields); i += 2 {
+		qtyStr, unit := fields[i], strings.ToLower(fields[i+1])
+		switch unit {
+		case "year", "years", "yr", "yrs":
+			n, err := parseIntervalWhole(qtyStr)
+			if err != nil {
+				return Value{}, err
+			}
+			months += n * 12
+		case "month", "months", "mon", "mons":
+			n, err := parseIntervalWhole(qtyStr)
+			if err != nil {
+				return Value{}, err
+			}
+			months += n
+		case "day", "days":
+			n, err := parseIntervalWhole(qtyStr)
+			if err != nil {
+				return Value{}, err
+			}
+			days += n
+		default:
+			unitNanos, ok := intervalTimeUnitNanos[unit]
+			if !ok {
+				return Value{}, nerr.New(nerr.InvalidArgument, "types.ParseInterval", "unknown interval unit "+unit)
+			}
+			n, err := decimalNanosFromUnit(qtyStr, unitNanos)
+			if err != nil {
+				return Value{}, err
+			}
+			nanos += n
+		}
+	}
+	if months < math.MinInt32 || months > math.MaxInt32 {
+		return Value{}, nerr.New(nerr.InvalidArgument, "types.ParseInterval", "interval month component out of range")
+	}
+	if days < math.MinInt32 || days > math.MaxInt32 {
+		return Value{}, nerr.New(nerr.InvalidArgument, "types.ParseInterval", "interval day component out of range")
+	}
+	return IntervalValue(int32(months), int32(days), nanos), nil
+}
+
+func parseIntervalWhole(qty string) (int64, error) {
+	n, err := strconv.ParseInt(strings.TrimSpace(qty), 10, 64)
+	if err != nil {
+		return 0, nerr.New(nerr.InvalidArgument, "types.ParseInterval", "year/month/day quantity must be a whole number")
+	}
+	return n, nil
+}
+
+// decimalNanosFromUnit converts a decimal-text quantity in the given unit to
+// exact nanoseconds via big.Int (coef * unitNanos / 10^scale), erroring on
+// any non-zero remainder (sub-nanosecond precision) rather than rounding.
+func decimalNanosFromUnit(qty string, unitNanos int64) (int64, error) {
+	d, err := ParseDecimal(qty)
+	if err != nil {
+		return 0, nerr.New(nerr.InvalidArgument, "types.ParseInterval", "invalid interval quantity")
+	}
+	num := new(big.Int).Mul(d.Coef, big.NewInt(unitNanos))
+	den := new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(d.Scale)), nil)
+	q, rem := new(big.Int).QuoRem(num, den, new(big.Int))
+	if rem.Sign() != 0 {
+		return 0, nerr.New(nerr.InvalidArgument, "types.ParseInterval", "interval quantity has sub-nanosecond precision")
+	}
+	if !q.IsInt64() {
+		return 0, nerr.New(nerr.InvalidArgument, "types.ParseInterval", "interval quantity out of range")
+	}
+	return q.Int64(), nil
+}
+
+// FormatInterval renders an INTERVAL's 3 components back to the same
+// "<quantity> <unit> ..." shape ParseInterval accepts, omitting zero
+// components (an all-zero interval formats as "0"). Mirrors Postgres's own
+// conditional-component output style.
+func FormatInterval(months, days int32, nanos int64) string {
+	var parts []string
+	years, rem := months/12, months%12
+	if years != 0 {
+		parts = append(parts, intervalUnitStr(years, "year"))
+	}
+	if rem != 0 {
+		parts = append(parts, intervalUnitStr(rem, "month"))
+	}
+	if days != 0 {
+		parts = append(parts, intervalUnitStr(days, "day"))
+	}
+	if nanos != 0 {
+		// Emits "<n> hours <n> minutes <n[.frac]> seconds" — the same
+		// "<quantity> <unit>" shape ParseInterval accepts, not a colon
+		// "HH:MM:SS" literal, which ParseInterval's grammar does not
+		// understand (found and fixed before this went out the door: the
+		// two were not actually round-trippable, despite this function's
+		// own doc comment claiming they were — caught by
+		// TestIntervalParseFormat's format/reparse round trip).
+		neg := nanos < 0
+		n := nanos
+		if neg {
+			n = -n
+		}
+		h := n / int64(time.Hour)
+		n %= int64(time.Hour)
+		m := n / int64(time.Minute)
+		n %= int64(time.Minute)
+		sec := n / int64(time.Second)
+		frac := n % int64(time.Second)
+		sign := int32(1)
+		if neg {
+			sign = -1
+		}
+		if h != 0 {
+			parts = append(parts, intervalUnitStr(sign*int32(h), "hour"))
+		}
+		if m != 0 {
+			parts = append(parts, intervalUnitStr(sign*int32(m), "minute"))
+		}
+		if sec != 0 || frac != 0 {
+			secStr := strconv.FormatInt(sec, 10)
+			if frac != 0 {
+				fracStr := strings.TrimRight(strconv.FormatInt(1_000_000_000+frac, 10)[1:], "0")
+				secStr += "." + fracStr
+			}
+			if neg {
+				secStr = "-" + secStr
+			}
+			unit := "seconds"
+			if sec == 1 && frac == 0 {
+				unit = "second"
+			}
+			parts = append(parts, secStr+" "+unit)
+		}
+	}
+	if len(parts) == 0 {
+		return "0"
+	}
+	return strings.Join(parts, " ")
+}
+
+func intervalUnitStr(n int32, unit string) string {
+	if n != 1 && n != -1 {
+		unit += "s"
+	}
+	return strconv.FormatInt(int64(n), 10) + " " + unit
+}
+
+
+// justifiedNanos computes an INTERVAL's Postgres-style "justified" total
+// (1 month = 30 days = 24h) as an exact big.Int, used for Cmp — not int64,
+// since months/days are each a full int32 and this engine's
+// nanosecond-precision time component (Postgres uses microseconds) makes
+// int64 overflow reachable well within int32's legitimate range.
+func justifiedNanos(months, days int32, nanos int64) (int64, error) {
+	const dayNanos = int64(86400_000_000_000)
+	totalDays := int64(months)*30 + int64(days)
+	if totalDays != 0 {
+		limit := int64(math.MaxInt64) / dayNanos
+		if totalDays > limit || totalDays < -limit {
+			return 0, nerr.New(nerr.InvalidArgument, "types.justifiedNanos", "interval magnitude too large to compare")
+		}
+	}
+	dayPart := totalDays * dayNanos
+	sum := dayPart + nanos
+	if (nanos > 0 && sum < dayPart) || (nanos < 0 && sum > dayPart) {
+		return 0, nerr.New(nerr.InvalidArgument, "types.justifiedNanos", "interval magnitude too large to compare")
+	}
+	return sum, nil
 }
 
 // decimalToInt converts an exact whole-number Decimal to an int64 in kind's
@@ -663,6 +865,8 @@ func (v Value) String() string {
 		return FormatDate(int32(v.Int))
 	case KindTime:
 		return FormatTimeOfDay(v.Time)
+	case KindInterval:
+		return FormatInterval(v.IntervalMonths, v.IntervalDays, v.Time)
 	default:
 		return "?"
 	}
@@ -812,6 +1016,28 @@ func (v Value) Cmp(o Value) (int, error) {
 		case len(v.Coords) < len(o.Coords):
 			return -1, nil
 		case len(v.Coords) > len(o.Coords):
+			return 1, nil
+		default:
+			return 0, nil
+		}
+	case KindInterval:
+		// Postgres's own "justified" heuristic (1 month = 30 days = 24h),
+		// not a comparison of the raw fields — two intervals unequal in
+		// their raw (months, days, nanos) can compare equal here (e.g. `1
+		// month` = `30 days`), matching Postgres's documented interval_cmp
+		// behavior exactly (docs/design-datatypes.md D6).
+		vn, err := justifiedNanos(v.IntervalMonths, v.IntervalDays, v.Time)
+		if err != nil {
+			return 0, err
+		}
+		on, err := justifiedNanos(o.IntervalMonths, o.IntervalDays, o.Time)
+		if err != nil {
+			return 0, err
+		}
+		switch {
+		case vn < on:
+			return -1, nil
+		case vn > on:
 			return 1, nil
 		default:
 			return 0, nil
@@ -1001,6 +1227,20 @@ func Coerce(v Value, dest Type) (Value, error) {
 		if textlike(v.Typ.Kind) {
 			return ParseUUID(textSource(v))
 		}
+	case KindTimestampTZ:
+		// Pre-existing gap, found and fixed while implementing D6: Coerce
+		// had no STRING/TEXT -> TIMESTAMPTZ case at all — ParseTimestamp
+		// was defined but never called from anywhere in the non-test
+		// codebase. This went undetected because every existing test
+		// populates TIMESTAMPTZ via DEFAULT NOW() or a driver-native
+		// datetime object sent directly as Kind.TimestampTZ over the wire
+		// (bypassing text coercion entirely) — a plain SQL string literal
+		// INSERT into a TIMESTAMPTZ column, e.g. `VALUES ('2024-01-01T00:00:00Z')`,
+		// has never worked in this codebase. Found only because D6's own
+		// tests needed a TIMESTAMPTZ column populated by literal text.
+		if textlike(v.Typ.Kind) {
+			return ParseTimestamp(textSource(v))
+		}
 	case KindEnum:
 		// CAST to ENUM validates label-set membership (docs/design-datatypes.md
 		// D11). Isolated from every family but text, mirroring D1-D8.
@@ -1185,6 +1425,14 @@ func Coerce(v Value, dest Type) (Value, error) {
 		// zone this engine does not carry (docs/design-datatypes.md D7).
 		if textlike(v.Typ.Kind) {
 			return ParseNaiveTimestamp(textSource(v))
+		}
+	case KindInterval:
+		// Isolated from every family but text, same D1-D8 isolation
+		// precedent (docs/design-datatypes.md D6) — no implicit numeric
+		// reinterpretation (an INTERVAL is not "a number of nanoseconds"
+		// to the type system, even though that's its internal storage).
+		if textlike(v.Typ.Kind) {
+			return ParseInterval(textSource(v))
 		}
 	}
 	return Value{}, nerr.New(nerr.InvalidArgument, "types.Coerce", "cannot coerce "+v.Typ.String()+" to "+dest.String())

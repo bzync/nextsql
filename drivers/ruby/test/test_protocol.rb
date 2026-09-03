@@ -187,12 +187,103 @@ module NextSQL
       assert_equal Protocol::KIND_DECIMAL, bare_kind
     end
 
+    def test_enum_round_trip
+      labels = %w[small medium large]
+      raw = Protocol.encode_param(Protocol::EnumValue.new(value: "medium", labels: labels))
+      value, next_off, kind = Protocol.decode_value(raw, 0)
+      assert_equal Protocol::KIND_ENUM, kind
+      assert_equal "medium", value
+      assert_equal raw.bytesize, next_off
+      assert_raises(Error) do
+        Protocol.encode_param(Protocol::EnumValue.new(value: "huge", labels: labels))
+      end
+      # decode_row_desc parses the same label-list framing for a column
+      # header (kind byte, 5 bytes of Precision/Scale/VecElem meta, then
+      # the ENUM label-count u16 + each u16-length-prefixed label).
+      row_desc = +Protocol.u16le(1)
+      row_desc << Protocol.u16str("sz")
+      row_desc << Protocol::KIND_ENUM.chr
+      row_desc << "\x00" * 5
+      row_desc << Protocol.append_enum_labels(labels)
+      cols = Protocol.decode_row_desc(row_desc)
+      assert_equal 1, cols.size
+      assert_equal "sz", cols[0].name
+      assert_equal Protocol::KIND_ENUM, cols[0].kind
+      assert_equal labels, cols[0].labels
+    end
+
     def test_timestamptz_round_trip
       t = Time.utc(2026, 9, 2, 12, 34, 56, 789_000)
       raw = Protocol.encode_param(t)
       value, _, kind = Protocol.decode_value(raw, 0)
       assert_equal Protocol::KIND_TIMESTAMPTZ, kind
       assert_in_delta t.to_r, value.to_r, 0.000001
+    end
+
+    def test_date_round_trip
+      d = Date.new(2024, 1, 15)
+      raw = Protocol.encode_param(d)
+      value, next_off, kind = Protocol.decode_value(raw, 0)
+      assert_equal Protocol::KIND_DATE, kind
+      assert_equal d, value
+      assert_equal raw.bytesize, next_off
+      # Pre-1970 dates round-trip too (signed day count).
+      pre = Date.new(1900, 1, 1)
+      assert_equal pre, Protocol.decode_value(Protocol.encode_param(pre), 0)[0]
+      # DateTime is Date's own subclass, but must still default to
+      # TIMESTAMPTZ (existing behavior), not be mistaken for a bare Date.
+      assert_equal Protocol::KIND_TIMESTAMPTZ, Protocol.decode_value(Protocol.encode_param(DateTime.new(2024, 1, 15)), 0)[2]
+    end
+
+    def test_time_of_day_round_trip
+      ns = (23 * 3600 + 59 * 60 + 59) * 1_000_000_000 + 999_000_000
+      raw = Protocol.encode_param(Protocol::TimeOfDay.new(nanos_since_midnight: ns))
+      value, next_off, kind = Protocol.decode_value(raw, 0)
+      assert_equal Protocol::KIND_TIME, kind
+      assert_equal ns, value
+      assert_equal raw.bytesize, next_off
+    end
+
+    def test_naive_timestamp_round_trip
+      # A local-zoned Time whose wall-clock fields, not its absolute
+      # instant, must be preserved (docs/design-datatypes.md D7).
+      t = Time.new(2024, 6, 15, 10, 30, 0, "+08:00")
+      raw = Protocol.encode_param(Protocol::NaiveTimestamp.new(value: t))
+      value, next_off, kind = Protocol.decode_value(raw, 0)
+      assert_equal Protocol::KIND_TIMESTAMP, kind
+      assert_equal [2024, 6, 15, 10, 30, 0], [value.year, value.month, value.day, value.hour, value.min, value.sec]
+      assert_equal raw.bytesize, next_off
+      # A bare Time still defaults to TIMESTAMPTZ.
+      assert_equal Protocol::KIND_TIMESTAMPTZ, Protocol.decode_value(Protocol.encode_param(t), 0)[2]
+    end
+
+    def test_float32_float64_round_trip
+      [[Protocol::Float32.new(1.5), Protocol::KIND_FLOAT32], [Protocol::Float64.new(1.5), Protocol::KIND_FLOAT64]].each do |wrapped, want_kind|
+        raw = Protocol.encode_param(wrapped)
+        value, next_off, kind = Protocol.decode_value(raw, 0)
+        assert_equal want_kind, kind
+        assert_in_delta 1.5, value, 0.0001
+        assert_equal raw.bytesize, next_off
+      end
+      # NaN/Infinity are valid FLOAT values (unlike the bare-Float -> Decimal path).
+      nan_value, = Protocol.decode_value(Protocol.encode_param(Protocol::Float64.new(Float::NAN)), 0)
+      assert nan_value.nan?
+      inf_value, = Protocol.decode_value(Protocol.encode_param(Protocol::Float64.new(Float::INFINITY)), 0)
+      assert_equal Float::INFINITY, inf_value
+      assert_raises(Error) { Protocol.encode_param(Float::NAN) }
+    end
+
+    def test_interval_round_trip
+      iv = Protocol::Interval.new(months: 14, days: 3, nanos: 4 * 3_600_000_000_000)
+      raw = Protocol.encode_param(iv)
+      value, next_off, kind = Protocol.decode_value(raw, 0)
+      assert_equal Protocol::KIND_INTERVAL, kind
+      assert_equal iv, value
+      assert_equal raw.bytesize, next_off
+      # Negative nanos (e.g. "-1 hour") must round-trip exactly.
+      neg = Protocol::Interval.new(months: 0, days: 0, nanos: -3_600_000_000_000)
+      neg_value, = Protocol.decode_value(Protocol.encode_param(neg), 0)
+      assert_equal(-3_600_000_000_000, neg_value.nanos)
     end
 
     def test_dense_vector_round_trip

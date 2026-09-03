@@ -21,6 +21,7 @@ const {
   decodeHelloOK,
   encodeSetReadConsistency,
   decodeNodeStatus,
+  decodeRowDesc,
   decodeNSJB,
   formatUUID,
   decodeDecimal,
@@ -276,6 +277,106 @@ test('fixed-width uint param round-trip (D3)', () => {
   assert.equal(decodeValue(encodeParam(42), 0).kind, Kind.Decimal);
   // uint64 decodes as BigInt (does not fit safely in a JS number).
   assert.equal(typeof decodeValue(encodeParam({ kind: 'uint64', value: 5n }), 0).value, 'bigint');
+});
+
+test('ENUM param round-trip and label-list wire framing (D11)', () => {
+  const labels = ['small', 'medium', 'large'];
+  const dec = decodeValue(encodeParam({ kind: 'enum', value: 'medium', labels }), 0);
+  assert.equal(dec.kind, Kind.Enum);
+  assert.equal(dec.value, 'medium');
+  assert.deepEqual(dec.labels, labels);
+
+  // A non-member label is rejected client-side too.
+  assert.throws(() => encodeParam({ kind: 'enum', value: 'huge', labels }));
+
+  // A NULL ENUM value still carries its label list on the wire.
+  const raw = encodeParam({ kind: 'enum', value: 'small', labels });
+  raw[1] = 1; // flip the null flag directly, keeping the same header/labels
+  const nullDec = decodeValue(raw, 0);
+  assert.equal(nullDec.value, null);
+  assert.deepEqual(nullDec.labels, labels);
+
+  // decodeRowDesc parses the same label-list framing for a column header
+  // (kind byte, 5 bytes of Precision/Scale/VecElem meta, then the ENUM
+  // label-count u16 + each u16-length-prefixed label) — hand-built to match
+  // internal/protocol/value.go's appendType exactly, since clients never
+  // encode a RowDesc themselves.
+  const nameBuf = Buffer.concat([Buffer.from([2, 0]), Buffer.from('sz', 'utf8')]); // u16 LE name length + name
+  const typeMeta = Buffer.concat([Buffer.from([Kind.Enum]), Buffer.alloc(5)]);
+  const labelBytes = Buffer.concat([
+    Buffer.from([labels.length, 0]),
+    ...labels.map((l) => Buffer.concat([Buffer.from([l.length, 0]), Buffer.from(l, 'utf8')])),
+  ]);
+  const rowDesc = Buffer.concat([Buffer.from([1, 0]), nameBuf, typeMeta, labelBytes]);
+  const cols = decodeRowDesc(rowDesc);
+  assert.equal(cols.length, 1);
+  assert.equal(cols[0].name, 'sz');
+  assert.equal(cols[0].kind, Kind.Enum);
+  assert.deepEqual(cols[0].labels, labels);
+});
+
+test('DATE/TIME/TIMESTAMP/CHAR/VARCHAR/FLOAT32/FLOAT64 param round-trip (D4/D5/D7/D8)', () => {
+  // DATE: a Date's UTC calendar day round-trips to the same UTC-midnight Date.
+  const d = new Date(Date.UTC(2024, 0, 15));
+  const decDate = decodeValue(encodeParam({ kind: 'date', value: d }), 0);
+  assert.equal(decDate.kind, Kind.Date);
+  assert.equal(decDate.value.getTime(), d.getTime());
+  // Pre-1970 dates must round-trip too (signed day count).
+  const preEpoch = new Date(Date.UTC(1900, 0, 1));
+  assert.equal(decodeValue(encodeParam({ kind: 'date', value: preEpoch }), 0).value.getTime(), preEpoch.getTime());
+
+  // TIME: nanoseconds since midnight.
+  const nsInDay = (23 * 3600 + 59 * 60 + 59) * 1_000_000_000 + 999_000_000;
+  const decTime = decodeValue(encodeParam({ kind: 'time', value: nsInDay }), 0);
+  assert.equal(decTime.kind, Kind.Time);
+  assert.equal(decTime.value, nsInDay);
+
+  // TIMESTAMP (naive): a bare Date defaults to TimestampTZ; the wrapper
+  // selects the naive Kind while sharing the exact same wire shape.
+  const ts = new Date('2024-06-15T10:30:00.000Z');
+  const decTs = decodeValue(encodeParam({ kind: 'timestamp', value: ts }), 0);
+  assert.equal(decTs.kind, Kind.Timestamp);
+  assert.equal(decTs.value.getTime(), ts.getTime());
+  assert.equal(decodeValue(encodeParam(ts), 0).kind, Kind.TimestampTZ);
+
+  // FLOAT32/FLOAT64: NaN/Infinity are valid (unlike the bare-number -> Decimal path).
+  for (const which of ['float32', 'float64']) {
+    for (const value of [1.5, -0, Infinity, -Infinity, NaN]) {
+      const dec = decodeValue(encodeParam({ kind: which, value }), 0);
+      assert.equal(dec.kind, which === 'float32' ? Kind.Float32 : Kind.Float64);
+      if (Number.isNaN(value)) {
+        assert.ok(Number.isNaN(dec.value));
+      } else {
+        assert.equal(Math.sign(1 / dec.value), Math.sign(1 / value)); // distinguishes 0 from -0 too
+      }
+    }
+  }
+
+  // CHAR/VARCHAR decode as plain strings (same encoding as STRING/TEXT); the
+  // server does the padding/length-ceiling validation, so no client-side
+  // encode wrapper is needed — a plain string already round-trips as the
+  // write path (server-side coercion covers it).
+  const charRaw = Buffer.concat([Buffer.from([Kind.Char, 0]), Buffer.alloc(5), Buffer.from([5, 0, 0, 0]), Buffer.from('ab   ')]);
+  assert.equal(decodeValue(charRaw, 0).value, 'ab   ');
+});
+
+test('INTERVAL param round-trip, including negative nanos (D6)', () => {
+  const dec = decodeValue(encodeParam({ kind: 'interval', months: 14, days: 3, nanos: 4n * 3_600_000_000_000n }), 0);
+  assert.equal(dec.kind, Kind.Interval);
+  assert.deepEqual(dec.value, { months: 14, days: 3, nanos: 4n * 3_600_000_000_000n });
+
+  // Regression test for a real bug found while implementing D6: putU64
+  // (used for INTERVAL's nanosecond component, which is legitimately
+  // negative, e.g. "-1 hour") called Buffer.writeBigUInt64LE directly on a
+  // possibly-negative BigInt, which throws a RangeError instead of wrapping
+  // to the unsigned two's-complement bit pattern — unlike the JS/Bun/Deno
+  // driver's DataView.setBigUint64, which already wraps automatically. This
+  // silently affected every pre-1970 TIMESTAMPTZ/TIMESTAMP too, since they
+  // share the same helper; nothing in this suite exercised a negative value
+  // through putU64 specifically until this interval test (the existing
+  // pre-1970 DATE case above uses a completely different int32 encode path).
+  const negDec = decodeValue(encodeParam({ kind: 'interval', months: 0, days: 0, nanos: -3_600_000_000_000n }), 0);
+  assert.equal(negDec.value.nanos, -3_600_000_000_000n);
 });
 
 test('decimal encode / decode', () => {

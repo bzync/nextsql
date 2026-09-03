@@ -152,7 +152,7 @@ func physicalRows(t *testing.T, tr *btree.Tree) int64 {
 		t.Fatal(err)
 	}
 	var n int64
-	err = tx.RangeLive(func(_, _ []byte) error {
+	err = tx.RangePhysical(func(_, _ []byte) error {
 		n++
 		return nil
 	})

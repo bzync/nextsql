@@ -20,6 +20,8 @@ MAX_PACKET = 1 << 20
 MAX_SQL = 1 << 20
 MAX_NAME = 256
 MAX_PARAMS = 256
+MAX_ENUM_LABELS = 4096
+MAX_ENUM_LABEL_BYTES = 255
 
 TYPE_HELLO = 1
 TYPE_HELLO_OK = 2
@@ -78,6 +80,15 @@ KIND_UINT8 = 19
 KIND_UINT16 = 20
 KIND_UINT32 = 21
 KIND_UINT64 = 22
+KIND_DATE = 23
+KIND_TIME = 24
+KIND_CHAR = 25
+KIND_VARCHAR = 26
+KIND_TIMESTAMP = 27
+KIND_FLOAT32 = 28
+KIND_FLOAT64 = 29
+KIND_ENUM = 30
+KIND_INTERVAL = 31
 
 _UTC = datetime.timezone.utc
 _EPOCH = datetime.datetime(1970, 1, 1, tzinfo=_UTC)
@@ -92,6 +103,9 @@ class ProtocolError(NextSQLError):
 class Column:
     name: str
     kind: int
+    # ENUM's declared label list (D11, Datatype expansion track); None for
+    # every other kind.
+    labels: list[str] | None = None
 
 
 @dataclass
@@ -211,11 +225,135 @@ _UINT_RANGES: dict[type, tuple[int, int, int]] = {
 }
 
 
+# Float32/Float64 (D8, Datatype expansion track): explicit wrappers, since a
+# bare Python float still defaults to KIND_DECIMAL (see encode_param) and
+# DECIMAL requires finite — these are needed both to pin the exact wire
+# width and to send NaN/+-Infinity, which FLOAT32/FLOAT64 support
+# (docs/design-datatypes.md D8) but DECIMAL does not.
+@dataclass
+class Float32:
+    value: float
+
+
+@dataclass
+class Float64:
+    value: float
+
+
+# Interval (D6, Datatype expansion track): months (int, calendar) + days
+# (int, calendar) + nanos (int, time-of-day component) — Postgres-style
+# 3-field storage. A plain string still works as an INTERVAL param for
+# INSERT/UPDATE column assignment (server-side Coerce, same as DATE/TIME/
+# TIMESTAMP text coercion) but not inside an arithmetic expression like
+# `dur + $1`, which requires the actual wire Kind.
+@dataclass
+class Interval:
+    months: int
+    days: int
+    nanos: int
+
+
+def _encode_interval(v: Interval) -> bytes:
+    return (
+        bytes([KIND_INTERVAL, 0])
+        + _reserved5()
+        + struct.pack("<i", v.months)
+        + struct.pack("<i", v.days)
+        + struct.pack("<q", v.nanos)
+    )
+
+
 def _encode_uint(v: Uint8 | Uint16 | Uint32 | Uint64) -> bytes:
     hi, kind, width = _UINT_RANGES[type(v)]
     if v.value < 0 or v.value > hi:
         raise NextSQLError("invalid_argument", f"{type(v).__name__} out of range")
     return bytes([kind, 0]) + _reserved5() + v.value.to_bytes(width, "little")
+
+
+# EnumValue (D11, Datatype expansion track): an explicit ENUM parameter wrapper.
+# Ordinary INSERT/UPDATE params can just pass a plain str — the server
+# coerces STRING -> ENUM against the destination column, same as a SQL
+# string literal. This wrapper exists for explicit round-tripping and
+# mirrors Int8/Uint8's precedent.
+@dataclass
+class EnumValue:
+    value: str
+    labels: list[str]
+
+
+def append_enum_labels(labels: list[str]) -> bytes:
+    out = u16le(len(labels))
+    for label in labels:
+        out += u16str(label, MAX_ENUM_LABEL_BYTES)
+    return out
+
+
+def read_enum_labels(b: bytes, off: int) -> tuple[list[str], int]:
+    _need(b, off, 2, "enum label count")
+    n = u16(b, off)
+    if n > MAX_ENUM_LABELS:
+        raise ProtocolError("enum label count exceeds limit")
+    off += 2
+    labels = []
+    for _ in range(n):
+        label, off = read_u16_string(b, off, MAX_ENUM_LABEL_BYTES)
+        labels.append(label)
+    return labels, off
+
+
+def _encode_enum(v: EnumValue) -> bytes:
+    try:
+        ord_ = v.labels.index(v.value)
+    except ValueError:
+        raise NextSQLError("invalid_argument", "value is not a member of the ENUM label set") from None
+    return bytes([KIND_ENUM, 0]) + _reserved5() + append_enum_labels(v.labels) + u16le(ord_)
+
+
+# NaiveTimestamp (D7, Datatype expansion track): an explicit wrapper for the
+# no-timezone TIMESTAMP type. A bare naive datetime.datetime (tzinfo is None)
+# already has an established meaning in this driver — "assume UTC", encoded
+# as TIMESTAMPTZ (see encode_param) — so this wrapper is required to select
+# the distinct TIMESTAMP Kind instead, rather than silently repurposing that
+# existing default. datetime.date and datetime.time need no such wrapper:
+# they are unambiguous native mappings for DATE/TIME with no prior meaning
+# in this driver to conflict with.
+@dataclass
+class NaiveTimestamp:
+    value: datetime.datetime
+
+
+def _civil_nanos(dt: datetime.datetime) -> int:
+    """Epoch nanoseconds for dt's own wall-clock fields, with no offset
+    applied — converts an aware dt to UTC first (so its *fields* become the
+    civil value), then treats those fields as literal (docs/design-datatypes.md D7)."""
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(_UTC)
+    dt = dt.replace(tzinfo=_UTC)
+    delta = dt - _EPOCH
+    return (delta.days * 86400 + delta.seconds) * 1_000_000_000 + delta.microseconds * 1000
+
+
+def _encode_naive_timestamp(v: NaiveTimestamp) -> bytes:
+    return bytes([KIND_TIMESTAMP, 0]) + _reserved5() + struct.pack("<q", _civil_nanos(v.value))
+
+
+def _encode_date(d: datetime.date) -> bytes:
+    day_count = (d - _EPOCH.date()).days
+    return bytes([KIND_DATE, 0]) + _reserved5() + struct.pack("<i", day_count)
+
+
+def _encode_time(t: datetime.time) -> bytes:
+    ns = (t.hour * 3600 + t.minute * 60 + t.second) * 1_000_000_000 + t.microsecond * 1000
+    return bytes([KIND_TIME, 0]) + _reserved5() + struct.pack("<Q", ns)
+
+
+def _encode_float(kind: int, n: float) -> bytes:
+    # NaN/+-Infinity are valid FLOAT32/FLOAT64 values (unlike the bare-float
+    # -> Decimal default path, which requires finite) — the server
+    # canonicalizes -0.0 -> +0.0 and every NaN payload to one value
+    # (docs/design-datatypes.md D8).
+    fmt = "<f" if kind == KIND_FLOAT32 else "<d"
+    return bytes([kind, 0]) + _reserved5() + struct.pack(fmt, n)
 
 
 def _need(b: bytes, off: int, n: int, what: str) -> None:
@@ -363,6 +501,16 @@ def encode_param(v: Any) -> bytes:
         return _encode_int(v)
     if isinstance(v, (Uint8, Uint16, Uint32, Uint64)):
         return _encode_uint(v)
+    if isinstance(v, Float32):
+        return _encode_float(KIND_FLOAT32, v.value)
+    if isinstance(v, Float64):
+        return _encode_float(KIND_FLOAT64, v.value)
+    if isinstance(v, EnumValue):
+        return _encode_enum(v)
+    if isinstance(v, NaiveTimestamp):
+        return _encode_naive_timestamp(v)
+    if isinstance(v, Interval):
+        return _encode_interval(v)
     if isinstance(v, str):
         return bytes([KIND_STRING, 0]) + _reserved5() + u32bytes(v.encode("utf-8"), MAX_PACKET)
     if isinstance(v, datetime.datetime):
@@ -370,6 +518,12 @@ def encode_param(v: Any) -> bytes:
         delta = dt.astimezone(_UTC) - _EPOCH
         ns = (delta.days * 86400 + delta.seconds) * 1_000_000_000 + delta.microseconds * 1000
         return bytes([KIND_TIMESTAMPTZ, 0]) + _reserved5() + struct.pack("<q", ns)
+    if isinstance(v, datetime.date):
+        # Checked after datetime.datetime (a subclass of date) above, so
+        # only a bare date reaches here.
+        return _encode_date(v)
+    if isinstance(v, datetime.time):
+        return _encode_time(v)
     if isinstance(v, Point):
         return bytes([KIND_POINT, 0]) + _reserved5() + struct.pack("<dd", v.lon, v.lat)
     if isinstance(v, Box):
@@ -389,12 +543,21 @@ def decode_value(b: bytes, off: int) -> tuple[Any, int, int]:
     kind = b[off]
     flags = b[off + 1]
     off += 7
+    enum_labels: list[str] | None = None
+    if kind == KIND_ENUM:
+        enum_labels, off = read_enum_labels(b, off)
     if flags & FLAG_NULL:
         return None, off, kind
+    if kind == KIND_ENUM:
+        _need(b, off, 2, "enum")
+        ord_ = u16(b, off)
+        if ord_ >= len(enum_labels):
+            raise ProtocolError("ENUM ordinal out of range")
+        return enum_labels[ord_], off + 2, kind
     if kind == KIND_UUID:
         _need(b, off, 16, "uuid")
         return _uuid.UUID(bytes=b[off : off + 16]), off + 16, kind
-    if kind in (KIND_STRING, KIND_TEXT):
+    if kind in (KIND_STRING, KIND_TEXT, KIND_CHAR, KIND_VARCHAR):
         raw, next_off = read_u32_bytes(b, off, MAX_PACKET)
         return raw.decode("utf-8"), next_off, kind
     if kind == KIND_BLOB:
@@ -411,6 +574,39 @@ def decode_value(b: bytes, off: int) -> tuple[Any, int, int]:
         sec, nsec = divmod(ns, 1_000_000_000)
         dt = _EPOCH + datetime.timedelta(seconds=sec, microseconds=nsec // 1000)
         return dt, off + 8, kind
+    if kind == KIND_TIMESTAMP:
+        # Naive/no-timezone: same wire shape as TimestampTZ, decoded to a
+        # naive datetime.datetime (tzinfo=None) — the civil value read
+        # literally, no offset (docs/design-datatypes.md D7).
+        ns = i64(b, off)
+        sec, nsec = divmod(ns, 1_000_000_000)
+        dt = (_EPOCH + datetime.timedelta(seconds=sec, microseconds=nsec // 1000)).replace(tzinfo=None)
+        return dt, off + 8, kind
+    if kind == KIND_DATE:
+        _need(b, off, 4, "date")
+        day_count = struct.unpack_from("<i", b, off)[0]
+        return _EPOCH.date() + datetime.timedelta(days=day_count), off + 4, kind
+    if kind == KIND_TIME:
+        # Nanoseconds since midnight; datetime.time only holds microsecond
+        # precision, so sub-microsecond nanoseconds are truncated (the same
+        # precision ceiling every timestamp-family decode already has here).
+        _need(b, off, 8, "time")
+        ns = u64(b, off)
+        sec, nsec = divmod(ns, 1_000_000_000)
+        h, rem = divmod(sec, 3600)
+        m, s = divmod(rem, 60)
+        return datetime.time(h, m, s, nsec // 1000), off + 8, kind
+    if kind in (KIND_FLOAT32, KIND_FLOAT64):
+        width = 4 if kind == KIND_FLOAT32 else 8
+        _need(b, off, width, "float")
+        fmt = "<f" if kind == KIND_FLOAT32 else "<d"
+        return struct.unpack_from(fmt, b, off)[0], off + width, kind
+    if kind == KIND_INTERVAL:
+        _need(b, off, 16, "interval")
+        months = struct.unpack_from("<i", b, off)[0]
+        days = struct.unpack_from("<i", b, off + 4)[0]
+        nanos = struct.unpack_from("<q", b, off + 8)[0]
+        return Interval(months, days, nanos), off + 16, kind
     if kind == KIND_BOOL:
         _need(b, off, 1, "bool")
         return b[off] != 0, off + 1, kind
@@ -494,8 +690,12 @@ def decode_row_desc(b: bytes) -> list[Column]:
     for _ in range(n):
         name, off = read_u16_string(b, off, MAX_NAME)
         _need(b, off, 6, "column type")
-        cols.append(Column(name=name, kind=b[off]))
+        kind = b[off]
         off += 6
+        labels: list[str] | None = None
+        if kind == KIND_ENUM:
+            labels, off = read_enum_labels(b, off)
+        cols.append(Column(name=name, kind=kind, labels=labels))
     return cols
 
 

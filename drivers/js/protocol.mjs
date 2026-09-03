@@ -12,6 +12,8 @@ export const MAX_PACKET = 1 << 20;
 export const MAX_SQL = 1 << 20;
 export const MAX_NAME = 256;
 export const MAX_PARAMS = 256;
+export const MAX_ENUM_LABELS = 4096;
+export const MAX_ENUM_LABEL_BYTES = 255;
 
 export const Type = {
   Hello: 1,
@@ -77,6 +79,15 @@ export const Kind = {
   Uint16: 20,
   Uint32: 21,
   Uint64: 22,
+  Date: 23,
+  Time: 24,
+  Char: 25,
+  Varchar: 26,
+  Timestamp: 27,
+  Float32: 28,
+  Float64: 29,
+  Enum: 30,
+  Interval: 31,
 };
 
 export class NextSQLError extends Error {
@@ -282,6 +293,37 @@ export function readU32Bytes(buf, off, max) {
     throw new NextSQLError('protocol', 'truncated bytes');
   }
   return { value: buf.subarray(off + 4, off + 4 + n), next: off + 4 + n };
+}
+
+// appendEnumLabels/readEnumLabels carry an ENUM Type's declared label list on
+// the wire, matching internal/protocol/value.go's appendEnumLabels/
+// readEnumLabels exactly (docs/design-datatypes.md D11): ENUM is the first
+// D-track type whose Type needs variable-length metadata beyond the fixed
+// 5/6-byte Precision/Scale/VecElem shape every other type fits into.
+function appendEnumLabels(labels) {
+  const parts = [putU16(labels.length)];
+  for (const l of labels) {
+    parts.push(appendU16String(l, MAX_ENUM_LABEL_BYTES));
+  }
+  return concat(parts);
+}
+
+function readEnumLabels(buf, off) {
+  if (off + 2 > buf.length) {
+    throw new NextSQLError('protocol', 'truncated enum label count');
+  }
+  const n = u16(buf, off);
+  if (n > MAX_ENUM_LABELS) {
+    throw new NextSQLError('protocol', 'enum label count exceeds limit');
+  }
+  off += 2;
+  const labels = [];
+  for (let i = 0; i < n; i++) {
+    const got = readU16String(buf, off, MAX_ENUM_LABEL_BYTES);
+    labels.push(got.value);
+    off = got.next;
+  }
+  return { value: labels, next: off };
 }
 
 function bigintToBytes(n) {
@@ -531,8 +573,84 @@ function encodeUint(which, value) {
   return concat([Uint8Array.of(kind, 0), new Uint8Array(5), full.subarray(0, width)]);
 }
 
+// encodeEnum builds an explicit ENUM parameter (D11, Datatype expansion
+// track). Ordinary INSERT/UPDATE params can just pass a plain JS string —
+// the server coerces STRING -> ENUM against the destination column, same as
+// a SQL string literal. This wrapper exists for explicit round-tripping and
+// mirrors encodeInt/encodeUint's precedent.
+function encodeEnum(label, labels) {
+  const ord = labels.indexOf(label);
+  if (ord < 0) {
+    throw new NextSQLError('invalid_argument', 'value is not a member of the ENUM label set');
+  }
+  return concat([Uint8Array.of(Kind.Enum, 0), new Uint8Array(5), appendEnumLabels(labels), putU16(ord)]);
+}
+
 function encodeTimestamp(ns) {
   return concat([Uint8Array.of(Kind.TimestampTZ, 0), new Uint8Array(5), putU64(ns)]);
+}
+
+// encodeDate/encodeTime/encodeNaiveTimestamp/encodeFloat32/encodeFloat64 (D5/
+// D7/D8, Datatype expansion track): explicit wrappers for types with no
+// natural bare-JS-value mapping (Date is always TimestampTZ; a number always
+// defaults to Decimal; JS has no date-only or time-only type). Wire shapes
+// mirror internal/sql/types/row.go's encodeScalar exactly: DATE is a signed
+// i32 day count (no sign-bit flip — that only applies to sortable index
+// keys, not wire values); TIME is nanoseconds-since-midnight, always
+// non-negative so it fits safely in a JS double (< 2^53); TIMESTAMP
+// (naive/no-timezone) shares TimestampTZ's exact 8-byte nanos-since-epoch
+// wire shape, tagged with a different Kind — the "naive" quality is a
+// server-side interpretation difference (no offset applied), not a
+// different byte layout.
+function encodeDate(dayCount) {
+  const buf = new Uint8Array(4);
+  new DataView(buf.buffer).setInt32(0, dayCount, true);
+  return concat([Uint8Array.of(Kind.Date, 0), new Uint8Array(5), buf]);
+}
+
+function encodeTime(nanosSinceMidnight) {
+  return concat([Uint8Array.of(Kind.Time, 0), new Uint8Array(5), putU64(nanosSinceMidnight)]);
+}
+
+function encodeNaiveTimestamp(ns) {
+  return concat([Uint8Array.of(Kind.Timestamp, 0), new Uint8Array(5), putU64(ns)]);
+}
+
+// NaN/+-Infinity are valid FLOAT32/FLOAT64 values (unlike the bare-number ->
+// Decimal default path, which requires finite): the server canonicalizes
+// -0.0 -> +0.0 and every NaN payload to one value and defines a total order
+// -Inf < reals < +Inf < NaN (docs/design-datatypes.md D8).
+function encodeFloat32(n) {
+  if (typeof n !== 'number') {
+    throw new NextSQLError('invalid_argument', 'FLOAT32 value must be a number');
+  }
+  return concat([Uint8Array.of(Kind.Float32, 0), new Uint8Array(5), putF32(n)]);
+}
+
+function encodeFloat64(n) {
+  if (typeof n !== 'number') {
+    throw new NextSQLError('invalid_argument', 'FLOAT64 value must be a number');
+  }
+  return concat([Uint8Array.of(Kind.Float64, 0), new Uint8Array(5), putF64(n)]);
+}
+
+// encodeInterval builds an explicit INTERVAL parameter (D6, Datatype
+// expansion track): months(i32 LE) + days(i32 LE) + nanos(i64 LE), the
+// exact wire shape internal/sql/types/row.go's encodeScalar uses — a fixed
+// 16-byte scalar needing no extra Type metadata (unlike ENUM). A plain
+// string still works as an INTERVAL param for INSERT/UPDATE column
+// assignment (server-side Coerce, same as DATE/TIME/TIMESTAMP text
+// coercion) but NOT inside an arithmetic expression like `dur + $1` — the
+// executor's INTERVAL arithmetic dispatch keys off the parameter's actual
+// wire Kind, so a plain string there is rejected as "not a DATE/TIME/
+// TIMESTAMP/TIMESTAMPTZ/INTERVAL operand", the same requirement the new
+// `INTERVAL 'text'` SQL literal syntax exists to satisfy from the SQL side.
+function encodeInterval(months, days, nanos) {
+  const mbuf = new Uint8Array(4);
+  new DataView(mbuf.buffer).setInt32(0, months, true);
+  const dbuf = new Uint8Array(4);
+  new DataView(dbuf.buffer).setInt32(0, days, true);
+  return concat([Uint8Array.of(Kind.Interval, 0), new Uint8Array(5), mbuf, dbuf, putU64(nanos)]);
 }
 
 function encodePoint(lon, lat) {
@@ -617,6 +735,33 @@ export function encodeParam(v) {
     if (v.kind === 'uint8' || v.kind === 'uint16' || v.kind === 'uint32' || v.kind === 'uint64') {
       return encodeUint(v.kind, v.value);
     }
+    if (v.kind === 'enum') {
+      return encodeEnum(v.value, v.labels);
+    }
+    if (v.kind === 'date') {
+      // Accepts a Date (its UTC calendar day) or a raw day-count integer.
+      const dayCount = v.value instanceof Date ? Math.floor(v.value.getTime() / 86400000) : Number(v.value);
+      return encodeDate(dayCount);
+    }
+    if (v.kind === 'time') {
+      // Nanoseconds since midnight (JS has no time-only type).
+      return encodeTime(v.value);
+    }
+    if (v.kind === 'timestamp') {
+      // Naive/no-timezone TIMESTAMP: accepts a Date (read as UTC calendar
+      // fields, no offset applied) or raw epoch nanoseconds.
+      const ns = v.value instanceof Date ? BigInt(v.value.getTime()) * 1000000n : BigInt(v.value);
+      return encodeNaiveTimestamp(ns);
+    }
+    if (v.kind === 'float32') {
+      return encodeFloat32(Number(v.value));
+    }
+    if (v.kind === 'float64') {
+      return encodeFloat64(Number(v.value));
+    }
+    if (v.kind === 'interval') {
+      return encodeInterval(v.months | 0, v.days | 0, v.nanos);
+    }
     return encodeString(JSON.stringify(v));
   }
   throw new NextSQLError('invalid_argument', 'unsupported parameter type');
@@ -629,8 +774,14 @@ export function decodeValue(buf, off) {
   const kind = buf[off];
   const flags = buf[off + 1];
   off += 7;
+  let enumLabels = null;
+  if (kind === Kind.Enum) {
+    const got = readEnumLabels(buf, off);
+    enumLabels = got.value;
+    off = got.next;
+  }
   if (flags & FlagNull) {
-    return { value: null, next: off, kind };
+    return { value: null, next: off, kind, labels: enumLabels || undefined };
   }
   switch (kind) {
     case Kind.UUID: {
@@ -640,7 +791,9 @@ export function decodeValue(buf, off) {
       return { value: formatUUID(buf.subarray(off, off + 16)), next: off + 16, kind };
     }
     case Kind.String:
-    case Kind.Text: {
+    case Kind.Text:
+    case Kind.Char:
+    case Kind.Varchar: {
       const got = readU32Bytes(buf, off, MAX_PACKET);
       return { value: td.decode(got.value), next: got.next, kind };
     }
@@ -662,6 +815,54 @@ export function decodeValue(buf, off) {
       }
       const ns = view(buf, off, 8).getBigInt64(0, true);
       return { value: new Date(Number(ns / 1000000n)), next: off + 8, kind };
+    }
+    case Kind.Timestamp: {
+      // Naive/no-timezone: same wire shape as TimestampTZ, decoded the same
+      // way — the Date's UTC-displayed fields are the intended civil value
+      // (no offset was ever applied), it is just not tagged as a zoned
+      // instant (docs/design-datatypes.md D7).
+      if (off + 8 > buf.length) {
+        throw new NextSQLError('protocol', 'truncated timestamp');
+      }
+      const ns = view(buf, off, 8).getBigInt64(0, true);
+      return { value: new Date(Number(ns / 1000000n)), next: off + 8, kind };
+    }
+    case Kind.Date: {
+      if (off + 4 > buf.length) {
+        throw new NextSQLError('protocol', 'truncated date');
+      }
+      const dayCount = view(buf, off, 4).getInt32(0, true);
+      return { value: new Date(dayCount * 86400000), next: off + 4, kind };
+    }
+    case Kind.Time: {
+      // Nanoseconds since midnight, always < 1 day: fits safely in a JS
+      // double (max ~8.64e13, well under 2^53), so no BigInt needed.
+      if (off + 8 > buf.length) {
+        throw new NextSQLError('protocol', 'truncated time');
+      }
+      const ns = view(buf, off, 8).getBigUint64(0, true);
+      return { value: Number(ns), next: off + 8, kind };
+    }
+    case Kind.Float32: {
+      if (off + 4 > buf.length) {
+        throw new NextSQLError('protocol', 'truncated float32');
+      }
+      return { value: view(buf, off, 4).getFloat32(0, true), next: off + 4, kind };
+    }
+    case Kind.Float64: {
+      if (off + 8 > buf.length) {
+        throw new NextSQLError('protocol', 'truncated float64');
+      }
+      return { value: view(buf, off, 8).getFloat64(0, true), next: off + 8, kind };
+    }
+    case Kind.Interval: {
+      if (off + 16 > buf.length) {
+        throw new NextSQLError('protocol', 'truncated interval');
+      }
+      const months = view(buf, off, 4).getInt32(0, true);
+      const days = view(buf, off + 4, 4).getInt32(0, true);
+      const nanos = view(buf, off + 8, 8).getBigInt64(0, true);
+      return { value: { months, days, nanos }, next: off + 16, kind };
     }
     case Kind.Bool: {
       if (off >= buf.length) {
@@ -777,6 +978,16 @@ export function decodeValue(buf, off) {
       }
       return { value: { coords }, next: p, kind };
     }
+    case Kind.Enum: {
+      if (off + 2 > buf.length) {
+        throw new NextSQLError('protocol', 'truncated enum');
+      }
+      const ord = u16(buf, off);
+      if (ord >= enumLabels.length) {
+        throw new NextSQLError('protocol', 'ENUM ordinal out of range');
+      }
+      return { value: enumLabels[ord], next: off + 2, kind, labels: enumLabels };
+    }
     case Kind.Polygon: {
       const nr = u16(buf, off);
       let p = off + 2;
@@ -868,13 +1079,20 @@ export function decodeRowDesc(b) {
     if (off + 6 > b.length) {
       throw new NextSQLError('protocol', 'truncated type');
     }
-    columns.push({
+    const kind = b[off];
+    const col = {
       name: name.value,
-      kind: b[off],
+      kind,
       precision: u16(b, off + 1),
       scale: u16(b, off + 3),
-    });
+    };
     off += 6;
+    if (kind === Kind.Enum) {
+      const got = readEnumLabels(b, off);
+      col.labels = got.value;
+      off = got.next;
+    }
+    columns.push(col);
   }
   return columns;
 }

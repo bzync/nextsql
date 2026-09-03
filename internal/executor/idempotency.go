@@ -354,10 +354,14 @@ func validateIdempotentResultType(typ types.Type) error {
 		if typ.Precision < 1 || typ.Precision > types.MaxCharLen || typ.Scale != 0 || typ.VecElem != 0 {
 			return nerr.New(nerr.InvalidFormat, "executor.decodeIdempotentResult", "invalid char result type")
 		}
+	case types.KindEnum:
+		if len(typ.EnumLabels) < 1 || len(typ.EnumLabels) > types.MaxEnumLabels {
+			return nerr.New(nerr.InvalidFormat, "executor.decodeIdempotentResult", "invalid enum result type")
+		}
 	case types.KindUUID, types.KindString, types.KindText, types.KindBlob, types.KindTimestampTZ, types.KindJSON, types.KindBool, types.KindNull, types.KindPoint, types.KindBox, types.KindLine, types.KindPolygon,
 		types.KindInt8, types.KindInt16, types.KindInt32, types.KindInt64,
 		types.KindUint8, types.KindUint16, types.KindUint32, types.KindUint64,
-		types.KindDate, types.KindTime, types.KindTimestamp, types.KindFloat32, types.KindFloat64:
+		types.KindDate, types.KindTime, types.KindTimestamp, types.KindFloat32, types.KindFloat64, types.KindInterval:
 	default:
 		return nerr.New(nerr.InvalidFormat, "executor.decodeIdempotentResult", "invalid result type")
 	}

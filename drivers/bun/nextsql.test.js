@@ -236,6 +236,48 @@ test('fixed-width uint param round-trip (D3)', () => {
   expect(typeof decodeValue(encodeParam({ kind: 'uint64', value: 5n }), 0).value).toBe('bigint');
 });
 
+test('ENUM param round-trip (D11)', () => {
+  const labels = ['small', 'medium', 'large'];
+  const dec = decodeValue(encodeParam({ kind: 'enum', value: 'medium', labels }), 0);
+  expect(dec.kind).toBe(Kind.Enum);
+  expect(dec.value).toBe('medium');
+  expect(dec.labels).toEqual(labels);
+  expect(() => encodeParam({ kind: 'enum', value: 'huge', labels })).toThrow();
+});
+
+test('DATE/TIME/TIMESTAMP/FLOAT32/FLOAT64 param round-trip (D5/D7/D8)', () => {
+  const d = new Date(Date.UTC(2024, 0, 15));
+  const decDate = decodeValue(encodeParam({ kind: 'date', value: d }), 0);
+  expect(decDate.kind).toBe(Kind.Date);
+  expect(decDate.value.getTime()).toBe(d.getTime());
+
+  const nsInDay = (23 * 3600 + 59 * 60 + 59) * 1_000_000_000 + 999_000_000;
+  const decTime = decodeValue(encodeParam({ kind: 'time', value: nsInDay }), 0);
+  expect(decTime.kind).toBe(Kind.Time);
+  expect(decTime.value).toBe(nsInDay);
+
+  const ts = new Date('2024-06-15T10:30:00.000Z');
+  const decTs = decodeValue(encodeParam({ kind: 'timestamp', value: ts }), 0);
+  expect(decTs.kind).toBe(Kind.Timestamp);
+  expect(decTs.value.getTime()).toBe(ts.getTime());
+  expect(decodeValue(encodeParam(ts), 0).kind).toBe(Kind.TimestampTZ);
+
+  const decF32 = decodeValue(encodeParam({ kind: 'float32', value: 1.5 }), 0);
+  expect(decF32.kind).toBe(Kind.Float32);
+  expect(decF32.value).toBe(1.5);
+  const decF64Nan = decodeValue(encodeParam({ kind: 'float64', value: NaN }), 0);
+  expect(decF64Nan.kind).toBe(Kind.Float64);
+  expect(Number.isNaN(decF64Nan.value)).toBe(true);
+});
+
+test('INTERVAL param round-trip, including negative nanos (D6)', () => {
+  const dec = decodeValue(encodeParam({ kind: 'interval', months: 14, days: 3, nanos: 4n * 3_600_000_000_000n }), 0);
+  expect(dec.kind).toBe(Kind.Interval);
+  expect(dec.value).toEqual({ months: 14, days: 3, nanos: 4n * 3_600_000_000_000n });
+  const negDec = decodeValue(encodeParam({ kind: 'interval', months: 0, days: 0, nanos: -3_600_000_000_000n }), 0);
+  expect(negDec.value.nanos).toBe(-3_600_000_000_000n);
+});
+
 test('decimal encode / decode', () => {
   const body = encodeDecimalString('-12.50');
   const raw = body.subarray(4);

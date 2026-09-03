@@ -61,6 +61,52 @@ func readU32Bytes(b []byte, off, max int) ([]byte, int, error) {
 	return raw, off + 4 + int(n), nil
 }
 
+// maxEnumLabelBytes bounds one ENUM label on the wire, matching
+// types.EnumType's own per-label length validation (docs/design-datatypes.md
+// D11). The label count itself is bounded by types.MaxEnumLabels.
+const maxEnumLabelBytes = 255
+
+// appendEnumLabels/readEnumLabels carry an ENUM Type's declared label list
+// alongside the fixed 5-byte Precision/Scale/VecElem meta (appendType/
+// appendValue), since ENUM is the first D-track type whose Type needs
+// variable-length wire metadata (docs/design-datatypes.md D11). readType and
+// readValue are both untrusted-decoder entry points (a value's Type also
+// travels on the bound-parameter path, client -> server), so the label count
+// and each label's length are bounded here before allocating, and the
+// reconstructed list is re-validated through types.EnumType (dedup, 1..
+// MaxEnumLabels, per-label length) rather than trusted as-is.
+func appendEnumLabels(dst []byte, labels []string) ([]byte, error) {
+	var n [2]byte
+	encoding.PutU16(n[:], 0, uint16(len(labels)))
+	dst = append(dst, n[:]...)
+	var err error
+	for _, l := range labels {
+		if dst, err = appendU16String(dst, l, maxEnumLabelBytes); err != nil {
+			return nil, err
+		}
+	}
+	return dst, nil
+}
+
+func readEnumLabels(b []byte, off int) ([]string, int, error) {
+	n, err := encoding.ReadU16(b, off)
+	if err != nil {
+		return nil, 0, protoErr("truncated enum label count")
+	}
+	if int(n) > types.MaxEnumLabels {
+		return nil, 0, protoErr("enum label count exceeds limit")
+	}
+	off += 2
+	labels := make([]string, n)
+	for i := range labels {
+		labels[i], off, err = readU16String(b, off, maxEnumLabelBytes)
+		if err != nil {
+			return nil, 0, err
+		}
+	}
+	return labels, off, nil
+}
+
 func appendValue(dst []byte, v types.Value, max int) ([]byte, error) {
 	dst = append(dst, byte(v.Typ.Kind))
 	var flags byte
@@ -73,6 +119,12 @@ func appendValue(dst []byte, v types.Value, max int) ([]byte, error) {
 	encoding.PutU16(meta[:], 2, v.Typ.Scale)
 	meta[4] = v.Typ.VecElem
 	dst = append(dst, meta[:]...)
+	if v.Typ.Kind == types.KindEnum {
+		var err error
+		if dst, err = appendEnumLabels(dst, v.Typ.EnumLabels); err != nil {
+			return nil, err
+		}
+	}
 	if v.Null {
 		return dst, nil
 	}
@@ -97,6 +149,16 @@ func readValue(b []byte, off, max int) (types.Value, int, error) {
 	elem := b[off+6]
 	off += 7
 	typ := types.Type{Kind: kind, Precision: prec, Scale: scale, VecElem: elem}
+	if kind == types.KindEnum {
+		labels, next, err := readEnumLabels(b, off)
+		if err != nil {
+			return types.Value{}, 0, err
+		}
+		if typ, err = types.EnumType(labels); err != nil {
+			return types.Value{}, 0, nerr.Wrap(nerr.Protocol, "protocol.readValue", "invalid enum type", err)
+		}
+		off = next
+	}
 	if flags&flagNull != 0 {
 		return types.Null(typ), off, nil
 	}
@@ -114,13 +176,20 @@ func readValue(b []byte, off, max int) (types.Value, int, error) {
 	return v, next, nil
 }
 
-func appendType(dst []byte, t types.Type) []byte {
+func appendType(dst []byte, t types.Type) ([]byte, error) {
 	dst = append(dst, byte(t.Kind))
 	var meta [5]byte
 	encoding.PutU16(meta[:], 0, t.Precision)
 	encoding.PutU16(meta[:], 2, t.Scale)
 	meta[4] = t.VecElem
-	return append(dst, meta[:]...)
+	dst = append(dst, meta[:]...)
+	if t.Kind == types.KindEnum {
+		var err error
+		if dst, err = appendEnumLabels(dst, t.EnumLabels); err != nil {
+			return nil, err
+		}
+	}
+	return dst, nil
 }
 
 func readType(b []byte, off int) (types.Type, int, error) {
@@ -133,5 +202,16 @@ func readType(b []byte, off int) (types.Type, int, error) {
 		Scale:     encoding.U16(b, off+3),
 		VecElem:   b[off+5],
 	}
-	return t, off + 6, nil
+	off += 6
+	if t.Kind == types.KindEnum {
+		labels, next, err := readEnumLabels(b, off)
+		if err != nil {
+			return types.Type{}, 0, err
+		}
+		if t, err = types.EnumType(labels); err != nil {
+			return types.Type{}, 0, nerr.Wrap(nerr.Protocol, "protocol.readType", "invalid enum type", err)
+		}
+		off = next
+	}
+	return t, off, nil
 }

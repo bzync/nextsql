@@ -3,15 +3,15 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useEffect, useState } from "react";
+import { useCommand } from "@bzync/rui";
 import { SiteHeader } from "@/components/SiteHeader";
-import { SearchDialog } from "@/components/Search";
 import { docsNav, docHref } from "@/lib/nav";
 import { site } from "@/lib/site";
 import { cn } from "@/lib/cn";
 
 export function DocsChrome({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
-  const [search, setSearch] = useState(false);
+  const { setOpen: setSearchOpen } = useCommand();
   const [menu, setMenu] = useState(false);
 
   useEffect(() => {
@@ -25,24 +25,7 @@ export function DocsChrome({ children }: { children: React.ReactNode }) {
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
-      const meta = event.metaKey || event.ctrlKey;
-      if (event.key === "k" && meta) {
-        event.preventDefault();
-        setSearch(true);
-        return;
-      }
-      if (event.key === "Escape") {
-        setMenu(false);
-        return;
-      }
-      if (
-        event.key === "/" &&
-        !(event.target instanceof HTMLInputElement) &&
-        !(event.target instanceof HTMLTextAreaElement)
-      ) {
-        event.preventDefault();
-        setSearch(true);
-      }
+      if (event.key === "Escape") setMenu(false);
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
@@ -51,7 +34,7 @@ export function DocsChrome({ children }: { children: React.ReactNode }) {
   return (
     <div className="min-h-full">
       <SiteHeader
-        onSearch={() => setSearch(true)}
+        onSearch={() => setSearchOpen(true)}
         onMenu={() => setMenu(true)}
         menuOpen={menu}
       />
@@ -96,7 +79,6 @@ export function DocsChrome({ children }: { children: React.ReactNode }) {
           </div>
         </div>
       ) : null}
-      <SearchDialog open={search} onClose={() => setSearch(false)} />
     </div>
   );
 }
@@ -138,7 +120,7 @@ function Sidebar({
                     className={cn(
                       "group relative flex min-h-11 items-center rounded-lg px-3 text-[14px] leading-none transition-all duration-150 lg:h-9 lg:min-h-0 lg:text-[13px]",
                       active
-                        ? "border border-blue-200/80 bg-blue-50 font-semibold text-blue-700 dark:border-blue-400/[0.16] dark:bg-blue-500/[0.13] dark:text-blue-300"
+                        ? "bg-blue-50 font-semibold text-blue-700 dark:bg-blue-500/[0.13] dark:text-blue-300"
                         : "text-slate-600 hover:bg-black/[0.04] hover:text-slate-900 dark:text-slate-400 dark:hover:bg-white/[0.055] dark:hover:text-slate-100",
                     )}
                   >

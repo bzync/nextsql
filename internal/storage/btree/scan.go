@@ -276,6 +276,10 @@ func (t *Tree) visitLeaf(h *buffer.Handle, start, end []byte, snap txn.Snapshot,
 			if err != nil {
 				return false, err
 			}
+			if has && ver.Xmax != 0 {
+				// Sole-snapshot fast path: skip an un-purged committed tombstone.
+				continue
+			}
 			if has {
 				payload = append([]byte(nil), ver.Payload...)
 			} else {
@@ -440,7 +444,13 @@ func (t *Tree) countLiveLocked() (int64, error) {
 	return n, nil
 }
 
-func (t *Tree) rangeLiveLocked(fn func(key, value []byte) error) error {
+// rangeLiveLocked walks physically-present records. When skipTomb is set it
+// also skips committed tombstones (Xmax != 0) — an un-purged deleted row is
+// still physically on the leaf when the deleting transaction could not reclaim
+// it at commit, and callers scanning for "live" rows (aggregation fast paths,
+// which run only when this is the sole snapshot) must not count it. Pass false
+// for a raw physical walk (maintenance / VACUUM verification).
+func (t *Tree) rangeLiveLocked(skipTomb bool, fn func(key, value []byte) error) error {
 	id, err := t.leftmostLeaf()
 	if err != nil {
 		return err
@@ -467,6 +477,9 @@ func (t *Tree) rangeLiveLocked(fn func(key, value []byte) error) error {
 			ver, has, err := row.Inspect(v)
 			if err != nil {
 				return err
+			}
+			if skipTomb && has && ver.Xmax != 0 {
+				return nil
 			}
 			payload := v
 			if has {
@@ -563,6 +576,11 @@ func (t *Tree) rangeCount(start, end []byte, snap txn.Snapshot, skipVis bool) (i
 				if !vis {
 					return nil
 				}
+			} else if ver, has, err := row.Inspect(v); err != nil {
+				return err
+			} else if has && ver.Xmax != 0 {
+				// Sole-snapshot fast path: skip an un-purged committed tombstone.
+				return nil
 			}
 			n++
 			return nil

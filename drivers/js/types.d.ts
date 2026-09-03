@@ -270,6 +270,15 @@ export declare const Kind: {
   readonly Uint16: 20;
   readonly Uint32: 21;
   readonly Uint64: 22;
+  readonly Date: 23;
+  readonly Time: 24;
+  readonly Char: 25;
+  readonly Varchar: 26;
+  readonly Timestamp: 27;
+  readonly Float32: 28;
+  readonly Float64: 29;
+  readonly Enum: 30;
+  readonly Interval: 31;
 };
 
 export declare const Type: {

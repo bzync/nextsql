@@ -40,6 +40,19 @@ updates:
         update-types:
           - "minor"
           - "patch"
+    ignore:
+      # eslint 10 removed context.getFilename(); eslint-plugin-react@7.37.5
+      # (bundled by eslint-config-next@16.3.1) still calls it and crashes on
+      # load. No fixed plugin release exists. Remove this once eslint-config-next
+      # ships eslint-10-compatible plugins. (dependabot PR #6)
+      - dependency-name: "eslint"
+        update-types: ["version-update:semver-major"]
+      # TypeScript 7.0 (the native compiler) is rejected by typescript-eslint,
+      # which eslint-config-next pulls in ("does not support TS 7.0"; support
+      # tracked for TS >= 7.1). Pinned to ~6.0.0 in package.json. Remove this
+      # once typescript-eslint supports TS 7.x. (dependabot PR #4)
+      - dependency-name: "typescript"
+        update-types: ["version-update:semver-major"]
 
   # Base images referenced by the production Dockerfile.
   - package-ecosystem: "docker"

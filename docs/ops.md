@@ -22,7 +22,7 @@ table decoder (`catalog.DecodeTable`) enforce this same catalog directly
 match what actually opens — not a separately maintained number that could
 drift. The error names the actual and required version numbers.
 
-Most families are **v1**; the catalog descriptor (`NSCT`) is at **v10**
+Most families are **v1**; the catalog descriptor (`NSCT`) is at **v11**
 (readable 1..10). Opening a data directory this binary can read is the
 supported path. A future format bump must either widen
 `MaxReadable` or add an explicit rewrite increment — not an in-place

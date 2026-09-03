@@ -758,14 +758,26 @@ func (tx *Txn) CountLive() (int64, error) {
 	return tx.tree.countLiveLocked()
 }
 
-// RangeLive walks every live record without a visibility check.
+// RangeLive walks every live record without an Xmin visibility check, skipping
+// committed tombstones. Safe only when this transaction is the sole snapshot.
 func (tx *Txn) RangeLive(fn func(key, value []byte) error) error {
 	if tx == nil || tx.done || fn == nil {
 		return nerr.New(nerr.InvalidArgument, "btree.Txn.RangeLive", "bad args")
 	}
 	tx.tree.mu.RLock()
 	defer tx.tree.mu.RUnlock()
-	return tx.tree.rangeLiveLocked(fn)
+	return tx.tree.rangeLiveLocked(true, fn)
+}
+
+// RangePhysical walks every physically-present record, including un-purged
+// committed tombstones. For maintenance / VACUUM verification, not query paths.
+func (tx *Txn) RangePhysical(fn func(key, value []byte) error) error {
+	if tx == nil || tx.done || fn == nil {
+		return nerr.New(nerr.InvalidArgument, "btree.Txn.RangePhysical", "bad args")
+	}
+	tx.tree.mu.RLock()
+	defer tx.tree.mu.RUnlock()
+	return tx.tree.rangeLiveLocked(false, fn)
 }
 
 // CountVisible is Count without taking additional locks.

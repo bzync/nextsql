@@ -120,6 +120,12 @@ func (s *Session) eval(e ast.Expr, tab *catalog.Table, row []types.Value) (types
 			if v.Null {
 				return v, nil
 			}
+			if v.Typ.Kind == types.KindInterval {
+				if v.IntervalMonths == math.MinInt32 || v.IntervalDays == math.MinInt32 || v.Time == math.MinInt64 {
+					return types.Value{}, nerr.New(nerr.InvalidArgument, "executor.eval", "INTERVAL negation overflow")
+				}
+				return types.IntervalValue(-v.IntervalMonths, -v.IntervalDays, -v.Time), nil
+			}
 			if !isNumericKind(v.Typ.Kind) {
 				return types.Value{}, nerr.New(nerr.InvalidArgument, "executor.eval", "unary minus requires a numeric type")
 			}
@@ -1270,9 +1276,250 @@ func isNumericKind(k types.Kind) bool {
 	return k == types.KindDecimal || types.IsInt(k) || types.IsUint(k) || types.IsFloat(k)
 }
 
+// isTemporalKind reports whether k is one of DATE/TIME/TIMESTAMP/TIMESTAMPTZ
+// (D6, Datatype expansion track): the Kinds INTERVAL arithmetic can combine
+// with, plus the "same Kind minus same Kind -> INTERVAL" rule.
+func isTemporalKind(k types.Kind) bool {
+	return k == types.KindDate || k == types.KindTime || k == types.KindTimestamp || k == types.KindTimestampTZ
+}
+
+const dayNanosConst = int64(86400_000_000_000)
+
+// evalIntervalArith handles every +/- combination involving INTERVAL, or two
+// operands of the same temporal Kind (D6, Datatype expansion track):
+//
+//	INTERVAL +/- INTERVAL        -> INTERVAL, field-wise, overflow-checked
+//	<temporal> +/- INTERVAL      -> same <temporal> Kind, except DATE which
+//	                                 always promotes to TIMESTAMP (a DATE has
+//	                                 no time-of-day, so an interval carrying
+//	                                 any time component doesn't fit back into
+//	                                 DATE — matches Postgres's own rule)
+//	INTERVAL + <temporal>        -> same as <temporal> + INTERVAL (commutative)
+//	INTERVAL - <temporal>        -> rejected (subtracting a point in time
+//	                                 from a duration is not meaningful)
+//	<temporal> - <same temporal> -> INTERVAL: the exact elapsed duration,
+//	                                 carried entirely in the nanosecond
+//	                                 field (months/days always 0) — this
+//	                                 increment does not attempt to break an
+//	                                 arbitrary elapsed duration back into
+//	                                 "N months, N days", which is inherently
+//	                                 ambiguous without an anchor date
+//
+// Calendar-month addition clamps the day-of-month to the target month's
+// last day (Jan 31 + 1 month = Feb 28/29), matching Postgres. TIME discards
+// an interval's months/days components entirely (also matching Postgres)
+// and wraps modulo 24h.
+func evalIntervalArith(op string, l, r types.Value) (types.Value, error) {
+	if op != "+" && op != "-" {
+		return types.Value{}, nerr.New(nerr.InvalidArgument, "executor.eval", "INTERVAL only supports + and -")
+	}
+	lInterval := l.Typ.Kind == types.KindInterval
+	rInterval := r.Typ.Kind == types.KindInterval
+	switch {
+	case lInterval && rInterval:
+		return addIntervals(l, r, op)
+	case lInterval && !rInterval:
+		if op == "-" {
+			return types.Value{}, nerr.New(nerr.InvalidArgument, "executor.eval", "cannot subtract a "+r.Typ.Kind.String()+" from an INTERVAL")
+		}
+		if !isTemporalKind(r.Typ.Kind) {
+			return types.Value{}, nerr.New(nerr.InvalidArgument, "executor.eval", "INTERVAL arithmetic requires a DATE/TIME/TIMESTAMP/TIMESTAMPTZ operand")
+		}
+		return applyIntervalToTemporal(r, l, "+")
+	case rInterval && !lInterval:
+		if !isTemporalKind(l.Typ.Kind) {
+			return types.Value{}, nerr.New(nerr.InvalidArgument, "executor.eval", "INTERVAL arithmetic requires a DATE/TIME/TIMESTAMP/TIMESTAMPTZ operand")
+		}
+		return applyIntervalToTemporal(l, r, op)
+	default:
+		if op != "-" {
+			return types.Value{}, nerr.New(nerr.InvalidArgument, "executor.eval", "cannot add two "+l.Typ.Kind.String()+" values")
+		}
+		return subtractTemporal(l, r)
+	}
+}
+
+func addIntervals(l, r types.Value, op string) (types.Value, error) {
+	var months, days int64
+	var nanos int64
+	var err error
+	if op == "+" {
+		months = int64(l.IntervalMonths) + int64(r.IntervalMonths)
+		days = int64(l.IntervalDays) + int64(r.IntervalDays)
+		nanos, err = addInt64Checked(l.Time, r.Time)
+	} else {
+		months = int64(l.IntervalMonths) - int64(r.IntervalMonths)
+		days = int64(l.IntervalDays) - int64(r.IntervalDays)
+		nanos, err = subInt64Checked(l.Time, r.Time)
+	}
+	if err != nil {
+		return types.Value{}, err
+	}
+	if months < math.MinInt32 || months > math.MaxInt32 {
+		return types.Value{}, nerr.New(nerr.InvalidArgument, "executor.eval", "INTERVAL month component overflow")
+	}
+	if days < math.MinInt32 || days > math.MaxInt32 {
+		return types.Value{}, nerr.New(nerr.InvalidArgument, "executor.eval", "INTERVAL day component overflow")
+	}
+	return types.IntervalValue(int32(months), int32(days), nanos), nil
+}
+
+// applyIntervalToTemporal computes temporal +/- interval. op == "-" negates
+// the interval's 3 components first, then always adds.
+func applyIntervalToTemporal(temporal, interval types.Value, op string) (types.Value, error) {
+	months, days, nanos := interval.IntervalMonths, interval.IntervalDays, interval.Time
+	if op == "-" {
+		if months == math.MinInt32 || days == math.MinInt32 || nanos == math.MinInt64 {
+			return types.Value{}, nerr.New(nerr.InvalidArgument, "executor.eval", "INTERVAL negation overflow")
+		}
+		months, days, nanos = -months, -days, -nanos
+	}
+	switch temporal.Typ.Kind {
+	case types.KindTime:
+		// months/days discarded (Postgres's own time+interval rule); wrap
+		// modulo 24h, handling a negative result correctly (Go's % keeps
+		// the dividend's sign).
+		result := (temporal.Time + nanos) % dayNanosConst
+		if result < 0 {
+			result += dayNanosConst
+		}
+		return types.TimeOfDayValue(result), nil
+	case types.KindDate:
+		// DATE always promotes to TIMESTAMP (docs/design-datatypes.md D6).
+		epochNanos, err := mulInt64Checked(int64(temporal.Int), dayNanosConst)
+		if err != nil {
+			return types.Value{}, err
+		}
+		result, err := addCalendar(epochNanos, months, days, nanos)
+		if err != nil {
+			return types.Value{}, err
+		}
+		return types.NaiveTimestampValue(result), nil
+	case types.KindTimestamp:
+		result, err := addCalendar(temporal.Time, months, days, nanos)
+		if err != nil {
+			return types.Value{}, err
+		}
+		return types.NaiveTimestampValue(result), nil
+	case types.KindTimestampTZ:
+		// Calendar (months/days) math operates on the UTC calendar fields
+		// directly — this engine has no session-timezone concept, unlike
+		// Postgres, whose TIMESTAMPTZ+INTERVAL uses the session's timezone
+		// GUC for calendar-correct results (docs/design-datatypes.md D6).
+		result, err := addCalendar(temporal.Time, months, days, nanos)
+		if err != nil {
+			return types.Value{}, err
+		}
+		return types.TimeValue(result), nil
+	default:
+		return types.Value{}, nerr.New(nerr.InvalidArgument, "executor.eval", "INTERVAL arithmetic requires a DATE/TIME/TIMESTAMP/TIMESTAMPTZ operand")
+	}
+}
+
+// addCalendar adds months (with day-of-month clamped to the target month's
+// last day), then days, then nanos, to an epoch-nanoseconds instant read as
+// literal UTC civil fields — the same order Postgres applies.
+func addCalendar(epochNanos int64, months, days int32, nanos int64) (int64, error) {
+	if months != 0 {
+		t := time.Unix(0, epochNanos).UTC()
+		y, m, d := t.Date()
+		hh, mm, ss := t.Clock()
+		ns := t.Nanosecond()
+		totalMonthIdx := int64(y)*12 + int64(m) - 1 + int64(months)
+		newYear := totalMonthIdx / 12
+		newMonthIdx := totalMonthIdx % 12
+		if newMonthIdx < 0 {
+			newMonthIdx += 12
+			newYear--
+		}
+		newMonth := time.Month(newMonthIdx + 1)
+		if lastDay := daysInMonth(int(newYear), newMonth); d > lastDay {
+			d = lastDay
+		}
+		epochNanos = time.Date(int(newYear), newMonth, d, hh, mm, ss, ns, time.UTC).UnixNano()
+	}
+	dayPart, err := mulInt64Checked(int64(days), dayNanosConst)
+	if err != nil {
+		return 0, err
+	}
+	epochNanos, err = addInt64Checked(epochNanos, dayPart)
+	if err != nil {
+		return 0, err
+	}
+	return addInt64Checked(epochNanos, nanos)
+}
+
+func daysInMonth(year int, month time.Month) int {
+	return time.Date(year, month+1, 0, 0, 0, 0, 0, time.UTC).Day()
+}
+
+// subtractTemporal computes l - r for two operands of the same temporal
+// Kind, as the exact elapsed duration expressed purely in INTERVAL's
+// nanosecond field (months/days always 0 — see evalIntervalArith's doc).
+func subtractTemporal(l, r types.Value) (types.Value, error) {
+	switch l.Typ.Kind {
+	case types.KindTime, types.KindTimestamp, types.KindTimestampTZ:
+		nanos, err := subInt64Checked(l.Time, r.Time)
+		if err != nil {
+			return types.Value{}, err
+		}
+		return types.IntervalValue(0, 0, nanos), nil
+	case types.KindDate:
+		lNanos, err := mulInt64Checked(int64(l.Int), dayNanosConst)
+		if err != nil {
+			return types.Value{}, err
+		}
+		rNanos, err := mulInt64Checked(int64(r.Int), dayNanosConst)
+		if err != nil {
+			return types.Value{}, err
+		}
+		nanos, err := subInt64Checked(lNanos, rNanos)
+		if err != nil {
+			return types.Value{}, err
+		}
+		return types.IntervalValue(0, 0, nanos), nil
+	default:
+		return types.Value{}, nerr.New(nerr.InvalidArgument, "executor.eval", "cannot add two "+l.Typ.Kind.String()+" values")
+	}
+}
+
+func addInt64Checked(a, b int64) (int64, error) {
+	sum := a + b
+	if (b > 0 && sum < a) || (b < 0 && sum > a) {
+		return 0, nerr.New(nerr.InvalidArgument, "executor.eval", "INTERVAL arithmetic overflow")
+	}
+	return sum, nil
+}
+
+func subInt64Checked(a, b int64) (int64, error) {
+	diff := a - b
+	if (b < 0 && diff < a) || (b > 0 && diff > a) {
+		return 0, nerr.New(nerr.InvalidArgument, "executor.eval", "INTERVAL arithmetic overflow")
+	}
+	return diff, nil
+}
+
+func mulInt64Checked(a, b int64) (int64, error) {
+	if a == 0 || b == 0 {
+		return 0, nil
+	}
+	p := a * b
+	if p/b != a {
+		return 0, nerr.New(nerr.InvalidArgument, "executor.eval", "INTERVAL arithmetic overflow")
+	}
+	return p, nil
+}
+
 func evalArith(op string, l, r types.Value) (types.Value, error) {
 	if l.Null || r.Null {
 		return types.Null(types.Type{Kind: types.KindDecimal}), nil
+	}
+	// DATE/TIME/TIMESTAMP/TIMESTAMPTZ +/- INTERVAL, INTERVAL +/- INTERVAL,
+	// and same-Kind-temporal subtraction (D6, Datatype expansion track) are
+	// handled before the numeric-only gate below, since none of these Kinds
+	// are numeric and Coerce keeps INTERVAL isolated from DECIMAL on purpose.
+	if l.Typ.Kind == types.KindInterval || r.Typ.Kind == types.KindInterval || (isTemporalKind(l.Typ.Kind) && l.Typ.Kind == r.Typ.Kind) {
+		return evalIntervalArith(op, l, r)
 	}
 	if !isNumericKind(l.Typ.Kind) || !isNumericKind(r.Typ.Kind) {
 		return types.Value{}, nerr.New(nerr.InvalidArgument, "executor.eval", "arithmetic requires a numeric type")

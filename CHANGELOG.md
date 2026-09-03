@@ -23,6 +23,53 @@ A roadmap item is not recorded as completed here until its implementation, tests
 
 ## [Unreleased]
 
+### Fixed — catalog format v11 bump was only half-applied (2026-09-04)
+
+- The `NSCT` catalog descriptor moved to v11 (per-column `ENUM` label list)
+  but the `internal/upgrade` compatibility-window tests, the newest
+  `DecodeTable` version guard, and the on-disk-format docs were never
+  updated to match — the compatibility tests shipped asserting v10 and
+  failing.
+- `internal/catalog/encode.go`: added the missing `tableVersionV11`
+  constant and gated the v11 ENUM-label decode block on it instead of the
+  bare "current version" constant, which would have silently stopped
+  decoding a v11 catalog's ENUM labels the moment a v12 is introduced.
+- `internal/upgrade/compat` tests corrected to v11, with a v12-rejection
+  guard added for the next bump. `docs/storage-format.md` (+ `sql.md`,
+  `ops.md`, `protocol.md`, `vector.md`, `security.md`) updated to describe
+  v11. See `TODO.md` log #102.
+
+### Fixed — aggregation over-counted deleted rows after concurrent DELETE churn (2026-09-04)
+
+- `SELECT COUNT(*)` and `SELECT COUNT(*) ... GROUP BY` over a partitioned
+  table could report more rows than actually exist, when the query runs
+  as the sole open snapshot shortly after sustained concurrent
+  INSERT/UPDATE/DELETE traffic. A plain row scan (`SELECT ...`) and
+  single-row index lookups returned the correct data throughout; only the
+  aggregate counts were wrong. No data was lost or corrupted on disk.
+- Root cause: the heap-aggregation fast path (taken only when the reader
+  is the sole snapshot) skips the per-row MVCC visibility check for speed,
+  but the underlying btree walks (`RangeLive` / `RangeLiveRange` /
+  `CountLiveRange`) iterated every physically-present slot — including
+  committed tombstones that the deleting transaction could not reclaim at
+  commit time because a concurrent snapshot still needed them. A deleted
+  row that had not yet been VACUUMed was counted as live. Normal
+  single-writer deletes purge their own tombstone immediately, which is
+  why this only surfaced under concurrency.
+- Fix: those three fast-path walks now skip records carrying a committed
+  delete marker, consistent with the rest of the engine's "live row"
+  accounting (`page.LiveSlots()`, `CountLive()`). The raw physical walk is
+  still available as `btree.Txn.RangePhysical` for maintenance/VACUUM
+  code. No on-disk format, wire-protocol, catalog, or isolation-level
+  change; the non-fast-path (already-correct) MVCC scan is untouched.
+- `TestPartitionCrossPartitionUniqueSustainedConcurrentWrites`
+  (`internal/executor/partition_test.go`) now asserts aggregate counts
+  equal the heap row count; 5/5 under `-race`. Regression swept:
+  `internal/executor` (incl. the deferred-tombstone `TestMaintain*` /
+  `TestCleanupDeadVersions*` suites), `internal/storage/...`,
+  `internal/recovery`, `internal/wal`, `tests/integration`. See `TODO.md`
+  log #101.
+
 ### Fixed — silent data loss repairing a replica from backup + `AddVoter` (2026-09-03)
 
 - Writing the previously-missing regression test for the documented

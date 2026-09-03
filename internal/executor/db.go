@@ -1770,31 +1770,6 @@ func (db *DB) putVec(name string, tr *btree.Tree) {
 	db.mu.Unlock()
 }
 
-func (db *DB) putIndex(table, name string, tr *btree.Tree) {
-	db.mu.Lock()
-	db.idxs[idxKey(table, name)] = tr
-	db.mu.Unlock()
-}
-
-func (db *DB) dropHeap(name string) {
-	db.mu.Lock()
-	delete(db.heaps, name)
-	db.mu.Unlock()
-}
-
-func (db *DB) dropIndex(table, name string) {
-	db.mu.Lock()
-	delete(db.idxs, idxKey(table, name))
-	db.mu.Unlock()
-	db.dropHNSW(idxKey(table, name))
-}
-
-func (db *DB) dropVec(name string) {
-	db.mu.Lock()
-	delete(db.vecs, name)
-	db.mu.Unlock()
-}
-
 func (db *DB) dropTableMaps(name string) {
 	db.mu.Lock()
 	delete(db.heaps, name)

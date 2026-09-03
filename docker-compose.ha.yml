@@ -1,0 +1,113 @@
+# Three-node Raft HA cluster. See docs/docker.md "Multi-node HA cluster" for
+# the full explanation, the dev-certificate command, and how to verify the
+# cluster came up correctly. Minimum voting-node count is enforced by
+# nextsqld itself (internal/replication.MinVotingNodes) — do not scale this
+# below 3 services.
+#
+# node-a is the Raft bootstrap node: it runs `nextsql init`, publishes a
+# backup of the freshly-initialized (pre-Raft) database to the shared
+# nextsql-seed volume, waits for node-b/node-c's Raft transports to be
+# listening, then starts nextsqld with --raft-bootstrap. node-b/node-c never
+# run their own `init` — they restore node-a's seed backup so every replica
+# shares the same identity and root key (docs/ha.md "All replicas of one
+# database share the keystore / root unlock key").
+services:
+  node-a:
+    build: .
+    image: nextsql:local
+    restart: unless-stopped
+    ports:
+      - "7210:7210"
+    environment:
+      NEXTSQL_SERVER_USER: app
+      NEXTSQL_SERVER_PASSWORD_FILE: /run/bootstrap/app-password
+      NEXTSQL_TLS_CERT: /run/tls/server.crt
+      NEXTSQL_TLS_KEY: /run/tls/server.key
+      NEXTSQL_SEED_TO: /seed/backup
+      NEXTSQL_NODE_ID: node-a
+      NEXTSQL_RAFT_BIND: node-a:7300
+      NEXTSQL_RAFT_JOIN: "node-a=node-a:7300,node-b=node-b:7300,node-c=node-c:7300"
+      NEXTSQL_RAFT_BOOTSTRAP: "1"
+      NEXTSQL_JOIN_WAIT: "node-b:7300,node-c:7300"
+    volumes:
+      - nextsql-a-data:/var/lib/nextsql
+      - nextsql-keys:/run/secrets
+      - nextsql-seed:/seed
+    secrets:
+      - source: app_password
+        target: /run/bootstrap/app-password
+      - source: server_crt
+        target: /run/tls/server.crt
+      - source: server_key
+        target: /run/tls/server.key
+
+  node-b:
+    build: .
+    image: nextsql:local
+    restart: unless-stopped
+    ports:
+      - "7211:7210"
+    environment:
+      NEXTSQL_TLS_CERT: /run/tls/server.crt
+      NEXTSQL_TLS_KEY: /run/tls/server.key
+      NEXTSQL_SEED_FROM: /seed/backup
+      NEXTSQL_NODE_ID: node-b
+      NEXTSQL_RAFT_BIND: node-b:7300
+      NEXTSQL_RAFT_JOIN: "node-a=node-a:7300,node-b=node-b:7300,node-c=node-c:7300"
+    volumes:
+      - nextsql-b-data:/var/lib/nextsql
+      - nextsql-keys:/run/secrets
+      - nextsql-seed:/seed
+    secrets:
+      - source: server_crt
+        target: /run/tls/server.crt
+      - source: server_key
+        target: /run/tls/server.key
+    depends_on:
+      - node-a
+
+  node-c:
+    build: .
+    image: nextsql:local
+    restart: unless-stopped
+    ports:
+      - "7212:7210"
+    environment:
+      NEXTSQL_TLS_CERT: /run/tls/server.crt
+      NEXTSQL_TLS_KEY: /run/tls/server.key
+      NEXTSQL_SEED_FROM: /seed/backup
+      NEXTSQL_NODE_ID: node-c
+      NEXTSQL_RAFT_BIND: node-c:7300
+      NEXTSQL_RAFT_JOIN: "node-a=node-a:7300,node-b=node-b:7300,node-c=node-c:7300"
+    volumes:
+      - nextsql-c-data:/var/lib/nextsql
+      - nextsql-keys:/run/secrets
+      - nextsql-seed:/seed
+    secrets:
+      - source: server_crt
+        target: /run/tls/server.crt
+      - source: server_key
+        target: /run/tls/server.key
+    depends_on:
+      - node-a
+
+volumes:
+  nextsql-a-data:
+  nextsql-b-data:
+  nextsql-c-data:
+  # Shared across all three services: node-a creates the root unlock key
+  # here on first start, node-b/node-c only ever read it back.
+  nextsql-keys:
+  # Shared seed handoff: node-a writes its backup here; node-b/node-c poll
+  # for it and read it, but `nextsql restore` also writes bookkeeping into
+  # the backup directory itself while opening its keystore (backup.OpenKeys),
+  # so this cannot be mounted read-only for the joining nodes.
+  nextsql-seed:
+
+secrets:
+  app_password:
+    file: ./secrets/app-password
+  server_crt:
+    file: ./secrets/server.crt
+  server_key:
+    file: ./secrets/server.key

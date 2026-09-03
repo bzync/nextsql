@@ -79,6 +79,7 @@ const (
 	KwTimestamp
 	KwDate
 	KwTime
+	KwInterval
 	KwJson
 	KwVector
 	KwF32
@@ -502,7 +503,7 @@ var keywords = map[string]Kind{
 	"text": KwText, "blob": KwBlob, "int8": KwInt8, "int16": KwInt16, "int32": KwInt32, "int64": KwInt64,
 	"uint8": KwUint8, "uint16": KwUint16, "uint32": KwUint32, "uint64": KwUint64,
 	"char": KwChar, "varchar": KwVarchar, "enum": KwEnum, "float32": KwFloat32, "float64": KwFloat64,
-	"decimal": KwDecimal, "timestamptz": KwTimestamptz, "timestamp": KwTimestamp, "date": KwDate, "time": KwTime, "json": KwJson,
+	"decimal": KwDecimal, "timestamptz": KwTimestamptz, "timestamp": KwTimestamp, "date": KwDate, "time": KwTime, "interval": KwInterval, "json": KwJson,
 	"vector": KwVector, "bitvector": KwBitvector, "sparsevector": KwSparsevector, "f32": KwF32, "f16": KwF16, "i8": KwI8, "explain": KwExplain, "analyze": KwAnalyze, "maintain": KwMaintain,
 	"point": KwPoint, "box": KwBox, "location": KwLocation,
 	"linestring": KwLineString, "polygon": KwPolygon, "spatial": KwSpatial,

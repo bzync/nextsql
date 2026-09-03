@@ -2,8 +2,10 @@ import type { Metadata, Viewport } from "next";
 import { Geist_Mono, Manrope, Syne } from "next/font/google";
 import "@bzync/rui/styles.css";
 import "./globals.css";
+import { CommandProvider } from "@bzync/rui";
 import { site } from "@/lib/site";
 import { SiteThemeProvider } from "@/components/SiteThemeProvider";
+import { DocsCommandPalette } from "@/components/DocsCommandPalette";
 
 const manrope = Manrope({
   variable: "--font-geist",
@@ -74,7 +76,12 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
         <a href="#content" className="skip-link">
           Skip to content
         </a>
-        <SiteThemeProvider>{children}</SiteThemeProvider>
+        <SiteThemeProvider>
+          <CommandProvider>
+            {children}
+            <DocsCommandPalette />
+          </CommandProvider>
+        </SiteThemeProvider>
       </body>
     </html>
   );

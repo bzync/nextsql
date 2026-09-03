@@ -182,6 +182,92 @@ class TestValues(unittest.TestCase):
         _, _, bare_kind = p.decode_value(p.encode_param(42), 0)
         self.assertEqual(bare_kind, p.KIND_DECIMAL)
 
+    def test_enum_round_trip(self) -> None:
+        labels = ["small", "medium", "large"]
+        raw = p.encode_param(p.EnumValue("medium", labels))
+        value, next_off, kind = p.decode_value(raw, 0)
+        self.assertEqual(kind, p.KIND_ENUM)
+        self.assertEqual(value, "medium")
+        self.assertEqual(next_off, len(raw))
+        with self.assertRaises(Exception):
+            p.encode_param(p.EnumValue("huge", labels))
+        # decodeRowDesc parses the same label-list framing for a column
+        # header (kind byte, 5 bytes of Precision/Scale/VecElem meta, then
+        # the ENUM label-count u16 + each u16-length-prefixed label).
+        row_desc = (
+            p.u16le(1)
+            + p.u16str("sz")
+            + bytes([p.KIND_ENUM])
+            + b"\x00" * 5
+            + p.append_enum_labels(labels)
+        )
+        cols = p.decode_row_desc(row_desc)
+        self.assertEqual(len(cols), 1)
+        self.assertEqual(cols[0].name, "sz")
+        self.assertEqual(cols[0].kind, p.KIND_ENUM)
+        self.assertEqual(cols[0].labels, labels)
+
+    def test_date_round_trip(self) -> None:
+        d = datetime.date(2024, 1, 15)
+        raw = p.encode_param(d)
+        value, next_off, kind = p.decode_value(raw, 0)
+        self.assertEqual(kind, p.KIND_DATE)
+        self.assertEqual(value, d)
+        self.assertEqual(next_off, len(raw))
+        # Pre-1970 dates round-trip too (signed day count).
+        pre = datetime.date(1900, 1, 1)
+        self.assertEqual(p.decode_value(p.encode_param(pre), 0)[0], pre)
+        # datetime.datetime (a date subclass) must not be mistaken for a
+        # bare date — it defaults to TIMESTAMPTZ (existing behavior).
+        self.assertEqual(p.decode_value(p.encode_param(datetime.datetime(2024, 1, 15)), 0)[2], p.KIND_TIMESTAMPTZ)
+
+    def test_time_round_trip(self) -> None:
+        t = datetime.time(23, 59, 59, 999_000)
+        raw = p.encode_param(t)
+        value, next_off, kind = p.decode_value(raw, 0)
+        self.assertEqual(kind, p.KIND_TIME)
+        self.assertEqual(value, t)
+        self.assertEqual(next_off, len(raw))
+
+    def test_naive_timestamp_round_trip(self) -> None:
+        dt = datetime.datetime(2024, 6, 15, 10, 30, 0)
+        raw = p.encode_param(p.NaiveTimestamp(dt))
+        value, next_off, kind = p.decode_value(raw, 0)
+        self.assertEqual(kind, p.KIND_TIMESTAMP)
+        self.assertEqual(value, dt)
+        self.assertIsNone(value.tzinfo)
+        self.assertEqual(next_off, len(raw))
+        # A bare naive datetime still defaults to TIMESTAMPTZ (existing
+        # behavior; NaiveTimestamp is required to select the naive Kind).
+        self.assertEqual(p.decode_value(p.encode_param(dt), 0)[2], p.KIND_TIMESTAMPTZ)
+
+    def test_float_round_trip(self) -> None:
+        for wrapped, want_kind in [(p.Float32(1.5), p.KIND_FLOAT32), (p.Float64(1.5), p.KIND_FLOAT64)]:
+            raw = p.encode_param(wrapped)
+            value, next_off, kind = p.decode_value(raw, 0)
+            self.assertEqual(kind, want_kind)
+            self.assertEqual(value, 1.5)
+            self.assertEqual(next_off, len(raw))
+        # NaN/Infinity are valid FLOAT values (unlike the bare-float -> Decimal path).
+        nan_value, _, _ = p.decode_value(p.encode_param(p.Float64(float("nan"))), 0)
+        self.assertTrue(nan_value != nan_value)  # NaN != NaN
+        inf_value, _, _ = p.decode_value(p.encode_param(p.Float64(float("inf"))), 0)
+        self.assertEqual(inf_value, float("inf"))
+        with self.assertRaises(Exception):
+            p.encode_param(float("nan"))  # bare float still requires finite
+
+    def test_interval_round_trip(self) -> None:
+        iv = p.Interval(months=14, days=3, nanos=4 * 3_600_000_000_000)
+        raw = p.encode_param(iv)
+        value, next_off, kind = p.decode_value(raw, 0)
+        self.assertEqual(kind, p.KIND_INTERVAL)
+        self.assertEqual(value, iv)
+        self.assertEqual(next_off, len(raw))
+        # Negative nanos (e.g. "-1 hour") must round-trip exactly.
+        neg = p.Interval(months=0, days=0, nanos=-3_600_000_000_000)
+        neg_value, _, _ = p.decode_value(p.encode_param(neg), 0)
+        self.assertEqual(neg_value.nanos, -3_600_000_000_000)
+
     def test_uuid_round_trip(self) -> None:
         import uuid
 

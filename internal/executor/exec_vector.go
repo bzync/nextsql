@@ -647,28 +647,6 @@ func (s *Session) countRange(htx *btree.Txn, start, end []byte, visible bool) (i
 	return n, nil
 }
 
-func (s *Session) parallelCountLive(htx *btree.Txn, splits [][]byte) (int64, error) {
-	ranges := splitByteRanges(nil, nil, splits)
-	counts := make([]int64, len(ranges))
-	tasks := make([]func() error, len(ranges))
-	for i := range ranges {
-		i := i
-		tasks[i] = func() error {
-			n, err := htx.CountLiveRange(ranges[i][0], ranges[i][1])
-			counts[i] = n
-			return err
-		}
-	}
-	if err := s.pool().Run(s.budget().Context(), s.workers(), tasks); err != nil {
-		return 0, err
-	}
-	var total int64
-	for _, c := range counts {
-		total += c
-	}
-	return total, nil
-}
-
 func (s *Session) parallelCount(htx *btree.Txn, splits [][]byte) (int64, error) {
 	ranges := splitByteRanges(nil, nil, splits)
 	counts := make([]int64, len(ranges))

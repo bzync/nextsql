@@ -1633,6 +1633,7 @@ func TestParseSystemShowAliases(t *testing.T) {
 		cols  []string
 	}{
 		{`SHOW DATABASES`, "system.storage", []string{"database"}},
+		{`SHOW REALMS`, "system.realms", nil},
 		{`SHOW TABLES`, "system.tables", nil},
 		{`SHOW INDEXES`, "system.indexes", nil},
 		{`SHOW CONNECTIONS`, "system.sessions", nil},

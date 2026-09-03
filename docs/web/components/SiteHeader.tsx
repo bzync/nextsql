@@ -5,8 +5,7 @@ import { usePathname } from "next/navigation";
 import { useEffect, useState } from "react";
 import { Logo } from "./Logo";
 import { ThemeToggle } from "./ThemeToggle";
-import { buttonClassName } from "@/components/ui/button";
-import { Kbd } from "@bzync/rui";
+import { Button, Kbd } from "@bzync/rui";
 
 export function SiteHeader({
   onSearch,
@@ -92,9 +91,9 @@ export function SiteHeader({
           ) : null}
           <ThemeToggle />
           <div className="ml-1 hidden sm:block">
-            <Link href="/docs/quick-start" className={buttonClassName({ size: "sm" })}>
-              Get started
-            </Link>
+            <Button asChild size="sm">
+              <Link href="/docs/quick-start">Get started</Link>
+            </Button>
           </div>
         </nav>
       </div>

@@ -12,6 +12,7 @@ import {
   encodeDecimalString,
   encodeHello,
   encodeParam,
+  struct,
   encodeSetReadConsistency,
   formatUUID,
   isLoopback,
@@ -398,4 +399,28 @@ Deno.test('SetReadConsistency / NodeStatus wire codec', () => {
 
 Deno.test('connectCluster requires an address', async () => {
   await assertRejects(() => connectCluster({ user: 'app', tls: {} }));
+});
+
+Deno.test('collections: ARRAY / MAP / STRUCT param round-trip (D9)', () => {
+  const arr = decodeValue(encodeParam(['a', 'b', 'c']), 0);
+  assert(arr.kind === Kind.Array);
+  assert(JSON.stringify(arr.value) === JSON.stringify(['a', 'b', 'c']));
+  const m = decodeValue(encodeParam(new Map([['x', 1n]])), 0);
+  assert(m.kind === Kind.Map);
+  const s = decodeValue(encodeParam(struct([['a', 'x'], ['b', 'y']])), 0);
+  assert(s.kind === Kind.Struct && s.value.a === 'x');
+  const nested = decodeValue(encodeParam(struct([['n', 'bob'], ['t', ['x', 'y']]])), 0);
+  assert(JSON.stringify(nested.value.t) === JSON.stringify(['x', 'y']));
+});
+
+Deno.test('spatial: EWKB decode / encode round-trip (Spatial track S4)', () => {
+  const u32le = (n) => { const b = new Uint8Array(4); new DataView(b.buffer).setUint32(0, n, true); return b; };
+  const f64le = (n) => { const b = new Uint8Array(8); new DataView(b.buffer).setFloat64(0, n, true); return b; };
+  const ewkb = new Uint8Array([1, ...u32le(1 | 0x20000000), ...u32le(4326), ...f64le(1.5), ...f64le(2.5)]);
+  const wire = new Uint8Array([Kind.Geometry, 0, 0, 0, 0, 0, 0, ...u32le(ewkb.length), ...ewkb]);
+  const got = decodeValue(wire, 0);
+  assert(got.next === wire.length);
+  assert(JSON.stringify(got.value) === JSON.stringify({ type: 'Point', srid: 4326, coordinates: [1.5, 2.5] }));
+  const enc = encodeParam({ kind: 'geometry', wkt: 'POINT(1 2)', srid: 4326 });
+  assert(decodeValue(enc, 0).value === 'SRID=4326;POINT(1 2)');
 });

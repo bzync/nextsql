@@ -17,6 +17,7 @@ import {
   encodeHello,
   encodeParam,
   encodeSetReadConsistency,
+  struct,
   formatUUID,
   isLoopback,
   isReadOnlySQL,
@@ -348,4 +349,37 @@ test('SetReadConsistency / NodeStatus wire codec', () => {
 
 test('connectCluster requires an address', async () => {
   await expect(connectCluster({ user: 'app', tls: {} })).rejects.toBeInstanceOf(NextSQLError);
+});
+
+test('collections: ARRAY / MAP / STRUCT param round-trip (D9)', () => {
+  const arr = decodeValue(encodeParam(['a', 'b', 'c']), 0);
+  expect(arr.kind).toBe(Kind.Array);
+  expect(arr.value).toEqual(['a', 'b', 'c']);
+
+  const withNull = decodeValue(encodeParam(['a', null, 'c']), 0);
+  expect(withNull.value).toEqual(['a', null, 'c']);
+
+  const m = decodeValue(encodeParam(new Map([['x', 'hi'], ['y', 'yo']])), 0);
+  expect(m.kind).toBe(Kind.Map);
+  expect(m.value.get('x')).toBe('hi');
+
+  const s = decodeValue(encodeParam(struct([['street', 'Main'], ['zip', '90210']])), 0);
+  expect(s.kind).toBe(Kind.Struct);
+  expect(s.value.street).toBe('Main');
+
+  const nested = decodeValue(encodeParam(struct([['name', 'bob'], ['tags', ['x', 'y']]])), 0);
+  expect(nested.value.tags).toEqual(['x', 'y']);
+});
+
+test('spatial: EWKB decode / encode round-trip (Spatial track S4)', () => {
+  const u32le = (n) => { const b = new Uint8Array(4); new DataView(b.buffer).setUint32(0, n, true); return b; };
+  const f64le = (n) => { const b = new Uint8Array(8); new DataView(b.buffer).setFloat64(0, n, true); return b; };
+  const ewkb = new Uint8Array([1, ...u32le(1 | 0x20000000), ...u32le(4326), ...f64le(1.5), ...f64le(2.5)]);
+  const wire = new Uint8Array([Kind.Geometry, 0, 0, 0, 0, 0, 0, ...u32le(ewkb.length), ...ewkb]);
+  const got = decodeValue(wire, 0);
+  expect(got.next).toBe(wire.length);
+  expect(got.value).toEqual({ type: 'Point', srid: 4326, coordinates: [1.5, 2.5] });
+
+  const enc = encodeParam({ kind: 'geometry', wkt: 'POINT(1 2)', srid: 4326 });
+  expect(decodeValue(enc, 0).value).toBe('SRID=4326;POINT(1 2)');
 });

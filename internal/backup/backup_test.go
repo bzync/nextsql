@@ -14,6 +14,7 @@ import (
 	"github.com/bzync/nextsql/internal/executor"
 	"github.com/bzync/nextsql/internal/nerr"
 	"github.com/bzync/nextsql/internal/sql/types"
+	"github.com/bzync/nextsql/internal/storage"
 	"github.com/bzync/nextsql/internal/storage/format"
 	"github.com/bzync/nextsql/internal/wal"
 )
@@ -103,6 +104,124 @@ func contains(ss []string, want string) bool {
 		}
 	}
 	return false
+}
+
+type engAdapter struct{ e *storage.Engine }
+
+func (a engAdapter) Identity() format.Identity { return a.e.Identity() }
+func (a engAdapter) Checkpoint() error         { return a.e.Checkpoint() }
+func (a engAdapter) CheckpointLSN() format.LSN { return a.e.WAL.CheckpointLSN() }
+func (a engAdapter) RedoLSN() format.LSN       { return a.e.WAL.RedoLSN() }
+func (a engAdapter) DurableLSN() format.LSN    { return a.e.WAL.DurableLSN() }
+
+func TestCreateFromEngineWhileDatabaseOpen(t *testing.T) {
+	dir := t.TempDir()
+	dataDir, dbPath, root, env := setupSQL(t, dir)
+
+	// Keep the database open — CreateFromEngine must not need a second
+	// storage.Open (that would run a second recovery pass).
+	live, err := executor.Open(dbPath, env, 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer live.Close()
+
+	dest := filepath.Join(dir, "hot.nsbak")
+	res, err := CreateFromEngine(engAdapter{live.Eng}, dataDir, dest, env, Options{})
+	if err != nil {
+		t.Fatalf("CreateFromEngine: %v", err)
+	}
+	if !res.Verified || !res.RestoreTest || res.Members < 2 {
+		t.Fatalf("unexpected result %+v", res)
+	}
+
+	// A write after the backup must not appear in it.
+	if _, err := live.Session().Exec(`INSERT INTO items (sku) VALUES ('after-backup')`); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := Verify(dest, env, true); err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+
+	restored := filepath.Join(dir, "restored-hot")
+	env2, err := crypto.OpenEnvelope(crypto.KeystorePath(dbPath), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer env2.Close()
+	if _, err := Restore(dest, restored, env2, RestoreOptions{}); err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+	got := execSKUs(t, filepath.Join(restored, config.DataFileName), env2)
+	if !contains(got, "alpha") {
+		t.Fatalf("restored backup missing pre-backup row: %v", got)
+	}
+	if contains(got, "after-backup") {
+		t.Fatalf("backup captured a write made after it was taken: %v", got)
+	}
+}
+
+func TestCreateFromEngineUnderConcurrentWrites(t *testing.T) {
+	if testing.Short() {
+		t.Skip("stress test")
+	}
+	dir := t.TempDir()
+	dataDir, dbPath, root, env := setupSQL(t, dir)
+
+	live, err := executor.Open(dbPath, env, 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer live.Close()
+
+	// Hammer the engine with writes for the whole duration of the backup.
+	stop := make(chan struct{})
+	done := make(chan int)
+	go func() {
+		n := 0
+		for {
+			select {
+			case <-stop:
+				done <- n
+				return
+			default:
+			}
+			if _, err := live.Session().Exec(`INSERT INTO items (sku) VALUES ('churn')`); err == nil {
+				n++
+			}
+		}
+	}()
+	time.Sleep(20 * time.Millisecond)
+
+	dest := filepath.Join(dir, "under-load.nsbak")
+	res, err := CreateFromEngine(engAdapter{live.Eng}, dataDir, dest, env, Options{})
+	close(stop)
+	writes := <-done
+	if err != nil {
+		t.Fatalf("CreateFromEngine under load: %v (after %d concurrent writes)", err, writes)
+	}
+	if !res.Verified || !res.RestoreTest {
+		t.Fatalf("backup taken under load not verified: %+v", res)
+	}
+	t.Logf("backup verified with ~%d concurrent writes during it", writes)
+
+	// The backup restores cleanly and holds a valid prefix of the writes
+	// (the pre-backup 'alpha' row must be there; exact churn count is
+	// whatever the checkpoint captured — the point is it is consistent).
+	restored := filepath.Join(dir, "restored-load")
+	env2, err := crypto.OpenEnvelope(crypto.KeystorePath(dbPath), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer env2.Close()
+	if _, err := Restore(dest, restored, env2, RestoreOptions{}); err != nil {
+		t.Fatalf("Restore of a backup taken under load: %v", err)
+	}
+	got := execSKUs(t, filepath.Join(restored, config.DataFileName), env2)
+	if !contains(got, "alpha") {
+		t.Fatalf("restored backup lost the pre-backup row: %v rows", len(got))
+	}
 }
 
 func TestBackupRestoreRoundTrip(t *testing.T) {

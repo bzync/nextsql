@@ -1420,27 +1420,27 @@ SIMD/unsafe/architecture-specific code is introduced only after profiling, tests
 
 # 29. Geospatial
 
-Native geospatial support includes:
+Native geospatial support has two families that sit side by side:
 
-- `POINT` / `LOCATION`
-- `BOX`
-- `LINESTRING`
-- `POLYGON`
-- WKT coercion
-- coordinate validation
-- `LON`
-- `LAT`
-- `DISTANCE`
-- `DISTANCE_SPHEROID`
-- `DWITHIN`
-- `WITHIN`
-- `COVERS`
-- line-length operations
-- pairwise `INTERSECTS` / `DISJOINT`
-- polygon area and perimeter
-- centroid and envelope
-- geometry type, point-count, and ring-count inspection
-- spatial indexes
+**Fixed WGS84 shapes** (`docs/geo.md`) — `POINT`/`LOCATION`, `BOX`,
+`LINESTRING`, `POLYGON` with WKT coercion, coordinate validation, `LON`/
+`LAT`, `DISTANCE`/`DISTANCE_SPHEROID`, `DWITHIN`/`WITHIN`/`COVERS`,
+line-length, pairwise `INTERSECTS`/`DISJOINT`, polygon area/perimeter,
+centroid/envelope, and geometry inspection.
+
+**General OGC types** (`docs/design-spatial.md`) — `GEOMETRY` (planar) and
+`GEOGRAPHY` (geodetic) with an explicit per-column SRID + subtype
+declaration (`GEOMETRY(Point, 3857)`), the OGC Simple Features common
+subset of `ST_*` functions, EWKB/EWKT/WKB/GeoJSON serialization, and a
+closed SRID set `{0, 4326, 3857}` (`ST_Transform` covers `4326 ↔ 3857`
+with no external PROJ dependency). These cover `MultiPoint`/
+`MultiLineString`/`MultiPolygon`/`GeometryCollection`. The two families
+coerce into one another (`POINT` ⇄ `GEOMETRY(Point)`); the fixed shapes
+are unchanged. This is a native subsystem targeting the common OGC subset,
+not a PostGIS clone — 3D/M coordinates, curve geometries, arbitrary datum
+transforms, and topology remain out of scope.
+
+- spatial indexes over both families
 
 Residual predicates remain exact.
 
@@ -1913,6 +1913,14 @@ nextsql import
 ```
 
 Backups remain encrypted.
+
+A live server also exposes backup over SQL for the NextSQL Manager: `BACKUP
+DATABASE` and `VERIFY BACKUP 'name'` (both `BACKUP`-privilege / cluster
+`ADMIN` gated) operate on the server's configured `backup_dir` via a
+hot-backup path that reuses the running engine (`backup.CreateFromEngine`) —
+the same checkpoint + fuzzy-copy + WAL-replay model, never a second engine
+open. Restore and PITR stay offline-CLI-only: a running server cannot restore
+into itself.
 
 Required backup flow:
 

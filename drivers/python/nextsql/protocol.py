@@ -89,6 +89,15 @@ KIND_FLOAT32 = 28
 KIND_FLOAT64 = 29
 KIND_ENUM = 30
 KIND_INTERVAL = 31
+KIND_STRUCT = 32
+KIND_ARRAY = 33
+KIND_MAP = 34
+KIND_GEOMETRY = 35
+KIND_GEOGRAPHY = 36
+
+MAX_NEST_DEPTH = 8
+MAX_STRUCT_FIELDS = 128
+MAX_COLLECTION_LEN = 1 << 20
 
 _UTC = datetime.timezone.utc
 _EPOCH = datetime.datetime(1970, 1, 1, tzinfo=_UTC)
@@ -106,6 +115,9 @@ class Column:
     # ENUM's declared label list (D11, Datatype expansion track); None for
     # every other kind.
     labels: list[str] | None = None
+    # Recursive descriptor for a STRUCT / ARRAY / MAP column (Collections
+    # track); None for every other kind.
+    coll_type: dict | None = None
 
 
 @dataclass
@@ -299,6 +311,289 @@ def read_enum_labels(b: bytes, off: int) -> tuple[list[str], int]:
         label, off = read_u16_string(b, off, MAX_ENUM_LABEL_BYTES)
         labels.append(label)
     return labels, off
+
+
+# --- Collections (STRUCT / ARRAY / MAP), docs/design-collections.md ----------
+
+
+@dataclass
+class StructValue:
+    """Explicit STRUCT parameter: an ordered list of (field_name, value)."""
+
+    fields: list[tuple[str, Any]]
+
+
+@dataclass
+class MapValue:
+    """Explicit MAP parameter: entries as a dict or a list of (key, value)."""
+
+    entries: Any
+
+
+def _read_type_full(b: bytes, off: int, depth: int) -> tuple[dict, int]:
+    _need(b, off, 6, "type")
+    t: dict = {
+        "kind": b[off],
+        "precision": u16(b, off + 1),
+        "scale": u16(b, off + 3),
+        "elem": b[off + 5],
+    }
+    nxt = _read_nested_descriptor(b, off + 6, t, depth)
+    return t, nxt
+
+
+def _read_nested_descriptor(b: bytes, off: int, t: dict, depth: int) -> int:
+    if depth > MAX_NEST_DEPTH + 1:
+        raise ProtocolError("collection type nesting too deep")
+    kind = t["kind"]
+    if kind == KIND_ENUM:
+        labels, off = read_enum_labels(b, off)
+        t["labels"] = labels
+        return off
+    if kind == KIND_ARRAY:
+        et, off = _read_type_full(b, off, depth + 1)
+        t["elemType"] = et
+        return off
+    if kind == KIND_MAP:
+        kt, off = _read_type_full(b, off, depth + 1)
+        vt, off = _read_type_full(b, off, depth + 1)
+        t["keyType"] = kt
+        t["elemType"] = vt
+        return off
+    if kind == KIND_STRUCT:
+        _need(b, off, 2, "struct field count")
+        n = u16(b, off)
+        if n == 0 or n > MAX_STRUCT_FIELDS:
+            raise ProtocolError("struct field count out of range")
+        off += 2
+        fields = []
+        for _ in range(n):
+            name, off = read_u16_string(b, off, 255)
+            ft, off = _read_type_full(b, off, depth + 1)
+            fields.append((name, ft))
+        t["fields"] = fields
+        return off
+    return off
+
+
+def _decode_payload(b: bytes, off: int, t: dict) -> tuple[Any, int]:
+    kind = t["kind"]
+    if kind in (KIND_STRUCT, KIND_ARRAY, KIND_MAP):
+        return _decode_collection_payload(b, off, t)
+    header = bytes([kind, 0]) + _reserved5()
+    if kind == KIND_ENUM:
+        header += append_enum_labels(t.get("labels", []))
+    synthetic = header + b[off:]
+    value, nxt, _ = decode_value(synthetic, 0)
+    return value, off + (nxt - len(header))
+
+
+def _decode_collection_payload(b: bytes, off: int, t: dict) -> tuple[Any, int]:
+    _need(b, off, 4, "collection")
+    body_len = u32(b, off)
+    body_end = off + 4 + body_len
+    _need(b, off + 4, body_len, "collection body")
+    p = off + 4
+    n = u32(b, p)
+    p += 4
+    if n > 2 * MAX_COLLECTION_LEN + 2 or n > body_len:
+        raise ProtocolError("collection member count out of range")
+    nb = (n + 7) >> 3
+    nulls = b[p : p + nb]
+    p += nb
+    kind = t["kind"]
+
+    def member_type(i: int) -> dict:
+        if kind == KIND_STRUCT:
+            return t["fields"][i][1]
+        if kind == KIND_ARRAY:
+            return t["elemType"]
+        return t["keyType"] if i % 2 == 0 else t["elemType"]
+
+    members: list[Any] = []
+    for i in range(n):
+        if nulls[i >> 3] & (1 << (i & 7)):
+            members.append(None)
+            continue
+        value, p = _decode_payload(b, p, member_type(i))
+        members.append(value)
+    if kind == KIND_STRUCT:
+        return {name: members[i] for i, (name, _) in enumerate(t["fields"])}, body_end
+    if kind == KIND_ARRAY:
+        return members, body_end
+    out = {}
+    for i in range(0, len(members) - 1, 2):
+        out[members[i]] = members[i + 1]
+    return out, body_end
+
+
+def _encode_type_full(t: dict) -> bytes:
+    out = bytes([t["kind"]]) + _reserved5()
+    kind = t["kind"]
+    if kind == KIND_ENUM:
+        out += append_enum_labels(t.get("labels", []))
+    elif kind == KIND_ARRAY:
+        out += _encode_type_full(t["elemType"])
+    elif kind == KIND_MAP:
+        out += _encode_type_full(t["keyType"]) + _encode_type_full(t["elemType"])
+    elif kind == KIND_STRUCT:
+        out += u16le(len(t["fields"]))
+        for name, ft in t["fields"]:
+            out += u16str(name, 255) + _encode_type_full(ft)
+    return out
+
+
+def _infer_value(v: Any) -> tuple[dict, bytes | None]:
+    if v is None:
+        return {"kind": KIND_STRING}, None
+    if isinstance(v, StructValue):
+        fields = []
+        payloads = []
+        for name, fv in v.fields:
+            ft, pl = _infer_value(fv)
+            fields.append((name, ft))
+            payloads.append(pl)
+        return {"kind": KIND_STRUCT, "fields": fields}, _collection_payload(payloads)
+    if isinstance(v, MapValue):
+        items = v.entries.items() if isinstance(v.entries, dict) else v.entries
+        flat_types: list[dict] = []
+        payloads = []
+        for k, val in items:
+            kt, kp = _infer_value(k)
+            vt, vp = _infer_value(val)
+            flat_types += [kt, vt]
+            payloads += [kp, vp]
+        key_type = next((flat_types[i] for i in range(0, len(flat_types), 2) if payloads[i] is not None), {"kind": KIND_STRING})
+        val_type = next((flat_types[i] for i in range(1, len(flat_types), 2) if payloads[i] is not None), {"kind": KIND_STRING})
+        return {"kind": KIND_MAP, "keyType": key_type, "elemType": val_type}, _collection_payload(payloads)
+    if isinstance(v, (list, tuple)):
+        types_payloads = [_infer_value(x) for x in v]
+        elem_type = next((t for t, p in types_payloads if p is not None), {"kind": KIND_STRING})
+        return {"kind": KIND_ARRAY, "elemType": elem_type}, _collection_payload([p for _, p in types_payloads])
+    enc = encode_param(v)
+    kind = enc[0]
+    hdr = 7
+    if kind == KIND_ENUM:
+        lc = u16(enc, 7)
+        hdr = 9
+        for _ in range(lc):
+            hdr += 2 + u16(enc, hdr)
+    return {"kind": kind}, enc[hdr:]
+
+
+def _collection_payload(payloads: list[bytes | None]) -> bytes:
+    n = len(payloads)
+    nb = (n + 7) >> 3
+    nulls = bytearray(nb)
+    chunks = b""
+    for i, pl in enumerate(payloads):
+        if pl is None:
+            nulls[i >> 3] |= 1 << (i & 7)
+        else:
+            chunks += pl
+    body = u32le(n) + bytes(nulls) + chunks
+    return u32le(len(body)) + body
+
+
+def _encode_collection_param(v: Any) -> bytes:
+    t, payload = _infer_value(v)
+    type_body = _encode_type_full(t)[1:]
+    return bytes([t["kind"], 0]) + type_body + (payload or b"")
+
+
+# --- Spatial: EWKB decode (Spatial track, docs/design-spatial.md) ----------
+
+_EWKB_TYPES = {
+    1: "Point", 2: "LineString", 3: "Polygon",
+    4: "MultiPoint", 5: "MultiLineString", 6: "MultiPolygon",
+    7: "GeometryCollection",
+}
+_EWKB_SRID_FLAG = 0x20000000
+
+
+@dataclass
+class Geometry:
+    """A decoded GEOMETRY / GEOGRAPHY value (Spatial track). `type` is the
+    OGC subtype name, `coordinates` nested per `type` (Point: [x, y]; a
+    GeometryCollection uses `geometries` instead)."""
+
+    type: str
+    srid: int
+    coordinates: Any = None
+    geometries: list["Geometry"] | None = None
+
+    def to_wkt(self) -> str:
+        def pt(xy: tuple[float, float]) -> str:
+            return f"{xy[0]} {xy[1]}"
+
+        def ring(r: list[tuple[float, float]]) -> str:
+            return "(" + ", ".join(pt(p) for p in r) + ")"
+
+        if self.type == "Point":
+            return f"POINT({pt(self.coordinates)})"
+        if self.type == "LineString":
+            return "LINESTRING(" + ", ".join(pt(p) for p in self.coordinates) + ")"
+        if self.type == "Polygon":
+            return "POLYGON(" + ", ".join(ring(r) for r in self.coordinates) + ")"
+        if self.type == "MultiPoint":
+            return "MULTIPOINT(" + ", ".join(f"({pt(p)})" for p in self.coordinates) + ")"
+        if self.type == "MultiLineString":
+            return "MULTILINESTRING(" + ", ".join(ring(r) for r in self.coordinates) + ")"
+        if self.type == "MultiPolygon":
+            return "MULTIPOLYGON(" + ", ".join("(" + ", ".join(ring(r) for r in poly) + ")" for poly in self.coordinates) + ")"
+        if self.type == "GeometryCollection":
+            return "GEOMETRYCOLLECTION(" + ", ".join(g.to_wkt() for g in (self.geometries or [])) + ")"
+        raise NextSQLError("invalid_argument", "unsupported geometry type")
+
+
+def _decode_ewkb(b: bytes, off: int, depth: int) -> tuple[Geometry, int]:
+    if depth > 8:
+        raise ProtocolError("geometry nesting too deep")
+    _need(b, off, 5, "geometry header")
+    if b[off] != 1:
+        raise ProtocolError("only little-endian EWKB is supported")
+    tword = struct.unpack_from("<I", b, off + 1)[0]
+    gtype = tword & ~_EWKB_SRID_FLAG
+    p = off + 5
+    srid = 0
+    if tword & _EWKB_SRID_FLAG:
+        srid = struct.unpack_from("<I", b, p)[0]
+        p += 4
+    name = _EWKB_TYPES.get(gtype)
+    if name is None:
+        raise ProtocolError("unknown geometry type")
+
+    def f64() -> float:
+        nonlocal p
+        v = struct.unpack_from("<d", b, p)[0]
+        p += 8
+        return v
+
+    def u32() -> int:
+        nonlocal p
+        v = struct.unpack_from("<I", b, p)[0]
+        p += 4
+        return v
+
+    def pts(n: int) -> list[tuple[float, float]]:
+        return [(f64(), f64()) for _ in range(n)]
+
+    if gtype == 1:
+        return Geometry(name, srid, (f64(), f64())), p
+    if gtype == 2:
+        return Geometry(name, srid, pts(u32())), p
+    if gtype == 3:
+        nr = u32()
+        rings = [pts(u32()) for _ in range(nr)]
+        return Geometry(name, srid, rings), p
+    np_ = u32()
+    parts: list[Geometry] = []
+    for _ in range(np_):
+        sub, p = _decode_ewkb(b, p, depth + 1)
+        parts.append(sub)
+    if gtype == 7:
+        return Geometry(name, srid, geometries=parts), p
+    return Geometry(name, srid, [part.coordinates for part in parts]), p
 
 
 def _encode_enum(v: EnumValue) -> bytes:
@@ -530,9 +825,20 @@ def encode_param(v: Any) -> bytes:
         return bytes([KIND_BOX, 0]) + _reserved5() + struct.pack("<dddd", v.west, v.south, v.east, v.north)
     if isinstance(v, Vector):
         return _encode_vector(v)
-    if isinstance(v, (list, tuple)) and all(isinstance(x, (int, float)) for x in v):
+    if isinstance(v, (list, tuple)) and len(v) > 0 and all(isinstance(x, (int, float)) for x in v):
         return _encode_vector(Vector(dim=len(v), values=[float(x) for x in v]))
-    if isinstance(v, (dict, list)):
+    if isinstance(v, (StructValue, MapValue)):
+        return _encode_collection_param(v)
+    if isinstance(v, Geometry):
+        wkt = v.to_wkt()
+        if v.srid:
+            wkt = f"SRID={v.srid};{wkt}"
+        return bytes([KIND_STRING, 0]) + _reserved5() + u32bytes(wkt.encode("utf-8"), MAX_PACKET)
+    if isinstance(v, (list, tuple)):
+        # A non-numeric (or empty) list/tuple is an ARRAY collection param;
+        # the server re-coerces element types against the destination column.
+        return _encode_collection_param(v)
+    if isinstance(v, dict):
         payload = _json.dumps(v, ensure_ascii=False).encode("utf-8")
         return bytes([KIND_STRING, 0]) + _reserved5() + u32bytes(payload, MAX_PACKET)
     raise NextSQLError("invalid_argument", f"unsupported parameter type: {type(v)!r}")
@@ -544,10 +850,17 @@ def decode_value(b: bytes, off: int) -> tuple[Any, int, int]:
     flags = b[off + 1]
     off += 7
     enum_labels: list[str] | None = None
+    coll_type: dict | None = None
     if kind == KIND_ENUM:
         enum_labels, off = read_enum_labels(b, off)
+    elif kind in (KIND_STRUCT, KIND_ARRAY, KIND_MAP):
+        coll_type = {"kind": kind}
+        off = _read_nested_descriptor(b, off, coll_type, 0)
     if flags & FLAG_NULL:
         return None, off, kind
+    if kind in (KIND_STRUCT, KIND_ARRAY, KIND_MAP):
+        value, nxt = _decode_collection_payload(b, off, coll_type)
+        return value, nxt, kind
     if kind == KIND_ENUM:
         _need(b, off, 2, "enum")
         ord_ = u16(b, off)
@@ -640,6 +953,10 @@ def decode_value(b: bytes, off: int) -> tuple[Any, int, int]:
             coords.append(struct.unpack_from("<d", b, p)[0])
             p += 8
         return Line(coords), p, kind
+    if kind in (KIND_GEOMETRY, KIND_GEOGRAPHY):
+        length = u32(b, off)
+        g, _ = _decode_ewkb(b, off + 4, 0)
+        return g, off + 4 + length, kind
     if kind == KIND_POLYGON:
         nr = u16(b, off)
         p = off + 2
@@ -693,9 +1010,13 @@ def decode_row_desc(b: bytes) -> list[Column]:
         kind = b[off]
         off += 6
         labels: list[str] | None = None
+        coll_type: dict | None = None
         if kind == KIND_ENUM:
             labels, off = read_enum_labels(b, off)
-        cols.append(Column(name=name, kind=kind, labels=labels))
+        elif kind in (KIND_STRUCT, KIND_ARRAY, KIND_MAP):
+            coll_type = {"kind": kind}
+            off = _read_nested_descriptor(b, off, coll_type, 0)
+        cols.append(Column(name=name, kind=kind, labels=labels, coll_type=coll_type))
     return cols
 
 

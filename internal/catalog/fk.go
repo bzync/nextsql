@@ -183,6 +183,12 @@ func validateOneFK(child *Table, fk *ForeignKey, lookup func(string) (*Table, bo
 		if ct.Kind == types.KindVector || ct.Kind == types.KindJSON || pt.Kind == types.KindVector || pt.Kind == types.KindJSON {
 			return nerr.New(nerr.InvalidArgument, "catalog.ValidateForeignKeys", "VECTOR and JSON cannot be foreign key columns")
 		}
+		if types.IsCollection(ct.Kind) || types.IsCollection(pt.Kind) {
+			return nerr.New(nerr.InvalidArgument, "catalog.ValidateForeignKeys", "STRUCT, ARRAY and MAP cannot be foreign key columns")
+		}
+		if types.IsGeneralSpatial(ct.Kind) || types.IsGeneralSpatial(pt.Kind) {
+			return nerr.New(nerr.InvalidArgument, "catalog.ValidateForeignKeys", "GEOMETRY and GEOGRAPHY cannot be foreign key columns")
+		}
 		if !fkTypesCompatible(ct, pt) {
 			return nerr.New(nerr.InvalidArgument, "catalog.ValidateForeignKeys", "foreign key type mismatch")
 		}

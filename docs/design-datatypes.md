@@ -23,14 +23,11 @@
 > after the user's explicit "must all datatypes must be supported end to
 > end" — D6 followed immediately after in the same session (log #100).
 > D4/D11 are deliberately **not** `ENCRYPTED CLIENT`-eligible. **D9
-> (collections) and D10 (spatial `GEOMETRY`/`GEOGRAPHY`) remain
-> planning-only** — each is explicitly blocked on a scoping/design decision
-> this document says needs `AskUserQuestion` before any code, not on
-> effort; see each section below (D9 has its own
-> `docs/design-collections.md`; D10's scoping decision — a new subsystem,
-> not a generalization of the existing 4 WGS84 shapes — was made
-> 2026-09-04 but the implementation itself was not started, being
-> phase-sized work). This document replaces the original flat taxonomy
+> (collections, `docs/design-collections.md`) and D10 (spatial,
+> `docs/design-spatial.md`) both split into their own cross-cutting tracks
+> once every scalar D-item landed, and both are now fully LANDED too**
+> (D9: `TODO.md` log #109; D10: log #113) — every D-track item, scalar and
+> non-scalar alike, is complete as of 2026-09-04. This document replaces the original flat taxonomy
 > sketch with a sequenced, gated plan, following the same "smallest coherent increment"
 > discipline used by the Multi-database hosting track
 > (`docs/design-multidatabase-dbaas.md`). Mirrored in `TODO.md` under
@@ -554,55 +551,35 @@ present in every driver for `VECTOR`/geospatial float fields — no new
 binary-math code needed, only new `Kind` cases routing to it). Live-verified
 against a real `nextsqld` through the Python, Node, and PHP drivers.
 
-### D9 — Collections: `ARRAY<T>` / `MAP<K,V>` / `STRUCT<...>` — SPLIT OUT 2026-09-04
-**Too large for this track.** Recursive type descriptors, per-element
-encoding, index-key ordering for composites, and row-format (`NSRW`)
-changes make this comparable in size to the original JSON (P9) or Vector
-(P11/P23) phases, not a bullet alongside scalar types. Split into its own
-`docs/design-collections.md` and a new `TODO.md` "Cross-cutting track —
-Collections" on 2026-09-04, at the user's request, once D1-D5/D7/D8/D11
-landed. Scoped only, not implemented — the new doc identifies the open
-questions (several needing `AskUserQuestion`) and a draft C1/C2/C3
-sequenced plan without deciding storage formats. No scalar-type work in
-this track should block on it, and it should not be started
-opportunistically. See `docs/design-collections.md`.
+### D9 — Collections: `ARRAY<T>` / `MAP<K,V>` / `STRUCT<...>` — SPLIT OUT 2026-09-04, then LANDED 2026-09-04
+**Too large for this track** (recursive type descriptors, per-element
+encoding, index-key ordering for composites, row-format `NSRW` changes —
+comparable to JSON/Vector phases), so split into its own
+`docs/design-collections.md` and a `TODO.md` "Cross-cutting track —
+Collections" on 2026-09-04. **All three sub-items (C1 `STRUCT`, C2
+`ARRAY`, C3 `MAP`) then landed end-to-end the same day** (`TODO.md` log
+#109) under the user's "must be full" — core engine (`NSCT` v11→v12,
+recursive wire descriptor, orderable lexicographic tuple keys), all 7
+drivers, fuzzing, docs. The full design record is
+`docs/design-collections.md` §2a.
 
-### D10 — Spatial: `GEOMETRY` / `GEOGRAPHY` — SCOPED 2026-09-04, NOT IMPLEMENTED
-**Scoping decision made 2026-09-04**: a second, more general PostGIS-style
-subsystem alongside the existing 4 WGS84 shapes (`POINT`/`BOX`/
-`LINESTRING`/`POLYGON`, `docs/geo.md`) — not a generalization of them with
-SRID support. This is explicitly the larger of the two options: the
-existing geo types stay exactly as they are (no SRID retrofit, no shared
-type hierarchy), and `GEOMETRY`/`GEOGRAPHY` become a separate, more general
-family alongside them.
+### D10 — Spatial: `GEOMETRY` / `GEOGRAPHY` — SPLIT OUT to its own track 2026-09-04
+**Scoping decision (2026-09-04)**: a second, more general PostGIS-style
+subsystem alongside the existing 4 WGS84 shapes (`docs/geo.md`) — not a
+generalization of them. The four fixed types stay exactly as they are.
 
-**This is phase-sized work, comparable to P9 (JSON) or P11/P23 (Vector),
-not a bullet in this track** — the same reasoning `docs/design-collections.md`
-gives for splitting D9 out applies here too. Before any code:
-
-- **A dedicated design document** (`docs/design-spatial.md` or similar,
-  not written here) needs to work out: an SRID (spatial reference system)
-  model — is every value tagged with its own SRID, or is SRID a per-column
-  declaration like today's fixed WGS84 assumption?; `GEOMETRY` (planar,
-  Cartesian arithmetic) vs. `GEOGRAPHY` (geodetic, great-circle arithmetic)
-  as genuinely separate types with separate operation semantics, matching
-  PostGIS's own split, or one type with a mode flag?; which OGC Simple
-  Features operations are in scope for a first increment (intersects,
-  contains, distance, buffer, ...) versus deferred; on-disk layout and
-  index-key ordering for arbitrary geometry collections (not just 4 fixed
-  shapes); a spatial index strategy beyond whatever the current 4-shape
-  `CREATE SPATIAL INDEX` already does.
-- Relationship to the existing 4 WGS84 types needs stating explicitly:
-  do `POINT`/`BOX`/`LINESTRING`/`POLYGON` get deprecated in favor of
-  `GEOMETRY`, stay as a fixed-shape fast path alongside the general family,
-  or something else? Per this track's own §2 decision record, a new type
-  can't be added without an explicit CAST/coercion relationship to
-  existing ones — that applies here too.
-
-**Not started.** No `TODO.md` item exists yet beyond this scoping note;
-one should be created only once the dedicated design document above
-exists, mirroring how `docs/design-collections.md` was created before
-D9 got a `TODO.md` cross-cutting-track entry.
+**Now has its own design document and `TODO.md` track**, written
+2026-09-04 under the user's "implement Collections and Spatial ... must be
+full": **`docs/design-spatial.md`** (§2 decision record — two separate
+Kinds `GEOMETRY`/`GEOGRAPHY`, per-column SRID+subtype declaration with no
+`NSCT`/protocol bump, closed SRID registry {0, 4326, 3857} with no `PROJ`
+dependency, EWKB on-disk with a u32 length prefix, canonical-EWKB
+index-key order, `CREATE SPATIAL INDEX` generalized to a bbox Z-order key,
+explicit CAST bridge to the four fixed types, `ST_`-only function surface)
+and a sequenced S1–S6 plan. Mirrored in `TODO.md` under "Cross-cutting
+track — Spatial." **S1 through S6 all landed 2026-09-04** (`TODO.md` log
+#113) — see `docs/design-spatial.md` §7 for the full per-increment
+writeup.
 
 ### D11 — `ENUM(label, ...)` — LANDED 2026-09-04
 Was missing from the original taxonomy entirely — added 2026-09-03, found
@@ -699,31 +676,7 @@ rejection all correct end-to-end; Go's path was already proven by the
 core-engine wiring's own live verification (log #97), and Bun/Deno share
 `protocol.mjs` with the live-verified Node implementation.
 
-## 4. Explicitly cut from the original taxonomy
-
-Not carried forward as engine column types. Reasoning below; revisit only
-if a concrete, stated use case appears (not "completeness").
-
-- **Identity/Network** (`INET`, `CIDR`, `MACADDR`): niche, no stated use
-  case. `VARBINARY`/`STRING` plus an app-level `CHECK`-style validator
-  covers this without new engine types.
-- **Structured Documents beyond JSON** (`YAML`, `XML`, `TOML`, `INI`,
-  `ENV`): JSON is a first-class type because of a real binary format
-  (`NSJB`) with path indexing behind it. These would each need the same
-  investment repeated five times, or else they're just `TEXT` with a
-  naming convention — in which case they add nothing as engine types.
-  Store as `TEXT`/`BLOB`; a format label is an application concern.
-- **DevOps/Infrastructure** (`DOCKERFILE`, `COMPOSE`, `K8S_MANIFEST`,
-  `HCL`), **Development Content** (`CODE`, `MARKDOWN`), **Generic Files**
-  (`FILE`): not database types by any definition used elsewhere in this
-  doc — no type-specific engine behavior (validation, indexing) was ever
-  specified for them. Conflicts with `PROJECT.md`'s explicit "not a
-  compatibility/generic storage layer" identity. If a real generic-file
-  need surfaces later, it's a single `FILE` type with an optional
-  MIME/format tag — a separate, future, explicitly-scoped item, not seven
-  new types here.
-
-## 5. What this track does NOT include
+## 4. What this track does NOT include
 
 Per `PROJECT.md`/`TODO.md` convention, this track gates no phase (P0-P27
 are closed; P28-P30 are next). Nothing here should be started opportunistically

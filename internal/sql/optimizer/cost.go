@@ -3,6 +3,7 @@ package optimizer
 import (
 	"math"
 	"strconv"
+	"strings"
 
 	"github.com/bzync/nextsql/internal/catalog"
 	"github.com/bzync/nextsql/internal/sql/ast"
@@ -189,6 +190,28 @@ func predSel(e ast.Expr, tab *catalog.Table, st *catalog.TableStats) sel {
 		}
 		return selIsNull
 	case ast.Call:
+		switch strings.ToLower(x.Name) {
+		case "st_intersects", "st_contains", "st_within", "st_covers", "st_coveredby":
+			if len(x.Args) == 2 {
+				for _, a := range x.Args {
+					if g, ok := geoConstGeom(a); ok {
+						if w, s, e, n, wrap, ok := types.GeoBBox(g); ok && !wrap {
+							return boxAreaSel([4]float64{w, s, e, n})
+						}
+					}
+				}
+			}
+			return selDefault
+		case "st_dwithin":
+			if len(x.Args) == 3 {
+				if r, ok := constValue(x.Args[2]); ok {
+					if meters, err := strconv.ParseFloat(r.String(), 64); err == nil && meters >= 0 {
+						return radiusSel(meters)
+					}
+				}
+			}
+			return selDefault
+		}
 		switch types.CanonGeoName(x.Name) {
 		case "dwithin":
 			if len(x.Args) == 3 {

@@ -198,6 +198,16 @@ func (s *Session) authorize(stmt ast.Stmt) error {
 		return s.require(security.PrivAdmin, security.ScopeCluster, "")
 	case ast.ClusterReconcileConfirm:
 		return s.require(security.PrivAdmin, security.ScopeCluster, "")
+	case ast.SetConfig:
+		return s.require(security.PrivAdmin, security.ScopeCluster, "")
+	case ast.BackupDatabase, ast.VerifyBackup:
+		// The dedicated BACKUP privilege (database scope) or cluster ADMIN.
+		if s.acl == nil ||
+			s.authAllowed(user, security.PrivBackup, security.ScopeDatabase, "") ||
+			s.authAllowed(user, security.PrivAdmin, security.ScopeCluster, "") {
+			return nil
+		}
+		return security.Deny("executor.authorize")
 	case ast.Explain:
 		return s.authorize(st.Stmt)
 	case ast.Begin, ast.Commit, ast.Rollback:
@@ -513,6 +523,12 @@ func sqlObject(stmt ast.Stmt) string {
 	case ast.ClusterMaintenance:
 		return ""
 	case ast.ClusterReconcileConfirm:
+		return ""
+	case ast.SetConfig:
+		return st.Key
+	case ast.VerifyBackup:
+		return st.Name
+	case ast.BackupDatabase:
 		return ""
 	case ast.Select:
 		return st.Table

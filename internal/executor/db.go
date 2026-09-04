@@ -11,12 +11,15 @@ import (
 	"time"
 
 	"github.com/bzync/nextsql/internal/catalog"
+	"github.com/bzync/nextsql/internal/config"
 	"github.com/bzync/nextsql/internal/crypto"
+	"github.com/bzync/nextsql/internal/logging"
 	"github.com/bzync/nextsql/internal/maintenance"
 	"github.com/bzync/nextsql/internal/metrics"
 	"github.com/bzync/nextsql/internal/nerr"
 	"github.com/bzync/nextsql/internal/replication"
 	"github.com/bzync/nextsql/internal/scheduler"
+	"github.com/bzync/nextsql/internal/security"
 	"github.com/bzync/nextsql/internal/sql/optimizer"
 	"github.com/bzync/nextsql/internal/storage"
 	"github.com/bzync/nextsql/internal/storage/btree"
@@ -73,6 +76,68 @@ type DB struct {
 	// DRAIN requests issued over SQL. Nil in embedded/CLI use, where there
 	// is no listening protocol.Server to drain.
 	drainFn func(timeout time.Duration)
+	// tlsStatusFn is set by nextsqld at startup to back system.tls with the
+	// live listener's redacted TLS status (see security.ServerTLSReloader.
+	// Status). Nil when no TLS listener is attached (embedded/CLI use, or a
+	// loopback-only plaintext deployment) — system.tls then reports
+	// enabled=false rather than erroring, same convention as
+	// system.replication reporting "standalone" with no cluster attached.
+	tlsStatusFn func() (security.TLSStatus, bool)
+	// keyStatusFn is set by nextsqld at startup to back system.key_versions
+	// with the attached crypto.Envelope's redacted key rotation state (see
+	// crypto.Envelope.KeyStatus). Nil when no persistent envelope is
+	// attached (embedded/CLI use with a bare crypto.KeyProvider, or a
+	// legacy deployment with no .keys keystore file) — system.key_versions
+	// then returns zero rows rather than erroring, same convention as
+	// system.databases/realms returning empty on a non-hosted deployment.
+	keyStatusFn func() ([]crypto.KeyStatus, bool)
+	// configFn is set by nextsqld at startup to back system.config with the
+	// running config.Config compared against the node's on-disk nextsql.conf
+	// (see config.DiffState — redacted values, a restart-required flag per
+	// key). Nil in embedded/CLI use, where there is no cfg to source from —
+	// system.config then returns zero rows rather than erroring, same
+	// convention as system.key_versions with no envelope attached.
+	configFn func() ([]config.EntryState, bool)
+	// auditFn is set by nextsqld at startup to back system.audit_log/
+	// system.audit_verify with a bounded, chain-verified tail of the live
+	// audit log (see security.TailEvents). Nil in embedded/CLI use, where
+	// there is no *security.Log to source from — both tables then report
+	// "not attached" rather than erroring. Called fresh on every query
+	// (unlike tlsStatusFn/keyStatusFn/configFn's already-in-memory state,
+	// this re-reads the file from disk each time — the whole point is to
+	// reflect what is actually durable on disk right now).
+	auditFn func(maxEvents int) (security.TailReport, bool)
+	// metricsFn is set by nextsqld at startup to back system.metrics with the
+	// process-wide metrics registry (normally metrics.Default()). Nil in
+	// embedded/CLI use — system.metrics then returns zero rows rather than
+	// erroring, same convention as configFn/keyStatusFn with nothing attached.
+	// nextsqld additionally routes this same DB's own query/txn counters into
+	// that registry via SetMetrics, so a single Snapshot is internally
+	// coherent (QPS/TPS/EncryptPct all share one born time).
+	metricsFn func() *metrics.Registry
+	// serverLogFn is set by nextsqld at startup to back system.server_log with
+	// a bounded tail of the in-memory log ring (logging.Ring). Nil in
+	// embedded/CLI use — system.server_log then returns zero rows rather than
+	// erroring. Re-read on every query (like auditFn) so the tail always
+	// reflects what has actually been logged up to that moment.
+	serverLogFn func(max int) []logging.Record
+	// configWriteFn is set by nextsqld at startup to back the SET CONFIG
+	// statement: it persists one setting to the node's on-disk nextsql.conf
+	// (the server owns the file; the client never touches it) and reports
+	// whether the change needs a restart to take effect. Nil when the server
+	// was started without a config file, or in embedded/CLI use — SET CONFIG
+	// then fails Unavailable rather than silently doing nothing.
+	configWriteFn func(key, value string, reset bool) (ConfigWriteResult, error)
+	// backup{Create,List,Verify}Fn are set by nextsqld at startup when a
+	// backup_dir is configured — they wrap internal/backup against this
+	// node's own data dir + live engine (kept out of the executor package to
+	// avoid an import cycle: internal/backup's own tests import executor).
+	// Nil when no backup_dir is configured or in embedded/CLI use — BACKUP
+	// DATABASE / VERIFY BACKUP / system.backups then report "not configured"
+	// rather than erroring.
+	backupCreateFn func() (BackupCreateResult, error)
+	backupListFn   func() ([]BackupListEntry, bool)
+	backupVerifyFn func(name string) (BackupVerifyResult, error)
 
 	// maintenanceMode gates every mutating statement with Unavailable while
 	// set, node-local like drainFn (no Raft replication — see
@@ -611,6 +676,244 @@ func (db *DB) SetDrainFunc(fn func(timeout time.Duration)) {
 		return
 	}
 	db.drainFn = fn
+}
+
+// SetTLSStatusSource registers the callback backing system.tls, normally
+// security.ServerTLSReloader.Status wired by nextsqld at startup. Nil (the
+// default) makes TLSStatus report "not attached" rather than erroring.
+func (db *DB) SetTLSStatusSource(fn func() (security.TLSStatus, bool)) {
+	if db == nil {
+		return
+	}
+	db.tlsStatusFn = fn
+}
+
+// TLSStatus returns the attached listener's live, redacted TLS status when
+// nextsqld has wired one via SetTLSStatusSource. The second return is false
+// for embedded/CLI use or a loopback plaintext deployment — never an error.
+func (db *DB) TLSStatus() (security.TLSStatus, bool) {
+	if db == nil || db.tlsStatusFn == nil {
+		return security.TLSStatus{}, false
+	}
+	return db.tlsStatusFn()
+}
+
+// SetKeyStatusSource registers the callback backing system.key_versions,
+// normally crypto.Envelope.KeyStatus wired by nextsqld at startup. Nil (the
+// default) makes KeyStatus report "not attached" rather than erroring.
+func (db *DB) SetKeyStatusSource(fn func() ([]crypto.KeyStatus, bool)) {
+	if db == nil {
+		return
+	}
+	db.keyStatusFn = fn
+}
+
+// KeyStatus returns the attached envelope's live, redacted key rotation
+// status when nextsqld has wired one via SetKeyStatusSource. The second
+// return is false for embedded/CLI use or a deployment with no persistent
+// keystore file — never an error.
+func (db *DB) KeyStatus() ([]crypto.KeyStatus, bool) {
+	if db == nil || db.keyStatusFn == nil {
+		return nil, false
+	}
+	return db.keyStatusFn()
+}
+
+// SetConfigSource registers the callback backing system.config, normally
+// config.DiffState(running, onDisk) wired by nextsqld at startup. Nil (the
+// default) makes ConfigEntries report "not attached" rather than erroring.
+func (db *DB) SetConfigSource(fn func() ([]config.EntryState, bool)) {
+	if db == nil {
+		return
+	}
+	db.configFn = fn
+}
+
+// ConfigEntries returns the running process's live, redacted configuration
+// diffed against the node's on-disk nextsql.conf when nextsqld has wired one
+// via SetConfigSource. The second return is false for embedded/CLI use,
+// where there is no process-level config.Config to source from — never an
+// error.
+func (db *DB) ConfigEntries() ([]config.EntryState, bool) {
+	if db == nil || db.configFn == nil {
+		return nil, false
+	}
+	return db.configFn()
+}
+
+// SetAuditSource registers the callback backing system.audit_log/
+// system.audit_verify, normally security.TailEvents (over the attached
+// *security.Log's own Path()) wired by nextsqld at startup. Nil (the
+// default) makes AuditTail report "not attached" rather than erroring.
+func (db *DB) SetAuditSource(fn func(maxEvents int) (security.TailReport, bool)) {
+	if db == nil {
+		return
+	}
+	db.auditFn = fn
+}
+
+// AuditTail returns a bounded, chain-verified tail of the attached audit
+// log when nextsqld has wired one via SetAuditSource. The second return is
+// false for embedded/CLI use, where there is no *security.Log to source
+// from — never an error, even when the chain itself fails to verify (that
+// shows up in the returned TailReport instead, same "surface the problem,
+// don't hide the data" reasoning TailEvents itself documents).
+func (db *DB) AuditTail(maxEvents int) (security.TailReport, bool) {
+	if db == nil || db.auditFn == nil {
+		return security.TailReport{}, false
+	}
+	return db.auditFn(maxEvents)
+}
+
+// SetMetricsSource registers the callback backing system.metrics, normally
+// a closure returning metrics.Default() wired by nextsqld at startup. Nil
+// (the default) makes MetricsSnapshot report "not attached" rather than
+// erroring.
+func (db *DB) SetMetricsSource(fn func() *metrics.Registry) {
+	if db == nil {
+		return
+	}
+	db.metricsFn = fn
+}
+
+// MetricsSnapshot returns a point-in-time snapshot of the process-wide
+// metrics registry when nextsqld has wired one via SetMetricsSource. The
+// second return is false for embedded/CLI use, where no process-level
+// registry is attached — never an error.
+func (db *DB) MetricsSnapshot() (metrics.Snapshot, bool) {
+	if db == nil || db.metricsFn == nil {
+		return metrics.Snapshot{}, false
+	}
+	r := db.metricsFn()
+	if r == nil {
+		return metrics.Snapshot{}, false
+	}
+	return r.Snapshot(), true
+}
+
+// SetServerLogSource registers the callback backing system.server_log,
+// normally logging.Ring.Snapshot wired by nextsqld at startup. Nil (the
+// default) makes ServerLogTail report "not attached" rather than erroring.
+func (db *DB) SetServerLogSource(fn func(max int) []logging.Record) {
+	if db == nil {
+		return
+	}
+	db.serverLogFn = fn
+}
+
+// ServerLogTail returns up to max of the most recent server log records
+// (oldest first) when nextsqld has wired a log ring via SetServerLogSource.
+// The second return is false for embedded/CLI use — never an error.
+func (db *DB) ServerLogTail(max int) ([]logging.Record, bool) {
+	if db == nil || db.serverLogFn == nil {
+		return nil, false
+	}
+	return db.serverLogFn(max), true
+}
+
+// ConfigWriteResult is what a SET CONFIG persist did: the value now in the
+// node's nextsql.conf (empty means "reset to built-in default"), the value
+// the running process is still using, and whether they differ — i.e. whether
+// a restart is needed for the change to take effect. Every SET CONFIG write
+// is persist-only today; nothing is hot-reloaded, so RestartRequired is true
+// whenever FileValue != RunningValue.
+type ConfigWriteResult struct {
+	Key             string
+	FileValue       string
+	RunningValue    string
+	RestartRequired bool
+}
+
+// SetConfigWriter registers the callback backing the SET CONFIG statement,
+// wired by nextsqld at startup only when it was started from a config file.
+// Nil (the default) makes SET CONFIG fail Unavailable.
+func (db *DB) SetConfigWriter(fn func(key, value string, reset bool) (ConfigWriteResult, error)) {
+	if db == nil {
+		return
+	}
+	db.configWriteFn = fn
+}
+
+// WriteConfigSetting persists one server setting to the node's on-disk
+// nextsql.conf via the wired writer. Returns Unavailable when no writer is
+// attached (no config file in use, or embedded/CLI). The write itself is the
+// nextsqld callback's job — validation, atomic replace, and the
+// running-vs-file comparison.
+func (db *DB) WriteConfigSetting(key, value string, reset bool) (ConfigWriteResult, error) {
+	if db == nil || db.configWriteFn == nil {
+		return ConfigWriteResult{}, nerr.New(nerr.Unavailable, "executor.WriteConfigSetting",
+			"this server was not started from a configuration file; SET CONFIG has nothing to persist")
+	}
+	return db.configWriteFn(key, value, reset)
+}
+
+// BackupCreateResult is the acknowledgment of a completed BACKUP DATABASE.
+type BackupCreateResult struct {
+	Name          string
+	CheckpointLSN uint64
+	DurableLSN    uint64
+	Members       int
+}
+
+// BackupListEntry is one row of system.backups.
+type BackupListEntry struct {
+	Name          string
+	CreatedUnix   int64
+	DatabaseID    string
+	CheckpointLSN uint64
+	DurableLSN    uint64
+}
+
+// BackupVerifyResult is the outcome of VERIFY BACKUP.
+type BackupVerifyResult struct {
+	Name    string
+	OK      bool
+	Problem string
+}
+
+// SetBackupOps registers the backup operation callbacks, wired by nextsqld
+// when a backup_dir is configured. Any nil argument leaves that operation
+// reporting Unavailable ("not configured").
+func (db *DB) SetBackupOps(
+	create func() (BackupCreateResult, error),
+	list func() ([]BackupListEntry, bool),
+	verify func(name string) (BackupVerifyResult, error),
+) {
+	if db == nil {
+		return
+	}
+	db.backupCreateFn, db.backupListFn, db.backupVerifyFn = create, list, verify
+}
+
+// BackupConfigured reports whether backup operations are wired.
+func (db *DB) BackupConfigured() bool { return db != nil && db.backupCreateFn != nil }
+
+// CreateBackup runs a BACKUP DATABASE via the wired callback. Node-local;
+// the caller enforces RBAC.
+func (db *DB) CreateBackup() (BackupCreateResult, error) {
+	if db == nil || db.backupCreateFn == nil {
+		return BackupCreateResult{}, nerr.New(nerr.Unavailable, "executor.CreateBackup",
+			"no backup directory configured on this server (set backup_dir)")
+	}
+	return db.backupCreateFn()
+}
+
+// ListBackups returns the backups in the configured backup_dir, oldest
+// first. The second return is false when no backup_dir is configured.
+func (db *DB) ListBackups() ([]BackupListEntry, bool) {
+	if db == nil || db.backupListFn == nil {
+		return nil, false
+	}
+	return db.backupListFn()
+}
+
+// VerifyBackup runs VERIFY BACKUP via the wired callback.
+func (db *DB) VerifyBackup(name string) (BackupVerifyResult, error) {
+	if db == nil || db.backupVerifyFn == nil {
+		return BackupVerifyResult{}, nerr.New(nerr.Unavailable, "executor.VerifyBackup",
+			"no backup directory configured on this server (set backup_dir)")
+	}
+	return db.backupVerifyFn(name)
 }
 
 // Drain asks the attached server, if any, to begin a graceful drain —

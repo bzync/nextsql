@@ -279,6 +279,11 @@ export declare const Kind: {
   readonly Float64: 29;
   readonly Enum: 30;
   readonly Interval: 31;
+  readonly Struct: 32;
+  readonly Array: 33;
+  readonly Map: 34;
+  readonly Geometry: 35;
+  readonly Geography: 36;
 };
 
 export declare const Type: {
@@ -317,6 +322,7 @@ export declare function decryptField(provider: FieldKeyProvider, database: strin
 export declare function validateConfig(cfg: Config): void;
 export declare function isLoopback(addr: string): boolean;
 export declare function encodeParam(v: Param): Uint8Array;
+export declare function struct(fields: Array<[string, unknown]>): { __struct: Array<[string, unknown]> };
 export declare function decodeValue(buf: Uint8Array, off: number): DecodeValue;
 export declare function encodeHello(h: Hello): Uint8Array;
 export declare function decodeHelloOK(b: Uint8Array): HelloOK;

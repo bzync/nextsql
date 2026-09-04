@@ -316,3 +316,107 @@ func TestCannotRevokeCurrent(t *testing.T) {
 		t.Fatalf("revoke current: %v", err)
 	}
 }
+
+// TestEnvelopeKeyStatus covers the system.key_versions read-model source
+// (Manager Security view, M4 remainder): a locked envelope refuses rather
+// than returning a stale/zero snapshot; a freshly created envelope reports
+// version 1 for every key with nothing revoked/retired; a rotation bumps
+// CurrentVersion/VersionCount; a Revoke of the now-superseded version drops
+// VersionCount back down while moving it into RevokedCount — and nowhere in
+// the returned struct is there room for key material to leak (the type
+// itself has no such field, not just "happens to be redacted here").
+func TestEnvelopeKeyStatus(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "db.keys")
+	root := testRoot(t)
+	env, err := CreateEnvelope(path, testIdent(t), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	statuses, err := env.KeyStatus()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(statuses) != 2+len(AllDomains) {
+		t.Fatalf("KeyStatus row count = %d, want %d (kek+master+%d domains)", len(statuses), 2+len(AllDomains), len(AllDomains))
+	}
+	byName := make(map[string]KeyStatus, len(statuses))
+	for _, st := range statuses {
+		if _, dup := byName[st.Domain]; dup {
+			t.Fatalf("duplicate key name %q in KeyStatus", st.Domain)
+		}
+		byName[st.Domain] = st
+	}
+	for _, want := range append([]string{"kek", "master"}, domainNames(t)...) {
+		st, ok := byName[want]
+		if !ok {
+			t.Fatalf("KeyStatus missing %q", want)
+		}
+		if st.CurrentVersion != 1 || st.VersionCount != 1 || st.RevokedCount != 0 || st.RetiredCount != 0 {
+			t.Fatalf("fresh envelope %q status = %+v, want version 1, count 1, nothing revoked/retired", want, st)
+		}
+	}
+
+	// Rotate DomainPage, then revoke the superseded version 1.
+	next, err := env.RotateDomain(DomainPage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next != 2 {
+		t.Fatalf("RotateDomain returned version %d, want 2", next)
+	}
+	statuses, err = env.KeyStatus()
+	if err != nil {
+		t.Fatal(err)
+	}
+	page := findKeyStatus(t, statuses, DomainName(DomainPage))
+	if page.CurrentVersion != 2 || page.VersionCount != 2 || page.RevokedCount != 0 {
+		t.Fatalf("post-rotate page status = %+v, want current 2, count 2, 0 revoked", page)
+	}
+
+	if err := env.Revoke(DomainPage, 1); err != nil {
+		t.Fatal(err)
+	}
+	statuses, err = env.KeyStatus()
+	if err != nil {
+		t.Fatal(err)
+	}
+	page = findKeyStatus(t, statuses, DomainName(DomainPage))
+	if page.CurrentVersion != 2 || page.VersionCount != 1 || page.RevokedCount != 1 {
+		t.Fatalf("post-revoke page status = %+v, want current 2, count 1 (v1's DEK is gone), 1 revoked", page)
+	}
+	// Every other domain is untouched by DomainPage's rotation/revocation.
+	wal := findKeyStatus(t, statuses, DomainName(DomainWAL))
+	if wal.CurrentVersion != 1 || wal.VersionCount != 1 || wal.RevokedCount != 0 {
+		t.Fatalf("unrelated wal status changed: %+v", wal)
+	}
+
+	_ = env.Close()
+	locked, err := OpenLocked(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := locked.KeyStatus(); !nerr.HasCode(err, nerr.Unauthorized) {
+		t.Fatalf("locked envelope must refuse KeyStatus: %v", err)
+	}
+}
+
+func domainNames(t *testing.T) []string {
+	t.Helper()
+	names := make([]string, len(AllDomains))
+	for i, d := range AllDomains {
+		names[i] = DomainName(d)
+	}
+	return names
+}
+
+func findKeyStatus(t *testing.T, statuses []KeyStatus, name string) KeyStatus {
+	t.Helper()
+	for _, st := range statuses {
+		if st.Domain == name {
+			return st
+		}
+	}
+	t.Fatalf("KeyStatus missing %q: %+v", name, statuses)
+	return KeyStatus{}
+}

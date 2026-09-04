@@ -14,7 +14,7 @@ import (
 
 const (
 	tableMagic      = "NSCT"
-	tableVersion    = 11
+	tableVersion    = 12
 	tableVersionV1  = 1
 	tableVersionV2  = 2
 	tableVersionV3  = 3
@@ -26,6 +26,7 @@ const (
 	tableVersionV9  = 9
 	tableVersionV10 = 10
 	tableVersionV11 = 11
+	tableVersionV12 = 12
 	// KeyTable prefixes durable table descriptors in the catalog tree.
 	KeyTable byte = 'T'
 	// KeyStats prefixes durable table statistics in the catalog tree.
@@ -178,7 +179,153 @@ func EncodeTable(t *Table) ([]byte, error) {
 			buf = appendString(buf, l)
 		}
 	}
+	// v12: per column, a recursive collection descriptor (STRUCT / ARRAY /
+	// MAP). A leading 0 byte marks a non-collection column and carries no
+	// further bytes; a leading 1 byte is followed by the full recursive Type
+	// (docs/design-collections.md).
+	for _, col := range t.Columns {
+		if !types.IsCollection(col.Type.Kind) {
+			buf = append(buf, 0)
+			continue
+		}
+		buf = append(buf, 1)
+		buf = appendTypeRec(buf, col.Type)
+	}
 	return buf, nil
+}
+
+// appendTypeRec serialises a full recursive Type, including a collection's
+// nested element/key/field descriptors and an ENUM's label list. Mirrors
+// takeTypeRec.
+func appendTypeRec(buf []byte, t types.Type) []byte {
+	buf = append(buf, byte(t.Kind), t.VecElem)
+	buf = appendU16(buf, t.Precision)
+	buf = appendU16(buf, t.Scale)
+	switch t.Kind {
+	case types.KindEnum:
+		buf = appendU16(buf, uint16(len(t.EnumLabels)))
+		for _, l := range t.EnumLabels {
+			buf = appendString(buf, l)
+		}
+	case types.KindArray:
+		if len(t.Elem) == 1 {
+			buf = appendTypeRec(buf, t.Elem[0])
+		}
+	case types.KindMap:
+		if len(t.Key) == 1 {
+			buf = appendTypeRec(buf, t.Key[0])
+		}
+		if len(t.Elem) == 1 {
+			buf = appendTypeRec(buf, t.Elem[0])
+		}
+	case types.KindStruct:
+		buf = appendU16(buf, uint16(len(t.Fields)))
+		for _, f := range t.Fields {
+			buf = appendString(buf, f.Name)
+			buf = appendTypeRec(buf, f.Type)
+		}
+	}
+	return buf
+}
+
+// takeTypeRec is the untrusted-decoder inverse of appendTypeRec. depth bounds
+// recursion at types.MaxNestDepth; every reconstructed collection/ENUM type is
+// re-validated through its own constructor rather than trusted as read.
+func takeTypeRec(raw []byte, off, depth int) (types.Type, int, error) {
+	if depth > types.MaxNestDepth+1 {
+		return types.Type{}, 0, nerr.New(nerr.InvalidFormat, "catalog.takeTypeRec", "collection type nesting too deep")
+	}
+	if off+6 > len(raw) {
+		return types.Type{}, 0, nerr.New(nerr.InvalidFormat, "catalog.takeTypeRec", "truncated type")
+	}
+	kind := types.Kind(raw[off])
+	elem := raw[off+1]
+	off += 2
+	prec, off, err := takeU16(raw, off)
+	if err != nil {
+		return types.Type{}, 0, err
+	}
+	scale, off, err := takeU16(raw, off)
+	if err != nil {
+		return types.Type{}, 0, err
+	}
+	base := types.Type{Kind: kind, VecElem: elem, Precision: prec, Scale: scale}
+	switch kind {
+	case types.KindEnum:
+		var n uint16
+		n, off, err = takeU16(raw, off)
+		if err != nil {
+			return types.Type{}, 0, err
+		}
+		if n > types.MaxEnumLabels {
+			return types.Type{}, 0, nerr.New(nerr.InvalidFormat, "catalog.takeTypeRec", "ENUM label count exceeds limit")
+		}
+		labels := make([]string, n)
+		for i := range labels {
+			labels[i], off, err = takeString(raw, off)
+			if err != nil {
+				return types.Type{}, 0, err
+			}
+		}
+		et, eerr := types.EnumType(labels)
+		if eerr != nil {
+			return types.Type{}, 0, nerr.Wrap(nerr.InvalidFormat, "catalog.takeTypeRec", "invalid ENUM labels", eerr)
+		}
+		return et, off, nil
+	case types.KindArray:
+		var e types.Type
+		e, off, err = takeTypeRec(raw, off, depth+1)
+		if err != nil {
+			return types.Type{}, 0, err
+		}
+		at, aerr := types.ArrayType(e)
+		if aerr != nil {
+			return types.Type{}, 0, nerr.Wrap(nerr.InvalidFormat, "catalog.takeTypeRec", "invalid ARRAY type", aerr)
+		}
+		return at, off, nil
+	case types.KindMap:
+		var k, val types.Type
+		k, off, err = takeTypeRec(raw, off, depth+1)
+		if err != nil {
+			return types.Type{}, 0, err
+		}
+		val, off, err = takeTypeRec(raw, off, depth+1)
+		if err != nil {
+			return types.Type{}, 0, err
+		}
+		mt, merr := types.MapType(k, val)
+		if merr != nil {
+			return types.Type{}, 0, nerr.Wrap(nerr.InvalidFormat, "catalog.takeTypeRec", "invalid MAP type", merr)
+		}
+		return mt, off, nil
+	case types.KindStruct:
+		var n uint16
+		n, off, err = takeU16(raw, off)
+		if err != nil {
+			return types.Type{}, 0, err
+		}
+		if n == 0 || n > types.MaxStructFields {
+			return types.Type{}, 0, nerr.New(nerr.InvalidFormat, "catalog.takeTypeRec", "STRUCT field count out of range")
+		}
+		fields := make([]types.Field, n)
+		for i := range fields {
+			fields[i].Name, off, err = takeString(raw, off)
+			if err != nil {
+				return types.Type{}, 0, err
+			}
+			fields[i].Type, off, err = takeTypeRec(raw, off, depth+1)
+			if err != nil {
+				return types.Type{}, 0, err
+			}
+		}
+		st, serr := types.StructType(fields)
+		if serr != nil {
+			return types.Type{}, 0, nerr.Wrap(nerr.InvalidFormat, "catalog.takeTypeRec", "invalid STRUCT type", serr)
+		}
+		return st, off, nil
+	default:
+		return base, off, nil
+	}
 }
 
 func validClientColumn(c Column) bool {
@@ -537,6 +684,33 @@ func DecodeTable(raw []byte) (*Table, error) {
 				return nil, nerr.New(nerr.InvalidFormat, "catalog.DecodeTable", "ENUM labels on a non-ENUM column")
 			}
 			t.Columns[i].Type = et
+		}
+	}
+	if ver >= tableVersionV12 {
+		for i := range t.Columns {
+			if off >= len(raw) {
+				return nil, nerr.New(nerr.InvalidFormat, "catalog.DecodeTable", "truncated collection descriptor")
+			}
+			flag := raw[off]
+			off++
+			switch flag {
+			case 0:
+				if types.IsCollection(t.Columns[i].Type.Kind) {
+					return nil, nerr.New(nerr.InvalidFormat, "catalog.DecodeTable", "collection column missing its descriptor")
+				}
+			case 1:
+				var ct types.Type
+				ct, off, err = takeTypeRec(raw, off, 0)
+				if err != nil {
+					return nil, err
+				}
+				if !types.IsCollection(ct.Kind) || ct.Kind != t.Columns[i].Type.Kind {
+					return nil, nerr.New(nerr.InvalidFormat, "catalog.DecodeTable", "collection descriptor Kind mismatch")
+				}
+				t.Columns[i].Type = ct
+			default:
+				return nil, nerr.New(nerr.InvalidFormat, "catalog.DecodeTable", "unknown collection descriptor flag")
+			}
 		}
 	}
 	if off != len(raw) {

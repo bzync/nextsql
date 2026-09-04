@@ -306,6 +306,28 @@ func mapIdents(e ast.Expr, fn func(string) string) ast.Expr {
 		parts := append([]string(nil), x.Parts...)
 		parts[0] = fn(parts[0])
 		return ast.Path{Parts: parts}
+	case ast.ArrayCtor:
+		els := make([]ast.Expr, len(x.Elems))
+		for i, el := range x.Elems {
+			els[i] = mapIdents(el, fn)
+		}
+		return ast.ArrayCtor{Elems: els}
+	case ast.StructCtor:
+		els := make([]ast.Expr, len(x.Elems))
+		for i, el := range x.Elems {
+			els[i] = mapIdents(el, fn)
+		}
+		return ast.StructCtor{Names: append([]string(nil), x.Names...), Elems: els}
+	case ast.MapCtor:
+		ks := make([]ast.Expr, len(x.Keys))
+		vs := make([]ast.Expr, len(x.Vals))
+		for i := range x.Keys {
+			ks[i] = mapIdents(x.Keys[i], fn)
+			vs[i] = mapIdents(x.Vals[i], fn)
+		}
+		return ast.MapCtor{Keys: ks, Vals: vs}
+	case ast.FieldAccess:
+		return ast.FieldAccess{Base: mapIdents(x.Base, fn), Field: x.Field}
 	default:
 		return e
 	}
@@ -405,6 +427,21 @@ func walkIdents(e ast.Expr, fn func(string)) {
 		if len(x.Parts) > 0 {
 			fn(x.Parts[0])
 		}
+	case ast.ArrayCtor:
+		for _, el := range x.Elems {
+			walkIdents(el, fn)
+		}
+	case ast.StructCtor:
+		for _, el := range x.Elems {
+			walkIdents(el, fn)
+		}
+	case ast.MapCtor:
+		for i := range x.Keys {
+			walkIdents(x.Keys[i], fn)
+			walkIdents(x.Vals[i], fn)
+		}
+	case ast.FieldAccess:
+		walkIdents(x.Base, fn)
 	}
 }
 

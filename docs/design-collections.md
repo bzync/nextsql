@@ -1,15 +1,20 @@
 # Collections — design & decomposition
 
-> Status: **scoped, not implemented.** Split out of the Datatype expansion
-> track's D9 item (`docs/design-datatypes.md`) on 2026-09-04 at the user's
-> request, following the same "smallest coherent increment" discipline as
-> that track and Multi-database hosting (`docs/design-multidatabase-dbaas.md`).
-> This document identifies the open questions and a sequenced plan; it does
-> not make the implementation-level decisions itself — several explicitly
-> need `AskUserQuestion` before any code, called out inline. Mirrored in
-> `TODO.md` under "Cross-cutting track — Collections." This track gates no
-> release phase and should not be started opportunistically inside other
-> phase/track work.
+> Status: **C1 `STRUCT`, C2 `ARRAY`, C3 `MAP` — all LANDED 2026-09-04**
+> (`TODO.md` log #107). Core engine (recursive `types.Type`, nested `NSRW`
+> row + sortable-key encoding, `NSCT` v11→v12 catalog descriptor, recursive
+> wire-protocol descriptor, lexer/parser/binder/executor, vectorized batch,
+> `xport`, FK exclusion), all 7 official drivers, decoder fuzzing, and live
+> verification through a real `nextsqld` all complete. Split out of the
+> Datatype expansion track's D9 item (`docs/design-datatypes.md`) on
+> 2026-09-04 at the user's request; implemented end-to-end under the user's
+> "implement Collections and Spatial ... must be full". This track gates no
+> release phase.
+>
+> The open questions each C-item's §3 stub used to defer to `AskUserQuestion`
+> were resolved in code and recorded in each item's "Landed design record"
+> below (the `docs/design-datatypes.md` §2 decision-record shape: on-disk
+> layout, index-key ordering, CAST/coercion, `ENCRYPTED CLIENT` eligibility).
 
 ## 1. Why this is its own track, not a Datatype-expansion item
 
@@ -72,47 +77,97 @@ and any design here needs to explain why it isn't just reusing them:
   (e.g. `VECTOR` for fixed-dimension float arrays feeding ANN search;
   `ARRAY<T>` for variable-length or non-float element sequences).
 
-## 3. Sequenced plan (draft — needs scoping, not yet decided)
+## 2a. Landed design record (all three C-items, 2026-09-04)
 
-Following the Datatype-expansion track's convention of ordering by
-value-to-cost ratio and dependency:
+Shared decisions, made once and recorded here; per-item specifics follow in §3.
 
-### C1 — `STRUCT<field: T, ...>` (fixed, named, heterogeneous fields)
+- **Recursive `types.Type`**: new `Fields []Field` (STRUCT), `Elem []Type`
+  (ARRAY element / MAP value), `Key []Type` (MAP key) — slices not `*Type`,
+  so `Type` stays copyable with no aliasing; `Equals`/`String`/`Comparable`
+  recurse. Constructors enforce `MaxNestDepth` = 8, `MaxStructFields` = 128,
+  `MaxCollectionLen` = 2²⁰.
+- **Heap-row encoding** (`row.go`): self-describing nested form — `u32` body
+  length (O(1) `skipScalar` at any depth), `u32` member count, null bitmap,
+  then each non-null member via `encodeScalar` recursively (MAP members
+  interleaved key,value,…). NSJB-shaped, as §1 predicted.
+- **Index-key ordering — all three ARE orderable** (resolving §1's open
+  question toward lexicographic tuple order): each member framed with a
+  marker byte `0x00` end / `0x01` NULL / `0x02` present, so a shorter
+  prefix sorts first and NULLs sort before present values; decode is
+  type-directed so payloads need no escaping. `Value.Cmp` matches
+  (`cmpMember`).
+- **Vectorized batch**: one boxed `[]types.Value` per row (`Vector.Coll`,
+  `+ CollKeys` for MAP) — the deliberately simple representation; a nested
+  columnar layout is a later optimization, not a correctness need.
+- **Catalog**: `NSCT` v11→**v12**, one recursive per-column descriptor
+  (`appendTypeRec`/`takeTypeRec`, depth-bounded, re-validated on decode);
+  `internal/upgrade/compat` `FamilyCatalog` window → 12.
+- **Wire protocol**: recursive `appendTypeFull`/`readTypeBody` after the
+  fixed 5-byte meta — **no protocol version bump** (scalar header
+  byte-identical; same precedent as ENUM's variable Type metadata).
+- **`ENCRYPTED CLIENT`: not eligible** for any collection kind
+  (structurally — client columns must be `KindString`); the server must
+  inspect structure for indexing/projection/coercion.
+- **FK eligibility**: collections cannot be FK columns (`catalog/fk.go`
+  block-list, with `VECTOR`/`JSON`).
+- **Aggregates**: `MIN`/`MAX` via generic `Value.Cmp`; `SUM`/`AVG` error.
+- **Coercion**: isolated except same-Kind collections (member-by-member) and
+  text (`Value.String()` → `STRING`/`TEXT`). MAP re-sorts to canonical key
+  order + rejects duplicate keys (`CanonicalizeMap`). Implicit `JSON` ⇄
+  collection coercion is **deliberately deferred** (clean follow-up: needs
+  an `NSJB` ⇄ typed-collection bridge).
+- **Grammar**: types `STRUCT<name TYPE, …>` / `ARRAY<TYPE>` /
+  `MAP<KEYTYPE, VALTYPE>` (`<…>`, BigQuery-style). Constructors are
+  function-call-shaped (no new lexer token): `ARRAY(e1, …)`,
+  `STRUCT(e1 AS f1, …)`, `MAP(k1, v1, …)` — server re-coerces member types
+  against the destination column. STRUCT field access is `col.field[.field…]`
+  (extends the `Path` node; a `Path` whose head column is a `STRUCT` is
+  field access, else JSON path extract). Accessors: `ELEMENT_AT` (1-based
+  for arrays), `CARDINALITY`/`ARRAY_LENGTH`/`MAP_SIZE`, `ARRAY_CONTAINS`,
+  `MAP_CONTAINS_KEY`, `MAP_KEYS`, `MAP_VALUES`.
+- **Drivers, all 7**: Go needs no change (shares `internal/protocol`);
+  JS/Bun/Deno (shared `protocol.mjs`), Node, PHP, Python, Ruby each gained
+  `Kind` 32/33/34, a recursive type-descriptor codec, a param path
+  (a plain list → ARRAY, plus `struct(...)` / `MapValue` / `StructValue`
+  wrappers), and RowDesc/value decode. Each driver's own suite gained a
+  collection round-trip test incl. a NULL member and a nested collection.
+
+## 3. Sequenced plan — all landed 2026-09-04
+
+Per-item specifics; the shared decisions are in §2a. Ordered as originally
+planned by value-to-cost ratio, though all three shipped in one increment.
+
+### C1 — `STRUCT<name T, ...>` (fixed, named, heterogeneous fields) — LANDED 2026-09-04
 Plausibly the cheapest of the three: a `STRUCT` column has a fixed,
 schema-known field list, so (unlike `ARRAY`/`MAP`) its size and layout are
 static per declared type, closer in spirit to a nested `CREATE TABLE`
 column list than to a variable-length collection. Candidate for the actual
 first increment if this track is picked up, but **not decided**.
 
-**Open questions needing `AskUserQuestion` before any code:**
-- Are nested `STRUCT`s inside a `STRUCT` allowed (recursion depth), and is
-  there a bound?
-- Does a `STRUCT` field support `NOT NULL`/`DEFAULT` the way a top-level
-  column does, or is the whole `STRUCT` value nullable only as a unit?
-- `CAST`/coercion: does a `JSON` object with matching keys implicitly
-  coerce to a `STRUCT`, or is construction explicit-only
-  (`STRUCT(field: expr, ...)` syntax)?
-- Index-key ordering: field-order lexicographic comparison, or
-  non-orderable (rejected in `PRIMARY KEY`/`ORDER BY`/index contexts)?
+**Open questions — all RESOLVED in code (see §2a and below):**
+- Nested `STRUCT`/`ARRAY`/`MAP` inside a `STRUCT` **allowed**, bounded at
+  `MaxNestDepth` = 8.
+- A `STRUCT` field is individually nullable (per-field null bit in the
+  nested encoding); the whole value is also nullable as a unit. Per-field
+  `NOT NULL`/`DEFAULT` constraints are **out of scope** (matches Postgres
+  composite types) — deferred, not blocking.
+- Construction is explicit: `STRUCT(expr AS name, ...)`. Implicit `JSON`
+  object → `STRUCT` coercion is **deferred** (see §2a).
+- Index-key ordering: **field-order lexicographic**, orderable (§2a).
 
-### C2 — `ARRAY<T>` (variable-length, homogeneous)
-**Open questions needing `AskUserQuestion` before any code:**
-- Element type restrictions: can `T` be `VECTOR`/`JSON`/another `ARRAY`
-  (arbitrary nesting), or is `T` restricted to non-collection scalars for
-  the first increment (deferring nested arrays to a later item, the way
-  D1-D11 deferred collections entirely)?
-- A max length bound (mirroring `MaxEnumLabels`'s 4096, `MaxVectorDim`,
-  etc.) — resource-safety requires *some* bound per `AGENTS.md` §10.
-  What's the right ceiling for an array column, and should it be
-  per-declaration (`ARRAY<T>(max_len)`) or a single engine-wide constant?
-- Index-key ordering: lexicographic element-by-element (like a tuple), or
-  non-orderable?
-- Vectorized-batch representation (§1 above) — offsets + flat child array,
-  vs. one Go slice-of-slices per row, vs. something else; this has real
-  performance implications and deserves a benchmark-informed decision, not
-  a default picked for expedience.
+### C2 — `ARRAY<T>` (variable-length, homogeneous) — LANDED 2026-09-04
+**Open questions — all RESOLVED in code (see §2a and below):**
+- `T` may be any storable type including another collection (arbitrary
+  nesting up to `MaxNestDepth` = 8). `VECTOR`/`JSON` as an element are
+  allowed by the type system (not specially blocked).
+- A single engine-wide constant `MaxCollectionLen` = 2²⁰, enforced at
+  decode and coerce time (not a per-declaration `ARRAY<T>(n)`).
+- Index-key ordering: **lexicographic element-by-element**, orderable (§2a).
+- Vectorized-batch representation: **one boxed `[]types.Value` per row**
+  (§2a); a nested columnar layout is a later, benchmark-informed
+  optimization.
 
-### C3 — `MAP<K,V>` (variable-length, homogeneous key/value pairs)
+### C3 — `MAP<K,V>` (variable-length, homogeneous key/value pairs) — LANDED 2026-09-04
 Likely the most expensive of the three: needs a defined key-uniqueness
 rule, a key ordering/comparison rule (for a canonical on-disk
 representation — two maps with the same entries in different insertion
@@ -120,29 +175,32 @@ order must encode identically or comparison/equality breaks), and
 key-type restrictions (can `K` be a `JSON` or `ARRAY`, or only orderable
 scalars?).
 
-**Open questions needing `AskUserQuestion` before any code:**
-- Key type restriction (orderable scalars only, most likely, but this is a
-  decision, not an assumption).
-- Canonical key ordering for on-disk encoding (sorted by `K`'s own
-  canonical order, most likely, for deterministic equality/comparison —
-  but explicit sign-off needed, matching every other D-track ordering
-  decision).
-- Duplicate-key behavior on construction: last-write-wins, or reject?
+**Open questions — all RESOLVED in code (see §2a and below):**
+- Key type: **orderable scalars only** (`MapKeyComparable` — no
+  collection/`JSON`/`VECTOR`/geo keys).
+- Canonical key ordering: **sorted by `K`'s own `Value.Cmp` order**
+  (`CanonicalizeMap`), so two MAPs with the same entries encode and
+  compare identically regardless of construction order.
+- Duplicate keys on construction: **rejected** (`CanonicalizeMap` errors).
 
-## 4. What this document deliberately does not do
+## 4. Deliberately out of scope (deferred, not blocking)
 
-Per the user's 2026-09-04 direction (split D9 into its own track, scope
-only, do not implement): this document identifies the shape of the problem
-and the specific decisions blocking each sub-item. It does not:
-
-- pick a storage format for any of C1/C2/C3 (each needs the
-  `docs/design-datatypes.md` §2-style decision record — on-disk layout,
-  index-key ordering, `CAST`/coercion rules, `ENCRYPTED CLIENT`
-  eligibility — filled in only after the open questions above are
-  answered);
-- write any code, `Kind` constant, or catalog format change;
-- commit this track to a specific next increment (C1 `STRUCT` is the
-  *candidate* smallest first step, not a decision).
+- **Implicit `JSON` ⇄ collection coercion** — a `JSON` object → `STRUCT`,
+  `JSON` array → `ARRAY<T>`, etc. Clean, separable follow-up: needs an
+  `NSJB` builder from a typed collection value and the inverse walk. A
+  collection → `STRING`/`TEXT` (via `Value.String()`) *is* supported.
+- **Per-field `NOT NULL` / `DEFAULT`** on a `STRUCT` field (matches
+  Postgres composite types, which don't enforce these on subfields).
+- **`ARRAY<T>(n)` per-declaration length bound** — a single engine-wide
+  `MaxCollectionLen` is used instead.
+- **Nested columnar (Arrow-style) vectorized-batch layout** — the boxed
+  `[]types.Value` representation is correct; this is a perf optimization
+  gated on a benchmark showing it matters.
+- **`[...]` / `[i]` subscript sugar** in the grammar — accessor functions
+  (`ELEMENT_AT`, `ARRAY_LENGTH`, …) cover the same ground with no new
+  lexer token; subscript sugar could be added later.
+- **`ARRAY_AGG` / `MAP_AGG` aggregates**, `UNNEST` in `FROM`, array/map
+  `slice`/`concat`/`sort`/`distinct` helpers — a natural next increment.
 
 ## 5. Source of truth
 

@@ -2,6 +2,7 @@ package types
 
 import (
 	"math"
+	"strings"
 
 	"github.com/bzync/nextsql/internal/nerr"
 )
@@ -96,7 +97,111 @@ const (
 	// needed (unlike KindEnum, INTERVAL's 3 fields fit in the existing fixed
 	// Value shape, no per-column metadata).
 	KindInterval
+	// KindStruct / KindArray / KindMap are the recursive collection type
+	// constructors (Collections track, docs/design-collections.md). Unlike
+	// every scalar D-track Kind these carry a recursive Type descriptor:
+	// STRUCT an ordered named (name, Type) field list on Type.Fields; ARRAY a
+	// single element Type on Type.Elem; MAP a key Type on Type.Key and a value
+	// Type on Type.Elem. The heap-row and sortable-key encodings gain a
+	// self-describing nested sub-encoding; the catalog persists the full
+	// recursive descriptor (NSCT v11 -> v12) and the wire protocol carries it
+	// as bounded recursive metadata. Appended last so the numeric tags stay
+	// stable across every driver's Kind table.
+	KindStruct
+	KindArray
+	KindMap
+	// KindGeometry (planar / Cartesian) and KindGeography (geodetic /
+	// great-circle) are the general OGC spatial types (Spatial track,
+	// docs/design-spatial.md) — a PostGIS-style subsystem alongside the four
+	// fixed WGS84 shapes (KindPoint/KindBox/KindLine/KindPolygon), NOT a
+	// generalization of them. SRID travels on Type.Precision, the geometry
+	// subtype on Type.Scale (see GeomSub* below) — so no NSCT/protocol
+	// version bump, same as every scalar D-item. On-disk payload is EWKB.
+	// Landing incrementally (S1..S6); until S1's row codec lands, a column of
+	// either Kind parses but a value cannot be encoded.
+	KindGeometry
+	KindGeography
 )
+
+// Geometry subtype tags, stored in Type.Scale for a KindGeometry /
+// KindGeography column. GeomSubAny (0) means the column accepts any subtype.
+const (
+	GeomSubAny uint16 = iota
+	GeomSubPoint
+	GeomSubLineString
+	GeomSubPolygon
+	GeomSubMultiPoint
+	GeomSubMultiLineString
+	GeomSubMultiPolygon
+	GeomSubGeometryCollection
+)
+
+// GeomSubName is the spelling used inside GEOMETRY(<sub>, <srid>).
+func GeomSubName(s uint16) string {
+	switch s {
+	case GeomSubPoint:
+		return "Point"
+	case GeomSubLineString:
+		return "LineString"
+	case GeomSubPolygon:
+		return "Polygon"
+	case GeomSubMultiPoint:
+		return "MultiPoint"
+	case GeomSubMultiLineString:
+		return "MultiLineString"
+	case GeomSubMultiPolygon:
+		return "MultiPolygon"
+	case GeomSubGeometryCollection:
+		return "GeometryCollection"
+	default:
+		return ""
+	}
+}
+
+// GeomSubByName is the inverse of GeomSubName (case-insensitive); ok is false
+// for an unknown spelling.
+func GeomSubByName(name string) (sub uint16, ok bool) {
+	for s := GeomSubPoint; s <= GeomSubGeometryCollection; s++ {
+		if strings.EqualFold(GeomSubName(s), name) {
+			return s, true
+		}
+	}
+	return 0, false
+}
+
+// Recognised SRID codes (docs/design-spatial.md §2.3). A column may declare
+// any u16 SRID (opaque metadata); only ST_Transform and the geodetic-math
+// path care about the specific value.
+const (
+	SRIDUnknown uint16 = 0
+	SRIDWGS84   uint16 = 4326
+	SRIDWebMerc uint16 = 3857
+)
+
+// GeometryType builds a GEOMETRY(<sub>, <srid>) column type. sub may be
+// GeomSubAny; srid may be 0 (docs/design-spatial.md §2.2).
+func GeometryType(sub, srid uint16) (Type, error) {
+	if sub > GeomSubGeometryCollection {
+		return Type{}, nerr.New(nerr.InvalidArgument, "types.GeometryType", "unknown geometry subtype")
+	}
+	return Type{Kind: KindGeometry, Precision: srid, Scale: sub}, nil
+}
+
+// GeographyType builds a GEOGRAPHY(<sub>, <srid>) column type. An unset SRID
+// defaults to WGS84 — the only geodetic frame this engine models.
+func GeographyType(sub, srid uint16) (Type, error) {
+	if sub > GeomSubGeometryCollection {
+		return Type{}, nerr.New(nerr.InvalidArgument, "types.GeographyType", "unknown geometry subtype")
+	}
+	if srid == SRIDUnknown {
+		srid = SRIDWGS84
+	}
+	return Type{Kind: KindGeography, Precision: srid, Scale: sub}, nil
+}
+
+// IsGeneralSpatial reports whether k is one of the general OGC spatial Kinds
+// (GEOMETRY / GEOGRAPHY) — as opposed to the four fixed WGS84 shapes.
+func IsGeneralSpatial(k Kind) bool { return k == KindGeometry || k == KindGeography }
 
 func (k Kind) String() string {
 	switch k {
@@ -162,9 +267,25 @@ func (k Kind) String() string {
 		return "ENUM"
 	case KindInterval:
 		return "INTERVAL"
+	case KindStruct:
+		return "STRUCT"
+	case KindArray:
+		return "ARRAY"
+	case KindMap:
+		return "MAP"
+	case KindGeometry:
+		return "GEOMETRY"
+	case KindGeography:
+		return "GEOGRAPHY"
 	default:
 		return "INVALID"
 	}
+}
+
+// IsCollection reports whether k is one of the recursive collection type
+// constructors (STRUCT / ARRAY / MAP), docs/design-collections.md.
+func IsCollection(k Kind) bool {
+	return k == KindStruct || k == KindArray || k == KindMap
 }
 
 // IntRange returns the inclusive representable range of a fixed-width signed
@@ -278,6 +399,174 @@ type Type struct {
 	Scale      uint16 // DECIMAL s
 	VecElem    uint8  // VecF32
 	EnumLabels []string
+	// Collection descriptors (Collections track, docs/design-collections.md).
+	// Elem carries ARRAY<T>'s element type and MAP<K,V>'s value type; Key
+	// carries MAP<K,V>'s key type; Fields carries STRUCT's ordered named field
+	// list. Each is a slice (length 0 or 1 for Elem/Key) rather than a *Type
+	// so Type stays copyable by value with no aliasing surprises — the same
+	// immutable-after-construction treatment EnumLabels already gets. Every
+	// non-collection Type leaves all three nil.
+	Elem   []Type
+	Key    []Type
+	Fields []Field
+}
+
+// Field is one named member of a STRUCT type, in declaration order.
+type Field struct {
+	Name string
+	Type Type
+}
+
+// Collection abuse limits (resource safety, AGENTS.md §10 / SKILLS.md §10).
+// MaxNestDepth bounds how deeply STRUCT/ARRAY/MAP may nest inside one another;
+// MaxStructFields bounds a STRUCT's field count; MaxCollectionLen bounds the
+// element count of one ARRAY value and the entry count of one MAP value at
+// decode/coerce time (each element is at least one encoded byte, so the row
+// byte length and the 16 KiB page bound it further in practice).
+const (
+	MaxNestDepth     = 8
+	MaxStructFields  = 128
+	MaxCollectionLen = 1 << 20
+)
+
+// typeDepth returns the collection nesting depth of t: 0 for any scalar, 1 for
+// a collection of scalars, 2 for a collection of collections of scalars, etc.
+func typeDepth(t Type) int {
+	switch t.Kind {
+	case KindArray:
+		if len(t.Elem) == 1 {
+			return 1 + typeDepth(t.Elem[0])
+		}
+		return 1
+	case KindMap:
+		d := 0
+		if len(t.Key) == 1 {
+			d = typeDepth(t.Key[0])
+		}
+		if len(t.Elem) == 1 {
+			if e := typeDepth(t.Elem[0]); e > d {
+				d = e
+			}
+		}
+		return 1 + d
+	case KindStruct:
+		d := 0
+		for _, f := range t.Fields {
+			if e := typeDepth(f.Type); e > d {
+				d = e
+			}
+		}
+		return 1 + d
+	default:
+		return 0
+	}
+}
+
+// validElementType rejects a collection element/field/value type that cannot
+// be stored: KindInvalid, KindNull, and a bare (descriptor-less) collection.
+func validElementType(t Type) error {
+	switch t.Kind {
+	case KindInvalid, KindNull:
+		return nerr.New(nerr.InvalidArgument, "types.collection", "invalid collection element type")
+	case KindArray:
+		if len(t.Elem) != 1 {
+			return nerr.New(nerr.InvalidArgument, "types.collection", "ARRAY element type is missing its element descriptor")
+		}
+	case KindMap:
+		if len(t.Key) != 1 || len(t.Elem) != 1 {
+			return nerr.New(nerr.InvalidArgument, "types.collection", "MAP element type is missing its key/value descriptor")
+		}
+	case KindStruct:
+		if len(t.Fields) == 0 {
+			return nerr.New(nerr.InvalidArgument, "types.collection", "STRUCT element type has no fields")
+		}
+	}
+	return nil
+}
+
+// ArrayType builds an ARRAY<T> column type. T may itself be a collection, up
+// to MaxNestDepth (docs/design-collections.md C2).
+func ArrayType(elem Type) (Type, error) {
+	if err := validElementType(elem); err != nil {
+		return Type{}, err
+	}
+	t := Type{Kind: KindArray, Elem: []Type{elem}}
+	if typeDepth(t) > MaxNestDepth {
+		return Type{}, nerr.New(nerr.InvalidArgument, "types.ArrayType", "collection nesting exceeds MaxNestDepth")
+	}
+	return t, nil
+}
+
+// MapKeyComparable reports whether k is a legal MAP key kind: an orderable
+// scalar (so a MAP value has a deterministic canonical on-disk order — see
+// docs/design-collections.md C3). Collections, JSON, VECTOR and geo are
+// rejected as keys.
+func MapKeyComparable(t Type) bool {
+	switch t.Kind {
+	case KindUUID, KindString, KindText, KindChar, KindVarchar, KindBlob, KindBool,
+		KindDecimal, KindInt8, KindInt16, KindInt32, KindInt64,
+		KindUint8, KindUint16, KindUint32, KindUint64,
+		KindFloat32, KindFloat64, KindDate, KindTime, KindTimestamp, KindTimestampTZ,
+		KindInterval, KindEnum:
+		return true
+	default:
+		return false
+	}
+}
+
+// MapType builds a MAP<K,V> column type. K must be an orderable scalar; V may
+// be any storable type including another collection (docs/design-collections.md C3).
+func MapType(key, val Type) (Type, error) {
+	if !MapKeyComparable(key) {
+		return Type{}, nerr.New(nerr.InvalidArgument, "types.MapType", "MAP key type must be an orderable scalar")
+	}
+	if err := validElementType(val); err != nil {
+		return Type{}, err
+	}
+	t := Type{Kind: KindMap, Key: []Type{key}, Elem: []Type{val}}
+	if typeDepth(t) > MaxNestDepth {
+		return Type{}, nerr.New(nerr.InvalidArgument, "types.MapType", "collection nesting exceeds MaxNestDepth")
+	}
+	return t, nil
+}
+
+// StructType builds a STRUCT<name T, ...> column type from an ordered field
+// list. Field names must be non-empty and unique (case-sensitive), and there
+// must be at least one and at most MaxStructFields (docs/design-collections.md C1).
+func StructType(fields []Field) (Type, error) {
+	if len(fields) == 0 || len(fields) > MaxStructFields {
+		return Type{}, nerr.New(nerr.InvalidArgument, "types.StructType", "STRUCT needs 1..MaxStructFields fields")
+	}
+	seen := make(map[string]struct{}, len(fields))
+	cp := make([]Field, len(fields))
+	for i, f := range fields {
+		if f.Name == "" || len(f.Name) > 255 {
+			return Type{}, nerr.New(nerr.InvalidArgument, "types.StructType", "STRUCT field name length is invalid")
+		}
+		if _, dup := seen[f.Name]; dup {
+			return Type{}, nerr.New(nerr.InvalidArgument, "types.StructType", "duplicate STRUCT field name")
+		}
+		seen[f.Name] = struct{}{}
+		if err := validElementType(f.Type); err != nil {
+			return Type{}, err
+		}
+		cp[i] = f
+	}
+	t := Type{Kind: KindStruct, Fields: cp}
+	if typeDepth(t) > MaxNestDepth {
+		return Type{}, nerr.New(nerr.InvalidArgument, "types.StructType", "collection nesting exceeds MaxNestDepth")
+	}
+	return t, nil
+}
+
+// StructFieldIndex returns the 0-based position of the named field, or -1.
+func (t Type) StructFieldIndex(name string) int {
+	for i, f := range t.Fields {
+		if f.Name == name {
+			return i
+		}
+	}
+	return -1
 }
 
 // MaxEnumLabels bounds an ENUM's declared label list. The on-disk ordinal is
@@ -339,6 +628,41 @@ func (t Type) String() string {
 			out += "'" + l + "'"
 		}
 		return out + ")"
+	case KindArray:
+		if len(t.Elem) == 1 {
+			return "ARRAY<" + t.Elem[0].String() + ">"
+		}
+		return "ARRAY"
+	case KindMap:
+		if len(t.Key) == 1 && len(t.Elem) == 1 {
+			return "MAP<" + t.Key[0].String() + ", " + t.Elem[0].String() + ">"
+		}
+		return "MAP"
+	case KindStruct:
+		out := "STRUCT<"
+		for i, f := range t.Fields {
+			if i > 0 {
+				out += ", "
+			}
+			out += f.Name + " " + f.Type.String()
+		}
+		return out + ">"
+	case KindGeometry, KindGeography:
+		name := "GEOMETRY"
+		if t.Kind == KindGeography {
+			name = "GEOGRAPHY"
+		}
+		sub := GeomSubName(t.Scale)
+		if sub == "" && t.Precision == 0 {
+			return name
+		}
+		if sub == "" {
+			sub = "Geometry"
+		}
+		if t.Precision == 0 {
+			return name + "(" + sub + ")"
+		}
+		return name + "(" + sub + ", " + itoa(int(t.Precision)) + ")"
 	default:
 		return t.Kind.String()
 	}
@@ -375,6 +699,24 @@ func (t Type) Equals(o Type) bool {
 	}
 	for i := range t.EnumLabels {
 		if t.EnumLabels[i] != o.EnumLabels[i] {
+			return false
+		}
+	}
+	if len(t.Elem) != len(o.Elem) || len(t.Key) != len(o.Key) || len(t.Fields) != len(o.Fields) {
+		return false
+	}
+	for i := range t.Elem {
+		if !t.Elem[i].Equals(o.Elem[i]) {
+			return false
+		}
+	}
+	for i := range t.Key {
+		if !t.Key[i].Equals(o.Key[i]) {
+			return false
+		}
+	}
+	for i := range t.Fields {
+		if t.Fields[i].Name != o.Fields[i].Name || !t.Fields[i].Type.Equals(o.Fields[i].Type) {
 			return false
 		}
 	}
@@ -499,6 +841,19 @@ func (t Type) Comparable() bool {
 	case KindUUID, KindString, KindText, KindDecimal, KindTimestampTZ, KindBool, KindPoint, KindBox, KindLine, KindPolygon, KindBlob,
 		KindInt8, KindInt16, KindInt32, KindInt64, KindUint8, KindUint16, KindUint32, KindUint64, KindDate, KindTime,
 		KindChar, KindVarchar, KindTimestamp, KindFloat32, KindFloat64, KindEnum, KindInterval:
+		return true
+	case KindArray:
+		return len(t.Elem) == 1 && t.Elem[0].Comparable()
+	case KindMap:
+		return len(t.Key) == 1 && len(t.Elem) == 1 && t.Key[0].Comparable() && t.Elem[0].Comparable()
+	case KindStruct:
+		for _, f := range t.Fields {
+			if !f.Type.Comparable() {
+				return false
+			}
+		}
+		return len(t.Fields) > 0
+	case KindGeometry, KindGeography:
 		return true
 	default:
 		return false

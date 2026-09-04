@@ -1567,11 +1567,22 @@ func (s *Session) indexKV(tab *catalog.Table, idx catalog.Index, row []types.Val
 		if len(idx.Columns) != 1 {
 			return nil, nil, nerr.New(nerr.InvalidArgument, "executor.indexKV", "spatial index column count")
 		}
-		pt := row[idx.Columns[0]]
-		if pt.Null || pt.Typ.Kind != types.KindPoint {
-			return nil, nil, nerr.New(nerr.InvalidArgument, "executor.indexKV", "spatial index requires POINT")
+		g := row[idx.Columns[0]]
+		var cx, cy float64
+		switch {
+		case g.Null:
+			return nil, nil, nerr.New(nerr.InvalidArgument, "executor.indexKV", "spatial index value is NULL")
+		case g.Typ.Kind == types.KindPoint:
+			cx, cy = g.Lon, g.Lat
+		case types.IsGeneralSpatial(g.Typ.Kind) && g.Geom != nil:
+			// Key on the bounding-box centre — the spatial index is lossy and
+			// every scan carries an exact residual (docs/design-spatial.md §2.6).
+			bb := types.GeomBBox(g.Geom)
+			cx, cy = (bb[0]+bb[2])/2, (bb[1]+bb[3])/2
+		default:
+			return nil, nil, nerr.New(nerr.InvalidArgument, "executor.indexKV", "spatial index requires POINT, GEOMETRY, or GEOGRAPHY")
 		}
-		k, err := types.EncodeGeoKey(types.GeoHash64(pt.Lon, pt.Lat), tab.PKValues(row))
+		k, err := types.EncodeGeoKey(types.GeoHash64(cx, cy), tab.PKValues(row))
 		if err != nil {
 			return nil, nil, err
 		}

@@ -43,6 +43,15 @@ func LocalMissing(op, message string) error {
 	}
 }
 
+// Validation is an invalid_argument that exits 6 (a supplied plan or
+// configuration failed validation — distinct from a malformed flag).
+func Validation(op, message string) error {
+	return &codedError{
+		code: ExitValidation,
+		err:  nerr.New(nerr.InvalidArgument, op, message),
+	}
+}
+
 // Code maps err to a process exit code. nil is 0.
 func Code(err error) int {
 	if err == nil {

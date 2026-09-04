@@ -23,6 +23,632 @@ A roadmap item is not recorded as completed here until its implementation, tests
 
 ## [Unreleased]
 
+### Verified / Fixed — Linux installer platform testing (P28, 2026-09-04)
+
+- Live end-to-end verification of the three Linux packaging artifacts
+  `scripts/build-linux-installer.sh` produces, on amd64: `.tar.gz`
+  (`install.sh --user` → `nextsql init` → real `nextsqld` → `nextsql exec`
+  → `uninstall.sh`, confirming binaries are removed and data/keys are left
+  in place), the self-extracting `.run` (same flow via `nextsql version`),
+  and the `.deb` (`dpkg-deb --info`/`--contents` against the `fakeroot`-built
+  package). A live system-wide `dpkg -i` was not performed (would mutate a
+  shared host's `/etc`, `/var/lib`, and systemd state). `.rpm` and the
+  Windows installers remain untested end to end — `rpmbuild`/Wine are not
+  available in this environment.
+- Fixed a stale `dist/` output-path reference left over from an earlier
+  rename: `scripts/build-linux-installer.sh`, `scripts/build-windows-installer.sh`,
+  and `packaging/lib.sh`'s `usage_common` all documented `dist/` as the
+  default output directory while the actual default is `installers/` in
+  every script; `packaging/README.md` had the same stale path. All four
+  now say `installers/`.
+- Added `/installers/` to `.gitignore` — the default build output directory
+  had no ignore entry, so a local build run showed as untracked (multi-MB
+  binary) files in `git status`.
+
+### Added — NextSQL Manager MVP slice M5: Backups, completing the Manager MVP (P28, 2026-09-04)
+
+- New `BACKUP DATABASE` and `VERIFY BACKUP 'name'` SQL statements: create a
+  verified encrypted backup of the connected node into its configured
+  `backup_dir` (config key), and integrity-check an existing one. Both
+  require the `BACKUP` privilege or cluster `ADMIN`, are node-local, and
+  fail `Unavailable` if `backup_dir` is unset. `BACKUP DATABASE` cannot run
+  inside a transaction.
+- New `backup.CreateFromEngine`: a hot-backup path that reuses the server's
+  already-open engine (checkpoint, then copy the file set while the server
+  keeps serving; restore reconciles the fuzzy copy by replaying WAL). No
+  second engine open and no second recovery pass, so neither can truncate a
+  WAL tail the other is mid-write on.
+- New `system.backups` virtual table: the verified backups in `backup_dir`,
+  oldest first — `name, created_at, database_id, checkpoint_lsn,
+  durable_lsn`. `BACKUP`-privilege gated; zero rows when `backup_dir` is
+  unset.
+- New config key `backup_dir`.
+- Manager: `GET /api/v1/backups`, `POST /api/v1/backups/action`
+  (create / verify), and a Backups view with a "Back up now" button and a
+  per-row Verify action.
+- **Restore and PITR stay offline-only** — a running server cannot restore
+  into itself. The Backups view prints the exact `nextsql restore` command.
+- **The NextSQL Manager MVP is complete**: all nine slices M1–M9, and the
+  Phase 28 Manager exit gate is closed.
+
+### Changed — system schema version 2 → 3 (P28, 2026-09-04)
+
+- `internal/system.SchemaVersion` is now 3; `system.capabilities` advertises
+  `system_schema_v3`. Driven by `system.config` gaining `file_value` /
+  `restart_required` columns (Manager M8). Also covers the tables added
+  during the Manager MVP: `system.tls`, `system.key_versions`,
+  `system.audit_verify`, `system.audit_log`, `system.config`,
+  `system.metrics`, `system.server_log`, `system.backups`.
+
+### Added — NextSQL Manager MVP slice M8: Configuration — validated safe editor, completing M8 (P28, 2026-09-04)
+
+- New `SET CONFIG key = value` SQL statement: persists one server setting to
+  the node's on-disk `nextsql.conf` through the server (the client never
+  names or touches a path). `value` is a string / number / `TRUE`/`FALSE` /
+  `DEFAULT` (reset to the built-in default). Requires cluster `ADMIN`,
+  node-local, cannot run in a transaction, audited `config.set`.
+- **Persist-only**: nothing is hot-reloaded, so a change takes effect on the
+  next `nextsqld` restart. `system.config` gained `file_value` and
+  `restart_required` columns showing the pending difference (also surfacing
+  a startup flag that overrode the file).
+- The server must have been started from a config file (`nextsqld --config`)
+  or `SET CONFIG` fails `Unavailable` — there is nothing to persist to.
+- `config` is matched as a bare identifier, not a keyword, so
+  `SELECT … FROM system.config` and anything else named `config` is
+  unaffected.
+- New `config.WithSetting` / `DiffState` / `SettableKeys` / `WriteFile`;
+  new `executor.DB.SetConfigWriter` / `WriteConfigSetting`.
+- Manager: `POST /api/v1/config/action` and an inline per-row editor in the
+  Configuration view (key allowlisted against `config.SettableKeys()`; each
+  changed row shows a "restart required" badge).
+- The file is rewritten in canonical `key=value` form — comments are not
+  preserved, and settings the built-in default populates are written
+  explicitly.
+- **M8 (Configuration) is now complete**: viewer plus validated editor.
+
+### Added — NextSQL Manager MVP slice M9: Logs & Diagnostics — diagnostic-bundle export, completing M9 (P28, 2026-09-04)
+
+- New `GET /api/v1/diagnostics/bundle`: one indented JSON document,
+  downloaded as an attachment (`nextsql-diagnostics-<UTC>.json`).
+- Assembled entirely from admin-only `system.*` read surfaces —
+  `metrics`, `server_log`, `config`, `capabilities`, `storage`,
+  `replication`, `replica_health`, `tls`, `key_versions`, and the
+  audit-chain *status* (not the audit log content). Driver-only: no
+  data-directory access, unlike `nextsql diagnose`.
+- Every constituent is already redacted at its source (config scrubs
+  addresses; tls/key_versions never carry key material); a top-level
+  `note` states what is and isn't included. No tenant row data.
+- The Diagnostics view gained a "Download diagnostic bundle" button.
+- **M9 (Logs & Diagnostics) is now complete**: metrics panel, server-log
+  tail, and diagnostic-bundle export.
+
+### Added — NextSQL Manager MVP slice M9: Logs & Diagnostics — server-log tail (P28, 2026-09-04)
+
+- New `system.server_log` virtual table: a bounded, in-memory tail of the
+  running process's structured log — `seq, event_time, level, message,
+  attributes`, newest 500 records retained, capped at 200 per query.
+  Admin-only; zero rows when no log ring is attached (embedded/CLI use).
+- New `internal/logging.Ring` + `logging.NewWithRing` — a fixed-capacity
+  ring that mirrors every log record before the unchanged stderr JSON
+  handler writes it. `nextsqld` now uses it; the Manager and auth-broker
+  keep the plain `logging.New`.
+- New `executor.DB.SetServerLogSource`/`ServerLogTail`, re-read on every
+  query so the tail is always current.
+- Folded into `GET /api/v1/diagnostics` (`{metrics, server_log}`); the
+  Diagnostics view gained a level-badged log table.
+- Addresses in log messages are **not** redacted (unlike `system.config`):
+  a log line is freeform text and an admin diagnosing a connectivity fault
+  needs it — same reasoning as `system.audit_log.remote`. This is an
+  in-memory diagnostic tail, not a durable log store (the real log is
+  still stderr / the service journal).
+- Still to land under M9: the redacted diagnostic-bundle export.
+
+### Added — NextSQL Manager MVP slice M9: Logs & Diagnostics — metrics panel (P28, 2026-09-04)
+
+- New `system.metrics` virtual table: one row per counter/gauge in the
+  process-wide metrics registry (`internal/metrics.Snapshot`) —
+  `category, name, value, unit`, grouped into throughput / latency /
+  encryption / storage / replication / constraints / maintenance / cdc /
+  runtime. Admin-only; list-shaped, zero rows for embedded/CLI use with no
+  process registry attached. Nothing redacted — the registry holds only
+  counters and process resource stats.
+- New `executor.DB.SetMetricsSource`/`MetricsSnapshot()`, the same
+  settable-callback shape as the TLS/key-rotation/config sources.
+- `nextsqld` now routes the connected database's own query/txn counters
+  into `metrics.Default()` (via `SetMetrics`) — the same registry the
+  crypto/storage/replication hooks already write to — so a single snapshot
+  is internally coherent (`queries_per_second`/`commits_per_second`/
+  `crypto_time_pct` all share one uptime base). This also fixes
+  `nextsql status`'s `queries`/`commits`/`errors` counters, which were
+  always zero for a real `nextsqld`.
+- New `GET /api/v1/diagnostics` read-model and a Diagnostics view/tab;
+  values are humanized by unit (bytes → KiB/MiB, nanoseconds → ms, etc.)
+  with the raw value kept alongside.
+- Reserved-word note: the grouping column is `category`, not `group`
+  (`GROUP BY` — no quoted-identifier escape), the same pitfall
+  `system.config`'s `name`-not-`key` already hit.
+- Still to land under M9: the server-log tail and the redacted
+  diagnostic-bundle export. See `docs/design-manager.md` M9.
+
+### Added — NextSQL Manager MVP slice M4: audit-chain viewer, closing M4 (P28, 2026-09-04)
+
+- New `system.audit_verify` virtual table: chain-integrity status (lines,
+  legacy/chained/signed counts, whether signing is enabled and checked,
+  overall verified/not, and the first bad line + reason if not). Admin-only;
+  always exactly one row, `verified=false` with the rest blank when no
+  audit log is attached.
+- New `system.audit_log` virtual table: the most recent audit records
+  (bounded to 200 per query regardless of file size on disk), admin-only,
+  zero rows when not attached. Includes a record even when the chain is
+  reported broken — an operator investigating a problem needs to see it,
+  not have it hidden. `remote` (a client address) is not redacted, matching
+  `system.sessions`'s existing convention.
+- New `security.TailEvents`, extending the existing `security.VerifyFile`
+  streaming scanner with a bounded ring buffer. New `executor.DB.
+  SetAuditSource`/`AuditTail()`, wired by `nextsqld` at startup — unlike
+  the TLS/key-rotation/config sources, this re-reads the file from disk on
+  every query, since the point is to reflect what is durable right now.
+- `GET /api/v1/security` extended with two new tables; the Security view
+  gained an `AuditVerifyCard` and an "Audit log" table.
+- Live-verified to detect an externally tampered file on the very next
+  query with no server restart, and to still surface the suspect record.
+- Two reserved-word column-naming fixes found live: `action` → `action_name`,
+  `time` → `event_time` (same pitfall `system.config`'s `key` → `name` hit).
+- Closes the Manager Security view's (M4) originally scoped surface:
+  users/roles/grants, TLS status, key-rotation status, and the audit
+  viewer are all now landed. See `docs/design-manager.md` M4.
+
+### Added — NextSQL Manager MVP slice M8: Configuration viewer (P28, 2026-09-04)
+
+- New `system.config` virtual table: one row per non-default setting in the
+  running process's `config.Config`. Admin-only; list-shaped, so it returns
+  zero rows (not a placeholder) for embedded/CLI use with no process-level
+  config attached.
+- Every network-address-shaped value (`listen_addr`, `raft_bind`,
+  `raft_join`, `auth_broker_listen`) is redacted to `[redacted]`; nothing
+  else is, since `Config` never holds key material or passwords, only file
+  paths to them.
+- New `config.Config.SafeEntries()` sources it, reusing `Marshal`'s own
+  byte output rather than re-enumerating every field a second time. New
+  `executor.DB.SetConfigSource`/`ConfigEntries()`, wired by `nextsqld` at
+  startup — the same settable-callback pattern as `SetTLSStatusSource`/
+  `SetKeyStatusSource`.
+- New `GET /api/v1/config` + a Configuration view/tab.
+- Read-only: a validated safe editor with restart-required indicators is a
+  separate, not-yet-built increment. See `docs/design-manager.md` M8.
+
+### Added — NextSQL Manager MVP slice M4 continuation: key rotation status (P28, 2026-09-04)
+
+- New `system.key_versions` virtual table: one row per key the attached
+  `crypto.Envelope` manages (`kek`, `master`, and each data domain — page,
+  WAL, UNDO, backup, vector, full-text, temp, replication) with its current
+  version and retained/revoked/retired counts. Never carries key material.
+  Admin-only; unlike `system.tls`'s "always one row," this table is
+  list-shaped and returns zero rows (not a placeholder) when no persistent
+  envelope is attached.
+- New `crypto.Envelope.KeyStatus()` sources it. New `executor.DB.
+  SetKeyStatusSource`/`KeyStatus()`, wired by `nextsqld` at startup — the
+  same settable-callback pattern as `SetTLSStatusSource`/`SetDrainFunc`.
+- `GET /api/v1/security` extended with a `key_versions` table; the Security
+  view gained a "Key rotation" table.
+- A real pre-existing wrinkle found and documented (not introduced): a
+  revoked version's count drops immediately but its revoked-flag lingers
+  until a later retire; retire's current implementation never actually sets
+  a "retired" flag, so the retired count is always 0 today.
+- Known scoping gap, same as the TLS status entry below: wired only onto
+  the legacy/non-hosted database handle. See `docs/design-manager.md` M4.
+
+### Added — NextSQL Manager MVP slice M4 continuation: TLS status (P28, 2026-09-04)
+
+- New `system.tls` virtual table: the live listener's redacted TLS status —
+  certificate subject/issuer/validity/DNS SANs plus mTLS/CRL posture. Never
+  carries private key material or a network address. Admin-only; always
+  exactly one row for an admin (`enabled=false` with the rest blank when no
+  TLS listener is attached), zero rows for a non-admin.
+- New `security.ServerTLSReloader.Status()` sources it from the same live
+  snapshot the TLS handshake path already serves, so a `Reload` rotation is
+  reflected on the very next call. New `executor.DB.SetTLSStatusSource`/
+  `TLSStatus()`, wired by `nextsqld` at startup — the same settable-callback
+  pattern as the pre-existing `SetDrainFunc`.
+- `GET /api/v1/security` extended with a `tls` table; the Security view
+  gained a `TLSStatusCard` (labeled fact sheet with an expiry-urgency badge)
+  instead of a raw table for this single descriptive row.
+- Known scoping gap, documented rather than silently absorbed: wired only
+  onto the legacy/non-hosted database handle (same scope `SetDrainFunc`
+  already has) — under multi-database hosting mode a hosted session's
+  `system.tls` does not yet reflect the process listener's real TLS state.
+  See `docs/design-manager.md` M4.
+
+### Added — NextSQL Manager MVP slice M7: Maintenance (P28, 2026-09-04)
+
+- `GET /api/v1/maintenance` + a Maintenance view — `system.tables`,
+  `system.indexes`, `system.table_stats`, `system.index_stats`.
+- `POST /api/v1/maintenance/action` — issues `ANALYZE [table]` /
+  `REBUILD INDEX name [ONLINE]` / `MAINTAIN DATABASE|TABLE name|INDEX name`,
+  each already gated server-side (`SELECT`, `INDEX`, `ADMIN ON CLUSTER`
+  respectively). The view requires a confirmation dialog before any of them.
+- A table/index name is untrusted text interpolated into hand-built SQL (no
+  quoted-identifier syntax exists in this dialect) — validated against the
+  lexer's own bare-identifier grammar before use.
+- Found and fixed a latent JSON-contract bug: `ANALYZE`/`MAINTAIN`/
+  `REBUILD INDEX` report only an affected count with zero columns, and Go's
+  nil-slice encoding rendered that as `"columns":null` against the
+  frontend's non-nullable `ResultSet.columns` type. Not yet triggered by any
+  existing view, but fixed at the source (`session.query`) plus a defensive
+  check in `ResultTable`.
+
+### Added — NextSQL Manager MVP slice M6: Cluster (P28, 2026-09-04)
+
+- `GET /api/v1/cluster` + a Cluster view — `system.replication` and
+  `system.replica_health` (both already always-visible, no admin gating
+  needed for the read side).
+- `POST /api/v1/cluster/action` — issues the exact documented
+  `CLUSTER TRANSFER LEADER` / `DRAIN [WITH (TIMEOUT_MS = n)]` /
+  `MAINTENANCE ENABLE|DISABLE` / `RECONCILE CONFIRM` statement for one of
+  five actions, each already gated on `ADMIN ON CLUSTER` server-side. The
+  Cluster view requires an explicit confirmation dialog before firing any of
+  them.
+- Verified live: `CLUSTER DRAIN` stops the listener and the entire
+  `nextsqld` process then exits — not just the Manager's own session. The
+  drain confirmation copy says this explicitly rather than implying a
+  lighter-weight disconnect.
+- M5 (Backups) was investigated first and found blocked: `nextsql
+  backup`/`restore`/`verify` operate on the data directory directly, with no
+  `BACKUP` SQL statement or `system.backups` table to wrap yet.
+
+### Added — NextSQL Manager MVP slice M4 partial: Security viewer (P28, 2026-09-04)
+
+- `GET /api/v1/security` + a Security view — `system.users`, `system.roles`,
+  `system.grants` (all already admin-only server-side: a non-admin sees
+  empty tables, never an error). Uses the same `runBundle` read-model
+  helper as M1–M3.
+- Scope note: M4's remaining pieces (TLS/certificate status, encryption-key
+  rotation status, and an audit-chain viewer) did **not** land — nothing in
+  `system.*` exposes that state today, and the only existing reader
+  (`nextsql audit`) uses direct data-directory file access the Manager is
+  architecturally forbidden from using. See `docs/design-manager.md` §6 M4.
+
+### Changed — NextSQL Manager frontend rebuilt on React + `@bzync/rui` (P28, 2026-09-04)
+
+- Replaced the M1 hand-written vanilla-JS shell with a React frontend using
+  `@bzync/rui` — the same component library `docs/web` (the product site)
+  uses. Server-observable behavior (the HTTP/JSON API, session/CSRF model,
+  and embedding mechanism) is unchanged; this is a frontend-source swap only.
+- New `internal/manager/frontend/` — a standalone npm package (not part of
+  the Go module) whose `npm run build` (esbuild) bundles into
+  `internal/manager/web/`, which is committed so `go build ./...` still needs
+  no Node toolchain.
+- CSP tightened from `default-src 'self'` to explicit per-directive rules
+  (`script-src 'self'`; `style-src` allows `'unsafe-inline'` for the
+  component library's runtime styles, which cannot execute code).
+
+### Added — NextSQL Manager MVP slices M2 (Databases & Storage) + M3 (Connections & Activity) (P28, 2026-09-04)
+
+- `GET /api/v1/databases` — `system.storage`, `system.databases` /
+  `system.realms` (a `hosted` flag; empty-and-reported, not an error, on a
+  single-database deployment), `system.tables`, `system.table_stats`.
+- `GET /api/v1/activity` — `system.sessions`, `system.active_queries`,
+  `system.transactions`, `system.locks`.
+- Both share a new read-model bundle helper with Overview: a named set of
+  `system.*` queries, where a non-required query's failure becomes a warning
+  and an empty result instead of failing the whole view.
+- Scope correction: the planned "query cancellation" line assumed a
+  server-side cancel-another-session surface that does not exist in NextSQL
+  (cancellation is client- or credential-driven, e.g. `nextsql token
+  revoke`) — M3 is observe-only; see `docs/design-manager.md` §6.
+
+### Added — NextSQL Manager MVP slice M1: serving backbone + Overview (P28, 2026-09-04)
+
+- New `nextsql-manager` binary — the NextSQL Manager, a loopback HTTP service
+  that serves an embedded operational-administration web UI plus a JSON API.
+  It is a pure client of a running `nextsqld`: every operation runs as the
+  logged-in operator's own NSQL user (server-side RBAC applies), it holds no
+  credentials of its own, and it has no data-directory or key access.
+- UI-framework decision recorded in the new `docs/design-manager.md`: a local
+  web app served by Go, chosen over Electron / Wails / Fyne, with the M1–M9
+  slice decomposition.
+- M1 landed: the loopback HTTP server (a non-loopback `--listen` requires
+  `--tls-cert`/`--tls-key`), an embedded HTML/CSS/vanilla-JS shell, an
+  operator-credential session layer (`SameSite=Strict` cookie + per-session
+  CSRF token on state-changing calls; bounded, self-expiring), and
+  `GET /api/v1/overview` (server storage / replication state, live session
+  and active-query counts, the capability registry — all from `system.*`).
+- New `internal/manager` package; it imports none of the storage-engine
+  internals (enforced by a test).
+
+### Added — rolling-cluster upgrade integration for `nextsql lifecycle upgrade` (P28, 2026-09-04)
+
+- `nextsql lifecycle upgrade` now detects Raft cluster membership offline (a
+  `raft/` state directory, the key-free `nextsql.cluster.json` status file, or
+  `node_id` + `raft_bind` in the config) and refuses to mutate a clustered
+  node in place until `--cluster-node` acknowledges the node has been drained
+  and, if it was the leader, that leadership was transferred. Without the flag
+  the run stops at `blocked` (exit 6) with nothing mutated and prints the
+  ordered per-node rolling procedure; `--dry-run` and `nextsql lifecycle
+  detect` show the same procedure without the gate.
+- `--json` output gains `cluster` (detection) and `rolling_upgrade`
+  (`proceed` / `blocking` / `warnings` / ordered `steps`) objects so an OS
+  installer or the NextSQL Manager can drive the sequence.
+- New pure decision logic `internal/setup.PlanRollingUpgrade`
+  (`ClusterUpgradeInput` → `ClusterUpgradeGuidance`). No catalog, storage
+  format, wire protocol, or Raft change.
+- `docs/install.md` and `docs/ops.md` ("Rolling upgrade") updated.
+
+### Added — FROM-less `SELECT` (2026-09-04)
+
+- `SELECT <expr-list>` with no `FROM` (e.g. `SELECT 1`, `SELECT NOW()`,
+  `SELECT 1 + 1 AS n`) is now supported, evaluated once against no row/table
+  context — the same bypass-the-binder precedent as `system.*` virtual
+  tables. `SELECT *` still requires `FROM`. `WHERE`/`ORDER BY`/`LIMIT`/
+  `OFFSET` apply to the single synthetic row; `GROUP BY`/`HAVING`/`SEARCH`/
+  `NEAREST`/`FACET` are rejected at parse time (they need a table or index).
+  A bare column reference fails closed rather than silently resolving to
+  nothing. Fixes `CLAUDE.md`'s own documented quickstart
+  (`nextsql exec ... -c "SELECT 1"`), which could not previously run.
+- No catalog/persistent-format/NSQL-wire/Raft change.
+
+### Added — Spatial types: `GEOMETRY` / `GEOGRAPHY` (Spatial track, 2026-09-04)
+
+- New column types `GEOMETRY(subtype, srid)` and `GEOGRAPHY(subtype, srid)`
+  — general OGC geometry (`Point`/`LineString`/`Polygon`/`MultiPoint`/
+  `MultiLineString`/`MultiPolygon`/`GeometryCollection`) alongside (not a
+  replacement for) the existing fixed `POINT`/`BOX`/`LINESTRING`/`POLYGON`
+  WGS84 types, which are unchanged. `GEOMETRY` is planar/Cartesian;
+  `GEOGRAPHY` is geodetic/great-circle (default SRID 4326). SRID and
+  subtype are declared per column; a value coerces implicitly to/from the
+  matching fixed shape.
+- SRID registry `{0, 4326, 3857}`; `ST_Transform` covers `4326 ↔ 3857`.
+- Constructors `ST_GeomFromText`/`ST_GeogFromText`/`ST_GeomFromEWKT`/
+  `ST_Point`/`ST_GeomFromGeoJSON`; accessors `ST_X`/`ST_Y`/`ST_SRID`/
+  `ST_SetSRID`/`ST_GeometryType`/`ST_NPoints`/`ST_NumGeometries`/
+  `ST_GeometryN`/`ST_ExteriorRing`/`ST_InteriorRingN`/`ST_NumInteriorRings`/
+  `ST_PointN`/`ST_StartPoint`/`ST_EndPoint`/`ST_Boundary`/`ST_Dimension`/
+  `ST_IsEmpty`/`ST_AsText`/`ST_AsEWKT`/`ST_AsBinary`/`ST_AsGeoJSON`;
+  measurement `ST_Distance`/`ST_Length`/`ST_Perimeter`/`ST_Area`/
+  `ST_Centroid`/`ST_Envelope`; predicates `ST_DWithin`/`ST_Intersects`/
+  `ST_Disjoint`/`ST_Contains`/`ST_Within`/`ST_Covers`/`ST_CoveredBy`/
+  `ST_Crosses`/`ST_Overlaps`/`ST_Touches`/`ST_Equals`; derived geometry
+  `ST_ConvexHull`/`ST_Simplify`/`ST_Segmentize`/`ST_Reverse`; overlay
+  `ST_Buffer`/`ST_Intersection`/`ST_Union`/`ST_Difference`/
+  `ST_SymDifference` (bounded — exact for convex/disjoint/containment
+  cases, errors rather than guessing for the general overlapping
+  non-convex case; see `docs/design-spatial.md` §8).
+- `CREATE SPATIAL INDEX` now accepts a `GEOMETRY`/`GEOGRAPHY` column
+  (bbox-centre Z-order key); `ST_Intersects`/`ST_Contains`/`ST_Within`/
+  `ST_Covers`/`ST_CoveredBy`/`ST_DWithin` against a constant are sargable.
+- On disk: EWKB with a `u32` length prefix. No `NSCT` catalog or NSQL
+  protocol version bump — SRID/subtype ride in the existing per-column
+  type metadata.
+- All 7 official drivers decode `GEOMETRY`/`GEOGRAPHY` result values to a
+  GeoJSON-shaped object; a WKT/EWKT string or an explicit
+  `{kind:'geometry'|'geography', wkt, srid}` wrapper works as a parameter.
+- See `docs/design-spatial.md`, `docs/geo.md`, `docs/sql.md`.
+
+### Fixed — Spatial: out-of-range SRID arguments were silently truncated (2026-09-04)
+
+- `ST_Point`'s SRID argument, `ST_SetSRID`, `ST_Transform`'s target SRID,
+  `ST_GeomFromGeoJSON`'s SRID argument, and the EWKT `SRID=<n>;...` text
+  prefix all narrowed a caller-supplied SRID to `u16` with a bare Go
+  conversion, which wraps silently instead of erroring — e.g.
+  `ST_Point(x, y, 99999)` produced a geometry tagged SRID 34463 with no
+  error, rather than failing the way `GEOMETRY(subtype, 99999)` in a
+  `CREATE TABLE` already correctly did. All six sites now validate the
+  range and error `"SRID out of range"`, matching the DDL form.
+
+### Added — database suspend/resume enforcement (Multi-database hosting M3-1, 2026-09-04)
+
+- `nextsql database suspend --realm NAME --database NAME --confirm` /
+  `nextsql database resume` (`docs/design-multidatabase-dbaas.md` §11.2,
+  §16 "M3"). Offline, exclusive-data-dir-lock CLI, the same shape as
+  `hosting set-realm-cap`/`set-database-cap`.
+- `hosting.Registry.Lookup` — the sole call `dbmanager.Manager.Acquire` (and
+  therefore every new client connection) resolves a realm/database through —
+  now fails closed for a non-Active database or realm instead of silently
+  opening it: `StateSuspended` → `Unavailable "database suspended"`,
+  `StateProvisioning`/`StateFailed` → `Unavailable`, `StateDeleting`/
+  `StateTombstoned` → `NotFound`. Previously `SetDatabaseState` could mark a
+  database Suspended durably while every connection kept working exactly as
+  before — suspend recorded intent without ever blocking access.
+- New `security.ActionDatabaseSuspend`/`ActionDatabaseResume` audit actions.
+- A state change is applied on `nextsqld`'s next restart, the same
+  already-documented shape as a live storage-cap edit.
+
+### Added — database drop/tombstone physical reclamation (Multi-database hosting M3-3, 2026-09-04)
+
+- `nextsql database drop --realm NAME --database NAME --confirm`
+  (`docs/design-multidatabase-dbaas.md` §11.2, §16 "M3"). Offline,
+  exclusive-data-dir-lock CLI, the same shape as `database suspend`/
+  `resume`. Transitions the database to `StateDeleting`, removes its whole
+  on-disk managed directory (db file plus `.keys`/`.wal`/`.undo`/
+  `.isolated` sidecars), then transitions to `StateTombstoned`. Idempotent
+  and crash-resumable at every step.
+- Scoped to realm-managed (`LayoutManaged`) databases; refuses the
+  deployment's default realm/database (no per-ID directory to safely
+  reclaim for the legacy-default layout, and every tool assumes it exists).
+- New `security.ActionDatabaseDrop` audit action.
+- `StateDeleting`/`StateTombstoned` and `hosting.Registry.Lookup`'s
+  fail-closed handling of both already existed (M3-1); this closes the
+  remaining gap — nothing previously reclaimed a tombstoned database's
+  files.
+
+### Added — `system.quotas` advisory view (Multi-database hosting M3, 2026-09-04)
+
+- New read-only `system.quotas` virtual table surfacing the hosting storage
+  caps (`docs/design-multidatabase-dbaas.md` §10.1). One row per realm and per
+  database from the deployment registry manifest, with `cap_bytes` and
+  `effective_cap_bytes` (`EffectiveStorageCapBytes` of the realm and database
+  caps). Admin-only and empty on a legacy/non-hosted deployment, the same
+  convention as `system.realms` / `system.databases`.
+- `used_bytes`, `pct_of_cap`, and `over_cap` (gated by `usage_known`) are
+  populated only for the row matching the session's own connected
+  realm+database — the data-file logical high-water, the quantity the write
+  path enforces the cap against. The view never errors and never bounds
+  anything; the authoritative over-cap signal is still the write rejection.
+- `system.capabilities` gains the `quotas_view` row. Existing
+  `system.realms` / `system.databases` are now also documented in
+  `docs/system-catalog.md`.
+
+### Added — Collection types: `STRUCT` / `ARRAY` / `MAP` (Collections track, 2026-09-04)
+
+- New column types `STRUCT<name T, …>`, `ARRAY<T>`, and `MAP<K,V>`, nestable
+  in one another to depth 8. `T` / field / value types may be any storable
+  type including another collection; `MAP` keys must be an orderable scalar.
+- Constructors `STRUCT(expr AS name, …)`, `ARRAY(e1, e2, …)`,
+  `MAP(k1, v1, k2, v2, …)`. STRUCT field access `col.field[.field…]`.
+  Functions `ELEMENT_AT` (1-based for arrays), `CARDINALITY` /
+  `ARRAY_LENGTH` / `MAP_SIZE`, `ARRAY_CONTAINS`, `MAP_CONTAINS_KEY`,
+  `MAP_KEYS`, `MAP_VALUES`.
+- All three are orderable (lexicographic tuple order, NULL members first) —
+  usable as `PRIMARY KEY`, `ORDER BY`, and index columns. `MIN`/`MAX` work;
+  `MAP` entries are stored in canonical key order so equal maps compare and
+  encode identically, and duplicate `MAP` keys are rejected.
+- Not `ENCRYPTED CLIENT`-eligible and not foreign-key-eligible.
+- On disk: a self-describing nested `NSRW` sub-encoding (`u32` body length
+  for O(1) skip at any depth). Catalog descriptor `NSCT` v11 → **v12**
+  (per-column recursive type descriptor; older descriptors still decode).
+  No NSQL wire-protocol version bump — the recursive type descriptor rides
+  after the existing fixed value header.
+- All 7 official drivers updated (recursive type-descriptor codec, a
+  collection param path, `RowDesc` parsing).
+- See `docs/design-collections.md`, `docs/sql.md`, `docs/storage-format.md`.
+
+### Added — `nextsql setup` transactional rollback of a failed install (P28, 2026-09-04)
+
+- `nextsql setup` now undoes a partial install on failure — a failed
+  `nextsql init` or post-install health check. It records whether each path
+  it might create already existed *before* the run and, on failure, removes
+  only the ones it actually created (database + sidecars, deployment
+  registry, generated `nextsql.conf`, generated key files), newest first. A
+  pre-existing operator-supplied key or a data directory that already held
+  files is never removed; the data directory itself is removed only if it
+  comes out empty. New `--keep-failed` flag leaves the partial install in
+  place for inspection.
+- New pure-logic `internal/setup`: `InstallRollback` (`Observe` /
+  `Preexisting` / `Track` / `Plan` / `Empty` — reverse-order removal list
+  with the never-delete-preexisting guard).
+- Closes the P28 "Transactional rollback of safe installer changes" and
+  "Never delete existing user data/keys on failed install" checklist items
+  for the CLI/automation path.
+- See `TODO.md` log #110.
+
+### Added — `nextsql lifecycle repair`, the installation repair runner (P28, 2026-09-04)
+
+- New `nextsql lifecycle repair --data-dir DIR --key-file FILE [--config FILE]
+  [--preset P] [--buffer-pages N] [--listen HOST:PORT [--tls-cert --tls-key]]
+  [--log-level L] [--force-config] [--fix-perms] [--dry-run] [--json]`.
+  Reconciles a damaged install without touching the database or unlock keys:
+  regenerates a missing or unparseable `nextsql.conf` with secure defaults
+  (an unparseable one is backed up first; a parseable one is left alone
+  unless `--force-config`), reports permission drift on the config (`0640`)
+  and key files (`0600`) and tightens it with `--fix-perms` (never loosens),
+  then opens the encrypted store once (running WAL recovery) to confirm
+  health. Outcomes `repaired` / `healthy` / `dry-run` / `blocked` (2/7) /
+  `failed` (5). Refuses to run while a server holds the deployment lock; is
+  not `setup` (will not initialize a database).
+- New pure-logic `internal/setup`: `PlanConfigRepair` (config action from
+  observed state + `--force-config`), `RepairPlan` (ordered `RepairStep`s
+  each flagged `Mutates`), `ConfigState`, `RepairConfigAction`,
+  `RepairOutcome`.
+- `docs/install.md` gains the `nextsql lifecycle repair` reference; "still to
+  come" now records the whole `lifecycle` backbone as complete.
+- See `TODO.md` log #108.
+
+### Added — `nextsql lifecycle uninstall`, the installation removal runner (P28, 2026-09-04)
+
+- New `nextsql lifecycle uninstall --data-dir DIR [--config FILE] [--key-file
+  FILE] [--instance-key-file FILE] [--purge-data] [--purge-keys] [--confirm]
+  [--json]`. Preserves the encrypted database and the external unlock keys by
+  default — a plain run removes only `nextsql.conf` and its `.bak-*`
+  siblings. `--purge-data` also removes the primary database + sidecars
+  (keystore/WAL/UNDO/isolated registry), the auth/ACL/audit files, the
+  deployment-registry database, and the deployment lock. `--purge-keys` (which
+  requires `--purge-data`, and resolvable key paths) also removes the root
+  and instance key files. Every run is a dry run until `--confirm`
+  (`outcome: planned`, exit 0). Refuses to run while a server holds the
+  deployment lock (`blocked`, exit 2) or with inconsistent purge flags
+  (exit 6) — nothing is deleted in either case. Outcomes `planned` /
+  `removed` / `blocked` / `partial` (exit 5).
+- New pure-logic `internal/setup`: `PlanUninstall` (classifies every known
+  artifact into remove / preserve for the requested purge flags, and reports
+  the flag-dependency / running-server refusals as blocking reasons rather
+  than silently downgrading), `UninstallCategory` (`safe`/`data`/`keys`),
+  `UninstallOutcome`.
+- `docs/install.md` extended with the `nextsql lifecycle uninstall`
+  reference; "still to come" narrowed to the `repair` runner + GUI + Manager.
+- See `TODO.md` log #107.
+
+### Added — `nextsql lifecycle upgrade`, the mutating in-place upgrade runner (P28, 2026-09-04)
+
+- New `nextsql lifecycle upgrade --data-dir DIR --key-file FILE [--config FILE]
+  [--buffer-pages N] [--dry-run] [--json]` — the mutating half of the
+  lifecycle backbone. Holds the deployment lock for the whole operation
+  (server running → `server-running`, exit 2), preflights the on-disk formats
+  (non-`ready` → blocked, nothing mutated), takes the verified config backup,
+  then opens the encrypted store once with this binary — running WAL recovery
+  and confirming the catalog decodes under the new format code — and
+  re-verifies the headers. Outcomes: `applied` (0) / `dry-run` (0) /
+  `blocked` (2/6/7) / `failed-verify` (5, any config backup already written
+  is retained for rollback). Never deletes anything; does not swap the binary
+  or restart a service. Idempotent.
+- New pure-logic `internal/setup`: `UpgradePlan` (ordered `UpgradeStep`s,
+  each flagged `Mutates` — one source for the dry-run output and the eventual
+  GUI's staged progress) and `UpgradeOutcome`.
+- `lifecycle preflight`'s header-assessment and `backup-config`'s verified
+  copy are refactored into shared helpers (`assessInPlaceUpgrade`,
+  `backupConfigFile`) that `upgrade` reuses.
+- `docs/install.md` extended with the `nextsql lifecycle upgrade` reference;
+  "still to come" narrowed to `repair` / `uninstall` / rolling-cluster /
+  rollback / GUI / Manager.
+- See `TODO.md` log #106.
+
+### Added — `nextsql lifecycle`, the installer lifecycle backbone (P28, 2026-09-04)
+
+- New `nextsql lifecycle` command group, the non-interactive backbone for
+  the Installer's detect / upgrade / repair / uninstall half:
+  - `detect --data-dir DIR [--config FILE]` — non-destructive discovery of an
+    existing installation: config presence + parse + resolved paths, whether
+    the database is initialized, on-disk header compatibility, format
+    database id, and whether a NextSQL process holds the deployment lock,
+    reduced to one status (`none` / `config-only` / `initialized` /
+    `running`).
+  - `preflight --data-dir DIR` — upgrade preflight: checks the keyless
+    superblock / WAL-control / UNDO-control / envelope header versions
+    against this binary's `internal/upgrade/compat` catalog and returns a
+    verdict (`ready` → exit 0; `not-initialized` → 7; `server-running` → 2;
+    `blocked-too-new` / `blocked-too-old` / `blocked-damaged` → 6), each with
+    the concrete fix.
+  - `backup-config --config FILE [--out DIR]` — copies the live config to a
+    timestamped `nextsql.conf.bak-<UTC>` sibling (mode 0640) and confirms the
+    copy reloads to an identical config before reporting success.
+- All three take `--json` and use the shared `nextsql` exit-code scheme.
+- New pure-logic `internal/setup` decisions: `ClassifyInstall` and
+  `AssessUpgrade` (verdict precedence: running server → uninitialized →
+  damaged header → too-new → too-old → ready).
+- `docs/install.md` extended with the `nextsql lifecycle` reference.
+- See `TODO.md` log #105.
+
+### Added — `nextsql setup`, the installer automation backbone (P28, 2026-09-04)
+
+- New `nextsql setup` command: one non-interactive step that detects the
+  host's CPU/RAM/disk/filesystem, sizes the buffer pool from a resource
+  preset (`conservative` / `balanced` / `high-performance` / `custom` —
+  10 / 25 / 50 % of physical RAM), writes a validated `nextsql.conf` with
+  secure defaults, initializes the database through the same path as
+  `nextsql init`, and verifies the result.
+- Secure by default: loopback-only listener; a non-loopback `--listen` is
+  rejected (exit 6) unless `--tls-cert` and `--tls-key` are both given; the
+  generated config contains no key, password, or token material.
+- Automation-friendly: `--json` single-object output, `--dry-run`,
+  `--skip-init`, `--config-in` / `--config-out`, and the standard `nextsql`
+  exit-code scheme.
+- New packages `internal/sysinfo` (cross-platform capacity snapshot) and
+  `internal/setup` (preset sizing + plan validation); new
+  `config.Config.Marshal` renders a config back to the `key=value` format
+  `config.Load` reads and round-trips with it.
+- New reference: `docs/install.md`.
+- Also bumped the stale `version.Phase` constant (15 → 27).
+- See `TODO.md` log #104.
+
 ### Fixed — catalog format v11 bump was only half-applied (2026-09-04)
 
 - The `NSCT` catalog descriptor moved to v11 (per-column `ENUM` label list)

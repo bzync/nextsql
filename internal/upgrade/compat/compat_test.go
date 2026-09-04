@@ -11,7 +11,7 @@ func TestCatalogCoversKnownFamilies(t *testing.T) {
 	seen := map[Family]bool{}
 	for _, s := range Catalog() {
 		if s.Family == FamilyCatalog {
-			if s.Current != 11 || s.MinReadable != 1 || s.MaxReadable != 11 {
+			if s.Current != 12 || s.MinReadable != 1 || s.MaxReadable != 12 {
 				t.Fatalf("%s: %+v", s.Family, s)
 			}
 		} else if s.Current != 1 || s.MinReadable != 1 || s.MaxReadable != 1 {
@@ -67,8 +67,11 @@ func TestCatalogFamilyWindow(t *testing.T) {
 	if err := Check(FamilyCatalog, 11); err != nil {
 		t.Fatalf("v11: %v", err)
 	}
-	if err := Check(FamilyCatalog, 12); !nerr.HasCode(err, nerr.InvalidFormat) {
+	if err := Check(FamilyCatalog, 12); err != nil {
 		t.Fatalf("v12: %v", err)
+	}
+	if err := Check(FamilyCatalog, 13); !nerr.HasCode(err, nerr.InvalidFormat) {
+		t.Fatalf("v13: %v", err)
 	}
 }
 

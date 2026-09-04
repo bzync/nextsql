@@ -397,7 +397,14 @@ func (r *Registry) Default() (Realm, Database, error) {
 // databases. Names are matched case-insensitively via normalizeName,
 // mirroring every other name-taking Registry method. Used by dbmanager
 // (M2-3a) to resolve a connection's Hello-selected realm/database to the
-// registry records needed to open it.
+// registry records needed to open it — the sole production call site, and
+// therefore the one place a non-Active realm or database must fail closed
+// (M3-1: suspend/resume enforcement). Every other Registry method that
+// reads State (CreateRealm/CreateDatabase/SetDatabaseState/the CLI's
+// Manifest()-walking resolvers) deliberately keeps seeing every state,
+// transient ones included, because they need it to make their own
+// idempotency/transition decisions — only connection routing should ever
+// refuse a non-Active pair.
 func (r *Registry) Lookup(realmName, databaseName string) (Realm, Database, error) {
 	if r == nil {
 		return Realm{}, Database{}, nerr.New(nerr.InvalidArgument, "hosting.Lookup", "nil registry")
@@ -418,6 +425,9 @@ func (r *Registry) Lookup(realmName, databaseName string) (Realm, Database, erro
 		}
 		for _, db := range realm.Databases {
 			if db.Name == dName {
+				if serr := lookupStateErr(realm.State, db.State); serr != nil {
+					return Realm{}, Database{}, serr
+				}
 				realm.Databases = append([]Database(nil), realm.Databases...)
 				return realm, db, nil
 			}
@@ -425,6 +435,40 @@ func (r *Registry) Lookup(realmName, databaseName string) (Realm, Database, erro
 		return Realm{}, Database{}, nerr.New(nerr.NotFound, "hosting.Lookup", "unknown database")
 	}
 	return Realm{}, Database{}, nerr.New(nerr.NotFound, "hosting.Lookup", "unknown realm")
+}
+
+// lookupStateErr reports whether a resolved realm/database pair is safe to
+// route a new connection to, checking the realm first (a suspended realm
+// blocks every one of its databases regardless of their own state — the
+// same precedence CreateDatabase's own realm.State check already uses).
+// nil means Active/Active. A realm-level non-Active state cannot be
+// reached today (no SetRealmState exists yet — realm suspend/delete is a
+// separate, still-open M3 item), but the field is already meaningful
+// (CreateDatabase already checks it, and it round-trips through NSRM), so
+// Lookup honors it defensively rather than trusting a value it never
+// itself sets.
+func lookupStateErr(realmState, dbState State) error {
+	if err := nonActiveLookupErr("realm", realmState); err != nil {
+		return err
+	}
+	return nonActiveLookupErr("database", dbState)
+}
+
+func nonActiveLookupErr(noun string, state State) error {
+	switch state {
+	case StateActive:
+		return nil
+	case StateProvisioning:
+		return nerr.New(nerr.Unavailable, "hosting.Lookup", noun+" not yet active")
+	case StateSuspended:
+		return nerr.New(nerr.Unavailable, "hosting.Lookup", noun+" suspended")
+	case StateFailed:
+		return nerr.New(nerr.Unavailable, "hosting.Lookup", noun+" in failed state")
+	case StateDeleting, StateTombstoned:
+		return nerr.New(nerr.NotFound, "hosting.Lookup", noun+" deleted")
+	default:
+		return nerr.New(nerr.Internal, "hosting.Lookup", "unknown "+noun+" state")
+	}
 }
 
 // LookupRealm returns a detached copy of the named realm, without requiring

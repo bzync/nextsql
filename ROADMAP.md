@@ -448,6 +448,17 @@ Planned:
 
 Professional lifecycle management and operational UI.
 
+**In progress.** The installer automation + lifecycle CLI backbone
+(`nextsql setup` / `nextsql lifecycle …`) is done. **The NextSQL Manager MVP
+is complete (2026-09-04)** — all nine slices M1–M9 (Overview, Databases,
+Activity, Security, Backups, Cluster, Maintenance, Configuration,
+Logs & Diagnostics), a loopback web app that drives the server only through
+the NSQL protocol as the operator's own user. New SQL surface it added:
+`SET CONFIG`, `BACKUP DATABASE`, `VERIFY BACKUP`; new `system.*` tables:
+`metrics`, `server_log`, `backups`, plus the M4 security tables and
+`system.config`. Restore/PITR stays CLI-only. Remaining: the GUI installer
+UX and end-to-end platform install tests.
+
 ---
 
 ## P29 — NextSQL Studio

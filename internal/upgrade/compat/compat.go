@@ -55,7 +55,7 @@ func Catalog() []Spec {
 		{Family: FamilyWALCtrl, Magic: "NSWC", Current: 1, MinReadable: 1, MaxReadable: 1, Notes: "WAL control file"},
 		{Family: FamilyUNDO, Magic: "NSUD", Current: 1, MinReadable: 1, MaxReadable: 1, Notes: "encrypted UNDO records"},
 		{Family: FamilyUNDOCtrl, Magic: "NSUC", Current: 1, MinReadable: 1, MaxReadable: 1, Notes: "UNDO control file"},
-		{Family: FamilyCatalog, Magic: "NSCT", Current: 11, MinReadable: 1, MaxReadable: 11, Notes: "table descriptors; v1 empty FKs, v2 foreign keys, v3 CDC image policy, v4 partition metadata, v5 stable partition identity allocator, v6 per-index HNSW traversal quantisation, v7 per-index vector ANN method + IVF list/probe counts, v8 per-index IVF-PQ subspace count, v9 per-index full-text analyzer id+revision, v10 per-column ENCRYPTED CLIENT logical type, v11 per-column ENUM label list"},
+		{Family: FamilyCatalog, Magic: "NSCT", Current: 12, MinReadable: 1, MaxReadable: 12, Notes: "table descriptors; v1 empty FKs, v2 foreign keys, v3 CDC image policy, v4 partition metadata, v5 stable partition identity allocator, v6 per-index HNSW traversal quantisation, v7 per-index vector ANN method + IVF list/probe counts, v8 per-index IVF-PQ subspace count, v9 per-index full-text analyzer id+revision, v10 per-column ENCRYPTED CLIENT logical type, v11 per-column ENUM label list, v12 per-column recursive STRUCT/ARRAY/MAP descriptor"},
 		{Family: FamilyBackup, Magic: "NSBK", Current: 1, MinReadable: 1, MaxReadable: 1, Notes: "physical backup header"},
 		{Family: FamilyExport, Magic: "NSXP", Current: 1, MinReadable: 1, MaxReadable: 1, Notes: "logical export header"},
 		{Family: FamilyProtocol, Magic: "NSQL", Current: 1, MinReadable: 1, MaxReadable: 1, Notes: "native wire protocol"},

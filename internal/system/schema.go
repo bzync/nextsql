@@ -12,7 +12,13 @@ import (
 
 // Version is the system schema version for machine consumers.
 // Deterministic and monotonic; bump only with column changes.
-const SchemaVersion = 2
+//
+// v3 (Phase 28, Manager MVP): system.config gained file_value /
+// restart_required (M8); new tables system.metrics (M9), system.server_log
+// (M9), system.backups (M5); the M4 security tables (system.tls,
+// system.key_versions, system.audit_verify, system.audit_log) and M8's
+// system.config were added under v2 without a bump — v3 covers all of it.
+const SchemaVersion = 3
 
 // SchemaName is the virtual schema name.
 const SchemaName = "system"
@@ -105,6 +111,133 @@ func init() {
 		{Name: "healthy", Type: types.Bool()},
 		{Name: "replication_suspect", Type: types.Bool()},
 	})
+	// tls (M4 remainder) exposes the live listener's redacted TLS status —
+	// leaf certificate identity/validity and the mTLS/CRL posture, never
+	// key material and never a network address (same convention as
+	// system.replication.leader_addr). Admin-only, like system.users/
+	// roles/grants: a non-admin gets zero rows. enabled=false with the
+	// other columns empty on a loopback plaintext deployment or embedded/
+	// CLI use, never an error — same "always one descriptive row" shape as
+	// system.replication reporting "standalone".
+	register("tls", []catalog.Column{
+		{Name: "enabled", Type: types.Bool()},
+		{Name: "subject", Type: types.String()},
+		{Name: "issuer", Type: types.String()},
+		{Name: "not_before", Type: types.TimestampTZ()},
+		{Name: "not_after", Type: types.TimestampTZ()},
+		{Name: "days_until_expiry", Type: dec(10, 0)},
+		{Name: "dns_names", Type: types.String()},
+		{Name: "mtls_required", Type: types.Bool()},
+		{Name: "client_ca_configured", Type: types.Bool()},
+		{Name: "client_crl_configured", Type: types.Bool()},
+	})
+	// key_versions (M4 remainder) exposes the attached crypto.Envelope's
+	// per-key rotation state — current version and retained/revoked/retired
+	// counts — never key material. Admin-only, like system.tls/users/roles/
+	// grants. Zero rows (never an error) when no persistent envelope is
+	// attached: embedded/CLI use with a bare crypto.KeyProvider, or a
+	// legacy deployment with no .keys keystore file — same "empty means not
+	// applicable" convention as system.databases/realms on a non-hosted
+	// deployment, chosen over system.tls's "always one row" shape because
+	// this table is a list of keys, not a single status fact.
+	register("key_versions", []catalog.Column{
+		{Name: "key_name", Type: types.String()},
+		{Name: "current_version", Type: dec(10, 0)},
+		{Name: "version_count", Type: dec(10, 0)},
+		{Name: "revoked_count", Type: dec(10, 0)},
+		{Name: "retired_count", Type: dec(10, 0)},
+	})
+	// config (M8 Configuration viewer, read-only) exposes the running
+	// process's config.Config, redacted (config.Config.SafeEntries) — every
+	// network-address-shaped value replaced with "[redacted]" (same
+	// convention as system.replication.leader_addr); nothing in Config ever
+	// holds key material to begin with. Admin-only, like system.tls/
+	// key_versions/users/roles/grants. Zero rows (list-shaped, never an
+	// error) when no process-level config.Config is attached — embedded/CLI
+	// use, same convention as system.key_versions with no envelope
+	// attached. Only settings that differ from Config's own Default() (or
+	// that Default() itself sets) appear — a field left at its zero value
+	// is omitted entirely, not shown as "0"/""; see config.Config.Marshal's
+	// own doc comment, which SafeEntries reuses verbatim. Column is named
+	// "name", not "key": KEY is a reserved word in this dialect's grammar
+	// (PRIMARY KEY/FOREIGN KEY) and there is no quoted-identifier syntax to
+	// escape it with, so "SELECT key FROM ..."/"ORDER BY key" could never
+	// parse.
+	register("config", []catalog.Column{
+		{Name: "name", Type: types.String()},
+		{Name: "value", Type: types.String()},
+		// file_value is the setting's value in the node's on-disk
+		// nextsql.conf; restart_required ("yes"/"no") is set when it
+		// differs from the running "value" — either because SET CONFIG
+		// persisted a change not yet applied, or because a startup flag
+		// overrode the file. Every SET CONFIG write is persist-only today.
+		{Name: "file_value", Type: types.String()},
+		{Name: "restart_required", Type: types.String()},
+	})
+	// audit_verify and audit_log (M4's last piece) close the Manager
+	// Security view's audit-chain viewer, over security.TailEvents — a
+	// bounded, chain-verified re-read of the live audit file, on every
+	// query (unlike the in-memory tls/key_versions/config sources above,
+	// there is nothing to cache: the whole point is what's actually
+	// durable on disk right now). Both are admin-only.
+	//
+	// audit_verify is a single status fact, same "always exactly one row"
+	// shape as system.tls: verified=false with zero counts when no audit
+	// log is attached (embedded/CLI use), or when the file could not even
+	// be read (in that case problem carries the read error, not a chain
+	// finding — checked at the executor layer, not distinguishable from a
+	// column here).
+	register("audit_verify", []catalog.Column{
+		{Name: "lines", Type: dec(20, 0)},
+		{Name: "legacy_count", Type: dec(20, 0)},
+		{Name: "chained_count", Type: dec(20, 0)},
+		{Name: "signed_count", Type: dec(20, 0)},
+		{Name: "signing_started", Type: types.Bool()},
+		{Name: "signatures_checked", Type: types.Bool()},
+		{Name: "verified", Type: types.Bool()},
+		{Name: "first_bad_line", Type: dec(20, 0)},
+		{Name: "problem", Type: types.String()},
+	})
+	// audit_log is list-shaped, same "zero rows means not applicable"
+	// convention as system.key_versions/system.config: the most recent
+	// entries (bounded server-side — see executor.systemAuditLogRows),
+	// oldest first. Deliberately includes a record even when audit_verify
+	// reports the chain broken: an operator investigating a detected
+	// problem needs to see the suspect entry, not have it silently hidden
+	// (security.TailEvents's own doc comment). Every field here already
+	// went through security.Redact/prepareAuditEvent at write time —
+	// "Never put passwords, keys, tokens, or secrets" is Event's own
+	// contract, not something this table adds; the object field can still
+	// legitimately name things like a table or index (DDL), a grantee
+	// (grant/revoke), or a database (create/drop) — never a secret value.
+	// remote is a client connection address, not server/cluster topology,
+	// so the "never expose a network address over SQL" convention
+	// (system.replication.leader_addr, system.config's listen_addr/
+	// raft_bind/raft_join) does not apply to it — confirmed against
+	// existing precedent, not just reasoned from scratch: system.sessions
+	// already exposes the identical kind of value in its own "remote"
+	// column, unredacted, and source-IP forensics is core audit-log value.
+	// Two columns needed renaming off their most natural names, both
+	// reserved words in this dialect's own grammar with no quoted-
+	// identifier escape, both caught the same way — by actually trying the
+	// query against a live built binary before shipping the schema, not by
+	// inspecting the lexer's keyword table and assuming it was exhaustive
+	// from memory (the same reserved-word pitfall system.config's "name",
+	// not "key", column already hit once): "action" (FOREIGN KEY's
+	// ON DELETE/UPDATE {CASCADE|RESTRICT|NO ACTION} clause) became
+	// "action_name"; "time" (the TIME data type keyword) became
+	// "event_time".
+	register("audit_log", []catalog.Column{
+		{Name: "seq", Type: dec(20, 0)},
+		{Name: "event_time", Type: types.TimestampTZ()},
+		{Name: "actor", Type: types.String()},
+		{Name: "action_name", Type: types.String()},
+		{Name: "object", Type: types.String()},
+		{Name: "outcome", Type: types.String()},
+		{Name: "remote", Type: types.String()},
+		{Name: "identity_source", Type: types.String()},
+		{Name: "signed", Type: types.Bool()},
+	})
 	// raft is an alias for replication
 	if t, ok := tables["system.replication"]; ok {
 		cp := t.Clone()
@@ -193,6 +326,92 @@ func init() {
 		{Name: "memory_bytes", Type: dec(20, 0)},
 		{Name: "workers", Type: dec(10, 0)},
 		{Name: "priority", Type: dec(10, 0)},
+	})
+	// quotas (M3) is the advisory surfacing of the hosting storage caps
+	// (docs/design-multidatabase-dbaas.md §10.1). One row per realm and per
+	// database from the deployment registry manifest. Admin-only and empty on
+	// a legacy/non-hosted deployment, exactly like system.realms/databases.
+	// used_bytes / pct_of_cap / over_cap are populated only for the row that
+	// matches the session's own connected database (usage_known = true); every
+	// other row reports the caps only. Never an error, never a hard limit —
+	// the authoritative signal is still the write-path rejection.
+	register("quotas", []catalog.Column{
+		{Name: "scope", Type: types.String()},
+		{Name: "realm_name", Type: types.String()},
+		{Name: "database_name", Type: types.String()},
+		{Name: "state", Type: types.String()},
+		{Name: "cap_bytes", Type: dec(20, 0)},
+		{Name: "effective_cap_bytes", Type: dec(20, 0)},
+		{Name: "usage_known", Type: types.Bool()},
+		{Name: "used_bytes", Type: dec(20, 0)},
+		{Name: "pct_of_cap", Type: dec(5, 0)},
+		{Name: "over_cap", Type: types.Bool()},
+	})
+	// metrics (M9) is the process-wide metrics registry (internal/metrics.
+	// Snapshot) surfaced read-only for the Manager's Logs & Diagnostics view.
+	// Admin-only, list-shaped: zero rows (not a placeholder row) when no
+	// process-level registry is attached — embedded/CLI use — same "empty
+	// means not applicable" convention as system.config/system.key_versions.
+	// Every field is rendered to a decimal string in "value" with a "unit"
+	// hint ("count"/"bytes"/"nanoseconds"/"ratio_pct"/"per_second") rather
+	// than a wide typed row per counter, the same name/value shape
+	// system.config already uses for a heterogeneous key space. "category"
+	// groups related counters for display; it is not "group" (a reserved
+	// word in this dialect's grammar — GROUP BY — with no quoted-identifier
+	// syntax to escape it, the same pitfall system.config's "name" not
+	// "key" and system.audit_log's "action_name"/"event_time" already hit).
+	// Nothing here is redacted: the registry holds only counters and process
+	// resource stats, never addresses, key material, or tenant data.
+	register("metrics", []catalog.Column{
+		{Name: "category", Type: types.String()},
+		{Name: "name", Type: types.String()},
+		{Name: "value", Type: types.String()},
+		{Name: "unit", Type: types.String()},
+	})
+	// server_log (M9) is a bounded, in-memory tail of the running process's
+	// own structured log (`internal/logging.Ring` — the newest
+	// `logging.DefaultRingCapacity` records, capped again per query at
+	// `executor.systemServerLogTailCap`), sourced from whatever `nextsqld`
+	// wired via `executor.DB.SetServerLogSource`. Admin-only, list-shaped:
+	// zero rows when no ring is attached (embedded/CLI use, a bare
+	// `logging.New` logger) — same "empty means not applicable" convention
+	// as system.metrics/system.config. Memory cost is fixed regardless of
+	// how long the process runs; this is a diagnostic tail, not a durable
+	// log store (the real log is still stderr/the service journal).
+	// `event_time` (not `time` — the `TIME` data-type keyword, the same
+	// pitfall system.audit_log's column already hit); every field is exactly
+	// what was written to stderr — the "never log keys/passwords/tokens"
+	// contract is the logger's callers' responsibility (`logging.New`'s own
+	// doc comment), not something this table re-checks. Unlike system.config,
+	// this table does **not** redact network addresses: a log message is
+	// freeform text (a listen address, a peer that went unreachable, a
+	// client that desynced) and an admin diagnosing a connectivity problem
+	// needs to see it — the same "privileged reader + real operational
+	// value" reasoning that keeps system.audit_log's `remote` unredacted.
+	// It never holds anything the process didn't already print to its own
+	// stderr / service journal.
+	register("server_log", []catalog.Column{
+		{Name: "seq", Type: dec(20, 0)},
+		{Name: "event_time", Type: types.TimestampTZ()},
+		{Name: "level", Type: types.String()},
+		{Name: "message", Type: types.String()},
+		{Name: "attributes", Type: types.String()},
+	})
+	// backups (M5) lists the verified backups in the node's configured
+	// backup directory (config key `backup_dir`), oldest first — one row per
+	// immediate subdirectory of `backup_dir` with a valid backup header
+	// (`backup.ListBackups`). Admin/BACKUP-privilege gated. Zero rows when no
+	// `backup_dir` is configured (embedded/CLI use, or the key unset) —
+	// same "empty means not applicable" convention as `system.config`. The
+	// write/verify side is the `BACKUP DATABASE` / `VERIFY BACKUP 'name'`
+	// statements (`docs/sql.md`); a driver-only client never names a
+	// filesystem path — `name` here is the subdirectory name only.
+	register("backups", []catalog.Column{
+		{Name: "name", Type: types.String()},
+		{Name: "created_at", Type: types.TimestampTZ()},
+		{Name: "database_id", Type: types.String()},
+		{Name: "checkpoint_lsn", Type: dec(20, 0)},
+		{Name: "durable_lsn", Type: dec(20, 0)},
 	})
 }
 
@@ -289,6 +508,7 @@ func Capabilities() [][]types.Value {
 		rowCap("oidc_broker", "supported", "external IdP (OIDC) token-exchange broker minting NSSC1 credentials; nextsql login (Authorization Code/PKCE, client-credentials)", version.String),
 		rowCap("audit_chain", "supported", "tamper-evident NSAC hash-chain audit log with optional NSAK Ed25519 signing and verification (nextsql audit)", version.String),
 		rowCap("storage_caps", "supported", "hosting realm/database storage caps enforced on the write path", version.String),
+		rowCap("quotas_view", "supported", "advisory system.quotas surfacing of hosting storage caps with connected-database usage/percent/over-cap", version.String),
 		rowCap("resource_groups", "experimental", "CREATE/ALTER/DROP RESOURCE GROUP workload-governance descriptors (system.resource_groups); durable and RBAC-gated, not yet wired to query admission/scheduling", version.String),
 	}
 	// Ensure deterministic order already sorted by name; sort to guarantee.

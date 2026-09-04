@@ -1465,9 +1465,21 @@ func spatialAlt(tab *catalog.Table, idx catalog.Index, pred ast.Expr, needed []i
 	case "dwithin":
 		var w, s, e, n float64
 		var world bool
-		if sp.center.IsPoint() {
+		switch {
+		case sp.planar:
+			// GEOMETRY column: the radius is in the SRID's own coordinate
+			// units, so grow the bbox directly. (The Z-order grid is WGS84
+			// degree-scaled — a projected-CRS column still works via the
+			// residual but with a wide range; docs/design-spatial.md §2.6.)
+			bw, bs, be, bn, _, ok := types.GeoBBox(sp.center)
+			if !ok {
+				world = true
+			} else {
+				w, s, e, n = bw-sp.radius, bs-sp.radius, be+sp.radius, bn+sp.radius
+			}
+		case sp.center.IsPoint():
 			w, s, e, n, world = types.CircleBBox(sp.center.Lon, sp.center.Lat, sp.radius)
-		} else {
+		default:
 			bw, bs, be, bn, wrap, ok := types.GeoBBox(sp.center)
 			if !ok || wrap {
 				world = true
@@ -1525,6 +1537,7 @@ type spatialMatch struct {
 	center types.Value
 	radius float64
 	box    types.Value
+	planar bool // GEOMETRY column: radius is in raw coordinate units, not metres
 	expr   ast.Expr
 }
 
@@ -1538,6 +1551,55 @@ func matchSpatial(pred ast.Expr, tab *catalog.Table, ord int) (spatialMatch, boo
 }
 
 func oneSpatial(e ast.Expr, tab *catalog.Table, ord int) (spatialMatch, bool) {
+	// General GEOMETRY / GEOGRAPHY columns: ST_Intersects / ST_DWithin /
+	// ST_Contains / ST_Within against a constant geometry become a bbox
+	// Z-order prefix range with the exact predicate kept as a residual
+	// (docs/design-spatial.md §2.6).
+	if ord >= 0 && ord < len(tab.Columns) && types.IsGeneralSpatial(tab.Columns[ord].Type.Kind) {
+		if call, ok := e.(ast.Call); ok {
+			name := strings.ToLower(call.Name)
+			switch name {
+			case "st_intersects", "st_contains", "st_within", "st_covers", "st_coveredby":
+				if len(call.Args) != 2 {
+					return spatialMatch{}, false
+				}
+				g, ok := geoGeneralColConst(call.Args[0], call.Args[1], tab, ord)
+				if !ok {
+					g, ok = geoGeneralColConst(call.Args[1], call.Args[0], tab, ord)
+				}
+				if !ok {
+					return spatialMatch{}, false
+				}
+				return spatialMatch{kind: "within", box: g, expr: e}, true
+			case "st_dwithin":
+				if len(call.Args) != 3 {
+					return spatialMatch{}, false
+				}
+				g, ok := geoGeneralColConst(call.Args[0], call.Args[1], tab, ord)
+				if !ok {
+					g, ok = geoGeneralColConst(call.Args[1], call.Args[0], tab, ord)
+				}
+				if !ok {
+					return spatialMatch{}, false
+				}
+				r, ok := constValue(call.Args[2])
+				if !ok || r.Null {
+					return spatialMatch{}, false
+				}
+				meters, err := strconv.ParseFloat(r.String(), 64)
+				if err != nil || meters < 0 {
+					return spatialMatch{}, false
+				}
+				return spatialMatch{
+					kind:   "dwithin",
+					center: g,
+					radius: meters,
+					planar: tab.Columns[ord].Type.Kind == types.KindGeometry,
+					expr:   e,
+				}, true
+			}
+		}
+	}
 	switch x := e.(type) {
 	case ast.Call:
 		switch types.CanonGeoName(x.Name) {
@@ -1660,6 +1722,78 @@ func geoColGeom(colExpr, constExpr ast.Expr, tab *catalog.Table, ord int) (types
 		case types.KindPoint, types.KindLine, types.KindPolygon:
 			return g, true
 		}
+	}
+	return types.Value{}, false
+}
+
+// geoGeneralColConst matches "<general-spatial column> <op> <constant
+// geometry>" and evaluates the constant to a KindGeometry value whose bbox
+// drives the spatial-index range.
+func geoGeneralColConst(colExpr, constExpr ast.Expr, tab *catalog.Table, ord int) (types.Value, bool) {
+	id, ok := colExpr.(ast.Ident)
+	if !ok {
+		return types.Value{}, false
+	}
+	if i, ok := tab.ColIndex(id.Name); !ok || i != ord {
+		return types.Value{}, false
+	}
+	return geoConstGeom(constExpr)
+}
+
+// geoConstGeom evaluates a constant geometry expression: a WKT/EWKT string
+// literal, or an ST_GeomFromText / ST_GeogFromText / ST_GeomFromEWKT /
+// ST_Point / ST_MakePoint call whose arguments are all literals.
+func geoConstGeom(e ast.Expr) (types.Value, bool) {
+	if v, ok := constValue(e); ok && !v.Null {
+		switch v.Typ.Kind {
+		case types.KindString, types.KindText:
+			if g, err := types.ParseGeneralWKT(v.Str, 0); err == nil {
+				return types.Value{Typ: types.Type{Kind: types.KindGeometry}, Geom: g}, true
+			}
+		}
+		if types.IsGeneralSpatial(v.Typ.Kind) {
+			return v, true
+		}
+	}
+	call, ok := e.(ast.Call)
+	if !ok {
+		return types.Value{}, false
+	}
+	nums := func(args []ast.Expr) ([]float64, bool) {
+		out := make([]float64, 0, len(args))
+		for _, a := range args {
+			cv, ok := constValue(a)
+			if !ok || cv.Null {
+				return nil, false
+			}
+			f, err := strconv.ParseFloat(cv.String(), 64)
+			if err != nil {
+				return nil, false
+			}
+			out = append(out, f)
+		}
+		return out, true
+	}
+	switch strings.ToLower(call.Name) {
+	case "st_geomfromtext", "st_geometryfromtext", "st_geogfromtext", "st_geographyfromtext", "st_geomfromewkt":
+		if len(call.Args) < 1 {
+			return types.Value{}, false
+		}
+		sv, ok := constValue(call.Args[0])
+		if !ok || sv.Null {
+			return types.Value{}, false
+		}
+		g, err := types.ParseGeneralWKT(sv.String(), 0)
+		if err != nil {
+			return types.Value{}, false
+		}
+		return types.Value{Typ: types.Type{Kind: types.KindGeometry}, Geom: g}, true
+	case "st_point", "st_makepoint":
+		xy, ok := nums(call.Args)
+		if !ok || len(xy) < 2 {
+			return types.Value{}, false
+		}
+		return types.Value{Typ: types.Type{Kind: types.KindGeometry}, Geom: &types.Geom{Type: 1, Coords: []float64{xy[0], xy[1]}}}, true
 	}
 	return types.Value{}, false
 }

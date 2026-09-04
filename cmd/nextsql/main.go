@@ -52,6 +52,10 @@ func run(args []string) error {
 		return nil
 	case "init":
 		return initDB(args[1:])
+	case "setup":
+		return setupCmd(args[1:])
+	case "lifecycle":
+		return lifecycleCmd(args[1:])
 	case "hosting":
 		return hostingCmd(args[1:])
 	case "realm":
@@ -136,11 +140,17 @@ func realmCmd(args []string) error {
 
 func databaseCmd(args []string) error {
 	if len(args) == 0 {
-		return nerr.New(nerr.InvalidArgument, "nextsql database", "expected create")
+		return nerr.New(nerr.InvalidArgument, "nextsql database", "expected create, suspend, resume, or drop")
 	}
 	switch args[0] {
 	case "create":
 		return createDatabase(args[1:])
+	case "suspend":
+		return setDatabaseState(args[1:], hosting.StateSuspended)
+	case "resume":
+		return setDatabaseState(args[1:], hosting.StateActive)
+	case "drop":
+		return dropDatabase(args[1:])
 	default:
 		return nerr.New(nerr.InvalidArgument, "nextsql database", "unknown database command")
 	}
@@ -427,6 +437,24 @@ func resolveDatabaseID(m hosting.Manifest, realmID hosting.ID, name string) (hos
 	return hosting.ID{}, nerr.New(nerr.NotFound, "nextsql hosting", "unknown database in realm")
 }
 
+// findManifestDatabase returns the full realm/database record for an
+// already-resolved pair. resolveRealmID/resolveDatabaseID confirm a name
+// resolves to an ID; callers that also need Layout/State (e.g. dropDatabase)
+// use this instead of re-walking the manifest inline.
+func findManifestDatabase(m hosting.Manifest, realmID, databaseID hosting.ID) (hosting.Realm, hosting.Database, bool) {
+	for _, realm := range m.Realms {
+		if realm.ID != realmID {
+			continue
+		}
+		for _, db := range realm.Databases {
+			if db.ID == databaseID {
+				return realm, db, true
+			}
+		}
+	}
+	return hosting.Realm{}, hosting.Database{}, false
+}
+
 func setRealmStorageCap(args []string) error {
 	const op = "nextsql hosting set-realm-cap"
 	fs := flag.NewFlagSet("hosting set-realm-cap", flag.ContinueOnError)
@@ -524,6 +552,182 @@ func setDatabaseStorageCap(args []string) error {
 	}
 	fmt.Printf("realm %s database %s cap_bytes %d\n",
 		strings.ToLower(strings.TrimSpace(*realm)), strings.ToLower(strings.TrimSpace(*database)), *capBytes)
+	return nil
+}
+
+// setDatabaseState is M3-1's CLI surface for the two lifecycle transitions
+// dbmanager's routing path (internal/hosting.Lookup) now actually enforces:
+// suspend blocks every future connection to the database until resumed,
+// resume restores it. Follows the exact same offline pattern as
+// set-realm-cap/set-database-cap (openHostingRegistryForCLI's exclusive
+// data-dir lock, so it fails Unavailable against a running nextsqld — a
+// state edit is an overwrite, applied on the next restart, same as a cap
+// edit; a live control-plane op to suspend/resume without a restart is the
+// same documented follow-on as live cap changes). Rename and drop/
+// tombstone are separate, still-open M3 items — not this increment's
+// scope.
+func setDatabaseState(args []string, target hosting.State) error {
+	verb, past, action := "suspend", "suspended", security.ActionDatabaseSuspend
+	if target == hosting.StateActive {
+		verb, past, action = "resume", "resumed", security.ActionDatabaseResume
+	}
+	op := "nextsql database " + verb
+	fs := flag.NewFlagSet("database "+verb, flag.ContinueOnError)
+	fs.String("data-dir", "", "deployment data directory")
+	fs.String("key-file", "", "database root unlock key file (used to locate KEY-FILE.instance)")
+	fs.String("instance-key-file", "", "deployment registry root key file (default KEY-FILE.instance)")
+	realm := fs.String("realm", "", "realm name")
+	database := fs.String("database", "", "logical database name")
+	confirm := fs.Bool("confirm", false, "confirm the registry change")
+	fs.String("env-file", "", "load only this dotenv file")
+	fs.Bool("no-env", false, "do not load .env files")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	reg, ddl, settings, err := openHostingRegistryForCLI(op, fs, args, true)
+	if err != nil {
+		return err
+	}
+	defer reg.Close()
+	defer ddl.Close()
+	if settings.Supplied["realm"] {
+		*realm = settings.Realm
+	}
+	if settings.Supplied["database"] {
+		*database = settings.Database
+	}
+	if *realm == "" || *database == "" {
+		return cli.LocalMissing(op, "--realm and --database are required")
+	}
+	if !*confirm {
+		return nerr.New(nerr.InvalidArgument, op, "--confirm is required")
+	}
+	m := reg.Manifest()
+	realmID, err := resolveRealmID(m, *realm)
+	if err != nil {
+		return err
+	}
+	databaseID, err := resolveDatabaseID(m, realmID, *database)
+	if err != nil {
+		return err
+	}
+	object := strings.ToLower(strings.TrimSpace(*realm)) + "/" + strings.ToLower(strings.TrimSpace(*database))
+	if err := reg.SetDatabaseState(realmID, databaseID, target); err != nil {
+		auditLocal(settings.DataDir, action, object, err)
+		return err
+	}
+	auditLocal(settings.DataDir, action, object, nil)
+	fmt.Printf("realm %s database %s %s\n", strings.ToLower(strings.TrimSpace(*realm)), strings.ToLower(strings.TrimSpace(*database)), past)
+	return nil
+}
+
+// dropDatabase is M3-3's CLI surface for the physical half of the delete
+// lifecycle (docs/design-multidatabase-dbaas.md §16 M3-3). The
+// StateDeleting/StateTombstoned states and Lookup's fail-closed handling of
+// both already existed (state machine landed with M0/M1; Lookup's
+// enforcement landed with M3-1, log #112) — the remaining gap was
+// exclusively that nothing ever reclaimed a tombstoned managed database's
+// on-disk files. Follows the exact same offline pattern as suspend/resume
+// (openHostingRegistryForCLI's exclusive data-dir lock, so it fails
+// Unavailable against a running nextsqld — there is no live connection to
+// evict because the server cannot be up while this runs). Scoped to
+// realm-managed (LayoutManaged) databases, never the deployment's default
+// realm/database: LayoutLegacyDefault lives directly at DATA-DIR/nextsql.db
+// with no per-ID directory to safely reclaim, and every tool that omits
+// --realm/--database assumes that path exists; a declarative-manifest
+// deployment's default database is LayoutManaged but is still rejected by
+// the explicit default-pair check for the same reason. Idempotent: a
+// database already StateTombstoned (e.g. a prior run that reclaimed the
+// files but crashed before the final state write) reports success without
+// erroring; a prior run that crashed after StateDeleting but before
+// reclaiming files resumes cleanly (os.RemoveAll is idempotent, and
+// CanTransition treats StateDeleting -> StateDeleting as a valid no-op).
+// Rename (M3-2), realm-level delete, and reclaiming an *open* database's
+// live buffer/task-pool footprint remain separate, still-open M3 items.
+func dropDatabase(args []string) error {
+	const op = "nextsql database drop"
+	fs := flag.NewFlagSet("database drop", flag.ContinueOnError)
+	fs.String("data-dir", "", "deployment data directory")
+	fs.String("key-file", "", "database root unlock key file (used to locate KEY-FILE.instance)")
+	fs.String("instance-key-file", "", "deployment registry root key file (default KEY-FILE.instance)")
+	realm := fs.String("realm", "", "realm name")
+	database := fs.String("database", "", "logical database name")
+	confirm := fs.Bool("confirm", false, "confirm the irreversible delete")
+	fs.String("env-file", "", "load only this dotenv file")
+	fs.Bool("no-env", false, "do not load .env files")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	reg, ddl, settings, err := openHostingRegistryForCLI(op, fs, args, true)
+	if err != nil {
+		return err
+	}
+	defer reg.Close()
+	defer ddl.Close()
+	if settings.Supplied["realm"] {
+		*realm = settings.Realm
+	}
+	if settings.Supplied["database"] {
+		*database = settings.Database
+	}
+	if *realm == "" || *database == "" {
+		return cli.LocalMissing(op, "--realm and --database are required")
+	}
+	if !*confirm {
+		return nerr.New(nerr.InvalidArgument, op, "--confirm is required")
+	}
+	m := reg.Manifest()
+	realmID, err := resolveRealmID(m, *realm)
+	if err != nil {
+		return err
+	}
+	databaseID, err := resolveDatabaseID(m, realmID, *database)
+	if err != nil {
+		return err
+	}
+	object := strings.ToLower(strings.TrimSpace(*realm)) + "/" + strings.ToLower(strings.TrimSpace(*database))
+	if realmID == m.DefaultRealm && databaseID == m.DefaultDatabase {
+		derr := nerr.New(nerr.InvalidArgument, op, "cannot drop the deployment default database")
+		auditLocal(settings.DataDir, security.ActionDatabaseDrop, object, derr)
+		return derr
+	}
+	_, dbRec, found := findManifestDatabase(m, realmID, databaseID)
+	if !found {
+		return nerr.New(nerr.NotFound, op, "unknown database in realm")
+	}
+	if dbRec.Layout != hosting.LayoutManaged {
+		lerr := nerr.New(nerr.InvalidArgument, op, "drop is only supported for realm-managed databases; the legacy default-layout database is out of scope")
+		auditLocal(settings.DataDir, security.ActionDatabaseDrop, object, lerr)
+		return lerr
+	}
+	if dbRec.State == hosting.StateTombstoned {
+		fmt.Printf("realm %s database %s already dropped\n",
+			strings.ToLower(strings.TrimSpace(*realm)), strings.ToLower(strings.TrimSpace(*database)))
+		return nil
+	}
+	if err := reg.SetDatabaseState(realmID, databaseID, hosting.StateDeleting); err != nil {
+		auditLocal(settings.DataDir, security.ActionDatabaseDrop, object, err)
+		return err
+	}
+	dbPath := hosting.ManagedDatabasePath(settings.DataDir, realmID, databaseID)
+	dir := filepath.Dir(dbPath)
+	if _, statErr := os.Stat(dir); statErr == nil {
+		if rmErr := os.RemoveAll(dir); rmErr != nil {
+			rmErr = nerr.Wrap(nerr.IO, op, "remove managed database files", rmErr)
+			auditLocal(settings.DataDir, security.ActionDatabaseDrop, object, rmErr)
+			return rmErr
+		}
+	} else if !os.IsNotExist(statErr) {
+		statErr = nerr.Wrap(nerr.IO, op, "stat managed database directory", statErr)
+		auditLocal(settings.DataDir, security.ActionDatabaseDrop, object, statErr)
+		return statErr
+	}
+	if err := reg.SetDatabaseState(realmID, databaseID, hosting.StateTombstoned); err != nil {
+		auditLocal(settings.DataDir, security.ActionDatabaseDrop, object, err)
+		return err
+	}
+	auditLocal(settings.DataDir, security.ActionDatabaseDrop, object, nil)
+	fmt.Printf("realm %s database %s dropped\n", strings.ToLower(strings.TrimSpace(*realm)), strings.ToLower(strings.TrimSpace(*database)))
 	return nil
 }
 
@@ -2552,6 +2756,20 @@ Usage:
   nextsql init --data-dir DIR --key-file FILE [--instance-key-file FILE]
                [--realm NAME --database NAME] [--user NAME --password-file FILE]
                [--env-file PATH | --no-env]
+  nextsql setup --data-dir DIR --key-file FILE [--preset conservative|balanced|high-performance|custom]
+               [--buffer-pages N] [--listen HOST:PORT [--tls-cert FILE --tls-key FILE]]
+               [--user NAME --password-file FILE] [--config-in FILE] [--config-out FILE]
+               [--json] [--dry-run] [--force] [--skip-init]
+  nextsql lifecycle detect --data-dir DIR [--config FILE] [--json]
+  nextsql lifecycle preflight --data-dir DIR [--json]
+  nextsql lifecycle backup-config --config FILE [--out DIR] [--json]
+  nextsql lifecycle upgrade --data-dir DIR --key-file FILE [--config FILE]
+               [--buffer-pages N] [--dry-run] [--json]
+  nextsql lifecycle repair --data-dir DIR --key-file FILE [--config FILE]
+               [--preset P] [--buffer-pages N] [--listen HOST:PORT] [--force-config]
+               [--fix-perms] [--dry-run] [--json]
+  nextsql lifecycle uninstall --data-dir DIR [--config FILE] [--key-file FILE]
+               [--purge-data] [--purge-keys] [--confirm] [--json]
   nextsql hosting adopt --data-dir DIR --key-file FILE [--instance-key-file FILE]
                [--realm NAME --database NAME] --confirm [--env-file PATH | --no-env]
   nextsql hosting migrate-tenant --source-data-dir DIR --source-key-file FILE --tenant VALUE
@@ -2561,6 +2779,10 @@ Usage:
                --realm NAME --database NAME --database-key-file FILE [--buffer-pages N]
   nextsql database create --data-dir DIR --key-file FILE [--instance-key-file FILE]
                --realm NAME --name NAME --database-key-file FILE [--buffer-pages N]
+  nextsql database suspend|resume --data-dir DIR --key-file FILE [--instance-key-file FILE]
+               --realm NAME --database NAME --confirm
+  nextsql database drop --data-dir DIR --key-file FILE [--instance-key-file FILE]
+               --realm NAME --database NAME --confirm
   nextsql login --idp NAME [--addr HOST:PORT] [--idp-config FILE]
 	           [--database NAME] [--realm NAME] [--no-browser] [--timeout DURATION]
 	           [--client-credentials [--client-secret-file FILE]]

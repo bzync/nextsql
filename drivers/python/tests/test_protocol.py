@@ -451,6 +451,39 @@ class TestHelpers(unittest.TestCase):
         self.assertTrue(c.is_loopback("[::1]:7210"))
         self.assertFalse(c.is_loopback("db.example.com:7210"))
 
+    def test_collections_round_trip(self) -> None:
+        arr_val, nxt, kind = p.decode_value(p.encode_param(["a", "b", "c"]), 0)
+        self.assertEqual(kind, p.KIND_ARRAY)
+        self.assertEqual(arr_val, ["a", "b", "c"])
+        self.assertEqual(p.decode_value(p.encode_param(["a", None, "c"]), 0)[0], ["a", None, "c"])
+        m_val, _, mkind = p.decode_value(p.encode_param(p.MapValue({"x": "hi"})), 0)
+        self.assertEqual(mkind, p.KIND_MAP)
+        self.assertEqual(m_val["x"], "hi")
+        s_val, _, skind = p.decode_value(p.encode_param(p.StructValue([("street", "Main"), ("zip", "90210")])), 0)
+        self.assertEqual(skind, p.KIND_STRUCT)
+        self.assertEqual(s_val["street"], "Main")
+        nested, _, _ = p.decode_value(p.encode_param(p.StructValue([("n", "bob"), ("t", ["x", "y"])])), 0)
+        self.assertEqual(nested["t"], ["x", "y"])
+
+    def test_spatial_ewkb_round_trip(self) -> None:
+        import struct
+
+        def u32le(n: int) -> bytes:
+            return struct.pack("<I", n)
+
+        def f64le(x: float) -> bytes:
+            return struct.pack("<d", x)
+
+        ewkb = b"\x01" + u32le(1 | 0x20000000) + u32le(4326) + f64le(1.5) + f64le(2.5)
+        wire = bytes([p.KIND_GEOMETRY, 0, 0, 0, 0, 0, 0]) + u32le(len(ewkb)) + ewkb
+        g, nxt, kind = p.decode_value(wire, 0)
+        self.assertEqual(nxt, len(wire))
+        self.assertEqual(kind, p.KIND_GEOMETRY)
+        self.assertEqual((g.type, g.srid, g.coordinates), ("Point", 4326, (1.5, 2.5)))
+        enc = p.encode_param(p.Geometry("Point", 4326, (1.0, 2.0)))
+        val, _, _ = p.decode_value(enc, 0)
+        self.assertEqual(val, "SRID=4326;POINT(1.0 2.0)")
+
 
 if __name__ == "__main__":
     unittest.main()

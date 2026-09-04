@@ -971,6 +971,13 @@ func GeometryPointCount(v Value) (int, error) {
 
 // GeoBBox is the axis-aligned lon/lat box of a geometry. wrap is true when the box crosses the antimeridian.
 func GeoBBox(v Value) (west, south, east, north float64, wrap bool, ok bool) {
+	if IsGeneralSpatial(v.Typ.Kind) && v.Geom != nil {
+		bb := GeomBBox(v.Geom)
+		if math.IsInf(bb[0], 0) {
+			return 0, 0, 0, 0, false, false
+		}
+		return bb[0], bb[1], bb[2], bb[3], false, true
+	}
 	switch {
 	case v.IsPoint():
 		return v.Lon, v.Lat, v.Lon, v.Lat, false, true

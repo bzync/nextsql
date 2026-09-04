@@ -93,6 +93,12 @@ func (s *Session) eval(e ast.Expr, tab *catalog.Table, row []types.Value) (types
 			if v, ok, err := evalJSONFn(x.Name, args); err != nil || ok {
 				return v, err
 			}
+			if v, ok, err := evalCollectionFn(x.Name, args); err != nil || ok {
+				return v, err
+			}
+			if v, ok, err := evalSpatialFn(x.Name, args); err != nil || ok {
+				return v, err
+			}
 			if v, ok, err := evalDateFn(x.Name, args); err != nil || ok {
 				return v, err
 			}
@@ -108,6 +114,18 @@ func (s *Session) eval(e ast.Expr, tab *catalog.Table, row []types.Value) (types
 			}
 			return types.Value{}, nerr.New(nerr.InvalidArgument, "executor.eval", "unknown function")
 		}
+	case ast.ArrayCtor:
+		return s.evalArrayCtor(x, tab, row)
+	case ast.StructCtor:
+		return s.evalStructCtor(x, tab, row)
+	case ast.MapCtor:
+		return s.evalMapCtor(x, tab, row)
+	case ast.FieldAccess:
+		base, err := s.eval(x.Base, tab, row)
+		if err != nil {
+			return types.Value{}, err
+		}
+		return structField(base, x.Field)
 	case ast.Case:
 		return s.evalCase(x, tab, row)
 	case ast.Unary:
@@ -255,16 +273,34 @@ func (s *Session) eval(e ast.Expr, tab *catalog.Table, row []types.Value) (types
 		if len(x.Parts) < 2 {
 			return types.Value{}, nerr.New(nerr.InvalidArgument, "executor.eval", "invalid path")
 		}
+		if tab == nil {
+			return types.Value{}, nerr.New(nerr.InvalidArgument, "executor.eval", "column reference is not valid in this context")
+		}
 		i, ok := tab.ColIndex(x.Parts[0])
 		if !ok {
 			return types.Value{}, nerr.New(nerr.NotFound, "executor.eval", "unknown column")
 		}
 		v := row[i]
+		if v.Typ.Kind == types.KindStruct || (v.Null && tab.Columns[i].Type.Kind == types.KindStruct) {
+			// col.field[.field...] — descend named STRUCT fields.
+			cur := v
+			if cur.Null {
+				cur = types.Null(tab.Columns[i].Type)
+			}
+			for _, part := range x.Parts[1:] {
+				f, err := structField(cur, part)
+				if err != nil {
+					return types.Value{}, err
+				}
+				cur = f
+			}
+			return cur, nil
+		}
 		if v.Null {
 			return types.Null(types.JSON()), nil
 		}
 		if v.Typ.Kind != types.KindJSON {
-			return types.Value{}, nerr.New(nerr.InvalidArgument, "executor.eval", "path extract requires a JSON column")
+			return types.Value{}, nerr.New(nerr.InvalidArgument, "executor.eval", "path extract requires a JSON or STRUCT column")
 		}
 		return types.ExtractJSON(v.JSON, x.Parts[1:])
 	default:

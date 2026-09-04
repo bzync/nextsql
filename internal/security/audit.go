@@ -30,6 +30,9 @@ const (
 	ActionBackupPrune         = "backup.prune"
 	ActionRealmCreate         = "realm.create"
 	ActionDatabaseCreate      = "database.create"
+	ActionDatabaseSuspend     = "database.suspend"
+	ActionDatabaseResume      = "database.resume"
+	ActionDatabaseDrop        = "database.drop"
 	ActionRestore             = "restore"
 	ActionExport              = "export"
 	ActionImport              = "import"
@@ -64,6 +67,8 @@ const (
 	ActionClusterDrain        = "cluster.drain"
 	ActionClusterMaintenance  = "cluster.maintenance"
 	ActionClusterReconcile    = "cluster.reconcile_confirm"
+	ActionConfigSet           = "config.set"
+	ActionBackupVerify        = "backup.verify"
 	// ActionAuditSigningEnabled is the signed transition record after which
 	// every chained line must carry a valid signature when verified with an
 	// audit public keyset. Its presence prevents stripping the first
@@ -176,7 +181,7 @@ func OpenAudit(path string) (*Log, error) {
 // participate; a file with no chained lines yet resumes at seq 1, prevHash
 // all-zero (a fresh genesis).
 func auditChainResumeState(path string) (uint64, [32]byte, bool, error) {
-	report, state, err := verifyAuditPath(path, nil)
+	report, state, err := verifyAuditPath(path, nil, 0)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return 1, [32]byte{}, false, nil

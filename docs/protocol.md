@@ -2,7 +2,14 @@
 
 `ENCRYPTED CLIENT` adds no NSQL frame or wire type. Clients bind and receive
 its `NSCE1.` ciphertext through the existing `STRING` value encoding; logical
-type and encryption status are catalog metadata (`NSCT` v11).
+type and encryption status are catalog metadata (`NSCT` v12).
+
+`STRUCT` / `ARRAY` / `MAP` values (`docs/design-collections.md`) travel as a
+self-describing recursive type descriptor after the fixed value header
+(depth-bounded, re-validated on decode), then a nested payload — no NSQL
+version bump (a scalar value's header is byte-identical to before). A
+plain-string / native-list / wrapper param for a collection column is
+re-coerced server-side against the destination column type.
 
 Versioned NextSQL framing spoken by `nextsqld` and the official drivers (`drivers/go`, `drivers/node`, `drivers/bun`, `drivers/deno`, `drivers/php`, `drivers/python`, `drivers/ruby`). Node, Bun, and Deno ship TypeScript types (`drivers/js/types.d.ts`). Local SQL execution is unchanged (`docs/sql.md`). This document is the on-the-wire contract.
 

@@ -348,6 +348,71 @@ func sqlLiteral(v types.Value) (string, error) {
 		return fmt.Sprintf("BOX(%g, %g, %g, %g)", v.Box[0], v.Box[1], v.Box[2], v.Box[3]), nil
 	case types.KindLine, types.KindPolygon:
 		return "'" + strings.ReplaceAll(v.String(), "'", "''") + "'", nil
+	case types.KindArray:
+		var b strings.Builder
+		b.WriteString("ARRAY(")
+		for i, e := range v.Coll {
+			if i > 0 {
+				b.WriteString(", ")
+			}
+			lit, err := sqlLiteral(e)
+			if err != nil {
+				return "", err
+			}
+			b.WriteString(lit)
+		}
+		b.WriteByte(')')
+		return b.String(), nil
+	case types.KindStruct:
+		var b strings.Builder
+		b.WriteString("STRUCT(")
+		for i, e := range v.Coll {
+			if i > 0 {
+				b.WriteString(", ")
+			}
+			lit, err := sqlLiteral(e)
+			if err != nil {
+				return "", err
+			}
+			b.WriteString(lit)
+			b.WriteString(" AS ")
+			if i < len(v.Typ.Fields) {
+				b.WriteString(quoteIdent(v.Typ.Fields[i].Name))
+			}
+		}
+		b.WriteByte(')')
+		return b.String(), nil
+	case types.KindMap:
+		var b strings.Builder
+		b.WriteString("MAP(")
+		for i := range v.Coll {
+			if i > 0 {
+				b.WriteString(", ")
+			}
+			kl, err := sqlLiteral(v.CollKeys[i])
+			if err != nil {
+				return "", err
+			}
+			vl, err := sqlLiteral(v.Coll[i])
+			if err != nil {
+				return "", err
+			}
+			b.WriteString(kl)
+			b.WriteString(", ")
+			b.WriteString(vl)
+		}
+		b.WriteByte(')')
+		return b.String(), nil
+	case types.KindGeometry, types.KindGeography:
+		if v.Geom == nil {
+			return "NULL", nil
+		}
+		fn := "ST_GeomFromEWKT"
+		if v.Typ.Kind == types.KindGeography {
+			fn = "ST_GeogFromText"
+			return fn + "('" + strings.ReplaceAll(types.FormatGeomWKT(v.Geom), "'", "''") + "')", nil
+		}
+		return fn + "('" + strings.ReplaceAll(types.FormatGeomEWKT(v.Geom), "'", "''") + "')", nil
 	default:
 		return "", nerr.New(nerr.InvalidArgument, "xport.sqlLiteral", "unsupported default type")
 	}

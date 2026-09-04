@@ -96,6 +96,50 @@ func (r *ServerTLSReloader) MTLS() bool {
 	return r != nil && strings.TrimSpace(r.clientCAFile) != ""
 }
 
+// TLSStatus is a redacted snapshot of a listener's live TLS configuration,
+// safe to expose to an authenticated admin session (system.tls): the leaf
+// certificate's public identity/validity and the mTLS/CRL posture. It never
+// carries private key material, and it never carries a network address —
+// same "no addresses over SQL" convention as system.replication.leader_addr.
+type TLSStatus struct {
+	Enabled             bool
+	Subject             string
+	Issuer              string
+	NotBefore, NotAfter time.Time
+	DNSNames            []string
+	MTLSRequired        bool
+	ClientCAConfigured  bool
+	ClientCRLConfigured bool
+}
+
+// Status returns the currently active leaf certificate's redacted status.
+// The second return is false only when r is nil or has no loaded
+// certificate yet (Reload failed before ever succeeding, which NewServerTLSReloader
+// already prevents — so in practice this is false only for a nil reloader).
+func (r *ServerTLSReloader) Status() (TLSStatus, bool) {
+	if r == nil {
+		return TLSStatus{}, false
+	}
+	r.mu.RLock()
+	cfg := r.current
+	r.mu.RUnlock()
+	if cfg == nil || len(cfg.Certificates) == 0 || cfg.Certificates[0].Leaf == nil {
+		return TLSStatus{}, false
+	}
+	leaf := cfg.Certificates[0].Leaf
+	return TLSStatus{
+		Enabled:             true,
+		Subject:             leaf.Subject.String(),
+		Issuer:              leaf.Issuer.String(),
+		NotBefore:           leaf.NotBefore,
+		NotAfter:            leaf.NotAfter,
+		DNSNames:            append([]string(nil), leaf.DNSNames...),
+		MTLSRequired:        cfg.ClientAuth == tls.RequireAndVerifyClientCert,
+		ClientCAConfigured:  r.MTLS(),
+		ClientCRLConfigured: strings.TrimSpace(r.clientCRLFile) != "",
+	}, true
+}
+
 // ServerTLS loads a certificate and requires TLS 1.3.
 func ServerTLS(certFile, keyFile string) (*tls.Config, error) {
 	return loadServerTLS(certFile, keyFile, "", "")

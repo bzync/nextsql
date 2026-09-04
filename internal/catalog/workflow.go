@@ -400,6 +400,8 @@ func validWorkflowType(t types.Type) bool {
 		return t.Precision >= 1 && t.Precision <= types.MaxCharLen && t.Scale == 0
 	case types.KindEnum:
 		return len(t.EnumLabels) >= 1 && len(t.EnumLabels) <= types.MaxEnumLabels
+	case types.KindGeometry, types.KindGeography:
+		return t.Scale <= uint16(types.GeomSubGeometryCollection)
 	case types.KindVector:
 		return t.VecElem == types.VecF32 && t.Precision >= 1 && t.Precision <= types.MaxVectorDim
 	default:

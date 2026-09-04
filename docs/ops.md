@@ -76,9 +76,18 @@ unreachable; it never automatically frees a suspected orphan.
   "Replica-lag monitoring" in `docs/ha.md`)
 - heap, total alloc, goroutines, CPU
 
-Page encrypt/decrypt in `crypto.SealPage` / `OpenPage` observe the
-process registry. Per-database query counters live on `executor.DB`.
-Metrics never contain passwords, keys, tokens, or secrets.
+Page encrypt/decrypt in `crypto.SealPage` / `OpenPage` observe the process
+registry. `nextsqld` routes each database's own query/txn counters into that
+same process registry (`executor.DB.SetMetrics`), so one snapshot is
+internally coherent — `queries_per_second` / `commits_per_second` /
+`crypto_time_pct` all share one uptime base. Metrics never contain
+passwords, keys, tokens, or secrets.
+
+The whole snapshot is queryable over SQL as **`system.metrics`** (admin-only,
+`category`/`name`/`value`/`unit`), and the NextSQL Manager's Diagnostics view
+renders it grouped by category alongside a bounded tail of the server's own
+structured log (**`system.server_log`**). See `docs/system-catalog.md`
+"Diagnostics (Manager M9)".
 
 Blocking index rebuild progress is available from
 `executor.DB.IndexRebuildProgress()`. Each active entry reports only table and
@@ -406,9 +415,15 @@ node:
    ordinary statements on this deployment finish comfortably inside it; a
    connection still busy exactly at the deadline is force-closed like any
    other drain (see the correctness note below).
-3. Stop the process, upgrade the binary, and restart it. It rejoins the
-   Raft cluster as a follower and replays from where it left off; wait for
-   it to catch up (`system.replica_health.apply_backlog` back to 0, or
+3. Stop the process and upgrade the binary. Run `nextsql lifecycle upgrade
+   --data-dir DIR --key-file FILE --cluster-node` while the process is down:
+   it runs WAL recovery and confirms the store opens and the catalog decodes
+   under the new binary before the node rejoins (see `docs/install.md`). The
+   `--cluster-node` flag is required for a node that shows Raft membership —
+   without it the command stops at `blocked` and prints this procedure — and
+   asserts steps 1–2 were done. Then restart the node. It rejoins the Raft
+   cluster as a follower and replays from where it left off; wait for it to
+   catch up (`system.replica_health.apply_backlog` back to 0, or
    `applied_lsn` matching the leader's) before moving on to the next node.
 4. Repeat for the next node. A 3-voter deployment keeps quorum (2 of 3)
    throughout every single node's cycle, so writes never stop landing

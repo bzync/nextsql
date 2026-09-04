@@ -128,6 +128,35 @@ type (
 	// ResetResourceGroup clears a session's resource group assignment,
 	// returning it to unbounded/process-default scheduling.
 	ResetResourceGroup struct{}
+	// SetConfig persists one server setting to the node's on-disk
+	// nextsql.conf (SET CONFIG <key> = <value|DEFAULT>). It is a deployment
+	// operation, not a session setting: the write goes through the server
+	// this connection reached, which owns the config file — the client never
+	// touches it. The change is persist-only; it takes effect on the next
+	// server restart (system.config's file_value / restart_required columns
+	// surface the pending difference). Requires ADMIN ON CLUSTER and a
+	// server that was started from a config file. Reset=true (DEFAULT)
+	// removes the key so it falls back to its built-in default.
+	SetConfig struct {
+		Key   string
+		Value string
+		Reset bool
+	}
+	// BackupDatabase (BACKUP DATABASE) asks the server this connection
+	// reached to write a verified, encrypted backup of itself into its
+	// configured backup directory (config key backup_dir). The client never
+	// names a filesystem path. Requires the BACKUP privilege (or cluster
+	// ADMIN), cannot run inside a transaction, and is node-local. The backup
+	// is a hot/fuzzy copy reconciled by WAL replay — the server's live
+	// engine is checkpointed first, never re-opened.
+	BackupDatabase struct{}
+	// VerifyBackup (VERIFY BACKUP 'name') integrity-checks one existing
+	// backup in the server's backup directory — hash verification plus a
+	// restore test into a temp directory; it never touches the live data
+	// file. Same privilege as BackupDatabase.
+	VerifyBackup struct {
+		Name string
+	}
 	ShowTasks          struct {
 		After string
 		Limit int
@@ -232,9 +261,15 @@ type (
 		ReturningStar bool
 	}
 	Select struct {
-		List           []SelectItem
-		Star           bool
-		Distinct       bool
+		List     []SelectItem
+		Star     bool
+		Distinct bool
+		// NoFrom is a SELECT with no FROM clause at all (e.g. `SELECT 1`,
+		// `SELECT NOW()`): the select list is evaluated exactly once against
+		// no row/table context. Table/Alias/FromQuery/Joins are always zero
+		// when NoFrom is set; the grammar routes a `SELECT *` (which needs a
+		// table) through the ordinary FROM-required path instead.
+		NoFrom         bool
 		Table          string
 		Alias          string
 		FromQuery      Stmt
@@ -427,6 +462,9 @@ func (AlterResourceGroup) stmt()      {}
 func (DropResourceGroup) stmt()       {}
 func (SetResourceGroup) stmt()        {}
 func (ResetResourceGroup) stmt()      {}
+func (SetConfig) stmt()               {}
+func (BackupDatabase) stmt()          {}
+func (VerifyBackup) stmt()            {}
 func (ShowTasks) stmt()               {}
 func (CancelTask) stmt()              {}
 func (Subscribe) stmt()               {}
@@ -623,6 +661,31 @@ type (
 	VectorLit struct {
 		Elems []float32
 	}
+	// ArrayCtor is ARRAY(e1, e2, ...) — a homogeneous array value built from
+	// its element expressions (docs/design-collections.md C2).
+	ArrayCtor struct {
+		Elems []Expr
+	}
+	// StructCtor is STRUCT(e1 AS f1, e2 AS f2, ...) — a struct value; Names
+	// and Elems are positionally aligned (docs/design-collections.md C1).
+	StructCtor struct {
+		Names []string
+		Elems []Expr
+	}
+	// MapCtor is MAP(k1, v1, k2, v2, ...) — flat alternating key/value
+	// expressions (docs/design-collections.md C3).
+	MapCtor struct {
+		Keys []Expr
+		Vals []Expr
+	}
+	// FieldAccess is expr.field, used to read a STRUCT member. The parser
+	// only produces this when the base is not a bare column name (that stays
+	// an Ident/Path so table.column keeps working); the executor also treats
+	// a Path whose head column is a STRUCT as field access.
+	FieldAccess struct {
+		Base  Expr
+		Field string
+	}
 )
 
 func (Literal) expr()        {}
@@ -640,3 +703,7 @@ func (ScalarSubquery) expr() {}
 func (InSubquery) expr()     {}
 func (ExistsSubquery) expr() {}
 func (VectorLit) expr()      {}
+func (ArrayCtor) expr()      {}
+func (StructCtor) expr()     {}
+func (MapCtor) expr()        {}
+func (FieldAccess) expr()    {}

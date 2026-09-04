@@ -19,6 +19,31 @@ nextsql backup list  --base-dir DIR
 nextsql backup prune --base-dir DIR (--keep-count N | --keep-days N) [--confirm]
 ```
 
+`nextsql backup`/`verify` open the data file themselves, so they are meant
+for an **offline** data directory (or one that is at least quiescent). The
+same operations against a *live* server go through SQL instead:
+
+```text
+BACKUP DATABASE            -- new backup into the server's backup_dir
+VERIFY BACKUP 'name'       -- integrity-check one existing backup
+SELECT * FROM system.backups
+```
+
+`BACKUP DATABASE` (Phase 28 / Manager M5) uses the server's **already-open
+engine** — `backup.CreateFromEngine` checkpoints it, reads the snapshot
+coordinates, then copies the file set while the server keeps serving; restore
+reconciles the fuzzy copy by replaying WAL from `RedoLSN`, and the
+restore-test still gates publication. There is no second `storage.Open` and
+no second recovery pass, so neither can truncate a WAL tail the other is
+mid-write on. The server writes each backup into a fresh timestamped
+subdirectory of `backup_dir` (config key), so `system.backups` and `VERIFY
+BACKUP` see them, and the retention convention below applies unchanged.
+`BACKUP DATABASE` / `VERIFY BACKUP` need the `BACKUP` privilege or cluster
+`ADMIN`; they fail `Unavailable` if `backup_dir` is unset. **Restore and PITR
+have no live equivalent** — a running server cannot restore into itself — so
+`nextsql restore` stays the only path; the Manager's Backups view prints the
+exact command.
+
 `nextsqld --wal-archive DIR` installs a WAL archiver so recycled (and
 checkpoint-time current) segments are copied for point-in-time recovery. See
 `docs/wal.md` "Retention" for the matching `wal_retention_ms` policy that

@@ -80,6 +80,9 @@ const (
 	KwDate
 	KwTime
 	KwInterval
+	KwStruct
+	KwArray
+	KwMap
 	KwJson
 	KwVector
 	KwF32
@@ -95,6 +98,8 @@ const (
 	KwLocation
 	KwLineString
 	KwPolygon
+	KwGeometry
+	KwGeography
 	KwSpatial
 	KwFulltext
 	KwSearch
@@ -504,9 +509,11 @@ var keywords = map[string]Kind{
 	"uint8": KwUint8, "uint16": KwUint16, "uint32": KwUint32, "uint64": KwUint64,
 	"char": KwChar, "varchar": KwVarchar, "enum": KwEnum, "float32": KwFloat32, "float64": KwFloat64,
 	"decimal": KwDecimal, "timestamptz": KwTimestamptz, "timestamp": KwTimestamp, "date": KwDate, "time": KwTime, "interval": KwInterval, "json": KwJson,
+	"struct": KwStruct, "array": KwArray, "map": KwMap,
 	"vector": KwVector, "bitvector": KwBitvector, "sparsevector": KwSparsevector, "f32": KwF32, "f16": KwF16, "i8": KwI8, "explain": KwExplain, "analyze": KwAnalyze, "maintain": KwMaintain,
 	"point": KwPoint, "box": KwBox, "location": KwLocation,
 	"linestring": KwLineString, "polygon": KwPolygon, "spatial": KwSpatial,
+	"geometry": KwGeometry, "geography": KwGeography,
 	"fulltext": KwFulltext, "search": KwSearch, "for": KwFor,
 	"nearest": KwNearest, "to": KwTo, "using": KwUsing, "hnsw": KwHnsw,
 	"cosine": KwCosine, "l2": KwL2, "inner_product": KwInnerProduct, "hamming": KwHamming,

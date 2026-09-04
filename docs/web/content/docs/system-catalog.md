@@ -13,7 +13,7 @@ SELECT sql FROM system.active_queries;
 `JOIN` and `GROUP BY` are not. Every session needs `CONNECT` on the database;
 some tables layer RBAC filtering on top.
 
-Capability consumers can query the supported `system_schema_v2` row in
+Capability consumers can query the supported `system_schema_v3` row in
 `system.capabilities` to identify the current stable system-column contract.
 `system_show_aliases` advertises the convenience syntax.
 

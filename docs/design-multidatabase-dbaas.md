@@ -1,8 +1,10 @@
 # Proposed Multi-Database Hosting and Subscription Isolation
 
-> Status: **ACCEPTED DESIGN — M1 FOUNDATION COMPLETE, M2-1/M2-2/M2-3a/
-> M2-3b-1/M2-3b-2/M2-3b-3a/M2-3b-3b/M2-4a/M2-4b-1/M2-5/M2-6 LANDED; NOT
-> PRODUCTION-GATED**
+> Status: **ACCEPTED DESIGN — M1 FOUNDATION COMPLETE, M2 COMPLETE
+> (M2-1/M2-2/M2-3a/M2-3b-1/M2-3b-2/M2-3b-3a/M2-3b-3b/M2-3b-3c/M2-4a/M2-4b-1/
+> M2-5/M2-6 LANDED), M3-1 LANDED 2026-09-04 (suspend/resume enforcement),
+> M3-3 LANDED 2026-09-04 (offline drop/tombstone physical reclamation);
+> M3-2, M3-4, M3-5 NOT STARTED; NOT PRODUCTION-GATED**
 >
 > This document is a design and delivery plan. `TODO.md` remains authoritative
 > for implementation status and sequencing. Nothing in this document changes a
@@ -854,8 +856,20 @@ command (overwrites the value) → start the server (the new ceiling is applied 
 open). A running-server control-plane path for live cap changes without a
 restart is a follow-on.
 
-Advisory surfacing (`system.quotas`, metrics for "N% of cap", over-cap alerts)
-is a separate follow-on; today the signal is the write rejection itself.
+**Advisory surfacing.** `system.quotas` (M3) exposes the storage caps
+read-only, admin-only, and empty on a legacy/non-hosted deployment — the same
+convention as `system.realms`/`system.databases`. One row per realm and one per
+database from the registry manifest, with `cap_bytes` (that scope's own
+configured cap) and `effective_cap_bytes` (`EffectiveStorageCapBytes` for a
+database row, the realm cap for a realm row). The usage columns — `used_bytes`,
+`pct_of_cap`, `over_cap`, gated by `usage_known` — are populated only for the
+row matching the session's own connected realm+database, because no other
+database's engine is reachable from a single connection; `used_bytes` is the
+data-file logical high-water (`allocator.Next()` pages × `PhysicalPageSize`),
+the same quantity the cap is enforced against. The view never errors and never
+bounds anything: the authoritative over-cap signal is still the write-path
+`nerr.Exhausted` rejection. Per-realm aggregate usage, a cross-database usage
+roll-up, and metrics for "N% of cap" / over-cap alerts remain follow-ons.
 
 **Authorization.** Two levels:
 
@@ -978,6 +992,25 @@ open — this CLI is invoked with the same registry-root key as `nextsql
 init`, equivalent to deployment-admin authority, not a separate authorized
 principal. Live serving of the created database — steps that would make it
 reachable over the wire protocol — is M2-2/M2-3.
+
+**M3-1, landed 2026-09-04, implements `database suspend`/`resume`** from the
+list below — the same offline, registry-root-key, exclusive-data-dir-lock
+shape as M2-1's `create`, not yet the live administrative protocol either.
+Unlike `create`, this pair is enforced, not just recorded: `nextsqld`'s
+`dbmanager.Manager.Acquire` (via `hosting.Registry.Lookup`) refuses to route
+any new connection to a suspended database once the process is restarted
+with the updated registry.
+
+**M3-3, landed 2026-09-04, implements `database drop`** — same offline shape
+again. `StateDeleting`/`StateTombstoned` and `Lookup`'s fail-closed handling
+of both already existed; this adds the missing physical half: transition to
+`StateDeleting`, `os.RemoveAll` the managed database's whole ID-based
+directory (db file + `.keys`/`.wal`/`.undo`/`.isolated` sidecars, all
+colocated under it), transition to `StateTombstoned`. Idempotent and
+resumable across a crash at any step. Scoped to `LayoutManaged` databases
+and never the deployment default (§16 M3-3 has the full writeup). `realm
+suspend`/`resume`, `database rename`, and every `list`/`status`/`plan`/
+`operation` verb below remain unimplemented (M3-2, M2-4b-2, §16).
 
 Administrative surface should include native, machine-readable equivalents of:
 
@@ -1437,13 +1470,144 @@ post-authentication database-not-found case noted above remains open.
 
 ### M3 — Independent operational lifecycle
 
-- Scope WAL, UNDO, caches, idempotency, tasks, workflows, schedules, CDC,
-  maintenance, temp/spill, backup, restore, PITR, import, and export.
-- Implement suspend/resume/rename/drop/tombstone workflows.
-- Implement key rotation, rewrap, restore-as-new, and crypto-shred boundaries.
+Decomposed 2026-09-04 (mirroring M2's own §9/§16 "smallest coherent
+increment" decomposition discipline), now that M2 is complete, into:
+
+- **M3-1 — suspend/resume lifecycle enforcement (LANDED 2026-09-04).**
+  `hosting.Registry.SetDatabaseState`'s validated `StateActive` ↔
+  `StateSuspended` transition already existed (`internal/hosting/registry.go`,
+  landed with M0/M1's state machine), but nothing actually enforced it: a
+  suspended database's registry row was durable and visible in
+  `system.databases`, but `dbmanager.Manager.Acquire` (the sole production
+  call site of `hosting.Registry.Lookup`, §9) would still resolve and open
+  it exactly like an Active one — "suspend" recorded intent without ever
+  blocking a connection. Fixed at the one place that matters: `Lookup` now
+  fails closed for any non-Active database (`StateProvisioning`/`StateFailed`
+  → `Unavailable`, `StateDeleting`/`StateTombstoned` → `NotFound`,
+  `StateSuspended` → `Unavailable "database suspended"`) and, defensively,
+  for any non-Active realm the same way (`CreateDatabase` already checked
+  `realm.State` for the same reason; no `SetRealmState` exists yet to
+  actually reach that path today — realm suspend/delete stays the separate,
+  already-flagged M2-4b-2 gap). Every other `Registry` method that reads
+  `State` (`CreateRealm`/`CreateDatabase`/`SetDatabaseState`/the CLI's
+  `Manifest()`-walking resolvers) deliberately keeps seeing every state,
+  transient ones included — they need that to make their own idempotency
+  decisions; only connection routing rejects a non-Active pair. Safe to be
+  message-specific post-auth: `dbmanager.Manager.Acquire` runs after
+  `TypeAuthOK` (`internal/protocol/server.go`), the same "post-authentication
+  ... a materially weaker, already-accepted disclosure" precedent M2-6
+  already established for the pre-existing not-found case. New
+  `nextsql database suspend`/`resume --realm NAME --database NAME --confirm`
+  (§11.2), following set-realm-cap/set-database-cap's exact offline pattern
+  (`openHostingRegistryForCLI`'s exclusive data-dir lock — fails
+  `Unavailable` against a running `nextsqld`; a state edit is an overwrite,
+  applied on the next restart, the same documented shape as a live cap
+  edit without a restart). `security.ActionDatabaseSuspend`/`ActionDatabaseResume`
+  audit actions. Tests: `internal/hosting` —
+  `TestLookupRejectsNonActiveDatabaseState` (table across all five
+  non-Active states), `TestLookupRejectsNonActiveRealm`;
+  `TestLookupResolvesRealmAndDatabaseCaseInsensitively` updated to activate
+  the database first (it used to pass by accident, resolving a
+  still-`StateProvisioning` database — the exact bug this increment closes).
+  `cmd/nextsql` — `TestDatabaseSuspendResumeCLI` (missing `--confirm`,
+  deployment-lock rejection, unknown realm, and — the enforcement proof,
+  not just persistence — a real `hosting.Registry.Lookup` call rejecting
+  the suspended pair and succeeding again once resumed). All green under
+  `-race`: `internal/hosting`, `cmd/nextsql`, `internal/dbmanager`,
+  `cmd/nextsqld`, `internal/protocol`, `internal/security`,
+  `tests/integration`. **Live-verified end to end** against real
+  `nextsql`/`nextsqld` binaries: a two-realm deployment, `INSERT` against
+  `acme/prod` succeeds while Active; stop the server, `database suspend`,
+  restart — `acme/prod` now rejects with `unavailable: database suspended`
+  while the unrelated default database keeps working normally; `database
+  resume` + restart — `acme/prod` accepts connections again and its
+  earlier row survived untouched. See `TODO.md` log #112 for the full
+  writeup.
+- **M3-2 — rename.** Not started. A durable name change for an existing
+  realm or database, distinct from its stable `ID` (every `ManagedDatabasePath`/
+  audit/registry reference is already ID-based, so renaming should not by
+  itself require touching physical files) — needs its own scoping pass for
+  in-flight-connection behavior (an open `dbmanager` entry is keyed by ID,
+  not name, so a rename likely needs no eviction, but that must be verified,
+  not assumed) and collision handling against another realm/database
+  already holding the target name.
+- **M3-3 — drop/tombstone (LANDED 2026-09-04).** `StateDeleting`/
+  `StateTombstoned` already existed in the state machine and `CanTransition`
+  already allowed `StateActive/StateSuspended/StateProvisioning/StateFailed →
+  StateDeleting → StateTombstoned`, and M3-1's `Lookup` fix already failed
+  closed for both (`NotFound`) — the gap was exclusively the *physical*
+  side: nothing reclaimed a tombstoned managed database's on-disk files.
+  New `nextsql database drop --realm NAME --database NAME --confirm`
+  (`cmd/nextsql/main.go` `dropDatabase`), the same offline
+  `openHostingRegistryForCLI` exclusive-lock pattern as `suspend`/`resume`/
+  `set-*-cap` (fails `Unavailable` against a running `nextsqld`, so there is
+  never a live connection to evict — the server cannot be up while this
+  runs). Flow: reject the deployment default realm/database pair and any
+  non-`LayoutManaged` database (`LayoutLegacyDefault` lives directly at
+  `DATA-DIR/nextsql.db` with no per-ID directory to safely reclaim, and
+  every tool that omits `--realm`/`--database` assumes that path exists) →
+  `SetDatabaseState(..., StateDeleting)` → `os.RemoveAll` the whole
+  `ManagedDatabasePath` parent directory (the db file plus its `.keys`
+  keystore, `.wal`/`.undo` directories, and `.isolated` integrity-registry
+  sidecar are all colocated under `realms/<RealmID>/databases/<DatabaseID>/`,
+  so one `RemoveAll` reclaims every artifact) → `SetDatabaseState(...,
+  StateTombstoned)`. Idempotent and crash-resumable at every step: a
+  database already `StateTombstoned` reports success without erroring
+  (files were already reclaimed by an earlier, possibly-interrupted run);
+  `StateDeleting → StateDeleting` is a valid no-op transition, so a run that
+  crashed after the first state write but before reclaiming files resumes
+  cleanly on retry (`os.RemoveAll` is itself idempotent). New
+  `security.ActionDatabaseDrop` audit action. **Deliberately out of scope
+  for this slice** (unchanged open items): rename (M3-2), realm-level
+  delete (part of the still-open M2-4b-2 realm-suspend gap), and reclaiming
+  a database's live buffer-pool/`TaskRuntime` footprint if it happens to be
+  open in `dbmanager` at the moment of deletion — not reachable today
+  because the offline lock already requires the server to be down for this
+  command to run at all; a future *online* drop/suspend control-plane
+  operation would need to address it. Tests: `internal/security`
+  (`ActionDatabaseDrop` constant); `cmd/nextsql/realm_database_test.go` —
+  `TestDatabaseDropCLI` (missing `--confirm`, deployment-lock rejection,
+  unknown realm leaves the managed directory untouched, a successful drop
+  tombstones the registry record *and* removes the on-disk directory *and*
+  makes `Lookup` fail `NotFound`, and a repeated drop of an
+  already-tombstoned database is a no-op success), 
+  `TestDatabaseDropRejectsDeploymentDefault` (the default database's state
+  and its `DATA-DIR/nextsql.db` file are both untouched by a rejected drop).
+  All green under `-race`: `cmd/nextsql`, `internal/hosting`,
+  `internal/dbmanager`, `internal/security`, `internal/protocol`,
+  `cmd/nextsqld`, `tests/integration`; `go build ./...` / `go vet ./...`
+  clean. **Live-verified end to end** against real `nextsql`/`nextsqld`
+  binaries: a two-realm deployment, `CREATE TABLE`/`INSERT`/`SELECT`
+  against `acme/prod` while Active; stop the server, inspect the on-disk
+  tree (db file + `.keys`/`.wal`/`.undo` present under the ID directory),
+  `database drop --confirm` → registry state 5 (Tombstoned), the whole
+  `databases/<DatabaseID>` directory gone; restart — the unrelated default
+  database keeps working normally (`CREATE TABLE`/`SELECT` succeed) while
+  `acme/prod` now rejects every statement with `nextsql: nextsql not_found:
+  nextsql: database deleted`. See `TODO.md` log #114 for the full writeup.
+- **M3-4 — per-database independent WAL/UNDO/cache/idempotency/task/CDC/
+  maintenance/temp-spill scope.** Largely already true as a side effect of
+  M2-3a's design (every managed database is its own `executor.DB`/`Engine`
+  with its own WAL, UNDO, buffer pool, and `TaskRuntime`/idempotency store,
+  opened and closed independently) — the real remaining gap, not yet
+  scoped, is backup/restore/PITR/import/export: today's `nextsql backup`/
+  `restore`/`export`/`import` all take a single `--data-dir`, with no
+  concept of "which managed database inside this deployment," and no
+  per-database WAL archiver is ever installed for a managed (non-primary)
+  database (`internal/hosting`'s M0/M1 registry-storage-caps note already
+  flags this same limitation from the caps angle).
+- **M3-5 — key rotation, rewrap, restore-as-new, and crypto-shred
+  boundaries.** Not started; M3-3's physical-reclamation shape now exists
+  (`os.RemoveAll` of the managed database's ID directory, including its
+  `.keys` keystore) but this item is specifically about doing that *and*
+  proving the key material is unrecoverable (crypto-shred), plus rotation/
+  rewrap/restore-as-new for a *live* database — still needs its own scoping
+  pass.
 
 Exit: one database can crash, restore, rotate, suspend, or be deleted without
 incorrect results, key use, state loss, or service interruption in another.
+Not yet met — M3-1 (suspend) and M3-3 (drop/tombstone, offline) are landed;
+rename, crash/restore/rotate (M3-2, M3-4, M3-5) remain open.
 
 ### M4 — Workload governance and subscription enforcement
 

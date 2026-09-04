@@ -1,6 +1,7 @@
 package hosting
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/bzync/nextsql/internal/nerr"
@@ -242,6 +243,14 @@ func TestLookupResolvesRealmAndDatabaseCaseInsensitively(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// CreateRealm leaves the new database StateProvisioning; Lookup only
+	// resolves Active pairs (M3-1), so activate it first — this test is
+	// about name resolution, not state gating (see
+	// TestLookupRejectsNonActiveDatabaseState/TestLookupRejectsNonActiveRealm
+	// for that).
+	if err := reg.SetDatabaseState(realm.ID, db.ID, StateActive); err != nil {
+		t.Fatal(err)
+	}
 
 	gotRealm, gotDB, err := reg.Lookup("CUSTOMER-B", "production")
 	if err != nil {
@@ -270,5 +279,134 @@ func TestLookupUnknownRealmOrDatabase(t *testing.T) {
 	}
 	if _, _, err := reg.Lookup("customer-b", "no-such-database"); !nerr.HasCode(err, nerr.NotFound) {
 		t.Fatalf("unknown database: want NotFound, got %v", err)
+	}
+}
+
+// TestLookupRejectsNonActiveDatabaseState is M3-1's core enforcement test:
+// Lookup (dbmanager's sole connection-routing resolution) must fail closed
+// for every non-Active database state, not just silently hand back a
+// database a connection has no business being routed to.
+func TestLookupRejectsNonActiveDatabaseState(t *testing.T) {
+	cases := []struct {
+		name       string
+		reach      func(reg *Registry, realmID, dbID ID) error
+		wantCode   nerr.Code
+		wantSubstr string
+	}{
+		{
+			name:       "provisioning",
+			reach:      func(reg *Registry, realmID, dbID ID) error { return nil }, // CreateRealm's own initial state
+			wantCode:   nerr.Unavailable,
+			wantSubstr: "not yet active",
+		},
+		{
+			name: "suspended",
+			reach: func(reg *Registry, realmID, dbID ID) error {
+				if err := reg.SetDatabaseState(realmID, dbID, StateActive); err != nil {
+					return err
+				}
+				return reg.SetDatabaseState(realmID, dbID, StateSuspended)
+			},
+			wantCode:   nerr.Unavailable,
+			wantSubstr: "suspended",
+		},
+		{
+			name: "failed",
+			reach: func(reg *Registry, realmID, dbID ID) error {
+				return reg.SetDatabaseState(realmID, dbID, StateFailed)
+			},
+			wantCode:   nerr.Unavailable,
+			wantSubstr: "failed state",
+		},
+		{
+			name: "deleting",
+			reach: func(reg *Registry, realmID, dbID ID) error {
+				if err := reg.SetDatabaseState(realmID, dbID, StateActive); err != nil {
+					return err
+				}
+				return reg.SetDatabaseState(realmID, dbID, StateDeleting)
+			},
+			wantCode:   nerr.NotFound,
+			wantSubstr: "deleted",
+		},
+		{
+			name: "tombstoned",
+			reach: func(reg *Registry, realmID, dbID ID) error {
+				if err := reg.SetDatabaseState(realmID, dbID, StateActive); err != nil {
+					return err
+				}
+				if err := reg.SetDatabaseState(realmID, dbID, StateDeleting); err != nil {
+					return err
+				}
+				return reg.SetDatabaseState(realmID, dbID, StateTombstoned)
+			},
+			wantCode:   nerr.NotFound,
+			wantSubstr: "deleted",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := Path(t.TempDir())
+			root := testRoot(t)
+			reg, _, err := EnsureBootstrap(path, root, testBootstrap(t, StateActive))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer reg.Close()
+
+			realm, db, _, err := reg.CreateRealm("customer-b", "production", testIdentity(t), "/run/keys/b.key")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := tc.reach(reg, realm.ID, db.ID); err != nil {
+				t.Fatalf("reach %s: %v", tc.name, err)
+			}
+			_, _, err = reg.Lookup("customer-b", "production")
+			if !nerr.HasCode(err, tc.wantCode) {
+				t.Fatalf("Lookup(%s): want code %s, got %v", tc.name, tc.wantCode, err)
+			}
+			if !strings.Contains(err.Error(), tc.wantSubstr) {
+				t.Fatalf("Lookup(%s): want message containing %q, got %v", tc.name, tc.wantSubstr, err)
+			}
+		})
+	}
+}
+
+// TestLookupRejectsNonActiveRealm proves a suspended realm blocks every one
+// of its databases from Lookup even when the database's own state is
+// Active — the same precedence CreateDatabase's realm.State check already
+// uses. No public API can suspend a realm yet (realm suspend/delete is a
+// separate, still-open M3 item), so this constructs the state directly via
+// EnsureManifest, the same technique TestCreateDatabaseRejectsNonActiveRealm
+// already uses.
+func TestLookupRejectsNonActiveRealm(t *testing.T) {
+	path := Path(t.TempDir())
+	root := testRoot(t)
+	ident := testIdentity(t)
+	reg, created, err := EnsureManifest(path, root, func(dep ID) (Manifest, error) {
+		realmID := deriveRealmID(dep, "suspended-realm")
+		return Manifest{
+			DeploymentID:    dep,
+			Generation:      1,
+			DefaultRealm:    realmID,
+			DefaultDatabase: ID(ident.Database),
+			Realms: []Realm{
+				{ID: realmID, Name: "suspended-realm", State: StateSuspended, Databases: []Database{
+					{ID: ID(ident.Database), Name: "prod", State: StateActive, Layout: LayoutManaged, Identity: ident, KeyRef: "/run/keys/prod.key"},
+				}},
+			},
+		}, nil
+	})
+	if err != nil || !created {
+		t.Fatalf("build suspended-realm registry: created=%v err=%v", created, err)
+	}
+	defer reg.Close()
+
+	_, _, err = reg.Lookup("suspended-realm", "prod")
+	if !nerr.HasCode(err, nerr.Unavailable) {
+		t.Fatalf("want Unavailable for a suspended realm, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "realm suspended") {
+		t.Fatalf("want a realm-specific message, got %v", err)
 	}
 }

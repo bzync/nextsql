@@ -68,6 +68,7 @@ export {
   encodeDecimalString,
   encodeHello,
   encodeParam,
+  struct,
   formatUUID,
   isLoopback,
   validateConfig,

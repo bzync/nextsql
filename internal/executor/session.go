@@ -743,6 +743,83 @@ func (s *Session) execAdmitted(ctx context.Context, sql string, params []Param) 
 		s.auditRecord(security.ActionResourceGroupAssign, "", nil)
 		return &Result{}, nil
 	}
+	if st, ok := stmt.(ast.SetConfig); ok {
+		if err := s.authorize(st); err != nil {
+			s.auditRecord(security.ActionConfigSet, st.Key, err)
+			return nil, err
+		}
+		if s.InTxn() {
+			return nil, nerr.New(nerr.InvalidArgument, "executor.SetConfig", "SET CONFIG cannot run inside a transaction")
+		}
+		// Node-local, like CLUSTER DRAIN/MAINTENANCE: each node has its own
+		// nextsql.conf, so this is not routed through the replicated write
+		// path and needs no requireLeader gate.
+		res, err := s.db.WriteConfigSetting(st.Key, st.Value, st.Reset)
+		s.auditRecord(security.ActionConfigSet, st.Key, err)
+		if err != nil {
+			return nil, err
+		}
+		restart := "no"
+		if res.RestartRequired {
+			restart = "yes"
+		}
+		return &Result{
+			Columns: []string{"key", "file_value", "running_value", "restart_required"},
+			Rows: [][]types.Value{{
+				types.TextValue(res.Key),
+				types.TextValue(res.FileValue),
+				types.TextValue(res.RunningValue),
+				types.TextValue(restart),
+			}},
+		}, nil
+	}
+	if _, ok := stmt.(ast.BackupDatabase); ok {
+		if err := s.authorize(stmt); err != nil {
+			s.auditRecord(security.ActionBackup, "", err)
+			return nil, err
+		}
+		if s.InTxn() {
+			return nil, nerr.New(nerr.InvalidArgument, "executor.BackupDatabase", "BACKUP DATABASE cannot run inside a transaction")
+		}
+		// Node-local: writes to this node's own backup_dir, not replicated.
+		res, err := s.db.CreateBackup()
+		s.auditRecord(security.ActionBackup, res.Name, err)
+		if err != nil {
+			return nil, err
+		}
+		return &Result{
+			Columns: []string{"name", "checkpoint_lsn", "durable_lsn", "members"},
+			Rows: [][]types.Value{{
+				types.TextValue(res.Name),
+				sysDec(int64(res.CheckpointLSN), 20),
+				sysDec(int64(res.DurableLSN), 20),
+				sysDec(int64(res.Members), 10),
+			}},
+		}, nil
+	}
+	if st, ok := stmt.(ast.VerifyBackup); ok {
+		if err := s.authorize(st); err != nil {
+			s.auditRecord(security.ActionBackupVerify, st.Name, err)
+			return nil, err
+		}
+		res, err := s.db.VerifyBackup(st.Name)
+		s.auditRecord(security.ActionBackupVerify, st.Name, err)
+		if err != nil {
+			return nil, err
+		}
+		ok := "no"
+		if res.OK {
+			ok = "yes"
+		}
+		return &Result{
+			Columns: []string{"name", "verified", "problem"},
+			Rows: [][]types.Value{{
+				types.TextValue(res.Name),
+				types.TextValue(ok),
+				types.TextValue(res.Problem),
+			}},
+		}, nil
+	}
 	if s != nil && s.db != nil && !s.txnGuard {
 		s.acquireTxnGuard()
 		defer func() {
@@ -812,6 +889,13 @@ func (s *Session) execAdmitted(ctx context.Context, sql string, params []Param) 
 		if err := s.requireReadConsistency(); err != nil {
 			return nil, err
 		}
+	}
+	if sel, ok := s.isNoFromSelect(stmt); ok {
+		// No table/index/catalog involved; bypass the normal binder entirely,
+		// the same architectural precedent as the system-select bypass below.
+		res, err := s.execNoFromSelect(sel)
+		s.auditRecord(workflowAuditAction(stmt), sqlObject(stmt), err)
+		return res, err
 	}
 	if sel, ok := s.isSystemSelect(stmt); ok {
 		// System catalog is authoritative and tenant-aware; bypass normal binder.

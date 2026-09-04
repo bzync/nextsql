@@ -430,6 +430,19 @@ func skipScalar(raw []byte, off int, t Type) (int, error) {
 			return 0, nerr.New(nerr.InvalidFormat, "types.skipScalar", "truncated box")
 		}
 		return off + 32, nil
+	case KindStruct, KindArray, KindMap, KindGeometry, KindGeography:
+		// The collection and general-geometry heap-row forms are both
+		// prefixed with a u32 body length, so a skip is O(1) regardless of
+		// nesting depth.
+		bodyLen, err := encoding.ReadU32(raw, off)
+		if err != nil {
+			return 0, err
+		}
+		end := off + 4 + int(bodyLen)
+		if end > len(raw) || end < off {
+			return 0, nerr.New(nerr.InvalidFormat, "types.skipScalar", "truncated value")
+		}
+		return end, nil
 	default:
 		_, next, err := decodeScalar(raw, off, t)
 		return next, err
@@ -574,8 +587,184 @@ func encodeScalar(v Value) ([]byte, error) {
 		return buf, nil
 	case KindLine, KindPolygon:
 		return encodeGeo(v)
+	case KindStruct, KindArray, KindMap:
+		return encodeCollection(v)
+	case KindGeometry, KindGeography:
+		return encodeGeneralGeo(v)
 	default:
 		return nil, nerr.New(nerr.InvalidArgument, "types.encodeScalar", "unsupported type")
+	}
+}
+
+// collectionMembers returns a collection value's members in encode order and
+// the matching member types from t. For MAP the two are interleaved
+// key,value,key,value,... so one flat loop covers every collection kind.
+func collectionMembers(v Value) (members []Value, err error) {
+	switch v.Typ.Kind {
+	case KindStruct:
+		if len(v.Coll) != len(v.Typ.Fields) {
+			return nil, nerr.New(nerr.InvalidArgument, "types.collection", "STRUCT field count mismatch")
+		}
+		return v.Coll, nil
+	case KindArray:
+		return v.Coll, nil
+	case KindMap:
+		if len(v.CollKeys) != len(v.Coll) {
+			return nil, nerr.New(nerr.InvalidArgument, "types.collection", "MAP key/value count mismatch")
+		}
+		out := make([]Value, 0, len(v.Coll)*2)
+		for i := range v.Coll {
+			out = append(out, v.CollKeys[i], v.Coll[i])
+		}
+		return out, nil
+	default:
+		return nil, nerr.New(nerr.InvalidArgument, "types.collection", "not a collection")
+	}
+}
+
+// encodeCollection writes the self-describing nested heap-row form for a
+// STRUCT / ARRAY / MAP value (docs/design-collections.md):
+//
+//	u32 body-length   (everything after this prefix, so skipScalar is O(1))
+//	u32 member-count   (fields for STRUCT; elements for ARRAY; 2*entries for MAP)
+//	null bitmap        ceil(member-count / 8) bytes
+//	member payloads    encodeScalar(member) for each non-null member, in order
+//
+// Members are themselves encoded through encodeScalar, so collections nest.
+func encodeCollection(v Value) ([]byte, error) {
+	members, err := collectionMembers(v)
+	if err != nil {
+		return nil, err
+	}
+	n := len(members)
+	if n > 2*MaxCollectionLen+2 {
+		return nil, nerr.New(nerr.InvalidArgument, "types.encodeCollection", "collection too large")
+	}
+	nulls := make([]byte, (n+7)/8)
+	var payload []byte
+	for i, m := range members {
+		if m.Null {
+			nulls[i/8] |= 1 << (i % 8)
+			continue
+		}
+		enc, err := encodeScalar(m)
+		if err != nil {
+			return nil, err
+		}
+		payload = append(payload, enc...)
+	}
+	body := make([]byte, 4+len(nulls)+len(payload))
+	encoding.PutU32(body, 0, uint32(n))
+	copy(body[4:], nulls)
+	copy(body[4+len(nulls):], payload)
+	out := make([]byte, 4+len(body))
+	encoding.PutU32(out, 0, uint32(len(body)))
+	copy(out[4:], body)
+	return out, nil
+}
+
+// memberTypes returns the decode-order member type list for a collection Type:
+// field types for STRUCT, the element type repeated n times for ARRAY, and
+// alternating key/value types for MAP (n is the on-disk member count).
+func memberTypes(t Type, n int) ([]Type, error) {
+	switch t.Kind {
+	case KindStruct:
+		if n != len(t.Fields) {
+			return nil, nerr.New(nerr.InvalidFormat, "types.decodeCollection", "STRUCT field count mismatch")
+		}
+		out := make([]Type, n)
+		for i, f := range t.Fields {
+			out[i] = f.Type
+		}
+		return out, nil
+	case KindArray:
+		if len(t.Elem) != 1 {
+			return nil, nerr.New(nerr.InvalidFormat, "types.decodeCollection", "ARRAY missing element type")
+		}
+		out := make([]Type, n)
+		for i := range out {
+			out[i] = t.Elem[0]
+		}
+		return out, nil
+	case KindMap:
+		if len(t.Key) != 1 || len(t.Elem) != 1 {
+			return nil, nerr.New(nerr.InvalidFormat, "types.decodeCollection", "MAP missing key/value type")
+		}
+		if n%2 != 0 {
+			return nil, nerr.New(nerr.InvalidFormat, "types.decodeCollection", "MAP member count is odd")
+		}
+		out := make([]Type, n)
+		for i := 0; i < n; i += 2 {
+			out[i] = t.Key[0]
+			out[i+1] = t.Elem[0]
+		}
+		return out, nil
+	default:
+		return nil, nerr.New(nerr.InvalidFormat, "types.decodeCollection", "not a collection")
+	}
+}
+
+func decodeCollection(raw []byte, off int, t Type) (Value, int, error) {
+	bodyLen, err := encoding.ReadU32(raw, off)
+	if err != nil {
+		return Value{}, 0, err
+	}
+	body, err := encoding.ReadBytes(raw, off+4, int(bodyLen))
+	if err != nil {
+		return Value{}, 0, err
+	}
+	end := off + 4 + int(bodyLen)
+	n32, err := encoding.ReadU32(body, 0)
+	if err != nil {
+		return Value{}, 0, err
+	}
+	n := int(n32)
+	// Bound the member count before allocating: each present member is at
+	// least one payload byte and each null member one bitmap bit, so n can
+	// never legitimately exceed the body length.
+	if n < 0 || n > 2*MaxCollectionLen+2 || n > len(body) {
+		return Value{}, 0, nerr.New(nerr.InvalidFormat, "types.decodeCollection", "collection member count out of range")
+	}
+	mts, err := memberTypes(t, n)
+	if err != nil {
+		return Value{}, 0, err
+	}
+	nb := (n + 7) / 8
+	if len(body) < 4+nb {
+		return Value{}, 0, nerr.New(nerr.InvalidFormat, "types.decodeCollection", "truncated collection null map")
+	}
+	nulls := body[4 : 4+nb]
+	p := 4 + nb
+	members := make([]Value, n)
+	for i := 0; i < n; i++ {
+		if nulls[i/8]&(1<<(i%8)) != 0 {
+			members[i] = Null(mts[i])
+			continue
+		}
+		mv, next, err := decodeScalar(body, p, mts[i])
+		if err != nil {
+			return Value{}, 0, err
+		}
+		p = next
+		members[i] = mv
+	}
+	return assembleCollection(t, members), end, nil
+}
+
+// assembleCollection turns a flat decode-order member list back into a typed
+// collection Value.
+func assembleCollection(t Type, members []Value) Value {
+	switch t.Kind {
+	case KindMap:
+		keys := make([]Value, 0, len(members)/2)
+		vals := make([]Value, 0, len(members)/2)
+		for i := 0; i+1 < len(members); i += 2 {
+			keys = append(keys, members[i])
+			vals = append(vals, members[i+1])
+		}
+		return Value{Typ: t, CollKeys: keys, Coll: vals}
+	default: // STRUCT, ARRAY
+		return Value{Typ: t, Coll: members}
 	}
 }
 
@@ -811,6 +1000,10 @@ func decodeScalar(raw []byte, off int, t Type) (Value, int, error) {
 		return bv, off + 32, nil
 	case KindLine, KindPolygon:
 		return decodeGeo(raw, off, t)
+	case KindStruct, KindArray, KindMap:
+		return decodeCollection(raw, off, t)
+	case KindGeometry, KindGeography:
+		return decodeGeneralGeo(raw, off, t)
 	default:
 		return Value{}, 0, nerr.New(nerr.InvalidFormat, "types.decodeScalar", "unsupported type")
 	}
@@ -991,9 +1184,123 @@ func encodeSortable(v Value) ([]byte, error) {
 		return out, nil
 	case KindLine, KindPolygon:
 		return encodeSortableGeo(v)
+	case KindStruct, KindArray, KindMap:
+		return encodeSortableCollection(v)
+	case KindGeometry, KindGeography:
+		return encodeSortableGeneralGeo(v)
 	default:
 		return nil, nerr.New(nerr.InvalidArgument, "types.encodeSortable", "unsupported key type")
 	}
+}
+
+// Collection sortable-key framing bytes. Each member is introduced by a marker
+// so a shorter collection that is a prefix of a longer one sorts first (proper
+// lexicographic tuple order), and NULL members sort before present ones:
+//
+//	0x00  end of members
+//	0x01  a NULL member (no payload)
+//	0x02  a present member, followed by its own type-directed sortable bytes
+//
+// 0x00 < 0x01 < 0x02, so end-of-list < null < present, which is exactly the
+// order Value.Cmp implements for collections. Decoding is type-directed (every
+// scalar sortable form is self-delimiting given its Type), so no escaping of
+// member payloads is needed.
+const (
+	collSortEnd     = 0x00
+	collSortNull    = 0x01
+	collSortPresent = 0x02
+)
+
+func encodeSortableCollection(v Value) ([]byte, error) {
+	members, err := collectionMembers(v)
+	if err != nil {
+		return nil, err
+	}
+	var out []byte
+	for _, m := range members {
+		if m.Null {
+			out = append(out, collSortNull)
+			continue
+		}
+		body, err := encodeSortable(m)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, collSortPresent)
+		out = append(out, body...)
+	}
+	out = append(out, collSortEnd)
+	return out, nil
+}
+
+func decodeSortableCollection(raw []byte, off int, t Type) (Value, int, error) {
+	// nextMemberType yields the type for member i: field types for STRUCT
+	// (bounded by field count), the element type for ARRAY, alternating
+	// key/value for MAP.
+	nextMemberType := func(i int) (Type, bool) {
+		switch t.Kind {
+		case KindStruct:
+			if i >= len(t.Fields) {
+				return Type{}, false
+			}
+			return t.Fields[i].Type, true
+		case KindArray:
+			if len(t.Elem) != 1 {
+				return Type{}, false
+			}
+			return t.Elem[0], true
+		case KindMap:
+			if len(t.Key) != 1 || len(t.Elem) != 1 {
+				return Type{}, false
+			}
+			if i%2 == 0 {
+				return t.Key[0], true
+			}
+			return t.Elem[0], true
+		default:
+			return Type{}, false
+		}
+	}
+	var members []Value
+	i := 0
+	for {
+		if off >= len(raw) {
+			return Value{}, 0, nerr.New(nerr.InvalidFormat, "types.decodeSortableCollection", "unterminated collection key")
+		}
+		marker := raw[off]
+		off++
+		if marker == collSortEnd {
+			break
+		}
+		if i >= 2*MaxCollectionLen+2 {
+			return Value{}, 0, nerr.New(nerr.InvalidFormat, "types.decodeSortableCollection", "collection key too long")
+		}
+		mt, ok := nextMemberType(i)
+		if !ok {
+			return Value{}, 0, nerr.New(nerr.InvalidFormat, "types.decodeSortableCollection", "collection key has too many members")
+		}
+		switch marker {
+		case collSortNull:
+			members = append(members, Null(mt))
+		case collSortPresent:
+			mv, next, err := decodeSortable(raw, off, mt)
+			if err != nil {
+				return Value{}, 0, err
+			}
+			off = next
+			members = append(members, mv)
+		default:
+			return Value{}, 0, nerr.New(nerr.InvalidFormat, "types.decodeSortableCollection", "bad collection key marker")
+		}
+		i++
+	}
+	if t.Kind == KindStruct && len(members) != len(t.Fields) {
+		return Value{}, 0, nerr.New(nerr.InvalidFormat, "types.decodeSortableCollection", "STRUCT key field count mismatch")
+	}
+	if t.Kind == KindMap && len(members)%2 != 0 {
+		return Value{}, 0, nerr.New(nerr.InvalidFormat, "types.decodeSortableCollection", "MAP key has an unpaired entry")
+	}
+	return assembleCollection(t, members), off, nil
 }
 
 // sortableFloat64Bits maps a float64 to a uint64 whose unsigned big-endian
@@ -1356,6 +1663,10 @@ func decodeSortable(raw []byte, off int, t Type) (Value, int, error) {
 		return bv, next, nil
 	case KindLine, KindPolygon:
 		return decodeSortableGeo(raw, off, t)
+	case KindStruct, KindArray, KindMap:
+		return decodeSortableCollection(raw, off, t)
+	case KindGeometry, KindGeography:
+		return decodeSortableGeneralGeo(raw, off, t)
 	default:
 		return Value{}, 0, nerr.New(nerr.InvalidFormat, "types.DecodeKey", "unsupported key type")
 	}

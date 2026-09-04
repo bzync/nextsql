@@ -122,6 +122,6 @@ usage_common() {
 Environment:
   GOOS / GOARCH are set by the script; do not export CGO_ENABLED=1.
 
-Outputs land in DIST (default: \$ROOT/dist).
+Outputs land in DIST (default: \$ROOT/installers).
 EOF
 }

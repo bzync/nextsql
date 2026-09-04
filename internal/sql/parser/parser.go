@@ -50,6 +50,9 @@ func (p *Parser) next() {
 }
 
 func (p *Parser) stmt() (ast.Stmt, error) {
+	if p.tok.Kind == lexer.Ident && strings.EqualFold(p.tok.Lit, "verify") {
+		return p.verifyBackupStmt()
+	}
 	switch p.tok.Kind {
 	case lexer.KwCreate:
 		return p.create()
@@ -83,6 +86,8 @@ func (p *Parser) stmt() (ast.Stmt, error) {
 		return p.analyze()
 	case lexer.KwMaintain:
 		return p.maintain()
+	case lexer.KwBackup:
+		return p.backupStmt()
 	case lexer.KwSet:
 		return p.setStmt()
 	case lexer.KwReset:
@@ -247,6 +252,9 @@ func (p *Parser) showTasks() (ast.Stmt, error) {
 // still rejected with the same removal message as before.
 func (p *Parser) setStmt() (ast.Stmt, error) {
 	p.next()
+	if p.tok.Kind == lexer.Ident && strings.EqualFold(p.tok.Lit, "config") {
+		return p.setConfigStmt()
+	}
 	if p.tok.Kind != lexer.KwResource {
 		return nil, nerr.New(nerr.Syntax, "sql.parser", "SET TENANT was removed; provision an isolated database with nextsql hosting")
 	}
@@ -259,6 +267,43 @@ func (p *Parser) setStmt() (ast.Stmt, error) {
 		return nil, err
 	}
 	return ast.SetResourceGroup{Name: name}, nil
+}
+
+// setConfigStmt parses SET CONFIG <key> = <value>, where <value> is a string
+// literal, a number, TRUE/FALSE, or DEFAULT (reset the key to its built-in
+// default). "config" is matched as a bare identifier, not a keyword, so
+// nothing that already names a column/table "config" (system.config
+// included) is affected.
+func (p *Parser) setConfigStmt() (ast.Stmt, error) {
+	p.next() // consume "config"
+	key, err := p.identOrKeyword()
+	if err != nil {
+		return nil, err
+	}
+	if err := p.expect(lexer.Eq, "="); err != nil {
+		return nil, err
+	}
+	switch p.tok.Kind {
+	case lexer.KwDefault:
+		p.next()
+		return ast.SetConfig{Key: key, Reset: true}, nil
+	case lexer.String:
+		v := p.tok.Lit
+		p.next()
+		return ast.SetConfig{Key: key, Value: v}, nil
+	case lexer.Number:
+		v := p.tok.Lit
+		p.next()
+		return ast.SetConfig{Key: key, Value: v}, nil
+	case lexer.KwTrue:
+		p.next()
+		return ast.SetConfig{Key: key, Value: "true"}, nil
+	case lexer.KwFalse:
+		p.next()
+		return ast.SetConfig{Key: key, Value: "false"}, nil
+	default:
+		return nil, nerr.New(nerr.Syntax, "sql.parser", "SET CONFIG value must be a string, number, TRUE/FALSE, or DEFAULT")
+	}
 }
 
 // resetStmt parses RESET RESOURCE GROUP, the one surviving form of RESET
@@ -274,6 +319,36 @@ func (p *Parser) resetStmt() (ast.Stmt, error) {
 		return nil, err
 	}
 	return ast.ResetResourceGroup{}, nil
+}
+
+// backupStmt parses the two backup operations the NextSQL Manager can drive
+// (M5). Both work against the server's configured backup_dir — the client
+// never names a filesystem path:
+//
+//	BACKUP DATABASE                 — create a new backup
+//	VERIFY BACKUP 'name'            — integrity-check an existing one
+//
+// "VERIFY" is matched as a bare identifier, not a keyword, so nothing that
+// already uses it as a name is affected.
+func (p *Parser) backupStmt() (ast.Stmt, error) {
+	p.next() // consume BACKUP
+	if err := p.expect(lexer.KwDatabase, "DATABASE"); err != nil {
+		return nil, err
+	}
+	return ast.BackupDatabase{}, nil
+}
+
+func (p *Parser) verifyBackupStmt() (ast.Stmt, error) {
+	p.next() // consume the "verify" identifier
+	if err := p.expect(lexer.KwBackup, "BACKUP"); err != nil {
+		return nil, err
+	}
+	if p.tok.Kind != lexer.String || p.tok.Lit == "" {
+		return nil, nerr.New(nerr.Syntax, "sql.parser", "VERIFY BACKUP requires a quoted backup name")
+	}
+	name := p.tok.Lit
+	p.next()
+	return ast.VerifyBackup{Name: name}, nil
 }
 
 func (p *Parser) clusterStmt() (ast.Stmt, error) {
@@ -2258,7 +2333,76 @@ func (p *Parser) refAction() (ast.FKAction, error) {
 }
 
 func (p *Parser) colType() (types.Type, error) {
+	return p.colTypeD(0)
+}
+
+// colTypeD parses a column type, tracking collection nesting depth so a
+// pathologically nested STRUCT/ARRAY/MAP type string cannot drive unbounded
+// parser recursion (the type constructors also reject depth > MaxNestDepth).
+func (p *Parser) colTypeD(depth int) (types.Type, error) {
+	if depth > types.MaxNestDepth+1 {
+		return types.Type{}, nerr.New(nerr.InvalidArgument, "sql.parser", "collection type nesting too deep")
+	}
 	switch p.tok.Kind {
+	case lexer.KwArray:
+		p.next()
+		if err := p.expect(lexer.Lt, "<"); err != nil {
+			return types.Type{}, err
+		}
+		elem, err := p.colTypeD(depth + 1)
+		if err != nil {
+			return types.Type{}, err
+		}
+		if err := p.expect(lexer.Gt, ">"); err != nil {
+			return types.Type{}, err
+		}
+		return types.ArrayType(elem)
+	case lexer.KwMap:
+		p.next()
+		if err := p.expect(lexer.Lt, "<"); err != nil {
+			return types.Type{}, err
+		}
+		key, err := p.colTypeD(depth + 1)
+		if err != nil {
+			return types.Type{}, err
+		}
+		if err := p.expect(lexer.Comma, ","); err != nil {
+			return types.Type{}, err
+		}
+		val, err := p.colTypeD(depth + 1)
+		if err != nil {
+			return types.Type{}, err
+		}
+		if err := p.expect(lexer.Gt, ">"); err != nil {
+			return types.Type{}, err
+		}
+		return types.MapType(key, val)
+	case lexer.KwStruct:
+		p.next()
+		if err := p.expect(lexer.Lt, "<"); err != nil {
+			return types.Type{}, err
+		}
+		var fields []types.Field
+		for {
+			name, err := p.ident()
+			if err != nil {
+				return types.Type{}, err
+			}
+			ft, err := p.colTypeD(depth + 1)
+			if err != nil {
+				return types.Type{}, err
+			}
+			fields = append(fields, types.Field{Name: name, Type: ft})
+			if p.tok.Kind == lexer.Comma {
+				p.next()
+				continue
+			}
+			break
+		}
+		if err := p.expect(lexer.Gt, ">"); err != nil {
+			return types.Type{}, err
+		}
+		return types.StructType(fields)
 	case lexer.KwUuid:
 		p.next()
 		return types.UUID(), nil
@@ -2387,6 +2531,17 @@ func (p *Parser) colType() (types.Type, error) {
 	case lexer.KwPolygon:
 		p.next()
 		return types.Polygon(), nil
+	case lexer.KwGeometry, lexer.KwGeography:
+		geog := p.tok.Kind == lexer.KwGeography
+		p.next()
+		sub, srid, err := p.geoTypeArgs()
+		if err != nil {
+			return types.Type{}, err
+		}
+		if geog {
+			return types.GeographyType(sub, srid)
+		}
+		return types.GeometryType(sub, srid)
 	case lexer.KwBitvector:
 		p.next()
 		if err := p.expect(lexer.Lt, "<"); err != nil {
@@ -2446,6 +2601,41 @@ func (p *Parser) colType() (types.Type, error) {
 	default:
 		return types.Type{}, nerr.New(nerr.Syntax, "sql.parser", "expected a type")
 	}
+}
+
+// geoTypeArgs parses the optional "(<subtype>[, <srid>])" of
+// GEOMETRY / GEOGRAPHY (docs/design-spatial.md §4). No parens => any subtype,
+// SRID 0.
+func (p *Parser) geoTypeArgs() (sub, srid uint16, err error) {
+	if p.tok.Kind != lexer.LParen {
+		return 0, 0, nil
+	}
+	p.next()
+	name := p.tok.Lit
+	if name == "" {
+		return 0, 0, nerr.New(nerr.Syntax, "sql.parser", "expected a geometry subtype name")
+	}
+	s, ok := types.GeomSubByName(name)
+	if !ok {
+		return 0, 0, nerr.New(nerr.Syntax, "sql.parser", "unknown geometry subtype "+name)
+	}
+	sub = s
+	p.next()
+	if p.tok.Kind == lexer.Comma {
+		p.next()
+		n, e := p.uintLit()
+		if e != nil {
+			return 0, 0, e
+		}
+		if n > 0xFFFF {
+			return 0, 0, nerr.New(nerr.InvalidArgument, "sql.parser", "SRID out of range")
+		}
+		srid = uint16(n)
+	}
+	if e := p.expect(lexer.RParen, ")"); e != nil {
+		return 0, 0, e
+	}
+	return sub, srid, nil
 }
 
 // charLen parses the mandatory "(n)" length argument of CHAR(n) / VARCHAR(n).
@@ -2975,111 +3165,120 @@ func (p *Parser) sel() (ast.Stmt, error) {
 			break
 		}
 	}
-	if err := p.expect(lexer.KwFrom, "FROM"); err != nil {
-		return nil, err
-	}
-	if p.tok.Kind == lexer.LParen {
+	if p.tok.Kind == lexer.KwFrom {
 		p.next()
-		if p.tok.Kind != lexer.KwSelect && p.tok.Kind != lexer.KwWith {
-			return nil, nerr.New(nerr.Syntax, "sql.parser", "derived table requires a SELECT query")
-		}
-		query, err := p.queryOrWith()
-		if err != nil {
-			return nil, err
-		}
-		if err := p.expect(lexer.RParen, ")"); err != nil {
-			return nil, err
-		}
-		if p.tok.Kind == lexer.KwAs {
+		if p.tok.Kind == lexer.LParen {
 			p.next()
-		}
-		alias, err := p.ident()
-		if err != nil {
-			return nil, nerr.New(nerr.Syntax, "sql.parser", "derived table requires an alias")
-		}
-		s.FromQuery = query
-		s.Alias = alias
-	} else {
-		name, alias, err := p.tableRef()
-		if err != nil {
-			return nil, err
-		}
-		s.Table = name
-		s.Alias = alias
-	}
-	for {
-		kind := ast.JoinInner
-		switch p.tok.Kind {
-		case lexer.KwJoin:
-			p.next()
-		case lexer.KwInner:
-			p.next()
-			if err := p.expect(lexer.KwJoin, "JOIN"); err != nil {
-				return nil, err
+			if p.tok.Kind != lexer.KwSelect && p.tok.Kind != lexer.KwWith {
+				return nil, nerr.New(nerr.Syntax, "sql.parser", "derived table requires a SELECT query")
 			}
-		case lexer.KwLeft:
-			p.next()
-			if p.tok.Kind == lexer.KwOuter {
-				p.next()
-			}
-			if err := p.expect(lexer.KwJoin, "JOIN"); err != nil {
-				return nil, err
-			}
-			kind = ast.JoinLeft
-		case lexer.KwRight:
-			p.next()
-			if p.tok.Kind == lexer.KwOuter {
-				p.next()
-			}
-			if err := p.expect(lexer.KwJoin, "JOIN"); err != nil {
-				return nil, err
-			}
-			kind = ast.JoinRight
-		case lexer.KwFull:
-			p.next()
-			if p.tok.Kind == lexer.KwOuter {
-				p.next()
-			}
-			if err := p.expect(lexer.KwJoin, "JOIN"); err != nil {
-				return nil, err
-			}
-			kind = ast.JoinFull
-		case lexer.KwCross:
-			p.next()
-			if err := p.expect(lexer.KwJoin, "JOIN"); err != nil {
-				return nil, err
-			}
-			kind = ast.JoinCross
-		default:
-			goto joinsDone
-		}
-		jn, ja, err := p.tableRef()
-		if err != nil {
-			return nil, err
-		}
-		js := ast.JoinSpec{Table: jn, Alias: ja, Kind: kind}
-		if p.tok.Kind == lexer.KwOn {
-			if kind == ast.JoinCross {
-				return nil, nerr.New(nerr.Syntax, "sql.parser", "CROSS JOIN does not take ON")
-			}
-			p.next()
-			on, err := p.or()
+			query, err := p.queryOrWith()
 			if err != nil {
 				return nil, err
 			}
-			js.On = on
-		} else if kind == ast.JoinLeft || kind == ast.JoinRight || kind == ast.JoinFull {
-			return nil, nerr.New(nerr.Syntax, "sql.parser", "outer join requires ON")
+			if err := p.expect(lexer.RParen, ")"); err != nil {
+				return nil, err
+			}
+			if p.tok.Kind == lexer.KwAs {
+				p.next()
+			}
+			alias, err := p.ident()
+			if err != nil {
+				return nil, nerr.New(nerr.Syntax, "sql.parser", "derived table requires an alias")
+			}
+			s.FromQuery = query
+			s.Alias = alias
 		} else {
-			js.Kind = ast.JoinCross
-			js.Cross = true
+			name, alias, err := p.tableRef()
+			if err != nil {
+				return nil, err
+			}
+			s.Table = name
+			s.Alias = alias
 		}
-		if js.Kind == ast.JoinCross {
-			js.Cross = true
+		for {
+			kind := ast.JoinInner
+			switch p.tok.Kind {
+			case lexer.KwJoin:
+				p.next()
+			case lexer.KwInner:
+				p.next()
+				if err := p.expect(lexer.KwJoin, "JOIN"); err != nil {
+					return nil, err
+				}
+			case lexer.KwLeft:
+				p.next()
+				if p.tok.Kind == lexer.KwOuter {
+					p.next()
+				}
+				if err := p.expect(lexer.KwJoin, "JOIN"); err != nil {
+					return nil, err
+				}
+				kind = ast.JoinLeft
+			case lexer.KwRight:
+				p.next()
+				if p.tok.Kind == lexer.KwOuter {
+					p.next()
+				}
+				if err := p.expect(lexer.KwJoin, "JOIN"); err != nil {
+					return nil, err
+				}
+				kind = ast.JoinRight
+			case lexer.KwFull:
+				p.next()
+				if p.tok.Kind == lexer.KwOuter {
+					p.next()
+				}
+				if err := p.expect(lexer.KwJoin, "JOIN"); err != nil {
+					return nil, err
+				}
+				kind = ast.JoinFull
+			case lexer.KwCross:
+				p.next()
+				if err := p.expect(lexer.KwJoin, "JOIN"); err != nil {
+					return nil, err
+				}
+				kind = ast.JoinCross
+			default:
+				goto joinsDone
+			}
+			jn, ja, err := p.tableRef()
+			if err != nil {
+				return nil, err
+			}
+			js := ast.JoinSpec{Table: jn, Alias: ja, Kind: kind}
+			if p.tok.Kind == lexer.KwOn {
+				if kind == ast.JoinCross {
+					return nil, nerr.New(nerr.Syntax, "sql.parser", "CROSS JOIN does not take ON")
+				}
+				p.next()
+				on, err := p.or()
+				if err != nil {
+					return nil, err
+				}
+				js.On = on
+			} else if kind == ast.JoinLeft || kind == ast.JoinRight || kind == ast.JoinFull {
+				return nil, nerr.New(nerr.Syntax, "sql.parser", "outer join requires ON")
+			} else {
+				js.Kind = ast.JoinCross
+				js.Cross = true
+			}
+			if js.Kind == ast.JoinCross {
+				js.Cross = true
+			}
+			s.Joins = append(s.Joins, js)
 		}
-		s.Joins = append(s.Joins, js)
+	joinsDone:
+	} else if s.Star {
+		return nil, nerr.New(nerr.Syntax, "sql.parser", "expected FROM")
+	} else {
+		// SELECT <expr-list> with no FROM at all: evaluated once against no
+		// row/table context (e.g. `SELECT 1`, `SELECT NOW()`). GROUP BY/
+		// HAVING/SEARCH/NEAREST/FACET are rejected below since they need a
+		// table or index; WHERE/ORDER BY/LIMIT/OFFSET are still meaningful
+		// against the single synthetic row and remain allowed.
+		s.NoFrom = true
 	}
-joinsDone:
 	if p.tok.Kind == lexer.KwWhere {
 		p.next()
 		ex, err := p.or()
@@ -3205,6 +3404,9 @@ joinsDone:
 	}
 	s.Limit = lim
 	s.Offset = off
+	if s.NoFrom && (len(s.Group) > 0 || s.Having != nil || s.SearchQuery != nil || s.NearestQuery != nil || s.Nearest2Query != nil || len(s.FacetCols) > 0) {
+		return nil, nerr.New(nerr.Syntax, "sql.parser", "SELECT without FROM does not support GROUP BY, HAVING, SEARCH, NEAREST, or FACET")
+	}
 	return s, nil
 }
 
@@ -3720,6 +3922,93 @@ func (p *Parser) primary() (ast.Expr, error) {
 		}
 		p.next()
 		return ast.Literal{Value: v}, nil
+	case lexer.KwArray:
+		p.next()
+		if err := p.expect(lexer.LParen, "("); err != nil {
+			return nil, err
+		}
+		var elems []ast.Expr
+		if p.tok.Kind != lexer.RParen {
+			for {
+				e, err := p.or()
+				if err != nil {
+					return nil, err
+				}
+				elems = append(elems, e)
+				if p.tok.Kind == lexer.Comma {
+					p.next()
+					continue
+				}
+				break
+			}
+		}
+		if err := p.expect(lexer.RParen, ")"); err != nil {
+			return nil, err
+		}
+		return ast.ArrayCtor{Elems: elems}, nil
+	case lexer.KwStruct:
+		p.next()
+		if err := p.expect(lexer.LParen, "("); err != nil {
+			return nil, err
+		}
+		var names []string
+		var elems []ast.Expr
+		for {
+			e, err := p.or()
+			if err != nil {
+				return nil, err
+			}
+			if err := p.expect(lexer.KwAs, "AS"); err != nil {
+				return nil, nerr.New(nerr.Syntax, "sql.parser", "STRUCT field needs an AS name")
+			}
+			nm, err := p.ident()
+			if err != nil {
+				return nil, err
+			}
+			names = append(names, nm)
+			elems = append(elems, e)
+			if p.tok.Kind == lexer.Comma {
+				p.next()
+				continue
+			}
+			break
+		}
+		if err := p.expect(lexer.RParen, ")"); err != nil {
+			return nil, err
+		}
+		return ast.StructCtor{Names: names, Elems: elems}, nil
+	case lexer.KwMap:
+		p.next()
+		if err := p.expect(lexer.LParen, "("); err != nil {
+			return nil, err
+		}
+		var flat []ast.Expr
+		if p.tok.Kind != lexer.RParen {
+			for {
+				e, err := p.or()
+				if err != nil {
+					return nil, err
+				}
+				flat = append(flat, e)
+				if p.tok.Kind == lexer.Comma {
+					p.next()
+					continue
+				}
+				break
+			}
+		}
+		if err := p.expect(lexer.RParen, ")"); err != nil {
+			return nil, err
+		}
+		if len(flat)%2 != 0 {
+			return nil, nerr.New(nerr.Syntax, "sql.parser", "MAP() needs an even number of arguments (key, value, ...)")
+		}
+		mc := ast.MapCtor{}
+		for i := 0; i < len(flat); i += 2 {
+			mc.Keys = append(mc.Keys, flat[i])
+			mc.Vals = append(mc.Vals, flat[i+1])
+		}
+		return mc, nil
 	case lexer.Number:
 		d, err := types.ParseDecimal(p.tok.Lit)
 		if err != nil {

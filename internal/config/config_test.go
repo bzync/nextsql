@@ -598,3 +598,184 @@ func TestLoadAndValidateEmbeddedAuthBroker(t *testing.T) {
 		t.Fatal("embedded broker accepted with HA enabled")
 	}
 }
+
+// TestSafeEntries covers the system.config read-model source (Manager
+// Configuration view, M8): every network-address-shaped key is redacted,
+// every other non-default setting passes through unredacted, a bare
+// Default() produces only its own core fields (no stray entries for
+// never-set fields), and the key set is exactly what Marshal would have
+// emitted — proving SafeEntries can never name a key Marshal doesn't.
+func TestSafeEntries(t *testing.T) {
+	cfg := Default()
+	cfg.DataDir = "/var/lib/nextsql"
+	cfg.KeyFile = "/etc/nextsql/master.key"
+	cfg.ListenAddr = "10.0.0.5:7210"
+	cfg.RaftBind = "10.0.0.5:7211"
+	cfg.RaftJoin = "1=10.0.0.5:7211,2=10.0.0.6:7211"
+	cfg.AuthBrokerListen = "127.0.0.1:8645"
+	cfg.MaxConnections = 256
+
+	entries := cfg.SafeEntries()
+	byKey := make(map[string]string, len(entries))
+	for _, e := range entries {
+		if _, dup := byKey[e.Key]; dup {
+			t.Fatalf("duplicate key %q in SafeEntries", e.Key)
+		}
+		byKey[e.Key] = e.Value
+	}
+
+	for _, redacted := range []string{"listen_addr", "raft_bind", "raft_join", "auth_broker_listen"} {
+		v, ok := byKey[redacted]
+		if !ok {
+			t.Fatalf("SafeEntries missing %q entirely", redacted)
+		}
+		if v != "[redacted]" {
+			t.Fatalf("SafeEntries[%q] = %q, want [redacted]", redacted, v)
+		}
+		if strings.Contains(v, "10.0.0") || strings.Contains(v, "127.0.0.1") || strings.Contains(v, ":") {
+			t.Fatalf("SafeEntries[%q] leaked address material: %q", redacted, v)
+		}
+	}
+	if byKey["data_dir"] != "/var/lib/nextsql" || byKey["key_file"] != "/etc/nextsql/master.key" {
+		t.Fatalf("non-address fields must pass through unredacted: %+v", byKey)
+	}
+	if byKey["max_connections"] != "256" {
+		t.Fatalf("numeric field mismatch: %+v", byKey)
+	}
+
+	// Same key set Marshal emits — split on "=" the same way SafeEntries
+	// does internally, so this test would catch either side drifting.
+	wantKeys := map[string]bool{}
+	for _, line := range strings.Split(strings.TrimRight(string(cfg.Marshal()), "\n"), "\n") {
+		if line == "" {
+			continue
+		}
+		k, _, _ := strings.Cut(line, "=")
+		wantKeys[k] = true
+	}
+	if len(wantKeys) != len(byKey) {
+		t.Fatalf("SafeEntries key count %d != Marshal key count %d", len(byKey), len(wantKeys))
+	}
+	for k := range wantKeys {
+		if _, ok := byKey[k]; !ok {
+			t.Fatalf("SafeEntries missing Marshal key %q", k)
+		}
+	}
+
+	// A bare Default() must not fabricate entries for fields nothing set.
+	bare := Default().SafeEntries()
+	for _, e := range bare {
+		if e.Key == "raft_bind" || e.Key == "raft_join" || e.Key == "max_connections" {
+			t.Fatalf("bare Default() must not emit unset field %q", e.Key)
+		}
+	}
+}
+
+func TestWithSetting(t *testing.T) {
+	base := Default()
+	base.DataDir = "/var/lib/nextsql"
+	base.BufferPages = 1024
+
+	// A numeric setting: parsed and range-checked like Load.
+	next, err := base.WithSetting("buffer_pages", "4096", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next.BufferPages != 4096 {
+		t.Fatalf("buffer_pages = %d, want 4096", next.BufferPages)
+	}
+	if base.BufferPages != 1024 {
+		t.Fatalf("WithSetting mutated the receiver: %d", base.BufferPages)
+	}
+	if next.DataDir != "/var/lib/nextsql" {
+		t.Fatalf("WithSetting dropped an unrelated key: %q", next.DataDir)
+	}
+
+	// A bool.
+	next, err = base.WithSetting("require_client_key", "true", false)
+	if err != nil || !next.RequireClientKey {
+		t.Fatalf("require_client_key: %v / %v", next.RequireClientKey, err)
+	}
+
+	// DEFAULT resets to the built-in default.
+	base.MaxConnections = 999
+	next, err = base.WithSetting("max_connections", "", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next.Setting("max_connections") != "" {
+		t.Fatalf("max_connections not reset: %q", next.Setting("max_connections"))
+	}
+
+	// Rejections: unknown key, unparseable value, out-of-range value,
+	// empty value without reset, a value that fails Validate.
+	for _, c := range []struct{ key, val string }{
+		{"nonsense_key", "1"},
+		{"buffer_pages", "not-a-number"},
+		{"buffer_pages", "0"},
+		{"buffer_pages", ""},
+		{"disk_watermark_warn_percent", "150"},
+	} {
+		if _, err := base.WithSetting(c.key, c.val, false); err == nil {
+			t.Fatalf("WithSetting(%q,%q) accepted, want error", c.key, c.val)
+		}
+	}
+
+	// Every settable key round-trips: set it to a plausible value, get it back.
+	for _, k := range SettableKeys() {
+		if !settableKeys[k] {
+			t.Fatalf("SettableKeys returned %q not in settableKeys", k)
+		}
+	}
+}
+
+func TestDiffState(t *testing.T) {
+	running := Default()
+	running.DataDir = "/data"
+	running.BufferPages = 2048 // came from a startup flag
+	running.MaxConnections = 100
+
+	file := Default()
+	file.DataDir = "/data"
+	file.BufferPages = 1024 // nextsql.conf still says the old value
+	file.MaxConnections = 100
+
+	states := DiffState(running, file)
+	byKey := map[string]EntryState{}
+	for _, s := range states {
+		byKey[s.Key] = s
+	}
+	if s := byKey["buffer_pages"]; s.Value != "2048" || s.FileValue != "1024" || !s.RestartRequired {
+		t.Fatalf("buffer_pages state = %+v", s)
+	}
+	if s := byKey["data_dir"]; s.RestartRequired {
+		t.Fatalf("data_dir matches; restart_required must be false: %+v", s)
+	}
+	if s := byKey["max_connections"]; s.RestartRequired {
+		t.Fatalf("max_connections matches: %+v", s)
+	}
+
+	// Same config for both -> nothing needs a restart.
+	for _, s := range DiffState(running, running) {
+		if s.RestartRequired {
+			t.Fatalf("identical configs but %q reports restart_required", s.Key)
+		}
+	}
+
+	// An address key: values differ but both display "[redacted]"; the
+	// RestartRequired flag must still be computed from the real values.
+	r2 := Default()
+	r2.ListenAddr = "0.0.0.0:7210"
+	f2 := Default()
+	f2.ListenAddr = "127.0.0.1:7210"
+	for _, s := range DiffState(r2, f2) {
+		if s.Key == "listen_addr" {
+			if s.Value != "[redacted]" || s.FileValue != "[redacted]" {
+				t.Fatalf("listen_addr not redacted: %+v", s)
+			}
+			if !s.RestartRequired {
+				t.Fatalf("listen_addr differs but RestartRequired=false: %+v", s)
+			}
+		}
+	}
+}

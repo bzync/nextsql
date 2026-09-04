@@ -15,10 +15,10 @@
 *pw
 /data/
 /tmp/
+/installers/
 /.gotmp/
 /.go-cache-*/
 /.p26-*
-/installers/
 .DS_Store
 .env.local
 __pycache__/

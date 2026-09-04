@@ -1,0 +1,8 @@
+/* App-level tweaks on top of @bzync/rui's stylesheet. */
+body {
+  margin: 0;
+}
+#root ul {
+  margin: 4px 0 0;
+  padding-left: 18px;
+}

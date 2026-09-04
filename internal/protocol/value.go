@@ -107,6 +107,156 @@ func readEnumLabels(b []byte, off int) ([]string, int, error) {
 	return labels, off, nil
 }
 
+// maxCollDescDepth bounds recursion when reading an untrusted collection Type
+// descriptor off the wire, matching types.MaxNestDepth (+1 slack for the
+// outermost constructor call).
+const maxCollDescDepth = types.MaxNestDepth + 1
+
+// appendTypeBody writes the fixed 5-byte Precision/Scale/VecElem meta plus any
+// variable metadata the Kind needs: an ENUM's label list, or a collection's
+// recursive element/key/field descriptor. The leading Kind byte is written by
+// the caller (appendType / appendValue).
+func appendTypeBody(dst []byte, t types.Type) ([]byte, error) {
+	var meta [5]byte
+	encoding.PutU16(meta[:], 0, t.Precision)
+	encoding.PutU16(meta[:], 2, t.Scale)
+	meta[4] = t.VecElem
+	dst = append(dst, meta[:]...)
+	var err error
+	switch t.Kind {
+	case types.KindEnum:
+		if dst, err = appendEnumLabels(dst, t.EnumLabels); err != nil {
+			return nil, err
+		}
+	case types.KindArray:
+		if len(t.Elem) != 1 {
+			return nil, protoErr("ARRAY type missing element descriptor")
+		}
+		if dst, err = appendTypeFull(dst, t.Elem[0]); err != nil {
+			return nil, err
+		}
+	case types.KindMap:
+		if len(t.Key) != 1 || len(t.Elem) != 1 {
+			return nil, protoErr("MAP type missing key/value descriptor")
+		}
+		if dst, err = appendTypeFull(dst, t.Key[0]); err != nil {
+			return nil, err
+		}
+		if dst, err = appendTypeFull(dst, t.Elem[0]); err != nil {
+			return nil, err
+		}
+	case types.KindStruct:
+		if len(t.Fields) == 0 || len(t.Fields) > types.MaxStructFields {
+			return nil, protoErr("STRUCT type field count out of range")
+		}
+		var n [2]byte
+		encoding.PutU16(n[:], 0, uint16(len(t.Fields)))
+		dst = append(dst, n[:]...)
+		for _, f := range t.Fields {
+			if dst, err = appendU16String(dst, f.Name, 255); err != nil {
+				return nil, err
+			}
+			if dst, err = appendTypeFull(dst, f.Type); err != nil {
+				return nil, err
+			}
+		}
+	}
+	return dst, nil
+}
+
+// appendTypeFull writes a complete recursive Type (Kind byte + body).
+func appendTypeFull(dst []byte, t types.Type) ([]byte, error) {
+	dst = append(dst, byte(t.Kind))
+	return appendTypeBody(dst, t)
+}
+
+// readTypeBody is the untrusted-decoder inverse of appendTypeBody. kind has
+// already been consumed by the caller; off points just past it.
+func readTypeBody(b []byte, off int, kind types.Kind, depth int) (types.Type, int, error) {
+	if depth > maxCollDescDepth {
+		return types.Type{}, 0, protoErr("collection type nesting too deep")
+	}
+	if off+5 > len(b) {
+		return types.Type{}, 0, protoErr("truncated type meta")
+	}
+	prec := encoding.U16(b, off)
+	scale := encoding.U16(b, off+2)
+	elem := b[off+4]
+	off += 5
+	base := types.Type{Kind: kind, Precision: prec, Scale: scale, VecElem: elem}
+	switch kind {
+	case types.KindEnum:
+		labels, next, err := readEnumLabels(b, off)
+		if err != nil {
+			return types.Type{}, 0, err
+		}
+		et, err := types.EnumType(labels)
+		if err != nil {
+			return types.Type{}, 0, nerr.Wrap(nerr.Protocol, "protocol.readType", "invalid enum type", err)
+		}
+		return et, next, nil
+	case types.KindArray:
+		e, next, err := readTypeFull(b, off, depth+1)
+		if err != nil {
+			return types.Type{}, 0, err
+		}
+		at, err := types.ArrayType(e)
+		if err != nil {
+			return types.Type{}, 0, nerr.Wrap(nerr.Protocol, "protocol.readType", "invalid array type", err)
+		}
+		return at, next, nil
+	case types.KindMap:
+		k, next, err := readTypeFull(b, off, depth+1)
+		if err != nil {
+			return types.Type{}, 0, err
+		}
+		val, next2, err := readTypeFull(b, next, depth+1)
+		if err != nil {
+			return types.Type{}, 0, err
+		}
+		mt, err := types.MapType(k, val)
+		if err != nil {
+			return types.Type{}, 0, nerr.Wrap(nerr.Protocol, "protocol.readType", "invalid map type", err)
+		}
+		return mt, next2, nil
+	case types.KindStruct:
+		n, err := encoding.ReadU16(b, off)
+		if err != nil {
+			return types.Type{}, 0, protoErr("truncated struct field count")
+		}
+		if n == 0 || int(n) > types.MaxStructFields {
+			return types.Type{}, 0, protoErr("struct field count out of range")
+		}
+		off += 2
+		fields := make([]types.Field, n)
+		for i := range fields {
+			fields[i].Name, off, err = readU16String(b, off, 255)
+			if err != nil {
+				return types.Type{}, 0, err
+			}
+			fields[i].Type, off, err = readTypeFull(b, off, depth+1)
+			if err != nil {
+				return types.Type{}, 0, err
+			}
+		}
+		st, err := types.StructType(fields)
+		if err != nil {
+			return types.Type{}, 0, nerr.Wrap(nerr.Protocol, "protocol.readType", "invalid struct type", err)
+		}
+		return st, off, nil
+	default:
+		return base, off, nil
+	}
+}
+
+func readTypeFull(b []byte, off, depth int) (types.Type, int, error) {
+	if off >= len(b) {
+		return types.Type{}, 0, protoErr("truncated type")
+	}
+	kind := types.Kind(b[off])
+	return readTypeBody(b, off+1, kind, depth)
+}
+
 func appendValue(dst []byte, v types.Value, max int) ([]byte, error) {
 	dst = append(dst, byte(v.Typ.Kind))
 	var flags byte
@@ -114,16 +264,9 @@ func appendValue(dst []byte, v types.Value, max int) ([]byte, error) {
 		flags |= flagNull
 	}
 	dst = append(dst, flags)
-	var meta [5]byte
-	encoding.PutU16(meta[:], 0, v.Typ.Precision)
-	encoding.PutU16(meta[:], 2, v.Typ.Scale)
-	meta[4] = v.Typ.VecElem
-	dst = append(dst, meta[:]...)
-	if v.Typ.Kind == types.KindEnum {
-		var err error
-		if dst, err = appendEnumLabels(dst, v.Typ.EnumLabels); err != nil {
-			return nil, err
-		}
+	var err error
+	if dst, err = appendTypeBody(dst, v.Typ); err != nil {
+		return nil, err
 	}
 	if v.Null {
 		return dst, nil
@@ -139,25 +282,15 @@ func appendValue(dst []byte, v types.Value, max int) ([]byte, error) {
 }
 
 func readValue(b []byte, off, max int) (types.Value, int, error) {
-	if off+7 > len(b) {
+	if off+2 > len(b) {
 		return types.Value{}, 0, protoErr("truncated value header")
 	}
 	kind := types.Kind(b[off])
 	flags := b[off+1]
-	prec := encoding.U16(b, off+2)
-	scale := encoding.U16(b, off+4)
-	elem := b[off+6]
-	off += 7
-	typ := types.Type{Kind: kind, Precision: prec, Scale: scale, VecElem: elem}
-	if kind == types.KindEnum {
-		labels, next, err := readEnumLabels(b, off)
-		if err != nil {
-			return types.Value{}, 0, err
-		}
-		if typ, err = types.EnumType(labels); err != nil {
-			return types.Value{}, 0, nerr.Wrap(nerr.Protocol, "protocol.readValue", "invalid enum type", err)
-		}
-		off = next
+	off += 2
+	typ, off, err := readTypeBody(b, off, kind, 0)
+	if err != nil {
+		return types.Value{}, 0, err
 	}
 	if flags&flagNull != 0 {
 		return types.Null(typ), off, nil
@@ -177,41 +310,9 @@ func readValue(b []byte, off, max int) (types.Value, int, error) {
 }
 
 func appendType(dst []byte, t types.Type) ([]byte, error) {
-	dst = append(dst, byte(t.Kind))
-	var meta [5]byte
-	encoding.PutU16(meta[:], 0, t.Precision)
-	encoding.PutU16(meta[:], 2, t.Scale)
-	meta[4] = t.VecElem
-	dst = append(dst, meta[:]...)
-	if t.Kind == types.KindEnum {
-		var err error
-		if dst, err = appendEnumLabels(dst, t.EnumLabels); err != nil {
-			return nil, err
-		}
-	}
-	return dst, nil
+	return appendTypeFull(dst, t)
 }
 
 func readType(b []byte, off int) (types.Type, int, error) {
-	if off+6 > len(b) {
-		return types.Type{}, 0, protoErr("truncated type")
-	}
-	t := types.Type{
-		Kind:      types.Kind(b[off]),
-		Precision: encoding.U16(b, off+1),
-		Scale:     encoding.U16(b, off+3),
-		VecElem:   b[off+5],
-	}
-	off += 6
-	if t.Kind == types.KindEnum {
-		labels, next, err := readEnumLabels(b, off)
-		if err != nil {
-			return types.Type{}, 0, err
-		}
-		if t, err = types.EnumType(labels); err != nil {
-			return types.Type{}, 0, nerr.Wrap(nerr.Protocol, "protocol.readType", "invalid enum type", err)
-		}
-		off = next
-	}
-	return t, off, nil
+	return readTypeFull(b, off, 0)
 }

@@ -4,7 +4,7 @@
 #
 # Usage:
 #   scripts/build-windows-installer.sh
-#   scripts/build-windows-installer.sh --arch amd64,arm64 --out dist
+#   scripts/build-windows-installer.sh --arch amd64,arm64 --out installers
 set -euo pipefail
 
 ROOT="$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)"
@@ -17,7 +17,7 @@ need_cmd sha256sum
 need_cmd python3
 
 ARCHES=""
-DIST="$ROOT/dist"
+DIST="$ROOT/installers"
 SKIP_ZIP=0
 SKIP_SETUP=0
 SKIP_NSIS=0
@@ -29,7 +29,7 @@ Usage: $(basename "$0") [options]
 
   --arch LIST     Go arches (comma-separated, or 'all' for amd64,arm64).
                   Default: host GOARCH ($(go env GOARCH)).
-  --out DIR       Output directory (default: dist/).
+  --out DIR       Output directory (default: installers/).
   --skip-zip      Do not write the portable zip.
   --skip-setup    Do not write the self-extracting setup.exe.
   --skip-nsis     Do not run makensis even if it is installed.

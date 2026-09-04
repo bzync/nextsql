@@ -5,8 +5,10 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
 	"math"
 	"math/big"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -45,6 +47,19 @@ type Value struct {
 	// (disambiguated by Typ.Kind, the same pattern DATE/TIME/TIMESTAMP use).
 	IntervalMonths int32
 	IntervalDays   int32
+	// Coll / CollKeys hold a collection value's members (Collections track,
+	// docs/design-collections.md): for STRUCT, Coll is the ordered field
+	// values (one per Typ.Fields entry, in the same order); for ARRAY, Coll is
+	// the elements; for MAP, Coll is the values and CollKeys the parallel
+	// keys, both ordered by the key's canonical Cmp order. Each member is
+	// itself a fully-typed Value, so collections nest.
+	Coll     []Value
+	CollKeys []Value
+	// Geom holds a general GEOMETRY / GEOGRAPHY value (Spatial track,
+	// docs/design-spatial.md). The four fixed WGS84 shapes keep using
+	// Lon/Lat/Box/Coords/Rings above; this is only for KindGeometry /
+	// KindGeography.
+	Geom *Geom
 }
 
 func Null(t Type) Value { return Value{Typ: t, Null: true} }
@@ -711,6 +726,26 @@ func DecimalFromFloat(f float64) (Value, error) {
 
 func BoolValue(b bool) Value { return Value{Typ: Bool(), Bool: b} }
 
+// StructValue builds a STRUCT value: fields must be positionally aligned with
+// t.Fields. This is the reconstruct-from-parts constructor (decode paths,
+// executor); use Coerce against a StructType for validation of untrusted or
+// computed input (docs/design-collections.md C1).
+func StructValue(t Type, fields []Value) Value {
+	return Value{Typ: t, Coll: append([]Value(nil), fields...)}
+}
+
+// ArrayValue builds an ARRAY value from its elements (docs/design-collections.md C2).
+func ArrayValue(t Type, elems []Value) Value {
+	return Value{Typ: t, Coll: append([]Value(nil), elems...)}
+}
+
+// MapValue builds a MAP value from parallel key/value slices. Callers that
+// build a map from untrusted input should route through Coerce, which sorts by
+// canonical key order and rejects duplicate keys (docs/design-collections.md C3).
+func MapValue(t Type, keys, vals []Value) Value {
+	return Value{Typ: t, CollKeys: append([]Value(nil), keys...), Coll: append([]Value(nil), vals...)}
+}
+
 // Clone returns a deep copy of v.
 func (v Value) Clone() Value {
 	if v.JSON != nil {
@@ -733,6 +768,23 @@ func (v Value) Clone() Value {
 	}
 	if v.Rings != nil {
 		v.Rings = append([]int(nil), v.Rings...)
+	}
+	if v.Coll != nil {
+		cp := make([]Value, len(v.Coll))
+		for i := range v.Coll {
+			cp[i] = v.Coll[i].Clone()
+		}
+		v.Coll = cp
+	}
+	if v.CollKeys != nil {
+		cp := make([]Value, len(v.CollKeys))
+		for i := range v.CollKeys {
+			cp[i] = v.CollKeys[i].Clone()
+		}
+		v.CollKeys = cp
+	}
+	if v.Geom != nil {
+		v.Geom = v.Geom.Clone()
 	}
 	return v
 }
@@ -867,9 +919,64 @@ func (v Value) String() string {
 		return FormatTimeOfDay(v.Time)
 	case KindInterval:
 		return FormatInterval(v.IntervalMonths, v.IntervalDays, v.Time)
+	case KindArray:
+		var b strings.Builder
+		b.WriteByte('[')
+		for i, e := range v.Coll {
+			if i > 0 {
+				b.WriteString(", ")
+			}
+			b.WriteString(memberString(e))
+		}
+		b.WriteByte(']')
+		return b.String()
+	case KindStruct:
+		var b strings.Builder
+		b.WriteByte('{')
+		for i, e := range v.Coll {
+			if i > 0 {
+				b.WriteString(", ")
+			}
+			if i < len(v.Typ.Fields) {
+				b.WriteString(v.Typ.Fields[i].Name)
+				b.WriteString(": ")
+			}
+			b.WriteString(memberString(e))
+		}
+		b.WriteByte('}')
+		return b.String()
+	case KindMap:
+		var b strings.Builder
+		b.WriteByte('{')
+		for i := range v.Coll {
+			if i > 0 {
+				b.WriteString(", ")
+			}
+			if i < len(v.CollKeys) {
+				b.WriteString(memberString(v.CollKeys[i]))
+			}
+			b.WriteString(": ")
+			b.WriteString(memberString(v.Coll[i]))
+		}
+		b.WriteByte('}')
+		return b.String()
+	case KindGeometry, KindGeography:
+		if v.Geom == nil {
+			return "NULL"
+		}
+		return FormatGeomWKT(v.Geom)
 	default:
 		return "?"
 	}
+}
+
+// memberString renders one collection member for Value.String — NULL members
+// as the literal NULL, everything else via its own String().
+func memberString(v Value) string {
+	if v.Null {
+		return "NULL"
+	}
+	return v.String()
 }
 
 func (v Value) Cmp(o Value) (int, error) {
@@ -1042,8 +1149,101 @@ func (v Value) Cmp(o Value) (int, error) {
 		default:
 			return 0, nil
 		}
+	case KindStruct:
+		// Field-by-field lexicographic in declaration order; the first
+		// non-equal field decides. Requires the same declared field list
+		// (docs/design-collections.md C1).
+		if len(v.Coll) != len(o.Coll) {
+			return 0, nerr.New(nerr.InvalidArgument, "types.Value.Cmp", "STRUCT shape mismatch")
+		}
+		for i := range v.Coll {
+			c, err := cmpMember(v.Coll[i], o.Coll[i])
+			if err != nil {
+				return 0, err
+			}
+			if c != 0 {
+				return c, nil
+			}
+		}
+		return 0, nil
+	case KindArray:
+		// Element-by-element lexicographic; a shorter array that is a prefix
+		// of a longer one sorts first (docs/design-collections.md C2).
+		n := len(v.Coll)
+		if len(o.Coll) < n {
+			n = len(o.Coll)
+		}
+		for i := 0; i < n; i++ {
+			c, err := cmpMember(v.Coll[i], o.Coll[i])
+			if err != nil {
+				return 0, err
+			}
+			if c != 0 {
+				return c, nil
+			}
+		}
+		switch {
+		case len(v.Coll) < len(o.Coll):
+			return -1, nil
+		case len(v.Coll) > len(o.Coll):
+			return 1, nil
+		default:
+			return 0, nil
+		}
+	case KindGeometry, KindGeography:
+		// Canonical-EWKB byte order — a deterministic total order, not
+		// geometrically meaningful (docs/design-spatial.md §2.5).
+		ab, err := encodeSortableGeneralGeo(v)
+		if err != nil {
+			return 0, err
+		}
+		bb, err := encodeSortableGeneralGeo(o)
+		if err != nil {
+			return 0, err
+		}
+		return bytes.Compare(ab, bb), nil
+	case KindMap:
+		// Entries are held in canonical key order, so a straight pairwise
+		// walk over (key, value) is a well-defined total order
+		// (docs/design-collections.md C3).
+		n := len(v.Coll)
+		if len(o.Coll) < n {
+			n = len(o.Coll)
+		}
+		for i := 0; i < n; i++ {
+			if c, err := cmpMember(v.CollKeys[i], o.CollKeys[i]); err != nil || c != 0 {
+				return c, err
+			}
+			if c, err := cmpMember(v.Coll[i], o.Coll[i]); err != nil || c != 0 {
+				return c, err
+			}
+		}
+		switch {
+		case len(v.Coll) < len(o.Coll):
+			return -1, nil
+		case len(v.Coll) > len(o.Coll):
+			return 1, nil
+		default:
+			return 0, nil
+		}
 	default:
 		return 0, nerr.New(nerr.InvalidArgument, "types.Value.Cmp", "type is not comparable")
+	}
+}
+
+// cmpMember compares two collection members with NULL ordered before every
+// present value (matching the sortable-key framing in row.go: end < null <
+// present).
+func cmpMember(a, b Value) (int, error) {
+	switch {
+	case a.Null && b.Null:
+		return 0, nil
+	case a.Null:
+		return -1, nil
+	case b.Null:
+		return 1, nil
+	default:
+		return a.Cmp(b)
 	}
 }
 
@@ -1199,6 +1399,10 @@ func Coerce(v Value, dest Type) (Value, error) {
 				return Value{}, err
 			}
 			return VarcharValue(v.Str, dest), nil
+		case KindStruct, KindArray, KindMap:
+			return coerceCollection(v, dest)
+		case KindGeometry, KindGeography:
+			return coerceGeneralGeo(v, dest)
 		default:
 			v.Typ = dest
 			return v, nil
@@ -1397,9 +1601,18 @@ func Coerce(v Value, dest Type) (Value, error) {
 			}
 			return g, nil
 		}
+		// CAST bridge: unwrap a GEOMETRY / GEOGRAPHY of the matching subtype
+		// back to a fixed WGS84 shape (docs/design-spatial.md §2.7). BOX has
+		// no OGC equivalent so it is text-only.
+		if IsGeneralSpatial(v.Typ.Kind) && v.Geom != nil && dest.Kind != KindBox {
+			return geomToFixedShape(v.Geom, dest)
+		}
 	case KindJSON:
 		if textlike(v.Typ.Kind) {
 			return JSONFromText(textSource(v))
+		}
+		if v.Typ.Kind == KindArray || v.Typ.Kind == KindStruct || v.Typ.Kind == KindMap {
+			return collectionToJSON(v)
 		}
 	case KindBlob:
 		// Deliberately not a byte-for-byte passthrough: STRING/TEXT and BLOB
@@ -1434,6 +1647,19 @@ func Coerce(v Value, dest Type) (Value, error) {
 		if textlike(v.Typ.Kind) {
 			return ParseInterval(textSource(v))
 		}
+	case KindGeometry, KindGeography:
+		// Text (WKT / EWKT), and the CAST bridge from the four fixed WGS84
+		// shapes (docs/design-spatial.md §2.7).
+		if textlike(v.Typ.Kind) {
+			g, err := ParseGeneralWKT(textSource(v), uint32(dest.Precision))
+			if err != nil {
+				return Value{}, err
+			}
+			return coerceGeneralGeo(Value{Typ: Type{Kind: dest.Kind}, Geom: g}, dest)
+		}
+		if bridged, ok := fixedShapeToGeom(v); ok {
+			return coerceGeneralGeo(Value{Typ: Type{Kind: dest.Kind}, Geom: bridged}, dest)
+		}
 	}
 	return Value{}, nerr.New(nerr.InvalidArgument, "types.Coerce", "cannot coerce "+v.Typ.String()+" to "+dest.String())
 }
@@ -1467,6 +1693,120 @@ func coerceSparse(v Value, dest Type) (Value, error) {
 	return SparseValue(idx, val, dest), nil
 }
 
+// coerceCollection coerces a STRUCT/ARRAY/MAP value to another collection type
+// of the same Kind, coercing each member to the destination's declared member
+// type (docs/design-collections.md). MAP entries are re-sorted into canonical
+// key order and duplicate keys are rejected.
+func coerceCollection(v Value, dest Type) (Value, error) {
+	switch dest.Kind {
+	case KindStruct:
+		if len(dest.Fields) != len(v.Coll) {
+			return Value{}, nerr.New(nerr.InvalidArgument, "types.Coerce", "STRUCT field count mismatch")
+		}
+		out := make([]Value, len(dest.Fields))
+		for i, f := range dest.Fields {
+			if i < len(v.Typ.Fields) && v.Typ.Fields[i].Name != "" && v.Typ.Fields[i].Name != f.Name {
+				return Value{}, nerr.New(nerr.InvalidArgument, "types.Coerce", "STRUCT field name mismatch ("+v.Typ.Fields[i].Name+" vs "+f.Name+")")
+			}
+			cv, err := Coerce(v.Coll[i], f.Type)
+			if err != nil {
+				return Value{}, err
+			}
+			out[i] = cv
+		}
+		return StructValue(dest, out), nil
+	case KindArray:
+		if len(dest.Elem) != 1 {
+			return Value{}, nerr.New(nerr.InvalidArgument, "types.Coerce", "ARRAY missing element type")
+		}
+		if len(v.Coll) > MaxCollectionLen {
+			return Value{}, nerr.New(nerr.InvalidArgument, "types.Coerce", "ARRAY exceeds MaxCollectionLen")
+		}
+		out := make([]Value, len(v.Coll))
+		for i := range v.Coll {
+			cv, err := Coerce(v.Coll[i], dest.Elem[0])
+			if err != nil {
+				return Value{}, err
+			}
+			out[i] = cv
+		}
+		return ArrayValue(dest, out), nil
+	case KindMap:
+		if len(dest.Key) != 1 || len(dest.Elem) != 1 {
+			return Value{}, nerr.New(nerr.InvalidArgument, "types.Coerce", "MAP missing key/value type")
+		}
+		if len(v.Coll) != len(v.CollKeys) {
+			return Value{}, nerr.New(nerr.InvalidArgument, "types.Coerce", "MAP key/value count mismatch")
+		}
+		if len(v.Coll) > MaxCollectionLen {
+			return Value{}, nerr.New(nerr.InvalidArgument, "types.Coerce", "MAP exceeds MaxCollectionLen")
+		}
+		keys := make([]Value, len(v.CollKeys))
+		vals := make([]Value, len(v.Coll))
+		for i := range v.CollKeys {
+			if v.CollKeys[i].Null {
+				return Value{}, nerr.New(nerr.InvalidArgument, "types.Coerce", "MAP key cannot be NULL")
+			}
+			ck, err := Coerce(v.CollKeys[i], dest.Key[0])
+			if err != nil {
+				return Value{}, err
+			}
+			cv, err := Coerce(v.Coll[i], dest.Elem[0])
+			if err != nil {
+				return Value{}, err
+			}
+			keys[i], vals[i] = ck, cv
+		}
+		ok, ov, err := CanonicalizeMap(keys, vals)
+		if err != nil {
+			return Value{}, err
+		}
+		return MapValue(dest, ok, ov), nil
+	default:
+		return Value{}, nerr.New(nerr.InvalidArgument, "types.Coerce", "not a collection destination")
+	}
+}
+
+// CanonicalizeMap returns keys/vals reordered into ascending canonical key
+// order (Value.Cmp) so that two MAPs with the same entries encode and compare
+// identically regardless of construction order, and errors on a duplicate key
+// (docs/design-collections.md C3).
+func CanonicalizeMap(keys, vals []Value) ([]Value, []Value, error) {
+	if len(keys) != len(vals) {
+		return nil, nil, nerr.New(nerr.InvalidArgument, "types.CanonicalizeMap", "key/value count mismatch")
+	}
+	idx := make([]int, len(keys))
+	for i := range idx {
+		idx[i] = i
+	}
+	var cmpErr error
+	sort.SliceStable(idx, func(a, b int) bool {
+		c, err := keys[idx[a]].Cmp(keys[idx[b]])
+		if err != nil {
+			cmpErr = err
+		}
+		return c < 0
+	})
+	if cmpErr != nil {
+		return nil, nil, cmpErr
+	}
+	ok := make([]Value, len(keys))
+	ov := make([]Value, len(vals))
+	for i, j := range idx {
+		ok[i], ov[i] = keys[j], vals[j]
+		if i > 0 {
+			c, err := ok[i-1].Cmp(ok[i])
+			if err != nil {
+				return nil, nil, err
+			}
+			if c == 0 {
+				return nil, nil, nerr.New(nerr.InvalidArgument, "types.CanonicalizeMap", "duplicate MAP key")
+			}
+		}
+	}
+	return ok, ov, nil
+}
+
 // JSONFromText parses UTF-8 JSON into the compact binary stored form.
 func JSONFromText(s string) (Value, error) {
 	doc, err := nsjson.FromText([]byte(s))
@@ -1474,6 +1814,109 @@ func JSONFromText(s string) (Value, error) {
 		return Value{}, err
 	}
 	return JSONValue(doc), nil
+}
+
+// collectionToJSON coerces an ARRAY/STRUCT/MAP value into JSON: it renders v
+// as a generic JSON tree, marshals that to text, and reuses JSONFromText's
+// already-validated text->NSJB path rather than hand-rolling a second binary
+// encoder for the same document. This is the general fix for coercing any
+// collection (nested to any depth) into a JSON column — the driver wire
+// protocol sends plain arrays/maps as native ARRAY/MAP values now, and those
+// must still be insertable into a JSON column exactly as a JSON-text literal
+// already was.
+func collectionToJSON(v Value) (Value, error) {
+	tree, err := valueToJSONAny(v)
+	if err != nil {
+		return Value{}, err
+	}
+	raw, err := json.Marshal(tree)
+	if err != nil {
+		return Value{}, nerr.New(nerr.InvalidArgument, "types.Coerce", "cannot encode collection as JSON: "+err.Error())
+	}
+	return JSONFromText(string(raw))
+}
+
+// valueToJSONAny converts v into a plain Go value (nil / bool / json.Number /
+// string / []any / map[string]any) suitable for json.Marshal, recursing into
+// nested ARRAY/STRUCT/MAP members. Kinds with no native JSON representation
+// (UUID, BLOB, VECTOR, GEOMETRY/GEOGRAPHY, DATE, TIME, TIMESTAMP[TZ],
+// INTERVAL, BOX/POINT/LINE/POLYGON) fall back to their existing text form,
+// same as CAST-to-string would produce.
+func valueToJSONAny(v Value) (any, error) {
+	if v.Null {
+		return nil, nil
+	}
+	switch v.Typ.Kind {
+	case KindBool:
+		return v.Bool, nil
+	case KindInt8, KindInt16, KindInt32, KindInt64:
+		return json.Number(strconv.FormatInt(v.Int, 10)), nil
+	case KindUint8, KindUint16, KindUint32, KindUint64:
+		return json.Number(strconv.FormatUint(v.Uint, 10)), nil
+	case KindFloat32, KindFloat64:
+		if math.IsNaN(float64(v.Flt)) || math.IsInf(float64(v.Flt), 0) {
+			return nil, nerr.New(nerr.InvalidArgument, "types.Coerce", "cannot represent NaN/Infinity in JSON")
+		}
+		return json.Number(FormatFloat(v.Typ.Kind, v.Flt)), nil
+	case KindDecimal:
+		return json.Number(v.Dec.String()), nil
+	case KindString, KindText, KindChar, KindVarchar, KindEnum:
+		return v.Str, nil
+	case KindJSON:
+		// Already JSON: decode back into a generic tree so it nests as a
+		// real subdocument instead of being double-encoded as a string.
+		if v.JSON == nil {
+			return nil, nil
+		}
+		txt, err := nsjson.ToText(v.JSON)
+		if err != nil {
+			return nil, err
+		}
+		var out any
+		if err := json.Unmarshal(txt, &out); err != nil {
+			return nil, err
+		}
+		return out, nil
+	case KindArray:
+		out := make([]any, len(v.Coll))
+		for i, e := range v.Coll {
+			cv, err := valueToJSONAny(e)
+			if err != nil {
+				return nil, err
+			}
+			out[i] = cv
+		}
+		return out, nil
+	case KindStruct:
+		out := make(map[string]any, len(v.Coll))
+		for i, e := range v.Coll {
+			name := "?"
+			if i < len(v.Typ.Fields) {
+				name = v.Typ.Fields[i].Name
+			}
+			cv, err := valueToJSONAny(e)
+			if err != nil {
+				return nil, err
+			}
+			out[name] = cv
+		}
+		return out, nil
+	case KindMap:
+		out := make(map[string]any, len(v.Coll))
+		for i := range v.Coll {
+			if i >= len(v.CollKeys) {
+				break
+			}
+			cv, err := valueToJSONAny(v.Coll[i])
+			if err != nil {
+				return nil, err
+			}
+			out[memberString(v.CollKeys[i])] = cv
+		}
+		return out, nil
+	default:
+		return v.String(), nil
+	}
 }
 
 // ExtractJSON reads a path from a binary JSON document without decoding unused siblings.

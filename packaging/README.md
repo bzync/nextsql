@@ -2,6 +2,13 @@
 
 Build scripts that package `nextsql`, `nextsqld`, and `nextsql-bench`.
 
+For first-run configuration and database initialization — hardware detection,
+resource presets, secure-default `nextsql.conf` generation, and post-install
+health verification, all non-interactive with machine-readable output — use
+`nextsql setup` (see `docs/install.md`). The OS installers and, later, the
+GUI installer drive that same command; every option they expose is available
+to a script.
+
 ```bash
 # Both platforms (from a Linux host; Windows is cross-compiled)
 ./scripts/build-installers.sh
@@ -13,7 +20,7 @@ Build scripts that package `nextsql`, `nextsqld`, and `nextsql-bench`.
 ./scripts/build-windows-installer.sh --arch amd64
 ```
 
-Artifacts land in `dist/`. Checksums: `dist/SHA256SUMS.linux`, `dist/SHA256SUMS.windows`, and `dist/SHA256SUMS` after the combined script.
+Artifacts land in `installers/`. Checksums: `installers/SHA256SUMS.linux`, `installers/SHA256SUMS.windows`, and `installers/SHA256SUMS` after the combined script.
 
 Requires Go 1.22+, `tar`, `gzip`, `zip`, `sha256sum`, and `python3`. Debian packages need `dpkg-deb` (and `fakeroot` when present). The Windows `.ico` is built with Python Pillow when that package is installed.
 

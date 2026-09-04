@@ -69,7 +69,7 @@ func TestTableEncodeRoundTrip(t *testing.T) {
 	// count), and v9 a further 3 bytes per index (full-text analyzer id +
 	// revision); strip all of that plus the partitioning byte to synthesise a
 	// legacy v3 body, and one more for v2.
-	trailer := len(got.Indexes)*17 + 1 + len(got.Columns)*3 // v10 adds one zero flag, v11 a zero ENUM-label-count u16, per unencrypted/non-ENUM column
+	trailer := len(got.Indexes)*17 + 1 + len(got.Columns)*4 // v10 one zero flag, v11 a zero ENUM-label-count u16, v12 a zero collection-descriptor flag, per unencrypted/non-ENUM/non-collection column
 	v3 := append([]byte(nil), raw[:len(raw)-trailer]...)
 	v3[4], v3[5] = byte(tableVersionV3), 0
 	legacyV3, err := DecodeTable(v3)
@@ -219,10 +219,10 @@ func TestTableEncodeFulltextAnalyzerV9(t *testing.T) {
 		}
 	}
 	// v8 ended after the IVF-PQ subspace counts; strip the 3-byte analyzer
-	// trailer per index, the v10 one-byte-per-column flag, and the v11
-	// two-byte-per-column ENUM label count, and the descriptor still decodes
-	// as simple.
-	v8 := append([]byte(nil), raw[:len(raw)-3-len(tab.Columns)*3]...)
+	// trailer per index, the v10 one-byte-per-column flag, the v11
+	// two-byte-per-column ENUM label count, and the v12 one-byte-per-column
+	// collection-descriptor flag, and the descriptor still decodes as simple.
+	v8 := append([]byte(nil), raw[:len(raw)-3-len(tab.Columns)*4]...)
 	v8[4], v8[5] = byte(tableVersionV8), 0
 	legacy, err := DecodeTable(v8)
 	if err != nil {
@@ -232,7 +232,7 @@ func TestTableEncodeFulltextAnalyzerV9(t *testing.T) {
 		t.Fatalf("v8 analyzer %+v", legacy.Indexes[0])
 	}
 	bad := append([]byte(nil), raw...)
-	bad[len(bad)-len(tab.Columns)*3-3] = 99
+	bad[len(bad)-len(tab.Columns)*4-3] = 99
 	if _, err := DecodeTable(bad); err == nil {
 		t.Fatal("expected unknown analyzer")
 	}

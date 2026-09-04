@@ -31,6 +31,7 @@ const {
   FileFieldKeyring,
   decryptField,
   encryptField,
+  struct,
 } = require('./nextsql');
 
 function fieldKey(id, fill) {
@@ -479,4 +480,31 @@ test('NodeStatus round-trips the server encoding', () => {
 
 test('connectCluster requires an address', async () => {
   await assert.rejects(() => connectCluster({ user: 'app', tls: {} }), NextSQLError);
+});
+
+test('collections: ARRAY / MAP / STRUCT param round-trip (D9)', () => {
+  const arr = decodeValue(encodeParam(['a', 'b', 'c']), 0);
+  assert.equal(arr.kind, Kind.Array);
+  assert.deepEqual(arr.value, ['a', 'b', 'c']);
+  assert.deepEqual(decodeValue(encodeParam(['a', null, 'c']), 0).value, ['a', null, 'c']);
+  const m = decodeValue(encodeParam(new Map([['x', 'hi']])), 0);
+  assert.equal(m.kind, Kind.Map);
+  assert.equal(m.value.get('x'), 'hi');
+  const s = decodeValue(encodeParam(struct([['street', 'Main'], ['zip', '90210']])), 0);
+  assert.equal(s.kind, Kind.Struct);
+  assert.equal(s.value.street, 'Main');
+  const nested = decodeValue(encodeParam(struct([['n', 'bob'], ['t', ['x', 'y']]])), 0);
+  assert.deepEqual(nested.value.t, ['x', 'y']);
+});
+
+test('spatial: EWKB decode / encode round-trip (Spatial track S4)', () => {
+  const u32le = (n) => { const b = Buffer.alloc(4); b.writeUInt32LE(n, 0); return b; };
+  const f64le = (n) => { const b = Buffer.alloc(8); b.writeDoubleLE(n, 0); return b; };
+  const ewkb = Buffer.concat([Buffer.from([1]), u32le(1 | 0x20000000), u32le(4326), f64le(1.5), f64le(2.5)]);
+  const wire = Buffer.concat([Buffer.from([Kind.Geometry, 0, 0, 0, 0, 0, 0]), u32le(ewkb.length), ewkb]);
+  const got = decodeValue(wire, 0);
+  assert.equal(got.next, wire.length);
+  assert.deepEqual(got.value, { type: 'Point', srid: 4326, coordinates: [1.5, 2.5] });
+  const enc = encodeParam({ kind: 'geometry', wkt: 'POINT(1 2)', srid: 4326 });
+  assert.equal(decodeValue(enc, 0).value, 'SRID=4326;POINT(1 2)');
 });

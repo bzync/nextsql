@@ -33,8 +33,22 @@ type Result struct {
 	RestoreTest bool
 }
 
+// LiveEngine is the subset of *storage.Engine that CreateFromEngine needs —
+// a checkpoint plus the four snapshot coordinates. Declared as an interface
+// so internal/backup keeps its existing dependency shape (it does not import
+// the engine except through storage.Open).
+type LiveEngine interface {
+	Identity() format.Identity
+	Checkpoint() error
+	CheckpointLSN() format.LSN
+	RedoLSN() format.LSN
+	DurableLSN() format.LSN
+}
+
 // Create writes an encrypted backup of dataDir to dest. dest is published
-// only after integrity checks (and a restore test) succeed.
+// only after integrity checks (and a restore test) succeed. It opens the
+// data file itself, so it must not be called against a data directory a
+// live server is writing to — use CreateFromEngine for that.
 func Create(dataDir, dest string, keys crypto.KeyProvider, opt Options) (*Result, error) {
 	if dataDir == "" || dest == "" {
 		return nil, nerr.New(nerr.InvalidArgument, "backup.Create", "data directory and destination are required")
@@ -68,6 +82,46 @@ func Create(dataDir, dest string, keys crypto.KeyProvider, opt Options) (*Result
 	if err := eng.Close(); err != nil {
 		return nil, err
 	}
+	return writeBackup(dataDir, dest, keys, ident, cp, redo, durable, opt)
+}
+
+// CreateFromEngine writes a backup using a server's already-open live engine
+// instead of opening the data file a second time — the safe path for a
+// running nextsqld. It checkpoints the live engine, reads its snapshot
+// coordinates, then copies the on-disk file set while the server keeps
+// writing; the copy is a fuzzy snapshot that restore reconciles by
+// replaying WAL from RedoLSN (the standard hot-backup model), and the
+// restore-test at the end still gates publication. No second storage.Open
+// and no second recovery pass, so there is no risk of one recovery
+// truncating a WAL tail the other is mid-write on.
+func CreateFromEngine(eng LiveEngine, dataDir, dest string, keys crypto.KeyProvider, opt Options) (*Result, error) {
+	if eng == nil {
+		return nil, nerr.New(nerr.InvalidArgument, "backup.CreateFromEngine", "nil engine")
+	}
+	if dataDir == "" || dest == "" {
+		return nil, nerr.New(nerr.InvalidArgument, "backup.CreateFromEngine", "data directory and destination are required")
+	}
+	if keys == nil {
+		return nil, nerr.New(nerr.InvalidArgument, "backup.CreateFromEngine", "nil key provider")
+	}
+	if _, err := os.Stat(dest); err == nil {
+		return nil, nerr.New(nerr.AlreadyExists, "backup.CreateFromEngine", "backup destination exists")
+	}
+	if _, err := os.Stat(filepath.Join(dataDir, config.DataFileName)); err != nil {
+		return nil, nerr.Wrap(nerr.NotFound, "backup.CreateFromEngine", "data file", err)
+	}
+	ident := eng.Identity()
+	if err := eng.Checkpoint(); err != nil {
+		return nil, err
+	}
+	return writeBackup(dataDir, dest, keys, ident, eng.CheckpointLSN(), eng.RedoLSN(), eng.DurableLSN(), opt)
+}
+
+// writeBackup is the shared body of Create and CreateFromEngine: given the
+// snapshot coordinates, it copies + seals the member files, writes the
+// manifest and header, restore-tests, and atomically publishes dest.
+func writeBackup(dataDir, dest string, keys crypto.KeyProvider, ident format.Identity, cp, redo, durable format.LSN, opt Options) (*Result, error) {
+	dbPath := filepath.Join(dataDir, config.DataFileName)
 
 	dek, wrap, err := newBackupDEK(keys)
 	if err != nil {

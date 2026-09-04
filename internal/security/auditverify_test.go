@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 )
 
@@ -56,6 +57,86 @@ func TestAuditChainResumesAcrossReopen(t *testing.T) {
 	}
 	if !report.Verified || report.Chained != 3 {
 		t.Fatalf("chain did not resume across reopen: %+v", report)
+	}
+}
+
+// TestTailEvents covers the system.audit_log/system.audit_verify read-model
+// source (Manager Security view, the last M4 piece): the ring buffer keeps
+// only the last maxEvents records in oldest-first order regardless of how
+// many lines the file actually has, maxEvents<=0 retains nothing, and a
+// tampered record still comes back in the tail (an operator investigating a
+// detected problem needs to see the suspect entry, not have it hidden) even
+// though VerifyReport correctly reports the chain broken.
+func TestTailEvents(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "audit.log")
+	l, err := OpenAudit(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 7; i++ {
+		l.Record(Event{Actor: "app", Action: ActionAuthSuccess, Object: strconv.Itoa(i), Outcome: "success"})
+	}
+	if err := l.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// maxEvents <= 0 retains nothing.
+	tr, err := TailEvents(path, 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tr.Events != nil {
+		t.Fatalf("maxEvents=0 must retain no events, got %d", len(tr.Events))
+	}
+	if !tr.Verified || tr.Chained != 7 {
+		t.Fatalf("report wrong with maxEvents=0: %+v", tr.VerifyReport)
+	}
+
+	// A cap smaller than the record count keeps only the newest, oldest-first.
+	tr, err = TailEvents(path, 3, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tr.Events) != 3 {
+		t.Fatalf("want 3 tailed events, got %d", len(tr.Events))
+	}
+	for i, want := range []string{"4", "5", "6"} {
+		if tr.Events[i].Object != want {
+			t.Fatalf("tail[%d].Object = %q, want %q (events = %+v)", i, tr.Events[i].Object, want, tr.Events)
+		}
+	}
+
+	// A cap larger than the record count returns everything, still oldest-first.
+	tr, err = TailEvents(path, 100, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tr.Events) != 7 || tr.Events[0].Object != "0" || tr.Events[6].Object != "6" {
+		t.Fatalf("uncapped tail wrong: %+v", tr.Events)
+	}
+
+	// A tampered record still appears in the tail; the report flags it.
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := bytes.Split(bytes.TrimRight(raw, "\n"), []byte("\n"))
+	lines[5] = bytes.Replace(lines[5], []byte(`"5"`), []byte(`"tampered"`), 1)
+	if err := os.WriteFile(path, bytes.Join(lines, []byte("\n")), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	tr, err = TailEvents(path, 3, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tr.Verified {
+		t.Fatal("tampered file must not report Verified")
+	}
+	if tr.FirstBadLine != 6 {
+		t.Fatalf("FirstBadLine = %d, want 6", tr.FirstBadLine)
+	}
+	if len(tr.Events) != 3 || tr.Events[1].Object != "tampered" {
+		t.Fatalf("tampered record must still be visible in the tail: %+v", tr.Events)
 	}
 }
 

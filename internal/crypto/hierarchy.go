@@ -371,6 +371,73 @@ func (e *Envelope) RotateDomain(domain byte) (format.KeyVersion, error) {
 	return next, nil
 }
 
+// KeyStatus is a redacted snapshot of one key's rotation state — current
+// version and how many versions are retained/revoked/retired. It never
+// contains key material (there is nothing in this struct to redact; the
+// bytes simply aren't here), same convention as security.TLSStatus.
+type KeyStatus struct {
+	Domain         string
+	CurrentVersion format.KeyVersion
+	// VersionCount is how many versions still have live key material in
+	// this key's ring (len(ring.keys) — the current version plus any older
+	// one not yet Revoked). Revoke deletes a version's DEK from the ring
+	// immediately (dropping VersionCount right away) but leaves a flag
+	// entry behind — counted in RevokedCount — until a later Retire drops
+	// that too. Always 1 for "kek"/"master": RotateKEK/RotateMaster discard
+	// the prior key immediately rather than retaining a ring of versions.
+	VersionCount int
+	// RevokedCount and RetiredCount both come from the ring's flags map
+	// (not its keys map), so a version keeps counting in RevokedCount after
+	// Revoke even though its key material and VersionCount slot are
+	// already gone — until Retire removes the flag entry entirely.
+	// RetiredCount is always 0 today: Retire's current implementation
+	// deletes a version's flags entry outright rather than ever setting
+	// flagRetired first, so there is no code path that produces a nonzero
+	// value yet. Reported anyway (not omitted) so this table's shape
+	// doesn't need to change if that ever does.
+	RevokedCount int
+	RetiredCount int
+}
+
+// KeyStatus returns a redacted snapshot of every key this envelope manages:
+// the KEK and master first (single current version each — see VersionCount's
+// doc comment), then each data domain in AllDomains order with its full
+// retained/revoked/retired counts. Requires the envelope to be unlocked
+// (same precondition every other Envelope method has).
+func (e *Envelope) KeyStatus() ([]KeyStatus, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if err := e.requireUnlockedLocked(); err != nil {
+		return nil, err
+	}
+	out := make([]KeyStatus, 0, 2+len(AllDomains))
+	out = append(out,
+		KeyStatus{Domain: "kek", CurrentVersion: e.kek.Version, VersionCount: 1},
+		KeyStatus{Domain: "master", CurrentVersion: e.master.Version, VersionCount: 1},
+	)
+	for _, d := range AllDomains {
+		ring, ok := e.rings[d]
+		if !ok {
+			continue
+		}
+		st := KeyStatus{
+			Domain:         DomainName(d),
+			CurrentVersion: ring.current,
+			VersionCount:   len(ring.keys),
+		}
+		for _, fl := range ring.flags {
+			if fl&flagRevoked != 0 {
+				st.RevokedCount++
+			}
+			if fl&flagRetired != 0 {
+				st.RetiredCount++
+			}
+		}
+		out = append(out, st)
+	}
+	return out, nil
+}
+
 // RotateKEK generates a new KEK and re-wraps the master. Domain DEKs are unchanged.
 func (e *Envelope) RotateKEK() error {
 	e.mu.Lock()

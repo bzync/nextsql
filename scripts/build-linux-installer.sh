@@ -3,7 +3,7 @@
 #
 # Usage:
 #   scripts/build-linux-installer.sh
-#   scripts/build-linux-installer.sh --arch amd64,arm64 --out dist
+#   scripts/build-linux-installer.sh --arch amd64,arm64 --out installers
 set -euo pipefail
 
 ROOT="$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)"
@@ -16,7 +16,7 @@ need_cmd gzip
 need_cmd sha256sum
 
 ARCHES=""
-DIST="$ROOT/dist"
+DIST="$ROOT/installers"
 SKIP_DEB=0
 SKIP_TARBALL=0
 SKIP_RUN=0
@@ -29,7 +29,7 @@ Usage: $(basename "$0") [options]
 
   --arch LIST     Go arches (comma-separated, or 'all' for amd64,arm64).
                   Default: host GOARCH ($(go env GOARCH)).
-  --out DIR       Output directory (default: dist/).
+  --out DIR       Output directory (default: installers/).
   --skip-deb      Do not build .deb packages.
   --skip-tarball  Do not build .tar.gz archives.
   --skip-run      Do not build self-extracting .run installers.

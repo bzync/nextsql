@@ -350,6 +350,85 @@ type testPipeAddr string
 func (a testPipeAddr) Network() string { return "test" }
 func (a testPipeAddr) String() string  { return string(a) }
 
+// TestServerTLSReloaderStatus covers the system.tls read-model source
+// (Manager Security view, M4 remainder): a nil reloader reports "not
+// attached" rather than panicking; a loaded reloader reports the redacted
+// leaf identity/validity plus the mTLS/CRL posture, with no key material
+// and no network address anywhere in the returned struct; a rotation
+// (Reload) is reflected in the very next Status call, matching the
+// "atomic snapshot" contract the handshake path already relies on.
+func TestServerTLSReloaderStatus(t *testing.T) {
+	var nilReloader *ServerTLSReloader
+	if _, ok := nilReloader.Status(); ok {
+		t.Fatal("nil reloader reported attached")
+	}
+
+	dir := t.TempDir()
+	ca, caKey, caPEM := makeTestCA(t)
+	serverCert1, serverKey1 := makeTestLeaf(t, ca, caKey, true, "")
+	certPath := writeTestPEM(t, dir, "server.crt", serverCert1, 0o644)
+	keyPath := writeTestPEM(t, dir, "server.key", serverKey1, 0o600)
+
+	reloader, err := NewServerTLSReloader(certPath, keyPath, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, ok := reloader.Status()
+	if !ok || !st.Enabled {
+		t.Fatalf("plain TLS reloader not reported enabled: %+v ok=%v", st, ok)
+	}
+	if st.Subject != "CN=localhost" || st.Issuer != "CN=NextSQL test CA" {
+		t.Fatalf("unexpected subject/issuer: %+v", st)
+	}
+	if st.NotBefore.IsZero() || st.NotAfter.IsZero() || !st.NotBefore.Before(st.NotAfter) {
+		t.Fatalf("unexpected validity window: %+v", st)
+	}
+	if len(st.DNSNames) != 1 || st.DNSNames[0] != "localhost" {
+		t.Fatalf("unexpected DNS names: %+v", st.DNSNames)
+	}
+	if st.MTLSRequired || st.ClientCAConfigured || st.ClientCRLConfigured {
+		t.Fatalf("plain TLS reloader reported mTLS/CRL posture: %+v", st)
+	}
+
+	// mTLS + CRL: both flags flip, and neither the client CA nor the CRL
+	// file path/contents leak into the struct.
+	caPath := writeTestPEM(t, dir, "client-ca.pem", caPEM, 0o600)
+	crlPath := writeTestPEM(t, dir, "client.crl", makeTestCRL(t, ca, caKey, nil, time.Now().Add(time.Hour)), 0o644)
+	mtlsReloader, err := NewServerTLSReloader(certPath, keyPath, caPath, crlPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, ok = mtlsReloader.Status()
+	if !ok || !st.MTLSRequired || !st.ClientCAConfigured || !st.ClientCRLConfigured {
+		t.Fatalf("mTLS/CRL posture not reflected: %+v ok=%v", st, ok)
+	}
+
+	// Rotation: a new leaf's Status is visible on the very next call.
+	// makeTestLeaf's validity window has only second resolution (X.509
+	// UTCTime), so cross a second boundary first or NotBefore/NotAfter for
+	// the two leaves could collide and the assertion below would be
+	// meaningless rather than merely flaky.
+	time.Sleep(1100 * time.Millisecond)
+	serverCert2, serverKey2 := makeTestLeaf(t, ca, caKey, true, "")
+	if err := os.WriteFile(certPath, serverCert2, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(keyPath, serverKey2, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	before, _ := reloader.Status()
+	if err := reloader.Reload(); err != nil {
+		t.Fatal(err)
+	}
+	after, ok := reloader.Status()
+	if !ok || !after.Enabled {
+		t.Fatalf("status not reported after reload: %+v ok=%v", after, ok)
+	}
+	if after.NotBefore.Equal(before.NotBefore) && after.NotAfter.Equal(before.NotAfter) {
+		t.Fatal("Status did not reflect the rotated leaf — looks cached from before Reload")
+	}
+}
+
 func makeTestCA(t *testing.T) (*x509.Certificate, *ecdsa.PrivateKey, []byte) {
 	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)

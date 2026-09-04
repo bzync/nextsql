@@ -1,6 +1,8 @@
 # Geospatial and location
 
-First-class WGS84 locations in the same ACID, encrypted, WAL-backed engine as the rest of NextSQL. This is not PostGIS and not a GIS sidecar.
+First-class WGS84 locations in the same ACID, encrypted, WAL-backed engine as the rest of NextSQL.
+
+These four fixed shapes are the fast path for a plain WGS84 point/box/line/polygon column and are unaffected by the general `GEOMETRY` / `GEOGRAPHY` family (`docs/design-spatial.md`) — that family sits *alongside* these types, not as a generalization of them; the two coerce into one another (e.g. a `POINT` value flows into a `GEOGRAPHY(Point, 4326)` column, and back). Reach for `GEOMETRY`/`GEOGRAPHY` for `Multi*`/`GeometryCollection` geometry, an explicit SRID, or planar (as opposed to geodetic) math; reach for the types below when a WGS84 point/box/line/polygon is all you need.
 
 ## Types
 

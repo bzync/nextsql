@@ -358,6 +358,36 @@ func validateIdempotentResultType(typ types.Type) error {
 		if len(typ.EnumLabels) < 1 || len(typ.EnumLabels) > types.MaxEnumLabels {
 			return nerr.New(nerr.InvalidFormat, "executor.decodeIdempotentResult", "invalid enum result type")
 		}
+	case types.KindArray:
+		if len(typ.Elem) != 1 {
+			return nerr.New(nerr.InvalidFormat, "executor.decodeIdempotentResult", "invalid array result type")
+		}
+		if err := validateIdempotentResultType(typ.Elem[0]); err != nil {
+			return err
+		}
+	case types.KindMap:
+		if len(typ.Key) != 1 || len(typ.Elem) != 1 {
+			return nerr.New(nerr.InvalidFormat, "executor.decodeIdempotentResult", "invalid map result type")
+		}
+		if err := validateIdempotentResultType(typ.Key[0]); err != nil {
+			return err
+		}
+		if err := validateIdempotentResultType(typ.Elem[0]); err != nil {
+			return err
+		}
+	case types.KindStruct:
+		if len(typ.Fields) == 0 {
+			return nerr.New(nerr.InvalidFormat, "executor.decodeIdempotentResult", "invalid struct result type")
+		}
+		for _, f := range typ.Fields {
+			if err := validateIdempotentResultType(f.Type); err != nil {
+				return err
+			}
+		}
+	case types.KindGeometry, types.KindGeography:
+		if typ.Scale > uint16(types.GeomSubGeometryCollection) {
+			return nerr.New(nerr.InvalidFormat, "executor.decodeIdempotentResult", "invalid geometry result type")
+		}
 	case types.KindUUID, types.KindString, types.KindText, types.KindBlob, types.KindTimestampTZ, types.KindJSON, types.KindBool, types.KindNull, types.KindPoint, types.KindBox, types.KindLine, types.KindPolygon,
 		types.KindInt8, types.KindInt16, types.KindInt32, types.KindInt64,
 		types.KindUint8, types.KindUint16, types.KindUint32, types.KindUint64,

@@ -620,10 +620,61 @@ func checkExpr(e ast.Expr, tab *catalog.Table, hint types.Type, allowNil bool) e
 		if !ok {
 			return nerr.New(nerr.NotFound, "sql.binder", "unknown column")
 		}
-		if tab.Columns[i].Type.Kind != types.KindJSON {
-			return nerr.New(nerr.InvalidArgument, "sql.binder", "path extract requires a JSON column")
+		switch tab.Columns[i].Type.Kind {
+		case types.KindJSON:
+			return nil
+		case types.KindStruct:
+			// col.field.field ... — every trailing part must resolve to a
+			// STRUCT field name, descending into nested STRUCTs.
+			ct := tab.Columns[i].Type
+			for _, part := range x.Parts[1:] {
+				fi := ct.StructFieldIndex(part)
+				if fi < 0 {
+					return nerr.New(nerr.NotFound, "sql.binder", "unknown STRUCT field "+part)
+				}
+				ct = ct.Fields[fi].Type
+			}
+			return nil
+		default:
+			return nerr.New(nerr.InvalidArgument, "sql.binder", "path extract requires a JSON or STRUCT column")
+		}
+	case ast.ArrayCtor:
+		for _, el := range x.Elems {
+			if err := checkExpr(el, tab, types.Type{}, false); err != nil {
+				return err
+			}
 		}
 		return nil
+	case ast.StructCtor:
+		if len(x.Names) == 0 || len(x.Names) != len(x.Elems) {
+			return nerr.New(nerr.InvalidArgument, "sql.binder", "malformed STRUCT constructor")
+		}
+		seen := map[string]struct{}{}
+		for i, nm := range x.Names {
+			if _, dup := seen[nm]; dup {
+				return nerr.New(nerr.InvalidArgument, "sql.binder", "duplicate STRUCT field name "+nm)
+			}
+			seen[nm] = struct{}{}
+			if err := checkExpr(x.Elems[i], tab, types.Type{}, false); err != nil {
+				return err
+			}
+		}
+		return nil
+	case ast.MapCtor:
+		if len(x.Keys) != len(x.Vals) {
+			return nerr.New(nerr.InvalidArgument, "sql.binder", "malformed MAP constructor")
+		}
+		for i := range x.Keys {
+			if err := checkExpr(x.Keys[i], tab, types.Type{}, false); err != nil {
+				return err
+			}
+			if err := checkExpr(x.Vals[i], tab, types.Type{}, false); err != nil {
+				return err
+			}
+		}
+		return nil
+	case ast.FieldAccess:
+		return checkExpr(x.Base, tab, types.Type{}, false)
 	case ast.Call:
 		switch x.Name {
 		case "uuid", "now", "ai":
@@ -733,6 +784,14 @@ func checkExpr(e ast.Expr, tab *catalog.Table, hint types.Type, allowNil bool) e
 			if len(x.Args) != 1 {
 				return nerr.New(nerr.InvalidArgument, "sql.binder", x.Name+" takes one argument")
 			}
+		case "cardinality", "array_length", "map_size", "map_keys", "map_values":
+			if x.Star || len(x.Args) != 1 {
+				return nerr.New(nerr.InvalidArgument, "sql.binder", x.Name+" takes one argument")
+			}
+		case "element_at", "array_contains", "map_contains_key":
+			if x.Star || len(x.Args) != 2 {
+				return nerr.New(nerr.InvalidArgument, "sql.binder", x.Name+" takes two arguments")
+			}
 		default:
 			if types.IsGeoFunc(x.Name) {
 				for _, a := range x.Args {
@@ -741,6 +800,14 @@ func checkExpr(e ast.Expr, tab *catalog.Table, hint types.Type, allowNil bool) e
 					}
 				}
 				return checkGeoCall(x)
+			}
+			if types.IsSpatialFunc(x.Name) {
+				for _, a := range x.Args {
+					if err := checkExpr(a, tab, types.Type{}, false); err != nil {
+						return err
+					}
+				}
+				return nil
 			}
 			return nerr.New(nerr.InvalidArgument, "sql.binder", "unknown function")
 		}

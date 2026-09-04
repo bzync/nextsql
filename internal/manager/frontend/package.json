@@ -1,0 +1,23 @@
+{
+  "name": "nextsql-manager-frontend",
+  "version": "0.0.0",
+  "private": true,
+  "description": "NextSQL Manager web UI. Source for the bundle embedded into cmd/nextsql-manager via internal/manager/web/.",
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@bzync/rui": "0.0.9",
+    "framer-motion": "13.2.0",
+    "react": "19.2.8",
+    "react-dom": "19.2.8"
+  },
+  "devDependencies": {
+    "@types/react": "19.1.8",
+    "@types/react-dom": "19.1.6",
+    "esbuild": "0.25.10",
+    "typescript": "5.9.3"
+  }
+}

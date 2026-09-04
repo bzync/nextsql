@@ -189,8 +189,11 @@ func bindCreateIndex(s ast.CreateIndex, lookup Lookup) (Bound, error) {
 		if tab.Columns[col].ClientEncrypted() {
 			return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "indexes cannot use an ENCRYPTED CLIENT column")
 		}
-		if s.Spatial && tab.Columns[col].Type.Kind != types.KindPoint {
-			return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "SPATIAL INDEX requires a POINT column")
+		if s.Spatial {
+			k := tab.Columns[col].Type.Kind
+			if k != types.KindPoint && !types.IsGeneralSpatial(k) {
+				return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "SPATIAL INDEX requires a POINT, GEOMETRY, or GEOGRAPHY column")
+			}
 		}
 		if s.Fulltext {
 			k := tab.Columns[col].Type.Kind

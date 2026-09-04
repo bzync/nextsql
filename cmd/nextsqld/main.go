@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -194,7 +195,7 @@ func run() error {
 	}
 	defer dataDirLock.Close()
 
-	log := logging.New(cfg.LogLevel, os.Stderr)
+	log, logRing := logging.NewWithRing(cfg.LogLevel, os.Stderr)
 	dbPath := filepath.Join(cfg.DataDir, config.DataFileName)
 	ksPath := crypto.KeystorePath(dbPath)
 	// bufBudget (M2-3b-2) is shared across every database this process opens
@@ -428,6 +429,108 @@ func run() error {
 			}
 			srv.Drain(timeout)
 		})
+		// env is nil for an embedded/CLI bare crypto.KeyProvider (no
+		// persistent .keys keystore) — system.key_versions then correctly
+		// reports "not attached" (see DB.KeyStatus's doc comment) rather
+		// than this being wired to something that would always error.
+		if env != nil {
+			db.SetKeyStatusSource(func() ([]crypto.KeyStatus, bool) {
+				st, err := env.KeyStatus()
+				return st, err == nil
+			})
+		}
+		// cfg is fully settled by this point (every cfg.Field = ... mutation
+		// above happens during flag/dotenv parsing, well before here), so
+		// this closure can safely capture it directly rather than a
+		// snapshot copy. system.config compares the running cfg against a
+		// fresh read of the on-disk nextsql.conf (config.DiffState) so
+		// file_value / restart_required reflect a persisted-but-not-applied
+		// SET CONFIG write, or a startup flag that overrode the file. When
+		// there is no config file, running and file are the same.
+		configFilePath := strings.TrimSpace(*cfgPath)
+		db.SetConfigSource(func() ([]config.EntryState, bool) {
+			fileCfg := cfg
+			if configFilePath != "" {
+				if loaded, err := config.Load(configFilePath); err == nil {
+					fileCfg = loaded
+				}
+			}
+			return config.DiffState(cfg, fileCfg), true
+		})
+		// SET CONFIG persists one setting to the on-disk nextsql.conf. Only
+		// wired when the server was started from a config file — otherwise
+		// there is nothing to persist to and SET CONFIG fails Unavailable.
+		// The write targets the file's own config (not the running cfg), so
+		// a startup flag override is never baked into the file as a side
+		// effect. Persist-only: nothing is hot-reloaded, so restart_required
+		// is true whenever the new file value differs from the running one.
+		if configFilePath != "" {
+			db.SetConfigWriter(func(key, value string, reset bool) (executor.ConfigWriteResult, error) {
+				fileCfg, err := config.Load(configFilePath)
+				if err != nil {
+					return executor.ConfigWriteResult{}, err
+				}
+				next, err := fileCfg.WithSetting(key, value, reset)
+				if err != nil {
+					return executor.ConfigWriteResult{}, err
+				}
+				if err := config.WriteFile(configFilePath, next, "SET CONFIG"); err != nil {
+					return executor.ConfigWriteResult{}, err
+				}
+				fileVal := next.Setting(key)
+				runVal := cfg.Setting(key)
+				return executor.ConfigWriteResult{
+					Key:             key,
+					FileValue:       fileVal,
+					RunningValue:    runVal,
+					RestartRequired: fileVal != runVal,
+				}, nil
+			})
+		}
+		// audit and auditSigningKeys (nil if signing isn't configured —
+		// security.TailEvents tolerates a nil verifiers keyset exactly like
+		// VerifyFile already does) are both settled above, before this
+		// point. Re-reads the file from disk on every query by design —
+		// system.audit_log/audit_verify reflect what is actually durable
+		// right now, not a startup snapshot.
+		db.SetAuditSource(func(maxEvents int) (security.TailReport, bool) {
+			tr, err := security.TailEvents(audit.Path(), maxEvents, auditSigningKeys)
+			if err != nil {
+				// A read/open failure (e.g. the file was removed out from
+				// under a running server) is real operational information,
+				// not "no audit log configured" — surface it through the
+				// same report.Problem field a chain-integrity finding would
+				// use, rather than silently degrading to "not attached".
+				return security.TailReport{VerifyReport: security.VerifyReport{Problem: err.Error()}}, true
+			}
+			return tr, true
+		})
+		// Route this DB's own query/txn/rows/fk/maintenance/cdc counters into
+		// the process-wide registry (metrics.Default()), the same one the
+		// crypto/storage/replication hooks already write to and the one
+		// system.metrics reads — so a single Snapshot is internally coherent
+		// (QPS/TPS/EncryptPct all computed against one born time). Safe here:
+		// no connection has been accepted yet, so db.metrics (a fresh
+		// metrics.New() from executor.Open) has recorded nothing to lose.
+		// Same legacy/non-hosted db scope as the sources above — under M2
+		// multi-database hosting a dbMgr-opened database keeps its own
+		// registry and system.metrics reports "not attached" for it, the
+		// identical wiring-scope caveat system.tls/config/key_versions carry.
+		db.SetMetrics(metrics.Default())
+		db.SetMetricsSource(func() *metrics.Registry { return metrics.Default() })
+		// backup_dir (M5) — where BACKUP DATABASE writes and system.backups /
+		// VERIFY BACKUP read from. Wired only when configured; the closures
+		// wrap internal/backup against this node's own data dir + live
+		// engine (kept out of the executor package to avoid an import
+		// cycle). Same legacy/non-hosted db scope as above.
+		if bd := strings.TrimSpace(cfg.BackupDir); bd != "" {
+			wireBackupOps(db, bd)
+		}
+		// system.server_log reads a bounded tail of the same in-memory ring
+		// every log line already flows through (logRing wraps the stderr JSON
+		// handler). Re-read per query so the tail is always current. Same
+		// legacy/non-hosted db scope as the sources above.
+		db.SetServerLogSource(logRing.Snapshot)
 	}
 	if cfg.LockTimeoutMS > 0 && db != nil {
 		db.SetLockWaitTimeout(time.Duration(cfg.LockTimeoutMS) * time.Millisecond)
@@ -715,6 +818,9 @@ func run() error {
 		}
 		srv.TLS = tlsReloader.Config()
 		srv.RequireServiceIdentity = tlsReloader.MTLS()
+		if db != nil {
+			db.SetTLSStatusSource(tlsReloader.Status)
+		}
 	} else if security.RequireTLS(cfg.ListenAddr) {
 		return nerr.New(nerr.InvalidArgument, "nextsqld", "TLS 1.3 is required for non-loopback listen addresses")
 	}

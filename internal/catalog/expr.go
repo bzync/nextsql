@@ -581,6 +581,31 @@ func ExprVolatile(e ast.Expr) bool {
 		}
 	case ast.Window, ast.ScalarSubquery, ast.InSubquery, ast.ExistsSubquery, ast.Param:
 		return true
+	case ast.ArrayCtor:
+		for _, e := range x.Elems {
+			if ExprVolatile(e) {
+				return true
+			}
+		}
+	case ast.StructCtor:
+		for _, e := range x.Elems {
+			if ExprVolatile(e) {
+				return true
+			}
+		}
+	case ast.MapCtor:
+		for _, e := range x.Keys {
+			if ExprVolatile(e) {
+				return true
+			}
+		}
+		for _, e := range x.Vals {
+			if ExprVolatile(e) {
+				return true
+			}
+		}
+	case ast.FieldAccess:
+		return ExprVolatile(x.Base)
 	}
 	return false
 }
@@ -615,6 +640,31 @@ func ExprHasSubquery(e ast.Expr) bool {
 				return true
 			}
 		}
+	case ast.ArrayCtor:
+		for _, e := range x.Elems {
+			if ExprHasSubquery(e) {
+				return true
+			}
+		}
+	case ast.StructCtor:
+		for _, e := range x.Elems {
+			if ExprHasSubquery(e) {
+				return true
+			}
+		}
+	case ast.MapCtor:
+		for _, e := range x.Keys {
+			if ExprHasSubquery(e) {
+				return true
+			}
+		}
+		for _, e := range x.Vals {
+			if ExprHasSubquery(e) {
+				return true
+			}
+		}
+	case ast.FieldAccess:
+		return ExprHasSubquery(x.Base)
 	}
 	return false
 }

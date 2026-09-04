@@ -39,6 +39,7 @@ go build ./...
 go build -o nextsql ./cmd/nextsql
 go build -o nextsqld ./cmd/nextsqld
 go build -o nextsql-bench ./cmd/nextsql-bench
+go build -o nextsql-manager ./cmd/nextsql-manager
 ```
 
 No Makefile — plain `go` tooling throughout. `go vet ./...` should stay clean.
@@ -159,10 +160,13 @@ cmd/nextsql                CLI (init, exec, migrate, backup, restore, verify, ex
                             import, diagnose, status, cluster, hosting, audit, token, version)
 cmd/nextsql-bench          official benchmark tool
 cmd/nextsql-auth-broker    OIDC external-IdP broker (P25)
+cmd/nextsql-manager        NextSQL Manager: loopback web UI + JSON API, a pure
+                            nextsqld protocol client (P28, MVP in progress)
 internal/                  engine: storage, wal, recovery, txn, undo, sql (lexer/parser/
                             binder), executor, catalog, crypto, security, auth, protocol,
                             replication, hosting, dbmanager, vector, fulltext, json, cdc,
-                            scheduler, cron, backup, xport, migrate, config, metrics, ...
+                            scheduler, cron, backup, xport, migrate, config, metrics,
+                            setup (installer lifecycle), manager (Manager backend), ...
 drivers/                   official native-protocol drivers: go, node, bun, deno, php,
                             python, ruby, plus shared TS types in drivers/js
 tests/                     integration, crash, ha (cross-package suites; unit tests live
@@ -176,7 +180,8 @@ Key `docs/*.md`: `sql.md` (dialect/catalog), `optimizer.md`, `execution.md`, `js
 `fulltext.md`, `vector.md`, `geo.md`, `storage-format.md`, `btree.md`, `wal.md`,
 `mvcc.md`, `protocol.md`, `security.md`, `backup.md`, `export.md`, `ops.md` (metrics/
 admission/SLOs), `ha.md`, `system-catalog.md`, `partitioning.md`, `cdc.md`, `workflows.md`
-(WORKFLOW/TRIGGER/SCHEDULE/TASK), `client-encryption.md`, `standards.md`.
+(WORKFLOW/TRIGGER/SCHEDULE/TASK), `client-encryption.md`, `standards.md`, `install.md`
+(P28 installer/automation surface — `nextsql setup`, resource presets).
 
 ## Engineering contract (from `AGENTS.md` / `SKILLS.md`)
 

@@ -86,8 +86,16 @@ module NextSQL
     KIND_FLOAT64 = 29
     KIND_ENUM = 30
     KIND_INTERVAL = 31
+    KIND_STRUCT = 32
+    KIND_ARRAY = 33
+    KIND_MAP = 34
+    KIND_GEOMETRY = 35
+    KIND_GEOGRAPHY = 36
+    MAX_NEST_DEPTH = 8
+    MAX_STRUCT_FIELDS = 128
+    MAX_COLLECTION_LEN = 1 << 20
 
-    Column = Struct.new(:name, :kind, :labels)
+    Column = Struct.new(:name, :kind, :labels, :coll_type)
     NodeStatus = Struct.new(:role, :has_leader, :healthy, :applied_lsn, :last_contact_ms, :apply_backlog)
 
     # Dense (values), reference (ref=true, dim only), or sparse
@@ -158,6 +166,40 @@ module NextSQL
     # INTERVAL param for INSERT/UPDATE column assignment (server-side
     # Coerce) but not inside an arithmetic expression like `dur + $1`,
     # which requires the actual wire Kind.
+    # StructValue / MapValue (Collections track, docs/design-collections.md):
+    # explicit STRUCT / MAP parameter wrappers. StructValue.fields is an
+    # ordered Array of [name, value]; MapValue.entries is a Hash or an Array
+    # of [key, value].
+    StructValue = Struct.new(:fields, keyword_init: true)
+    MapValue = Struct.new(:entries, keyword_init: true)
+
+    # Geometry (Spatial track, docs/design-spatial.md): a decoded GEOMETRY /
+    # GEOGRAPHY value. +type+ is the OGC subtype name, +coordinates+ nested
+    # per type (Point: [x, y]); a GeometryCollection uses +geometries+
+    # instead. Also doubles as an explicit param wrapper: Geometry.new(type:
+    # nil, srid: 4326, wkt: "POINT(1 2)").
+    Geometry = Struct.new(:type, :srid, :coordinates, :geometries, :wkt, keyword_init: true) do
+      def to_wkt
+        return wkt if wkt
+
+        pt = ->(xy) { "#{xy[0]} #{xy[1]}" }
+        ring = ->(r) { "(#{r.map(&pt).join(', ')})" }
+        case type
+        when 'Point' then "POINT(#{pt.call(coordinates)})"
+        when 'LineString' then "LINESTRING(#{coordinates.map(&pt).join(', ')})"
+        when 'Polygon' then "POLYGON(#{coordinates.map(&ring).join(', ')})"
+        when 'MultiPoint' then "MULTIPOINT(#{coordinates.map { |c| "(#{pt.call(c)})" }.join(', ')})"
+        when 'MultiLineString' then "MULTILINESTRING(#{coordinates.map(&ring).join(', ')})"
+        when 'MultiPolygon'
+          "MULTIPOLYGON(#{coordinates.map { |poly| "(#{poly.map(&ring).join(', ')})" }.join(', ')})"
+        when 'GeometryCollection'
+          "GEOMETRYCOLLECTION(#{geometries.map(&:to_wkt).join(', ')})"
+        else
+          raise Error.new('invalid_argument', 'unsupported geometry type')
+        end
+      end
+    end
+
     Interval = Struct.new(:months, :days, :nanos) do
       def initialize(months:, days:, nanos:)
         super(months, days, nanos)
@@ -404,12 +446,19 @@ module NextSQL
         (KIND_BOX.chr + "\x00" + reserved5).b + [v.west, v.south, v.east, v.north].pack("E4")
       when Vector
         encode_vector(v)
+      when StructValue, MapValue
+        encode_collection_param(v)
+      when Geometry
+        wkt = v.wkt || v.to_wkt
+        wkt = "SRID=#{v.srid};#{wkt}" if v.srid && wkt !~ /\ASRID=/i
+        (KIND_STRING.chr + "\x00" + reserved5).b + u32bytes(wkt.b, MAX_PACKET)
       when Array
         if !v.empty? && v.all? { |x| x.is_a?(Numeric) }
           encode_vector(Vector.new(dim: v.size, values: v.map(&:to_f)))
         else
-          json = JSON.generate(v)
-          (KIND_STRING.chr + "\x00" + reserved5).b + u32bytes(json.b, MAX_PACKET)
+          # A non-numeric (or empty) Array is an ARRAY collection param; the
+          # server re-coerces element types against the destination column.
+          encode_collection_param(v)
         end
       when Hash
         json = JSON.generate(v)
@@ -419,16 +468,278 @@ module NextSQL
       end
     end
 
+    # --- Collections (STRUCT / ARRAY / MAP), docs/design-collections.md -------
+
+    def read_type_full(b, off, depth)
+      need!(b, off, 6, "type")
+      t = { kind: b.getbyte(off), precision: u16(b, off + 1), scale: u16(b, off + 3), elem: b.getbyte(off + 5) }
+      nxt = read_nested_descriptor(b, off + 6, t, depth)
+      [t, nxt]
+    end
+
+    def read_nested_descriptor(b, off, t, depth)
+      raise ProtocolError, "collection type nesting too deep" if depth > MAX_NEST_DEPTH + 1
+
+      case t[:kind]
+      when KIND_ENUM
+        labels, off = read_enum_labels(b, off)
+        t[:labels] = labels
+        off
+      when KIND_ARRAY
+        et, off = read_type_full(b, off, depth + 1)
+        t[:elem_type] = et
+        off
+      when KIND_MAP
+        kt, off = read_type_full(b, off, depth + 1)
+        vt, off = read_type_full(b, off, depth + 1)
+        t[:key_type] = kt
+        t[:elem_type] = vt
+        off
+      when KIND_STRUCT
+        need!(b, off, 2, "struct field count")
+        n = u16(b, off)
+        raise ProtocolError, "struct field count out of range" if n.zero? || n > MAX_STRUCT_FIELDS
+
+        off += 2
+        fields = []
+        n.times do
+          name, off = read_u16_string(b, off, 255)
+          ft, off = read_type_full(b, off, depth + 1)
+          fields << [name, ft]
+        end
+        t[:fields] = fields
+        off
+      else
+        off
+      end
+    end
+
+    def decode_payload(b, off, t)
+      kind = t[:kind]
+      return decode_collection_payload(b, off, t) if [KIND_STRUCT, KIND_ARRAY, KIND_MAP].include?(kind)
+
+      header = (kind.chr + "\x00" + reserved5).b
+      header << append_enum_labels(t[:labels] || []) if kind == KIND_ENUM
+      synthetic = header + b.byteslice(off, b.bytesize - off)
+      value, nxt, = decode_value(synthetic, 0)
+      [value, off + (nxt - header.bytesize)]
+    end
+
+    def decode_collection_payload(b, off, t)
+      need!(b, off, 4, "collection")
+      body_len = u32(b, off)
+      body_end = off + 4 + body_len
+      need!(b, off + 4, body_len, "collection body")
+      p = off + 4
+      n = u32(b, p)
+      p += 4
+      raise ProtocolError, "collection member count out of range" if n > (2 * MAX_COLLECTION_LEN) + 2 || n > body_len
+
+      nb = (n + 7) / 8
+      nulls = b.byteslice(p, nb)
+      p += nb
+      kind = t[:kind]
+      members = []
+      n.times do |i|
+        if (nulls.getbyte(i / 8) & (1 << (i % 8))) != 0
+          members << nil
+          next
+        end
+        mt = if kind == KIND_STRUCT
+               t[:fields][i][1]
+             elsif kind == KIND_ARRAY
+               t[:elem_type]
+             else
+               i.even? ? t[:key_type] : t[:elem_type]
+             end
+        value, p = decode_payload(b, p, mt)
+        members << value
+      end
+      case kind
+      when KIND_STRUCT
+        out = {}
+        t[:fields].each_with_index { |(name, _), i| out[name] = members[i] }
+        [out, body_end]
+      when KIND_ARRAY
+        [members, body_end]
+      else
+        out = {}
+        (0...(members.size - 1)).step(2) { |i| out[members[i]] = members[i + 1] }
+        [out, body_end]
+      end
+    end
+
+    def encode_type_full(t)
+      out = +(t[:kind].chr + reserved5).b
+      case t[:kind]
+      when KIND_ENUM
+        out << append_enum_labels(t[:labels] || [])
+      when KIND_ARRAY
+        out << encode_type_full(t[:elem_type])
+      when KIND_MAP
+        out << encode_type_full(t[:key_type]) << encode_type_full(t[:elem_type])
+      when KIND_STRUCT
+        out << u16le(t[:fields].size)
+        t[:fields].each { |name, ft| out << u16str(name, 255) << encode_type_full(ft) }
+      end
+      out
+    end
+
+    def infer_value(v)
+      case v
+      when nil
+        return [{ kind: KIND_STRING }, nil]
+      when StructValue
+        fields = []
+        payloads = []
+        v.fields.each do |name, fv|
+          ft, pl = infer_value(fv)
+          fields << [name.to_s, ft]
+          payloads << pl
+        end
+        return [{ kind: KIND_STRUCT, fields: fields }, collection_payload(payloads)]
+      when MapValue
+        items = v.entries.is_a?(Hash) ? v.entries.to_a : v.entries
+        types = []
+        payloads = []
+        items.each do |k, val|
+          kt, kp = infer_value(k)
+          vt, vp = infer_value(val)
+          types << kt << vt
+          payloads << kp << vp
+        end
+        ki = (0...payloads.size).step(2).find { |i| !payloads[i].nil? }
+        vi = (1...payloads.size).step(2).find { |i| !payloads[i].nil? }
+        key_type = ki ? types[ki] : { kind: KIND_STRING }
+        val_type = vi ? types[vi] : { kind: KIND_STRING }
+        return [{ kind: KIND_MAP, key_type: key_type, elem_type: val_type }, collection_payload(payloads)]
+      when Array
+        types = []
+        payloads = []
+        v.each do |x|
+          xt, xp = infer_value(x)
+          types << xt
+          payloads << xp
+        end
+        ei = payloads.index { |pl| !pl.nil? }
+        elem_type = ei ? types[ei] : { kind: KIND_STRING }
+        return [{ kind: KIND_ARRAY, elem_type: elem_type }, collection_payload(payloads)]
+      end
+      enc = encode_param(v)
+      kind = enc.getbyte(0)
+      hdr = 7
+      if kind == KIND_ENUM
+        lc = u16(enc, 7)
+        hdr = 9
+        lc.times { hdr += 2 + u16(enc, hdr) }
+      end
+      [{ kind: kind }, enc.byteslice(hdr, enc.bytesize - hdr)]
+    end
+
+    def collection_payload(payloads)
+      n = payloads.size
+      nb = (n + 7) / 8
+      nulls = Array.new(nb, 0)
+      chunks = +"".b
+      payloads.each_with_index do |pl, i|
+        if pl.nil?
+          nulls[i / 8] |= 1 << (i % 8)
+        else
+          chunks << pl
+        end
+      end
+      body = u32le(n) + nulls.pack("C*") + chunks
+      u32le(body.bytesize) + body
+    end
+
+    def encode_collection_param(v)
+      t, payload = infer_value(v)
+      full = encode_type_full(t)
+      type_body = full.byteslice(1, full.bytesize - 1)
+      (t[:kind].chr + "\x00").b + type_body + (payload || "".b)
+    end
+
+    # --- Spatial: EWKB decode (Spatial track, docs/design-spatial.md) ------
+
+    EWKB_TYPES = {
+      1 => "Point", 2 => "LineString", 3 => "Polygon",
+      4 => "MultiPoint", 5 => "MultiLineString", 6 => "MultiPolygon",
+      7 => "GeometryCollection"
+    }.freeze
+    EWKB_SRID_FLAG = 0x20000000
+
+    def decode_ewkb(b, off, depth)
+      raise ProtocolError, "geometry nesting too deep" if depth > 8
+
+      need!(b, off, 5, "geometry header")
+      raise ProtocolError, "only little-endian EWKB is supported" unless b.getbyte(off) == 1
+
+      tword = u32(b, off + 1)
+      gtype = tword & ~EWKB_SRID_FLAG
+      p = off + 5
+      srid = 0
+      if (tword & EWKB_SRID_FLAG) != 0
+        srid = u32(b, p)
+        p += 4
+      end
+      name = EWKB_TYPES[gtype]
+      raise ProtocolError, "unknown geometry type" unless name
+
+      f64 = lambda {
+        v = b.byteslice(p, 8).unpack1("E")
+        p += 8
+        v
+      }
+      u32f = lambda {
+        v = u32(b, p)
+        p += 4
+        v
+      }
+      pts = ->(n) { Array.new(n) { [f64.call, f64.call] } }
+
+      case gtype
+      when 1
+        [Geometry.new(type: name, srid: srid, coordinates: [f64.call, f64.call]), p]
+      when 2
+        [Geometry.new(type: name, srid: srid, coordinates: pts.call(u32f.call)), p]
+      when 3
+        nr = u32f.call
+        rings = Array.new(nr) { pts.call(u32f.call) }
+        [Geometry.new(type: name, srid: srid, coordinates: rings), p]
+      else
+        np = u32f.call
+        parts = []
+        np.times do
+          sub, p = decode_ewkb(b, p, depth + 1)
+          parts << sub
+        end
+        if gtype == 7
+          [Geometry.new(type: name, srid: srid, geometries: parts), p]
+        else
+          [Geometry.new(type: name, srid: srid, coordinates: parts.map(&:coordinates)), p]
+        end
+      end
+    end
+
     def decode_value(b, off)
       need!(b, off, 7, "value header")
       kind = b.getbyte(off)
       flags = b.getbyte(off + 1)
       off += 7
       enum_labels = nil
+      coll_type = nil
       if kind == KIND_ENUM
         enum_labels, off = read_enum_labels(b, off)
+      elsif [KIND_STRUCT, KIND_ARRAY, KIND_MAP].include?(kind)
+        coll_type = { kind: kind }
+        off = read_nested_descriptor(b, off, coll_type, 0)
       end
       return [nil, off, kind] if flags & FLAG_NULL != 0
+
+      if [KIND_STRUCT, KIND_ARRAY, KIND_MAP].include?(kind)
+        value, nxt = decode_collection_payload(b, off, coll_type)
+        return [value, nxt, kind]
+      end
 
       case kind
       when KIND_ENUM
@@ -531,6 +842,10 @@ module NextSQL
           p += 8
         end
         [Line.new(coords), p, kind]
+      when KIND_GEOMETRY, KIND_GEOGRAPHY
+        len = u32(b, off)
+        g, = decode_ewkb(b, off + 4, 0)
+        [g, off + 4 + len, kind]
       when KIND_POLYGON
         nr = u16(b, off)
         p = off + 2
@@ -593,10 +908,14 @@ module NextSQL
         kind = b.getbyte(off)
         off += 6
         labels = nil
+        coll_type = nil
         if kind == KIND_ENUM
           labels, off = read_enum_labels(b, off)
+        elsif [KIND_STRUCT, KIND_ARRAY, KIND_MAP].include?(kind)
+          coll_type = { kind: kind }
+          off = read_nested_descriptor(b, off, coll_type, 0)
         end
-        cols << Column.new(name, kind, labels)
+        cols << Column.new(name, kind, labels, coll_type)
       end
       cols
     end

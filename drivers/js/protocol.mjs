@@ -88,7 +88,17 @@ export const Kind = {
   Float64: 29,
   Enum: 30,
   Interval: 31,
+  Struct: 32,
+  Array: 33,
+  Map: 34,
+  Geometry: 35,
+  Geography: 36,
 };
+
+// Collection abuse limits, mirroring internal/sql/types (docs/design-collections.md).
+const MAX_NEST_DEPTH = 8;
+const MAX_STRUCT_FIELDS = 128;
+const MAX_COLLECTION_LEN = 1 << 20;
 
 export class NextSQLError extends Error {
   constructor(code, message) {
@@ -324,6 +334,320 @@ function readEnumLabels(buf, off) {
     off = got.next;
   }
   return { value: labels, next: off };
+}
+
+// --- Collections (STRUCT / ARRAY / MAP), docs/design-collections.md ----------
+
+// readTypeFull parses a complete recursive Type descriptor: [kind][meta5] plus,
+// for a collection, its nested element/key/field descriptors (ENUM: its label
+// list). Mirrors the server's protocol.readTypeFull. Returns { type, next }
+// where type is { kind, precision, scale, elem, labels?, elemType?, keyType?,
+// fields? }.
+function readTypeFull(buf, off, depth) {
+  if (off + 6 > buf.length) throw new NextSQLError('protocol', 'truncated type');
+  const kind = buf[off];
+  const type = {
+    kind,
+    precision: u16(buf, off + 1),
+    scale: u16(buf, off + 3),
+    elem: buf[off + 5],
+  };
+  const next = readNestedDescriptor(buf, off + 6, type, depth);
+  return { type, next };
+}
+
+// readNestedDescriptor reads only the variable metadata that follows the fixed
+// [kind][meta5] part for an ENUM or a collection, filling it into `type`.
+// Returns the offset just past it.
+function readNestedDescriptor(buf, off, type, depth) {
+  if (depth > MAX_NEST_DEPTH + 1) {
+    throw new NextSQLError('protocol', 'collection type nesting too deep');
+  }
+  const kind = type.kind;
+  if (kind === Kind.Enum) {
+    const got = readEnumLabels(buf, off);
+    type.labels = got.value;
+    return got.next;
+  }
+  if (kind === Kind.Array) {
+    const e = readTypeFull(buf, off, depth + 1);
+    type.elemType = e.type;
+    return e.next;
+  }
+  if (kind === Kind.Map) {
+    const k = readTypeFull(buf, off, depth + 1);
+    const v = readTypeFull(buf, k.next, depth + 1);
+    type.keyType = k.type;
+    type.elemType = v.type;
+    return v.next;
+  }
+  if (kind === Kind.Struct) {
+    if (off + 2 > buf.length) throw new NextSQLError('protocol', 'truncated struct field count');
+    const n = u16(buf, off);
+    if (n === 0 || n > MAX_STRUCT_FIELDS) {
+      throw new NextSQLError('protocol', 'struct field count out of range');
+    }
+    off += 2;
+    const fields = [];
+    for (let i = 0; i < n; i++) {
+      const name = readU16String(buf, off, 255);
+      off = name.next;
+      const ft = readTypeFull(buf, off, depth + 1);
+      off = ft.next;
+      fields.push({ name: name.value, type: ft.type });
+    }
+    type.fields = fields;
+    return off;
+  }
+  return off;
+}
+
+// decodePayload decodes one value payload (no [kind][flags] header) given its
+// resolved type descriptor. Used for both top-level values and for every
+// collection member, so collections nest.
+function decodePayload(buf, off, type) {
+  const kind = type.kind;
+  if (kind === Kind.Struct || kind === Kind.Array || kind === Kind.Map) {
+    return decodeCollectionPayload(buf, off, type);
+  }
+  // A scalar member reuses decodeValue's scalar switch by prepending a
+  // synthetic [kind][flags][meta5] header (+ label list for ENUM), then
+  // translating the offset back.
+  const header = [Uint8Array.of(kind, 0), new Uint8Array(5)];
+  if (kind === Kind.Enum) header.push(appendEnumLabels(type.labels || []));
+  const headerBytes = concat(header);
+  const synthetic = concat([headerBytes, buf.subarray(off)]);
+  const got = decodeValue(synthetic, 0);
+  return { value: got.value, next: off + (got.next - headerBytes.length) };
+}
+
+function decodeCollectionPayload(buf, off, type) {
+  if (off + 4 > buf.length) throw new NextSQLError('protocol', 'truncated collection');
+  const bodyLen = view(buf, off, 4).getUint32(0, true);
+  const bodyEnd = off + 4 + bodyLen;
+  if (bodyEnd > buf.length) throw new NextSQLError('protocol', 'truncated collection body');
+  let p = off + 4;
+  const n = view(buf, p, 4).getUint32(0, true);
+  p += 4;
+  if (n > 2 * MAX_COLLECTION_LEN + 2 || n > bodyLen) {
+    throw new NextSQLError('protocol', 'collection member count out of range');
+  }
+  const nb = (n + 7) >> 3;
+  const nulls = buf.subarray(p, p + nb);
+  p += nb;
+  const memberType = (i) => {
+    if (type.kind === Kind.Struct) return type.fields[i].type;
+    if (type.kind === Kind.Array) return type.elemType;
+    return i % 2 === 0 ? type.keyType : type.elemType; // MAP
+  };
+  const members = [];
+  for (let i = 0; i < n; i++) {
+    if (nulls[i >> 3] & (1 << (i & 7))) {
+      members.push(null);
+      continue;
+    }
+    const got = decodePayload(buf, p, memberType(i));
+    p = got.next;
+    members.push(got.value);
+  }
+  let value;
+  if (type.kind === Kind.Struct) {
+    value = {};
+    for (let i = 0; i < type.fields.length; i++) value[type.fields[i].name] = members[i];
+  } else if (type.kind === Kind.Array) {
+    value = members;
+  } else {
+    value = new Map();
+    for (let i = 0; i + 1 < members.length; i += 2) value.set(members[i], members[i + 1]);
+  }
+  return { value, next: bodyEnd, kind: type.kind };
+}
+
+// --- Collection param encoding ----------------------------------------------
+
+// encodeTypeFull writes a recursive Type descriptor for a value being inferred
+// from a plain JS value. Mirrors readTypeFull / the server's appendTypeFull.
+function encodeTypeFull(type) {
+  const parts = [Uint8Array.of(type.kind), new Uint8Array(5)];
+  if (type.kind === Kind.Enum) parts.push(appendEnumLabels(type.labels || []));
+  else if (type.kind === Kind.Array) parts.push(encodeTypeFull(type.elemType));
+  else if (type.kind === Kind.Map) {
+    parts.push(encodeTypeFull(type.keyType));
+    parts.push(encodeTypeFull(type.elemType));
+  } else if (type.kind === Kind.Struct) {
+    parts.push(putU16(type.fields.length));
+    for (const f of type.fields) {
+      parts.push(appendU16String(f.name, 255));
+      parts.push(encodeTypeFull(f.type));
+    }
+  }
+  return concat(parts);
+}
+
+// inferValue turns a plain JS value into { type, payload } where payload is the
+// raw encodeScalar bytes (no header). The server re-coerces against the
+// destination column, so member types only need to be self-consistent.
+function inferValue(v) {
+  if (v === null || v === undefined) {
+    return { type: { kind: Kind.String }, payload: null };
+  }
+  if (Array.isArray(v)) {
+    const els = v.map(inferValue);
+    const elemType = els.find((e) => e.payload !== null)?.type || { kind: Kind.String };
+    return { type: { kind: Kind.Array, elemType }, payload: collectionPayload(els) };
+  }
+  if (v instanceof Map) {
+    const entries = [];
+    for (const [k, val] of v) {
+      entries.push(inferValue(k));
+      entries.push(inferValue(val));
+    }
+    const keyType = entries.find((_, i) => i % 2 === 0 && entries[i].payload !== null)?.type || { kind: Kind.String };
+    const elemType = entries.find((_, i) => i % 2 === 1 && entries[i].payload !== null)?.type || { kind: Kind.String };
+    return { type: { kind: Kind.Map, keyType, elemType }, payload: collectionPayload(entries) };
+  }
+  if (v && typeof v === 'object' && v.__struct) {
+    const fields = [];
+    const els = [];
+    for (const [name, fv] of v.__struct) {
+      const iv = inferValue(fv);
+      fields.push({ name, type: iv.type });
+      els.push(iv);
+    }
+    return { type: { kind: Kind.Struct, fields }, payload: collectionPayload(els) };
+  }
+  // A scalar: run it through encodeParam and split off the header.
+  const enc = encodeParam(v);
+  const kind = enc[0];
+  let hdr = 7;
+  if (kind === Kind.Enum) {
+    // header + label list
+    const lc = u16(enc, 7);
+    hdr = 9;
+    for (let i = 0; i < lc; i++) hdr += 2 + u16(enc, hdr);
+  }
+  return { type: { kind }, payload: enc.subarray(hdr) };
+}
+
+function collectionPayload(members) {
+  const n = members.length;
+  const nb = (n + 7) >> 3;
+  const nulls = new Uint8Array(nb);
+  const chunks = [];
+  members.forEach((m, i) => {
+    if (m.payload === null) nulls[i >> 3] |= 1 << (i & 7);
+    else chunks.push(m.payload);
+  });
+  const body = concat([putU32(n), nulls, ...chunks]);
+  return concat([putU32(body.length), body]);
+}
+
+// encodeStruct / encodeArrayParam / encodeMapParam build a collection param.
+function encodeCollectionParam(v) {
+  const iv = inferValue(v);
+  const typeBody = encodeTypeFull(iv.type).subarray(1); // drop leading kind byte
+  return concat([Uint8Array.of(iv.type.kind, 0), typeBody, iv.payload || new Uint8Array(0)]);
+}
+
+/** Wrap an array of [name, value] pairs as an explicit STRUCT parameter. */
+export function struct(fields) {
+  return { __struct: fields };
+}
+
+// --- Spatial: EWKB decode (Spatial track, docs/design-spatial.md) ----------
+// GEOMETRY / GEOGRAPHY values arrive as a u32 length prefix + extended-WKB.
+// The driver decodes them to a GeoJSON-ish object { type, srid, coordinates }
+// (coordinates are [x, y] pairs, nested per geometry type). For a parameter a
+// plain WKT string already round-trips (the server coerces STRING -> the
+// column type); an explicit { kind: 'geometry'|'geography', wkt, srid }
+// wrapper is also accepted.
+const EWKB_TYPES = {
+  1: 'Point', 2: 'LineString', 3: 'Polygon',
+  4: 'MultiPoint', 5: 'MultiLineString', 6: 'MultiPolygon',
+  7: 'GeometryCollection',
+};
+const EWKB_SRID_FLAG = 0x20000000;
+
+function decodeEWKB(buf, off, depth) {
+  if (depth > 8) throw new NextSQLError('protocol', 'geometry nesting too deep');
+  if (off + 5 > buf.length) throw new NextSQLError('protocol', 'truncated geometry');
+  if (buf[off] !== 1) throw new NextSQLError('protocol', 'only little-endian EWKB is supported');
+  const dv = view(buf, off + 1, 4);
+  const tword = dv.getUint32(0, true);
+  const gtype = tword & ~EWKB_SRID_FLAG;
+  let p = off + 5;
+  let srid = 0;
+  if (tword & EWKB_SRID_FLAG) {
+    srid = view(buf, p, 4).getUint32(0, true);
+    p += 4;
+  }
+  const f64 = () => {
+    const v = view(buf, p, 8).getFloat64(0, true);
+    p += 8;
+    return v;
+  };
+  const u32 = () => {
+    const v = view(buf, p, 4).getUint32(0, true);
+    p += 4;
+    return v;
+  };
+  const pts = (n) => {
+    const out = [];
+    for (let i = 0; i < n; i++) out.push([f64(), f64()]);
+    return out;
+  };
+  let coordinates;
+  const name = EWKB_TYPES[gtype];
+  if (!name) throw new NextSQLError('protocol', 'unknown geometry type');
+  if (gtype === 1) {
+    coordinates = [f64(), f64()];
+  } else if (gtype === 2) {
+    coordinates = pts(u32());
+  } else if (gtype === 3) {
+    const nr = u32();
+    coordinates = [];
+    for (let r = 0; r < nr; r++) coordinates.push(pts(u32()));
+  } else {
+    const np = u32();
+    const parts = [];
+    for (let i = 0; i < np; i++) {
+      const sub = decodeEWKB(buf, p, depth + 1);
+      p = sub.__next;
+      parts.push(sub);
+    }
+    const g = { type: name, srid };
+    if (gtype === 7) g.geometries = parts.map((x) => stripNext(x));
+    else g.coordinates = parts.map((x) => x.coordinates);
+    g.__next = p;
+    return g;
+  }
+  return { type: name, srid, coordinates, __next: p };
+}
+
+function stripNext(g) {
+  const { __next, ...rest } = g;
+  if (rest.geometries) rest.geometries = rest.geometries.map(stripNext);
+  return rest;
+}
+
+// geoToWKT renders a GeoJSON-ish { type, coordinates } object as WKT, so a
+// decoded geometry can be sent straight back as a parameter.
+function geoToWKT(g) {
+  const p = (xy) => `${xy[0]} ${xy[1]}`;
+  const ring = (r) => `(${r.map(p).join(', ')})`;
+  switch (g.type) {
+    case 'Point': return `POINT(${p(g.coordinates)})`;
+    case 'LineString': return `LINESTRING(${g.coordinates.map(p).join(', ')})`;
+    case 'Polygon': return `POLYGON(${g.coordinates.map(ring).join(', ')})`;
+    case 'MultiPoint': return `MULTIPOINT(${g.coordinates.map((c) => `(${p(c)})`).join(', ')})`;
+    case 'MultiLineString': return `MULTILINESTRING(${g.coordinates.map(ring).join(', ')})`;
+    case 'MultiPolygon':
+      return `MULTIPOLYGON(${g.coordinates.map((poly) => `(${poly.map(ring).join(', ')})`).join(', ')})`;
+    case 'GeometryCollection':
+      return `GEOMETRYCOLLECTION(${g.geometries.map(geoToWKT).join(', ')})`;
+    default:
+      throw new NextSQLError('invalid_argument', 'unsupported geometry type');
+  }
 }
 
 function bigintToBytes(n) {
@@ -713,6 +1037,17 @@ export function encodeParam(v) {
   if (Array.isArray(v) && v.length > 0 && v.every((x) => typeof x === 'number')) {
     return encodeVector(v);
   }
+  if (Array.isArray(v)) {
+    // A non-numeric (or empty) array is an ARRAY collection param; the server
+    // re-coerces element types against the destination column.
+    return encodeCollectionParam(v);
+  }
+  if (v instanceof Map) {
+    return encodeCollectionParam(v);
+  }
+  if (v && typeof v === 'object' && v.__struct) {
+    return encodeCollectionParam(v);
+  }
   if (v && typeof v === 'object') {
     if ('lon' in v && 'lat' in v) {
       return encodePoint(Number(v.lon), Number(v.lat));
@@ -762,6 +1097,22 @@ export function encodeParam(v) {
     if (v.kind === 'interval') {
       return encodeInterval(v.months | 0, v.days | 0, v.nanos);
     }
+    if (v.kind === 'geometry' || v.kind === 'geography') {
+      // A WKT / EWKT string that the server coerces into the destination
+      // column. { kind, wkt } or { kind, wkt, srid }.
+      let wkt = v.wkt != null ? String(v.wkt) : geoToWKT(v);
+      if (v.srid != null && !/^SRID=/i.test(wkt)) wkt = `SRID=${v.srid};${wkt}`;
+      return encodeString(wkt);
+    }
+    if (v.kind === 'array' || v.kind === 'map' || v.kind === 'struct') {
+      // Explicit collection wrapper: { kind:'array', value:[...] },
+      // { kind:'map', value: Map|[[k,v],...] },
+      // { kind:'struct', value:[[name,val],...] }.
+      let inner = v.value;
+      if (v.kind === 'map' && Array.isArray(inner)) inner = new Map(inner);
+      if (v.kind === 'struct') inner = { __struct: inner };
+      return encodeCollectionParam(inner);
+    }
     return encodeString(JSON.stringify(v));
   }
   throw new NextSQLError('invalid_argument', 'unsupported parameter type');
@@ -775,10 +1126,14 @@ export function decodeValue(buf, off) {
   const flags = buf[off + 1];
   off += 7;
   let enumLabels = null;
+  let collType = null;
   if (kind === Kind.Enum) {
     const got = readEnumLabels(buf, off);
     enumLabels = got.value;
     off = got.next;
+  } else if (kind === Kind.Struct || kind === Kind.Array || kind === Kind.Map) {
+    collType = { kind };
+    off = readNestedDescriptor(buf, off, collType, 0);
   }
   if (flags & FlagNull) {
     return { value: null, next: off, kind, labels: enumLabels || undefined };
@@ -1004,6 +1359,16 @@ export function decodeValue(buf, off) {
       }
       return { value: { rings }, next: p, kind };
     }
+    case Kind.Struct:
+    case Kind.Array:
+    case Kind.Map:
+      return decodeCollectionPayload(buf, off, collType);
+    case Kind.Geometry:
+    case Kind.Geography: {
+      const len = view(buf, off, 4).getUint32(0, true);
+      const g = stripNext(decodeEWKB(buf, off + 4, 0));
+      return { value: g, next: off + 4 + len, kind };
+    }
     default:
       throw new NextSQLError('protocol', 'unsupported type');
   }
@@ -1091,6 +1456,10 @@ export function decodeRowDesc(b) {
       const got = readEnumLabels(b, off);
       col.labels = got.value;
       off = got.next;
+    } else if (kind === Kind.Struct || kind === Kind.Array || kind === Kind.Map) {
+      const t = { kind };
+      off = readNestedDescriptor(b, off, t, 0);
+      col.collType = t;
     }
     columns.push(col);
   }

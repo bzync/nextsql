@@ -40,6 +40,18 @@ type Vector struct {
 	// DATE/TIME/TIMESTAMP/TIMESTAMPTZ already use).
 	IntervalMonths []int32
 	IntervalDays   []int32
+	// Coll / CollKeys hold STRUCT / ARRAY / MAP values one boxed
+	// []types.Value per row (Collections track). This is the deliberately
+	// simple representation from docs/design-collections.md — a nested
+	// columnar (Arrow-style offsets + child arrays) layout is a possible
+	// later optimization, not needed for correctness. CollKeys is the
+	// parallel key list for a MAP column.
+	Coll     [][]types.Value
+	CollKeys [][]types.Value
+	// Geom holds a general GEOMETRY / GEOGRAPHY value one pointer per row
+	// (Spatial track). The four fixed WGS84 shapes keep using
+	// Lon/Lat/Box/Coords/Rings above.
+	Geom []*types.Geom
 }
 
 // New allocates a batch with capacity snapped to a supported size.
@@ -96,6 +108,13 @@ func newVec(t types.Type, n int) Vector {
 	case types.KindLine, types.KindPolygon:
 		v.Coords = make([][]float64, n)
 		v.Rings = make([][]int, n)
+	case types.KindStruct, types.KindArray, types.KindMap:
+		v.Coll = make([][]types.Value, n)
+		if t.Kind == types.KindMap {
+			v.CollKeys = make([][]types.Value, n)
+		}
+	case types.KindGeometry, types.KindGeography:
+		v.Geom = make([]*types.Geom, n)
 	}
 	return v
 }
@@ -219,6 +238,22 @@ func setAt(col *Vector, i int, v types.Value) {
 	case types.KindLine, types.KindPolygon:
 		col.Coords[i] = v.Coords
 		col.Rings[i] = v.Rings
+	case types.KindStruct, types.KindArray, types.KindMap:
+		if col.Coll == nil {
+			col.Coll = make([][]types.Value, len(col.Null))
+		}
+		col.Coll[i] = v.Coll
+		if col.Typ.Kind == types.KindMap {
+			if col.CollKeys == nil {
+				col.CollKeys = make([][]types.Value, len(col.Null))
+			}
+			col.CollKeys[i] = v.CollKeys
+		}
+	case types.KindGeometry, types.KindGeography:
+		if col.Geom == nil {
+			col.Geom = make([]*types.Geom, len(col.Null))
+		}
+		col.Geom[i] = v.Geom
 	}
 }
 
@@ -303,6 +338,12 @@ func getAt(col *Vector, i int) types.Value {
 	case types.KindPolygon:
 		v, _ := types.PolygonValue(col.Coords[i], col.Rings[i])
 		return v
+	case types.KindStruct, types.KindArray:
+		return types.Value{Typ: col.Typ, Coll: col.Coll[i]}
+	case types.KindMap:
+		return types.Value{Typ: col.Typ, Coll: col.Coll[i], CollKeys: col.CollKeys[i]}
+	case types.KindGeometry, types.KindGeography:
+		return types.Value{Typ: col.Typ, Geom: col.Geom[i]}
 	default:
 		return types.Null(col.Typ)
 	}
@@ -367,6 +408,13 @@ func (b *Batch) Compact(sel []int) {
 			case types.KindLine, types.KindPolygon:
 				col.Coords[d] = col.Coords[s]
 				col.Rings[d] = col.Rings[s]
+			case types.KindStruct, types.KindArray, types.KindMap:
+				col.Coll[d] = col.Coll[s]
+				if col.CollKeys != nil {
+					col.CollKeys[d] = col.CollKeys[s]
+				}
+			case types.KindGeometry, types.KindGeography:
+				col.Geom[d] = col.Geom[s]
 			}
 		}
 	}
@@ -437,6 +485,16 @@ func clonePrefix(src Vector, n, cap int) Vector {
 	case types.KindLine, types.KindPolygon:
 		copy(dst.Coords, src.Coords[:n])
 		copy(dst.Rings, src.Rings[:n])
+	case types.KindStruct, types.KindArray, types.KindMap:
+		copy(dst.Coll, src.Coll[:n])
+		if src.CollKeys != nil {
+			if dst.CollKeys == nil {
+				dst.CollKeys = make([][]types.Value, cap)
+			}
+			copy(dst.CollKeys, src.CollKeys[:n])
+		}
+	case types.KindGeometry, types.KindGeography:
+		copy(dst.Geom, src.Geom[:n])
 	}
 	return dst
 }

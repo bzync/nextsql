@@ -187,9 +187,9 @@ func TestPartitionCatalogV5ReadsNextID(t *testing.T) {
 	}
 	// Zero indexes: v6+ trailers are empty, so a v5 version byte on a current
 	// body must still consume NextID (not wait for tableVersion == current).
-	// Strip v10's one-byte-per-column flag and v11's two-byte-per-column
-	// ENUM label count.
-	v5 := append([]byte(nil), raw[:len(raw)-len(tab.Columns)*3]...)
+	// Strip v10's one-byte-per-column flag, v11's two-byte-per-column
+	// ENUM label count, and v12's one-byte-per-column collection flag.
+	v5 := append([]byte(nil), raw[:len(raw)-len(tab.Columns)*4]...)
 	v5[4], v5[5] = byte(tableVersionV5), 0
 	got, err := DecodeTable(v5)
 	if err != nil {
@@ -211,9 +211,10 @@ func TestPartitionCatalogV4DerivesNextIdentity(t *testing.T) {
 		t.Fatal(err)
 	}
 	// NSCT v4 ended immediately after the partition list; v5 appends NextID.
-	// Strip v10's one-byte-per-column flag and v11's two-byte-per-column
-	// ENUM label count (3 bytes/column total) in addition to NextID's 4 bytes.
-	v4 := append([]byte(nil), raw[:len(raw)-len(tab.Columns)*3-4]...)
+	// Strip v10's one-byte-per-column flag, v11's two-byte-per-column
+	// ENUM label count, and v12's one-byte-per-column collection flag (4
+	// bytes/column total) in addition to NextID's 4 bytes.
+	v4 := append([]byte(nil), raw[:len(raw)-len(tab.Columns)*4-4]...)
 	v4[4], v4[5] = byte(tableVersionV4), 0
 	got, err := DecodeTable(v4)
 	if err != nil {
@@ -223,7 +224,7 @@ func TestPartitionCatalogV4DerivesNextIdentity(t *testing.T) {
 		t.Fatalf("derived next partition id=%d want 8", got.Partitioning.NextID)
 	}
 	zeroNext := append([]byte(nil), raw...)
-	for i := len(zeroNext) - len(tab.Columns)*3 - 4; i < len(zeroNext)-len(tab.Columns)*3; i++ {
+	for i := len(zeroNext) - len(tab.Columns)*4 - 4; i < len(zeroNext)-len(tab.Columns)*4; i++ {
 		zeroNext[i] = 0
 	}
 	if _, err := DecodeTable(zeroNext); err == nil {

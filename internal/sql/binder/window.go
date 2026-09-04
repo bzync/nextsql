@@ -456,6 +456,31 @@ func containsWindow(e ast.Expr) bool {
 				return true
 			}
 		}
+	case ast.ArrayCtor:
+		for _, e := range x.Elems {
+			if containsWindow(e) {
+				return true
+			}
+		}
+	case ast.StructCtor:
+		for _, e := range x.Elems {
+			if containsWindow(e) {
+				return true
+			}
+		}
+	case ast.MapCtor:
+		for _, e := range x.Keys {
+			if containsWindow(e) {
+				return true
+			}
+		}
+		for _, e := range x.Vals {
+			if containsWindow(e) {
+				return true
+			}
+		}
+	case ast.FieldAccess:
+		return containsWindow(x.Base)
 	}
 	return false
 }
@@ -493,6 +518,31 @@ func containsGroupingAgg(e ast.Expr) bool {
 				return true
 			}
 		}
+	case ast.ArrayCtor:
+		for _, e := range x.Elems {
+			if containsGroupingAgg(e) {
+				return true
+			}
+		}
+	case ast.StructCtor:
+		for _, e := range x.Elems {
+			if containsGroupingAgg(e) {
+				return true
+			}
+		}
+	case ast.MapCtor:
+		for _, e := range x.Keys {
+			if containsGroupingAgg(e) {
+				return true
+			}
+		}
+		for _, e := range x.Vals {
+			if containsGroupingAgg(e) {
+				return true
+			}
+		}
+	case ast.FieldAccess:
+		return containsGroupingAgg(x.Base)
 	}
 	return false
 }

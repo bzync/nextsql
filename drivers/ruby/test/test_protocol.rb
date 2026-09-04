@@ -95,6 +95,34 @@ module NextSQL
   end
 
   class TestValues < Minitest::Test
+    def test_spatial_ewkb_round_trip
+      ewkb = [1].pack("C") + [1 | 0x20000000].pack("V") + [4326].pack("V") + [1.5].pack("E") + [2.5].pack("E")
+      wire = [Protocol::KIND_GEOMETRY, 0, 0, 0, 0, 0, 0].pack("C7") + [ewkb.bytesize].pack("V") + ewkb
+      val, next_off, kind = Protocol.decode_value(wire, 0)
+      assert_equal wire.bytesize, next_off
+      assert_equal Protocol::KIND_GEOMETRY, kind
+      assert_equal "Point", val.type
+      assert_equal 4326, val.srid
+      assert_equal [1.5, 2.5], val.coordinates
+      enc = Protocol.encode_param(Protocol::Geometry.new(wkt: "POINT(1 2)", srid: 4326))
+      assert_equal "SRID=4326;POINT(1 2)", Protocol.decode_value(enc, 0)[0]
+    end
+
+    def test_collections_round_trip
+      arr_val, arr_next, arr_kind = Protocol.decode_value(Protocol.encode_param(%w[a b c]), 0)
+      assert_equal Protocol::KIND_ARRAY, arr_kind
+      assert_equal %w[a b c], arr_val
+      assert_equal(["a", nil, "c"], Protocol.decode_value(Protocol.encode_param(["a", nil, "c"]), 0)[0])
+      m_val, _, m_kind = Protocol.decode_value(Protocol.encode_param(Protocol::MapValue.new(entries: { "x" => "hi" })), 0)
+      assert_equal Protocol::KIND_MAP, m_kind
+      assert_equal "hi", m_val["x"]
+      s_val, _, s_kind = Protocol.decode_value(Protocol.encode_param(Protocol::StructValue.new(fields: [["street", "Main"], ["zip", "90210"]])), 0)
+      assert_equal Protocol::KIND_STRUCT, s_kind
+      assert_equal "Main", s_val["street"]
+      nested, = Protocol.decode_value(Protocol.encode_param(Protocol::StructValue.new(fields: [["n", "bob"], ["t", %w[x y]]])), 0)
+      assert_equal %w[x y], nested["t"]
+    end
+
     def test_null_param
       raw = Protocol.encode_param(nil)
       value, next_off, kind = Protocol.decode_value(raw, 0)

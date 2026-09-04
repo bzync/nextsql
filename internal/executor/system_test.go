@@ -2,10 +2,18 @@ package executor
 
 import (
 	"fmt"
+	"io"
+	"strconv"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/bzync/nextsql/internal/auth"
+	"github.com/bzync/nextsql/internal/config"
 	"github.com/bzync/nextsql/internal/crypto"
+	"github.com/bzync/nextsql/internal/logging"
+	"github.com/bzync/nextsql/internal/metrics"
+	"github.com/bzync/nextsql/internal/nerr"
 	"github.com/bzync/nextsql/internal/security"
 	"github.com/bzync/nextsql/internal/sql/types"
 )
@@ -60,7 +68,7 @@ func TestSystemCapabilities(t *testing.T) {
 	for _, r := range res.Rows {
 		caps[r[0].Str] = r
 	}
-	for _, name := range []string{"partitions_range", "partitions_hash", "partitions_list", "system_schema_v2", "system_show_aliases"} {
+	for _, name := range []string{"partitions_range", "partitions_hash", "partitions_list", "system_schema_v3", "system_show_aliases"} {
 		row, ok := caps[name]
 		if !ok || row[1].Str != "supported" {
 			t.Fatalf("capability %q = %v, want supported", name, row)
@@ -1022,5 +1030,631 @@ func TestSystemUsersRolesGrants(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("admin system.grants missing reporting SELECT orders row: %v", resGrants.Rows)
+	}
+}
+
+func TestSystemTLS(t *testing.T) {
+	db := testDB(t)
+
+	aclPath := t.TempDir() + "/acl.db"
+	acl, err := security.CreateACL(aclPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := acl.Grant("bob", security.PrivConnect, security.ScopeDatabase, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := acl.Grant("root", security.PrivConnect, security.ScopeDatabase, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := acl.Grant("root", security.PrivAdmin, security.ScopeCluster, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	bob := db.Session()
+	bob.SetACL(acl)
+	bob.SetIdentity("bob")
+	root := db.Session()
+	root.SetACL(acl)
+	root.SetIdentity("root")
+
+	// No TLS listener attached (the default for an embedded/CLI DB, and for
+	// SetTLSStatusSource never called): a non-admin sees zero rows, an
+	// admin sees exactly one row reporting enabled=false rather than an
+	// error, same convention as system.replication's "standalone" row.
+	if res := execOK(t, bob, "SELECT * FROM system.tls"); len(res.Rows) != 0 {
+		t.Fatalf("non-admin bob must see zero rows, got %v", res.Rows)
+	}
+	res := execOK(t, root, "SELECT * FROM system.tls")
+	if len(res.Rows) != 1 {
+		t.Fatalf("admin system.tls row count = %d, want 1: %v", len(res.Rows), res.Rows)
+	}
+	row := res.Rows[0]
+	if row[0].Bool {
+		t.Fatalf("enabled=true with no TLS status source wired: %v", row)
+	}
+	if row[1].Str != "" || row[2].Str != "" || row[6].Str != "" || !row[3].Null || !row[4].Null {
+		t.Fatalf("non-empty identity fields with no TLS status source wired: %v", row)
+	}
+
+	// Wire a fixed status (as nextsqld does via
+	// security.ServerTLSReloader.Status) and confirm every column reflects
+	// it, with the private-key-adjacent fields (there are none in
+	// TLSStatus, by construction) and network address (there is no address
+	// field either) never present.
+	notBefore := time.Now().Add(-24 * time.Hour).Truncate(time.Second)
+	notAfter := time.Now().Add(30 * 24 * time.Hour).Truncate(time.Second)
+	db.SetTLSStatusSource(func() (security.TLSStatus, bool) {
+		return security.TLSStatus{
+			Enabled:             true,
+			Subject:             "CN=db.example.internal",
+			Issuer:              "CN=Internal CA",
+			NotBefore:           notBefore,
+			NotAfter:            notAfter,
+			DNSNames:            []string{"db.example.internal", "db2.example.internal"},
+			MTLSRequired:        true,
+			ClientCAConfigured:  true,
+			ClientCRLConfigured: true,
+		}, true
+	})
+
+	res = execOK(t, root, "SELECT * FROM system.tls")
+	if len(res.Rows) != 1 {
+		t.Fatalf("admin system.tls row count = %d, want 1: %v", len(res.Rows), res.Rows)
+	}
+	row = res.Rows[0]
+	if !row[0].Bool {
+		t.Fatalf("enabled=false with a TLS status source wired: %v", row)
+	}
+	if row[1].Str != "CN=db.example.internal" || row[2].Str != "CN=Internal CA" {
+		t.Fatalf("subject/issuer = %q/%q", row[1].Str, row[2].Str)
+	}
+	if row[3].Null || row[3].Time != notBefore.UnixNano() {
+		t.Fatalf("not_before = %v, want %v", row[3], notBefore)
+	}
+	if row[4].Null || row[4].Time != notAfter.UnixNano() {
+		t.Fatalf("not_after = %v, want %v", row[4], notAfter)
+	}
+	daysStr := row[5].Dec.String()
+	days, err := strconv.Atoi(daysStr)
+	if row[5].Null || err != nil || days < 28 || days > 30 {
+		t.Fatalf("days_until_expiry = %q (parse err %v), want ~29-30", daysStr, err)
+	}
+	if row[6].Str != "db.example.internal,db2.example.internal" {
+		t.Fatalf("dns_names = %q", row[6].Str)
+	}
+	if !row[7].Bool || !row[8].Bool || !row[9].Bool {
+		t.Fatalf("mtls_required/client_ca_configured/client_crl_configured not all true: %v", row)
+	}
+
+	// Never an error even for a plaintext deployment; a non-admin still
+	// sees zero rows once a status source is wired.
+	if res := execOK(t, bob, "SELECT * FROM system.tls"); len(res.Rows) != 0 {
+		t.Fatalf("non-admin bob must see zero rows even with a status source wired, got %v", res.Rows)
+	}
+}
+
+func TestSystemKeyVersions(t *testing.T) {
+	db := testDB(t)
+
+	aclPath := t.TempDir() + "/acl.db"
+	acl, err := security.CreateACL(aclPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := acl.Grant("bob", security.PrivConnect, security.ScopeDatabase, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := acl.Grant("root", security.PrivConnect, security.ScopeDatabase, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := acl.Grant("root", security.PrivAdmin, security.ScopeCluster, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	bob := db.Session()
+	bob.SetACL(acl)
+	bob.SetIdentity("bob")
+	root := db.Session()
+	root.SetACL(acl)
+	root.SetIdentity("root")
+
+	// No envelope attached (the default for the embedded/CLI testDB, and
+	// for SetKeyStatusSource never called): a list-shaped table returns
+	// zero rows rather than a placeholder row or an error, for admin and
+	// non-admin alike — the "not applicable" convention system.databases/
+	// realms already use on a non-hosted deployment.
+	if res := execOK(t, root, "SELECT * FROM system.key_versions"); len(res.Rows) != 0 {
+		t.Fatalf("admin system.key_versions with no source wired must be empty, got %v", res.Rows)
+	}
+	if res := execOK(t, bob, "SELECT * FROM system.key_versions"); len(res.Rows) != 0 {
+		t.Fatalf("non-admin bob must see zero rows, got %v", res.Rows)
+	}
+
+	// Wire a fixed status (as nextsqld does via crypto.Envelope.KeyStatus)
+	// and confirm every column reflects it, admin-only.
+	db.SetKeyStatusSource(func() ([]crypto.KeyStatus, bool) {
+		return []crypto.KeyStatus{
+			{Domain: "kek", CurrentVersion: 1, VersionCount: 1},
+			{Domain: "page", CurrentVersion: 2, VersionCount: 1, RevokedCount: 1},
+		}, true
+	})
+
+	res := execOK(t, root, "SELECT * FROM system.key_versions ORDER BY key_name")
+	if len(res.Rows) != 2 {
+		t.Fatalf("admin system.key_versions row count = %d, want 2: %v", len(res.Rows), res.Rows)
+	}
+	kek, page := res.Rows[0], res.Rows[1]
+	if kek[0].Str != "kek" || kek[1].Dec.String() != "1" || kek[2].Dec.String() != "1" || kek[3].Dec.String() != "0" || kek[4].Dec.String() != "0" {
+		t.Fatalf("kek row = %v", kek)
+	}
+	if page[0].Str != "page" || page[1].Dec.String() != "2" || page[2].Dec.String() != "1" || page[3].Dec.String() != "1" || page[4].Dec.String() != "0" {
+		t.Fatalf("page row = %v", page)
+	}
+
+	if res := execOK(t, bob, "SELECT * FROM system.key_versions"); len(res.Rows) != 0 {
+		t.Fatalf("non-admin bob must see zero rows even with a status source wired, got %v", res.Rows)
+	}
+}
+
+func TestSystemConfig(t *testing.T) {
+	db := testDB(t)
+
+	aclPath := t.TempDir() + "/acl.db"
+	acl, err := security.CreateACL(aclPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := acl.Grant("bob", security.PrivConnect, security.ScopeDatabase, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := acl.Grant("root", security.PrivConnect, security.ScopeDatabase, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := acl.Grant("root", security.PrivAdmin, security.ScopeCluster, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	bob := db.Session()
+	bob.SetACL(acl)
+	bob.SetIdentity("bob")
+	root := db.Session()
+	root.SetACL(acl)
+	root.SetIdentity("root")
+
+	// No config source wired (the default for the embedded/CLI testDB):
+	// a list-shaped table returns zero rows, admin and non-admin alike.
+	if res := execOK(t, root, "SELECT * FROM system.config"); len(res.Rows) != 0 {
+		t.Fatalf("admin system.config with no source wired must be empty, got %v", res.Rows)
+	}
+	if res := execOK(t, bob, "SELECT * FROM system.config"); len(res.Rows) != 0 {
+		t.Fatalf("non-admin bob must see zero rows, got %v", res.Rows)
+	}
+
+	// Wire a fixed set of entry states (as nextsqld does via config.DiffState)
+	// and confirm they pass through unchanged — redaction itself is
+	// config.TestDiffState's job, not this layer's.
+	db.SetConfigSource(func() ([]config.EntryState, bool) {
+		return []config.EntryState{
+			{Key: "data_dir", Value: "/var/lib/nextsql", FileValue: "/var/lib/nextsql"},
+			{Key: "buffer_pages", Value: "2048", FileValue: "1024", RestartRequired: true},
+		}, true
+	})
+
+	res := execOK(t, root, "SELECT * FROM system.config ORDER BY name")
+	if len(res.Rows) != 2 {
+		t.Fatalf("admin system.config row count = %d, want 2: %v", len(res.Rows), res.Rows)
+	}
+	// columns: name, value, file_value, restart_required
+	if res.Rows[1][0].Str != "data_dir" || res.Rows[1][1].Str != "/var/lib/nextsql" || res.Rows[1][3].Str != "no" {
+		t.Fatalf("data_dir row = %v", res.Rows[1])
+	}
+	if res.Rows[0][0].Str != "buffer_pages" || res.Rows[0][2].Str != "1024" || res.Rows[0][3].Str != "yes" {
+		t.Fatalf("buffer_pages row = %v", res.Rows[0])
+	}
+
+	if res := execOK(t, bob, "SELECT * FROM system.config"); len(res.Rows) != 0 {
+		t.Fatalf("non-admin bob must see zero rows even with a source wired, got %v", res.Rows)
+	}
+}
+
+func TestSetConfig(t *testing.T) {
+	db := testDB(t)
+
+	aclPath := t.TempDir() + "/acl.db"
+	acl, err := security.CreateACL(aclPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, u := range []string{"bob", "root"} {
+		if err := acl.Grant(u, security.PrivConnect, security.ScopeDatabase, ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := acl.Grant("root", security.PrivAdmin, security.ScopeCluster, ""); err != nil {
+		t.Fatal(err)
+	}
+	bob := db.Session()
+	bob.SetACL(acl)
+	bob.SetIdentity("bob")
+	root := db.Session()
+	root.SetACL(acl)
+	root.SetIdentity("root")
+
+	// No writer wired: SET CONFIG fails Unavailable, not a silent no-op.
+	if _, err := root.Exec("SET CONFIG buffer_pages = 4096"); err == nil {
+		t.Fatal("SET CONFIG with no writer wired must error")
+	} else if !nerr.HasCode(err, nerr.Unavailable) {
+		t.Fatalf("want Unavailable, got %v", err)
+	}
+
+	// Wire a writer that records what it was asked to persist.
+	var gotKey, gotVal string
+	var gotReset bool
+	db.SetConfigWriter(func(key, value string, reset bool) (ConfigWriteResult, error) {
+		gotKey, gotVal, gotReset = key, value, reset
+		return ConfigWriteResult{Key: key, FileValue: value, RunningValue: "1024", RestartRequired: true}, nil
+	})
+
+	// Non-admin is refused before the writer is ever called.
+	gotKey = ""
+	if _, err := bob.Exec("SET CONFIG buffer_pages = 4096"); err == nil {
+		t.Fatal("non-admin SET CONFIG must be refused")
+	}
+	if gotKey != "" {
+		t.Fatalf("writer called for an unauthorized SET CONFIG: %q", gotKey)
+	}
+
+	res, err := root.Exec("SET CONFIG buffer_pages = 4096")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotKey != "buffer_pages" || gotVal != "4096" || gotReset {
+		t.Fatalf("writer got key=%q val=%q reset=%v", gotKey, gotVal, gotReset)
+	}
+	// columns: key, file_value, running_value, restart_required
+	if len(res.Rows) != 1 || res.Rows[0][0].Str != "buffer_pages" || res.Rows[0][3].Str != "yes" {
+		t.Fatalf("SET CONFIG result = %v", res.Rows)
+	}
+
+	// DEFAULT reaches the writer as reset=true.
+	if _, err := root.Exec("SET CONFIG buffer_pages = DEFAULT"); err != nil {
+		t.Fatal(err)
+	}
+	if !gotReset {
+		t.Fatal("SET CONFIG ... = DEFAULT did not set reset=true")
+	}
+
+	// The writer's error propagates.
+	db.SetConfigWriter(func(key, value string, reset bool) (ConfigWriteResult, error) {
+		return ConfigWriteResult{}, nerr.New(nerr.InvalidArgument, "test", "bad value")
+	})
+	if _, err := root.Exec("SET CONFIG buffer_pages = 4096"); err == nil {
+		t.Fatal("writer error must propagate")
+	}
+}
+
+func TestSystemMetrics(t *testing.T) {
+	db := testDB(t)
+
+	aclPath := t.TempDir() + "/acl.db"
+	acl, err := security.CreateACL(aclPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := acl.Grant("bob", security.PrivConnect, security.ScopeDatabase, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := acl.Grant("root", security.PrivConnect, security.ScopeDatabase, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := acl.Grant("root", security.PrivAdmin, security.ScopeCluster, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	bob := db.Session()
+	bob.SetACL(acl)
+	bob.SetIdentity("bob")
+	root := db.Session()
+	root.SetACL(acl)
+	root.SetIdentity("root")
+
+	// No metrics source wired (the default for the embedded/CLI testDB):
+	// a list-shaped table returns zero rows, admin and non-admin alike.
+	if res := execOK(t, root, "SELECT * FROM system.metrics"); len(res.Rows) != 0 {
+		t.Fatalf("admin system.metrics with no source wired must be empty, got %v", res.Rows)
+	}
+	if res := execOK(t, bob, "SELECT * FROM system.metrics"); len(res.Rows) != 0 {
+		t.Fatalf("non-admin bob must see zero rows, got %v", res.Rows)
+	}
+
+	// Wire a registry (as nextsqld does with metrics.Default()) and record a
+	// couple of observations, then confirm they surface.
+	reg := metrics.New()
+	reg.ObserveQuery(time.Millisecond, nil)
+	reg.AddCommit()
+	db.SetMetricsSource(func() *metrics.Registry { return reg })
+
+	res := execOK(t, root, "SELECT * FROM system.metrics")
+	if len(res.Rows) == 0 {
+		t.Fatal("admin system.metrics must have rows once a source is wired")
+	}
+	seen := map[string]string{}
+	for _, r := range res.Rows {
+		// columns: category, name, value, unit
+		seen[r[1].Str] = r[2].Str
+		if r[0].Str == "" || r[3].Str == "" {
+			t.Fatalf("every metric row needs a category and unit: %v", r)
+		}
+	}
+	if seen["queries"] != "1" {
+		t.Fatalf("queries metric = %q, want 1", seen["queries"])
+	}
+	if seen["commits"] != "1" {
+		t.Fatalf("commits metric = %q, want 1", seen["commits"])
+	}
+	if _, ok := seen["goroutines"]; !ok {
+		t.Fatal("expected a runtime goroutines metric")
+	}
+
+	if res := execOK(t, bob, "SELECT * FROM system.metrics"); len(res.Rows) != 0 {
+		t.Fatalf("non-admin bob must see zero rows even with a source wired, got %v", res.Rows)
+	}
+}
+
+func TestSystemServerLog(t *testing.T) {
+	db := testDB(t)
+
+	aclPath := t.TempDir() + "/acl.db"
+	acl, err := security.CreateACL(aclPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, u := range []string{"bob", "root"} {
+		if err := acl.Grant(u, security.PrivConnect, security.ScopeDatabase, ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := acl.Grant("root", security.PrivAdmin, security.ScopeCluster, ""); err != nil {
+		t.Fatal(err)
+	}
+	bob := db.Session()
+	bob.SetACL(acl)
+	bob.SetIdentity("bob")
+	root := db.Session()
+	root.SetACL(acl)
+	root.SetIdentity("root")
+
+	// No log source wired: zero rows, admin and non-admin alike.
+	if res := execOK(t, root, "SELECT * FROM system.server_log"); len(res.Rows) != 0 {
+		t.Fatalf("admin system.server_log with no source wired must be empty, got %v", res.Rows)
+	}
+
+	// Wire a ring (as nextsqld does with logging.NewWithRing) and log a line.
+	l, ring := logging.NewWithRing("info", io.Discard)
+	l.Info("checkpoint complete", "lsn", 4096)
+	db.SetServerLogSource(ring.Snapshot)
+
+	res := execOK(t, root, "SELECT * FROM system.server_log ORDER BY seq DESC")
+	if len(res.Rows) != 1 {
+		t.Fatalf("admin system.server_log row count = %d, want 1: %v", len(res.Rows), res.Rows)
+	}
+	row := res.Rows[0]
+	// columns: seq, event_time, level, message, attributes
+	if row[2].Str != "INFO" || row[3].Str != "checkpoint complete" {
+		t.Fatalf("server_log row = level=%q msg=%q", row[2].Str, row[3].Str)
+	}
+	if !strings.Contains(row[4].Str, "lsn=4096") {
+		t.Fatalf("server_log attributes = %q, want lsn=4096", row[4].Str)
+	}
+
+	if res := execOK(t, bob, "SELECT * FROM system.server_log"); len(res.Rows) != 0 {
+		t.Fatalf("non-admin bob must see zero rows even with a source wired, got %v", res.Rows)
+	}
+}
+
+func TestBackupStatementsAndSystemBackups(t *testing.T) {
+	db := testDB(t)
+
+	aclPath := t.TempDir() + "/acl.db"
+	acl, err := security.CreateACL(aclPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, u := range []string{"bob", "root", "bk"} {
+		if err := acl.Grant(u, security.PrivConnect, security.ScopeDatabase, ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := acl.Grant("root", security.PrivAdmin, security.ScopeCluster, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := acl.Grant("bk", security.PrivBackup, security.ScopeDatabase, ""); err != nil {
+		t.Fatal(err)
+	}
+	mk := func(id string) *Session {
+		s := db.Session()
+		s.SetACL(acl)
+		s.SetIdentity(id)
+		return s
+	}
+	bob, root, bk := mk("bob"), mk("root"), mk("bk")
+
+	// Nothing wired: BACKUP DATABASE / VERIFY BACKUP fail Unavailable,
+	// system.backups is empty.
+	if _, err := root.Exec("BACKUP DATABASE"); !nerr.HasCode(err, nerr.Unavailable) {
+		t.Fatalf("BACKUP DATABASE with no ops wired: want Unavailable, got %v", err)
+	}
+	if res := execOK(t, root, "SELECT * FROM system.backups"); len(res.Rows) != 0 {
+		t.Fatalf("system.backups with nothing wired must be empty, got %v", res.Rows)
+	}
+
+	created := false
+	verifiedName := ""
+	db.SetBackupOps(
+		func() (BackupCreateResult, error) {
+			created = true
+			return BackupCreateResult{Name: "backup-x", CheckpointLSN: 7, DurableLSN: 42, Members: 8}, nil
+		},
+		func() ([]BackupListEntry, bool) {
+			return []BackupListEntry{{Name: "backup-x", CreatedUnix: 1000, DatabaseID: "db1", CheckpointLSN: 7, DurableLSN: 42}}, true
+		},
+		func(name string) (BackupVerifyResult, error) {
+			verifiedName = name
+			return BackupVerifyResult{Name: name, OK: true}, nil
+		},
+	)
+
+	// Non-privileged user is refused before the op runs.
+	created = false
+	if _, err := bob.Exec("BACKUP DATABASE"); err == nil {
+		t.Fatal("unprivileged BACKUP DATABASE must be refused")
+	}
+	if created {
+		t.Fatal("backup ran for an unauthorized user")
+	}
+
+	// The BACKUP privilege is enough (not just cluster ADMIN).
+	res, err := bk.Exec("BACKUP DATABASE")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !created || res.Rows[0][0].Str != "backup-x" || res.Rows[0][3].Dec.String() != "8" {
+		t.Fatalf("BACKUP DATABASE result = %v", res.Rows)
+	}
+
+	// system.backups lists it (BACKUP-privileged user can see it too).
+	rows := execOK(t, bk, "SELECT * FROM system.backups").Rows
+	if len(rows) != 1 || rows[0][0].Str != "backup-x" || rows[0][2].Str != "db1" {
+		t.Fatalf("system.backups rows = %v", rows)
+	}
+	if r := execOK(t, bob, "SELECT * FROM system.backups"); len(r.Rows) != 0 {
+		t.Fatalf("unprivileged bob must see zero system.backups rows, got %v", r.Rows)
+	}
+
+	// VERIFY BACKUP passes the name through and reports the outcome.
+	vr, err := root.Exec("VERIFY BACKUP 'backup-x'")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if verifiedName != "backup-x" || vr.Rows[0][1].Str != "yes" {
+		t.Fatalf("VERIFY BACKUP: name=%q result=%v", verifiedName, vr.Rows)
+	}
+
+	// A failed verification surfaces as verified=no + problem, not an error.
+	db.SetBackupOps(nil, nil, func(name string) (BackupVerifyResult, error) {
+		return BackupVerifyResult{Name: name, OK: false, Problem: "hash mismatch"}, nil
+	})
+	vr, err = root.Exec("VERIFY BACKUP 'bad'")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if vr.Rows[0][1].Str != "no" || vr.Rows[0][2].Str != "hash mismatch" {
+		t.Fatalf("failed verify = %v", vr.Rows)
+	}
+
+	// BACKUP DATABASE inside a transaction is refused.
+	if _, err := root.Exec("BEGIN"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := root.Exec("BACKUP DATABASE"); err == nil {
+		t.Fatal("BACKUP DATABASE inside a transaction must be refused")
+	}
+	_, _ = root.Exec("ROLLBACK")
+}
+
+func TestSystemAuditVerifyAndLog(t *testing.T) {
+	db := testDB(t)
+
+	aclPath := t.TempDir() + "/acl.db"
+	acl, err := security.CreateACL(aclPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := acl.Grant("bob", security.PrivConnect, security.ScopeDatabase, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := acl.Grant("root", security.PrivConnect, security.ScopeDatabase, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := acl.Grant("root", security.PrivAdmin, security.ScopeCluster, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	bob := db.Session()
+	bob.SetACL(acl)
+	bob.SetIdentity("bob")
+	root := db.Session()
+	root.SetACL(acl)
+	root.SetIdentity("root")
+
+	// No audit source wired (the default for the embedded/CLI testDB):
+	// audit_verify still returns its one status row (verified=false, all
+	// counts zero), audit_log returns zero rows (list-shaped) — for admin
+	// and non-admin alike.
+	res := execOK(t, root, "SELECT * FROM system.audit_verify")
+	if len(res.Rows) != 1 {
+		t.Fatalf("admin system.audit_verify row count = %d, want 1: %v", len(res.Rows), res.Rows)
+	}
+	row := res.Rows[0]
+	if row[0].Dec.String() != "0" || row[6].Bool {
+		t.Fatalf("no-source-wired audit_verify row = %v", row)
+	}
+	if res := execOK(t, root, "SELECT * FROM system.audit_log"); len(res.Rows) != 0 {
+		t.Fatalf("admin system.audit_log with no source wired must be empty, got %v", res.Rows)
+	}
+	if res := execOK(t, bob, "SELECT * FROM system.audit_verify"); len(res.Rows) != 0 {
+		t.Fatalf("non-admin bob must see zero audit_verify rows, got %v", res.Rows)
+	}
+
+	// Wire a fixed TailReport (as nextsqld does via security.TailEvents)
+	// and confirm every column reflects it, admin-only.
+	when := time.Now().UTC().Truncate(time.Second)
+	db.SetAuditSource(func(maxEvents int) (security.TailReport, bool) {
+		full := security.TailReport{
+			VerifyReport: security.VerifyReport{
+				Lines: 5, Legacy: 1, Chained: 4, Signed: 2,
+				SigningStarted: true, SignaturesChecked: true, Verified: true,
+			},
+			Events: []security.Event{
+				{Seq: 3, Time: when, Actor: "app", Action: "auth.success", Object: "orders", Outcome: "success", Remote: "10.0.0.5:5000", IdentitySource: "password"},
+				{Seq: 4, Time: when, Actor: "app", Action: "grant", Object: "orders", Outcome: "success", Sig: "c2ln", KeyID: 7},
+			},
+		}
+		if maxEvents <= 0 {
+			return security.TailReport{VerifyReport: full.VerifyReport}, true
+		}
+		return full, true
+	})
+
+	res = execOK(t, root, "SELECT * FROM system.audit_verify")
+	if len(res.Rows) != 1 {
+		t.Fatalf("admin system.audit_verify row count = %d, want 1: %v", len(res.Rows), res.Rows)
+	}
+	row = res.Rows[0]
+	if row[0].Dec.String() != "5" || row[1].Dec.String() != "1" || row[2].Dec.String() != "4" || row[3].Dec.String() != "2" {
+		t.Fatalf("audit_verify counts = %v", row)
+	}
+	if !row[4].Bool || !row[5].Bool || !row[6].Bool {
+		t.Fatalf("audit_verify signing_started/signatures_checked/verified not all true: %v", row)
+	}
+
+	res = execOK(t, root, "SELECT * FROM system.audit_log ORDER BY seq")
+	if len(res.Rows) != 2 {
+		t.Fatalf("admin system.audit_log row count = %d, want 2: %v", len(res.Rows), res.Rows)
+	}
+	unsigned, signed := res.Rows[0], res.Rows[1]
+	if unsigned[0].Dec.String() != "3" || unsigned[2].Str != "app" || unsigned[3].Str != "auth.success" || unsigned[4].Str != "orders" || unsigned[6].Str != "10.0.0.5:5000" || unsigned[8].Bool {
+		t.Fatalf("unsigned audit_log row = %v", unsigned)
+	}
+	if unsigned[1].Null || unsigned[1].Time != when.UnixNano() {
+		t.Fatalf("audit_log time = %v, want %v", unsigned[1], when)
+	}
+	if signed[0].Dec.String() != "4" || signed[3].Str != "grant" || !signed[8].Bool {
+		t.Fatalf("signed audit_log row = %v", signed)
+	}
+
+	if res := execOK(t, bob, "SELECT * FROM system.audit_log"); len(res.Rows) != 0 {
+		t.Fatalf("non-admin bob must see zero audit_log rows even with a source wired, got %v", res.Rows)
 	}
 }

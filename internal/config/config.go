@@ -2,9 +2,13 @@ package config
 
 import (
 	"bufio"
+	"fmt"
+	"io"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/bzync/nextsql/internal/nerr"
 )
@@ -70,6 +74,13 @@ type Config struct {
 	// every new audit record. Private key material stays outside the database.
 	AuditSigningKeyset string
 	WalArchive         string
+	// BackupDir, when set, is the directory the server writes backups into
+	// (one timestamped subdirectory per `BACKUP DATABASE`) and lists /
+	// verifies from (`system.backups`, `VERIFY BACKUP`). The NextSQL Manager
+	// drives all three (`docs/design-manager.md` M5). Unset disables those
+	// operations — there is nowhere for the server to put a backup, and a
+	// driver-only client must never name a server filesystem path itself.
+	BackupDir string
 	// WalRetentionMS, when positive and WalArchive is configured, makes
 	// nextsqld periodically advance the WAL pruning horizon
 	// (DB.SetWALRetentionHorizon) to the newest archived-segment LSN at or
@@ -287,14 +298,19 @@ func (c Config) ReplicaLagWarnThreshold() uint64 {
 
 // Load reads a simple key=value file. Unknown keys are rejected.
 func Load(path string) (Config, error) {
-	cfg := Default()
 	f, err := os.Open(path)
 	if err != nil {
 		return Config{}, nerr.Wrap(nerr.IO, "config.Load", "open", err)
 	}
 	defer f.Close()
+	return loadFrom(f)
+}
 
-	sc := bufio.NewScanner(f)
+// loadFrom parses key=value lines from r onto a fresh Default(), the shared
+// body of Load and WithSetting. Every accepted key is one Marshal emits.
+func loadFrom(r io.Reader) (Config, error) {
+	cfg := Default()
+	sc := bufio.NewScanner(r)
 	for sc.Scan() {
 		line := strings.TrimSpace(sc.Text())
 		if line == "" || strings.HasPrefix(line, "#") {
@@ -364,6 +380,8 @@ func Load(path string) (Config, error) {
 			cfg.AuditSigningKeyset = v
 		case "wal_archive":
 			cfg.WalArchive = v
+		case "backup_dir":
+			cfg.BackupDir = v
 		case "wal_retention_ms":
 			n, err := strconv.Atoi(v)
 			if err != nil || n < 0 {
@@ -525,6 +543,387 @@ func Load(path string) (Config, error) {
 		return Config{}, nerr.Wrap(nerr.IO, "config.Load", "read", err)
 	}
 	return cfg, nil
+}
+
+// Marshal renders the config back to the same key=value format Load reads.
+// Every key it emits is one Load accepts, so Load(Marshal(c)) reconstructs an
+// equal Config (given both start from the same Default()). String fields are
+// emitted only when non-empty, numeric fields only when non-zero, and bools
+// only when true — so the output records exactly the settings that differ
+// from a bare Default(), plus the core fields Default() itself populates.
+//
+// It does not write a file or add comment headers; callers that persist a
+// generated config (e.g. `nextsql setup`) prepend their own provenance
+// header.
+func (c Config) Marshal() []byte {
+	var b strings.Builder
+	str := func(k, v string) {
+		if v != "" {
+			b.WriteString(k)
+			b.WriteByte('=')
+			b.WriteString(v)
+			b.WriteByte('\n')
+		}
+	}
+	num := func(k string, v int) {
+		if v != 0 {
+			b.WriteString(k)
+			b.WriteByte('=')
+			b.WriteString(strconv.Itoa(v))
+			b.WriteByte('\n')
+		}
+	}
+	flt := func(k string, v float64) {
+		if v != 0 {
+			b.WriteString(k)
+			b.WriteByte('=')
+			b.WriteString(strconv.FormatFloat(v, 'g', -1, 64))
+			b.WriteByte('\n')
+		}
+	}
+	boolean := func(k string, v bool) {
+		if v {
+			b.WriteString(k)
+			b.WriteString("=true\n")
+		}
+	}
+
+	str("data_dir", c.DataDir)
+	str("key_file", c.KeyFile)
+	str("instance_key_file", c.InstanceKeyFile)
+	str("auth_file", c.AuthFile)
+	str("listen_addr", c.ListenAddr)
+	str("log_level", c.LogLevel)
+	num("buffer_pages", c.BufferPages)
+
+	str("tls_cert", c.TLSCert)
+	str("tls_key", c.TLSKey)
+	str("tls_client_ca", c.TLSClientCA)
+	str("tls_client_crl", c.TLSClientCRL)
+	boolean("require_client_key", c.RequireClientKey)
+
+	str("token_verify_keyset", c.TokenKeyset)
+	str("token_revocations", c.TokenRevocations)
+	str("token_audience", c.TokenAudience)
+	if len(c.TokenIdentitySourceHints) != 0 {
+		ids := make([]int, 0, len(c.TokenIdentitySourceHints))
+		for id := range c.TokenIdentitySourceHints {
+			ids = append(ids, int(id))
+		}
+		sort.Ints(ids)
+		parts := make([]string, 0, len(ids))
+		for _, id := range ids {
+			parts = append(parts, strconv.Itoa(id)+":"+c.TokenIdentitySourceHints[uint32(id)])
+		}
+		str("token_identity_source_hint", strings.Join(parts, ","))
+	}
+
+	str("auth_broker_config", c.AuthBrokerConfig)
+	str("auth_broker_listen", c.AuthBrokerListen)
+
+	str("audit_file", c.AuditFile)
+	str("audit_signing_keyset", c.AuditSigningKeyset)
+	str("wal_archive", c.WalArchive)
+	str("backup_dir", c.BackupDir)
+	num("wal_retention_ms", c.WalRetentionMS)
+
+	num("disk_watermark_check_ms", c.DiskWatermarkCheckMS)
+	flt("disk_watermark_warn_percent", c.DiskWatermarkWarnPercent)
+	flt("disk_watermark_reject_percent", c.DiskWatermarkRejectPercent)
+	num("replica_lag_check_ms", c.ReplicaLagCheckMS)
+	num("replica_lag_warn_entries", c.ReplicaLagWarnEntries)
+
+	num("max_inflight_queries", c.MaxInflight)
+	num("max_open_databases", c.MaxOpenDatabases)
+	num("max_total_buffer_pages", c.MaxTotalBufferPages)
+	num("task_workers", c.TaskWorkers)
+	num("max_query_queue", c.MaxQueryQueue)
+	num("query_queue_wait_ms", c.QueueWaitMS)
+	num("max_result_rows", c.MaxResultRows)
+
+	num("max_connections", c.MaxConnections)
+	num("max_connections_per_user", c.MaxConnectionsPerUser)
+	num("max_connections_per_database", c.MaxConnectionsPerDatabase)
+	num("max_connections_per_realm", c.MaxConnectionsPerRealm)
+
+	num("idle_timeout_ms", c.IdleTimeoutMS)
+	num("statement_timeout_ms", c.StatementTimeoutMS)
+	num("transaction_timeout_ms", c.TransactionTimeoutMS)
+	num("lock_timeout_ms", c.LockTimeoutMS)
+	num("idle_transaction_timeout_ms", c.IdleTransactionTimeoutMS)
+	num("shutdown_drain_ms", c.DrainTimeoutMS)
+
+	str("node_id", c.NodeID)
+	str("raft_bind", c.RaftBind)
+	str("raft_join", c.RaftJoin)
+	boolean("raft_bootstrap", c.RaftBootstrap)
+
+	return []byte(b.String())
+}
+
+// Entry is one redacted key=value pair from SafeEntries.
+type Entry struct {
+	Key, Value string
+}
+
+// redactedConfigKeys are the Marshal keys that name a network address. Never
+// expose a network address over SQL (the same convention
+// system.replication.leader_addr already follows) — the connecting operator
+// already knows the address they dialed, but SafeEntries backs an
+// admin-visible system.* table, and a different admin session shouldn't
+// learn Raft peer topology or an OIDC broker's listener from it.
+var redactedConfigKeys = map[string]bool{
+	"listen_addr":        true,
+	"raft_bind":          true,
+	"raft_join":          true,
+	"auth_broker_listen": true,
+}
+
+// SafeEntries renders the same settings Marshal does — a key it emits is one
+// Marshal (and therefore Load) also emits, so this can never drift into
+// naming a field Marshal doesn't already know about — as structured
+// key/value pairs with every network-address-shaped value replaced by
+// "[redacted]". Nothing in Config ever holds key material to begin with (see
+// the type's own doc comment), so no other redaction is needed: every other
+// value here is already safe to show an authenticated admin, the same trust
+// tier system.users/system.tls/system.key_versions already use.
+//
+// Reuses Marshal's exact byte output (parsed back on "=") rather than
+// re-enumerating every field a second time, so the two can never disagree
+// about which keys exist or how a value is formatted.
+func (c Config) SafeEntries() []Entry {
+	lines := strings.Split(strings.TrimRight(string(c.Marshal()), "\n"), "\n")
+	out := make([]Entry, 0, len(lines))
+	for _, line := range lines {
+		if line == "" {
+			continue
+		}
+		k, v, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		if redactedConfigKeys[k] {
+			v = "[redacted]"
+		}
+		out = append(out, Entry{Key: k, Value: v})
+	}
+	return out
+}
+
+// settableKeys is every key SET CONFIG may target — exactly the keys Marshal
+// emits and Load accepts. Derived once from a fully-populated Config so it
+// can never silently drift from Marshal's own list: a key Marshal stops
+// emitting (or starts emitting) changes this set automatically.
+var settableKeys = func() map[string]bool {
+	// A Config with every string non-empty, every number non-zero, every
+	// bool true — so Marshal emits one line per settable key.
+	probe := Config{
+		DataDir: "x", KeyFile: "x", InstanceKeyFile: "x", AuthFile: "x",
+		ListenAddr: "x", LogLevel: "x", BufferPages: 1,
+		TLSCert: "x", TLSKey: "x", TLSClientCA: "x", TLSClientCRL: "x", RequireClientKey: true,
+		TokenKeyset: "x", TokenRevocations: "x", TokenAudience: "x",
+		TokenIdentitySourceHints: map[uint32]string{1: "x"},
+		AuthBrokerConfig:         "x", AuthBrokerListen: "x",
+		AuditFile: "x", AuditSigningKeyset: "x", WalArchive: "x", BackupDir: "x", WalRetentionMS: 1,
+		DiskWatermarkCheckMS: 1, DiskWatermarkWarnPercent: 1, DiskWatermarkRejectPercent: 1,
+		ReplicaLagCheckMS: 1, ReplicaLagWarnEntries: 1,
+		MaxInflight: 1, MaxOpenDatabases: 1, MaxTotalBufferPages: 1, TaskWorkers: 1,
+		MaxQueryQueue: 1, QueueWaitMS: 1, MaxResultRows: 1,
+		MaxConnections: 1, MaxConnectionsPerUser: 1, MaxConnectionsPerDatabase: 1, MaxConnectionsPerRealm: 1,
+		IdleTimeoutMS: 1, StatementTimeoutMS: 1, TransactionTimeoutMS: 1, LockTimeoutMS: 1,
+		IdleTransactionTimeoutMS: 1, DrainTimeoutMS: 1,
+		NodeID: "x", RaftBind: "x", RaftJoin: "x", RaftBootstrap: true,
+	}
+	keys := map[string]bool{}
+	for _, line := range strings.Split(strings.TrimRight(string(probe.Marshal()), "\n"), "\n") {
+		if k, _, ok := strings.Cut(line, "="); ok {
+			keys[strings.TrimSpace(k)] = true
+		}
+	}
+	return keys
+}()
+
+// Setting returns the marshalled value of one key (the same text Marshal
+// would emit for it), or "" when the key is at its built-in default and
+// therefore not emitted. Used to compare a running config against an
+// on-disk one for SET CONFIG's restart-required indicator.
+func (c Config) Setting(key string) string {
+	key = strings.TrimSpace(key)
+	for _, line := range strings.Split(strings.TrimRight(string(c.Marshal()), "\n"), "\n") {
+		if k, v, ok := strings.Cut(line, "="); ok && strings.TrimSpace(k) == key {
+			return strings.TrimSpace(v)
+		}
+	}
+	return ""
+}
+
+// SettableKeys returns the sorted list of keys SET CONFIG accepts.
+func SettableKeys() []string {
+	out := make([]string, 0, len(settableKeys))
+	for k := range settableKeys {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// WithSetting returns a copy of c with the single setting key=value applied,
+// parsed and range-checked exactly as Load would and then Validate()d. reset
+// (SET CONFIG key = DEFAULT) removes the key so it falls back to its built-in
+// default. An unknown key, an unparseable value, or a result that fails
+// validation is an error, and c is returned unchanged. Every network-address
+// key is settable (there is no reason an operator can't move a listener),
+// but the caller is responsible for the "no non-loopback listen without
+// TLS" rule — Validate does not enforce it, matching Load.
+//
+// It works by splicing one line into c.Marshal()'s own output and re-parsing
+// through loadFrom, so it can never disagree with Load about which keys
+// exist or how a value is formatted — the same trick SafeEntries uses.
+func (c Config) WithSetting(key, value string, reset bool) (Config, error) {
+	key = strings.TrimSpace(key)
+	if !settableKeys[key] {
+		return c, nerr.New(nerr.InvalidArgument, "config.WithSetting", "unknown setting "+key)
+	}
+	kv := map[string]string{}
+	var order []string
+	for _, line := range strings.Split(strings.TrimRight(string(c.Marshal()), "\n"), "\n") {
+		if line == "" {
+			continue
+		}
+		k, v, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		k = strings.TrimSpace(k)
+		if _, seen := kv[k]; !seen {
+			order = append(order, k)
+		}
+		kv[k] = strings.TrimSpace(v)
+	}
+	if reset {
+		delete(kv, key)
+	} else {
+		if strings.ContainsAny(value, "\n\r") {
+			return c, nerr.New(nerr.InvalidArgument, "config.WithSetting", "value must not contain a newline")
+		}
+		value = strings.TrimSpace(value)
+		if value == "" {
+			return c, nerr.New(nerr.InvalidArgument, "config.WithSetting", "empty value; use SET CONFIG "+key+" = DEFAULT to reset")
+		}
+		if _, seen := kv[key]; !seen {
+			order = append(order, key)
+		}
+		kv[key] = value
+	}
+	var b strings.Builder
+	for _, k := range order {
+		if v, ok := kv[k]; ok {
+			fmt.Fprintf(&b, "%s=%s\n", k, v)
+		}
+	}
+	next, err := loadFrom(strings.NewReader(b.String()))
+	if err != nil {
+		return c, err
+	}
+	if err := next.Validate(); err != nil {
+		return c, err
+	}
+	return next, nil
+}
+
+// WriteFile atomically writes c to path in the canonical key=value form Load
+// reads, prefixed with a provenance header naming `by` (e.g. "SET CONFIG" or
+// "nextsql setup"). It writes a sibling ".tmp" then renames, so a crash
+// mid-write never leaves a truncated config. Any comments or non-canonical
+// formatting a previous file had are not preserved — a config managed through
+// SET CONFIG is canonical-form.
+func WriteFile(path string, c Config, by string) error {
+	header := "# NextSQL server configuration\n" +
+		"# Last written by " + by + " on " + time.Now().UTC().Format(time.RFC3339) + "\n" +
+		"# Edit and restart nextsqld to apply. Keys/secrets are never stored here.\n\n"
+	body := append([]byte(header), c.Marshal()...)
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, body, 0o640); err != nil {
+		return nerr.Wrap(nerr.IO, "config.WriteFile", "write", err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return nerr.Wrap(nerr.IO, "config.WriteFile", "rename", err)
+	}
+	return nil
+}
+
+// EntryState is one row for the system.config viewer: a setting's value in
+// the running process, its value in the node's on-disk nextsql.conf, and
+// whether the two differ (i.e. whether a restart would change behavior).
+// Value and FileValue are redacted exactly as SafeEntries does; the
+// RestartRequired flag is computed from the unredacted values, so it stays
+// correct even for the address keys SafeEntries masks.
+type EntryState struct {
+	Key             string
+	Value           string
+	FileValue       string
+	RestartRequired bool
+}
+
+func marshalMap(c Config) map[string]string {
+	m := map[string]string{}
+	for _, line := range strings.Split(strings.TrimRight(string(c.Marshal()), "\n"), "\n") {
+		if k, v, ok := strings.Cut(line, "="); ok {
+			m[strings.TrimSpace(k)] = strings.TrimSpace(v)
+		}
+	}
+	return m
+}
+
+// DiffState returns one EntryState per key that either config sets away from
+// its default, comparing the running config to the on-disk one. Keys are in
+// running-config Marshal order, then any file-only keys. Pass the running
+// config for both arguments when the server has no config file — every row
+// then reports RestartRequired=false with FileValue == Value.
+func DiffState(running, file Config) []EntryState {
+	rawRun := marshalMap(running)
+	rawFile := marshalMap(file)
+	safeRun := map[string]string{}
+	for _, e := range running.SafeEntries() {
+		safeRun[e.Key] = e.Value
+	}
+	safeFile := map[string]string{}
+	for _, e := range file.SafeEntries() {
+		safeFile[e.Key] = e.Value
+	}
+
+	seen := map[string]bool{}
+	var order []string
+	for _, line := range strings.Split(strings.TrimRight(string(running.Marshal()), "\n"), "\n") {
+		if k, _, ok := strings.Cut(line, "="); ok {
+			k = strings.TrimSpace(k)
+			if !seen[k] {
+				seen[k] = true
+				order = append(order, k)
+			}
+		}
+	}
+	for _, line := range strings.Split(strings.TrimRight(string(file.Marshal()), "\n"), "\n") {
+		if k, _, ok := strings.Cut(line, "="); ok {
+			k = strings.TrimSpace(k)
+			if !seen[k] {
+				seen[k] = true
+				order = append(order, k)
+			}
+		}
+	}
+
+	out := make([]EntryState, 0, len(order))
+	for _, k := range order {
+		out = append(out, EntryState{
+			Key:             k,
+			Value:           safeRun[k],
+			FileValue:       safeFile[k],
+			RestartRequired: rawRun[k] != rawFile[k],
+		})
+	}
+	return out
 }
 
 func (c Config) Validate() error {

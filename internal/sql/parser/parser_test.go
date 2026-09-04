@@ -408,6 +408,45 @@ func TestParseSelectDistinct(t *testing.T) {
 	}
 }
 
+func TestParseSelectNoFrom(t *testing.T) {
+	stmt, err := Parse(`SELECT 1`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sel, ok := stmt.(ast.Select)
+	if !ok || !sel.NoFrom || sel.Table != "" || sel.FromQuery != nil || len(sel.Joins) != 0 || len(sel.List) != 1 {
+		t.Fatalf("unexpected NoFrom AST: %#v", stmt)
+	}
+
+	stmt, err = Parse(`SELECT 1 AS x, 2+2 AS y, NOW(), UUID() WHERE 1 = 1 ORDER BY 1 LIMIT 1 OFFSET 0`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sel, ok = stmt.(ast.Select)
+	if !ok || !sel.NoFrom || len(sel.List) != 4 || sel.Where == nil || len(sel.Order) != 1 || sel.Limit == nil || sel.Offset == nil {
+		t.Fatalf("unexpected NoFrom AST with clauses: %#v", stmt)
+	}
+}
+
+func TestParseSelectStarRequiresFrom(t *testing.T) {
+	if _, err := Parse(`SELECT *`); !nerr.HasCode(err, nerr.Syntax) {
+		t.Fatalf("expected Syntax error for SELECT * without FROM, got %v", err)
+	}
+}
+
+func TestParseSelectNoFromRejectsTableOnlyClauses(t *testing.T) {
+	for _, sql := range []string{
+		`SELECT 1 GROUP BY 1`,
+		`SELECT 1 HAVING 1 = 1`,
+		`SELECT 1 SEARCH title FOR 'x'`,
+		`SELECT 1 FACET x`,
+	} {
+		if _, err := Parse(sql); !nerr.HasCode(err, nerr.Syntax) {
+			t.Fatalf("%s: expected Syntax error, got %v", sql, err)
+		}
+	}
+}
+
 func TestParseWindow(t *testing.T) {
 	stmt, err := Parse(`SELECT k, ROW_NUMBER() OVER (PARTITION BY k ORDER BY v DESC) AS n FROM t`)
 	if err != nil {
@@ -1764,6 +1803,95 @@ func TestParseSetResetResourceGroup(t *testing.T) {
 	} {
 		if _, err := Parse(sql); err == nil {
 			t.Fatalf("accepted invalid SET/RESET form: %s", sql)
+		}
+	}
+}
+
+func TestParseSetConfig(t *testing.T) {
+	cases := []struct {
+		sql   string
+		key   string
+		value string
+		reset bool
+	}{
+		{`SET CONFIG buffer_pages = 4096`, "buffer_pages", "4096", false},
+		{`SET CONFIG log_level = 'debug'`, "log_level", "debug", false},
+		{`SET CONFIG require_client_key = TRUE`, "require_client_key", "true", false},
+		{`SET CONFIG raft_bootstrap = false`, "raft_bootstrap", "false", false},
+		{`SET CONFIG buffer_pages = DEFAULT`, "buffer_pages", "", true},
+		{`set config log_level = 'info'`, "log_level", "info", false}, // case-insensitive
+	}
+	for _, c := range cases {
+		stmt, err := Parse(c.sql)
+		if err != nil {
+			t.Fatalf("%s: %v", c.sql, err)
+		}
+		sc, ok := stmt.(ast.SetConfig)
+		if !ok {
+			t.Fatalf("%s: got %#v", c.sql, stmt)
+		}
+		if sc.Key != c.key || sc.Value != c.value || sc.Reset != c.reset {
+			t.Fatalf("%s: got %+v", c.sql, sc)
+		}
+	}
+
+	// system.config (and any bare identifier "config") is unaffected — this
+	// still parses as a SELECT, "config" is not a keyword.
+	if _, err := Parse(`SELECT * FROM system.config ORDER BY name`); err != nil {
+		t.Fatalf("SELECT FROM system.config regressed: %v", err)
+	}
+
+	for _, bad := range []string{
+		`SET CONFIG`,
+		`SET CONFIG buffer_pages`,
+		`SET CONFIG buffer_pages =`,
+		`SET CONFIG = 1`,
+		`SET CONFIG buffer_pages = (1)`,
+	} {
+		if _, err := Parse(bad); err == nil {
+			t.Fatalf("accepted invalid SET CONFIG: %s", bad)
+		}
+	}
+}
+
+func TestParseBackupStatements(t *testing.T) {
+	p := func(sql string) ast.Stmt {
+		t.Helper()
+		s, err := Parse(sql)
+		if err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+		return s
+	}
+	if _, ok := p("BACKUP DATABASE").(ast.BackupDatabase); !ok {
+		t.Fatal("BACKUP DATABASE did not parse to ast.BackupDatabase")
+	}
+	if _, ok := p("backup database").(ast.BackupDatabase); !ok {
+		t.Fatal("lowercase backup database did not parse")
+	}
+	vb, ok := p("VERIFY BACKUP 'backup-20260101T000000Z'").(ast.VerifyBackup)
+	if !ok || vb.Name != "backup-20260101T000000Z" {
+		t.Fatalf("VERIFY BACKUP = %#v", vb)
+	}
+	if _, ok := p("verify backup 'x'").(ast.VerifyBackup); !ok {
+		t.Fatal("lowercase verify backup did not parse")
+	}
+
+	// "verify" and "backup"/"database" stay usable as ordinary names.
+	if _, err := Parse("SELECT * FROM system.backups"); err != nil {
+		t.Fatalf("system.backups regressed: %v", err)
+	}
+
+	for _, bad := range []string{
+		"BACKUP",
+		"BACKUP TABLE",
+		"VERIFY",
+		"VERIFY BACKUP",
+		"VERIFY BACKUP x",
+		"VERIFY BACKUP ''",
+	} {
+		if _, err := Parse(bad); err == nil {
+			t.Fatalf("accepted invalid backup statement: %s", bad)
 		}
 	}
 }

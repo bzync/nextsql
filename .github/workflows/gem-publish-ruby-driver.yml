@@ -64,8 +64,8 @@ jobs:
       - name: Build
         run: gem build bzync-nextsql.gemspec
 
-      - name: Configure RubyGems trusted publishing
-        uses: rubygems/configure-trusted-publisher@v1
+      - name: Configure RubyGems trusted publishing (OIDC)
+        uses: rubygems/configure-rubygems-credentials@v2
 
       - name: Publish
         run: gem push bzync-nextsql-*.gem

@@ -24,3 +24,7 @@
 __pycache__/
 *.pyc
 *.gem
+.claude/
+.codex/
+.agents/
+.fixtures/

@@ -5,8 +5,12 @@ name: Publish Ruby driver to RubyGems
 # tag version must match drivers/ruby/lib/nextsql/version.rb, or the job fails
 # before publishing. Pure standard library, so no bundle/install step.
 #
-# Requires the RUBYGEMS_API_KEY repository secret (a RubyGems API key with the
-# "Push rubygem" scope). Mirrors npm-publish-node-driver.yml.
+# Uses RubyGems.org Trusted Publishing (OIDC) — configure a trusted publisher
+# on rubygems.org for gem "bzync-nextsql" with:
+#   repository  = bzync/nextsql
+#   workflow    = gem-publish-ruby-driver.yml
+#   environment = rubygems
+# (add it as a "pending" publisher before the gem exists). No API key secret.
 
 on:
   push:
@@ -19,16 +23,19 @@ on:
         required: false
         type: string
 
-defaults:
-  run:
-    working-directory: drivers/ruby
-
 permissions:
   contents: read
 
 jobs:
   publish:
     runs-on: ubuntu-latest
+    environment: rubygems
+    permissions:
+      contents: read
+      id-token: write # RubyGems Trusted Publishing
+    defaults:
+      run:
+        working-directory: drivers/ruby
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -38,7 +45,8 @@ jobs:
       - name: Set up Ruby
         uses: ruby/setup-ruby@v1
         with:
-          ruby-version: "3.3"
+          ruby-version: "3.4"
+          rubygems: latest
 
       - name: Verify tag matches version.rb
         run: |
@@ -53,9 +61,11 @@ jobs:
       - name: Test
         run: ruby -Ilib -Itest test/test_protocol.rb
 
-      - name: Build and publish
-        run: |
-          gem build bzync-nextsql.gemspec
-          gem push bzync-nextsql-*.gem
-        env:
-          GEM_HOST_API_KEY: ${{ secrets.RUBYGEMS_API_KEY }}
+      - name: Build
+        run: gem build bzync-nextsql.gemspec
+
+      - name: Configure RubyGems trusted publishing
+        uses: rubygems/configure-trusted-publisher@v1
+
+      - name: Publish
+        run: gem push bzync-nextsql-*.gem

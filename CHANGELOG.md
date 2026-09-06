@@ -23,6 +23,18 @@ A roadmap item is not recorded as completed here until its implementation, tests
 
 ## [Unreleased]
 
+### Added — Docker Hub image publishing (2026-09-07)
+
+- `.github/workflows/docker-publish-image.yml` builds the `Dockerfile` and
+  pushes multi-arch (`linux/amd64`, `linux/arm64`) images to
+  `docker.io/bzynchub/nextsql`: `edge` from `master`, semver tags from
+  `v*.*.*` release tags, and an immutable `sha-<short>` on every build.
+  Pull requests touching the image build it without pushing. Requires the
+  `DOCKERHUB_USERNAME` / `DOCKERHUB_TOKEN` repository secrets.
+- `Dockerfile` build stage now cross-compiles from `$BUILDPLATFORM` using
+  `GOOS`/`GOARCH` instead of emulating the Go toolchain under QEMU for the
+  non-native target, so the arm64 build no longer runs the compiler emulated.
+
 ### Fixed — silent data loss repairing a replica from backup + `AddVoter` (2026-09-03)
 
 - Writing the previously-missing regression test for the documented

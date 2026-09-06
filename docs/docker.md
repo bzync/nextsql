@@ -5,6 +5,22 @@ are persisted in `/var/lib/nextsql`; the root unlock key is persisted in the
 separate `/run/secrets` volume and is never placed in the database volume.
 Pages, WAL, and UNDO remain encrypted by default.
 
+## Prebuilt image
+
+Multi-arch images (`linux/amd64`, `linux/arm64`) are published to Docker Hub by
+the `Publish container image` workflow:
+
+```bash
+docker pull bzynchub/nextsql:0.1.0     # a released version
+docker pull bzynchub/nextsql:edge      # latest master build
+```
+
+Every build is also tagged `sha-<short>` for an immutable reference. The
+Compose files below build the image locally (`build: .`); to run a published
+image instead, replace `build: .` with `image: bzynchub/nextsql:0.1.0`.
+
+## Building locally
+
 Prepare a password file and TLS certificate/key. The certificate must include
 the hostname clients use. For a local-only development certificate:
 

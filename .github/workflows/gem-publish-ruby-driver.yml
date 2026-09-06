@@ -6,11 +6,9 @@ name: Publish Ruby driver to RubyGems
 # before publishing. Pure standard library, so no bundle/install step.
 #
 # Uses RubyGems.org Trusted Publishing (OIDC) — configure a trusted publisher
-# on rubygems.org for gem "bzync-nextsql" with:
-#   repository  = bzync/nextsql
-#   workflow    = gem-publish-ruby-driver.yml
-#   environment = rubygems
-# (add it as a "pending" publisher before the gem exists). No API key secret.
+# on rubygems.org for gem "bzync-nextsql" with repository "bzync/nextsql" and
+# workflow "gem-publish-ruby-driver.yml" (add it as a "pending" publisher
+# before the gem exists). No environment, no API key secret.
 
 on:
   push:
@@ -29,7 +27,6 @@ permissions:
 jobs:
   publish:
     runs-on: ubuntu-latest
-    environment: rubygems
     permissions:
       contents: read
       id-token: write # RubyGems Trusted Publishing

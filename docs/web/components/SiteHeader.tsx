@@ -27,19 +27,23 @@ export function SiteHeader({
     else setOpen(true);
   };
 
+  // Only lock body scroll for the overlay this component owns. In docs mode
+  // (`onMenu` set) DocsChrome renders the drawer and owns the scroll lock;
+  // running a second save/restore here nests with DocsChrome's and can leave
+  // `body { overflow: hidden }` stuck after the menu closes.
   useEffect(() => {
-    if (!menuOpen) return;
+    if (onMenu || !open) return;
     const previous = document.body.style.overflow;
     document.body.style.overflow = "hidden";
     const onKey = (event: KeyboardEvent) => {
-      if (event.key === "Escape" && !onMenu) setOpen(false);
+      if (event.key === "Escape") setOpen(false);
     };
     window.addEventListener("keydown", onKey);
     return () => {
       document.body.style.overflow = previous;
       window.removeEventListener("keydown", onKey);
     };
-  }, [menuOpen, onMenu]);
+  }, [open, onMenu]);
 
   const showOverlay = !onMenu && open;
 

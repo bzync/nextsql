@@ -15,7 +15,6 @@
 *pw
 /data/
 /tmp/
-/installers/
 /.gotmp/
 /.go-cache-*/
 /.p26-*

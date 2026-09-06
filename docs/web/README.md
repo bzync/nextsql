@@ -28,11 +28,11 @@ Deployed to GitHub Pages by `.github/workflows/docs-pages.yml` on every push to
 
 There's no admin UI — releases are data, edited directly:
 
-1. Add or edit the version's entry in `data/releases.json` (highlights, changelog,
-   artifact metadata) and commit it.
-2. Place the actual binaries under `public/downloads/<version>/` before running
-   `npm run build`. That directory is gitignored — CI needs its own step (or a
-   separate release pipeline) to fetch/stage the right binaries there before the
-   static build runs; nothing does this automatically today.
+1. Upload the installer artifacts to a GitHub Release (`gh release create vX.Y.Z
+   …`). Download buttons on `/download` point at
+   `https://github.com/bzync/nextsql/releases/download/v<version>/<filename>`.
+2. Add or edit the version's entry in `data/releases.json` (highlights, changelog,
+   artifact filename/size/sha256) and commit it. `public/downloads/` is gitignored
+   and unused; do not commit binaries.
 
 Markdown pages are in `content/docs/`; navigation is `lib/nav.ts`.

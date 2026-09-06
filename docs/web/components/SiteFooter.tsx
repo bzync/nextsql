@@ -53,7 +53,7 @@ export function SiteFooter() {
             </li>
             <li>
               <Link href="/docs/install" className="text-muted transition-colors hover:text-foreground">
-                Install from source
+                Install
               </Link>
             </li>
             <li>

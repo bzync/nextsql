@@ -75,7 +75,48 @@
           "text": "Official Go, Node/Bun/Deno, and PHP drivers. Keys never go in a URL."
         }
       ],
-      "artifacts": []
+      "artifacts": [
+        {
+          "id": "linux-amd64-deb",
+          "kind": "deb",
+          "platform": "linux-amd64",
+          "filename": "nextsql_0.1.0-dev_amd64.deb",
+          "size": 17798744,
+          "sha256": "514616cfdfcfb8377d1d20412f126ec4a795b8f97517557e4d15971cd8dbb8f6"
+        },
+        {
+          "id": "linux-amd64-run",
+          "kind": "run",
+          "platform": "linux-amd64",
+          "filename": "nextsql-0.1.0-dev-linux-amd64.run",
+          "size": 21299395,
+          "sha256": "44dd800e557c56310bbe9aa08611696f6d26213b73c42dac06fcd1dc9db09a39"
+        },
+        {
+          "id": "linux-amd64-tar",
+          "kind": "archive",
+          "platform": "linux-amd64",
+          "filename": "nextsql-0.1.0-dev-linux-amd64.tar.gz",
+          "size": 21299542,
+          "sha256": "b720553fdae9bb28ade5edfce270ba518eb8da336f098a6c1823ab058849f186"
+        },
+        {
+          "id": "windows-amd64-setup",
+          "kind": "setup",
+          "platform": "windows-amd64",
+          "filename": "nextsql-0.1.0-dev-windows-amd64-setup.exe",
+          "size": 19821770,
+          "sha256": "5094a4d82293d2b44761accba6204e6b863fa6648fc037ef400e1fb68282b2f8"
+        },
+        {
+          "id": "windows-amd64-zip",
+          "kind": "archive",
+          "platform": "windows-amd64",
+          "filename": "nextsql-0.1.0-dev-windows-amd64.zip",
+          "size": 17292474,
+          "sha256": "3d4e765925fd06c3ef2e347abd441dfd316be3dda975b7ecc01c8f4b9f1618af"
+        }
+      ]
     }
   ]
 }

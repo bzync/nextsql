@@ -54,7 +54,7 @@ export default async function DownloadPage() {
                   Release notes
                 </Link>
                 <Link href="/docs/install" className="text-muted hover:text-foreground">
-                  Install from source
+                  How to install
                 </Link>
               </div>
             </div>

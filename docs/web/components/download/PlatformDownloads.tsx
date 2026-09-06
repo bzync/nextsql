@@ -17,8 +17,14 @@ export function PlatformDownloads({ release }: { release: Release }) {
   const [platform, setPlatform] = useState<Platform>("linux-amd64");
 
   useEffect(() => {
-    setPlatform(detectPlatform());
-  }, []);
+    const detected = detectPlatform();
+    if (release.artifacts.some((artifact) => artifact.platform === detected)) {
+      setPlatform(detected);
+      return;
+    }
+    const first = release.artifacts[0]?.platform;
+    if (first) setPlatform(first);
+  }, [release.artifacts]);
 
   const matching = useMemo(
     () => release.artifacts.filter((artifact) => artifact.platform === platform),

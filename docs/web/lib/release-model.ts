@@ -1,5 +1,3 @@
-import { assetPath } from "@/lib/asset-path";
-
 export const PLATFORMS = [
   "linux-amd64",
   "linux-arm64",
@@ -98,8 +96,9 @@ function parseVersion(version: string): { nums: number[]; pre: string } {
   return { nums, pre };
 }
 
+/** GitHub Release download URL. Binaries are not hosted on the docs site. */
 export function artifactUrl(version: string, filename: string): string {
-  return assetPath(`/downloads/${encodeURIComponent(version)}/${encodeURIComponent(filename)}`);
+  return `https://github.com/bzync/nextsql/releases/download/v${encodeURIComponent(version)}/${encodeURIComponent(filename)}`;
 }
 
 export function formatBytes(size: number): string {

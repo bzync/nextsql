@@ -1,9 +1,10 @@
 name: Deploy docs site to GitHub Pages
 
 # docs/web is a pure static site (landing page, /docs, and /download — a
-# read-only release history; actual binaries live wherever they're hosted,
-# since public/downloads/** is gitignored). `next build` emits static HTML
-# into out/, which this workflow publishes to GitHub Pages as-is.
+# read-only release history). Installer binaries live on GitHub Releases;
+# /download links to github.com/bzync/nextsql/releases/download/….
+# `next build` emits static HTML into out/, which this workflow publishes
+# to GitHub Pages as-is.
 
 on:
   push:

@@ -2,7 +2,7 @@
 
 A complete first session: install the engine, initialize, serve, create a multimodel table, write, query, index, and inspect.
 
-Install `nextsql` and `nextsqld` first — see [Install](/docs/install). For a container, see [Docker](/docs/docker). `nextsql setup --profile production` is the non-interactive live-install path (fail-closed preflight plus operational defaults). This walkthrough uses `nextsql init` so you can see each file. Use two terminals. Paths below are examples. In production put the key file on a different volume from `--data-dir`.
+Install `nextsql` and `nextsqld` first — Linux and Windows packages are on [Downloads](/download); steps are in [Install](/docs/install). For a container, see [Docker](/docs/docker). `nextsql setup --profile production` is the non-interactive live-install path (fail-closed preflight plus operational defaults). This walkthrough uses `nextsql init` so you can see each file. Use two terminals. Paths below are examples. In production put the key file on a different volume from `--data-dir`.
 
 ## Create a password file and initialize
 

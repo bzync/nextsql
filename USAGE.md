@@ -4,7 +4,14 @@ End-to-end user documentation for **NextSQL 0.1.0-dev**. This manual documents t
 
 NextSQL is a new database. It is not PostgreSQL, MySQL, MongoDB, Elasticsearch, or a vector-store compatibility layer. It has its own storage format, SQL dialect, wire protocol (NSQL v1), and official drivers.
 
-**Implementation status (2026-08-29):** phases 0–15 and P19 are complete. P16 correctness/SLO closure remains open. P17 schema lifecycle + storage maintenance is shipped except `REBUILD INDEX ... ONLINE`, which remains deliberately rejected/deferred. P18's implementable SQL-completeness scope is shipped; partition-wise aggregation/join waits for broader P21 work. P20 is complete. P21 has a bounded RANGE/HASH/LIST physical-partitioning slice with ADD/DROP and validated ATTACH/DETACH ownership-transfer DDL, local non-unique B+Tree-family indexes, and stable-ID row statistics; broader P21 gates and P22–P30 remain open.
+**Implementation status (2026-09-04):** phases P0–P27 are complete. P28 is
+in progress: `nextsql setup`/`nextsql lifecycle` and the nine-slice Manager
+MVP are complete; standalone GUI installer M1 is implemented and
+targeted-tested, while packaging integration, richer wizard flows,
+accessibility validation, silent-install coverage, and remaining platform
+execution gates are open. Multi-database hosting M2 is complete; M3
+suspend/resume and offline drop are landed, while independent backup/PITR,
+key, and HA lifecycle remain open.
 
 Treat 0.1.0-dev as an engine under measurement, not a drop-in production replacement, until you have run `nextsql-bench --slo` plus the relevant crash, recovery, security, and HA suites on your hardware.
 
@@ -91,6 +98,8 @@ Internal format and design notes live in [`docs/`](docs/). This file is the oper
 
 | `nextsql-auth-broker` | Optional. OIDC token-exchange broker: validates an external ID token and mints an `NSSC1.` short-lived credential. `nextsqld` never talks to it |
 
+| `nextsql-admin` | NextSQL Admin — one binary, three modes: Setup (token-authenticated loopback wizard that drives `nextsql setup`), Operations (loopback web UI over the native driver, server-enforced RBAC), Studio (placeholder, P29) |
+
 ### Files that matter
 
 A data directory is **not** a single file. After `nextsql init` and the first server start you typically have:
@@ -111,7 +120,7 @@ DATA-DIR/
 
   nextsql.db.undo/      encrypted UNDO log
 
-  nextsql.users         password hashes (PBKDF2-HMAC-SHA256)
+  nextsql.users         versioned password hashes (Argon2id; legacy PBKDF2 readable)
 
   nextsql.acl           roles and grants
 
@@ -161,13 +170,13 @@ Linux:
 
 ```bash
 
-sudo dpkg -i dist/nextsql_*_amd64.deb
+sudo dpkg -i installers/nextsql_*_amd64.deb
 
-# or: sudo ./dist/nextsql-*-linux-amd64.run
+# or: sudo ./installers/nextsql-*-linux-amd64.run
 
 ```
 
-Windows: run `dist/nextsql-*-windows-amd64-setup.exe` as Administrator (`/S` for silent).
+Windows: run `installers/nextsql-*-windows-amd64-setup.exe` as Administrator (`/S` for silent).
 
 The packages copy binaries and a config file. They do **not** initialize a data directory or start `nextsqld`. After install:
 
@@ -187,6 +196,21 @@ sudo systemctl enable --now nextsql          # Linux
 
 Layout, silent flags, and user-local Linux installs: [`packaging/README.md`](packaging/README.md).
 
+For a secure non-interactive first run, use `nextsql setup`; for the GUI Setup-mode
+flow, build `nextsql-admin` beside `nextsql` and run it against an uninitialized
+data directory (it auto-detects Setup mode):
+
+```bash
+nextsql setup --data-dir /var/lib/nextsql --key-file /etc/nextsql/root.key \
+  --preset balanced --user app --password-file /tmp/nextsql.pw
+nextsql-admin                   # opens a token-authenticated loopback wizard (Setup mode)
+```
+
+The GUI currently covers welcome, paths/dry-run validation, resource preset,
+administrator, summary, install, and completion. It is not yet bundled as the
+default OS-package entry point. See [`docs/install.md`](docs/install.md) and
+[`docs/design-admin-setup.md`](docs/design-admin-setup.md).
+
 ### Build from source
 
 Requires **Go 1.22+**.
@@ -203,6 +227,10 @@ go build -o nextsqld      ./cmd/nextsqld
 
 go build -o nextsql-bench ./cmd/nextsql-bench
 
+go build -o nextsql-auth-broker ./cmd/nextsql-auth-broker
+
+go build -o nextsql-admin ./cmd/nextsql-admin
+
 ```
 
 Confirm:
@@ -215,7 +243,11 @@ Confirm:
 
 ```
 
-Official drivers live in the same tree (`drivers/go`, `drivers/node`, `drivers/bun`, `drivers/deno`, `drivers/php`, `drivers/python`, `drivers/ruby`). They are not published as public packages.
+Official drivers live in the same tree (`drivers/go`, `drivers/node`,
+`drivers/bun`, `drivers/deno`, `drivers/php`, `drivers/python`,
+`drivers/ruby`). Node.js is published/configured as the public MIT package
+`@bzync/nextsql`; the others are currently used from the repository unless
+their package metadata says otherwise.
 
 ---
 
@@ -527,9 +559,25 @@ See [`docs/sql.md`](docs/sql.md) for catalog internals.
 
 | `STRING` / `TEXT` | UTF-8. Same encoding; `TEXT` is the long-form name |
 
+| `BLOB` | Raw bytes; `X'<hex>'` literals; byte-lexicographic ordering |
+
+| `CHAR(n)` / `VARCHAR(n)` | UTF-8 character-count bounds; `CHAR` pads on assignment and ignores trailing spaces for comparison |
+
+| `INT8` / `INT16` / `INT32` / `INT64` | Exact fixed-width signed integers; narrowing is range checked |
+
+| `UINT8` / `UINT16` / `UINT32` / `UINT64` | Exact fixed-width unsigned integers; negative/narrowing assignments fail |
+
 | `DECIMAL(p,s)` | `1 ≤ p ≤ 38`, `s ≤ p`. Unscaled integer + scale. `DEFAULT AI()` when `s = 0` |
 
 | `TIMESTAMPTZ` | UTC nanoseconds. `DEFAULT NOW()` |
+
+| `DATE` / `TIME` / `TIMESTAMP` | Civil date, time-of-day, and timezone-free civil timestamp |
+
+| `INTERVAL` | Months + days + nanoseconds; native date/time arithmetic |
+
+| `FLOAT32` / `FLOAT64` | IEEE 754 finite values; NaN and infinities are rejected |
+
+| `ENUM('label', …)` | Declaration-order scalar; catalog labels are part of the type |
 
 | `JSON` | Compact binary `NSJB`. Insert a JSON text literal |
 
@@ -541,6 +589,8 @@ See [`docs/sql.md`](docs/sql.md) for catalog internals.
 
 | `BITVECTOR<N>` | `N` single-bit elements packed into `ceil(N/8)` bytes (1/32 of `VECTOR<F32,N>`). Each element must be `0` or `1` on write. Ranks by `HAMMING` (default and only metric); widened to `float32` `0`/`1` for all math and `NEAREST` |
 
+| `SPARSEVECTOR<N>` | Sorted non-zero coordinate/value pairs; sparse inverted index and cosine/inner-product retrieval |
+
 | `POINT` / `LOCATION` | WGS84 longitude, latitude |
 
 | `BOX` | west, south, east, north |
@@ -548,6 +598,14 @@ See [`docs/sql.md`](docs/sql.md) for catalog internals.
 | `LINESTRING` | at least two vertices |
 
 | `POLYGON` | closed exterior ring, optional holes; 256-vertex cap |
+
+| `GEOMETRY[(subtype, srid)]` / `GEOGRAPHY[(subtype, srid)]` | General OGC common-subset geometry with EWKB storage; planar vs geodetic semantics |
+
+| `STRUCT<name T, …>` | Fixed named heterogeneous fields; nested field access with `col.field` |
+
+| `ARRAY<T>` | Bounded homogeneous nested sequence; `ELEMENT_AT`, `CARDINALITY`, `ARRAY_CONTAINS` |
+
+| `MAP<K,V>` | Canonically key-sorted map with scalar orderable keys; lookup/key/value helpers |
 
 A table **must** declare `PRIMARY KEY`. Secondary indexes store secondary key + primary key. B-tree indexes may add `INCLUDE (cols)`, `WHERE predicate`, and expression keys such as `LOWER(name)`; `EXPLAIN` shows `covering` when the scan does not fetch the heap.
 
@@ -571,7 +629,7 @@ CREATE VECTOR INDEX … USING IVFPQ WITH (LISTS = n, SUBSPACES = M [, PROBES = m
 
 DROP INDEX [IF EXISTS] name
 
-REBUILD INDEX name
+REBUILD INDEX name [ONLINE]
 
 MAINTAIN DATABASE
 
@@ -606,6 +664,12 @@ CREATE ROLE / DROP ROLE
 
 GRANT / REVOKE
 
+CREATE / ALTER / DROP RESOURCE GROUP; SET / RESET RESOURCE GROUP
+
+SET CONFIG key = value
+
+BACKUP DATABASE; VERIFY BACKUP 'name'
+
 ```
 
 ### Functions (common)
@@ -622,7 +686,9 @@ GRANT / REVOKE
 
 | Vector | `COSINE(a,b)`, `L2(a,b)`, `INNER_PRODUCT(a,b)` |
 
-| Geo | `POINT`, `BOX`, `LON`/`LAT`, `DISTANCE`, `DISTANCE_SPHEROID`, `DWITHIN`, `WITHIN`, `COVERS`, `LINELENGTH` (and `ST_*` aliases) |
+| Geo | fixed WGS84 constructors plus `ST_*` measurement, predicate, overlay, WKT/EWKB/GeoJSON helpers for `GEOMETRY`/`GEOGRAPHY` |
+
+| Collections | `STRUCT`, `ARRAY`, `MAP`, `ELEMENT_AT`, `CARDINALITY`/`ARRAY_LENGTH`, `MAP_SIZE`, containment/key/value helpers |
 
 ### Index lifecycle and maintenance
 
@@ -633,9 +699,13 @@ DROP INDEX ix_category;
 DROP INDEX IF EXISTS ix_old;
 
 REBUILD INDEX ix_category;
+REBUILD INDEX ix_category ONLINE;
 ```
 
-`REBUILD INDEX name` is currently a **blocking** rebuild. `REBUILD INDEX name ONLINE` is intentionally rejected until concurrent-write correctness is proven; do not treat the blocking implementation as online.
+`REBUILD INDEX name` is the blocking fallback. `REBUILD INDEX name ONLINE`
+uses a shadow tree plus concurrent-write mirroring for non-partitioned
+B+Tree/UNIQUE/JSON-path/spatial indexes. Partitioned, vector, and full-text
+indexes remain on the explicit blocking path.
 
 Maintenance is bounded and observable:
 
@@ -986,7 +1056,11 @@ Details: [`docs/optimizer.md`](docs/optimizer.md).
 
 ## 10. Geospatial
 
-Coordinates are **(longitude, latitude)** on WGS84. This is not PostGIS.
+The fixed `POINT`/`BOX`/`LINESTRING`/`POLYGON` family uses **(longitude,
+latitude)** on WGS84. General `GEOMETRY` (planar) and `GEOGRAPHY` (geodetic)
+types sit alongside it with explicit subtype/SRID declarations and OGC
+common-subset values; NextSQL defines native semantics rather than claiming
+PostGIS compatibility.
 
 ```sql
 
@@ -1024,11 +1098,20 @@ SELECT DISTANCE_SPHEROID(POINT(-74.0060, 40.7128), POINT(-118.2437, 34.0522));
 
 WKT also coerces: `POINT(lon lat)`, `BOX(w s, e n)`, `LINESTRING(...)`, `POLYGON((...))`.
 
-`CREATE SPATIAL INDEX` requires a single `POINT` column (not `UNIQUE`). The optimizer uses a Morton geohash prefix for `DWITHIN`, `DISTANCE(col, const) < r`, `WITHIN`, and `COVERS`. The residual predicate is exact. `EXPLAIN` shows `IndexScan … spatial`.
+`CREATE SPATIAL INDEX` accepts one fixed `POINT` column or one
+`GEOMETRY`/`GEOGRAPHY` column (not `UNIQUE`). It indexes a conservative
+bounding envelope and always retains the exact predicate as a residual.
+`EXPLAIN` shows `IndexScan … spatial`.
 
 `DISTANCE` is haversine meters. `DISTANCE_SPHEROID` is Vincenty on the WGS84 ellipsoid; near-antipodal pairs fall back to haversine.
 
-3D, geography-vs-geometry dual types, and spheroidal distance-to-polyline are not implemented. Details: [`docs/geo.md`](docs/geo.md).
+General values support Point/LineString/Polygon, MultiPoint/MultiLineString/
+MultiPolygon, and GeometryCollection; WKT/EWKB/GeoJSON conversion, bounded
+predicates/overlay, and all seven driver codecs are implemented. 3D/M,
+curves, raster, arbitrary PROJ transforms, a true R-tree, aggregate
+`ST_Collect`/`ST_Extent`, and full spheroidal overlay/distance-to-polyline
+remain out of scope. Details: [`docs/geo.md`](docs/geo.md) and
+[`docs/design-spatial.md`](docs/design-spatial.md).
 
 ---
 
@@ -1525,7 +1608,9 @@ Priority, highest wins: explicit flags (including empty strings) > non-empty pro
 
 | `NEXTSQL_IDP_CONFIG` | OIDC client profile file | user config dir `nextsql/config.toml` |
 
-| `NEXTSQL_DATABASE` | Hello database; validated against registered default when present | empty (select default) |
+| `NEXTSQL_REALM_NAME` | Hello realm for hosted routing | empty (server default) |
+
+| `NEXTSQL_DATABASE` | Hello database; routed within the selected/default realm | empty (server default) |
 
 | `NEXTSQL_TLS_CA` | PEM CA / server cert | none |
 
@@ -2827,7 +2912,9 @@ go test ./tests/integration ./tests/crash ./tests/ha
 
 | JSON depth / size | 32 / 1 MiB |
 
-| Vector dimension | 8192, finite elements |
+| Vector dimension | 8192 dense/bit; 65535 sparse, finite elements |
+
+| Collection nesting / length | depth 8 / 1,048,576 elements |
 
 | LINESTRING / POLYGON vertices | 256 |
 
@@ -2851,7 +2938,7 @@ P17/P18 added user-visible behavior that older copies of this manual did not des
 
 - `DROP INDEX [IF EXISTS] name` for shipped index types
 
-- blocking `REBUILD INDEX name`
+- blocking `REBUILD INDEX name` plus online rebuild for its proven non-partitioned B+Tree-family scope
 
 - safe heap/index page reclamation and durable freelist reuse
 
@@ -2863,7 +2950,7 @@ P17/P18 added user-visible behavior that older copies of this manual did not des
 
 ### Deliberately not shipped / still open
 
-- `REBUILD INDEX ... ONLINE` — blocking rebuild is the shipped path; `ONLINE` remains rejected until concurrent-write safety is proven
+- `REBUILD INDEX ... ONLINE` remains unavailable for partitioned, vector, and full-text indexes; those use blocking rebuild
 
 - P16 is **complete** (exit gate green); the terminal 100M B+Tree invariant soak is a deferred standalone measurement, not a release gate
 
@@ -2877,15 +2964,15 @@ P17/P18 added user-visible behavior that older copies of this manual did not des
 
 - P24 Full-text Search 2.0 is complete; further language analyzers beyond `simple` / `english` / `french` / `german` / `spanish` and additional runtime/index optimizations are documented non-gate follow-ons
 
-- P25 Security 2.0 is **complete** (exit gate closed 2026-09-02, `docs/security.md` "P25 security review sign-off"): mTLS/service identities, live certificate/trust rotation, X.509 CRL revocation, signed short-lived credentials, the external-IdP broker, field-level client encryption (experimental SQL/catalog/server slice, all official drivers, PITR, replication/failover, and `FileFieldKeyring` key rotation/revocation), Argon2id password hashing, and tamper-evident/signed audit-chain hardening are all production-gated. OCSP and optional OIDC opaque introspection/JIT remain off by design, not as open blockers
+- P25 Security 2.0 is **complete** (exit gate closed 2026-09-02, `docs/security.md` "P25 security review sign-off"): mTLS/service identities, live certificate/trust rotation, X.509 CRL revocation, signed short-lived credentials, the external-IdP broker, field-level client encryption (the five driver families in P25 scope, PITR, replication/failover, and `FileFieldKeyring` key rotation/revocation), Argon2id password hashing, and tamper-evident/signed audit-chain hardening are production-gated. Python/Ruby field-encryption helpers remain open; OCSP and optional OIDC opaque introspection/JIT remain off by design
 
-- P26 System catalog / introspection 2.0 is **complete** (exit gate closed 2026-09-02, `docs/system-catalog.md` "P26 exit gate closure"): the virtual `system` schema (catalog/storage/replication/live session/security-administration tables), nine `SHOW` convenience aliases, and an authoritative capability registry are all production-gated. The current release gate is P27 Operational maturity + workload governance
+- P26 System catalog / introspection 2.0 is **complete** (exit gate closed 2026-09-02, `docs/system-catalog.md` "P26 exit gate closure"): the virtual `system` schema (catalog/storage/replication/live session/security-administration tables), nine `SHOW` convenience aliases, and an authoritative capability registry are production-gated
 
-- P27 workload governance / operational maturity
+- P27 workload governance / operational maturity is **complete** (exit gate closed 2026-09-03)
 
-- P28 Professional Installer + NextSQL Manager
+- P28 (NextSQL Admin — Setup + Operations modes) is **in progress**: setup/lifecycle and the Operations-mode MVP are complete; Setup mode M1 is implemented and targeted-tested; the remaining installer platform, packaging, silent-install, richer-wizard, and accessibility gates are open
 
-- P29 web-based NextSQL Studio
+- P29 NextSQL Admin — Studio mode (web-based NextSQL Studio)
 
 - P30 NextSQL Intelligence + built-in RAG
 
@@ -2913,14 +3000,13 @@ P17/P18 added user-visible behavior that older copies of this manual did not des
 
 ### Planned features are not current syntax
 
-`PROJECT.md` describes the intended finished product. This manual does **not** expose unchecked P25–P30 grammar as usable syntax before implementation. P0–P24 shipped surfaces are documented above.
+`PROJECT.md` describes the intended finished product. This manual does **not**
+expose unchecked P28–P30 grammar as usable syntax before implementation.
+P0–P27 shipped surfaces and the implemented P28 increments are documented
+above.
 
-For example, do not assume these work merely because they are planned:
-
-```text
-Follower-read consistency syntax
-follower-read consistency syntax
-```
+For example, do not assume Studio or Intelligence syntax exists merely because
+it appears in the intended product document.
 
 Check `TODO.md`, server capability metadata when available, and the matching-version manual before using a planned feature.
 
@@ -2944,7 +3030,8 @@ the database; some tables layer RBAC filtering on top.
 Catalog/storage tables (always visible, or filtered to tables you can
 `SELECT`): `capabilities`, `tables`, `columns`, `indexes`, `table_stats`,
 `index_stats`, `partitions`, `storage`, `replication` (alias `raft`),
-`replica_health`, `workflows`, `tasks`.
+`replica_health`, `workflows`, `tasks`, `resource_groups`, `realms`,
+`databases`, and `quotas`.
 
 Live, node-local, in-memory tables — cleared on restart, not replicated, one
 per `nextsqld` process; a non-admin sees only their own rows:
@@ -2968,6 +3055,14 @@ The convenience aliases `SHOW DATABASES`, `SHOW TABLES`, `SHOW INDEXES`,
 `system.*` sources. They accept no clauses; use a direct system-table query
 for filtering, ordering, or pagination. Full reference:
 [docs/system-catalog.md](docs/system-catalog.md).
+
+Additional admin-only operational tables back the completed Manager MVP:
+`system.users`, `roles`, `grants`, `tls`, `key_versions`, `audit_verify`,
+`audit_log`, `config`, `metrics`, `server_log`, and `backups`. The current
+column-contract capability is `system_schema_v3`. Process-level sources such
+as TLS/config/log/metrics/backups are still attached only to the primary DB in
+multi-database hosting mode; a secondary manager-opened database may therefore
+return an empty/not-attached view for those process-wide sources.
 
 ---
 

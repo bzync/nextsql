@@ -2,9 +2,9 @@
 
 NextSQL exposes a read-only virtual `system` schema: ordinary `SELECT`
 against tables that are computed on the fly from live server/catalog state,
-not stored rows. It is the one supported way for Studio/Manager, drivers, or
-operators to introspect a database without reading data-directory files
-directly.
+not stored rows. It is the one supported way for NextSQL Admin (any mode),
+drivers, or operators to introspect a database without reading data-directory
+files directly.
 
 ```sql
 SELECT * FROM system.tables;
@@ -35,6 +35,10 @@ Raft/replication layer) and are visible to any connected user unless noted.
 | `system.tables` | `name, id, column_count, pk, legacy_tenant_column` | Filtered to tables the caller has `SELECT` on (table- or database-scoped), or all tables for an admin. |
 | `system.columns` | `table_name, column_name, ordinal, type, not_null, is_primary, default_value` | Same table-visibility filter as `system.tables`. |
 | `system.indexes` | `table_name, index_name, kind, is_unique, columns, include_columns, predicate, status` | Same table-visibility filter. |
+| `system.foreign_keys` | `table_name, constraint_name, ordinal, column_name, ref_table, ref_column, on_delete, on_update` | One row per referencing column, ordered by child table then constraint then `ordinal` (1-based position within the key). `on_delete`/`on_update` are `RESTRICT` (NextSQL's stored form of `NO ACTION`), `CASCADE`, `SET NULL`, or `SET DEFAULT`. `ref_column` is blank if the referenced table is not currently visible in the catalog. Filtered by `SELECT` on the referencing (child) table — same rule as `system.columns`. |
+| `system.table_ddl` | `table_name, object_type, object_name, ddl` | One row per visible table (`object_type` = `TABLE`, `object_name` = the table) and one per index on it (`object_type` = `INDEX`, `object_name` = the index). `ddl` is the canonical `CREATE` statement rendered by the same `internal/catalog/ddl` code that backs SQL backup/restore export — FK ordinals, expression/JSON-path indexes, vector method/quantization, full-text analyzer, ENUM/CHAR/VARCHAR types, `DEFAULT` literals. Ordered by `table_name`, then `TABLE` before `INDEX`, then `object_name`. A render error for one object appears as a `-- unavailable: …` comment in its `ddl` cell rather than failing the query. Same table-visibility filter as `system.tables`. |
+| `system.triggers` | `name, owner, timing, event, table_name, workflow, arg_count` | One row per row trigger. `timing` is `BEFORE` or `AFTER`; `event` is `INSERT`, `UPDATE`, or `DELETE`. Filtered by `SELECT` on the table the trigger fires on, the same rule as `system.foreign_keys`; this intentionally exposes the invoked workflow name as a dependency of that visible table, but not the workflow body. |
+| `system.schedules` | `name, owner, kind, spec, workflow, enabled, next_fire, last_fire` | One row per schedule. `kind` is `AT`, `EVERY`, or `CRON`; `spec` is UTC RFC 3339, Go duration text, or the stored cron expression respectively. `next_fire`/`last_fire` are typed `TIMESTAMPTZ` values and are `NULL` until known. Filtered by visibility of the invoked workflow (`EXECUTE` on that workflow, database-scoped `SELECT`, or admin), the same rule as `system.workflows`. |
 | `system.table_stats` | `table_name, row_count, updated_at` | Same table-visibility filter. |
 | `system.index_stats` | `table_name, index_name, row_count` | Same table-visibility filter. |
 | `system.partitions` | see `docs/partitioning.md` | Same table-visibility filter. |
@@ -97,9 +101,9 @@ table.
 
 | Table | Columns | Notes |
 |---|---|---|
-| `system.config` | `name, value, file_value, restart_required` | One row per setting the running process's `config.Config` or the node's on-disk `nextsql.conf` sets away from its default (`config.DiffState`, which reuses `Config.Marshal`'s exact field list and zero-value-omission rule). `value` is the running value; `file_value` is what `nextsql.conf` currently says; `restart_required` (`"yes"`/`"no"`) is set when they differ — either because `SET CONFIG` persisted a change not yet applied, or because a startup flag overrode the file. Admin-only; list-shaped like `system.key_versions`, so it returns **zero rows** (not a placeholder row) for embedded/CLI use with no process-level `config.Config`. **Every network-address-shaped value is redacted** in both `value` and `file_value` to `[redacted]` (`listen_addr`, `raft_bind`, `raft_join`, `auth_broker_listen`) — same "never expose a network address over SQL" convention as `system.replication.leader_addr` — but `restart_required` is still computed from the *unredacted* values, so it stays correct for those keys. Nothing else is redacted: `Config` itself never holds key material or passwords (only file *paths* to them). The column is named `name`, not `key` (`KEY` is a reserved word — `PRIMARY KEY`/`FOREIGN KEY` — with no quoted-identifier escape). The write side is the `SET CONFIG` statement (`docs/sql.md`) — cluster `ADMIN`, persist-only to `nextsql.conf`, effective on restart; it backs the NextSQL Manager's Configuration editor (`docs/design-manager.md` M8). |
+| `system.config` | `name, value, file_value, restart_required` | One row per setting the running process's `config.Config` or the node's on-disk `nextsql.conf` sets away from its default (`config.DiffState`, which reuses `Config.Marshal`'s exact field list and zero-value-omission rule). `value` is the running value; `file_value` is what `nextsql.conf` currently says; `restart_required` (`"yes"`/`"no"`) is set when they differ — either because `SET CONFIG` persisted a change not yet applied, or because a startup flag overrode the file. Admin-only; list-shaped like `system.key_versions`, so it returns **zero rows** (not a placeholder row) for embedded/CLI use with no process-level `config.Config`. **Every network-address-shaped value is redacted** in both `value` and `file_value` to `[redacted]` (`listen_addr`, `raft_bind`, `raft_join`, `auth_broker_listen`) — same "never expose a network address over SQL" convention as `system.replication.leader_addr` — but `restart_required` is still computed from the *unredacted* values, so it stays correct for those keys. Nothing else is redacted: `Config` itself never holds key material or passwords (only file *paths* to them). The column is named `name`, not `key` (`KEY` is a reserved word — `PRIMARY KEY`/`FOREIGN KEY` — with no quoted-identifier escape). The write side is the `SET CONFIG` statement (`docs/sql.md`) — cluster `ADMIN`, persist-only to `nextsql.conf`, effective on restart; it backs NextSQL Admin's Operations-mode Configuration editor (`docs/design-admin-operations.md` M8). |
 
-## Diagnostics (Manager M9)
+## Diagnostics (Operations mode M9)
 
 | Table | Columns | Notes |
 |---|---|---|
@@ -192,9 +196,24 @@ diagnostic data source exists.
 | RBAC coverage breadth | yes | yes | yes | yes | `system.table_stats`/`system.index_stats`/`system.partitions` (share `canSeeTable` with `system.tables`/`columns`/`indexes`) and `system.workflows` (`canSeeWorkflow`) now each have a dedicated pinning test (`TestSystemCatalogRBACRemainingViews`), not just their better-known siblings. |
 | Realm/database visibility | yes | yes | yes | yes | Structural, not filter-based: `protocol.Server` holds exactly one `*executor.DB`, and `cmd/nextsqld`'s `openHostedDefault` opens exactly one realm/database pair per process via `hosting.Registry.Default()`. No code path today lets a session observe another realm's or database's `system.*` rows, because no process ever has more than one open at once. This is a hard prerequisite to revisit if/when a multi-database-per-process `DatabaseManager` (`docs/design-multidatabase-dbaas.md` §9) ships — that is out of scope for P26 and stays a documented future gap, not a current one. |
 
-`Production-gated = no` above means P26 itself is still open; it does not
-revoke the production-gated status of earlier phases whose state these views
-report.
+The historic `Production-gated = no` cells above record the audit state before
+the P26 closure immediately below; that dated closure supersedes them. They do
+not revoke the production-gated status of earlier phases whose state these
+views report.
+
+## P29 catalog-extension audit (2026-09-06)
+
+These definition views were added after P26 closed, for official-interface
+Studio inspection. They are virtual query-time projections of the existing
+catalog: no persistent, WAL, recovery, Raft, wire, or driver format changes.
+Adding whole views does not change an existing view's columns, so
+`SchemaVersion` remains 3.
+
+| Surface | Designed | Implemented | Tested | Production-gated | Evidence / remaining work |
+|---|---:|---:|---:|---:|---|
+| `system.triggers` definition view | yes | yes | yes | no | Shape/value/drop lifecycle in `TestSystemTriggersAndSchedules`; independent table-visibility gates in `TestSystemTriggersAndSchedulesRBAC`. P29 exit gate remains open. |
+| `system.schedules` definition view | yes | yes | yes | no | EVERY formatting, enabled/next/typed-null last-fire state in `TestSystemTriggersAndSchedules`; workflow-EXECUTE visibility separated from table visibility in `TestSystemTriggersAndSchedulesRBAC`. P29 exit gate remains open. |
+| Bounded Studio relationship consumer | yes | yes | yes | no | Every workflow-explorer result is capped at 500 rows and explicitly marked truncated; live Admin integration plus pure graph bounds and real-browser/axe coverage. P29 exit gate remains open. |
 
 ## P26 exit gate closure (2026-09-02)
 

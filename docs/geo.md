@@ -101,4 +101,8 @@ SELECT * FROM routes
 WHERE ST_Intersects(path, POLYGON('((-74 40, -73 40, -73 41, -74 41, -74 40))'));
 ```
 
-3D, geography-vs-geometry dual types, and spheroidal distance-to-polyline are not implemented.
+The general `GEOMETRY` / `GEOGRAPHY` family, including SRIDs, OGC collection
+shapes, EWKB/WKT/GeoJSON, predicates, measurements, overlay operations, and
+spatial indexing, is documented in `docs/design-spatial.md`. Remaining limits
+include 3D coordinates and a fully ellipsoidal geodesic-to-polyline model for
+the four fixed native WGS84 shapes.

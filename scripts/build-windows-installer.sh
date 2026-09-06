@@ -6,6 +6,7 @@
 #   scripts/build-windows-installer.sh
 #   scripts/build-windows-installer.sh --arch amd64,arm64 --out installers
 set -euo pipefail
+shopt -s inherit_errexit
 
 ROOT="$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)"
 # shellcheck source=../packaging/lib.sh
@@ -22,6 +23,7 @@ SKIP_ZIP=0
 SKIP_SETUP=0
 SKIP_NSIS=0
 NAME="nextsql"
+GPG_KEY="${NEXTSQL_RELEASE_GPG_KEY:-}"
 
 usage() {
 	cat <<EOF
@@ -33,6 +35,9 @@ Usage: $(basename "$0") [options]
   --skip-zip      Do not write the portable zip.
   --skip-setup    Do not write the self-extracting setup.exe.
   --skip-nsis     Do not run makensis even if it is installed.
+  --gpg-key ID    Detached-sign SHA256SUMS.windows with this GPG key (also
+                  settable via NEXTSQL_RELEASE_GPG_KEY). Unset by default —
+                  no release-signing key exists in this repo/CI yet.
   -h, --help      Show this help.
 
 Cross-compiles with CGO_ENABLED=0. NSIS is optional; the Go setup.exe is
@@ -52,6 +57,8 @@ while [ $# -gt 0 ]; do
 	--skip-zip) SKIP_ZIP=1 ;;
 	--skip-setup) SKIP_SETUP=1 ;;
 	--skip-nsis) SKIP_NSIS=1 ;;
+	--gpg-key) GPG_KEY="${2:?}"; shift ;;
+	--gpg-key=*) GPG_KEY="${1#--gpg-key=}" ;;
 	*) die "unknown argument: $1" ;;
 	esac
 	shift
@@ -212,6 +219,8 @@ info "checksums"
 		sha256sum "$f" >>SHA256SUMS.windows
 	done
 )
+
+sign_checksums "$DIST/SHA256SUMS.windows" "$GPG_KEY"
 
 info "Windows installers"
 printf '    %s\n' "${ARTIFACTS[@]}"

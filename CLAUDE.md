@@ -39,7 +39,8 @@ go build ./...
 go build -o nextsql ./cmd/nextsql
 go build -o nextsqld ./cmd/nextsqld
 go build -o nextsql-bench ./cmd/nextsql-bench
-go build -o nextsql-manager ./cmd/nextsql-manager
+go build -o nextsql-auth-broker ./cmd/nextsql-auth-broker
+go build -o nextsql-admin ./cmd/nextsql-admin
 ```
 
 No Makefile — plain `go` tooling throughout. `go vet ./...` should stay clean.
@@ -146,11 +147,12 @@ leader means writes fail closed. SQL is not re-executed on followers (`UUID()`/`
 `AI()` stay deterministic — they're captured once and replicated).
 
 **Multi-database hosting** (`internal/hosting`, `internal/dbmanager`): a separate,
-in-progress cross-cutting track (`docs/design-multidatabase-dbaas.md`) layering
-selectable multi-database/multi-realm routing, shared buffer/task-worker/scheduler
-budgets, and per-realm auth on top of the single-database engine above. Track its own
-milestone state (M1/M2/M3...) in that design doc and in `TODO.md`, separate from the
-P0–P30 phase list.
+in-progress cross-cutting track (`docs/design-multidatabase-dbaas.md`). M2 selectable
+multi-realm/multi-database routing is complete, with realm-scoped auth, bounded open
+handles/idle eviction, a shared buffer budget, and shared task workers/scheduling. M3
+suspend/resume and offline managed-database drop have landed; rename, independently
+addressed backup/PITR/key lifecycle, registry DR/Raft, and hosted HA remain open. Track
+its milestone state separately from the P0–P30 phase list.
 
 ## Repository layout
 
@@ -160,13 +162,17 @@ cmd/nextsql                CLI (init, exec, migrate, backup, restore, verify, ex
                             import, diagnose, status, cluster, hosting, audit, token, version)
 cmd/nextsql-bench          official benchmark tool
 cmd/nextsql-auth-broker    OIDC external-IdP broker (P25)
-cmd/nextsql-manager        NextSQL Manager: loopback web UI + JSON API, a pure
-                            nextsqld protocol client (P28, MVP in progress)
+cmd/nextsql-admin          NextSQL Admin: loopback web UI + JSON API, a pure nextsqld
+                            protocol client, one binary with three modes — Setup
+                            (formerly the Installer, token loopback wizard driving
+                            `nextsql setup` as a subprocess), Operations (formerly
+                            Manager, MVP complete), Studio (Phase 29, placeholder only)
 internal/                  engine: storage, wal, recovery, txn, undo, sql (lexer/parser/
                             binder), executor, catalog, crypto, security, auth, protocol,
                             replication, hosting, dbmanager, vector, fulltext, json, cdc,
                             scheduler, cron, backup, xport, migrate, config, metrics,
-                            setup (installer lifecycle), manager (Manager backend), ...
+                            setup (installer lifecycle CLI backbone), admin (setup/ops/
+                            studio modes — see cmd/nextsql-admin), browseropen, ...
 drivers/                   official native-protocol drivers: go, node, bun, deno, php,
                             python, ruby, plus shared TS types in drivers/js
 tests/                     integration, crash, ha (cross-package suites; unit tests live
@@ -181,7 +187,10 @@ Key `docs/*.md`: `sql.md` (dialect/catalog), `optimizer.md`, `execution.md`, `js
 `mvcc.md`, `protocol.md`, `security.md`, `backup.md`, `export.md`, `ops.md` (metrics/
 admission/SLOs), `ha.md`, `system-catalog.md`, `partitioning.md`, `cdc.md`, `workflows.md`
 (WORKFLOW/TRIGGER/SCHEDULE/TASK), `client-encryption.md`, `standards.md`, `install.md`
-(P28 installer/automation surface — `nextsql setup`, resource presets).
+(P28 installer/automation surface — `nextsql setup`, lifecycle), `design-admin.md` (P28/29
+NextSQL Admin umbrella — one binary, Setup/Operations/Studio modes; see also
+`design-admin-setup.md` and `design-admin-operations.md` for per-mode implementation
+history).
 
 ## Engineering contract (from `AGENTS.md` / `SKILLS.md`)
 
@@ -194,7 +203,7 @@ correctness → durability → security → integrity → availability
 
 Concretely: never weaken fsync/WAL durability for benchmarks; never silently reduce ANN
 recall for latency; never weaken tenant isolation for convenience; never bypass RBAC
-through any surface (Studio, Manager, CLI, drivers, Intelligence); never bypass the
+through any surface (NextSQL Admin's any mode, CLI, drivers, Intelligence); never bypass the
 parser/binder/planner to make SQL syntax work quickly.
 
 **Before modifying code**, identify: owning phase (`TODO.md`), persistent-format impact,

@@ -8,8 +8,7 @@ Documentation source of truth:
 
 ```text
 PROJECT.md = intended finished product
-TODO.md    = current implementation/status truth
-TODO.md    = implementation status, sequencing, dependencies, and phase gates
+TODO.md    = current implementation status, sequencing, dependencies, and gates
 SKILLS.md  = engineering/agent contract
 AGENTS.md  = repository agent entrypoint
 USAGE.md   = current user/operator manual
@@ -23,7 +22,7 @@ SQL/PSM, SQL/MED, SQL/Schemata, SQL/MDA, and SQL/PGQ), ISO/IEC 9579:2000 RDA
 principles, TCP with TLS 1.3, and Unicode/UTF-8. This is a design baseline, not
 a blanket conformance claim; see [`docs/standards.md`](docs/standards.md).
 
-**Version:** 0.1.0-dev · **Status:** P16 correctness/SLO closure open · **Module:** [`github.com/bzync/nextsql`](https://github.com/bzync/nextsql)
+**Version:** 0.1.0-dev · **Status:** P28 installer gate in progress; P0–P27 complete · **Module:** [`github.com/bzync/nextsql`](https://github.com/bzync/nextsql)
 
 ```sql
 
@@ -311,6 +310,7 @@ Schema lifecycle and maintenance:
 ```sql
 DROP INDEX IF EXISTS ix_old;
 REBUILD INDEX ix_category;        -- blocking
+REBUILD INDEX ix_category ONLINE; -- supported non-partitioned B+Tree-family indexes
 MAINTAIN TABLE products;
 ```
 
@@ -418,9 +418,11 @@ Also in the production surface:
 
 - Online DEK rotation, key-version revocation (kills sessions), crypto-shred of the keystore
 
-- Experimental `ENCRYPTED CLIENT`: randomized server-opaque `NSCE1.` fields
-  with Go, Node.js/TypeScript, Bun, Deno, and PHP helpers; PITR and HA coverage
-  remain open
+- Production-gated `ENCRYPTED CLIENT` core: randomized server-opaque `NSCE1.`
+  fields with helpers and durable `FileFieldKeyring` lifecycle in the five
+  drivers in P25 scope (Go, Node.js/TypeScript, Bun, Deno, PHP), plus tested
+  PITR and HA/failover. It remains capability-labeled `experimental` because
+  no searchable/deterministic mode ships; Python/Ruby helpers remain open
 
 - TLS 1.3 required for non-loopback listen addresses
 
@@ -592,8 +594,8 @@ P24  Full-text Search 2.0
 P25  Security 2.0
 P26  System Catalog / Introspection 2.0
 P27  Operational Maturity / Workload Governance
-P28  Professional Installer + NextSQL Manager
-P29  Web-based NextSQL Studio
+P28  NextSQL Admin — Setup + Operations modes
+P29  NextSQL Admin — Studio mode (NextSQL Studio)
 P30  NextSQL Intelligence + Built-in RAG
 ```
 
@@ -622,9 +624,13 @@ cmd/nextsql           CLI
 
 cmd/nextsql-bench     official benchmark tool
 
+cmd/nextsql-auth-broker  optional OIDC credential broker
+
+cmd/nextsql-admin     NextSQL Admin — one binary, Setup/Operations/Studio modes
+
 internal/             engine (storage, WAL, MVCC, SQL, crypto, HA, …)
 
-drivers/              Go, Node, Bun, Deno, PHP + shared JS codec
+drivers/              Go, Node, Bun, Deno, PHP, Python, Ruby + shared JS codec/types
 
 tests/                integration, crash, HA
 
@@ -695,13 +701,20 @@ Current development state:
 
 ```text
 P0–P15  complete
-P16      open — correctness / SLO closure
-P17      complete except REBUILD INDEX ... ONLINE is deferred
-P18      implementable scope complete; partition-wise agg/join now unblocked by P21
+P16      complete — exit gate green; terminal 100M B+Tree soak is a non-gate follow-on
+P17      complete — ONLINE rebuild proven for non-partitioned B+Tree/UNIQUE/JSON-path/spatial indexes
+P18      implementable scope complete, including partition-wise aggregation/join
 P19      complete — native v1 plus clean repository-wide functional gate
 P20      complete — native committed CDC/change streams
 P21      complete — RANGE/HASH/LIST partitioning, local indexes, cross-partition UNIQUE/UPSERT, statistics, benchmarks, and offline legacy TENANT migration
-P22–P30 planned/open
+P22      complete — follower reads/read scaling
+P23      complete — Vector Engine 2.0
+P24      complete — Full-text Search 2.0
+P25      complete — Security 2.0
+P26      complete — System Catalog / Introspection 2.0
+P27      complete — Operational Maturity / Workload Governance
+P28      in progress — NextSQL Admin (Setup + Operations modes); setup/lifecycle + Operations-mode MVP complete; installer gate open
+P29–P30 planned/open
 ```
 
 P17 now includes shipped schema/storage-lifecycle work such as:
@@ -740,13 +753,19 @@ closed 2026-08-30 with the same disposition as P18. P23 Vector Engine 2.0 is
 complete (production-gating sign-off 2026-08-31). P24 Full-text Search 2.0 is
 complete (exit gate closed 2026-08-31). P25 Security 2.0 is complete (exit
 gate closed 2026-09-02): mTLS, short-lived credentials, the external-IdP
-broker, field-level client encryption (including all official drivers, PITR,
-HA/failover, and durable key rotation/revocation), Argon2id password hashing,
+broker, field-level client encryption (the five P25-scope driver families,
+PITR, HA/failover, and durable key rotation/revocation), Argon2id password hashing,
 and audit-chain hardening are all production-gated. P26 System Catalog /
 Introspection 2.0 is complete (exit gate closed 2026-09-02): the virtual
 `system` schema, live session/security-administration tables, `SHOW`
 aliases, and an authoritative capability registry are all production-gated.
-The current release gate is P27 Operational Maturity / Workload Governance.
+P27 Operational Maturity / Workload Governance closed 2026-09-03. The current
+release gate is P28's remaining Setup-mode work (NextSQL Admin — see
+`docs/design-admin.md`). The `nextsql setup`/`lifecycle` backbone and all nine
+Operations-mode MVP slices are complete; Setup mode M1 is implemented and
+targeted-tested, while packaging integration, richer wizard flows,
+accessibility validation, silent-install coverage, and remaining platform
+execution gates are open.
 
 Large sequential `DELETE` is correct after the leaf-merge fix and its 10M timing methodology is published. The tracker also records published 100M analytics results.
 
@@ -768,11 +787,12 @@ bounded maintenance, backup/restore/PITR, `nextsql-bench --partition`, a
 randomized pruning-soundness property test, and explicit offline migration of a
 legacy `tenant_id` / `PARTITION BY TENANT` database into an isolated hosted
 deployment (`nextsql hosting migrate-tenant`). Distributed sharding is a
-separate future phase. The roadmap then continues through follower reads, Vector
-Engine 2.0, Full-text Search 2.0, Security 2.0, system introspection, workload
-governance, Installer/Manager, web-based Studio, and NextSQL Intelligence/RAG.
+separate future phase. Follower reads, Vector Engine 2.0, Full-text Search 2.0,
+Security 2.0, system introspection, and workload governance are complete. The
+roadmap continues through the remaining Setup-mode work, Studio mode, and
+NextSQL Intelligence/RAG.
 
-P22–P26 are complete; P27+ capabilities remain open until their `TODO.md` gates are green. P19
+P22–P27 are complete; P28 remains open until its installer gate is green. P19
 syntax and semantics are documented in `docs/workflows.md`; P20 and P21 are
 documented in `docs/cdc.md` and `docs/partitioning.md`.
 
@@ -790,4 +810,6 @@ Treat NextSQL as an engine under measurement, not a drop-in production replaceme
 
 ## License
 
-Proprietary. Driver packages are marked unlicensed / proprietary and are not published as public packages.
+The engine is proprietary. The Node.js package is `@bzync/nextsql` and is
+published/configured as a public MIT-licensed package; the other driver trees
+remain repository-distributed unless their package metadata says otherwise.

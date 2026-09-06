@@ -22,8 +22,8 @@ table decoder (`catalog.DecodeTable`) enforce this same catalog directly
 match what actually opens — not a separately maintained number that could
 drift. The error names the actual and required version numbers.
 
-Most families are **v1**; the catalog descriptor (`NSCT`) is at **v11**
-(readable 1..10). Opening a data directory this binary can read is the
+Most families are **v1**; the catalog descriptor (`NSCT`) is at **v12**
+(readable 1..12). Opening a data directory this binary can read is the
 supported path. A future format bump must either widen
 `MaxReadable` or add an explicit rewrite increment — not an in-place
 guess. See `docs/storage-format.md` "Format and catalog migration
@@ -84,10 +84,10 @@ internally coherent — `queries_per_second` / `commits_per_second` /
 passwords, keys, tokens, or secrets.
 
 The whole snapshot is queryable over SQL as **`system.metrics`** (admin-only,
-`category`/`name`/`value`/`unit`), and the NextSQL Manager's Diagnostics view
-renders it grouped by category alongside a bounded tail of the server's own
-structured log (**`system.server_log`**). See `docs/system-catalog.md`
-"Diagnostics (Manager M9)".
+`category`/`name`/`value`/`unit`), and NextSQL Admin's Operations-mode
+Diagnostics view renders it grouped by category alongside a bounded tail of
+the server's own structured log (**`system.server_log`**). See
+`docs/system-catalog.md` "Diagnostics (Operations mode M9)".
 
 Blocking index rebuild progress is available from
 `executor.DB.IndexRebuildProgress()`. Each active entry reports only table and

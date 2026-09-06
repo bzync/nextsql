@@ -54,7 +54,8 @@ At the current baseline:
 ```text
 P0–P15  complete
 P16      complete — exit gate green; terminal 100M B+Tree soak deferred as a standalone measurement
-P17      complete except REBUILD INDEX ... ONLINE is deferred
+P17      complete — ONLINE rebuild proven for non-partitioned B+Tree/UNIQUE/
+         JSON-path/spatial indexes; blocking fallback for unsupported families
 P18      implementable scope complete
 P19      complete
 P20      complete
@@ -63,11 +64,26 @@ P22      complete
 P23      complete — Vector Engine 2.0; production-gating sign-off 2026-08-31
 P24      complete — Full-text Search 2.0; exit gate closed 2026-08-31
 P25      complete — Security 2.0; exit gate closed 2026-09-02, security review sign-off in docs/security.md
-P26      open — System catalog / introspection 2.0; virtual schema core + all 5 live tables + all 9 SHOW aliases landed, exit gate open
-P27–P30 planned/open
+P26      complete — System catalog / introspection 2.0; exit gate closed 2026-09-02
+P27      complete — Operational maturity + workload governance; exit gate closed 2026-09-03
+P28      in progress — NextSQL Admin: Setup + Operations modes (2026-09-05: Installer +
+         Manager + Studio merged into one product, one binary nextsql-admin — see
+         docs/design-admin.md). Operations-mode MVP (all nine M1–M9 slices) is COMPLETE
+         (docs/design-admin-operations.md). Setup mode's implemented wizard,
+         packaging integration, service flow, and accessibility baseline are verified;
+         Linux .tar.gz/.run/.deb/.rpm and silent/offline/upgrade/repair paths are
+         live-verified. Recovery-key capability and Windows/macOS execution remain
+         capability/environment-blocked.
+P29      in progress — Studio M1–M3, five native explorers, Users/Roles,
+         Transaction/Lock, Audit, bounded per-tab plan comparison plus
+         ANALYZE-only profiler, catalog-aware table/column IntelliSense
+         (no keyword completion), and deterministic misspelled FROM/JOIN
+         table-name suggestions implemented; MVP gate open
+P30      planned
 ```
 
-P26 is the current release gate. Prioritize:
+P28 is the current release gate — specifically the GUI installer, the only
+open piece of its exit gate. Prioritize:
 
 ```text
 1. Audit designed vs implemented vs tested vs production-gated status for
@@ -104,9 +120,10 @@ audience + client binding, and non-interactive renewal. Embedded single-node
 mode is implemented on a separate bounded listener with issuer/verifier checks
 and a live native-user/ACL membership feed. Optional opaque introspection and
 JIT remain off. Field-level client encryption has an experimental
-SQL/catalog/server slice, official-driver helpers in Go/Node.js/TypeScript/
-Bun/Deno/PHP, and tested PITR + HA/failover; durable key-rotation/revocation
-KMS lifecycle remains before production gating. Password hashing has migrated
+SQL/catalog/server slice, helpers in the five drivers in P25 scope
+(Go/Node.js/TypeScript/Bun/Deno/PHP), tested PITR + HA/failover, and durable
+`FileFieldKeyring` rotation/revocation. The Python and Ruby drivers added later
+do not yet expose field-encryption helpers. Password hashing has migrated
 to Argon2id (versioned records, PBKDF2 backward compatibility, transparent
 login rehash, DoS benchmarks). Audit hardening is implemented: `nextsql.audit`
 carries a versioned `NSAC` hash chain with optional `NSAK` Ed25519 signatures
@@ -122,16 +139,23 @@ principal provisioning remain off by design, not as open blockers.
 Stemming, stop-word dictionaries, versioned language analyzers, english synonym dictionary v1, prefix search, fuzzy matching, typo tolerance, highlight/snippet generation, multi-field search, field weighting, and faceting landed: `NSCT` v9 analyzer metadata, `WITH (ANALYZER = 'simple' | 'english' | 'french' | 'german' | 'spanish')`, english v3 = Porter2 + stop-word dictionary v1 + query-time synonym dictionary v1, french/german/spanish v1 = Snowball stemmer + stop list, trailing `*` prefix queries and trailing `~` fuzzy queries, automatic typo tolerance on missing unadorned tokens (fail-closed expansion caps), `HIGHLIGHT`/`SNIPPET` on SEARCH SELECT lists (bounded markers/width), `CREATE FULLTEXT INDEX` / `SEARCH` on 1–8 columns (phrases stay per-field), optional `SEARCH col WEIGHT n` (query-time BM25 tf scale, `(0, 64]`, default 1), `SELECT * … SEARCH … FACET col [, col …]` independent histograms over the full match set (per-facet `LIMIT`, 8 columns / 1024 values fail closed), default BM25/phrase behaviour preserved.
 
 Do not let later feature work destabilize an earlier release gate. P26 System
-catalog / introspection 2.0 is the current release gate. The virtual `system`
-schema core (capabilities/tables/columns/indexes/storage/replication/raft/
-workflows/tasks/partitions/stats, RBAC-filtered) landed first; all 5 live
+catalog / introspection 2.0 is complete (exit gate closed 2026-09-02): the
+virtual `system` schema core (capabilities/tables/columns/indexes/storage/
+replication/raft/workflows/tasks/partitions/stats, RBAC-filtered), all 5 live
 tables — `system.sessions`/`system.active_queries`/`system.transactions`/
 `system.change_streams`/`system.locks` (node-local, in-memory,
-RBAC-filtered — see `docs/system-catalog.md`) — landed 2026-09-01.
-All nine planned `SHOW` convenience aliases landed 2026-09-02; the exit gate
-remains open.
+RBAC-filtered — see `docs/system-catalog.md`) — and all nine planned `SHOW`
+convenience aliases. P27 Operational maturity + workload governance closed
+2026-09-03. **P28 NextSQL Admin (Setup + Operations modes) is the current
+release gate**: Operations mode's MVP is complete; Setup mode
+(`docs/design-admin-setup.md`) has its standalone M1 flow implemented and
+targeted-tested. Packaging integration, richer encryption/advanced flows,
+accessibility validation, silent-install coverage, and remaining platform
+execution tests are open.
 
-Always verify the latest status in `TODO.md` before acting.
+Always verify the latest status in `TODO.md` before acting — its log entries
+are numbered and dated; trust the highest-numbered one over any status text
+in this file, including the summary above.
 
 ---
 
@@ -160,7 +184,7 @@ Examples:
 - Never silently reduce ANN recall to improve latency.
 - Never weaken tenant isolation for convenience.
 - Never bypass parser/binder/planner architecture to make SQL syntax work quickly.
-- Never bypass RBAC through Studio, Manager, CLI, drivers, or Intelligence.
+- Never bypass RBAC through any NextSQL Admin mode, CLI, drivers, or Intelligence.
 - Never invent a custom cryptographic primitive.
 - Never introduce unbounded goroutines, allocations, result buffers, task queues, or subscriber queues.
 
@@ -430,17 +454,18 @@ Do not convert targets into claims without measured evidence.
 
 # 14. Current Product Direction
 
-Expected future phases are:
+Remaining phases are:
 
 ```text
-P27 Operational maturity + workload governance
-P28 Professional Installer + NextSQL Manager
-P29 NextSQL Studio
-P30 NextSQL Intelligence + built-in RAG
+P28 NextSQL Admin — Setup + Operations modes  — in progress (Setup-mode GUI M1 landed; installer gate open)
+P29 NextSQL Admin — Studio mode                — in progress (M1–M3, focused native/developer-operations slices, bounded plan comparison/ANALYZE profiler, catalog-aware IntelliSense, and misspelled table-name suggestions landed; MVP gate open)
+P30 NextSQL Intelligence + built-in RAG        — planned
 ```
 
-P0–P26 are complete (P16's terminal 100M B+Tree soak and P17's `REBUILD INDEX
-… ONLINE` remain documented deferred follow-ons, not open gates).
+P0–P27 are complete. P16's terminal 100M B+Tree soak remains a documented
+standalone measurement outside the gate. P17 online rebuild is shipped for
+the proven non-partitioned B+Tree-family scope; vector, full-text, and
+partitioned indexes deliberately retain the blocking fallback.
 
 Preserve these principles:
 
@@ -465,7 +490,7 @@ Do not:
 - introduce hidden compatibility layers;
 - make an LLM the query optimizer;
 - make AI required for database correctness;
-- make Studio/Manager read raw database files as a shortcut;
+- make any NextSQL Admin mode read raw database files as a shortcut;
 - create unbounded worker pools;
 - make unsupported availability/security claims;
 - weaken durability for official performance results;

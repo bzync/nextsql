@@ -2,6 +2,7 @@
 # Sourced by scripts/build-*-installer.sh. Not executable on its own.
 
 set -euo pipefail
+shopt -s inherit_errexit
 
 packaging_root() {
 	# packaging/ when sourced as packaging/lib.sh
@@ -100,6 +101,26 @@ build_go() {
 	mkdir -p "$(dirname "$out")"
 	CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" \
 		go build -trimpath -ldflags="-s -w" -o "$out" "$pkg"
+}
+
+sign_checksums() {
+	# Detached-sign a checksums file with GPG. `key_id` comes from the
+	# calling script's `--gpg-key` flag (or the NEXTSQL_RELEASE_GPG_KEY env
+	# var it falls back to) — signing is opt-in, since no release key exists
+	# in this repo or CI yet. Unconfigured (no key_id) is a silent no-op, the
+	# same tolerance already used for optional tools like rpmbuild/makensis.
+	# Once a key IS requested, failure to sign must not be silent: producing
+	# release artifacts while quietly skipping an explicitly requested
+	# signature would be exactly the "fake success" this repo's engineering
+	# contract forbids, so both a missing `gpg` and a signing failure `die`.
+	local sums_file="$1" key_id="$2"
+	[ -n "$key_id" ] || return 0
+	command -v gpg >/dev/null 2>&1 || die "gpg not found but --gpg-key was given"
+	rm -f "${sums_file}.asc"
+	gpg --batch --yes --local-user "$key_id" --detach-sign --armor \
+		--output "${sums_file}.asc" "$sums_file" \
+		|| die "gpg failed to sign $sums_file with key $key_id"
+	info "signed $sums_file -> ${sums_file}.asc (key $key_id)"
 }
 
 write_sha256() {

@@ -575,6 +575,83 @@ func TestDriverStreamAndCancel(t *testing.T) {
 	}
 }
 
+func TestDriverContextCancelWhileWaitingForInitialResponse(t *testing.T) {
+	addr, tlsCfg := startTLSServer(t)
+	holder := openApp(t, addr, tlsCfg)
+	waiter := openApp(t, addr, tlsCfg)
+	observer := openApp(t, addr, tlsCfg)
+	ctx := context.Background()
+	if _, err := holder.Exec(ctx, `CREATE TABLE cancel_wait (id INT64 PRIMARY KEY, note STRING)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := holder.Exec(ctx, `INSERT INTO cancel_wait (id, note) VALUES (1, 'before')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := holder.Exec(ctx, `BEGIN`); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _, _ = holder.Exec(context.Background(), `ROLLBACK`) }()
+	// Both transactions must be live before the first write. Read-committed
+	// single-writer transactions intentionally skip the lock-manager fast
+	// path when no concurrent transaction exists yet.
+	if _, err := waiter.Exec(ctx, `BEGIN`); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _, _ = waiter.Exec(context.Background(), `ROLLBACK`) }()
+	if _, err := holder.Exec(ctx, `UPDATE cancel_wait SET note = 'held' WHERE id = 1`); err != nil {
+		t.Fatal(err)
+	}
+
+	waitCtx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	const waitingSQL = `UPDATE cancel_wait SET note = 'waiting' WHERE id = 1`
+	go func() {
+		_, err := waiter.Exec(waitCtx, waitingSQL)
+		done <- err
+	}()
+
+	// Observe the waiter from the server's own live-query view instead of
+	// guessing with a sleep. It has sent its query and is waiting for the
+	// holder's row lock before cancellation is issued.
+	seen := false
+	deadline := time.Now().Add(2 * time.Second)
+	for !seen && time.Now().Before(deadline) {
+		active, err := observer.Exec(context.Background(), `SELECT sql FROM system.active_queries`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, row := range active.Rows {
+			if len(row) == 1 && !row[0].Null && row[0].Str == waitingSQL {
+				seen = true
+				break
+			}
+		}
+		if !seen {
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+	if !seen {
+		t.Fatal("lock-waiting query never appeared in system.active_queries")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("lock-waiting query succeeded after context cancellation")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("context cancellation did not interrupt the initial response wait")
+	}
+
+	// Cancellation drains Error+Ready and leaves the connection reusable.
+	if _, err := waiter.Exec(context.Background(), `ROLLBACK`); err != nil {
+		t.Fatalf("rollback after cancellation: %v", err)
+	}
+	if _, err := waiter.Exec(context.Background(), `SELECT 1`); err != nil {
+		t.Fatalf("connection unusable after cancellation: %v", err)
+	}
+}
+
 func TestDriverRejectsKeyURL(t *testing.T) {
 	_, err := nextsql.Open(nextsql.Config{
 		Address:  "nextsql://app:pw@localhost/db?key=secret",

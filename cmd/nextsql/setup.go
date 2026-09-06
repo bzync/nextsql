@@ -113,20 +113,32 @@ func setupCmd(args []string) error {
 		return err
 	}
 
+	// Stat, never mutate: this is the same generate-vs-import disclosure for
+	// both --dry-run and a real run, computed before `nextsql init` (which
+	// would otherwise generate a missing key file itself) ever runs. A
+	// pre-existing file is always imported/reused, never regenerated or
+	// overwritten — this only makes that already-true behavior explicit to
+	// the operator instead of leaving it implicit (`TODO.md` Phase 28
+	// "Installer UX" — generate/import root unlock key).
+	keyFileExists := statExists(*keyFile)
+	instanceKeyExists := statExists(plan.InstanceKeyFile)
+
 	result := setupResult{
-		NextSQLVersion: version.String,
-		Phase:          version.Phase,
-		Hardware:       plan.Info,
-		Recommendation: plan.Recommendation,
-		ConfigPath:     plan.ConfigPath,
-		ListenAddr:     plan.ListenAddr,
-		TLS:            plan.TLS,
-		DataDir:        plan.DataDir,
-		KeyFile:        plan.KeyFile,
-		InstanceKey:    plan.InstanceKeyFile,
-		AdminUser:      plan.AdminUser,
-		Warnings:       plan.Warnings,
-		DryRun:         *dryRun,
+		NextSQLVersion:    version.String,
+		Phase:             version.Phase,
+		Hardware:          plan.Info,
+		Recommendation:    plan.Recommendation,
+		ConfigPath:        plan.ConfigPath,
+		ListenAddr:        plan.ListenAddr,
+		TLS:               plan.TLS,
+		DataDir:           plan.DataDir,
+		KeyFile:           plan.KeyFile,
+		KeyFileExists:     keyFileExists,
+		InstanceKey:       plan.InstanceKeyFile,
+		InstanceKeyExists: instanceKeyExists,
+		AdminUser:         plan.AdminUser,
+		Warnings:          append(append([]string{}, plan.Warnings...), keyFileAdvisories(*keyFile, keyFileExists, plan.InstanceKeyFile, instanceKeyExists)...),
+		DryRun:            *dryRun,
 	}
 
 	if *dryRun {
@@ -304,16 +316,60 @@ type setupResult struct {
 	TLS            bool                 `json:"tls"`
 	DataDir        string               `json:"data_dir"`
 	KeyFile        string               `json:"key_file"`
-	InstanceKey    string               `json:"instance_key_file"`
-	AdminUser      string               `json:"admin_user,omitempty"`
-	Initialized    bool                 `json:"initialized"`
-	InitOutput     string               `json:"init_output,omitempty"`
-	Health         *setupHealth         `json:"health,omitempty"`
-	Warnings       []string             `json:"warnings"`
-	DryRun         bool                 `json:"dry_run"`
-	Plan           string               `json:"plan,omitempty"`
-	RolledBack     []string             `json:"rolled_back,omitempty"`
-	RollbackKept   []string             `json:"rollback_kept,omitempty"`
+	// KeyFileExists reports whether --key-file already existed on disk at
+	// plan time: true means it will be imported and reused as-is, false
+	// means a new root unlock key will be generated there. Never flips a
+	// generate into an overwrite either way — this is disclosure, not a
+	// switch; see keyFileAdvisories.
+	KeyFileExists     bool         `json:"key_file_exists"`
+	InstanceKey       string       `json:"instance_key_file"`
+	InstanceKeyExists bool         `json:"instance_key_exists"`
+	AdminUser         string       `json:"admin_user,omitempty"`
+	Initialized       bool         `json:"initialized"`
+	InitOutput        string       `json:"init_output,omitempty"`
+	Health            *setupHealth `json:"health,omitempty"`
+	Warnings          []string     `json:"warnings"`
+	DryRun            bool         `json:"dry_run"`
+	Plan              string       `json:"plan,omitempty"`
+	RolledBack        []string     `json:"rolled_back,omitempty"`
+	RollbackKept      []string     `json:"rollback_kept,omitempty"`
+}
+
+// statExists reports whether path names an existing filesystem entry. It
+// deliberately collapses every stat error other than "not found" to false —
+// callers only use this for advisory disclosure text, never as a security or
+// correctness gate (the actual create-if-missing logic in `nextsql init`
+// re-stats and handles its own errors independently).
+func statExists(path string) bool {
+	if path == "" {
+		return false
+	}
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+// keyFileAdvisories makes the already-true generate-vs-import behavior of
+// `nextsql init` explicit instead of leaving it implicit: a key file that
+// exists is always imported and reused, one that doesn't is always
+// generated fresh — nothing here changes that, it only tells the operator
+// which one is about to happen before they confirm.
+func keyFileAdvisories(keyFile string, keyExists bool, instanceKeyFile string, instanceExists bool) []string {
+	var w []string
+	if keyFile != "" {
+		if keyExists {
+			w = append(w, "an existing root unlock key file was found at "+keyFile+": it will be imported and reused, not regenerated or overwritten")
+		} else {
+			w = append(w, "no key file found at "+keyFile+": a new root unlock key will be generated there")
+		}
+	}
+	if instanceKeyFile != "" {
+		if instanceExists {
+			w = append(w, "an existing deployment-registry key file was found at "+instanceKeyFile+": it will be imported and reused")
+		} else {
+			w = append(w, "no deployment-registry key file found at "+instanceKeyFile+": a new one will be generated there")
+		}
+	}
+	return w
 }
 
 type setupHealth struct {
@@ -398,6 +454,13 @@ func writeConfigFile(path string, c config.Config) error {
 	return nil
 }
 
+func keyFileVerb(exists bool) string {
+	if exists {
+		return "existing, will be imported"
+	}
+	return "new, will be generated"
+}
+
 func emitSetup(r setupResult, jsonOut bool) error {
 	if jsonOut {
 		enc := json.NewEncoder(os.Stdout)
@@ -426,7 +489,7 @@ func emitSetup(r setupResult, jsonOut bool) error {
 	fmt.Fprintf(w, "\nserver\n")
 	fmt.Fprintf(w, "  listen        %s%s\n", r.ListenAddr, tlsSuffix(r.TLS))
 	fmt.Fprintf(w, "  data-dir      %s\n", r.DataDir)
-	fmt.Fprintf(w, "  key-file      %s\n", r.KeyFile)
+	fmt.Fprintf(w, "  key-file      %s (%s)\n", r.KeyFile, keyFileVerb(r.KeyFileExists))
 	fmt.Fprintf(w, "  config        %s\n", r.ConfigPath)
 	if r.AdminUser != "" {
 		fmt.Fprintf(w, "  admin user    %s\n", r.AdminUser)

@@ -2,6 +2,7 @@ package txn
 
 import (
 	"bytes"
+	"context"
 	"sync"
 	"time"
 
@@ -82,6 +83,19 @@ func NewLockManager() *LockManager {
 }
 
 func (lm *LockManager) Acquire(txn format.TxnID, key []byte, mode Mode, tag string) error {
+	return lm.AcquireContext(context.Background(), txn, key, mode, tag)
+}
+
+// AcquireContext is Acquire with cancellation for a contended wait. A
+// canceled request is removed from both the waiter queue and wait-for graph,
+// so it cannot leak a future grant or participate in false deadlock cycles.
+func (lm *LockManager) AcquireContext(ctx context.Context, txn format.TxnID, key []byte, mode Mode, tag string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nerr.Wrap(nerr.Canceled, "txn.Lock", "lock wait canceled", err)
+	}
 	k := string(key)
 	lm.mu.Lock()
 	if lm.canGrantKey(txn, k, key, mode) {
@@ -100,11 +114,22 @@ func (lm *LockManager) Acquire(txn format.TxnID, key []byte, mode Mode, tag stri
 	}
 	wait := lm.waitTimeout
 	lm.mu.Unlock()
-	return lm.await(w, txn, wait)
+	return lm.await(ctx, w, txn, wait)
 }
 
 // AcquireRange locks [start, end). A nil end is unbounded.
 func (lm *LockManager) AcquireRange(txn format.TxnID, start, end []byte, mode Mode, tag string) error {
+	return lm.AcquireRangeContext(context.Background(), txn, start, end, mode, tag)
+}
+
+// AcquireRangeContext is AcquireRange with cancellation for a contended wait.
+func (lm *LockManager) AcquireRangeContext(ctx context.Context, txn format.TxnID, start, end []byte, mode Mode, tag string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nerr.Wrap(nerr.Canceled, "txn.Lock", "lock wait canceled", err)
+	}
 	lm.mu.Lock()
 	if lm.canGrantRange(txn, start, end, mode) {
 		lm.grantRange(txn, start, end, mode, tag)
@@ -128,7 +153,7 @@ func (lm *LockManager) AcquireRange(txn format.TxnID, start, end []byte, mode Mo
 	}
 	wait := lm.waitTimeout
 	lm.mu.Unlock()
-	return lm.await(w, txn, wait)
+	return lm.await(ctx, w, txn, wait)
 }
 
 // await blocks until w is granted (wake() sends nil on w.ch) or wait
@@ -140,33 +165,50 @@ func (lm *LockManager) AcquireRange(txn format.TxnID, start, end []byte, mode Mo
 // after the timer fires distinguishes "really timed out" from "granted the
 // instant before the timer fired," where the grant must be honored (the
 // lock is really held; failing here without releasing it would leak it).
-func (lm *LockManager) await(w *waiter, txn format.TxnID, wait time.Duration) error {
+func (lm *LockManager) await(ctx context.Context, w *waiter, txn format.TxnID, wait time.Duration) error {
 	if wait <= 0 {
-		return <-w.ch
+		select {
+		case err := <-w.ch:
+			return err
+		case <-ctx.Done():
+			if !lm.removeCanceledWaiter(w, txn) {
+				return <-w.ch
+			}
+			return nerr.Wrap(nerr.Canceled, "txn.Lock", "lock wait canceled", ctx.Err())
+		}
 	}
 	timer := time.NewTimer(wait)
 	defer timer.Stop()
 	select {
 	case err := <-w.ch:
 		return err
-	case <-timer.C:
-		lm.mu.Lock()
-		stillWaiting := false
-		for _, x := range lm.waiters {
-			if x == w {
-				stillWaiting = true
-				break
-			}
-		}
-		if !stillWaiting {
-			lm.mu.Unlock()
+	case <-ctx.Done():
+		if !lm.removeCanceledWaiter(w, txn) {
 			return <-w.ch
 		}
-		lm.removeWaiter(w)
-		lm.clearWait(txn)
-		lm.mu.Unlock()
+		return nerr.Wrap(nerr.Canceled, "txn.Lock", "lock wait canceled", ctx.Err())
+	case <-timer.C:
+		if !lm.removeCanceledWaiter(w, txn) {
+			return <-w.ch
+		}
 		return nerr.New(nerr.Exhausted, "txn.Lock", "lock wait timeout exceeded")
 	}
+}
+
+// removeCanceledWaiter returns true only while w is still queued. A false
+// return means wake granted it atomically just before cancellation/timeout;
+// the caller must consume that real grant from w.ch rather than leak it.
+func (lm *LockManager) removeCanceledWaiter(w *waiter, txn format.TxnID) bool {
+	lm.mu.Lock()
+	defer lm.mu.Unlock()
+	for _, x := range lm.waiters {
+		if x == w {
+			lm.removeWaiter(w)
+			lm.clearWait(txn)
+			return true
+		}
+	}
+	return false
 }
 
 // SetWaitTimeout changes the contended-lock wait bound for future

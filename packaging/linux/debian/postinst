@@ -47,6 +47,12 @@ directory (and keep the root unlock key off the data volume in production):
 Loopback (127.0.0.1:7210) may run without TLS. Any other listen address
 requires tls_cert and tls_key in /etc/nextsql/nextsql.conf.
 
+Or, as a regular (non-root) user, run the browser-based setup wizard instead
+of the steps above: nextsql-admin
+(not run automatically here: a package post-install script must stay
+non-interactive, and creating the database as root here would leave it
+unreadable by the unprivileged 'nextsql' service account)
+
 EOF
 
 exit 0

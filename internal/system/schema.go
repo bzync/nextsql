@@ -18,6 +18,9 @@ import (
 // (M9), system.backups (M5); the M4 security tables (system.tls,
 // system.key_versions, system.audit_verify, system.audit_log) and M8's
 // system.config were added under v2 without a bump — v3 covers all of it.
+// system.foreign_keys, system.table_ddl, system.triggers and
+// system.schedules (Phase 29 Studio) are new read-only views, not column
+// changes to existing ones, so they do not bump the version.
 const SchemaVersion = 3
 
 // SchemaName is the virtual schema name.
@@ -57,6 +60,41 @@ func init() {
 		{Name: "include_columns", Type: types.String()},
 		{Name: "predicate", Type: types.String()},
 		{Name: "status", Type: types.String()},
+	})
+	register("foreign_keys", []catalog.Column{
+		{Name: "table_name", Type: types.String()},
+		{Name: "constraint_name", Type: types.String()},
+		{Name: "ordinal", Type: dec(10, 0)},
+		{Name: "column_name", Type: types.String()},
+		{Name: "ref_table", Type: types.String()},
+		{Name: "ref_column", Type: types.String()},
+		{Name: "on_delete", Type: types.String()},
+		{Name: "on_update", Type: types.String()},
+	})
+	register("table_ddl", []catalog.Column{
+		{Name: "table_name", Type: types.String()},
+		{Name: "object_type", Type: types.String()},
+		{Name: "object_name", Type: types.String()},
+		{Name: "ddl", Type: types.String()},
+	})
+	register("triggers", []catalog.Column{
+		{Name: "name", Type: types.String()},
+		{Name: "owner", Type: types.String()},
+		{Name: "timing", Type: types.String()},
+		{Name: "event", Type: types.String()},
+		{Name: "table_name", Type: types.String()},
+		{Name: "workflow", Type: types.String()},
+		{Name: "arg_count", Type: dec(10, 0)},
+	})
+	register("schedules", []catalog.Column{
+		{Name: "name", Type: types.String()},
+		{Name: "owner", Type: types.String()},
+		{Name: "kind", Type: types.String()},
+		{Name: "spec", Type: types.String()},
+		{Name: "workflow", Type: types.String()},
+		{Name: "enabled", Type: types.Bool()},
+		{Name: "next_fire", Type: types.TimestampTZ()},
+		{Name: "last_fire", Type: types.TimestampTZ()},
 	})
 	register("storage", []catalog.Column{
 		{Name: "database", Type: types.String()},

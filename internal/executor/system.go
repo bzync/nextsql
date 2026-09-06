@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/bzync/nextsql/internal/catalog"
+	"github.com/bzync/nextsql/internal/catalog/ddl"
 	"github.com/bzync/nextsql/internal/hosting"
 	"github.com/bzync/nextsql/internal/nerr"
 	"github.com/bzync/nextsql/internal/security"
@@ -278,6 +279,14 @@ func (s *Session) systemRows(name string, schema *catalog.Table) ([][]types.Valu
 		return s.systemColumnsRows()
 	case "system.indexes":
 		return s.systemIndexesRows()
+	case "system.foreign_keys":
+		return s.systemForeignKeysRows()
+	case "system.table_ddl":
+		return s.systemTableDDLRows()
+	case "system.triggers":
+		return s.systemTriggersRows()
+	case "system.schedules":
+		return s.systemSchedulesRows()
 	case "system.storage":
 		return s.systemStorageRows()
 	case "system.replication", "system.raft":
@@ -467,6 +476,241 @@ func (s *Session) systemIndexesRows() ([][]types.Value, error) {
 		}
 		return out[i][0].Str < out[j][0].Str
 	})
+	return out, nil
+}
+
+func (s *Session) systemForeignKeysRows() ([][]types.Value, error) {
+	if s.db == nil || s.db.Cat == nil {
+		return [][]types.Value{}, nil
+	}
+	list := s.db.Cat.List()
+	sort.Slice(list, func(i, j int) bool { return list[i].Name < list[j].Name })
+	dec10 := types.Type{Kind: types.KindDecimal, Precision: 10, Scale: 0}
+	var out [][]types.Value
+	for _, t := range list {
+		if !s.canSeeTable(t.Name) {
+			continue
+		}
+		for _, fk := range t.ForeignKeys {
+			parent, haveParent := s.db.Cat.Get(fk.RefTable)
+			for i, childOrd := range fk.Columns {
+				childName := ""
+				if childOrd >= 0 && childOrd < len(t.Columns) {
+					childName = t.Columns[childOrd].Name
+				}
+				refName := ""
+				if haveParent && i < len(fk.RefColumns) {
+					if ro := fk.RefColumns[i]; ro >= 0 && ro < len(parent.Columns) {
+						refName = parent.Columns[ro].Name
+					}
+				}
+				out = append(out, []types.Value{
+					types.StringValue(t.Name),
+					types.StringValue(fk.Name),
+					types.DecimalValue(types.DecimalFromInt64(int64(i+1)), dec10),
+					types.StringValue(childName),
+					types.StringValue(fk.RefTable),
+					types.StringValue(refName),
+					types.StringValue(fkActionName(fk.OnDelete)),
+					types.StringValue(fkActionName(fk.OnUpdate)),
+				})
+			}
+		}
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i][0].Str != out[j][0].Str {
+			return out[i][0].Str < out[j][0].Str
+		}
+		return out[i][1].Str < out[j][1].Str
+	})
+	return out, nil
+}
+
+// systemTableDDLRows renders the canonical CREATE statement for every
+// visible table and its indexes, using the shared internal/catalog/ddl
+// renderer (the same one xport's backup/restore SQL export uses), so a
+// client can reconstruct schema without guessing from system.columns /
+// system.indexes. One row per object: object_type is TABLE or INDEX. A
+// render error for one object is surfaced in its ddl cell as a comment
+// rather than failing the whole view.
+func (s *Session) systemTableDDLRows() ([][]types.Value, error) {
+	if s.db == nil || s.db.Cat == nil {
+		return [][]types.Value{}, nil
+	}
+	list := s.db.Cat.List()
+	sort.Slice(list, func(i, j int) bool { return list[i].Name < list[j].Name })
+	var out [][]types.Value
+	for _, t := range list {
+		if !s.canSeeTable(t.Name) {
+			continue
+		}
+		parents := map[string]*catalog.Table{}
+		for _, fk := range t.ForeignKeys {
+			if fk.RefTable == "" || fk.RefTable == t.Name {
+				continue
+			}
+			if p, ok := s.db.Cat.Get(fk.RefTable); ok {
+				parents[fk.RefTable] = p
+			}
+		}
+		tableDDL, err := ddl.CreateTableSQLWithParents(t, parents)
+		if err != nil {
+			tableDDL = "-- unavailable: " + err.Error()
+		}
+		out = append(out, []types.Value{
+			types.StringValue(t.Name),
+			types.StringValue("TABLE"),
+			types.StringValue(t.Name),
+			types.StringValue(tableDDL),
+		})
+		for _, idx := range t.Indexes {
+			idxDDL, err := ddl.CreateIndexSQL(t, idx)
+			if err != nil {
+				idxDDL = "-- unavailable: " + err.Error()
+			}
+			out = append(out, []types.Value{
+				types.StringValue(t.Name),
+				types.StringValue("INDEX"),
+				types.StringValue(idx.Name),
+				types.StringValue(idxDDL),
+			})
+		}
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i][0].Str != out[j][0].Str {
+			return out[i][0].Str < out[j][0].Str
+		}
+		if out[i][1].Str != out[j][1].Str {
+			return out[i][1].Str > out[j][1].Str // TABLE before INDEX
+		}
+		return out[i][2].Str < out[j][2].Str
+	})
+	return out, nil
+}
+
+func fkActionName(a catalog.FKAction) string {
+	switch a {
+	case catalog.FKCascade:
+		return "CASCADE"
+	case catalog.FKSetNull:
+		return "SET NULL"
+	case catalog.FKSetDefault:
+		return "SET DEFAULT"
+	default:
+		return "RESTRICT"
+	}
+}
+
+func triggerTimingName(t ast.TriggerTiming) string {
+	if t == ast.TriggerAfter {
+		return "AFTER"
+	}
+	return "BEFORE"
+}
+
+func triggerEventName(e ast.TriggerEvent) string {
+	switch e {
+	case ast.TriggerUpdate:
+		return "UPDATE"
+	case ast.TriggerDelete:
+		return "DELETE"
+	default:
+		return "INSERT"
+	}
+}
+
+// systemTriggersRows lists row triggers. A trigger is visible when the caller
+// can SELECT the table it fires on — the same rule as system.foreign_keys —
+// so it surfaces cleanly in a table's dependency view.
+func (s *Session) systemTriggersRows() ([][]types.Value, error) {
+	if s.db == nil {
+		return [][]types.Value{}, nil
+	}
+	s.db.mu.RLock()
+	defer s.db.mu.RUnlock()
+	dec10 := types.Type{Kind: types.KindDecimal, Precision: 10, Scale: 0}
+	var out [][]types.Value
+	for _, tg := range s.db.triggers {
+		if tg == nil || !s.canSeeTable(tg.Table) {
+			continue
+		}
+		out = append(out, []types.Value{
+			types.StringValue(tg.Name),
+			types.StringValue(tg.Owner),
+			types.StringValue(triggerTimingName(tg.Timing)),
+			types.StringValue(triggerEventName(tg.Event)),
+			types.StringValue(tg.Table),
+			types.StringValue(tg.Workflow),
+			types.DecimalValue(types.DecimalFromInt64(int64(len(tg.Args))), dec10),
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i][0].Str < out[j][0].Str })
+	return out, nil
+}
+
+func scheduleKindName(k ast.ScheduleKind) string {
+	switch k {
+	case ast.ScheduleAt:
+		return "AT"
+	case ast.ScheduleCron:
+		return "CRON"
+	default:
+		return "EVERY"
+	}
+}
+
+func scheduleSpecString(sc *catalog.Schedule) string {
+	switch sc.Kind {
+	case ast.ScheduleAt:
+		if sc.SpecNS == 0 {
+			return ""
+		}
+		return time.Unix(0, sc.SpecNS).UTC().Format(time.RFC3339)
+	case ast.ScheduleCron:
+		return sc.Cron
+	default:
+		if sc.SpecNS == 0 {
+			return ""
+		}
+		return time.Duration(sc.SpecNS).String()
+	}
+}
+
+// systemSchedulesRows lists SCHEDULE definitions. A schedule is visible when
+// the caller can execute the workflow it invokes — the same rule as
+// system.workflows.
+func (s *Session) systemSchedulesRows() ([][]types.Value, error) {
+	if s.db == nil {
+		return [][]types.Value{}, nil
+	}
+	s.db.mu.RLock()
+	defer s.db.mu.RUnlock()
+	nullTS := types.Null(types.TimestampTZ())
+	var out [][]types.Value
+	for _, sc := range s.db.schedules {
+		if sc == nil || !s.canSeeWorkflow(sc.Workflow) {
+			continue
+		}
+		next := nullTS
+		if sc.NextFireNS != 0 {
+			next = types.TimeValue(sc.NextFireNS)
+		}
+		last := nullTS
+		if sc.LastFireNS != 0 {
+			last = types.TimeValue(sc.LastFireNS)
+		}
+		out = append(out, []types.Value{
+			types.StringValue(sc.Name),
+			types.StringValue(sc.Owner),
+			types.StringValue(scheduleKindName(sc.Kind)),
+			types.StringValue(scheduleSpecString(sc)),
+			types.StringValue(sc.Workflow),
+			types.BoolValue(sc.Enabled),
+			next,
+			last,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i][0].Str < out[j][0].Str })
 	return out, nil
 }
 

@@ -1,0 +1,26 @@
+{
+  "name": "nextsql-admin-frontend",
+  "version": "0.0.0",
+  "private": true,
+  "description": "NextSQL Admin web UI (Setup, Operations, and Studio). Source for the bundle embedded into cmd/nextsql-admin via internal/admin/web/.",
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs",
+    "typecheck": "tsc --noEmit",
+    "test:studio": "node test-studio-results.mjs",
+    "test:a11y": "npm run build && node test-accessibility.mjs"
+  },
+  "dependencies": {
+    "@bzync/rui": "0.0.9",
+    "framer-motion": "13.2.0",
+    "react": "19.2.8",
+    "react-dom": "19.2.8"
+  },
+  "devDependencies": {
+    "@types/react": "19.1.8",
+    "@types/react-dom": "19.1.6",
+    "axe-core": "^4.13.0",
+    "esbuild": "0.25.10",
+    "typescript": "5.9.3"
+  }
+}

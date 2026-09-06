@@ -1,0 +1,114 @@
+/* Self-hosted fonts, so NextSQL Admin renders in its intended typeface
+   regardless of what's installed on the target machine — Setup mode's whole
+   point is running on a bare/fresh host, which usually has neither Inter
+   nor JetBrains Mono, and it must work fully offline (no CDN fetch). Each
+   file is Google Fonts' own variable-font build, latin subset only (this UI
+   is English-only); esbuild's woff2 -> dataurl loader (build.mjs) inlines
+   them into app.css, so nothing is fetched at runtime. Family names match
+   --font-sans/--font-mono's first-choice entries (rui's theme, see
+   node_modules/@bzync/rui/dist/styles.css) so no theme override is needed
+   — these simply become what those vars resolve to. Inter: OFL-1.1,
+   https://github.com/rsms/inter. JetBrains Mono: OFL-1.1,
+   https://github.com/JetBrains/JetBrainsMono. */
+@font-face {
+  font-family: "Inter Variable";
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: swap;
+  src: url("./fonts/Inter-Variable.woff2") format("woff2");
+}
+@font-face {
+  font-family: "JetBrains Mono Variable";
+  font-style: normal;
+  font-weight: 100 800;
+  font-display: swap;
+  src: url("./fonts/JetBrainsMono-Variable.woff2") format("woff2");
+}
+
+/* rui's theme vars (--color-bg etc.) are only applied where something opts
+   in via its bg-bg/text-foreground utility classes or a component like
+   AppShell that already does — a bare <body> stays browser-default white
+   otherwise, which reads as a broken/unstyled page below content shorter
+   than the viewport. html/body get the theme background and full viewport
+   height explicitly here so the page never shows through as blank/white. */
+html, body, #root {
+  height: 100%;
+}
+body {
+  margin: 0;
+}
+#root ul {
+  margin: 4px 0 0;
+  padding-left: 18px;
+}
+
+/* Shared skip-link, used by both the Setup wizard shell and the Operations
+   shell. */
+.nsa-skip {
+  position: fixed;
+  top: 12px;
+  left: 12px;
+  z-index: 100;
+  transform: translateY(-200%);
+  border-radius: var(--radius-md);
+  background: var(--color-surface-raised);
+  color: var(--color-foreground);
+  padding: 8px 12px;
+  box-shadow: var(--shadow-floating);
+}
+.nsa-skip:focus {
+  transform: translateY(0);
+  outline: 2px solid var(--color-accent-500);
+  outline-offset: 2px;
+}
+
+/* Shared theme selector (shared/ThemeSelect.tsx). */
+.nsa-theme-select {
+  width: 150px;
+}
+.nsa-theme-trigger {
+  min-height: 36px;
+}
+
+/* The mode-detection loading/error card shown by the top-level App.tsx
+   before Setup or Operations mounts. */
+.nsa-loading-page {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 32px 20px;
+  box-sizing: border-box;
+}
+
+/* rui 0.0.9's Stepper descriptions and alert/status body variants use a
+   fixed slate utility color that misses AA contrast on this shell's
+   backgrounds in both themes — keep the component structure but use the
+   active theme's guaranteed text token everywhere Admin renders them. */
+[role="status"] .leading-relaxed,
+[role="alert"] .leading-relaxed,
+.text-slate-500,
+span.text-xs.font-mono.text-slate-400 {
+  color: var(--color-foreground);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+@media (prefers-contrast: more) {
+  .nsa-theme-trigger {
+    border-width: 2px;
+  }
+}
+
+@media (forced-colors: active) {
+  .nsa-skip:focus, .nsa-theme-trigger:focus-visible {
+    outline-color: Highlight;
+  }
+}

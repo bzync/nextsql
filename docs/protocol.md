@@ -180,7 +180,13 @@ JS `connectCluster`, PHP `NextSQL\Cluster`).
 
 ## Authentication
 
-Passwords are stored as PBKDF2-HMAC-SHA256 (100 000 iterations, 16-byte salt, 32-byte hash) in `nextsql.users` (`NSAU` v1). The file mode is `0600`. Authentication failures use the same error for unknown user and bad password. Nothing in this file is a plaintext password. In mTLS mode the certificate identity is bound before this password check; successful sessions still pass both password authentication and RBAC.
+New passwords are stored as versioned Argon2id records in `nextsql.users`
+(`NSAU` v2; 64 MiB, time 1, parallelism 4). Legacy PBKDF2-HMAC-SHA256 records
+remain readable and are transparently rehashed after a successful login. The
+file mode is `0600`; unknown users and bad passwords return the same error and
+perform equivalent bounded hash work. Nothing in this file is a plaintext
+password. In mTLS mode the certificate identity is bound before this password
+check; successful sessions still pass authentication and RBAC.
 
 The auth file is not the storage DEK. The root stays in `--key-file` or in the
 client `KeyProvider`. HelloOK `AuthMethod` `2` means the client must unlock.
@@ -197,15 +203,16 @@ An optional bounded `token_identity_source_hint=KEY_ID:oidc,...` changes only
 the server audit label to `oidc` / `mtls+oidc` after signature verification; it
 adds no claim and does not change NSQL or the `NSSC1.` format.
 
-For deployments containing the M1 `nextsql.instance` registry, `nextsqld`
-loads the registered default logical database name into the existing Hello
-check. A matching non-empty Hello database is accepted, a different non-empty
-name is `not_found`, and an empty v1 field selects the default for compatibility.
-This is default-database validation, not multi-database routing.
+For deployments containing the `nextsql.instance` registry, `nextsqld`
+resolves the optional Hello realm/database pair through the registry and
+routes the connection to that registered database via the bounded database
+manager. Empty fields select the registered defaults for compatibility. The
+legacy no-registry path remains pinned to its configured/default database.
+Unknown realm/database/user combinations are carried through the password
+verification step and collapse to the same generic `unauthorized` result,
+preventing pre-authentication existence enumeration.
 
-`Hello.Realm` (M2-2) works the same way, one layer up: `nextsqld` also loads
-the registered default realm's name and rejects a non-empty, non-matching
-`Hello.Realm` with `not_found` ("unknown realm"). It is an **additive
+`Hello.Realm` is an **additive
 trailing field, not a protocol version bump** — the frame header's `Version`
 remains a hard equality gate with no negotiation. A client that never
 configures a realm emits nothing past `user`, producing the exact pre-realm
@@ -214,11 +221,8 @@ when bytes remain past `user`, mirroring `NSCT`'s V1 field-versioning
 pattern in `internal/catalog`); a client that does select a realm requires a
 server new enough to decode the trailing field, and fails closed with a
 decode error against an older one rather than silently connecting to
-whatever that server has open. This is still flat-string identity
-validation against the one realm+database pair a given `nextsqld` process
-serves, not selectable multi-database engine routing — see
-`docs/design-multidatabase-dbaas.md` §8/§16 for that still-open scope
-(M2-3/M2-4).
+whatever that server has open. See `docs/design-multidatabase-dbaas.md` for
+the selectable-hosting design, landed M2 scope, and remaining M3/HA gaps.
 
 ## Streaming and backpressure
 

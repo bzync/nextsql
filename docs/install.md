@@ -1,18 +1,19 @@
 # Installation and first-run setup (Phase 28)
 
-Phase 28 splits the operator-facing surface into three products:
+Phase 28/29 cover NextSQL Admin, one application with three modes (see
+`docs/design-admin.md`):
 
 ```text
-NextSQL Installer → install / upgrade / repair / uninstall
-NextSQL Manager   → server / cluster / security / backup / operations
-NextSQL Studio    → database development / SQL / data / schema / RAG   (Phase 29)
+Setup mode       → install / upgrade / repair / uninstall            (Phase 28)
+Operations mode  → server / cluster / security / backup / operations (Phase 28)
+Studio mode      → database development / SQL / data / schema / RAG  (Phase 29)
 ```
 
 This note covers the **automation backbone** shared by all of them:
 `nextsql setup`. The OS-native installers in `packaging/` (see
-`packaging/README.md`) and, later, the Manager GUI all drive the same code
-path — nothing an installer does to bring a server up is unavailable to a
-script.
+`packaging/README.md`) and the `nextsql-admin` GUI (Setup mode) all drive the
+same code path — nothing an installer does to bring a server up is
+unavailable to a script.
 
 ## `nextsql setup`
 
@@ -75,7 +76,15 @@ overrides the preset.
   nothing.
 - Root unlock key and deployment-registry key are created at the
   `--key-file` path and `--key-file`.instance, mode `0600`; keep this path
-  off the data volume in production.
+  off the data volume in production. A pre-existing file at either path is
+  always imported and reused as-is — never regenerated or overwritten,
+  generate-or-import is decided purely by whether the path already exists.
+  `--json` (and `--dry-run --json`) makes this explicit before anything is
+  written: `key_file_exists` / `instance_key_exists` booleans plus a
+  matching advisory in `warnings` ("a new root unlock key will be generated
+  there" vs. "it will be imported and reused, not regenerated or
+  overwritten") — the GUI installer's Location and Review steps surface the
+  same disclosure.
 - The generated `nextsql.conf` is mode `0640` and contains no key, password,
   or token material — only file paths.
 - Passing `--user` without `--password-file` (or vice versa) is rejected.
@@ -322,11 +331,26 @@ tracks.
 ## Still to come in Phase 28
 
 The `nextsql lifecycle` backbone (`detect` / `preflight` / `backup-config` /
-`upgrade` / `repair` / `uninstall`) is complete, and `upgrade` now routes a
-Raft cluster node through the per-node rolling procedure (`--cluster-node`
-acknowledgment; `rolling_upgrade` guidance in the `--json` output). What
-remains in Phase 28: transactional rollback of installer-created files is
-done for `nextsql setup`; the GUI installer UX (welcome / component selection
-/ encryption wizard / staged progress / accessibility) and the entire NextSQL
-Manager MVP are still open. All are tracked in `TODO.md` under Phase 28. This
-note grows as they land.
+`upgrade` / `repair` / `uninstall`) is complete, `upgrade` routes a Raft
+cluster node through the per-node rolling procedure (`--cluster-node`
+acknowledgment; `rolling_upgrade` guidance in the `--json` output), and
+transactional rollback of installer-created files is done for `nextsql
+setup`. The **Operations-mode MVP (all nine M1–M9 slices) is complete** —
+see `docs/design-admin-operations.md`. What remains in Phase 28: the **Setup
+mode GUI** (`nextsql-admin` / `internal/admin/setup`,
+`docs/design-admin-setup.md`) — M1 (serving backbone + a working welcome →
+location → resources → administrator → summary → install → completion flow,
+driving `nextsql setup` as a subprocess), **M3 (advanced options — skip-init,
+custom buffer pages, remote listen address + TLS)**, and **M6 (an optional
+"start automatically at boot" step that enables an already-installed,
+already-matching systemd unit — never authors one itself)** are implemented
+and targeted-tested. **M5 is complete**: Setup and Operations modes share the
+same branded RUI shell/theme behavior, and deterministic headless-Chrome
+keyboard + axe WCAG 2.2 A/AA audits cover both,
+including increased contrast and reduced motion. Remaining work is
+recovery-key export/verification (the rest of M2), non-Linux packaging and
+full silent/upgrade/repair installer-path coverage, plus platform execution
+tests for `.rpm` and the Windows
+artifacts (blocked on `rpmbuild`/Wine not being available in every build
+environment). All are tracked in `TODO.md` under Phase 28. This note grows
+as they land.

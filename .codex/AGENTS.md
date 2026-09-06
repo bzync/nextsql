@@ -12,7 +12,7 @@ Native OLTP + vector DB in Go. Not PG/MySQL compatible. Own parser/binder/planne
 
 ## 2. Current Gate
 
-P0–P15 complete; P16 open (correctness/SLO: corrected 1M HNSW, p95 <25ms with recall, 100M B+Tree soak); P17 complete except REBUILD INDEX ... ONLINE deferred; P18 implementable complete (partition-wise waits on P21); P19–P30 planned. Prioritize P16 until green, then P19 WORKFLOW→TRIGGER→SCHEDULE→TASK.
+P0–P27 complete. P16's terminal 100M B+Tree soak is a documented standalone measurement outside the gate. P17's `REBUILD INDEX ... ONLINE` ships for non-partitioned BTree/UNIQUE/JSON-path/spatial indexes; vector, full-text, and partitioned indexes retain the blocking fallback. **P28 NextSQL Admin (Setup + Operations modes) is the current release gate** — Operations mode's MVP is complete, and Setup mode's implemented wizard, Linux packaging, silent/offline/upgrade/repair flows, and accessibility baseline are verified; recovery-key capability and Windows/macOS execution remain blocked. **P29 Studio is in progress** — M1–M3, all five native explorers, Users/Roles, read-only Transaction/Lock and Audit explorers, bounded plan comparison/ANALYZE profiler, catalog-aware table/column IntelliSense (no keyword completion), and deterministic misspelled FROM/JOIN table-name suggestions are implemented; its MVP gate remains open. P30 (Intelligence) is planned. Always verify the highest-numbered log entry in `TODO.md` — it wins over this file.
 
 ## 3. Priority Order
 

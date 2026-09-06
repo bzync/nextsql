@@ -449,6 +449,270 @@ func TestSystemCatalogRBACRemainingViews(t *testing.T) {
 	}
 }
 
+func TestSystemForeignKeys(t *testing.T) {
+	db := testDB(t)
+	s := db.Session()
+	execOK(t, s, `CREATE TABLE parents (
+		region STRING NOT NULL,
+		id STRING NOT NULL,
+		PRIMARY KEY (region, id)
+	)`)
+	execOK(t, s, `CREATE TABLE kids (
+		kid STRING PRIMARY KEY,
+		p_region STRING NOT NULL,
+		p_id STRING NOT NULL,
+		CONSTRAINT fk_kids FOREIGN KEY (p_region, p_id)
+			REFERENCES parents (region, id)
+			ON DELETE CASCADE ON UPDATE RESTRICT
+	)`)
+	execOK(t, s, `CREATE TABLE notes (
+		id STRING PRIMARY KEY,
+		kid_ref STRING REFERENCES kids (kid) ON DELETE SET NULL
+	)`)
+
+	res := execOK(t, s, "SELECT * FROM system.foreign_keys")
+	wantCols := []string{"table_name", "constraint_name", "ordinal", "column_name", "ref_table", "ref_column", "on_delete", "on_update"}
+	if fmt.Sprint(res.Columns) != fmt.Sprint(wantCols) {
+		t.Fatalf("columns = %v, want %v", res.Columns, wantCols)
+	}
+	got := make([][]string, 0, len(res.Rows))
+	for _, r := range res.Rows {
+		got = append(got, []string{
+			r[0].Str, r[1].Str, r[2].Dec.String(), r[3].Str,
+			r[4].Str, r[5].Str, r[6].Str, r[7].Str,
+		})
+	}
+	want := [][]string{
+		{"kids", "fk_kids", "1", "p_region", "parents", "region", "CASCADE", "RESTRICT"},
+		{"kids", "fk_kids", "2", "p_id", "parents", "id", "CASCADE", "RESTRICT"},
+		{"notes", "fk_notes_kid_ref", "1", "kid_ref", "kids", "kid", "SET NULL", "RESTRICT"},
+	}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("rows =\n%v\nwant\n%v", got, want)
+	}
+
+	// SHOW alias parity is not defined for this view; the SELECT is the source
+	// of truth. Verify the WHERE filter narrows to one child table.
+	res = execOK(t, s, "SELECT * FROM system.foreign_keys WHERE table_name='notes'")
+	if len(res.Rows) != 1 || res.Rows[0][1].Str != "fk_notes_kid_ref" {
+		t.Fatalf("filtered rows = %v", res.Rows)
+	}
+}
+
+func TestSystemForeignKeysRBAC(t *testing.T) {
+	dir := t.TempDir()
+	dek, _ := crypto.GenerateDEK(1)
+	keys, _ := crypto.NewMemoryKeyProvider(dek)
+	db, err := Create(dir+"/db", keys, 16)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	defer db.Close()
+	s := db.Session()
+	execOK(t, s, `CREATE TABLE parents (id STRING PRIMARY KEY)`)
+	execOK(t, s, `CREATE TABLE kids (id STRING PRIMARY KEY, p STRING NOT NULL REFERENCES parents (id))`)
+
+	acl, err := security.CreateACL(dir + "/acl.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	acl.Grant("bob", security.PrivConnect, security.ScopeDatabase, "")
+	acl.Grant("bob", security.PrivSelect, security.ScopeTable, "kids")
+	acl.Grant("alice", security.PrivConnect, security.ScopeDatabase, "")
+
+	bob := db.Session()
+	bob.SetACL(acl)
+	bob.SetIdentity("bob")
+	if rows := execOK(t, bob, "SELECT * FROM system.foreign_keys").Rows; len(rows) != 1 || rows[0][0].Str != "kids" {
+		t.Fatalf("bob should see the kids FK, got %v", rows)
+	}
+
+	alice := db.Session()
+	alice.SetACL(acl)
+	alice.SetIdentity("alice")
+	if rows := execOK(t, alice, "SELECT * FROM system.foreign_keys").Rows; len(rows) != 0 {
+		t.Fatalf("alice should see no FK rows, got %v", rows)
+	}
+}
+
+func TestSystemTableDDL(t *testing.T) {
+	db := testDB(t)
+	s := db.Session()
+	execOK(t, s, `CREATE TABLE parents (id STRING PRIMARY KEY, note STRING DEFAULT 'x')`)
+	execOK(t, s, `CREATE TABLE kids (
+		kid STRING PRIMARY KEY,
+		p STRING NOT NULL REFERENCES parents (id) ON DELETE CASCADE,
+		meta JSON
+	)`)
+	execOK(t, s, `CREATE INDEX kids_p ON kids (p)`)
+
+	res := execOK(t, s, "SELECT * FROM system.table_ddl")
+	wantCols := []string{"table_name", "object_type", "object_name", "ddl"}
+	if fmt.Sprint(res.Columns) != fmt.Sprint(wantCols) {
+		t.Fatalf("columns = %v, want %v", res.Columns, wantCols)
+	}
+	byKey := map[string]string{}
+	for _, r := range res.Rows {
+		byKey[r[1].Str+" "+r[2].Str] = r[3].Str
+	}
+	if got := byKey["TABLE kids"]; !strings.Contains(got, `CREATE TABLE "kids"`) ||
+		!strings.Contains(got, `FOREIGN KEY ("p") REFERENCES "parents" ("id") ON DELETE CASCADE`) {
+		t.Fatalf("kids table DDL = %q", got)
+	}
+	if got := byKey["TABLE parents"]; !strings.Contains(got, `"note" STRING DEFAULT 'x'`) {
+		t.Fatalf("parents table DDL = %q", got)
+	}
+	if got := byKey["INDEX kids_p"]; got != `CREATE INDEX "kids_p" ON "kids" ("p")` {
+		t.Fatalf("kids_p index DDL = %q", got)
+	}
+
+	// TABLE rows sort before INDEX rows within a table; ordered by table_name.
+	var order []string
+	for _, r := range res.Rows {
+		order = append(order, r[0].Str+"/"+r[1].Str+"/"+r[2].Str)
+	}
+	want := []string{"kids/TABLE/kids", "kids/INDEX/kids_p", "parents/TABLE/parents"}
+	if fmt.Sprint(order) != fmt.Sprint(want) {
+		t.Fatalf("row order = %v, want %v", order, want)
+	}
+
+	// The rendered DDL round-trips: dropping and recreating from it works.
+	execOK(t, s, "DROP TABLE kids")
+	execOK(t, s, byKey["TABLE kids"])
+	execOK(t, s, byKey["INDEX kids_p"])
+}
+
+func TestSystemTableDDLRBAC(t *testing.T) {
+	dir := t.TempDir()
+	dek, _ := crypto.GenerateDEK(1)
+	keys, _ := crypto.NewMemoryKeyProvider(dek)
+	db, err := Create(dir+"/db", keys, 16)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	defer db.Close()
+	s := db.Session()
+	execOK(t, s, `CREATE TABLE visible (id STRING PRIMARY KEY)`)
+	execOK(t, s, `CREATE TABLE hidden (id STRING PRIMARY KEY)`)
+
+	acl, err := security.CreateACL(dir + "/acl.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	acl.Grant("bob", security.PrivConnect, security.ScopeDatabase, "")
+	acl.Grant("bob", security.PrivSelect, security.ScopeTable, "visible")
+
+	bob := db.Session()
+	bob.SetACL(acl)
+	bob.SetIdentity("bob")
+	rows := execOK(t, bob, "SELECT * FROM system.table_ddl").Rows
+	if len(rows) != 1 || rows[0][0].Str != "visible" {
+		t.Fatalf("bob should see only the visible table DDL, got %v", rows)
+	}
+}
+
+func TestSystemTriggersAndSchedules(t *testing.T) {
+	db := testDB(t)
+	s := db.Session()
+	execOK(t, s, `CREATE TABLE orders (id STRING PRIMARY KEY, state STRING)`)
+	execOK(t, s, `CREATE TABLE audit_log (id STRING PRIMARY KEY)`)
+	execOK(t, s, `CREATE WORKFLOW record(id STRING) AS BEGIN INSERT INTO audit_log (id) VALUES ($id); END`)
+	execOK(t, s, `CREATE TRIGGER audit_ins AFTER INSERT ON orders FOR EACH ROW RUN WORKFLOW record(NEW.id)`)
+	execOK(t, s, `CREATE SCHEDULE nightly EVERY '1h' RUN WORKFLOW record('sched')`)
+
+	trg := execOK(t, s, "SELECT * FROM system.triggers")
+	wantTrgCols := []string{"name", "owner", "timing", "event", "table_name", "workflow", "arg_count"}
+	if fmt.Sprint(trg.Columns) != fmt.Sprint(wantTrgCols) {
+		t.Fatalf("triggers columns = %v, want %v", trg.Columns, wantTrgCols)
+	}
+	if len(trg.Rows) != 1 {
+		t.Fatalf("triggers rows = %v", trg.Rows)
+	}
+	r := trg.Rows[0]
+	if r[0].Str != "audit_ins" || r[2].Str != "AFTER" || r[3].Str != "INSERT" || r[4].Str != "orders" || r[5].Str != "record" || r[6].Dec.String() != "1" {
+		t.Fatalf("trigger row = %v", r)
+	}
+
+	sch := execOK(t, s, "SELECT * FROM system.schedules")
+	wantSchCols := []string{"name", "owner", "kind", "spec", "workflow", "enabled", "next_fire", "last_fire"}
+	if fmt.Sprint(sch.Columns) != fmt.Sprint(wantSchCols) {
+		t.Fatalf("schedules columns = %v, want %v", sch.Columns, wantSchCols)
+	}
+	if len(sch.Rows) != 1 {
+		t.Fatalf("schedules rows = %v", sch.Rows)
+	}
+	sr := sch.Rows[0]
+	if sr[0].Str != "nightly" || sr[2].Str != "EVERY" || sr[3].Str != "1h0m0s" || sr[4].Str != "record" || !sr[5].Bool {
+		t.Fatalf("schedule row = %v", sr)
+	}
+	if sr[7].Typ.Kind != types.KindTimestampTZ || !sr[7].Null {
+		t.Fatalf("last_fire should be a typed NULL before first run: %+v", sr[7])
+	}
+
+	// A trigger is not visible once its table is gone from view.
+	execOK(t, s, "DROP TRIGGER audit_ins")
+	if rows := execOK(t, s, "SELECT * FROM system.triggers").Rows; len(rows) != 0 {
+		t.Fatalf("dropped trigger still listed: %v", rows)
+	}
+}
+
+func TestSystemTriggersAndSchedulesRBAC(t *testing.T) {
+	dir := t.TempDir()
+	dek, _ := crypto.GenerateDEK(1)
+	keys, _ := crypto.NewMemoryKeyProvider(dek)
+	db, err := Create(dir+"/db", keys, 16)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	defer db.Close()
+	s := db.Session()
+	execOK(t, s, `CREATE TABLE orders (id STRING PRIMARY KEY)`)
+	execOK(t, s, `CREATE TABLE sink (id STRING PRIMARY KEY)`)
+	execOK(t, s, `CREATE WORKFLOW w(id STRING) AS BEGIN INSERT INTO sink (id) VALUES ($id); END`)
+	execOK(t, s, `CREATE TRIGGER t_orders AFTER INSERT ON orders FOR EACH ROW RUN WORKFLOW w(NEW.id)`)
+	execOK(t, s, `CREATE SCHEDULE hourly EVERY '1h' RUN WORKFLOW w('scheduled')`)
+
+	acl, err := security.CreateACL(dir + "/acl.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	acl.Grant("alice", security.PrivConnect, security.ScopeDatabase, "")
+
+	alice := db.Session()
+	alice.SetACL(acl)
+	alice.SetIdentity("alice")
+	if rows := execOK(t, alice, "SELECT * FROM system.triggers").Rows; len(rows) != 0 {
+		t.Fatalf("connect-only user should see no triggers, got %v", rows)
+	}
+	if rows := execOK(t, alice, "SELECT * FROM system.schedules").Rows; len(rows) != 0 {
+		t.Fatalf("connect-only user should see no schedules, got %v", rows)
+	}
+
+	acl.Grant("bob", security.PrivConnect, security.ScopeDatabase, "")
+	acl.Grant("bob", security.PrivSelect, security.ScopeTable, "orders")
+	bob := db.Session()
+	bob.SetACL(acl)
+	bob.SetIdentity("bob")
+	if rows := execOK(t, bob, "SELECT * FROM system.triggers").Rows; len(rows) != 1 || rows[0][0].Str != "t_orders" {
+		t.Fatalf("table reader should see its trigger, got %v", rows)
+	}
+	if rows := execOK(t, bob, "SELECT * FROM system.schedules").Rows; len(rows) != 0 {
+		t.Fatalf("table reader without workflow EXECUTE should see no schedules, got %v", rows)
+	}
+
+	acl.Grant("carol", security.PrivConnect, security.ScopeDatabase, "")
+	acl.Grant("carol", security.PrivExecute, security.ScopeFunction, "w")
+	carol := db.Session()
+	carol.SetACL(acl)
+	carol.SetIdentity("carol")
+	if rows := execOK(t, carol, "SELECT * FROM system.triggers").Rows; len(rows) != 0 {
+		t.Fatalf("workflow executor without table SELECT should see no triggers, got %v", rows)
+	}
+	if rows := execOK(t, carol, "SELECT * FROM system.schedules").Rows; len(rows) != 1 || rows[0][0].Str != "hourly" {
+		t.Fatalf("workflow executor should see its schedule, got %v", rows)
+	}
+}
+
 func TestSystemRedacted(t *testing.T) {
 	dir := t.TempDir()
 	dek, _ := crypto.GenerateDEK(1)

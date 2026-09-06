@@ -1342,6 +1342,14 @@ func (s *Session) run(ctx context.Context, plan planner.Logical, trace *optimize
 		}
 		auto = true
 	}
+	if h := s.x.owner.Handle(); h != nil {
+		lockCtx := ctx
+		if s.qbudget != nil {
+			lockCtx = s.qbudget.Context()
+		}
+		h.SetContext(lockCtx)
+		defer h.SetContext(nil)
+	}
 	prev := s.trace
 	s.trace = trace
 	s.resetFKStmt()

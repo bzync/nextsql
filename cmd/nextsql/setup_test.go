@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -246,6 +247,72 @@ func TestSetupRollbackPreservesPreexistingKeyAndDataDir(t *testing.T) {
 	if _, statErr := os.Stat(filepath.Join(dataDir, config.DataFileName)); !os.IsNotExist(statErr) {
 		t.Errorf("rollback left the created database behind")
 	}
+}
+
+// TestSetupKeyFileExistsDisclosure covers the generate-vs-import advisory
+// (`TODO.md` Phase 28 "Installer UX" — makes `nextsql init`'s already-true
+// "existing key is imported, missing key is generated" behavior explicit in
+// --json output rather than leaving it implicit). Dry-run only: it must
+// never mutate anything to answer the question.
+func TestSetupKeyFileExistsDisclosure(t *testing.T) {
+	parseResult := func(t *testing.T, args []string) setupResult {
+		t.Helper()
+		out, err := captureStdout(func() error { return setupCmd(args) })
+		if err != nil {
+			t.Fatalf("setupCmd: %v", err)
+		}
+		var r setupResult
+		if err := json.Unmarshal([]byte(out), &r); err != nil {
+			t.Fatalf("invalid JSON output: %v\n%s", err, out)
+		}
+		return r
+	}
+
+	t.Run("fresh path reports generate", func(t *testing.T) {
+		dataDir := filepath.Join(t.TempDir(), "data")
+		keyFile := filepath.Join(t.TempDir(), "root.key")
+
+		r := parseResult(t, smallSetupArgs(dataDir, keyFile, "--dry-run", "--json"))
+		if r.KeyFileExists {
+			t.Error("expected key_file_exists=false for a path with no file")
+		}
+		if r.InstanceKeyExists {
+			t.Error("expected instance_key_exists=false for a path with no file")
+		}
+		if !containsSubstring(r.Warnings, "a new root unlock key will be generated") {
+			t.Errorf("expected a generate advisory, got warnings: %v", r.Warnings)
+		}
+		if _, err := os.Stat(keyFile); !os.IsNotExist(err) {
+			t.Error("dry-run must not create the key file it reports on")
+		}
+	})
+
+	t.Run("pre-existing key reports import", func(t *testing.T) {
+		dataDir := filepath.Join(t.TempDir(), "data")
+		keyFile := filepath.Join(t.TempDir(), "root.key")
+		k, err := crypto.CreateKeyFile(keyFile, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		k.Zero()
+
+		r := parseResult(t, smallSetupArgs(dataDir, keyFile, "--dry-run", "--json"))
+		if !r.KeyFileExists {
+			t.Error("expected key_file_exists=true for a pre-existing key file")
+		}
+		if !containsSubstring(r.Warnings, "will be imported and reused, not regenerated or overwritten") {
+			t.Errorf("expected an import advisory, got warnings: %v", r.Warnings)
+		}
+	})
+}
+
+func containsSubstring(haystack []string, needle string) bool {
+	for _, s := range haystack {
+		if strings.Contains(s, needle) {
+			return true
+		}
+	}
+	return false
 }
 
 func TestSetupKeepFailedLeavesPartialInstall(t *testing.T) {

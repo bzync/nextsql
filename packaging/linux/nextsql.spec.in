@@ -21,11 +21,14 @@ mkdir -p %{buildroot}
 cp -a @@STAGE@@/. %{buildroot}/
 
 %files
-%license usr/share/doc/nextsql/copyright
-%doc usr/share/doc/nextsql/README
+%license %{_datadir}/doc/%{name}/copyright
+%doc %{_datadir}/doc/%{name}/README
+%{_datadir}/doc/%{name}/USAGE.md.gz
+%{_datadir}/doc/%{name}/VERSION
 %{_bindir}/nextsql
 %{_bindir}/nextsqld
 %{_bindir}/nextsql-bench
+%{_bindir}/nextsql-admin
 %config(noreplace) %{_sysconfdir}/nextsql/nextsql.conf
 %{_unitdir}/nextsql.service
 %{_prefix}/lib/sysusers.d/nextsql.conf

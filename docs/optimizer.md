@@ -105,7 +105,14 @@ detail lists the window function names.
 `UPSERT` is a leaf like `Insert`. `EXPLAIN` shows `Upsert`. `RETURNING` does
 not change the operator; the executor projects the written rows.
 
-`EXPLAIN ANALYZE` executes the statement (including DML). Disk / cache / spill stay 0 until Phase 7 instrumentation. Workers is 1.
+`EXPLAIN ANALYZE` executes the statement (including DML). Its fields are
+server-reported observations, but they are not additive profiler samples:
+operator elapsed times may include child work, and the current executor can
+mirror elapsed time into the CPU field. Peak query memory and spill bytes can
+be carried on the root; disk/cache remain zero where the executor does not
+attribute those counters to an operator. Worker counts reflect the bounded
+worker budget/use recorded for that operator (defaulting to 1). Consumers must
+not sum operator time/resources or derive percentages from these fields.
 
 ## Hybrid plans (Phase 12)
 

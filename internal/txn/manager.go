@@ -1,6 +1,7 @@
 package txn
 
 import (
+	"context"
 	"sync"
 	"sync/atomic"
 
@@ -14,6 +15,37 @@ type Handle struct {
 	Iso      Isolation
 	Snap     Snapshot
 	ReadOnly bool
+
+	ctxMu sync.RWMutex
+	ctx   context.Context
+}
+
+// SetContext associates the currently executing statement's bounded context
+// with this transaction. A transaction can span statements, so callers clear
+// it after each statement rather than retaining request-scoped values.
+func (h *Handle) SetContext(ctx context.Context) {
+	if h == nil {
+		return
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	h.ctxMu.Lock()
+	h.ctx = ctx
+	h.ctxMu.Unlock()
+}
+
+func (h *Handle) context() context.Context {
+	if h == nil {
+		return context.Background()
+	}
+	h.ctxMu.RLock()
+	ctx := h.ctx
+	h.ctxMu.RUnlock()
+	if ctx == nil {
+		return context.Background()
+	}
+	return ctx
 }
 
 // Manager allocates transaction ids, snapshots, and the lock table.
@@ -274,7 +306,7 @@ func (m *Manager) LockKey(h *Handle, key []byte, mode Mode, tag string) error {
 	if h == nil {
 		return nerr.New(nerr.InvalidArgument, "txn.LockKey", "nil handle")
 	}
-	return m.Locks.Acquire(h.ID, key, mode, tag)
+	return m.Locks.AcquireContext(h.context(), h.ID, key, mode, tag)
 }
 
 // LockRange takes a range lock for h. tag labels the lock for introspection
@@ -283,5 +315,5 @@ func (m *Manager) LockRange(h *Handle, start, end []byte, mode Mode, tag string)
 	if h == nil {
 		return nerr.New(nerr.InvalidArgument, "txn.LockRange", "nil handle")
 	}
-	return m.Locks.AcquireRange(h.ID, start, end, mode, tag)
+	return m.Locks.AcquireRangeContext(h.context(), h.ID, start, end, mode, tag)
 }

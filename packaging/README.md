@@ -1,6 +1,7 @@
 # NextSQL installers
 
-Build scripts that package `nextsql`, `nextsqld`, and `nextsql-bench`.
+Build scripts that package `nextsql`, `nextsqld`, `nextsql-bench`, and
+`nextsql-admin`.
 
 For first-run configuration and database initialization — hardware detection,
 resource presets, secure-default `nextsql.conf` generation, and post-install
@@ -21,6 +22,15 @@ to a script.
 ```
 
 Artifacts land in `installers/`. Checksums: `installers/SHA256SUMS.linux`, `installers/SHA256SUMS.windows`, and `installers/SHA256SUMS` after the combined script.
+
+To detached-sign the checksums file with GPG, pass `--gpg-key ID` (or set
+`NEXTSQL_RELEASE_GPG_KEY`) — no signing key exists in this repo/CI yet, so
+this is opt-in and produces no `.asc` file unless a key is given:
+
+```bash
+./scripts/build-linux-installer.sh --gpg-key you@example.com
+gpg --verify installers/SHA256SUMS.linux.asc installers/SHA256SUMS.linux
+```
 
 Requires Go 1.22+, `tar`, `gzip`, `zip`, `sha256sum`, and `python3`. Debian packages need `dpkg-deb` (and `fakeroot` when present). The Windows `.ico` is built with Python Pillow when that package is installed.
 

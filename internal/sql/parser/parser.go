@@ -2902,13 +2902,22 @@ func (p *Parser) indexKey() (string, []string, ast.Expr, error) {
 			return "", nil, ast.Call{Name: c, Args: args}, nil
 		}
 		parts := []string{c}
-		for p.tok.Kind == lexer.Dot {
-			p.next()
-			part, err := p.ident()
-			if err != nil {
-				return "", nil, nil, err
+		for {
+			if p.tok.Kind == lexer.Dot {
+				p.next()
+				part, err := p.ident()
+				if err != nil {
+					return "", nil, nil, err
+				}
+				parts = append(parts, part)
+				continue
 			}
-			parts = append(parts, part)
+			if index, ok := pathIndexPart(p.tok); ok {
+				parts = append(parts, index)
+				p.next()
+				continue
+			}
+			break
 		}
 		return parts[0], parts, nil, nil
 	}
@@ -4136,19 +4145,48 @@ func (p *Parser) nameOrCall() (ast.Expr, error) {
 		}
 		return p.maybeWindow(ast.Call{Name: name, Args: args})
 	}
-	if p.tok.Kind == lexer.Dot {
+	if _, ok := pathIndexPart(p.tok); p.tok.Kind == lexer.Dot || ok {
 		parts := []string{name}
-		for p.tok.Kind == lexer.Dot {
-			p.next()
-			part, err := p.ident()
-			if err != nil {
-				return nil, err
+		for {
+			if p.tok.Kind == lexer.Dot {
+				p.next()
+				part, err := p.ident()
+				if err != nil {
+					return nil, err
+				}
+				parts = append(parts, part)
+				continue
 			}
-			parts = append(parts, part)
+			if index, ok := pathIndexPart(p.tok); ok {
+				parts = append(parts, index)
+				p.next()
+				continue
+			}
+			break
 		}
 		return ast.Path{Parts: parts}, nil
 	}
 	return ast.Ident{Name: name}, nil
+}
+
+// pathIndexPart reports whether tok is a JSON array-index path segment
+// arriving fused with its leading dot. The lexer tokenizes "." immediately
+// followed by a digit (`.number` in Lexer.next) as a single leading-dot
+// Number literal — the same rule that lexes ".5" as the float literal
+// 0.5 — so `metadata.tags.0` (docs/json.md's own array-index example)
+// arrives here as Ident("tags") followed by Number(".0"), never a separate
+// Dot then Number(0): a Dot-continuation loop checking only lexer.Dot would
+// otherwise stop the path one segment short. Both call sites that build a
+// Path's parts list from raw tokens — nameOrCall (ordinary expressions) and
+// indexKey (a bare, non-parenthesized CREATE INDEX key) — check this in
+// addition to lexer.Dot, so a genuine leading-dot float literal anywhere
+// else (an ordinary arithmetic operand, a function argument, and so on)
+// lexes and parses exactly as before.
+func pathIndexPart(tok lexer.Token) (string, bool) {
+	if tok.Kind != lexer.Number || !strings.HasPrefix(tok.Lit, ".") {
+		return "", false
+	}
+	return tok.Lit[1:], true
 }
 
 func (p *Parser) orderItem() (ast.OrderItem, error) {

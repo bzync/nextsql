@@ -75,8 +75,8 @@ Consequences:
   leader-routing guidance. Followers never silently serve stale data as
   `STRONG`.
 - A `STRONG` read costs one quorum round trip. It is a correctness barrier,
-  not a lease-only fast path; a cheaper lease-based path and follower-served
-  modes are later Phase 22 increments.
+  not a lease-only fast path. The shipped `BOUNDED` and `STALE` modes below
+  provide follower-served alternatives with explicit weaker guarantees.
 
 ### `BOUNDED`
 
@@ -410,8 +410,9 @@ records never contain passwords, keys, tokens, or secrets.
 
 - Not “guaranteed zero downtime”.
 - Not a multi-primary write mesh.
-- Follower-read routing ships in every official driver (Go, Node, Bun, Deno,
-  PHP): the wire messages, `BOUNDED` mode, and per-driver cluster clients are
+- Follower-read routing ships in every official driver (Go, Node.js, Bun,
+  Deno, PHP, Python, and Ruby): the wire messages, `BOUNDED` mode, and
+  per-driver cluster clients are
   implemented. The read-scaling benchmark is published above
   (`nextsql-bench --readscale`), and the Phase 22 exit gate is closed — see
   **Consistency model and sign-off** for the linearizability argument and the

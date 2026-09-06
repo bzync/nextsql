@@ -1,6 +1,6 @@
 # Spatial — `GEOMETRY` / `GEOGRAPHY` — design & decomposition
 
-> Status: **design recorded, implementation in progress.** This is D10 from
+> Status: **S1–S6 complete (2026-09-04).** This is D10 from
 > the Datatype-expansion track (`docs/design-datatypes.md`), whose recorded
 > 2026-09-04 scoping decision was "a new, more general PostGIS-style
 > subsystem **alongside** the existing 4 WGS84 shapes — not a generalization
@@ -18,12 +18,12 @@
 
 ## 1. What already ships, and why this sits beside it
 
-`docs/geo.md` ships four fixed scalar types — `POINT`/`LOCATION`, `BOX`,
+Before this track landed, `docs/geo.md` shipped four fixed scalar types — `POINT`/`LOCATION`, `BOX`,
 `LINESTRING`, `POLYGON` — each its own `Kind` with a fixed little-endian
 `float64` layout, hard-coded WGS84 lon/lat degrees, no SRID concept, a
 256-vertex cap so a geometry fits one 16 KiB page, and deliberately
-*native* (not OGC) predicate semantics. Its own closing line lists
-"geography-vs-geometry dual types" as **not implemented**.
+*native* (not OGC) predicate semantics. Its former closing limitation listed
+"geography-vs-geometry dual types" as not implemented; S1–S6 closed that gap.
 
 This track adds that. The four existing types **stay exactly as they are**
 — no SRID retrofit, no shared type hierarchy, no deprecation. They remain

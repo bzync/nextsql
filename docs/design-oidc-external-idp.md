@@ -67,7 +67,7 @@ existing credential_, not a new thing the SQL server has to understand.**
 ### Goals
 
 - OIDC Authorization Code + PKCE for interactive login from the `nextsql` CLI
-  and, later, NextSQL Studio.
+  and, later, NextSQL Admin's Studio mode.
 - OIDC/OAuth2 client-credentials grant for confidential workloads.
 - Deterministic, auditable IdP-claim → native-principal mapping.
 - Deterministic IdP-group → native-role mapping that can only *narrow*, never

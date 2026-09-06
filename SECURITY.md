@@ -45,7 +45,7 @@ Security-sensitive areas include:
 
 - authentication;
 - authorization;
-- tenant isolation;
+- realm/database isolation;
 - root/key handling;
 - encryption;
 - WAL/backup confidentiality;
@@ -53,7 +53,7 @@ Security-sensitive areas include:
 - TLS;
 - Raft/replication authentication;
 - audit integrity;
-- Studio/Manager authorization;
+- NextSQL Admin authorization (Setup/Operations/Studio modes);
 - Intelligence/RAG data access.
 
 ---
@@ -72,15 +72,17 @@ Current page encryption uses AES-256-GCM.
 
 ---
 
-## Tenant Isolation
+## Realm and Database Isolation
 
-Cross-tenant data leakage tolerance is zero.
+Cross-realm/database data leakage tolerance is zero. Shared row tenancy has
+been removed; a connection is bound to one resolved hosted realm/database and
+physical table partitioning is never an authorization boundary.
 
 Every new feature must preserve:
 
-- session tenant context;
+- immutable session realm/database context;
 - RBAC;
-- row isolation;
+- realm-local authentication and database-scoped authorization;
 - authorization checks;
 - auditability.
 

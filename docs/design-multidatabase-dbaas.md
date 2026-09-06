@@ -65,9 +65,13 @@ the already-dead-in-production `TaskRuntime.Cancel`/`running` registry
 (2026-09-03) — with that, M2-3b (and the whole M2 selectable-hosting
 milestone) is complete.
 
-ID-layout migration/rollback of the *existing* legacy default database,
-realm-local auth stores (§5.2, M2-4), quotas, HA replication, and
-independent operational lifecycle remain open.
+The live selectable-hosting core now includes realm-aware authentication and
+ACL lookup, bounded opens/idle eviction/quarantine, a shared buffer budget,
+and a centralized bounded task scheduler. Still open are migration/rollback
+of the existing legacy default database into the managed-ID layout, separate
+per-realm auth files/crypto-shred, the remaining quota/control-plane work, HA
+replication for secondary databases, and the unfinished M3 operational
+lifecycle items below.
 
 ## 1. Purpose
 
@@ -112,23 +116,25 @@ The feature must preserve NextSQL's priority order: correctness, durability,
 security, integrity, availability, latency, throughput, efficiency, developer
 experience, then features.
 
-## 2. Current Baseline and Gap
+## 2. Current Baseline and Remaining Gap
 
-The current implementation is deliberately single-database:
+The M2 selectable-hosting core is implemented. With a deployment registry,
+`nextsqld` resolves the optional Hello realm/database pair, binds the session
+immutably to that registered database, and routes it through
+`internal/dbmanager.Manager`. Opens are bounded and single-flight; idle
+secondary databases close; failed opens are quarantined with bounded backoff;
+buffer pages and task workers are process-bounded. Realm-aware auth and ACL
+lookup prevent cross-realm credential or privilege reuse, and pre-auth failures
+do not disclose whether a realm/database/user exists.
 
-- `nextsqld` opens `DATA-DIR/nextsql.db`;
-- `protocol.Server` owns one database handle, auth store, ACL store, audit log,
-  and task runtime;
-- the Hello `database` field is optional and does not select an engine;
-- `CREATE DATABASE name` creates a sibling file but does not register, route,
-  serve, back up, recover, or replicate that database as part of the running
-  server;
-- auth and ACL files are scoped to the one configured data directory;
-- HA is attached to the one opened executor database.
-
-Therefore the existing `CREATE DATABASE` implementation is a useful storage
-primitive, not multi-database server support. It must not be advertised as the
-latter.
+The legacy no-registry path still opens `DATA-DIR/nextsql.db` and treats an
+empty Hello realm/database as the configured default. HA, process-level
+TLS/audit/config/metrics attachment, database-addressed backup/PITR/import/
+export, managed-database key lifecycle, registry disaster recovery, and full
+online lifecycle are not yet complete for secondary databases. `CREATE
+DATABASE` SQL remains the legacy storage primitive; managed hosting is
+provisioned with `nextsql realm` / `nextsql database` commands and the
+deployment registry.
 
 ## 3. Terminology
 
@@ -453,8 +459,8 @@ Rules:
 - remote connections require TLS, with mTLS/service identity integrated when
   Phase 25 provides it.
 
-All official drivers, CLI commands, migrations, Studio, and Manager must use
-the same server-authoritative routing and capability negotiation.
+All official drivers, CLI commands, migrations, and NextSQL Admin (every mode)
+must use the same server-authoritative routing and capability negotiation.
 
 ## 9. Bounded Database Engine Manager
 

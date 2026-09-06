@@ -7,7 +7,6 @@ NextSQL is currently under active development as `0.1.0-dev`.
 This changelog follows the project source-of-truth model:
 
 ```text
-TODO.md    = current implementation/status truth
 PROJECT.md = intended finished product
 TODO.md    = implementation status, sequencing, dependencies, and phase gates
 SKILLS.md  = engineering/agent contract
@@ -22,6 +21,1136 @@ A roadmap item is not recorded as completed here until its implementation, tests
 ---
 
 ## [Unreleased]
+
+> Phase 30 (NextSQL Intelligence / built-in RAG) is deferred to the next
+> version and is not being implemented in this release.
+
+### Verified — NextSQL Admin high-DPI browser rendering (P29, 2026-09-06)
+
+- The real-Chrome accessibility suite now exercises Setup, Operations, and the
+  authenticated Studio workspace at device-pixel ratio 2. It verifies each
+  compact responsive layout, rejects document-level horizontal overflow and
+  undersized raster sources, confirms bundled scalable fonts are ready, and
+  reruns axe WCAG 2.2 AA before restoring default device metrics. This closes
+  Studio's browser/CSS high-DPI checklist item; Windows/macOS package execution
+  remains separately unverified. See `TODO.md` log #202.
+
+### Added — NextSQL Admin Studio: parameterized INSERT / UPDATE / DELETE generation (P29, 2026-09-06)
+
+- A new **Parameterized DML…** control in the Studio SQL workspace builds a
+  positional-parameter (`$1..$N`) `INSERT`, `UPDATE`, or `DELETE` statement
+  *template* for the chosen table from its authorized column metadata and loads
+  it into the active editor tab **for review** — it never executes anything and
+  adds no server route (it reuses `GET /api/v1/studio/table`). The emitted
+  `$1..$N` placeholders are bound in the editor's existing Parameters panel
+  before the operator runs the statement; `UPDATE`/`DELETE` require at least one
+  WHERE key column so the statement targets specific rows, and every identifier
+  is quoted. The Studio query-tab strip now scrolls horizontally instead of
+  wrapping to multiple rows. See `TODO.md` log #201.
+
+### Added — NextSQL Admin Studio: CSV / JSON import for development (P29, 2026-09-06)
+
+- A new **Import data…** control in the Studio SQL workspace parses a pasted or
+  loaded CSV / semicolon / TSV / JSON-array / NDJSON document, auto-maps its
+  fields to the target table's authorized columns (with per-field overrides),
+  and builds a bounded `INSERT` script into the active editor tab **for
+  review** — it never executes anything and adds no server route (it reuses
+  `GET /api/v1/studio/table`). Integer and boolean cells are validated against
+  the target column type with named row errors rather than quoted guesses;
+  every identifier and string value is quoted; input and output are bounded
+  (≤8 MiB in, ≤2,000 rows, 100-row `INSERT` batches, ≤1 MiB SQL).
+  `VECTOR` / geo / collection / `BLOB` columns are not offered as targets.
+  See `TODO.md` log #200.
+
+### Added — NextSQL Admin Studio: table-inspector Dependencies panel (P29, 2026-09-06)
+
+- The Studio table inspector now shows a **Dependencies** section — the inbound
+  "Referenced by" foreign-key grid together with the row triggers defined on the
+  table, read from `system.triggers` (added as a non-required query to the
+  existing `GET /api/v1/studio/table` bundle). The lazy schema tree gains a
+  matching per-table **Triggers** sub-branch. No new route or capability;
+  `system.triggers` already restricts each row to callers who can `SELECT` the
+  table the trigger fires on. See `TODO.md` log #199.
+
+### Added — NextSQL Admin Studio: development data generator (P29, 2026-09-06)
+
+- A **Generate data…** control in Studio builds `INSERT` statements of synthetic
+  rows from a table's authorized column metadata and loads them into the editor
+  for review — it never executes anything and adds no server route. Generation is
+  bounded (at most 1,000 rows, batched into 100-row statements, 512 KiB cap) and
+  deterministic: the same seed always produces identical SQL. Per-column fill
+  strategies cover the scalar types (`INT8..64`/`UINT8..64`, `DECIMAL`, `STRING`/
+  `TEXT`, `UUID`, `BOOL`, `TIMESTAMPTZ`, `JSON`); `VECTOR`/geo/collection/`BLOB`
+  columns are marked "not generatable" and left out, and a NOT-NULL column with
+  no default that would be left out is a blocking error. See `TODO.md` log #198.
+
+### Added — NextSQL Admin Studio: visible cross-database administration warning (P29, 2026-09-06)
+
+- Studio's parse-only pre-run analysis now marks `CREATE`/`DROP USER` and
+  `CREATE`/`DROP ROLE` as realm-scoped. Before execution, the confirmation names
+  the connected realm/database and explains that the principal change affects
+  every database in that realm; canceling runs nothing. Consolidated script
+  confirmation applies the same rule, and destructive realm DDL retains both
+  its destructive and cross-database reasons. Server-side RBAC remains the
+  authority. See `TODO.md` log #197.
+
+### Added — NextSQL Admin Studio: schema migration history explorer (P29, 2026-09-06)
+
+- A read-only **Migrations…** explorer (toolbar + command palette) shows the
+  database's `nsql_schema_migrations` history — version, name, applied-at,
+  execution time, dirty flag, direction — through the logged-in operator's own
+  connection (`GET /api/v1/studio/migrations`). A bounded summary reports the
+  applied count, current version, and any dirty migration state, pointing at
+  `nextsql migrate repair`. When the migration system has never run on the
+  database (or the role cannot read the reserved table) the panel says so.
+- Read-only by design: authoring, validating, dry-running, applying and
+  reverting migrations stay with the `nextsql migrate` CLI, which needs the
+  local migration files this protocol-only client never holds. First slice of
+  the Developer-operations migration workspace. See `TODO.md` log #196.
+
+### Fixed — NextSQL Admin Studio: result status line for writes (P29, 2026-09-06)
+
+- The one-line result status under the editor now reports `N rows affected` (or
+  `Statement completed`) for a column-less write or DDL instead of a misleading
+  `0 rows`, and `N rows · M columns · T ms` for a read. See `TODO.md` log #195.
+
+### Added — NextSQL Admin Studio: global command palette (P29, 2026-09-06)
+
+- **Ctrl/Cmd+K** (or a **Commands** button) opens a searchable palette over
+  Studio's own actions — run/cancel a query, open any explorer, switch
+  connection, saved queries, and more. It only reaches existing actions; no new
+  behavior. See `TODO.md` log #194.
+
+### Added — NextSQL Admin Studio: recent-connections quick-switch (P29, 2026-09-06)
+
+- The Switch-connection modal now lists the realm/database pairs recently
+  switched to on the current server as quick-fill buttons (stored per host +
+  user in the browser, bounded at 10, never a credential — the password is
+  still required). See `TODO.md` log #193.
+
+### Added — NextSQL Admin Studio: per-session read-consistency mode (P29, 2026-09-06)
+
+- The Studio toolbar now has a read-consistency selector — **Strong** (default),
+  **Bounded** (with a staleness bound in seconds), or **Stale** — applied live to
+  the session's connection via `POST /api/v1/studio/read-consistency` (no
+  reconnect; affects reads only, writes still go to the leader). A warning badge
+  shows whenever the mode is not Strong so a stale result is never presented as
+  authoritative. A realm/database switch resets the mode to Strong. See `TODO.md`
+  log #192.
+
+### Added — NextSQL Admin Studio: switch realm/database (P29, 2026-09-06)
+
+- The Studio toolbar now shows the `nextsqld` address the session targets and a
+  **Switch connection…** control that re-targets the session's connection to a
+  different realm and/or database on the same server, without signing out.
+- `POST /api/v1/studio/reconnect` opens a fresh authenticated connection (the
+  password is supplied each time and never stored) and swaps it in atomically:
+  a switch cannot race an in-flight query (`409`), and a failed open (wrong
+  password → `401`, unknown realm, suspended database) leaves the existing
+  connection untouched. First real connection-manager capability; named
+  multi-host profiles and credential storage remain open. See `TODO.md` log #191.
+
+### Added — trigger/schedule catalog and Studio workflow diagram (P29, 2026-09-06)
+
+- Added read-only `system.triggers` and `system.schedules` definition views.
+  Trigger rows follow visibility of their firing table; schedule rows follow
+  visibility of their invoked workflow. Their shapes, native state values,
+  lifecycle, and separated RBAC gates are pinned by executor tests.
+- The Studio Workflows & CDC explorer now independently caps all five of its
+  catalog/activity results at 500 rows and adds trigger/schedule tables plus a
+  deterministic accessible relationship view:
+  `TABLE → TRIGGER → WORKFLOW` and `SCHEDULE → WORKFLOW`. A labelled inline SVG
+  is drawn only for a small complete graph; an always-visible bounded text
+  alternative remains for keyboard/screen-reader and large-graph use. See
+  `TODO.md` log #190.
+
+### Added — NextSQL Admin Studio unified Constraints panel (P29, 2026-09-06)
+
+- The Studio table inspector now combines the selected table's already
+  authorized primary-key, UNIQUE-index, NOT-NULL, and foreign-key metadata into
+  one bounded **Constraints** grid. Composite keys retain catalog ordinal order;
+  UNIQUE remains explicitly labelled as an index with its predicate/include/
+  status; and a duplicate `PRIMARY` backing-index row is suppressed. No new
+  server route or catalog surface is involved. See `TODO.md` log #189.
+
+### Added — NextSQL Admin Studio table DDL view (P29, 2026-09-06)
+
+- The Studio table inspector gains a **DDL** section: the canonical
+  `CREATE TABLE` and `CREATE INDEX` statements for the selected table (from
+  the new `system.table_ddl` view, added to the table-detail bundle), shown
+  as a copyable script with an **Open in editor** action. Degrades to no
+  panel against a server without the view. See `TODO.md` log #188.
+
+### Added — `system.table_ddl` canonical-DDL catalog view (P29, 2026-09-06)
+
+- New read-only system view `system.table_ddl` (`table_name`, `object_type`,
+  `object_name`, `ddl`): one row per visible table and one per index, where
+  `ddl` is the canonical `CREATE` statement — the same rendering used by
+  encrypted-backup SQL export, correct for foreign-key ordinals, expression
+  and JSON-path indexes, vector index method/quantization, full-text
+  analyzer, ENUM/CHAR/VARCHAR types, and `DEFAULT` literals. Filtered by
+  `SELECT` on the table, exactly like `system.columns`. `SchemaVersion` is
+  unchanged (a new view, not a column change).
+- Internal: the DDL renderer moved from `internal/xport` to a new
+  dependency-free `internal/catalog/ddl` package so the query executor can
+  reuse it; backup/restore/tenant-migration behavior is unchanged. See
+  `TODO.md` log #187.
+
+### Added — NextSQL Admin Studio prepared parameters (P29, 2026-09-06)
+
+- A Studio editor buffer that references positional placeholders (`$1..$N`)
+  now shows a **Parameters** panel: one value field per distinct placeholder,
+  each with a NULL toggle. The bind values are per-tab and ephemeral — never
+  written to browser storage, never sent anywhere except with an explicit Run.
+- Run sends the values as a bounded positional array (`params`) on
+  `POST /api/v1/studio/query` / `.../stream`; at most 32 parameters, 64 KiB per
+  value. Each value is bound as a string and coerced to the placeholder's
+  expected type by nextsqld's binder (server-side RBAC and validation stay
+  authoritative); a toggled slot binds a typed SQL NULL. Single-statement Run
+  only. Closes the Studio MVP exit-gate "Prepared parameters" line. See
+  `TODO.md` log #186.
+
+### Added — NextSQL Admin Studio saved queries with tag folders (P29, 2026-09-06)
+
+- A **Saved** panel in the Studio editor keeps named, tag-grouped SQL
+  snippets, mirrored to `localStorage` per connection (text only, never sent
+  anywhere). A "folder" is a tag — the panel filters by tag and by free text
+  over name and SQL.
+- Each saved query loads into the active tab without running, can be updated
+  with the current buffer, renamed, or deleted. Bounded: 200 entries, 200,000
+  chars of SQL each, 10 tags each. See `TODO.md` log #184.
+- The panel also exports the whole set to a JSON file — a stable,
+  order-independent document (`format: "nextsql-studio-saved-queries-v1"`,
+  entries sorted by name, two-space indent) that diffs cleanly when checked
+  into a repo — and imports one back, merging by entry id: new entries are
+  added, an existing entry is replaced only by a strictly newer copy, and an
+  older copy never clobbers a local edit. See `TODO.md` log #185.
+
+### Added — NextSQL Admin Studio crash recovery for unsaved editors (P29, 2026-09-06)
+
+- Each Studio editor tab's title and SQL text (only — not results, errors, or
+  history) is mirrored to `localStorage` under a per-connection key and
+  restored on load, so a browser crash, accidental close, or reload does not
+  lose unsaved work. Bounded: at most 8 tabs, 200,000 chars per buffer,
+  malformed data ignored, every storage access best-effort.
+- A status notice on restore offers **Start fresh** to discard the recovered
+  tabs. This is a deliberate, narrow exception to Studio's "query history
+  never touches disk" rule — only the working buffer is persisted, never the
+  run log. See `TODO.md` log #183.
+
+### Added — NextSQL Admin Studio global object search (P29, 2026-09-06)
+
+- A **Search objects…** finder in the Studio database explorer — a keyboard-
+  driven modal over table names (from the initial catalog read) and workflow
+  names (one authorized `system.workflows` read). Matching ranks exact,
+  prefix, substring, then in-order subsequence, and never surfaces a
+  non-subsequence guess.
+- Selecting a table opens it in the inspector; selecting a workflow opens the
+  read-only Workflows explorer. Columns and indexes are not searched (that
+  would need a per-table fetch) — the finder says so. No new route or server
+  surface. See `TODO.md` log #182.
+
+### Added — NextSQL Admin Studio schema-relationship diagram (P29, 2026-09-06)
+
+- A **Schema diagram…** explorer in the Studio toolbar shows an entity-
+  relationship view built from the actual foreign keys. `GET
+  /api/v1/studio/schema-graph` runs one authorized, RBAC-filtered
+  `system.foreign_keys` read (capped at 4,000 rows); the browser collapses it
+  to one edge per constraint, lays the tables out in dependency layers (cycles
+  broken deterministically), and renders an inline `<svg role="img">` with a
+  grouped **Relationships** list as its text alternative.
+- Schemas with more than 40 related tables or 80 foreign keys, or a truncated
+  read, show the relationship list alone. No graph/layout library is added —
+  the layout math is pure and unit-tested. See `TODO.md` log #181.
+
+### Added — NextSQL Admin Studio per-table foreign-key inspection, inbound + outbound (P29, 2026-09-06)
+
+- The Studio database explorer now shows a table's foreign keys. The lazy
+  `GET /api/v1/studio/table` bundle reads `system.foreign_keys` filtered by
+  `table_name` (not required; empty for a table with none), carrying the same
+  visibility filter as the rest of the bundle.
+- The table inspector renders a **Foreign keys** section (raw
+  `system.foreign_keys` rows, or "This table has no foreign keys."); the
+  schema tree gains a per-table **Foreign keys** sub-branch — one leaf per
+  constraint, `(child cols) → ref_table (ref cols)` with a non-`RESTRICT`
+  `ON DELETE` action shown inline.
+- The inspector's Foreign keys section also shows a **Referenced by** grid —
+  FK constraints on other visible tables that point at the selected one, from
+  a second `system.foreign_keys` read filtered on `ref_table` (only inbound
+  references from child tables the caller can already see are listed). The
+  schema-tree sub-branch stays outbound-only.
+- An ER diagram from actual FKs remains open. Primary-key columns are already
+  tagged `PK` in the Columns view. No new route or engine change.
+  See `TODO.md` logs #179–#180.
+
+### Added — `system.foreign_keys` catalog view (P29, 2026-09-06)
+
+- New read-only virtual view `system.foreign_keys`
+  (`table_name, constraint_name, ordinal, column_name, ref_table, ref_column,
+  on_delete, on_update`): one row per referencing column, ordered by child
+  table then constraint then 1-based `ordinal`. `on_delete`/`on_update` are
+  `RESTRICT` / `CASCADE` / `SET NULL` / `SET DEFAULT`. Filtered by `SELECT`
+  on the referencing (child) table — the same table-visibility rule as
+  `system.columns` / `system.indexes`.
+- Unblocks the Studio database explorer's foreign-key sub-nodes, a
+  table-overview FK panel, and an ER-diagram-from-actual-FKs view. NextSQL
+  has no `CHECK` constraint; PK / `UNIQUE` / `NOT NULL` are already exposed
+  by `system.tables` / `system.indexes` / `system.columns`, so no separate
+  `system.constraints` view is added.
+- No persistent-format, protocol, or catalog-encoding change; `SchemaVersion`
+  is unchanged (a new view, not a column change). See `TODO.md` log #178.
+
+### Added — NextSQL Admin Studio lazy-loaded schema tree (P29, 2026-09-06)
+
+- The Studio database explorer is now a lazy object tree instead of a flat
+  table list. A **Tables** branch lists every authorized table (from the
+  bootstrap read); expanding a table node fetches its existing
+  `GET /api/v1/studio/table` bundle once and shows lazy **Columns**
+  (`name · type`, primary-key columns tagged) and **Indexes** sub-branches.
+  Selecting a table name still opens the full inspector.
+- A read-only **Workflows** branch lazily runs the existing
+  `GET /api/v1/studio/workflows` bundle on first open and lists each
+  visible workflow (name, owner) — no run/cancel/edit action.
+- No new route or server surface; every read goes through the operator's
+  authorized official-driver session, so the system catalog's RBAC
+  filtering stays the sole authority. Primary/foreign-key + constraint
+  sub-nodes, a DDL view, and an ER diagram still need a server catalog
+  surface that does not exist yet.
+- Added real-browser expand-Columns / expand-Workflows / one-authorized-read
+  assertions under axe WCAG 2.2 AA. See `TODO.md` log #177.
+
+### Added — NextSQL Admin Studio production environment tag + read-only safety mode (P29, 2026-09-06)
+
+- The operator can tag the current Studio connection's environment
+  (development / test / staging / production) — a per-viewer browser
+  preference keyed by realm/database/user, never sent anywhere and not a
+  credential.
+- A `production` tag shows a standing banner and turns on **read-only
+  mode** (toggleable for the session). While read-only mode is on, every
+  write statement — single or inside a script — asks for confirmation
+  before running, individually overridable with "Run anyway".
+- `POST /api/v1/studio/query/analyze` now also returns a `write` flag,
+  classifying read vs write at the AST level with the same list nextsqld's
+  own `executor.isMutating` uses. Advisory only — server-side RBAC remains
+  the real protection.
+- Closes the "Highly visible production indicator", "Production safety
+  mode", and "Optional read-only production session default"
+  connection-manager checklist lines. Added write-classification unit
+  tests, an analyze-`write` integration assertion, and a real-browser
+  tag/banner/confirm/toggle flow under axe WCAG 2.2 AA. See `TODO.md` log
+  #176.
+
+### Added — NextSQL Admin Studio RBAC-enforcement test (P29, 2026-09-06)
+
+- Added `TestAdminStudioEnforcesRBAC`: with a real `security.ACL` and a
+  limited user, it proves a Studio session cannot list, open, read, or
+  `CREATE` anything the user's grants disallow — through
+  `/studio/bootstrap`, `/studio/table`, `/studio/query`, and
+  `/studio/workflows` — and that admin-only `system.*` views return zero
+  rows rather than data or an error.
+- Closes the Studio MVP exit-gate line "RBAC/realm/database tests pass".
+  Test-only; no production behavior change. See `TODO.md` log #175.
+
+### Added — NextSQL Admin Studio indexed-JSON-path completion (P29, 2026-09-06)
+
+- The editor's catalog-aware IntelliSense now completes native JSON paths:
+  when the caret is inside a dotted path (`metadata.tags…`), the suggestion
+  panel switches from table/column names to the JSON paths a
+  FROM/JOIN-referenced table is actually **indexed** on.
+- Those paths come from the `system.indexes` rows the IntelliSense fetch
+  already returns — the only JSON structure NextSQL exposes any metadata
+  for — so completion never offers an inferred or free-typed path. No new
+  server route or request; pure frontend logic plus editor wiring.
+- Vector-aware completion and inline parser/binder diagnostics remain open:
+  the latter was assessed this round and needs source positions threaded
+  through ~100 parser error sites and the binder's name-resolution errors,
+  a core-decoder change rather than a frontend slice.
+- Added path-extraction / range-detection / prefix-ranking unit tests and a
+  real-browser flow (dotted-path mode switch, offered path, accept) under
+  axe WCAG 2.2 AA. See `TODO.md` log #174.
+
+### Added — NextSQL Admin Studio Workflows, tasks & change-streams explorer (P29, 2026-09-06)
+
+- Added a read-only Studio explorer (toolbar button "Workflows & CDC…")
+  over the authorized `system.workflows` / `system.tasks` /
+  `system.change_streams` catalog, served by one small dedicated bundle
+  route `GET /api/v1/studio/workflows` built the same way as
+  `GET /api/v1/studio/table`.
+- Lists workflows, their durable scheduled tasks (with a client-side
+  per-workflow filter), and the open CDC `SUBSCRIBE` consumers on the node
+  with each subscription's `lsn` resume cursor; refetches on every open and
+  explicit Refresh because task and subscription state is live.
+- Read-only by design, matching the Transaction console and Audit viewer:
+  workflow bodies and trigger/schedule definitions are authored through
+  the editor's own `CREATE`/`ALTER` statements, there is no
+  cancel/retry-task control, and a CDC subscription is paused/resumed only
+  by its own consuming client (not Studio). A full trigger/schedule
+  relationship graph and a canonical `CREATE TABLE` DDL view both remain
+  blocked on server catalog surfaces that do not exist yet
+  (`system.triggers`/`system.schedules`; canonical DDL emission).
+- Added a live `CREATE WORKFLOW` → `system.workflows` integration
+  assertion plus a `change_streams` result-presence check, a no-session
+  401 check for the new route, and a real-browser flow (open/refetch/
+  client-side filter/stream-lsn render/no-mutation-control) under axe
+  WCAG 2.2 AA. See `TODO.md` logs #172–#173.
+
+### Added — NextSQL Admin Studio table/index statistics inspection (P29, 2026-09-06)
+
+- The Studio database explorer's lazy table detail now includes a
+  **Statistics** section: the table's `system.table_stats` row (row count,
+  `updated_at`) and its `system.index_stats` rows (per-index row count),
+  or an explicit "run ANALYZE" note when neither is populated.
+- Implemented by extending the existing `GET /api/v1/studio/table` bundle
+  with two more authorized reads — no new route, no engine change. Both
+  reads are non-required and share `system.tables`' exact table-visibility
+  filter, so a user sees statistics only for tables they can already see.
+- The section labels these as `ANALYZE`-written estimates, not a live
+  `COUNT(*)`; Studio issues no `ANALYZE` itself.
+- Added a live ANALYZE→`system.table_stats`/`system.index_stats`
+  integration assertion and a real-browser section-render check with axe
+  WCAG 2.2 AA. See `TODO.md` log #171.
+
+### Added — NextSQL Admin Studio deterministic misspelled table-name suggestions (P29, 2026-09-06)
+
+- Added a live, non-interrupting notice when the SQL editor's buffer
+  references a bare (unqualified) FROM/JOIN table name that matches no real
+  table but is a small Levenshtein edit distance from exactly one real
+  catalog table name — with a one-click fix that rewrites every occurrence
+  of just that name.
+- Deliberately scoped to table names only: a schema-qualified target (e.g.
+  `system.capabilities`), a truncated catalog read, or a tie between two
+  equally-close real table names is never flagged or "corrected" by a
+  guess. Column/alias/function-name misspelling suggestions are out of
+  scope — a plain identifier scan cannot safely tell those apart from a
+  bare table/column reference without real parser AST access.
+- Investigated and ruled out reacting to a live server error instead:
+  NextSQL's "unknown table"/"unknown column" errors never include the
+  offending identifier's own name in their text today, so this is a
+  purely client-side check against the already-loaded catalog, with no
+  server or wire change.
+- Added Levenshtein-distance/detection/tie/bound/apply unit tests and a
+  real-browser flow proving the notice appears, fixes, disappears, and
+  never false-positives on a real or schema-qualified name, plus axe
+  WCAG 2.2 AA. See `TODO.md` log #170.
+
+### Added — NextSQL Admin Studio catalog-aware IntelliSense (P29, 2026-09-05)
+
+- Added a bounded, keyboard-operable table/column-name suggestion list
+  (Ctrl+Space or a "Suggest" toolbar button next to Find). Table names come
+  free from the already-loaded catalog; column names for a FROM/JOIN-
+  referenced table are fetched lazily, only while the panel is open, through
+  the existing per-table catalog route every native explorer already uses,
+  capped at a 16-table cache.
+- Deliberately excluded NextSQL keyword completion: the only ground truth for
+  the keyword set is the lexer's own unexported table, and duplicating it in
+  the frontend would silently drift.
+- Reused the existing Popover/dialog primitive instead of a caret-anchored
+  popup (`@bzync/rui`'s editor has no overlay primitive), with the ARIA 1.2
+  combobox-with-listbox-popup role applied to the editor's underlying
+  textarea so focus never leaves it while suggesting.
+- Added pure extraction/ranking/word-range/cache-eviction unit tests and a
+  real-browser flow covering mouse and keyboard-only acceptance, cache reuse
+  across a close/reopen cycle, and axe WCAG 2.2 AA. See `TODO.md` log #169.
+
+### Added — NextSQL Admin Studio query profiler breakdown (P29, 2026-09-05)
+
+- Added an ANALYZE-only Profile view capped at 512 operators. It preserves the
+  server's structural order and raw time/CPU/memory/disk/cache/spill/workers/
+  index values while adding estimate-error factors and reported maxima for
+  root/child time, memory, spill, and workers.
+- Made the metric boundary explicit after auditing the executor: operator
+  timings can include child work, CPU can mirror elapsed time, and root
+  resources can be query-level. Studio never sums operators, invents
+  percentages, or treats an unattributed zero disk/cache counter as proof of
+  no I/O. Corrected the stale metric note in `docs/optimizer.md` accordingly.
+- Added pure duration/profile/bound tests and a real-browser Profile flow that
+  verifies server timing, a 100× estimate miss, reported memory, the visible
+  non-additive warning, labeled table, and axe WCAG 2.2 A/AA. See `TODO.md`
+  log #168.
+
+### Added — NextSQL Admin Studio plan comparison (P29, 2026-09-05)
+
+- Added bounded per-tab EXPLAIN/EXPLAIN ANALYZE baselines and comparison. A
+  baseline is deep-copied, capped at 512 operators, retained across reruns and
+  tab switches, isolated from other tabs, and never persisted or sent to the
+  server.
+- Added deterministic structural-path comparison with explicit
+  same/metric/operator/added/removed states. The UI preserves the server's raw
+  estimate and resource values, never guesses semantic node identity across a
+  reshaped tree, and labels values as measured only when their snapshot came
+  from EXPLAIN ANALYZE.
+- Added Pin/Replace, Compare, and Clear actions plus an accessible summary and
+  result table. Pure tests cover copy isolation, alignment, classification,
+  and the 512-node bound; the real-browser regression covers replace/compare,
+  analyzed measurement scope, tab isolation/persistence, clearing, and axe
+  WCAG 2.2 A/AA. See `TODO.md` log #167.
+
+### Added — NextSQL Admin Studio Audit viewer (P29, 2026-09-05)
+
+- Added a read-only Studio Audit viewer reusing Operations Security's existing
+  admin-only `GET /api/v1/security` read of `system.audit_verify` and
+  `system.audit_log`; no new route, privilege path, or engine interface was
+  introduced. It refreshes on every open/manual Refresh, surfaces partial
+  bundle warnings, and shares a one-in-flight guard with Users/Roles and the
+  GRANT/REVOKE suggestion loader.
+- Extracted the existing Operations `AuditVerifyCard` into a shared component,
+  keeping chain/signature counts, failure state, first-bad-line diagnostics,
+  and problem text identical in both modes. The recent tail remains capped at
+  200 server-side, retains suspect records after verification failure, and
+  exposes no delete/clear/repair action or polling loop.
+- Extended the real-browser regression from a verified chain through a
+  simulated tamper detected on Refresh, asserting the failure diagnosis and
+  suspect record remain visible; fresh open/refresh/reopen reads and axe WCAG
+  2.2 A/AA also pass. See `TODO.md` log #166.
+
+### Added — NextSQL Admin Studio Transaction console + Lock explorer (P29, 2026-09-05)
+
+- Added a read-only "Transactions & locks…" Developer operations panel that
+  reuses Operations mode's existing authorized `GET /api/v1/activity` bundle
+  over `system.sessions`, `system.active_queries`, `system.transactions`, and
+  `system.locks`; no new server route, privilege, or engine interface was
+  introduced. The panel refetches on every open and manual Refresh, limits
+  reads to one in flight, and surfaces partial-read warnings.
+- Deliberately provides no cross-session kill/terminate/rollback action:
+  NextSQL has no authoritative server operation for it, so the UI states that
+  boundary instead of implying unsupported behavior.
+- Fixed keyboard access to wide shared catalog tables after the new realistic
+  active-query fixture exposed RUI's inner horizontal scroller to axe's
+  `scrollable-region-focusable` rule. `ResultTable` now uses a labeled,
+  focusable outer scroll owner with distinct Activity-table labels in both
+  Operations and Studio. The real-browser test verifies rendered live rows,
+  no fabricated kill control, Refresh and reopen refetches, and axe WCAG 2.2
+  A/AA. See `TODO.md` log #165.
+
+### Added — NextSQL Admin Studio Users & roles privilege explorer (P29, 2026-09-05)
+
+- Added a read-only Users & roles privilege explorer (Developer operations
+  scope) reachable next to the GRANT/REVOKE builder, reusing the same
+  admin-only `GET /api/v1/security` read Operations mode's Security view and
+  the builder's grantee suggestions already use — no new server route. A
+  non-admin connection sees empty sections, never an error, matching that
+  existing convention.
+- Each `system.grants` row's "Revoke…" action reverses its exact
+  grantee/privilege/scope/object back into a `GrantBuilderState` via a new
+  `grantStateFromRow` and opens the existing GRANT/REVOKE builder prefilled
+  (a new optional `initial` prop) — it never executes anything itself; only
+  the builder's own "Insert into editor" touches the active tab.
+- Confirmed directly against `internal/security/rbac.go` and
+  `internal/executor/security.go` before writing the reverse mapping:
+  `system.grants` never carries a role-membership row (that lives in
+  `system.roles.members` via a separate `ACL.GrantRole` path), and `ALL
+  PRIVILEGES` persists as the single privilege `"admin"`, not a synthetic
+  flag — so it round-trips as `REVOKE ADMIN ON ...`, a real statement, rather
+  than a reconstructed flag that was never actually stored. No new server
+  route, optimizer hint, privilege path, or persistent/wire/catalog format
+  was introduced. See `TODO.md` log #164.
+
+### Added — NextSQL Admin Studio Geo Explorer (P29, 2026-09-05)
+
+- Added a capability-gated native Geo Explorer — the fifth and final
+  originally scoped Studio native explorer — driven by the connected
+  session's authorized `system.columns`/`system.indexes` metadata,
+  restricted to a table's `POINT` column(s) (a spatial index and `WITHIN`'s
+  point-vs-region argument order both require exactly a `POINT`). A fixed
+  equirectangular click-to-draw world canvas is a convenience only — it is
+  `aria-hidden`, since every coordinate it can set is also reachable through
+  ordinary keyboard-accessible Longitude/Latitude/Radius fields and
+  Add/Remove-vertex controls.
+- Two query modes generate exact native SQL checked directly against
+  `internal/sql/types/geo.go`: point+radius builds `WHERE DWITHIN(col,
+  POINT(lon, lat), meters)`; polygon builds `WHERE WITHIN(col,
+  POLYGON('(...)'))` over a ring auto-closed by repeating its first vertex.
+  A valid shape reuses the existing `CellInspector` `GeoView` renderer,
+  unchanged, for a zoomed confirmation preview.
+- Reusing `GeoView` on a realistically wide literal surfaced a real
+  pre-existing accessibility defect shared by all four of `CellInspector`'s
+  raw-value `CodeBlock` call sites (a missing focusable scroll wrapper,
+  failing axe's `scrollable-region-focusable` check on wide content) — fixed
+  at the source for all four, not worked around locally. No new server
+  route, optimizer hint, privilege path, or persistent/wire/catalog format
+  was introduced. See `TODO.md` log #163.
+
+### Added — NextSQL Admin Studio Hybrid Explorer (P29, 2026-09-05)
+
+- Added a capability-gated native Hybrid Explorer (requires both `fulltext`
+  and `vector` server support) that composes an optional single-condition
+  structured filter (restricted to columns and operators that coerce
+  cleanly — NextSQL has no `LIKE`/regex operator) with the same catalog-driven
+  full-text and vector builders the standalone Full-text and Vector
+  Explorers already use, into one native `[WHERE ...] SEARCH ... NEAREST
+  ... LIMIT n` statement.
+- Added an "Explain" action that runs `EXPLAIN ANALYZE` of the exact
+  generated SQL through the existing bounded Studio stream; the
+  already-implemented graphical EXPLAIN/EXPLAIN ANALYZE tree renders it
+  automatically, with candidate counts coming from that tree's own per-node
+  row figures. `Run search` labels its ordinal result rank "Hybrid rank",
+  stating that NextSQL's reciprocal-rank-fusion score is not exposed as a
+  single number. No new server route, optimizer hint, privilege path, or
+  persistent/wire/catalog format was introduced. See `TODO.md` log #162.
+
+### Added — NextSQL Admin Studio Vector Explorer (P29, 2026-09-05)
+
+- Added a capability-gated native Vector Explorer driven by the connected
+  session's authorized `system.columns`/`system.indexes` metadata. Operators
+  can choose a table and `VECTOR`/`BITVECTOR`/`SPARSEVECTOR` column, a
+  metric restricted to exactly what that column kind supports (verified
+  against a real server's own rejection behavior), paste a query vector in
+  several accepted shapes, and set a 1–100 Top-K.
+- A live "Vector inspector" validates the pasted vector's dimension count
+  against the column's declared size and its value domain for a `BITVECTOR`
+  column before a query can be built. Generated `NEAREST` SQL safely quotes
+  identifiers and can be copied, inserted without execution, or explicitly
+  run through Studio's existing bounded NSQL stream. Confirmed there is no
+  per-query HNSW/IVF/IVFPQ search-time tuning setting anywhere in NSQL, so
+  the explorer states this rather than offering one. No new server route,
+  optimizer hint, privilege path, or persistent/wire/catalog format was
+  introduced. See `TODO.md` log #161.
+
+### Added — NextSQL Admin Studio Full-text Explorer (P29, 2026-09-05)
+
+- Added a capability-gated native Full-text Explorer driven by the connected
+  session's authorized `system.tables`, `system.columns`, and
+  `system.indexes` metadata. Operators can choose a table and valid
+  full-text index (locking its ordered STRING/TEXT fields) or the documented
+  sequential fallback, enter bounded native phrase/prefix/fuzzy/typo syntax,
+  select rows/HIGHLIGHT/SNIPPET output, and set a 1–100 result limit.
+- Generated SEARCH SQL safely quotes identifiers and string literals and can
+  be copied, inserted without execution, or explicitly run through Studio's
+  existing bounded NSQL stream. Results show truthful ordinal BM25 rank while
+  stating that numeric scores are not exposed; match markers remain literal
+  text rather than interpreted HTML. Ambiguous catalog field boundaries and
+  non-valid indexes fail closed. No new server route, optimizer hint,
+  privilege path, or persistent/wire/catalog format was introduced. See
+  `TODO.md` log #160.
+
+### Added — NextSQL Admin Studio JSON Explorer (P29, 2026-09-05)
+
+- The bounded JSON result-cell inspector is now a dedicated native explorer:
+  select any object/array/scalar node, inspect or copy its exact NextSQL path,
+  switch between tree and unchanged raw JSON, and insert a safely quoted
+  `SELECT <path> FROM <table> LIMIT 100` into the active editor without
+  executing it. Numeric array positions use the parser behavior fixed in
+  `TODO.md` log #158.
+- When the source table is selected, path status comes from its authorized
+  live `system.indexes` metadata and names valid matches. Special-key paths
+  whose segment boundaries the current dotted catalog text cannot prove are
+  marked ambiguous instead of guessed. Pure helper/parser coverage and the
+  real-Chrome axe workflow are green. No new server route, privilege path, or
+  persistent/wire/catalog format was introduced. See `TODO.md` log #159.
+
+### Fixed — JSON array-index path syntax never actually parsed (P9, 2026-09-05)
+
+- `docs/json.md`'s own documented example — a numeric path segment indexing
+  a JSON array, e.g. `metadata.tags.0` — has never parsed since Phase 9
+  shipped: the lexer fuses a dot immediately followed by a digit into one
+  leading-dot float-literal token (the same rule that lexes `.5` as `0.5`),
+  so the path never saw the token it needed to continue and always failed
+  with a syntax error. `SELECT`, `WHERE`, and `CREATE INDEX` were all
+  affected; the only working spelling was the undocumented workaround of
+  quoting the numeric segment (`tags."0"`).
+- Fixed narrowly in `internal/sql/parser` (no lexer, binder, AST, or
+  executor change): both places that build a JSON path from raw tokens now
+  also recognize the fused leading-dot-digit token as a path segment,
+  alongside the existing plain-dot case. Ordinary leading-dot float literals
+  elsewhere in a statement are unaffected. Verified live against a real
+  server (`SELECT`/`WHERE`/`CREATE INDEX`+`EXPLAIN IndexScan`/`SHOW INDEXES`
+  all now correct) and covered with new parser, fuzz, and executor tests
+  that didn't exist for this shape before. See `TODO.md` log #158.
+
+### Added — NextSQL Admin Studio find/replace (P29, 2026-09-05)
+
+- The Studio query editor gained a "Find" panel (also opened with Ctrl/Cmd+F
+  while the editor has focus): Find, Match case, Previous/Next, Replace, and
+  Replace all, operating only on the active tab's own SQL text.
+- Matching is a literal substring search (never a regex) with wrap-around
+  navigation. A match is shown by moving the editor's real text selection to
+  it rather than a separate highlight overlay, which is why this was
+  achievable where syntax highlighting and SQL formatting are not (both
+  blocked on missing editor primitives — see `TODO.md` logs #154/#155).
+  This closes every SQL-editor checklist slice except catalog-aware
+  IntelliSense, source-position diagnostics, and saved workspace artifacts.
+  See `TODO.md` log #157.
+
+### Added — NextSQL Admin Studio GRANT/REVOKE builder (P29, 2026-09-05)
+
+- Studio's query editor gained a "Grant / Revoke…" builder: a form that
+  generates a `GRANT` or `REVOKE` statement (role membership, or a privilege
+  list/`ALL PRIVILEGES` on any scope the grammar supports — cluster,
+  database, schema, table, column, function, resource group, backup,
+  replication, administration) and inserts it into the active editor tab for
+  review. It never executes or bypasses the existing confirm-before-run
+  check or server-side RBAC, and adds no new server route — grantee/role
+  suggestions reuse Operations mode's existing Security-view read.
+- Every generated identifier is safely double-quoted regardless of content.
+  Found and documented a real, pre-existing SQL-grammar gap while grounding
+  the generator against the live parser: `GRANT ALTER ...` cannot parse
+  today even though the `ALTER` privilege exists at the engine level,
+  because it lexes as a reserved keyword the GRANT/REVOKE parser doesn't
+  accept — the builder excludes it rather than generating unparseable SQL.
+  See `TODO.md` log #156.
+
+### Added — NextSQL Admin Studio Execute Script (P29, 2026-09-05)
+
+- The Studio SQL editor can now run a whole buffer of multiple statements as
+  a script (`Run script`), tokenized server-side with a real lexer pass
+  (never a naive `;` split) via the new `POST /api/v1/studio/query/split`.
+- If any statement in the script is destructive (the same UPDATE/DELETE-
+  without-WHERE and destructive-DDL classifier used for a single statement),
+  one consolidated confirmation shows the statement count and reasons before
+  anything runs, instead of interrupting the script partway through.
+- Statements run one at a time, stopping at the first failed or canceled
+  one; each statement's own status and result are listed and selectable, and
+  every statement is recorded into query history the same as a single run.
+- Fixed a real bug found via live verification: a DDL/DML statement's result
+  reports `null` column metadata (no result set), which crashed the result
+  grid the first time a script ran a non-`SELECT` statement through the
+  reused non-streaming query path. The streaming path already handled this;
+  the fix normalizes it at the API client boundary so every caller is
+  null-safe. Covered by a regression test that reproduces the exact crash
+  when the fix is reverted. See `TODO.md` log #155.
+
+### Added — NextSQL Admin Studio multi-tab editing (P29, 2026-09-05)
+
+- The Studio query editor now supports up to 8 independent tabs, each with
+  its own SQL buffer and last result/error, switchable without losing
+  either tab's content.
+- The server allows only one active Studio query per session, so running a
+  query in one tab shows every other tab a disabled "Busy…" Run action and
+  a notice naming which tab is running, rather than ever attempting (and
+  failing) a second concurrent query. A tab currently running cannot be
+  closed; closing any other tab falls back to an adjacent one.
+- Verified with a real-Chrome test that runs a deliberately delayed query in
+  one tab, confirms a second tab shows the busy state and can't be closed,
+  confirms both tabs' buffers/results stay independent across switches, and
+  confirms tab creation stops at the 8-tab bound — plus axe audits, which
+  caught and fixed a real touch-target-size violation on the tab close
+  buttons. See `TODO.md` log #154.
+
+### Added — NextSQL Admin Studio graphical EXPLAIN / EXPLAIN ANALYZE tree (P29, 2026-09-05)
+
+- `EXPLAIN`/`EXPLAIN ANALYZE` results now render as a nested plan tree by
+  default (with a toggle back to the ordinary grid) instead of only a flat
+  table, reconstructed client-side from the existing result columns — no
+  server or protocol change.
+- Every operator shows its estimated rows; `EXPLAIN ANALYZE` additionally
+  shows actual rows and CPU/memory/disk/cache/spill/workers/index. A plain
+  `EXPLAIN` shows an explicit "Estimates only" notice instead — measured
+  fields are never shown unless the statement actually measured them.
+- An operator whose actual row count is ≥10x off its estimate is flagged as
+  an estimation error (≥3x as a warning).
+- Verified with parser unit tests built from real output captured against a
+  live `nextsqld`, and a real-Chrome test that runs an `EXPLAIN ANALYZE`,
+  confirms the estimation-error highlight and toggles between Plan and Table
+  views, plus an axe audit (which caught and fixed a real ARIA violation on
+  the view toggle). See `TODO.md` log #153.
+
+### Added — NextSQL Admin Studio query history with privacy controls (P29, 2026-09-05)
+
+- Every statement run through the editor is now recorded in a "History"
+  popover (success with row count/elapsed, cancellation, or error). A
+  canceled confirm-before-run dialog records nothing, since no query ran.
+  Clicking an entry reloads its SQL into the editor without re-running it —
+  a past destructive statement still passes the confirm-before-run check
+  again on its own merits.
+- The list is an in-memory, per-session record only: never written to
+  browser storage or sent anywhere, cleared on reload/navigation, with an
+  explicit "Clear" action and a 50-entry/2 MiB bound regardless.
+- Closes the "Query history with privacy controls" SQL-editor checklist
+  item. Verified with a real-Chrome flow that records four successful runs
+  (confirming a canceled confirmation added nothing), reloads a past entry
+  without triggering a new query, and clears the list. See `TODO.md` log
+  #152.
+
+### Added — NextSQL Admin Studio execute selection (P29, 2026-09-05)
+
+- The editor's Run action (button or Ctrl/Cmd+Enter) now runs a non-empty
+  text selection instead of the whole buffer, letting a user draft several
+  candidate statements in one editor and run exactly one. The confirm-before-
+  run destructive-statement check runs against the same selected substring,
+  and the button relabels itself "Run selection" while one is active.
+- `selectionStart`/`selectionEnd` are read directly from the editor's
+  `<textarea>` at run time (not from reactive state), so the exact
+  highlighted text is what gets analyzed and executed even though clicking
+  Run moves focus away from the editor first.
+- Closes the "Execute selection" SQL-editor checklist item. Verified with a
+  real-Chrome interaction that highlights one statement inside a two-line
+  buffer and confirms (via a fixture-captured request body) that only the
+  highlighted text — not the full buffer — is analyzed and executed. See
+  `TODO.md` log #151.
+
+### Added — NextSQL Admin Studio confirm-before-run destructive-statement warning (P29, 2026-09-05)
+
+- Before running an editor statement, the browser now calls a new
+  `POST /api/v1/studio/query/analyze` route, which parses the SQL with the
+  same `internal/sql/parser` package `nextsqld`'s own executor binds (no
+  reimplemented heuristic, no driver connection) and classifies it. A
+  statement is flagged when it is `UPDATE`/`DELETE` with no `WHERE` clause,
+  `DROP TABLE`/`INDEX`/`USER`/`ROLE`/`WORKFLOW`/`TRIGGER`/`SCHEDULE`/`RESOURCE
+  GROUP`, or `ALTER TABLE ... DROP COLUMN`/`DROP PARTITION`.
+- A flagged statement shows a confirmation naming the reason (e.g. the table
+  it would empty or drop) before the query ever runs; canceling executes
+  nothing. A parse failure or other analyze error is not treated as a block —
+  the statement still runs and the real executor stays the sole authority, as
+  before this check existed.
+- This closes the "Warn UPDATE/DELETE without WHERE using parsed AST" and
+  "Warn destructive DDL" Connection-manager checklist items without requiring
+  the larger multi-environment connection-manager scope (profiles, OS
+  credential storage, TLS/mTLS fields, production mode), which remains open.
+  Verified with unit tests, an HTTP-level integration test, a live-NSQL
+  integration test against a real running server, and a real-Chrome
+  interaction + axe audit of the confirm/cancel/run-anyway flow. See
+  `TODO.md` log #150.
+
+### Added — NextSQL Admin Studio general GEOMETRY/GEOGRAPHY multi-shape preview (P29, 2026-09-05)
+
+- Extended the M3 native cell inspector's geo preview from the four fixed
+  native shapes to the general `GEOMETRY`/`GEOGRAPHY` family's `MULTIPOINT`,
+  `MULTILINESTRING`, `MULTIPOLYGON`, and `GEOMETRYCOLLECTION` values. The
+  frontend parser mirrors the server's own WKT grammar exactly, recursively
+  flattening a `GEOMETRYCOLLECTION`'s members (including nested collections)
+  to the same 8-level depth the server enforces, under an independent
+  point/part budget.
+- `GEOMETRY` is planar and `GEOGRAPHY` is geodetic in an arbitrary per-column
+  SRID — neither is necessarily WGS84 degrees like the four fixed shapes are
+  — so the new general-shape path never applies the fixed path's longitude/
+  latitude range check, and the inspector's "Coordinate order" fact now reads
+  the declared column type instead of always claiming longitude/latitude.
+- Added parser unit coverage for all four new shapes (both `MULTIPOINT`
+  spellings, a nested-collection flattening case, unclosed-ring/unrecognized-
+  keyword rejection, and empty-collection rejection), replacing the prior
+  test that asserted the old raw-WKT-only fallback. `npm run typecheck`,
+  `npm run test:studio`, and `npm run test:a11y` all pass; this is a
+  browser-only change with no server route, persistent format, or protocol
+  impact. See `TODO.md` log #149.
+
+### Added — NextSQL Admin Studio M3 result tools and native inspectors (P29, 2026-09-05)
+
+- Added active-cell and selected/all-loaded row copy plus local CSV/JSON
+  export to the bounded virtualized query grid. CSV/TSV neutralizes formula
+  prefixes and writes SQL NULL as `\\N`; the versioned JSON envelope preserves
+  ordered/duplicate columns, types, strings, and NULL. Encoded output is capped
+  independently at 64 MiB and is never sent to server storage or the PWA cache.
+- Added type-aware inspectors for bounded JSON tree/raw views, dense/bit/sparse
+  vectors, fixed `POINT`/`BOX`/`LINESTRING`/`POLYGON` coordinate previews, and
+  canonical/UTC/browser-local/epoch `TIMESTAMPTZ` values. General spatial
+  multi-shapes deliberately remain raw-WKT-only and stay open in the checklist.
+- Added deterministic serializer/parser/bound tests and real-Chrome interactions
+  for selection plus each inspector. The modal and full workspace pass axe WCAG
+  2.2 A/AA; the audit found and fixed a dark-theme JSON-string contrast miss.
+- A follow-up adversarial re-verification pass found and fixed three more real
+  gaps: `serializeResult` now validates column-type/column and row-width
+  consistency instead of trusting a malformed result; the export filename
+  prefix uses locale-independent `toLowerCase()` instead of
+  `toLocaleLowerCase()` (which folds differently under e.g. the Turkish
+  locale); and the geo parser now fails closed on a `BOX` without exactly two
+  corners, a `LINESTRING` under two points, or an unclosed/under-four-point
+  `POLYGON` ring instead of rendering a wrong preview. See `TODO.md` log #148.
+
+### Added — NextSQL Admin Studio M2 streaming and virtualized results (P29, 2026-09-05)
+
+- Added a session+CSRF-protected `/api/v1/studio/query/stream` endpoint that
+  sends ordered NDJSON metadata, bounded row batches, and a terminal completion
+  or error frame through the official Go driver. Server limits remain 5,000
+  rows, 8 MiB, and 25 seconds, with new 128-row/256-KiB batch targets and a
+  1-MiB single-row ceiling; truncation cancels and drains the NSQL stream.
+- The browser now parses and validates the stream incrementally, independently
+  re-enforces frame/order/row/byte/column limits, reports progressive row
+  counts, and mounts only the visible fixed-height result window plus bounded
+  overscan. Typed headers, NULL rendering, cancellation, and connection reuse
+  are preserved.
+- Added unit, authenticated HTTP, live NSQL, race, and real-Chrome coverage for
+  frame ordering, limits, failures, lock-wait cancellation, a 250-row bounded
+  DOM, and axe WCAG 2.2 A/AA. P29 remains in progress; this closes only the
+  streaming/virtualized result-grid checklist slice.
+
+### Added — NextSQL Admin Studio M1 authenticated query workspace (P29, 2026-09-05)
+
+- Replaced the Studio placeholder with a responsive explorer/editor/inspector
+  workspace in the shared Admin shell. It discovers the connected server's
+  capabilities, lists only authorized `system.tables`, lazy-loads table/
+  column/index metadata, and executes one NextSQL statement through the
+  logged-in operator's official-driver NSQL connection.
+- Added session+CSRF-protected `/api/v1/studio/{bootstrap,table,query,
+  query/cancel}` endpoints. SQL is capped at 1 MiB/25 seconds; catalog
+  bootstrap at 1,000 tables; results at 5,000 rows or 8 MiB, with a separate
+  1,000-row browser DOM cap. Excess results are explicitly marked truncated
+  after the stream is canceled and drained.
+- Added typed/NULL-aware result rendering, Ctrl/Cmd+Enter execution, explicit
+  session-scoped cancellation, connection/database/realm context, and table
+  overview/column/index inspection. The current states pass the real-Chrome
+  axe WCAG 2.2 A/AA audit in the shared light/dark/system shell.
+- Added `docs/design-admin-studio.md`, including the designed vs implemented
+  vs tested vs production-gated audit. P29 remains in progress: the saved
+  connection manager, IntelliSense/prepared parameters, general spatial/native
+  explorers, EXPLAIN, migration, and production-safety surfaces are still open.
+
+### Fixed — query cancellation before first response and during lock waits (2026-09-05)
+
+- The Go driver now arms context cancellation before waiting for the initial
+  `RowDesc`/`CommandComplete`; previously a query blocked before that frame
+  could not be canceled.
+- Transaction key/range waits now observe the executing query-budget context
+  and remove canceled waiters from both the lock queue and wait-for graph.
+  Deterministic TLS/NSQL and Admin HTTP integrations hold a real row lock,
+  observe the waiting query via `system.active_queries`, cancel it, and prove
+  the same connection remains reusable.
+
+### Added — NextSQL Admin is now a fully integrated PWA (2026-09-05)
+
+- Web app manifest (`manifest.webmanifest`), service worker (`sw.js`), and
+  the icon set needed for install prompts/"Add to Home Screen", shared by
+  every mode (Setup, Operations, Studio placeholder) since they're
+  registered once from the top-level shell.
+- The service worker precaches only the static JS/CSS bundle and applies
+  stale-while-revalidate to everything else — but **never** intercepts
+  `/api/*` (live session/auth/query data must always reach the real
+  server) and **never** caches a Setup-mode one-time `?token=` URL. Cache
+  name is a hash of the built bundle, so a new release always gets a fresh
+  cache and the old one is dropped automatically.
+- New Go routes (`GET /manifest.webmanifest`, `/sw.js`, `/favicon.ico`,
+  `/apple-icon.png`, `/icons/*`), each reachable only at its top-level path
+  — served from `internal/admin/webpwa/`, an embed sibling to
+  `internal/admin/web/` rather than a subdirectory of it, specifically so
+  none of them are also reachable under `/assets/` (which exposes `web/`
+  wholesale). CSP gained explicit `worker-src 'self'; manifest-src 'self'`.
+- Live-verified in real headless Chrome: the service worker registers,
+  activates, and controls the page after reload; the app shell is cached;
+  no `/api/*` URL ever appears in the cache.
+
+### Verified — offline installation and no mandatory telemetry (P28, 2026-09-05)
+
+- Confirmed no outbound network call exists anywhere in the setup/install/
+  lifecycle code paths or packaging scripts (repo-wide grep for `net/http`
+  clients, `curl`/`wget`, `http(s)://` literals), then proved it live: a
+  full install → provision → server → real query cycle, and separately
+  `nextsql-admin`'s Setup-mode wizard serving its first page, both inside a
+  `docker run --network none` container with no network stack at all.
+
+### Added — GPG-signed release/checksum pipeline (P28, 2026-09-05)
+
+- `--gpg-key ID` (or `NEXTSQL_RELEASE_GPG_KEY`) on both
+  `scripts/build-{linux,windows}-installer.sh` detached-signs the
+  `SHA256SUMS.*` file via a new shared `sign_checksums` helper
+  (`packaging/lib.sh`). Opt-in (no signing key exists in this repo/CI yet);
+  once a key is given, a missing `gpg` or a signing failure aborts the
+  build rather than silently shipping unsigned artifacts.
+
+### Verified — silent/unattended install and upgrade/repair through the packaged installer artifacts (P28, 2026-09-05)
+
+- `.tar.gz`/`.run`: zero-prompt install (isolated `HOME`/XDG env, `--no-gui`,
+  no TTY) → `nextsql setup --json` → real server → real query →
+  `uninstall.sh`, end to end.
+- `.deb`: `DEBIAN_FRONTEND=noninteractive apt-get install`/`remove`/`purge` in
+  a disposable container; confirmed `purge` still preserves
+  `/var/lib/nextsql` and the root key by design.
+- `nextsql lifecycle upgrade`/`repair`, using the actual packaged `.tar.gz`
+  binaries rather than freshly built ones: both `--dry-run` and real runs,
+  each followed by a live post-operation query against the same data.
+- Closes Phase 28's "Silent install tested," "Upgrade tested," and "Repair
+  tested" exit-gate items; the remaining items are Windows/macOS-hardware or
+  code-signing-tooling blocked, plus M2's separately-scoped recovery-key gap.
+
+### Fixed — packaging: `.rpm` build (two spec bugs) and a build-script error-handling gap (P28, 2026-09-05)
+
+- `packaging/linux/nextsql.spec.in`: `%doc`/`%license` used relative paths,
+  which RPM only auto-copies from a `%prep`/`%build`-populated build
+  directory — this spec has neither (it copies pre-built binaries straight
+  into `%{buildroot}`), so the copy always failed. Fixed to use the same
+  absolute-buildroot-path form the rest of `%files` already uses. Also
+  restored `nextsql-admin`, `USAGE.md.gz`, and `VERSION` to `%files` — files
+  the shared staging tree installs but the spec never declared, caught by
+  RPM's "installed but unpackaged files" check (which `.deb` has no
+  equivalent of, so this was invisible there). `.rpm` is now built and
+  live-installed end to end for the first time.
+- `scripts/build-linux-installer.sh`: removed a `build_rpm "$arch" || true`
+  that suspended `set -e` for that call's *entire* execution tree (a bash
+  semantic: `-e` is ignored while a command's exit status is being tested by
+  `||`/`&&`/`if`), meaning a real `go build` failure during RPM staging would
+  have been silently swallowed and misreported as the benign "rpmbuild not
+  installed" skip case rather than failing the build loudly. `build_rpm`
+  already tolerates its two legitimate skip cases internally, so the
+  call-site guard was redundant and harmful. Added `shopt -s inherit_errexit`
+  to this script, `build-windows-installer.sh`, and `packaging/lib.sh` as
+  defense in depth.
+
+### Changed — NextSQL Installer + NextSQL Manager + NextSQL Studio merged into one product, NextSQL Admin (P28/P29, 2026-09-05)
+
+- **One product, one binary.** `nextsql-manager` and `nextsql-install` are gone;
+  `cmd/nextsql-admin` replaces both, with a new `internal/admin` package holding
+  three modes: `setup` (formerly `internal/installgui`), `ops` (formerly
+  `internal/manager`), and `studio` (new, placeholder only — Phase 29 is still
+  unbuilt). Behavior of Setup and Operations modes is unchanged from the
+  former Installer/Manager; this is a process/package/frontend restructuring,
+  not a feature change.
+- **Mode selection at startup**, not two simultaneous UIs: `nextsql-admin`
+  shells out to `nextsql lifecycle detect --json` to decide Setup mode
+  (no initialized install found — token loopback auth, ephemeral port,
+  auto-open browser) vs. Operations mode (installed — session+CSRF login,
+  fixed `127.0.0.1:7220` default). `--mode setup|operate` overrides detection.
+  New unauthenticated `GET /api/v1/mode`.
+- **One frontend.** New `internal/admin/frontend/` (React + `@bzync/rui`,
+  same versions both prior apps used) replaces the two separate npm packages;
+  shared `Brand`/`ThemeSelect`/API-client base deduplicated; a new hash-based
+  router makes the Operations shell's tabs — including a new placeholder
+  Studio tab ("Coming in Phase 29") — URL-addressable for the first time.
+  Build output committed to `internal/admin/web/`.
+- Two real bugs found and fixed during the merge: `@bzync/rui`'s `Select` is
+  button/listbox-based (not a native `<select>`), which the accessibility
+  test suite's theme-toggle interaction now matches; and a WCAG AA contrast
+  failure in the Wordmark's accent color against the Operations sidebar's
+  dark background (Setup mode's rail didn't have this problem).
+- Docs restructured: new `docs/design-admin.md` (umbrella design), with
+  `docs/design-manager.md` → `docs/design-admin-operations.md` and
+  `docs/design-installer-gui.md` → `docs/design-admin-setup.md` (renamed,
+  full implementation history preserved). `PROJECT.md`, `TODO.md`,
+  `ARCHITECTURE.md`, and every cross-referencing doc updated.
+- Verified: `go build ./...` / `go vet ./...` clean; `internal/admin/...`
+  and `tests/integration -run TestAdmin` green under `-race`; frontend
+  typecheck/build/axe a11y (WCAG 2.2 AA) green; live end-to-end against real
+  binaries in both Setup and Operations modes.
+
+### Changed — Installer M5 accessibility complete; Manager aligned to Installer UI/UX (P28, 2026-09-05)
+
+- The Installer now exposes semantic ordered progress, current-step state,
+  skip navigation, stable heading focus and live announcements across every
+  step/install-result transition, correctly associated custom-combobox and
+  form errors, a named resource-preset group, and keyboard-complete path
+  suggestions. A password now requires matching confirmation before Continue;
+  blank confirmation previously left it enabled.
+- Installer and Manager now share the Installer's visual language: canonical
+  wordmark, backdrop, self-hosted fonts, elevated main surface, 200px branded
+  rail, spacing/responsive behavior, and an explicit persisted System/Light/
+  Dark selector. Manager retains a wider table canvas and exposes responsive
+  tab orientation correctly to assistive technology.
+- Added bounded, dependency-light real-Chrome audits for both generated
+  frontends (`npm run test:a11y`) over a shared CDP harness. They cover the
+  full installer keyboard flow and Manager login/authenticated navigation,
+  run axe's WCAG 2.2 A/AA-tagged rules, and verify emulated increased-contrast
+  and reduced-motion behavior. The pass found and corrected two RUI 0.0.9
+  fixed-color contrast misses at the application boundary.
+- Fixed the Installer CSP to permit its build's inlined `data:` font assets
+  (matching Manager's already-correct policy); the browser audit now runs
+  under that production policy and asserts the Inter face actually loads.
+
+### Added — GUI installer frontend rebuilt on React + @bzync/rui; M4 packaging integration for Linux (P28, 2026-09-05)
+
+- New `internal/installgui/frontend/` — the wizard is now React + `@bzync/rui`
+  (same stack, same dependency versions, same build pattern as NextSQL
+  Manager), replacing M1's hand-written vanilla-JS version. Output committed
+  to `internal/installgui/web/`; `go build ./...` still needs no Node
+  toolchain.
+- `scripts/build-linux-installer.sh` now bundles `nextsql-install` into
+  every Linux artifact. `install.sh` (tarball/`.run`) auto-launches it as
+  the default interactive entry point on a fresh, TTY-driven `--user`
+  install (`--no-gui` opts out); `--system`/root installs and the `.deb`
+  `postinst` only mention it as an alternative, never auto-launch it, since
+  it would otherwise create the database as root instead of the
+  unprivileged `nextsql` service account. `uninstall.sh` removes the binary
+  too.
+- Fixed: the "start at boot" checkbox's config-path check compared against
+  the wrong default (`nextsql setup`'s own no-`--config-out` default, inside
+  the data directory) instead of the packaged installers' actual `/etc` (or
+  per-user `$XDG_CONFIG_HOME`) split — meaning it had been silently,
+  permanently unusable for every packaged install since service registration
+  landed. `internal/installgui.Params`/`Defaults` gained a `configOut` field
+  wired to `nextsql setup --config-out`, prefilled from the same
+  installer-convention split `dataDir`/`keyFile` already use.
+- Fixed: the Administrator step's Continue button could disable itself (a
+  too-short password, or a username without a password) with no visible
+  explanation beyond a small muted hint — now always shows an explicit error
+  banner naming the exact reason.
+- Fixed: the page's dark/light theme background only painted as far as the
+  wizard card's own height, leaving the browser's default white below it on
+  a viewport taller than the card.
+
+### Added — GUI installer M6 complete: service registration / start at boot (P28, 2026-09-04)
+
+- The Resources step gained a "Start NextSQL automatically at boot"
+  checkbox. It only ever enables an **already-installed, already-matching**
+  systemd unit — it never authors/writes a unit file itself, that stays the
+  packaged (`.deb`/`.tar.gz`/`.run`) installer's job. Disabled with a clear,
+  specific reason whenever there is no matching unit to enable.
+- New read-only `GET /api/v1/service` (detection) and a best-effort,
+  non-fatal `systemctl enable --now nextsql` step folded into
+  `POST /api/v1/install` when requested — its outcome never affects whether
+  the database install itself succeeded.
+- Fixed a real bug found during live verification: `systemctl enable --now`
+  reports success once a start is *issued*, even if the process exits
+  immediately after. The response now distinguishes "enabled to start at
+  boot" from "actually running now" instead of conflating the two.
+
+### Added — GUI installer M3 complete: remote listen address + TLS (P28, 2026-09-04)
+
+- The Resources step gained an "Advanced: configure a remote listen
+  address" section — a listen-address field plus TLS certificate/private-key
+  path fields (paths only; content is never uploaded, same contract as the
+  root key file).
+- `nextsql setup`'s existing non-loopback-requires-TLS check
+  (`ErrInsecureRemote`) is the one authoritative validator, reached the same
+  way every other GUI mutation reaches its CLI validation; the UI adds only
+  an advisory client-side hint.
+- Closes M3 (skip-init and custom buffer pages already landed in M1) and the
+  "TLS certificate assistant and validation" / "Component selection"
+  `TODO.md` lines.
+
+### Added — GUI installer M2 partial: generate-vs-import root-key disclosure (P28, 2026-09-04)
+
+- `nextsql setup` / `nextsql setup --dry-run --json` now report whether
+  `--key-file` (and the resolved `--instance-key-file`) already exist on
+  disk before anything is written, via new `key_file_exists` /
+  `instance_key_exists` fields plus a matching advisory in `warnings` — the
+  pre-existing "an existing key is imported and reused, a missing one is
+  generated" behavior was already correct, just silent.
+- The GUI installer's Location and Review steps show this explicitly (a
+  banner refreshed on every "Check", repeated on Review right before
+  Install is confirmed) — closes the "Secure encryption setup wizard" and
+  "Generate/import root unlock key" gaps in `docs/design-installer-gui.md`
+  M2.
+
+### Added — GUI installer M1 continuation: Advanced mode + graceful finish (P28, 2026-09-04)
+
+- The Resources step gained an "Advanced" checkbox for `nextsql setup
+  --skip-init` (write the configuration only, initialize the database
+  later) — closes the "Standard vs Advanced installation" and "Component
+  selection" gap for M1's scope.
+- New `POST /api/v1/finish` + `Server.Done()`: the completion screen's
+  "Finish" button now stops `nextsql-install` itself, so a GUI-only
+  operator never has to switch to a terminal and press Ctrl+C.
+
+### Added — GUI installer M1: architecture + serving backbone (P28, 2026-09-04)
+
+- New `cmd/nextsql-install` binary + `internal/installgui` package: a
+  loopback HTTP service serving an embedded first-run setup wizard (Welcome
+  → Location → Resources → Administrator → Summary → Install → Completion),
+  opened automatically in the operator's browser. Chosen architecture (via
+  `AskUserQuestion`, see `docs/design-installer-gui.md`): the same "local
+  web app served by Go" pattern as NextSQL Manager, but the installer never
+  links the storage engine at all — every effect happens by driving the
+  already-tested `nextsql setup` CLI as a subprocess (`--dry-run --json` for
+  live preview, `--json` to commit). Enforced by an import-boundary test
+  mirroring Manager's own.
+- Single-run token authentication (Jupyter-style `?token=`), no login
+  screen — there is nothing to authenticate against before the first
+  database exists.
+- The administrator password never touches argv or a log line: it is
+  written to a mode-0600 temp file for the one subprocess call that needs
+  it and deleted immediately after.
+- New `internal/browseropen` package, extracted from `internal/oidcclient`'s
+  pre-existing `DefaultBrowserOpener` (now a thin wrapper over it) — the
+  installer and the OIDC login flow share one cross-platform "open a
+  browser" implementation.
+- Not yet done (tracked in `docs/design-installer-gui.md` M2–M5):
+  recovery-key export, generate-vs-import key choice, a TLS certificate
+  assistant, bundling `nextsql-install` into the OS packaging artifacts, and
+  an accessibility/theming pass.
+
+### Fixed — stale phase status in `AGENTS.md` / `.codex/AGENTS.md` (2026-09-04)
+
+- Both repository-agent instruction files still claimed P0–P15/P26 complete
+  and P16/P27–P30 open or planned; `TODO.md`'s own log already showed
+  P0–P27 complete and the NextSQL Manager MVP done. Updated both to the true
+  current release gate (P28, the GUI installer) so Codex/Grok-class agents
+  reading `AGENTS.md` don't act on stale status.
 
 ### Verified / Fixed — Linux installer platform testing (P28, 2026-09-04)
 
@@ -2569,13 +3698,12 @@ Targeted functional/race tests, command builds, and serialized
 
 ### Current release gate
 
-P16 correctness/SLO closure, **P22 follower reads / read scaling**, and
-**P23 Vector Engine 2.0** are all **complete** (P16 paper-closed 2026-08-30;
-P22 exit gate closed 2026-08-30 with the linearizability/consistency sign-off
-in `docs/ha.md` and the `TestFollowerReadFailoverSessionGuarantee` failover
-session-guarantee test; P23 exit gate closed 2026-08-31 with the
-production-gating sign-off in `docs/vector.md`). The current release gate is
-**P24 Full-text Search 2.0**.
+P0–P27 are complete. **P28 Professional Installer + NextSQL Manager** is the
+current release gate. The setup/lifecycle automation and all nine Manager MVP
+slices are complete; GUI-installer M1 is implemented and targeted-tested.
+Packaging the GUI entry point, full platform execution (especially `.rpm` and
+Windows), silent-install coverage, the remaining encryption/TLS wizard scope,
+and the accessibility baseline remain open. See `TODO.md` for the live gate.
 
 P22 exit gate, all satisfied:
 
@@ -2584,8 +3712,8 @@ P22 exit gate, all satisfied:
   `STALE` (unbounded) — all consistent committed prefixes, `STALE`/`BOUNDED`
   never mislabelled `STRONG`;
 - replica lag + follower health via `system.replica_health` and `NodeStatus`;
-- follower-read routing in the server and every official driver (Go, Node, Bun,
-  Deno, PHP);
+- follower-read routing in the server and every official driver (Go, Node.js,
+  Bun, Deno, PHP, Python, and Ruby);
 - read-scaling benchmark `nextsql-bench --readscale`;
 - linearizability/consistency sign-off (`docs/ha.md` "Consistency model and
   sign-off") and failover session-guarantee test.

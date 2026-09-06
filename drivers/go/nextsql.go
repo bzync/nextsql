@@ -865,14 +865,35 @@ func (c *Conn) queryPayload(ctx context.Context, typ protocol.Type, payload []by
 		c.mu.Unlock()
 		return nil, err
 	}
-	rows, err := c.readRows()
-	if err != nil {
-		return nil, err
-	}
+	return c.readRowsContext(ctx)
+}
+
+// readRowsContext arms cancellation before waiting for the first response
+// frame. Queries can block in the executor before RowDesc/CommandComplete is
+// available (for example on a transaction lock), so installing the callback
+// after readRows returned made context cancellation ineffective during that
+// entire interval. A result completed in the first frame is disarmed here;
+// streaming results transfer ownership of stop to Rows.Close.
+func (c *Conn) readRowsContext(ctx context.Context) (*Rows, error) {
+	var stop func() bool
 	if ctx != nil {
 		conn := c
-		rows.stop = context.AfterFunc(ctx, func() { _ = conn.Cancel(context.Background()) })
+		stop = context.AfterFunc(ctx, func() { _ = conn.Cancel(context.Background()) })
 	}
+	rows, err := c.readRows()
+	if err != nil {
+		if stop != nil {
+			stop()
+		}
+		return nil, err
+	}
+	if rows.closed {
+		if stop != nil {
+			stop()
+		}
+		return rows, nil
+	}
+	rows.stop = stop
 	return rows, nil
 }
 
@@ -1138,15 +1159,7 @@ func (s *Stmt) Query(ctx context.Context, params ...types.Value) (*Rows, error) 
 		c.mu.Unlock()
 		return nil, err
 	}
-	rows, err := c.readRows()
-	if err != nil {
-		return nil, err
-	}
-	if ctx != nil {
-		conn := c
-		rows.stop = context.AfterFunc(ctx, func() { _ = conn.Cancel(context.Background()) })
-	}
-	return rows, nil
+	return c.readRowsContext(ctx)
 }
 
 func (s *Stmt) Close() error {

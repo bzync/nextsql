@@ -6,18 +6,24 @@ HERE="$(CDPATH= cd -- "$(dirname "$0")" && pwd)"
 
 usage() {
 	cat <<'EOF'
-Usage: install.sh [--user | --system] [--prefix DIR] [--no-service]
+Usage: install.sh [--user | --system] [--prefix DIR] [--no-service] [--no-gui]
 
   --system     Install under /usr/local (default when running as root)
   --user       Install under $HOME/.local; systemd --user unit
   --prefix DIR Override prefix (binaries in DIR/bin)
   --no-service Skip systemd unit installation
+  --no-gui     Print manual setup instructions instead of launching the
+               browser-based setup wizard (nextsql-admin). The wizard is
+               only launched when this flag is absent, stdin is a terminal,
+               and no configuration file exists here yet — a scripted or
+               already-configured install always gets the manual output.
 EOF
 }
 
 MODE=""
 PREFIX=""
 NO_SERVICE=0
+NO_GUI=0
 
 while [ $# -gt 0 ]; do
 	case "$1" in
@@ -27,6 +33,7 @@ while [ $# -gt 0 ]; do
 	--prefix) PREFIX="${2:?}"; shift ;;
 	--prefix=*) PREFIX="${1#--prefix=}" ;;
 	--no-service) NO_SERVICE=1 ;;
+	--no-gui) NO_GUI=1 ;;
 	*) echo "unknown argument: $1" >&2; usage >&2; exit 2 ;;
 	esac
 	shift
@@ -77,16 +84,49 @@ mkdir -p "$BIN_DIR" "$CONF_DIR" "$DATA_DIR" "$WAL_DIR"
 install -m 0755 "$HERE/bin/nextsql" "$BIN_DIR/nextsql"
 install -m 0755 "$HERE/bin/nextsqld" "$BIN_DIR/nextsqld"
 install -m 0755 "$HERE/bin/nextsql-bench" "$BIN_DIR/nextsql-bench"
+# nextsql-admin (the GUI setup wizard) is optional here on purpose: a
+# hand-assembled or pre-M4 tarball layout may not ship it, and installation
+# must not fail just because the wizard binary is missing — see the
+# LAUNCH_GUI gate below, which degrades to the manual instructions whenever
+# it isn't present.
+HAVE_GUI=0
+if [ -x "$HERE/bin/nextsql-admin" ]; then
+	install -m 0755 "$HERE/bin/nextsql-admin" "$BIN_DIR/nextsql-admin"
+	HAVE_GUI=1
+fi
 
-if [ ! -f "$CONF_DIR/nextsql.conf" ]; then
-	sed \
-		-e "s|^data_dir=.*|data_dir=$DATA_DIR|" \
-		-e "s|^key_file=.*|key_file=$KEY_FILE|" \
-		-e "s|^# wal_archive=.*|# wal_archive=$WAL_DIR|" \
-		"$HERE/etc/nextsql.conf" >"$CONF_DIR/nextsql.conf"
-	chmod 0640 "$CONF_DIR/nextsql.conf"
-else
-	echo "Keeping existing $CONF_DIR/nextsql.conf"
+CONFIG_EXISTED=0
+[ -f "$CONF_DIR/nextsql.conf" ] && CONFIG_EXISTED=1
+
+# LAUNCH_GUI: hand off to the browser-based setup wizard instead of printing
+# manual next steps. Deliberately scoped to --user mode only for now: in
+# --system mode the wizard (which inherits install.sh's root privileges)
+# would create the data directory and key file as root, but the "nextsql"
+# system service account is what actually needs to read/write them — a
+# correct handoff needs either running the wizard's subprocess as that
+# unprivileged account or restricting which path it's allowed to write to,
+# neither of which this increment does. Getting that wrong would be a real
+# permission/availability bug, not a convenience trade worth making here, so
+# --system installs keep exactly today's tested manual-instructions path
+# (with a one-line pointer to nextsql-admin as a same-user alternative).
+# See docs/design-installer-gui.md M4 for the follow-up.
+LAUNCH_GUI=0
+if [ "$HAVE_GUI" -eq 1 ] && [ "$NO_GUI" -eq 0 ] && [ "$CONFIG_EXISTED" -eq 0 ] \
+	&& [ "$MODE" = user ] && [ -t 0 ]; then
+	LAUNCH_GUI=1
+fi
+
+if [ "$LAUNCH_GUI" -eq 0 ]; then
+	if [ "$CONFIG_EXISTED" -eq 1 ]; then
+		echo "Keeping existing $CONF_DIR/nextsql.conf"
+	else
+		sed \
+			-e "s|^data_dir=.*|data_dir=$DATA_DIR|" \
+			-e "s|^key_file=.*|key_file=$KEY_FILE|" \
+			-e "s|^# wal_archive=.*|# wal_archive=$WAL_DIR|" \
+			"$HERE/etc/nextsql.conf" >"$CONF_DIR/nextsql.conf"
+		chmod 0640 "$CONF_DIR/nextsql.conf"
+	fi
 fi
 
 if [ "$MODE" = system ]; then
@@ -128,6 +168,25 @@ if [ "$NO_SERVICE" -eq 0 ] && command -v systemctl >/dev/null 2>&1; then
 	echo "Installed systemd unit nextsql.service (not enabled; init first)."
 fi
 
+if [ "$LAUNCH_GUI" -eq 1 ]; then
+	echo
+	echo "Launching the NextSQL setup wizard in your browser..."
+	echo "(nothing is written until you confirm the summary screen there;"
+	echo " press Ctrl+C now, or click Finish when done, to return here)"
+	echo
+	# Not exec'd: install.sh regains control once the wizard process exits
+	# (Finish button or Ctrl+C) so it can print a closing note below,
+	# regardless of whether setup actually completed.
+	"$BIN_DIR/nextsql-admin" || true
+	echo
+	echo "Setup wizard exited. Re-run it any time with:"
+	echo "  $BIN_DIR/nextsql-admin"
+	echo
+	echo "Keep $KEY_FILE off the data volume in production."
+	echo "Done."
+	exit 0
+fi
+
 cat <<EOF
 
 NextSQL binaries are on disk. The server is not started until you initialize:
@@ -156,6 +215,23 @@ EOF
 	*":$BIN_DIR:"*) ;;
 	*) echo "Put $BIN_DIR on your PATH." ;;
 	esac
+fi
+
+if [ "$HAVE_GUI" -eq 1 ]; then
+	echo
+	if [ "$MODE" = system ]; then
+		echo "Or, as a regular (non-root) user, run the browser-based setup wizard"
+		echo "instead of the steps above: $BIN_DIR/nextsql-admin"
+		echo "(not offered automatically here: it would create the database as"
+		echo " root, not as the unprivileged 'nextsql' service account)"
+	elif [ "$CONFIG_EXISTED" -eq 1 ]; then
+		echo "The browser-based setup wizard was not offered because a config"
+		echo "already exists at $CONF_DIR/nextsql.conf. Run it directly if you"
+		echo "still want it: $BIN_DIR/nextsql-admin"
+	else
+		echo "Or run the browser-based setup wizard instead of the steps above:"
+		echo "  $BIN_DIR/nextsql-admin"
+	fi
 fi
 
 echo

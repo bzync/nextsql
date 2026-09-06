@@ -6,11 +6,10 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"os/exec"
-	"runtime"
 	"sync"
 	"time"
 
+	"github.com/bzync/nextsql/internal/browseropen"
 	"github.com/bzync/nextsql/internal/nerr"
 )
 
@@ -20,22 +19,7 @@ type BrowserOpener func(url string) error
 
 // DefaultBrowserOpener opens url with the platform's default handler.
 func DefaultBrowserOpener(url string) error {
-	var cmd string
-	var args []string
-	switch runtime.GOOS {
-	case "darwin":
-		cmd, args = "open", []string{url}
-	case "windows":
-		cmd, args = "rundll32", []string{"url.dll,FileProtocolHandler", url}
-	default:
-		cmd, args = "xdg-open", []string{url}
-	}
-	c := exec.Command(cmd, args...)
-	if err := c.Start(); err != nil {
-		return nerr.Wrap(nerr.Unavailable, "oidcclient", "launch browser", err)
-	}
-	go func() { _ = c.Wait() }()
-	return nil
+	return browseropen.Open(url)
 }
 
 // LoginOptions configures an interactive Authorization Code + PKCE login.

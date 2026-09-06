@@ -89,20 +89,17 @@ NextSQL Bench
   Correctness-aware official benchmark and SLO measurement suite
 
 NextSQL Drivers
-  Go / Node.js / TypeScript / Bun / Deno / PHP
+  Go / Node.js / TypeScript / Bun / Deno / PHP / Python / Ruby
   plus future officially supported SDKs
 
-NextSQL Installer
-  Install / initialize / upgrade / repair / uninstall
-
-NextSQL Manager
-  Server / cluster / security / backup / maintenance / operations UI
-
-NextSQL Studio
-  Native NextSQL database development IDE
+NextSQL Admin
+  One application, three modes:
+  Setup       — install / initialize / upgrade / repair / uninstall
+  Operations  — server / cluster / security / backup / maintenance UI
+  Studio      — native NextSQL database development IDE
 
 NextSQL Intelligence
-  Version-aware, permission-aware, RAG-grounded assistant inside Studio
+  Version-aware, permission-aware, RAG-grounded assistant inside Studio mode
 ```
 
 All products must use official NextSQL interfaces and server truth.
@@ -176,7 +173,7 @@ unless explicitly labeled experimental and excluded from official SLO claims.
                                       │
                 ┌─────────────────────┼─────────────────────┐
                 │                     │                     │
-             Drivers                 CLI              Studio/Manager
+             Drivers                 CLI               NextSQL Admin
                 │                     │                     │
                 └─────────────────────┼─────────────────────┘
                                       │
@@ -327,9 +324,10 @@ nextsql/
 │   ├── deno/
 │   └── php/
 │
-├── installer/
-├── manager/
-├── studio/
+├── admin/
+│   ├── setup/
+│   ├── ops/
+│   └── studio/
 ├── intelligence/
 ├── tests/
 ├── docs/
@@ -1814,6 +1812,8 @@ Official drivers target:
 - Bun
 - Deno
 - PHP
+- Python
+- Ruby
 
 Drivers must support applicable server features such as:
 
@@ -1914,7 +1914,7 @@ nextsql import
 
 Backups remain encrypted.
 
-A live server also exposes backup over SQL for the NextSQL Manager: `BACKUP
+A live server also exposes backup over SQL for NextSQL Admin's Operations mode: `BACKUP
 DATABASE` and `VERIFY BACKUP 'name'` (both `BACKUP`-privilege / cluster
 `ADMIN` gated) operate on the server's configured `backup_dir` via a
 hot-backup path that reuses the running engine (`backup.CreateFromEngine`) —
@@ -2096,7 +2096,7 @@ It is authoritative for:
 - unsupported features
 - feature/version metadata
 
-Studio, Manager, drivers, and Intelligence must negotiate against server capabilities rather than assuming feature availability.
+NextSQL Admin (all modes, including Intelligence) and drivers must negotiate against server capabilities rather than assuming feature availability.
 
 All system views obey RBAC and realm/database boundaries.
 
@@ -2188,7 +2188,24 @@ Migration validation must use parser/binder/catalog truth.
 
 ---
 
-# 46. NextSQL Installer
+# 46. NextSQL Admin
+
+NextSQL Admin is the official single application for installing, operating, and
+developing against NextSQL. It ships as one binary (`nextsql-admin`) with one frontend
+shell and three modes:
+
+- **Setup mode** (this section) — first-run install/upgrade/repair/uninstall lifecycle.
+- **Operations mode** (§47) — day-to-day server/cluster/security/backup administration.
+- **Studio mode** (§48-§67) — the database development IDE, including Intelligence.
+
+The three modes share one process, one visual/accessibility baseline, and one product
+identity; they differ in what they connect to and what credentials they require, not in
+product identity. Setup mode runs before a database exists and needs no login (a
+single-operator local trust boundary); Operations and Studio modes both connect to a
+running `nextsqld` using real NSQL credentials. A cross-mode contract applies to all
+three — see §73.
+
+## Setup mode
 
 The official installer provides a professional installation lifecycle.
 
@@ -2222,9 +2239,10 @@ Installer must not imply unsupported OS/platform combinations are production-rea
 
 ---
 
-# 47. NextSQL Manager
+# 47. NextSQL Admin — Operations Mode
 
-NextSQL Manager is the official operational administration UI, separate from Studio.
+Operations mode is NextSQL Admin's official operational administration surface,
+complementing Setup mode (§46) and Studio mode (§48).
 
 Primary responsibilities:
 
@@ -2251,13 +2269,13 @@ Primary responsibilities:
 - CDC operational status
 - partition status
 
-Manager uses:
+Operations mode uses:
 
 - official NSQL/API interfaces
 - `system` schema
 - server capability negotiation
 
-Manager must never:
+Operations mode must never:
 
 - read raw database pages directly
 - read WAL files as a shortcut
@@ -2269,11 +2287,10 @@ Server truth is authoritative.
 
 ---
 
-# 48. NextSQL Studio
+# 48. NextSQL Admin — Studio Mode
 
-NextSQL Studio is the official NextSQL database development IDE.
-
-It is separate from Manager.
+Studio mode is NextSQL Admin's official database development IDE experience,
+complementing Setup mode (§46) and Operations mode (§47).
 
 Target users:
 
@@ -3217,7 +3234,7 @@ It is complete only after implementation, tests, docs, and its exit gate are gre
 
 # 73. Product UX and Safety Contract
 
-Applies to Installer, Manager, Studio, and Intelligence.
+Applies to NextSQL Admin (Setup, Operations, and Studio modes) and Intelligence.
 
 All user-facing products should provide:
 
@@ -3232,6 +3249,10 @@ All user-facing products should provide:
 - server-authoritative status
 - capability negotiation
 - no fake success states
+- installable as a PWA where the product is a web UI (NextSQL Admin): a manifest, a
+  service worker, and offline app-shell loading — but a service worker must never cache
+  live session/auth/query traffic (`/api/*`-shaped surfaces) or a one-time auth token URL;
+  only the static shell is ever cached
 - no silent privilege escalation
 
 ---
@@ -3308,9 +3329,7 @@ CDC / change streams
 Canonical system introspection
 Operational workload governance
 Official drivers
-Professional Installer
-NextSQL Manager
-NextSQL Studio
+NextSQL Admin (Setup / Operations / Studio modes)
 NextSQL Intelligence
 RAG Playground
 ```

@@ -14,7 +14,7 @@
 ```text
 P0–P15  complete
 P16      complete — exit gate green; terminal 100M B+Tree soak deferred as a standalone measurement
-P17      complete except REBUILD INDEX ... ONLINE deferred
+P17      complete — ONLINE rebuild proven for non-partitioned B+Tree/UNIQUE/JSON-path/spatial indexes; blocking fallback elsewhere
 P18      implementable scope complete
 P19      complete — v1 implementation and clean repository-wide functional gate green
 P20      complete — native committed CDC streaming, images, retention, RBAC, and failover verified
@@ -24,8 +24,11 @@ P23      complete — Vector Engine 2.0 (quantised types, quantised HNSW, IVF/IV
 P24      complete — Full-text Search 2.0; compatibility, adversarial bounds, quality, and encrypted recovery exit gate closed 2026-08-31
 P25      complete — Security 2.0; mTLS, short-lived credentials, external IdP broker, field-level client encryption, password-hash evolution, and audit-chain hardening all production-gated; exit gate closed 2026-09-02
 P26      complete — System catalog / introspection 2.0; virtual system schema, live session/security-administration tables, SHOW aliases, and an authoritative capability registry all production-gated; exit gate closed 2026-09-02
-P27–P30 planned/open
-Hosting   partial — accepted multi-database M1 registry/bootstrap foundation; selectable multi-engine routing remains open
+P27      complete — lifecycle/drain, session controls, resource groups, operational CLI, rolling-upgrade, and connection-governance gate closed 2026-09-03
+P28      in progress — Setup/Operations largely complete; remaining recovery-key and Windows/macOS items are capability/environment blocked
+P29      in progress — M1 workspace + M2 streaming/virtualization + M3 bounded result tools/native inspectors + all five dedicated native explorers (JSON, Full-text, Vector, Hybrid, Geo) + Users/Roles, live Transaction/Lock, verified Audit, bounded per-tab plan comparison, and ANALYZE-only profiler implemented; MVP gate open
+P30      deferred to the next version — not in scope for the current release
+Hosting   partial — selectable bounded multi-realm/multi-database routing (M2) complete; M3 suspend/resume and drop landed; independent backup/PITR/key/HA lifecycle remains open
 ```
 
 Cross-cutting baseline work also includes rich bounded operations over the
@@ -34,13 +37,14 @@ cache, and durable database-user-scoped mutation idempotency. This does not clos
 P23 follow-ons such as a `BITVECTOR`/Hamming `--vecquant` row or an IVF-PQ
 process-local cache.
 
-The managed-hosting foundation now adds an encrypted/versioned deployment
-registry, separate registry root, stable realm/database identities, resumable
-`nextsql init`, default database verification, a server-held deployment lock,
-and explicit restartable offline adoption of an existing default database. It
-remains one served engine per `nextsqld`; ID-layout/sibling-file migration,
-realm routing, bounded multi-engine management, quotas, independent operations,
-and HA lifecycle are still planned. See
+The managed-hosting track now provides an encrypted/versioned deployment
+registry, separate registry root, stable realm/database identities, declarative
+bootstrap, realm-scoped auth, storage caps, and bounded per-connection routing
+through `internal/dbmanager`. Idle secondary databases evict, open failures are
+quarantined, buffer memory is budgeted process-wide, and task execution/polling
+uses shared bounded infrastructure. Suspend/resume and offline managed-database
+drop are implemented. Rename, database-addressed backup/PITR/import/export,
+key lifecycle, registry DR/Raft, and multi-database HA remain open. See
 `docs/design-multidatabase-dbaas.md`.
 
 ---
@@ -62,8 +66,8 @@ disposition as P18). P22 follower reads / read scaling is complete (exit gate
 closed 2026-08-30). P23 Vector Engine 2.0 is complete (exit gate closed
 2026-08-31). P24 Full-text Search 2.0 is complete. P25 Security 2.0 is
 complete (exit gate closed 2026-09-02). P26 System catalog / introspection
-2.0 is complete (exit gate closed 2026-09-02); the current release gate is
-P27 Operational maturity + workload governance.
+2.0 is complete (exit gate closed 2026-09-02). P27 closed 2026-09-03; the
+current release gate is P28's remaining installer work.
 
 ---
 
@@ -412,8 +416,7 @@ security dashboard had no official read source — is closed by new
 admin-only `system.users`/`system.roles`/`system.grants`; the capability
 registry gained rows for every previously-undiscoverable P23/P25 surface;
 RBAC-coverage and realm/database-visibility were audited and confirmed
-already satisfied. The current release gate is **P27 Operational maturity +
-workload governance**.
+already satisfied. P27 later closed on 2026-09-03.
 
 Stable native introspection for:
 
@@ -431,9 +434,9 @@ Stable native introspection for:
 
 ---
 
-## P27 — Workload Governance
+## P27 — Workload Governance (complete)
 
-Planned:
+Implemented and exit-gated 2026-09-03:
 
 - resource groups;
 - CPU/memory quotas;
@@ -444,29 +447,188 @@ Planned:
 
 ---
 
-## P28 — Installer + Manager
+## P28 — NextSQL Admin: Setup + Operations modes
 
-Professional lifecycle management and operational UI.
+Professional lifecycle management and operational UI, unified as one product,
+NextSQL Admin (2026-09-05 merge, see `docs/design-admin.md`) — one binary
+`nextsql-admin` with Setup/Operations/Studio modes, replacing the formerly
+separate Installer/Manager/Studio products.
 
 **In progress.** The installer automation + lifecycle CLI backbone
-(`nextsql setup` / `nextsql lifecycle …`) is done. **The NextSQL Manager MVP
+(`nextsql setup` / `nextsql lifecycle …`) is done. **The Operations-mode MVP
 is complete (2026-09-04)** — all nine slices M1–M9 (Overview, Databases,
 Activity, Security, Backups, Cluster, Maintenance, Configuration,
 Logs & Diagnostics), a loopback web app that drives the server only through
 the NSQL protocol as the operator's own user. New SQL surface it added:
 `SET CONFIG`, `BACKUP DATABASE`, `VERIFY BACKUP`; new `system.*` tables:
 `metrics`, `server_log`, `backups`, plus the M4 security tables and
-`system.config`. Restore/PITR stays CLI-only. Remaining: the GUI installer
-UX and end-to-end platform install tests.
+`system.config`. Restore/PITR stays CLI-only. Setup mode is a loopback web
+wizard with token auth and the welcome → location → resources →
+administrator → summary → install → completion flow, delegating plan/install
+to `nextsql setup`. Its Linux `.tar.gz`/`.run`/`.deb` packaging integration
+and M5 accessibility pass are complete; Setup and Operations modes share the
+same branded RUI shell/theme behavior, backed by real-Chrome keyboard and axe
+WCAG 2.2 A/AA regression tests. Remaining: recovery-key UX, Windows/macOS
+packaging and execution, full silent-install coverage, and upgrade/repair
+verification through the installer path.
 
 ---
 
-## P29 — NextSQL Studio
+## P29 — NextSQL Admin: Studio mode (NextSQL Studio)
 
-Web-based professional database development interface with:
+**In progress.** M1 is an authenticated, capability-aware three-pane
+workspace in the shared Admin shell: authorized table/column/index discovery,
+a single NextSQL editor with execution and real lock-wait cancellation, and a
+typed result preview. M2 streams ordered, bounded NDJSON row batches and mounts
+only a visible-window slice in the result DOM while preserving row/byte/time
+limits; the one-line result status reports rows and columns for a read and the
+affected-row count for a column-less write or DDL, never a misleading "0 rows". M3 adds safe bounded cell/row copy, CSV/JSON export, and JSON/vector/
+fixed-geo/TIMESTAMPTZ inspection. All five originally scoped dedicated native
+explorers are also complete: JSON tree/raw/path selection with authorized
+live-index status; a capability/catalog-driven Full-text SEARCH builder with
+HIGHLIGHT/SNIPPET output, ordinal BM25 rank, and copy/insert/explicit bounded
+execution; a capability/catalog-driven Vector NEAREST builder with
+column-kind-restricted metric selection and a live dimension/domain-validating
+inspector; a Hybrid Explorer composing an optional structured filter with
+those same Full-text/Vector builders into one WHERE+SEARCH+NEAREST statement,
+with an Explain action that reuses the existing graphical EXPLAIN tree; and a
+Geo Explorer with an accessible click-to-draw world canvas generating native
+DWITHIN/WITHIN queries over a POINT column. A Users & roles privilege
+explorer (Developer operations scope) is also implemented: a read-only view
+over the same admin-only `system.users`/`system.roles`/`system.grants`
+catalog Operations mode's Security view exposes, with a per-grant "Revoke…"
+action that prefills the existing GRANT/REVOKE builder from a real grant row.
+A read-only Transaction console + Lock explorer also reuses Operations mode's
+existing authorized live Activity bundle, refreshes on every open/manual
+Refresh, and truthfully omits unsupported cross-session kill/rollback actions.
+A read-only Audit viewer similarly reuses the existing admin-only Security
+bundle's chain verification and bounded 200-record tail, retaining suspect
+records when verification fails and exposing no mutation action. Graphical
+EXPLAIN/EXPLAIN ANALYZE now also supports a bounded per-tab baseline and
+deterministic structural-path comparison without guessed semantic matching;
+server-reported values are called measured only for analyzed snapshots. Its
+ANALYZE-only profiler adds bounded per-operator estimate-error signals and
+reported maxima while explicitly refusing to sum inclusive/query-level
+metrics or invent percentages. A bounded, keyboard-operable catalog-aware
+IntelliSense list now offers table/column-name completion (no NextSQL
+keyword completion, since the only ground truth for that set lives in the
+lexer and would silently drift) — table names come free from the loaded
+catalog, and column names for FROM/JOIN-referenced tables are fetched
+lazily, only while the panel is open, through the same per-table route
+every explorer already uses. A deterministic misspelled-table-name notice
+builds on that same extraction: a bare FROM/JOIN target within a small
+edit distance of exactly one real catalog table gets a live, non-
+interrupting "did you mean" fix, while a schema-qualified target, a
+truncated catalog, or a tie between equally-close names is never flagged
+or guessed — column/alias/function-name suggestions are deliberately out
+of scope, since a plain identifier scan cannot safely tell those apart.
+The database explorer's lazy table detail now also shows a bounded
+**Statistics** section — the table's `system.table_stats` row and its
+`system.index_stats` rows, labelled as `ANALYZE`-written estimates rather
+than a live count — by extending the existing per-table detail bundle
+with two more authorized reads, no new route. A read-only Workflows,
+relationships, tasks & change-streams explorer over the authorized
+`system.workflows` / `system.triggers` / `system.schedules` /
+`system.tasks` / `system.change_streams` catalog (one small dedicated
+bundle route) lists native definitions, durable scheduled tasks (with a
+client-side per-workflow filter), and open CDC `SUBSCRIBE` consumers with
+their resume `lsn`. Its bounded accessible diagram renders
+`TABLE → TRIGGER → WORKFLOW` and `SCHEDULE → WORKFLOW`, backed by an
+always-visible text alternative and a fail-closed large/partial-graph
+fallback. It refetches on every open since task/subscription state is live;
+authoring stays in the editor and there is no cancel/retry-task or stream
+pause/resume control. IntelliSense also completes native JSON
+paths when the caret is inside a dotted path, offering only the paths a
+referenced table is actually indexed on (the sole JSON structure the
+server exposes metadata for) — never a guessed path. The RBAC boundary —
+that a Studio session is confined to the logged-in user's own grants
+across every Studio route — is integration-test-covered
+(`TestAdminStudioEnforcesRBAC`). The operator can tag the current
+connection's environment (dev/test/staging/production); a production tag
+shows a standing banner and turns on a read-only safety mode that holds
+every write behind a confirmation (the analyze endpoint now returns a
+`write` flag mirroring nextsqld's own mutation classification). A
+**Switch connection…** control re-targets the session to a different realm
+or database on the same `nextsqld` without signing out — a fresh
+authenticated connection (password supplied each time, never stored)
+swapped in atomically, failing closed on a busy connection or a bad
+credential — and the toolbar shows the server address it targets. A
+read-consistency selector sets the session to strong (default), bounded
+(with a staleness bound) or stale — a live session-control change on the
+current connection affecting reads only, with a warning badge whenever the
+mode is not strong. The switch form also offers the realm/database pairs
+recently used on the current server as quick-fill buttons (stored in the
+browser, never a credential). Parsed-AST pre-run analysis also marks
+`CREATE`/`DROP USER` and `CREATE`/`DROP ROLE` as realm-wide: the confirmation
+names the connected realm/database and explains the cross-database reach,
+including inside a consolidated script warning. These
+are the connection-manager slices landed ahead of the full multi-target
+profile model (named multi-host profiles, TLS/mTLS fields, and OS
+credential storage still to come). The database explorer itself is now a lazy-loaded object tree: a
+Tables branch whose nodes fetch each table's existing per-table detail
+bundle once to reveal Columns/Indexes sub-branches (selecting a name
+still opens the full inspector), plus a read-only Workflows branch that
+runs the existing workflows bundle on first open — no new route.
+A new read-only `system.foreign_keys` catalog view (child table,
+constraint, ordinal, column, referenced table/column, `ON DELETE` /
+`ON UPDATE` action; visibility-filtered like `system.columns`) exposes
+referential structure to any client; Studio consumes it in a per-table
+**Foreign keys** inspector section (outbound constraints plus a
+**Referenced by** grid of inbound references), an outbound-only
+schema-tree sub-branch, and a **Schema diagram** explorer — an inline-SVG
+entity-relationship view laid out from the whole foreign-key catalog, with
+a grouped relationship list as its text alternative and large-schema
+fallback (no layout library, pure unit-tested layout math). A **Search
+objects** finder gives keyboard-driven ranked lookup across table and
+workflow names, and a **command palette** (Ctrl/Cmd+K) does the same across
+Studio's own actions — run a query, open an explorer, switch connection —
+without adding any behavior of its own. Unsaved editor tabs (title + SQL text only) are mirrored to
+the browser and restored on reload, so a crash or accidental close does not
+lose work — a narrow, documented exception to Studio's otherwise
+disk-free client state. A **Saved** panel keeps named, tag-grouped SQL
+snippets in the same per-connection browser storage (load / update / rename
+/ delete), with git-friendly file export (a stable, order-independent
+document) and merge-by-id import. A buffer that references positional
+placeholders (`$1..$N`) gets a **Parameters** bind panel; the values ride
+the query request as a bounded positional array and are coerced to each
+placeholder's type by the server. The table inspector's **DDL** section
+shows the canonical `CREATE TABLE`/`CREATE INDEX` for the selected table,
+from a new `system.table_ddl` catalog view backed by the same renderer that
+produces backup/restore SQL export. Its bounded **Constraints** section unifies
+the already-authorized primary-key, UNIQUE-index, NOT-NULL, and foreign-key
+metadata without adding a server route. A read-only **Migrations** explorer
+shows the database's `nsql_schema_migrations` history — applied versions,
+current version, and any dirty state — via a new
+`GET /api/v1/studio/migrations` read; authoring and applying migrations stay
+with the `nextsql migrate` CLI, which holds the local migration files. A
+**Generate data…** builder produces deterministic, seed-driven `INSERT`
+scripts of synthetic rows from a table's authorized column metadata and loads
+them into the editor for review — bounded, never executed, no server route.
+The table inspector also has a **Dependencies** section — inbound foreign-key
+references plus the row triggers defined on the table, read from
+`system.triggers` (no new route) — with a matching schema-tree **Triggers**
+sub-branch. An **Import data…** builder parses a pasted or loaded
+CSV / TSV / JSON / NDJSON document, maps its fields to a table's authorized
+columns, and builds a bounded, type-checked `INSERT` script into the editor
+for review — never executed, no server route. A **Parameterized DML…** builder
+emits a positional-parameter (`$1..$N`) `INSERT`, `UPDATE`, or `DELETE`
+statement template for a table from its authorized column metadata into the
+editor, bound in the existing Parameters panel before it runs — never executed,
+no server route; `UPDATE`/`DELETE` require an explicit WHERE key. The query-tab
+strip scrolls horizontally rather than wrapping. All use only the official Go
+driver over NSQL and pass the current real-browser accessibility audit. The
+shared browser gate also runs Setup, Operations, and Studio at DPR 2, asserting
+their compact layouts, no page-level horizontal overflow or undersized raster
+source, loaded scalable fonts, and axe WCAG 2.2 AA before resetting device
+metrics; this closes Studio's browser/CSS high-DPI item without changing the
+unverified Windows/macOS package status. See
+`docs/design-admin-studio.md`.
 
-- SQL editor;
-- explorer;
+The open MVP expands that foundation into:
+
+- saved multi-environment connection management and secure OS credential storage;
+- source-position parser/binder diagnostics and a data-editing grid;
+- general spatial preview and safe data editing;
 - profiling;
 - multimodel tools;
 - workflow/task/CDC tooling.
@@ -474,6 +636,8 @@ Web-based professional database development interface with:
 ---
 
 ## P30 — NextSQL Intelligence
+
+**Deferred to the next version — not in scope for the current release.**
 
 Built-in, permission-aware RAG/AI assistance for:
 

@@ -105,7 +105,10 @@ P16 is complete (paper-closed 2026-08-30). Exit gate, all satisfied:
 
 The terminal randomized 100M-operation B+Tree invariant soak is a deferred
 standalone measurement, not a release gate (same disposition as P18); v8
-reached 44M clean operations. The current release gate is P22 follower reads.
+reached 44M clean operations. P22 follower reads later closed 2026-08-30;
+P0–P27 are complete and P28's remaining installer work is the current release
+gate. Installer status does not change the measured engine targets in this
+document.
 
 ---
 

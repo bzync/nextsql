@@ -1,6 +1,7 @@
 package parser
 
 import (
+	"slices"
 	"strings"
 	"testing"
 
@@ -1042,6 +1043,19 @@ func TestParsePointAndSpatialIndex(t *testing.T) {
 	if ix.Spatial || ix.Fulltext || len(ix.Keys) != 1 || len(ix.Keys[0]) != 2 || ix.Keys[0][0] != "metadata" || ix.Keys[0][1] != "category" {
 		t.Fatalf("path index %+v", ix)
 	}
+	// A bare (non-parenthesized) array-index path key: the lexer fuses a
+	// dot immediately followed by a digit into one leading-dot Number token
+	// (the same rule that lexes ".5" as 0.5), so indexKey's Dot-continuation
+	// loop must also recognize that fused shape or the path stops one
+	// segment short — see pathIndexPart.
+	stmt, err = Parse(`CREATE INDEX tag0_index ON products (metadata.tags.0)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ix = stmt.(ast.CreateIndex)
+	if len(ix.Keys) != 1 || len(ix.Keys[0]) != 3 || ix.Keys[0][0] != "metadata" || ix.Keys[0][1] != "tags" || ix.Keys[0][2] != "0" {
+		t.Fatalf("array-index path index %+v", ix)
+	}
 	stmt, err = Parse(`CREATE FULLTEXT INDEX ix_body ON articles (body)`)
 	if err != nil {
 		t.Fatal(err)
@@ -1186,6 +1200,26 @@ func TestParsePointAndSpatialIndex(t *testing.T) {
 	sn, ok := sel.List[1].Expr.(ast.Call)
 	if !ok || sn.Name != "snippet" || len(sn.Args) != 2 {
 		t.Fatalf("snippet %+v", sel.List[1].Expr)
+	}
+	// Studio's Full-text Explorer emits fully quoted identifiers, primary-key
+	// context, one aliased SNIPPET per selected field, and a safely escaped
+	// string literal. Pin that exact generated shape against the real grammar.
+	stmt, err = Parse(`SELECT "id", SNIPPET("title") AS "title_snippet", SNIPPET("body") AS "body_snippet" FROM "articles" SEARCH "title", "body" FOR 'customer''s database' LIMIT 20`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sel = stmt.(ast.Select)
+	if len(sel.List) != 3 || sel.List[1].Alias != "title_snippet" || sel.List[2].Alias != "body_snippet" {
+		t.Fatalf("Studio full-text projection %+v", sel.List)
+	}
+	if len(sel.SearchCols) != 2 || sel.SearchCols[0] != "title" || sel.SearchCols[1] != "body" {
+		t.Fatalf("Studio full-text fields %v", sel.SearchCols)
+	}
+	if query, ok := sel.SearchQuery.(ast.Literal); !ok || query.Value.Str != "customer's database" {
+		t.Fatalf("Studio full-text query %+v", sel.SearchQuery)
+	}
+	if sel.Limit == nil || *sel.Limit != 20 {
+		t.Fatalf("Studio full-text limit %+v", sel.Limit)
 	}
 	stmt, err = Parse(`CREATE VECTOR INDEX docs_embedding ON documents(embedding) USING HNSW`)
 	if err != nil {
@@ -1341,6 +1375,59 @@ func TestParseJSONPathAndVectorLit(t *testing.T) {
 	ins := stmt.(ast.Insert)
 	if _, ok := ins.Rows[0][0].(ast.VectorLit); !ok {
 		t.Fatalf("want vector, got %T", ins.Rows[0][0])
+	}
+}
+
+// TestParseJSONPathArrayIndex pins docs/json.md's own array-index example
+// (`tags.0`), which never actually parsed before pathIndexPart: the lexer
+// fuses a dot immediately followed by a digit into a single leading-dot
+// Number literal (the same rule that lexes ".5" as the float 0.5), so
+// `metadata.tags.0` arrived at the Path-continuation loop as
+// Ident("tags") followed by Number(".0"), never a separate Dot then
+// Number(0) — confirmed against the parser directly (a throwaway probe
+// test), not assumed from reading the grammar.
+func TestParseJSONPathArrayIndex(t *testing.T) {
+	path := func(t *testing.T, sql string) []string {
+		t.Helper()
+		stmt, err := Parse(sql)
+		if err != nil {
+			t.Fatalf("%q: %v", sql, err)
+		}
+		p, ok := stmt.(ast.Select).List[0].Expr.(ast.Path)
+		if !ok {
+			t.Fatalf("%q: want ast.Path, got %T", sql, stmt.(ast.Select).List[0].Expr)
+		}
+		return p.Parts
+	}
+	cases := []struct {
+		sql   string
+		parts []string
+	}{
+		{`SELECT metadata.tags.0 FROM products`, []string{"metadata", "tags", "0"}},
+		{`SELECT metadata.0 FROM products`, []string{"metadata", "0"}},
+		{`SELECT metadata.tags.12 FROM products`, []string{"metadata", "tags", "12"}},
+		{`SELECT metadata.tags.0.category FROM products`, []string{"metadata", "tags", "0", "category"}},
+		{`SELECT metadata.tags.0.1 FROM products`, []string{"metadata", "tags", "0", "1"}},
+		// Studio's JSON Explorer quotes every identifier in generated SQL
+		// while leaving array positions numeric. Pin that exact shape against
+		// the real parser, including a quoted segment after the array index.
+		{`SELECT "metadata"."tags".0."category" FROM "products" LIMIT 100`, []string{"metadata", "tags", "0", "category"}},
+	}
+	for _, c := range cases {
+		if got := path(t, c.sql); !slices.Equal(got, c.parts) {
+			t.Fatalf("%q: parts = %v, want %v", c.sql, got, c.parts)
+		}
+	}
+
+	// A genuine leading-dot float literal must still lex and parse exactly
+	// as before everywhere else — this fix is scoped to the one place a
+	// Path chain is actually being built, not a general lexer change.
+	stmt, err := Parse(`SELECT 1 + .5`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := stmt.(ast.Select).List[0].Expr.(ast.Binary); !ok {
+		t.Fatalf("want Binary, got %T", stmt.(ast.Select).List[0].Expr)
 	}
 }
 

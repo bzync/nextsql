@@ -1,6 +1,7 @@
 package txn
 
 import (
+	"context"
 	"sync"
 	"testing"
 	"time"
@@ -19,6 +20,44 @@ func TestLockSharedCompatible(t *testing.T) {
 	}
 	lm.ReleaseAll(1)
 	lm.ReleaseAll(2)
+}
+
+func TestContendedLockWaitHonorsContextCancellation(t *testing.T) {
+	lm := NewLockManager()
+	if err := lm.Acquire(1, []byte("a"), Exclusive, "orders"); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- lm.AcquireContext(ctx, 2, []byte("a"), Exclusive, "orders")
+	}()
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		lm.mu.Lock()
+		waiting := len(lm.waiters) == 1
+		lm.mu.Unlock()
+		if waiting || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	cancel()
+	if err := <-done; !nerr.HasCode(err, nerr.Canceled) {
+		t.Fatalf("want canceled, got %v", err)
+	}
+	lm.mu.Lock()
+	wantNoWaiters := len(lm.waiters) == 0 && len(lm.waitFor) == 0
+	lm.mu.Unlock()
+	if !wantNoWaiters {
+		t.Fatal("canceled waiter leaked queue or wait-for state")
+	}
+	lm.ReleaseAll(1)
+	if err := lm.Acquire(3, []byte("a"), Exclusive, "orders"); err != nil {
+		t.Fatalf("lock unusable after canceled waiter: %v", err)
+	}
+	lm.ReleaseAll(3)
 }
 
 func TestDeadlockAbortsOne(t *testing.T) {

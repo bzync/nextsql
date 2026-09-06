@@ -31,7 +31,15 @@ Current supported/implemented surfaces include:
 - vector;
 - hybrid queries;
 - geospatial;
-- schema lifecycle/maintenance.
+- schema lifecycle/maintenance;
+- WORKFLOW/TRIGGER/SCHEDULE/TASK and committed CDC;
+- RANGE/HASH/LIST partitioning and follower-read routing;
+- the virtual `system` schema and workload governance;
+- seven official drivers (Go, Node.js/TypeScript, Bun, Deno, PHP, Python,
+  Ruby);
+- `nextsql setup`/`nextsql lifecycle` automation;
+- the completed NextSQL Admin Operations-mode MVP;
+- the NextSQL Admin Setup-mode M1 flow.
 
 Exact status is authoritative in `TODO.md`.
 
@@ -39,19 +47,13 @@ Exact status is authoritative in `TODO.md`.
 
 ## Planned but Not Yet Supported as Shipped Features
 
-Until their phases close:
+Current open product work includes:
 
-- WORKFLOW/TRIGGER/SCHEDULE/TASK;
-- CDC;
-- native physical partitioning;
-- follower reads;
-- Vector Engine 2.0;
-- Full-text Search 2.0;
-- Security 2.0 extensions;
-- System Catalog 2.0;
-- Workload Governance 2.0;
-- NextSQL Manager;
-- NextSQL Studio;
+- the remaining P28 installer gate: richer wizard flows, packaging integration,
+  silent and cross-platform execution, and accessibility validation;
+- production-gating the broader multi-database hosting track beyond completed
+  M2 routing and landed M3 suspend/drop;
+- NextSQL Admin's Studio mode (NextSQL Studio);
 - NextSQL Intelligence/RAG.
 
 ---
@@ -60,7 +62,11 @@ Until their phases close:
 
 Only platforms tested by the current release process should be described as supported.
 
-Current packaging work includes Linux and Windows artifacts.
+Current packaging work includes Linux and Windows artifacts. Linux `.tar.gz`
+and `.run` paths have been live-tested on amd64; `.deb` metadata/layout has
+been inspected but not installed system-wide. `.rpm` and Windows artifacts
+have not been executed in the current environment. Checksums are produced;
+release signing is not yet implemented.
 
 Production support should be declared per release, not assumed from build scripts alone.
 

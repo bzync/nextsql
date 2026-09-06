@@ -1,0 +1,124 @@
+/* Setup-mode-specific layout on top of @bzync/rui's stylesheet and
+   ../shared/shared.css (fonts, reset, skip link, theme select, shared
+   contrast/motion rules). */
+#installer-step-title:focus {
+  outline: none;
+}
+.nsi-page {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 32px 20px;
+  box-sizing: border-box;
+}
+.nsi-shell {
+  width: 100%;
+  max-width: 640px;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+.nsi-rail {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+.nsi-brand-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.nsi-main {
+  min-width: 0; /* let long content (paths, code blocks) shrink instead of overflowing the grid track */
+}
+.nsi-rail-footer {
+  display: none; /* only worth the vertical space once the rail has room to breathe — see the >=760px rule below */
+}
+.nsi-stepper-desktop {
+  display: none;
+}
+.nsi-stepper-mobile {
+  width: 100%;
+}
+
+/* >=760px: data/administrator step content plus a resting stepper column
+   comfortably fit side by side without either feeling cramped — below
+   that, stacking (mobile pattern below) reads better than a squeezed
+   two-column layout. */
+@media (min-width: 760px) {
+  .nsi-shell {
+    max-width: 880px;
+    flex-direction: row;
+    align-items: flex-start;
+    gap: 40px;
+  }
+  .nsi-rail {
+    width: 200px;
+    flex: 0 0 200px;
+    position: sticky;
+    top: 32px;
+  }
+  .nsi-main {
+    flex: 1 1 auto;
+  }
+  .nsi-rail-footer {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    margin-top: 8px;
+  }
+  .nsi-stepper-desktop {
+    display: block;
+  }
+  .nsi-stepper-mobile {
+    display: none;
+  }
+}
+
+/* Path fields (PathField) read as filesystem paths, not prose — a
+   monospace face makes long paths easier to scan character-by-character
+   and visually distinguishes them from the surrounding label text. */
+.nsi-path-input {
+  font-family: var(--font-mono);
+  font-size: 13px;
+}
+/* PathField's own small combobox (see its file comment for why it isn't
+   rui's Autocomplete): a plain relative/absolute pair is enough since the
+   dropdown never needs to escape a scroll container here. */
+.nsi-path-wrap {
+  position: relative;
+}
+.nsi-path-list {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  right: 0;
+  z-index: 30;
+  max-height: 256px;
+  overflow-y: auto;
+}
+
+pre.nsi-code {
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 13px;
+}
+
+@media (prefers-contrast: more) {
+  .nsi-path-list {
+    border-width: 2px;
+  }
+  .nsi-path-list [aria-selected="true"] {
+    outline: 2px solid currentColor;
+    outline-offset: -2px;
+  }
+}
+
+@media (forced-colors: active) {
+  .nsi-path-list [aria-selected="true"] {
+    background: Highlight;
+    color: HighlightText;
+  }
+}

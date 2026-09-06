@@ -1,0 +1,80 @@
+/* Operations-mode-specific layout on top of @bzync/rui's stylesheet and
+   ../shared/shared.css (fonts, reset, skip link, theme select, shared
+   contrast/motion rules). NextSQL Admin's Operations shell is an
+   application workspace, not a second copy of the centered Setup wizard.
+   RUI owns every visible shell primitive; these rules only size the
+   product-specific composition. */
+.nsm-shell { width: 100%; min-height: 100vh; }
+.nsm-sidebar { width: 248px; flex: 0 0 248px; }
+.nsm-sidebar nav { min-height: 0; overflow-y: auto; }
+.nsm-sidebar footer p {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.nsm-body, .nsm-main { min-width: 0; }
+/* rui's --color-accent-500 (the Wordmark's "SQL" span) misses AA against
+   the Sidebar's own dark-theme surface specifically — Setup mode's rail
+   uses a lighter surface and doesn't have this problem, so the override is
+   scoped to the Sidebar only, same pattern as the slate/leading-relaxed
+   fixes in shared.css. */
+.nsm-sidebar .text-accent-500 { color: var(--color-foreground); }
+.nsm-topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+.nsm-content { padding-top: 24px; padding-bottom: 40px; }
+.nsm-content [role="tabpanel"] { margin-top: 24px; }
+.nsm-mobile-nav { display: none; }
+.nsm-mobile-signout { display: none; }
+.nsm-result-table-scroll {
+  max-width: 100%;
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+  border-radius: var(--radius-md);
+}
+.nsm-result-table-scroll:focus-visible {
+  outline: 2px solid var(--color-accent-500);
+  outline-offset: 2px;
+}
+/* RUI's Table owns an inner horizontal scroller by default. The labeled,
+   focusable wrapper above owns scrolling so keyboard users can reach wide
+   catalog results. */
+.nsm-result-table-scroll .nsm-result-table-inner { overflow-x: visible; }
+
+.nsm-login-page {
+  min-height: 100vh;
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 32px 20px;
+}
+.nsm-login-shell {
+  width: 100%;
+  max-width: 480px;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+
+@media (max-width: 899px) {
+  .nsm-sidebar { display: none; }
+  .nsm-mobile-nav {
+    display: flex;
+    width: 100%;
+    overflow-x: auto;
+    border-radius: 0;
+  }
+  .nsm-mobile-nav > * { flex: 0 0 auto; }
+  .nsm-mobile-signout { display: inline-flex; }
+  .nsm-content { padding-top: 20px; }
+}
+
+@media (prefers-contrast: more) {
+  .nsm-mobile-nav {
+    border-width: 2px;
+  }
+}

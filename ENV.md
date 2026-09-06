@@ -36,10 +36,11 @@ NEXTSQL_TENANT
 | `NEXTSQL_DATA_DIR` | init, adoption, `nextsqld` | Encrypted deployment data directory | none |
 | `NEXTSQL_KEY_FILE` | init, adoption, `nextsqld` | External default-database root key **file path** | none |
 | `NEXTSQL_INSTANCE_KEY_FILE` | init, adoption, `nextsqld` | External deployment-registry root key **file path** | `NEXTSQL_KEY_FILE.instance` |
-| `NEXTSQL_REALM_NAME` | init, adoption | Logical subscription/account realm name | `default` |
+| `NEXTSQL_REALM_NAME` | init, adoption, clients | Logical subscription/account realm name; client Hello realm selection | `default` for init/adoption; server default for clients |
 | `NEXTSQL_DATABASE` | init, adoption, clients | Logical database name; client Hello selection | init/adoption: `default`; client: server default |
 | `NEXTSQL_BUFFER_PAGES` | init, adoption, `nextsqld` | Positive database buffer-pool page count | `1024` |
 | `NEXTSQL_HOSTING_CONFIRM` | adoption | `true`/`1`/`yes` confirms non-interactive offline adoption | `false` |
+| `NEXTSQL_HOSTING_MANIFEST_FILE` | init, `nextsqld` | Declarative multi-realm/database bootstrap manifest | none |
 | `NEXTSQL_SERVER_USER` | init, `nextsqld` | Server/bootstrap administrator name | none |
 | `NEXTSQL_SERVER_PASSWORD_FILE` | init, `nextsqld` | Preferred server/bootstrap password-file path | none |
 | `NEXTSQL_SERVER_PASS` | init, `nextsqld` | Inline server/bootstrap password; automation fallback | none |
@@ -91,14 +92,15 @@ registers it under the `customer-a` realm.
 
 ## Multiple realms and databases
 
-The current init/runtime slice accepts one default `(realm, database)` pair per
-deployment and serves only that registered default. Do not invent numbered
-variables such as `NEXTSQL_REALM_1` or encode lists in `NEXTSQL_REALM_NAME`.
+`NEXTSQL_REALM_NAME` and `NEXTSQL_DATABASE` select one default pair for
+single-database initialization and one realm/database in a client Hello. A
+running hosted `nextsqld` can route different connections to different active,
+registered pairs through the bounded database manager. Do not invent numbered
+variables such as `NEXTSQL_REALM_1` or encode lists in one value.
 
-The planned batch setup uses a declarative file selected by
-`NEXTSQL_HOSTING_MANIFEST_FILE`. That variable is documented in the hosting
-design, not in the active reference table above, because batch provisioning and
-live multi-database routing are not shipped yet. See
+Batch bootstrap uses a declarative file selected by
+`NEXTSQL_HOSTING_MANIFEST_FILE`; the file can provision multiple realms and
+databases, including a fully managed deployment with no legacy default. See
 [`docs/design-multidatabase-dbaas.md`](docs/design-multidatabase-dbaas.md).
 
 For an existing pre-registry default database:
@@ -207,12 +209,14 @@ uses `NEXTSQL_SERVER_USER` with `NEXTSQL_SERVER_PASSWORD_FILE` or
 
 ## Current hosting limitation
 
-The current M1 implementation registers and verifies one default database per
-`nextsqld`. Realm/database dotenv naming, encrypted registry state, and
-isolation identities are implemented, but selectable multiple database engines
-behind one server remain the M2 milestone. `NEXTSQL_DATABASE` currently selects
-or validates the registered default; it is not yet arbitrary multi-engine
-routing.
+Selectable bounded multi-realm/multi-database routing (M2) is implemented.
+`NEXTSQL_REALM_NAME`/`NEXTSQL_DATABASE` bind a client to a registered active
+database; realm-scoped auth, idle eviction, open-failure quarantine, the shared
+buffer budget, and centralized task workers/scheduling apply. Managed
+secondaries remain single-node and process-level TLS/config/metrics/log/backup
+sources are not yet attached to every database opened lazily by the manager.
+Database-addressed backup/restore/PITR/import/export, independent key lifecycle,
+registry DR/Raft replication, and hosted HA remain M3+ work.
 
 ## Security checklist
 

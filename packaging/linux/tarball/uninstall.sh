@@ -48,6 +48,6 @@ if command -v systemctl >/dev/null 2>&1; then
 	systemctl $SYSTEMCTL_USER daemon-reload >/dev/null 2>&1 || true
 fi
 
-rm -f "$PREFIX/bin/nextsql" "$PREFIX/bin/nextsqld" "$PREFIX/bin/nextsql-bench"
+rm -f "$PREFIX/bin/nextsql" "$PREFIX/bin/nextsqld" "$PREFIX/bin/nextsql-bench" "$PREFIX/bin/nextsql-admin"
 echo "Removed NextSQL binaries and the systemd unit."
 echo "Data directories and /etc/nextsql (or ~/.config/nextsql) were left in place."

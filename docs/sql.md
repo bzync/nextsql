@@ -238,9 +238,9 @@ temporary restore directory, never the live database. Both require the
 node-local. If `backup_dir` is unset, both fail `Unavailable`. The backups
 are visible in `system.backups`. **Restore and point-in-time recovery are
 offline-only** — a running server cannot restore into itself — and stay with
-the `nextsql restore` CLI (`docs/backup.md`); the NextSQL Manager surfaces
-the exact command rather than a button. Backs the Manager's Backups view
-(`docs/design-manager.md` M5).
+the `nextsql restore` CLI (`docs/backup.md`); NextSQL Admin's Operations mode
+surfaces the exact command rather than a button. Backs Operations mode's
+Backups view (`docs/design-admin-operations.md` M5).
 
 `SET CONFIG key = value` persists one server setting to the node this
 connection reached's on-disk `nextsql.conf`. `value` is a string literal, a
@@ -259,8 +259,8 @@ canonical `key=value` form: any comments are not preserved, and settings the
 built-in `Default()` populates (e.g. `max_inflight_queries`) are written
 explicitly even if you did not set them. `key` must be one of the settings
 `nextsql.conf` accepts (the same list `config.SettableKeys()` /
-`nextsql setup --config-out` use); anything else is rejected. Backs the
-NextSQL Manager's Configuration editor (`docs/design-manager.md` M8).
+`nextsql setup --config-out` use); anything else is rejected. Backs NextSQL
+Admin's Operations-mode Configuration editor (`docs/design-admin-operations.md` M8).
 
 `CREATE RESOURCE GROUP name [IF NOT EXISTS] [WITH (MAX_CONCURRENCY = n, MEMORY
 = bytes, WORKERS = n, PRIORITY = n)]` declares a durable, RBAC-gated (cluster

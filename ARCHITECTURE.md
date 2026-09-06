@@ -41,14 +41,14 @@ Correctness
 ## 2. High-Level System
 
 ```text
-Clients / CLI / Studio / Manager
+Clients / CLI / NextSQL Admin (Setup, Operations, Studio modes)
             │
             ▼
      Native NSQL Protocol
             │
          TLS/Auth
             │
-       RBAC/Tenant
+   RBAC/Realm/Database
             │
           Parser
             │
@@ -284,12 +284,15 @@ Unbounded per-query goroutines are forbidden.
 
 ### Vector
 
-- `VECTOR<F32,N>`;
+- `VECTOR<F32,N>` / `VECTOR<F16,N>` / `VECTOR<I8,N>`;
+- `BITVECTOR<N>` / `SPARSEVECTOR<N>`;
 - exact flat search;
-- HNSW;
+- HNSW, IVF, IVF-PQ, and sparse inverted retrieval;
 - COSINE;
 - L2;
-- INNER_PRODUCT.
+- INNER_PRODUCT;
+- HAMMING;
+- dense + sparse + BM25 fusion.
 
 ### Geospatial
 
@@ -297,8 +300,17 @@ Unbounded per-query goroutines are forbidden.
 - BOX;
 - LINESTRING;
 - POLYGON;
+- general `GEOMETRY` / `GEOGRAPHY` with subtype/SRID;
+- WKT, EWKB, and GeoJSON conversion;
 - distance/predicate functions;
 - spatial indexes.
+
+### Scalar and collection types
+
+- exact signed/unsigned integer widths, `BLOB`, bounded `CHAR`/`VARCHAR`;
+- `DATE`, `TIME`, `TIMESTAMP`, `TIMESTAMPTZ`, `INTERVAL`;
+- `FLOAT32`, `FLOAT64`, `ENUM`;
+- recursively bounded `STRUCT`, `ARRAY`, and `MAP`.
 
 ---
 
@@ -418,18 +430,24 @@ CDC must preserve:
 
 ---
 
-## 16. Partitioning and Read Scaling
+## 16. Partitioning, Hosting, and Read Scaling
 
-Planned partitioning:
+P21 local physical partitioning is implemented with one-to-eight-column
+`RANGE`, `HASH`, and `LIST` keys, partition-local index roots, bounded
+ADD/DROP/ATTACH/DETACH, pruning, statistics/costing, and partition-wise
+aggregation/equi-join. It is not distributed sharding and never replaces RBAC.
 
-- RANGE;
-- HASH;
-- LIST where justified;
-- tenant-aware partitioning.
+P22 follower reads expose `STRONG`, `BOUNDED`, and `STALE` semantics. Strong
+reads remain leader-only behind a Raft quorum barrier; every official driver
+has a bounded cluster-routing client, but the server independently enforces the
+mode.
 
-Follower reads must expose explicit consistency semantics.
-
-Strong reads cannot be silently served from replicas that cannot satisfy them.
+The separate hosting track layers a versioned encrypted deployment registry
+and `internal/dbmanager` over the per-database engine. M2 routes connections to
+multiple realms/databases within one process with realm-scoped auth, bounded
+open handles/eviction, a shared buffer budget, and centralized task scheduling.
+Managed databases are still single-node: independently addressed backup/PITR,
+key lifecycle, registry DR/Raft, and hosted HA remain open.
 
 ---
 
@@ -440,16 +458,19 @@ NextSQL Engine
 ├── nextsqld
 ├── nextsql CLI
 ├── nextsql-bench
+├── nextsql-auth-broker
 ├── official drivers
-├── Installer
-├── Manager
-├── Studio
-└── Intelligence
+└── nextsql-admin (P28-29; one binary, three modes)
+    ├── Setup mode      (P28; formerly nextsql-install — GUI M1/M3/M5/M6 complete)
+    ├── Operations mode (P28; formerly nextsql-manager — MVP complete)
+    ├── Studio mode     (P29; not yet built — placeholder only)
+    └── Intelligence    (P30; lives inside Studio mode)
 ```
 
 The server remains authoritative.
 
-Studio/Manager must use native public interfaces rather than reading raw pages/WAL directly.
+NextSQL Admin must use native public interfaces rather than reading raw pages/WAL
+directly, in every mode.
 
 ---
 

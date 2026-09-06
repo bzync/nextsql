@@ -24,7 +24,8 @@ NextSQL combines:
 - Native network protocol
 - High availability
 - Operational tooling
-- Future programmable automation, CDC, partitioning, read scaling, Studio, and built-in RAG
+- Programmable automation, CDC, partitioning, and follower-read scaling
+- Future Studio and built-in RAG
 
 NextSQL is **not** a PostgreSQL/MySQL/MariaDB compatibility project. Do not introduce compatibility dependencies unless explicitly requested.
 
@@ -116,7 +117,7 @@ Current development state:
 ```text
 P0–P15  complete
 P16      complete — exit gate green; terminal 100M B+Tree soak deferred as a non-gate standalone measurement
-P17      complete — REBUILD INDEX ... ONLINE is a deferred follow-on (not a gate item)
+P17      complete — ONLINE rebuild proven for non-partitioned B+Tree/UNIQUE/JSON-path/spatial indexes; blocking fallback elsewhere
 P18      implementable scope complete
 P19      complete; clean repository-wide functional gate passed 2026-08-29
 P20      complete
@@ -126,11 +127,15 @@ P23      complete — Vector Engine 2.0; production-gating sign-off 2026-08-31
 P24      complete — Full-text Search 2.0; exit gate closed 2026-08-31
 P25      complete — Security 2.0; exit gate closed 2026-09-02, security review sign-off in docs/security.md
 P26      complete — System catalog / introspection 2.0; exit gate closed 2026-09-02, see docs/system-catalog.md "P26 exit gate closure"
-P27–P30 planned/open
+P27      complete — Operational maturity + workload governance; exit gate closed 2026-09-03
+P28      in progress — remaining recovery-key and Windows/macOS items blocked
+P29      in progress — Studio M1 workspace + M2 streaming/virtualization + M3 bounded result tools/native inspectors + all five native explorers + Users/Roles, Transaction/Lock, and Audit developer-operations explorers + bounded plan comparison/ANALYZE profiler + catalog-aware table/column IntelliSense + deterministic misspelled FROM/JOIN table-name suggestions implemented; MVP gate open
+P30      planned/open
 ```
 
-Immediate release-gate work is **P27 Operational maturity + workload
-governance**. P26 System catalog / introspection 2.0 is complete: the
+Immediate release-gate work is **P28 Professional Installer + NextSQL
+Manager**, specifically the remaining installer gate. P26 System catalog /
+introspection 2.0 is complete: the
 virtual `system` schema core (RBAC-filtered
 capabilities/tables/columns/indexes/storage/replication/raft/workflows/
 tasks/partitions/stats), all 5 live tables (`system.sessions`/
@@ -548,18 +553,20 @@ Optimizer/index extensions include:
 - Top-N sort
 - improved join reordering
 
-Partition-wise aggregation and joins remain deferred until physical partitioning exists in P21.
+Partition-wise aggregation and equi-joins are implemented for the bounded P21
+cases documented in `docs/partitioning.md`.
 
 ---
 
 # 6. Schema Lifecycle and Maintenance Skill
 
-P17 is substantially complete.
+P17 is complete.
 
 Preserve:
 
 - DROP INDEX for all shipped index types
-- blocking REBUILD INDEX
+- blocking REBUILD INDEX fallback
+- online rebuild for proven non-partitioned B+Tree/UNIQUE/JSON-path/spatial indexes
 - crash-safe index rebuild
 - page reclamation
 - durable freelist
@@ -584,9 +591,10 @@ Preserve:
 - automatic statistics refresh policy
 - bounded automatic maintenance scheduling
 
-`REBUILD INDEX ... ONLINE` remains deferred until concurrent-write correctness is proven.
-
-Never silently reinterpret the blocking implementation as online.
+`REBUILD INDEX ... ONLINE` uses shadow-tree arm/drain/backfill/swap with
+concurrent-write mirroring for its supported scope. Partitioned, vector, and
+full-text indexes continue to use the blocking implementation; never silently
+label that fallback online.
 
 ---
 
@@ -937,7 +945,7 @@ of truth; do not add an independent diagnostic path.
 
 # 15. P27 Skill — Operational Maturity / Workload Governance
 
-Add production governance around the engine.
+P27 is complete. Preserve the production-governance contract around the engine.
 
 Key areas:
 
@@ -959,13 +967,21 @@ The system must degrade through queueing/rejection/cancellation rather than OOM 
 
 ---
 
-# 16. P28 Skill — Professional Installer + NextSQL Manager
+# 16. P28 Skill — NextSQL Admin: Setup + Operations modes
 
-Keep product separation clear.
+NextSQL Admin is one product, one binary (`nextsql-admin`), three modes (Setup,
+Operations, Studio — see `docs/design-admin.md`). Keep the modes' responsibilities
+clear even though they share one process/shell.
 
-## Installer
+Current state: the `nextsql setup`/`nextsql lifecycle` automation backbone and
+all nine Operations-mode MVP slices are complete. Setup mode M1 is implemented
+and targeted-tested as `internal/admin/setup`; packaging it as the default
+interactive entry point, richer encryption/advanced flows, silent and
+cross-platform install execution, and the accessibility pass remain open.
 
-The installer is responsible for:
+## Setup mode
+
+Setup mode is responsible for:
 
 - installation
 - initialization
@@ -987,9 +1003,9 @@ Professional UX should be:
 
 Support appropriate Linux/server targets first according to the roadmap; do not pretend unsupported platforms are production-ready.
 
-## NextSQL Manager
+## Operations mode
 
-Manager is the operational administration product.
+Operations mode is NextSQL Admin's operational administration surface.
 
 Expected areas include:
 
@@ -1005,13 +1021,14 @@ Expected areas include:
 - maintenance
 - upgrades
 
-Manager must use public/native NextSQL APIs rather than secret privileged shortcuts.
+Operations mode must use public/native NextSQL APIs rather than secret privileged shortcuts.
 
 ---
 
-# 17. P29 Skill — NextSQL Studio
+# 17. P29 Skill — NextSQL Admin: Studio mode (NextSQL Studio)
 
-NextSQL Studio is the web-based professional database development interface.
+NextSQL Studio is the web-based professional database development interface,
+built as a mode of NextSQL Admin rather than a separate product/binary.
 
 Core product goals:
 
@@ -1492,8 +1509,7 @@ The intended NextSQL product family is:
 NextSQL Engine
 NextSQL CLI
 Official NextSQL Drivers
-NextSQL Manager
-NextSQL Studio
+NextSQL Admin (Setup / Operations / Studio modes)
 NextSQL Intelligence
 ```
 
@@ -1536,10 +1552,9 @@ Before claiming completion:
 
 # 30. Current Execution Directive
 
-P0–P26 are complete. P26 System catalog / introspection 2.0's exit gate
-closed 2026-09-02 with the dated closure record in `docs/system-catalog.md`.
-Continue in dependency order on **P27 Operational maturity + workload
-governance**:
+P0–P27 are complete. P28 NextSQL Admin (Setup + Operations modes) is the
+current release gate. The Operations-mode MVP gate is green; continue in
+dependency order on the remaining Setup-mode work:
 
 ```text
 1. Audit designed vs implemented vs tested vs production-gated status for

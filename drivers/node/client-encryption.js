@@ -455,7 +455,7 @@ module.exports = function createClientEncryption(deps) {
   }
 
   // NSFK1 is the durable field-keyring format used by FileFieldKeyring (see
-  // drivers/js/client-encryption.mjs for the identical Bun/Deno codec and
+  // drivers/js/client-encryption.mjs for the identical shared (Bun) codec and
   // drivers/go/nextsql.go for the Go implementation):
   //
   //   magic "NSFK" (4) | version u16=1 | count u16

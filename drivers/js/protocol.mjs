@@ -1,5 +1,5 @@
-// Shared NSQL v1 codec for official JS-family drivers (Node stays
-// self-contained CJS; Bun and Deno import this module).
+// Shared NSQL v1 codec for the official JS-family drivers (Node stays
+// self-contained CJS; the Bun driver imports this module).
 // Keys and passwords are never accepted in a URL.
 
 const te = new TextEncoder();

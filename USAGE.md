@@ -244,10 +244,11 @@ Confirm:
 ```
 
 Official drivers live in the same tree (`drivers/go`, `drivers/node`,
-`drivers/bun`, `drivers/deno`, `drivers/php`, `drivers/python`,
-`drivers/ruby`). Node.js is published/configured as the public MIT package
-`@bzync/nextsql`; the others are currently used from the repository unless
-their package metadata says otherwise.
+`drivers/bun`, `drivers/php`, `drivers/python`, `drivers/ruby`). All MIT.
+Published to language registries: `@bzync/nextsql` (npm), `bzync/nextsql`
+(Composer), `bzync-nextsql` (PyPI), `bzync-nextsql` (RubyGems),
+`github.com/bzync/nextsql/drivers/go` (Go modules). The Bun client is used
+from the repository tree.
 
 ---
 
@@ -2107,25 +2108,16 @@ On SIGINT/SIGTERM, `nextsqld` stops accepting new connections and closes each ex
 
 Official drivers speak NSQL v1. **Do not put keys or passwords in a URL.** TLS 1.3 is required off loopback.
 
-| Runtime | Path | Open |
-
+| Runtime | Install | Open |
 |---|---|---|
+| Go | `go get github.com/bzync/nextsql/drivers/go` | `nextsql.Open(nextsql.Config{…})` |
+| Node.js 18+ | `npm i @bzync/nextsql` | `connect({ address, user, password, tls })` |
+| Bun | [`drivers/bun`](drivers/bun) (repo tree) | same shape as Node |
+| PHP 8.1+ | `composer require bzync/nextsql` | `NextSQL\Client::connect([…])` |
+| Python 3.10+ | `pip install bzync-nextsql` | `nextsql.connect(nextsql.Config(…))` |
+| Ruby 3.0+ | `gem install bzync-nextsql` | `NextSQL.connect(NextSQL::Config.new(…))` |
 
-| Go | [`drivers/go`](drivers/go) | `nextsql.Open(nextsql.Config{…})` |
-
-| Node.js 18+ | [`drivers/node`](drivers/node) | `connect({ address, user, password, tls })` |
-
-| Bun | [`drivers/bun`](drivers/bun) | same shape as Node |
-
-| Deno | [`drivers/deno`](drivers/deno) | `import { connect } from "./mod.ts"` |
-
-| PHP 8.1+ | [`drivers/php`](drivers/php) | `NextSQL\Client::connect([…])` |
-
-| Python 3.10+ | [`drivers/python`](drivers/python) | `nextsql.connect(nextsql.Config(…))` |
-
-| Ruby 3.0+ | [`drivers/ruby`](drivers/ruby) | `NextSQL.connect(NextSQL::Config.new(…))` |
-
-Shared TypeScript types: [`drivers/js/types.d.ts`](drivers/js/types.d.ts).
+Shared TypeScript types: [`drivers/js/types.d.ts`](drivers/js/types.d.ts) (bundled into `@bzync/nextsql`).
 
 Common API: `exec` (materialize), `query` (stream rows), `prepare` / execute, `cancel`, `close`. A connection is single-flight: a second query while rows are open returns `conflict`.
 
@@ -2261,27 +2253,7 @@ await conn.close();
 
 Typed parameters: `{ kind: "uuid" | "decimal", value: "…" }`, numbers, strings, booleans, `Date`, `number[]` (vectors), `{ lon, lat }` (points), `{ west, south, east, north }` (boxes), or a plain object (JSON).
 
-TypeScript: `import { connect, type Config } from "./drivers/node/nextsql"`.
-
-### Deno
-
-```ts
-import { connect } from "./drivers/deno/mod.ts";
-
-const conn = await connect({
-  address: "127.0.0.1:7210",
-
-  user: "app",
-
-  password: Deno.env.get("NEXTSQL_DATABASE_PASS"),
-
-  insecureNoTLS: true,
-});
-
-const res = await conn.exec("SELECT 1");
-
-await conn.close();
-```
+TypeScript: `import { connect, type Config } from "@bzync/nextsql"`.
 
 ### PHP 8.1+
 
@@ -2516,13 +2488,13 @@ Drivers:
 
 - Go: `Config.KeyProvider` (a `crypto.KeyProvider` that returns the root DEK).
 
-- Node / Bun / Deno: `key: <32-byte Buffer | Uint8Array>`.
+- Node / Bun: `key: <32-byte Buffer | Uint8Array>`.
 
 - PHP: `'key' => $clientRoot` (32-byte string).
 
 Field-level `ENCRYPTED CLIENT` columns are **experimental**. The randomized
 `NSCE1.` SQL/catalog/server path, helpers for Go, Node.js/TypeScript, Bun,
-Deno, and PHP, PITR, replication/failover, and durable key-rotation/revocation
+and PHP, PITR, replication/failover, and durable key-rotation/revocation
 (`FileFieldKeyring`) are all implemented and tested; formal production gating
 awaits the phase-wide P25 exit gate. See
 [`docs/client-encryption.md`](docs/client-encryption.md).
@@ -2790,7 +2762,7 @@ Every read runs in one of three session modes (default `STRONG`):
 - **`BOUNDED`** — served from any member within `MAX STALENESS` of the leader (default five heartbeats); a member that has fallen further behind is rejected. No quorum round trip.
 - **`STALE`** — served from any member's local applied state with no freshness bound.
 
-There is no SQL syntax for this yet — it is set on the wire (`SetReadConsistency` frame) / in a driver. Every official driver exposes `setReadConsistency` / `nodeStatus` and a routing cluster client — `nextsql.Cluster` (`OpenCluster` over `Config.Nodes`) in Go, `connectCluster` in Node/Bun/Deno, `NextSQL\Cluster::connect` in PHP — that sends eligible read-only statements to a healthy follower and writes / DDL / transactions / `STRONG` reads to the leader, and fails over to the new leader on a leader change. Per-node lag is visible in `system.replica_health` and the `NodeStatus` frame. `STRONG` reads keep read-your-writes and monotonic reads across a leader failover; `STALE`/`BOUNDED` may lag (documented trade-off). Consistency argument: [`docs/ha.md`](docs/ha.md) "Consistency model and sign-off".
+There is no SQL syntax for this yet — it is set on the wire (`SetReadConsistency` frame) / in a driver. Every official driver exposes `setReadConsistency` / `nodeStatus` and a routing cluster client — `nextsql.Cluster` (`OpenCluster` over `Config.Nodes`) in Go, `connectCluster` in Node/Bun, `NextSQL\Cluster::connect` in PHP — that sends eligible read-only statements to a healthy follower and writes / DDL / transactions / `STRONG` reads to the leader, and fails over to the new leader on a leader change. Per-node lag is visible in `system.replica_health` and the `NodeStatus` frame. `STRONG` reads keep read-your-writes and monotonic reads across a leader failover; `STALE`/`BOUNDED` may lag (documented trade-off). Consistency argument: [`docs/ha.md`](docs/ha.md) "Consistency model and sign-off".
 
 Details: [`docs/ha.md`](docs/ha.md).
 

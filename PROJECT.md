@@ -89,7 +89,7 @@ NextSQL Bench
   Correctness-aware official benchmark and SLO measurement suite
 
 NextSQL Drivers
-  Go / Node.js / TypeScript / Bun / Deno / PHP / Python / Ruby
+  Go / Node.js / TypeScript / Bun / PHP / Python / Ruby
   plus future officially supported SDKs
 
 NextSQL Admin
@@ -318,7 +318,6 @@ nextsql/
 │   ├── go/
 │   ├── node/
 │   ├── bun/
-│   ├── deno/
 │   └── php/
 │
 ├── admin/
@@ -1805,7 +1804,6 @@ Official drivers target:
 - Node.js
 - TypeScript
 - Bun
-- Deno
 - PHP
 - Python
 - Ruby

@@ -1,0 +1,61 @@
+name: Publish Ruby driver to RubyGems
+
+# Publishes drivers/ruby as the `bzync-nextsql` gem ("gem install bzync-nextsql",
+# then `require "nextsql"`). Triggered by pushing a tag like ruby-v0.1.0 — the
+# tag version must match drivers/ruby/lib/nextsql/version.rb, or the job fails
+# before publishing. Pure standard library, so no bundle/install step.
+#
+# Requires the RUBYGEMS_API_KEY repository secret (a RubyGems API key with the
+# "Push rubygem" scope). Mirrors npm-publish-node-driver.yml.
+
+on:
+  push:
+    tags:
+      - "ruby-v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to publish from (e.g. ruby-v0.1.0), for a manual re-run"
+        required: false
+        type: string
+
+defaults:
+  run:
+    working-directory: drivers/ruby
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.3"
+
+      - name: Verify tag matches version.rb
+        run: |
+          ref="${{ inputs.tag || github.ref_name }}"
+          tag_version="${ref#ruby-v}"
+          gem_version="$(ruby -Ilib -rnextsql/version -e 'print NextSQL::VERSION')"
+          if [ "$tag_version" != "$gem_version" ]; then
+            echo "::error::Tag $ref (version $tag_version) does not match NextSQL::VERSION $gem_version"
+            exit 1
+          fi
+
+      - name: Test
+        run: ruby -Ilib -Itest test/test_protocol.rb
+
+      - name: Build and publish
+        run: |
+          gem build bzync-nextsql.gemspec
+          gem push bzync-nextsql-*.gem
+        env:
+          GEM_HOST_API_KEY: ${{ secrets.RUBYGEMS_API_KEY }}

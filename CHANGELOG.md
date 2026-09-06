@@ -22,6 +22,33 @@ A roadmap item is not recorded as completed here until its implementation, tests
 
 ## [Unreleased]
 
+### Removed
+
+- **The Deno driver (`drivers/deno`) is removed.** The official driver set is
+  now Go, Node.js, Bun, PHP, Python, and Ruby (six). The wire protocol is
+  unchanged. `drivers/js` (shared codec + types) is now used only by the Node
+  (types) and Bun (runtime + types) drivers; the Deno-only `caCerts` TLS
+  option is gone from the shared type surface.
+
+### Changed — drivers published to language registries (2026-09-07)
+
+- Official drivers are now published under MIT to their language registries and
+  versioned independently of the engine (`0.1.0`):
+  `@bzync/nextsql` (npm), `bzync/nextsql` (Composer / Packagist),
+  `bzync-nextsql` (PyPI), `bzync-nextsql` (RubyGems), and
+  `github.com/bzync/nextsql/drivers/go` (Go modules). The Bun client stays
+  repository-distributed. New tag-triggered publish workflows:
+  `gem-publish-ruby-driver.yml`, `pypi-publish-python-driver.yml`,
+  `packagist-split-php-driver.yml` (git-subtree split to a `bzync/nextsql-php`
+  mirror that Packagist watches).
+- `drivers/node/nextsql.d.ts` and `drivers/bun/nextsql.d.ts` are now
+  self-contained copies of the shared `drivers/js/types.d.ts` (with a drift
+  guard test) instead of a `from '../js/types'` re-export that would not
+  resolve for an installed npm consumer.
+- The repository `LICENSE` is MIT and now applies uniformly: `drivers/php`'s
+  `composer.json` no longer says `proprietary`, and the README no longer says
+  "the engine is proprietary".
+
 ### Security
 
 - Bump `golang.org/x/crypto` 0.55.0 → 0.56.0 (GO-2026-6354, GO-2026-6355:
@@ -31,12 +58,24 @@ A roadmap item is not recorded as completed here until its implementation, tests
   `vuln-type: library`) flag it as a fixable HIGH. Requires `go` directive
   1.25.0 → 1.26.0 (x/crypto 0.56.0's minimum).
 
+### Changed — immutable container image tags (2026-09-07)
+
+- The `bzynchub/nextsql` Docker Hub repository is set to "All tags are
+  immutable". `.github/workflows/docker-publish-image.yml` no longer publishes
+  moving tags: `latest` is disabled, and the `edge`, `{{major}}.{{minor}}`,
+  and `{{major}}` patterns are removed. A release tag `v0.x.y` now publishes
+  exactly `0.x.y`; every build still gets an `sha-<short>` tag. Both tag
+  shapes are write-once — re-cutting a release means bumping the version.
+  Consumers pin an explicit `0.x.y` or `sha-<short>`. The `:latest`, `:0.0`,
+  and `:edge` tags created by the 0.0.1 publish are stale and can be deleted
+  from Docker Hub.
+
 ## [0.0.1] — 2026-09-07
 
 First tagged release. Cut to exercise the release/publish pipeline; the engine
 is still pre-1.0 and under active development (see `TODO.md`). The container
-image publish workflow tags this as `bzynchub/nextsql:0.0.1`, `:0.0`, and
-`:latest`.
+image publish workflow tagged this `bzynchub/nextsql:0.0.1` (plus moving
+`:0.0` / `:latest` / `:edge` tags later retired — see `[Unreleased]`).
 
 ### Changed — container image runtime is scratch (2026-09-07)
 
@@ -54,10 +93,12 @@ image publish workflow tags this as `bzynchub/nextsql:0.0.1`, `:0.0`, and
 
 - `.github/workflows/docker-publish-image.yml` builds the `Dockerfile` and
   pushes multi-arch (`linux/amd64`, `linux/arm64`) images to
-  `docker.io/bzynchub/nextsql`: `edge` from `master`, semver tags from
-  `v*.*.*` release tags, and an immutable `sha-<short>` on every build.
-  Pull requests touching the image build it without pushing. Requires the
-  `DOCKERHUB_USERNAME` / `DOCKERHUB_TOKEN` repository secrets.
+  `docker.io/bzynchub/nextsql`: a semver tag from a `v*.*.*` release tag and
+  an `sha-<short>` on every build. (The initial version of this workflow also
+  pushed moving `edge` / `{{major}}.{{minor}}` / `latest` tags; retired the
+  same day — see `[Unreleased]`.) Pull requests touching the image build it
+  without pushing. Requires the `DOCKERHUB_USERNAME` / `DOCKERHUB_TOKEN`
+  repository secrets.
 - `Dockerfile` build stage now cross-compiles from `$BUILDPLATFORM` using
   `GOOS`/`GOARCH` instead of emulating the Go toolchain under QEMU for the
   non-native target, so the arm64 build no longer runs the compiler emulated.

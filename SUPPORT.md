@@ -35,8 +35,7 @@ Current supported/implemented surfaces include:
 - WORKFLOW/TRIGGER/SCHEDULE/TASK and committed CDC;
 - RANGE/HASH/LIST partitioning and follower-read routing;
 - the virtual `system` schema and workload governance;
-- seven official drivers (Go, Node.js/TypeScript, Bun, Deno, PHP, Python,
-  Ruby);
+- six official drivers (Go, Node.js/TypeScript, Bun, PHP, Python, Ruby);
 - `nextsql setup`/`nextsql lifecycle` automation;
 - the completed NextSQL Admin Operations-mode MVP;
 - the NextSQL Admin Setup-mode M1 flow.

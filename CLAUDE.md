@@ -173,7 +173,7 @@ internal/                  engine: storage, wal, recovery, txn, undo, sql (lexer
                             scheduler, cron, backup, xport, migrate, config, metrics,
                             setup (installer lifecycle CLI backbone), admin (setup/ops/
                             studio modes — see cmd/nextsql-admin), browseropen, ...
-drivers/                   official native-protocol drivers: go, node, bun, deno, php,
+drivers/                   official native-protocol drivers: go, node, bun, php,
                             python, ruby, plus shared TS types in drivers/js
 tests/                     integration, crash, ha (cross-package suites; unit tests live
                             alongside their package under internal/)

@@ -72,7 +72,7 @@
           "id": "c10",
           "kind": "added",
           "area": "Drivers",
-          "text": "Official Go, Node/Bun/Deno, and PHP drivers. Keys never go in a URL."
+          "text": "Official Go, Node/Bun, and PHP drivers. Keys never go in a URL."
         }
       ],
       "artifacts": [

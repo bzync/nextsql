@@ -34,6 +34,17 @@ function fieldKey(id, fill) {
   return { id, material: new Uint8Array(32).fill(fill) };
 }
 
+test('nextsql.d.ts type surface matches the shared drivers/js source', async () => {
+  const marker = 'export interface TLSOptions';
+  const [shared, local] = await Promise.all([
+    readFile(new URL('../js/types.d.ts', import.meta.url), 'utf8'),
+    readFile(new URL('./nextsql.d.ts', import.meta.url), 'utf8'),
+  ]);
+  expect(local.startsWith('//')).toBe(true);
+  expect(local.includes("from '../js")).toBe(false);
+  expect(local.slice(local.indexOf(marker))).toBe(shared.slice(shared.indexOf(marker)));
+});
+
 test('NSCE1 field encryption round-trip, rotation, and revocation', async () => {
   const v1 = fieldKey('v1', 1);
   const ring = new MemoryFieldKeyring(v1);

@@ -1,7 +1,7 @@
 # Client-encrypted fields
 
 Status: **experimental P25 increment**. The SQL/catalog/server path and helpers
-for Go, Node.js/TypeScript, Bun, Deno, and PHP are implemented. PITR and
+for Go, Node.js/TypeScript, Bun, and PHP are implemented. PITR and
 replication/failover are tested (exact-ciphertext restore-to-target-LSN; no
 lost acknowledged ciphertext across leader failover). Every official driver
 also ships a durable, atomic, file-backed keyring (`FileFieldKeyring`) so
@@ -103,14 +103,14 @@ plain, err := conn.DecryptField(ctx, "accounts", "ssn",
 Do not log keys or put them in a URL. The application must back up field keys
 separately from NextSQL data.
 
-## JavaScript, TypeScript, Bun, and Deno
+## JavaScript, TypeScript, and Bun
 
 The JS-family drivers expose the same async provider contract. `fieldKeys` is
 kept on the connection config and never encoded into a URL or NSQL frame.
 `MemoryFieldKeyring` is bounded and non-durable.
 
 ```ts
-import { FieldType, MemoryFieldKeyring, connect, generateFieldKey } from 'nextsql';
+import { FieldType, MemoryFieldKeyring, connect, generateFieldKey } from '@bzync/nextsql';
 
 const ring = new MemoryFieldKeyring(generateFieldKey('accounts-ssn-v1'));
 const conn = await connect({
@@ -131,7 +131,7 @@ const plain = await conn.decryptField(
 Application/KMS providers implement `currentFieldKey(database, table, column)`
 and `fieldKey(database, table, column, keyID)`, returning `{id, material}` where
 `material` is exactly 32 bytes. Both methods may return a value or a Promise.
-Node.js uses `node:crypto`; Bun and Deno use Web Crypto.
+Node.js uses `node:crypto`; Bun uses Web Crypto.
 
 ## PHP
 
@@ -159,7 +159,7 @@ $plain = $conn->decryptField(
 ```
 
 The PHP implementation uses OpenSSL AES-256-GCM. Cross-driver fixtures verify
-that Go-produced ciphertext decrypts in Node.js, Bun, Deno, and PHP, and that
+that Go-produced ciphertext decrypts in Node.js, Bun, and PHP, and that
 Node.js-produced ciphertext decrypts in Go.
 
 ## Rotation, revocation, and recovery
@@ -223,9 +223,8 @@ err = kr.Revoke("accounts-ssn-v1")
 The JavaScript-family and PHP drivers expose the same
 `create`/`open`/`rotate`/`revoke`/`reload`/`list` shape as async methods
 (`FileFieldKeyring.create(path, current)`, `FileFieldKeyring.open(path)`).
-Bun and Deno each implement the file I/O with their native file API
-(`node:fs/promises` for Bun, `Deno.readFile`/`writeFile`/`rename` for Deno)
-over the shared, I/O-free `encodeFieldKeyring`/`decodeFieldKeyring` codec in
+Bun implements the file I/O with `node:fs/promises` over the shared, I/O-free
+`encodeFieldKeyring`/`decodeFieldKeyring` codec in
 `drivers/js/client-encryption.mjs`; Node's independent copy in
 `drivers/node/client-encryption.js` uses `node:fs/promises` directly; PHP's
 `NextSQL\FileFieldKeyring` uses `pack`/`unpack` and `rename`.
@@ -257,8 +256,8 @@ in every official driver: create/reopen persistence, rotation overlap-read
 correctness, revocation zeroing material on disk and failing closed,
 revoked-id reuse rejection, corrupt-file rejection, and cross-driver format
 interop are all covered by automated tests (`drivers/go/nextsql_test.go`,
-`drivers/bun/nextsql.test.js`, `drivers/deno/nextsql_test.js`,
-`drivers/node/nextsql.test.js`, `drivers/php/tests/unit.php`). The
+`drivers/bun/nextsql.test.js`, `drivers/node/nextsql.test.js`,
+`drivers/php/tests/unit.php`). The
 phase-wide P25 exit gate (`docs/security.md` "P25 security review sign-off")
 closed the same day once password hashing and audit hardening also landed, so
 `ENCRYPTED CLIENT` is now formally production-gated — still `experimental`

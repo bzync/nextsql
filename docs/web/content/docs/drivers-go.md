@@ -97,7 +97,7 @@ and `DecryptField(ctx, table, column, logicalType, resultValue)` after a bare
 projection. `MemoryFieldKeyring` is bounded convenience storage for keys already
 loaded from a secret manager; `FileFieldKeyring` is the durable rotation/
 revocation path. The field key is never sent to `nextsqld`. Equivalent helpers
-ship in Node.js/TypeScript, Bun, Deno, and PHP (not Python or Ruby). PITR and
+ship in Node.js/TypeScript, Bun, and PHP (not Python or Ruby). PITR and
 HA/failover are tested. The capability stays **experimental** because no
 searchable or deterministic mode ships.
 

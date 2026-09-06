@@ -1,11 +1,13 @@
-// Shared TypeScript surface for official JS-family NextSQL drivers.
+// Shared TypeScript surface for the official Node.js and Bun NextSQL drivers.
 // Keys and passwords are never accepted in a URL.
+//
+// drivers/node/nextsql.d.ts and drivers/bun/nextsql.d.ts are published copies
+// of this file (npm packs only in-package files); their parity tests fail if
+// they drift from this canonical source.
 
 export interface TLSOptions {
   /** PEM or DER trust material. */
   ca?: string | Uint8Array;
-  /** Deno-style extra trust anchors. */
-  caCerts?: string[];
   /** SNI and certificate hostname (may differ from the TCP host). */
   servername?: string;
   /** Explicitly disable verification. Remote production must not set this. */

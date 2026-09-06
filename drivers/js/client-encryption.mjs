@@ -1,4 +1,4 @@
-// Portable NSCE1 client-field encryption for the Bun and Deno drivers.
+// Portable NSCE1 client-field encryption for the Bun driver.
 // Field keys remain in the caller-supplied provider and never cross NSQL.
 
 import {
@@ -822,9 +822,9 @@ export class MemoryFieldKeyring {
 }
 
 // NSFK1 is the durable field-keyring format used by FileFieldKeyring
-// (implemented per runtime in drivers/bun, drivers/deno, drivers/node since
-// each has its own native file API). This module owns the pure, I/O-free
-// codec so every runtime encodes/decodes an identical byte format:
+// (implemented per runtime in drivers/bun and drivers/node since each has its
+// own native file API). This module owns the pure, I/O-free codec so every
+// runtime encodes/decodes an identical byte format:
 //
 //   magic "NSFK" (4) | version u16=1 | count u16
 //   per record: idLen u8 | id bytes | created u64 (unix seconds) |

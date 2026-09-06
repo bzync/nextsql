@@ -219,7 +219,7 @@ function putU64(n) {
   const b = Buffer.alloc(8);
   // BigInt.asUintN wraps a negative value to its unsigned 64-bit two's-
   // complement bit pattern before writeBigUInt64LE, which otherwise throws
-  // a RangeError for anything outside [0, 2^64) (unlike the JS/Bun/Deno
+  // a RangeError for anything outside [0, 2^64) (unlike the shared JS/Bun
   // driver's DataView.setBigUint64, which already wraps automatically per
   // the ECMAScript ToBigUint64 abstract operation). Found and fixed while
   // implementing D6 (INTERVAL's nanosecond component is legitimately
@@ -871,7 +871,7 @@ function encodeFloat64(n) {
 // expansion track): months(i32 LE) + days(i32 LE) + nanos(i64 LE) — a
 // plain string still works as an INTERVAL param for INSERT/UPDATE column
 // assignment (server-side Coerce) but not inside an arithmetic expression
-// like `dur + $1`, which requires the actual wire Kind (see the JS/Bun/Deno
+// like `dur + $1`, which requires the actual wire Kind (see the shared JS/Bun
 // driver's encodeInterval for the full explanation).
 function encodeInterval(months, days, nanos) {
   const mbuf = Buffer.alloc(4);

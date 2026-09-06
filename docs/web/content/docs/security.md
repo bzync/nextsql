@@ -27,7 +27,7 @@ off the data volume. `nextsql setup --profile production` and `nextsqld
 --production` fail closed if an unlock key sits inside the data directory.
 Connections select a hosted realm and database; see [Hosting](/docs/hosting).
 
-Online DEK rotation, key-version revocation (kills sessions), and crypto-shred of the keystore are in the production surface. Field-level `ENCRYPTED CLIENT` columns stay **experimental** because no searchable or deterministic mode ships — a deliberate scope decision. The randomized `NSCE1.` server/catalog path, helpers in Go, Node.js/TypeScript, Bun, Deno, and PHP, PITR, HA/failover, and durable `FileFieldKeyring` rotation/revocation are implemented and tested. Python and Ruby drivers do not yet expose field-encryption helpers. The server stores only opaque ciphertext and rejects predicates, indexes, and search on these fields.
+Online DEK rotation, key-version revocation (kills sessions), and crypto-shred of the keystore are in the production surface. Field-level `ENCRYPTED CLIENT` columns stay **experimental** because no searchable or deterministic mode ships — a deliberate scope decision. The randomized `NSCE1.` server/catalog path, helpers in Go, Node.js/TypeScript, Bun, and PHP, PITR, HA/failover, and durable `FileFieldKeyring` rotation/revocation are implemented and tested. Python and Ruby drivers do not yet expose field-encryption helpers. The server stores only opaque ciphertext and rejects predicates, indexes, and search on these fields.
 
 ## Bootstrap
 

@@ -22,7 +22,7 @@
     "url": "git+https://github.com/bzync/nextsql.git",
     "directory": "drivers/node"
   },
-  "homepage": "https://nextsql.dev/docs/drivers",
+  "homepage": "https://nextsql.bzync.com/docs/drivers",
   "bugs": {
     "url": "https://github.com/bzync/nextsql/issues"
   },

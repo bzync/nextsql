@@ -311,13 +311,12 @@ function Architecture() {
 
 function Drivers() {
   const rows = [
-    { runtime: "Go", path: "drivers/go", open: "nextsql.Open(nextsql.Config{…})" },
-    { runtime: "Node.js 18+", path: "drivers/node", open: "connect({ address, user, password, tls })" },
-    { runtime: "Bun", path: "drivers/bun", open: "same shape as Node" },
-    { runtime: "Deno", path: "drivers/deno", open: 'import { connect } from "./mod.ts"' },
-    { runtime: "PHP 8.1+", path: "drivers/php", open: "NextSQL\\Client::connect([…])" },
-    { runtime: "Python 3.10+", path: "drivers/python", open: "nextsql.connect(nextsql.Config(…))" },
-    { runtime: "Ruby 3.0+", path: "drivers/ruby", open: "NextSQL.connect(NextSQL::Config.new(…))" },
+    { runtime: "Go", path: "go get …/drivers/go", open: "nextsql.Open(nextsql.Config{…})" },
+    { runtime: "Node.js 18+", path: "npm i @bzync/nextsql", open: "connect({ address, user, password, tls })" },
+    { runtime: "Bun", path: "drivers/bun (repo)", open: "same shape as Node" },
+    { runtime: "PHP 8.1+", path: "composer require bzync/nextsql", open: "NextSQL\\Client::connect([…])" },
+    { runtime: "Python 3.10+", path: "pip install bzync-nextsql", open: "nextsql.connect(nextsql.Config(…))" },
+    { runtime: "Ruby 3.0+", path: "gem install bzync-nextsql", open: "NextSQL.connect(NextSQL::Config.new(…))" },
   ];
   return (
     <section className="border-b border-line">
@@ -343,7 +342,7 @@ function Drivers() {
             <TableHeader>
               <tr>
                 <TableHead>Runtime</TableHead>
-                <TableHead>Path</TableHead>
+                <TableHead>Install</TableHead>
                 <TableHead>Open</TableHead>
               </tr>
             </TableHeader>

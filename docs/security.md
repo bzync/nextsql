@@ -151,7 +151,7 @@ CREATE TABLE accounts (
 deterministic wrap, if ever offered, is searchable encryption and leaks
 equality. That leakage will be documented on the statement that introduces it.
 The randomized `NSCE1.` AES-256-GCM envelope, SQL/catalog/server path, and Go,
-Node.js/TypeScript, Bun, Deno, and PHP driver helpers are implemented. The
+Node.js/TypeScript, Bun, and PHP driver helpers are implemented. The
 server permits opaque storage and bare projection but rejects predicates,
 expressions, indexes, search, grouping, and ordering. PITR and replication/
 failover are now tested (exact-ciphertext restore-to-target-LSN; no lost
@@ -612,10 +612,10 @@ introspection, and JIT principal provisioning — all remain off by default.
 | External auth remains behind RBAC | yes | yes | yes | yes — every server enforces `ACL.AllowedScoped`; embedded mode also checks the live native user and direct/transitive ACL membership before minting, with empty intersection denial and immediate revocation behavior (`TestExchangeRBACIntersection`, `TestEmbeddedAuthBrokerUsesLiveNativeMembership`) |
 | IdP group/role mapping | yes | yes | yes | yes — `NSIP` literal + RE2 `${n}` group→role mappings, 16-role cap, empty ⇒ deny, consumed by the broker; `TestIdentityPolicyGroupRegexCapture`, `TestIdentityPolicyRoleCapDenies`, `TestExchangeRejections` (unmapped groups/subject ⇒ deny) |
 | `ENCRYPTED CLIENT` | yes | yes | yes | yes — every item-level blocker, including durable key rotation/revocation, is closed; see `docs/client-encryption.md` "Production-gating sign-off (Phase 25)" — `NSCT` v11; parser/catalog/binder/executor tests |
-| Official-driver field encryption | yes | yes | yes | yes — Go, Node.js/TypeScript, Bun, Deno, and PHP provider/keyring/encrypt/decrypt helpers; Go↔non-Go portability fixtures |
+| Official-driver field encryption | yes | yes | yes | yes — Go, Node.js/TypeScript, Bun, and PHP provider/keyring/encrypt/decrypt helpers; Go↔non-Go portability fixtures |
 | Server-opaque client fields | yes | yes | yes | yes — server structurally validates/stores `NSCE1.` but has no field key; encrypted restart/plaintext-scan test |
 | Searchable-encryption leakage contract | yes | no search mode | yes | yes — randomized envelope; predicates/index/search/order/group/distinct/set operations fail closed; leakage documented |
-| Field-key rotation | yes | yes | yes | yes — `FileFieldKeyring` (Go/Node/Bun/Deno/PHP): atomic, versioned, 0600 `NSFK1` file; overlap reads after rotation persist across restart; cross-driver format interop |
+| Field-key rotation | yes | yes | yes | yes — `FileFieldKeyring` (Go/Node/Bun/PHP): atomic, versioned, 0600 `NSFK1` file; overlap reads after rotation persist across restart; cross-driver format interop |
 | Field-key revocation | yes | yes | yes | yes — revoked material zeroed on disk, revoked ids fail closed and can never be reused, current key cannot be revoked directly |
 | Field wrong-key/tamper behavior | yes | yes | yes | yes — GCM/context/type/revocation tests + `FuzzInspect` |
 | Field backup/restore/PITR | yes | yes | yes | yes — `TestEncryptedClientPITRRestoresExactCiphertextAtTarget`: base backup + archived WAL restored to a target LSN before a later `UPDATE` retains `TEXT ENCRYPTED CLIENT`, returns the exact pre-target ciphertext, excludes the later write, decrypts only via the client helper |

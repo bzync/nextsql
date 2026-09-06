@@ -288,7 +288,7 @@ The native protocol carries two additive messages for routing:
 
 Every official driver ships a routing client over the cluster members —
 `nextsql.Cluster` (`OpenCluster` with `Config.Nodes`) in Go, `connectCluster`
-in the Node / Bun / Deno drivers (`cfg.nodes`, `cfg.readConsistency`,
+in the Node / Bun drivers (`cfg.nodes`, `cfg.readConsistency`,
 `cfg.maxStalenessMs`), and `NextSQL\Cluster::connect` in PHP
 (`readConsistency` / `maxStalenessMs` config keys). With the read-consistency
 mode set to `Bounded` or `Stale` it sends eligible read-only statements to a
@@ -411,7 +411,7 @@ records never contain passwords, keys, tokens, or secrets.
 - Not “guaranteed zero downtime”.
 - Not a multi-primary write mesh.
 - Follower-read routing ships in every official driver (Go, Node.js, Bun,
-  Deno, PHP, Python, and Ruby): the wire messages, `BOUNDED` mode, and
+  PHP, Python, and Ruby): the wire messages, `BOUNDED` mode, and
   per-driver cluster clients are
   implemented. The read-scaling benchmark is published above
   (`nextsql-bench --readscale`), and the Phase 22 exit gate is closed — see

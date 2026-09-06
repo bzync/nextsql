@@ -18,10 +18,11 @@
 #     conn.close
 #   end
 #
-# Not published as a gem — require it from this tree directly
-# (+drivers/ruby/lib+ on +$LOAD_PATH+), matching every other official
-# driver.
+# Published to RubyGems as +bzync-nextsql+ (+gem install bzync-nextsql+, then
+# +require "nextsql"+). Zero runtime dependencies. It can also be required
+# straight from this tree with +drivers/ruby/lib+ on +$LOAD_PATH+.
 
+require_relative "nextsql/version"
 require_relative "nextsql/errors"
 require_relative "nextsql/protocol"
 require_relative "nextsql/client"

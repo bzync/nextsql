@@ -320,21 +320,14 @@ MAINTAIN TABLE products;
 
 Official drivers speak the native NSQL protocol. **Keys and passwords never go in a URL.** TLS 1.3 is required off loopback.
 
-| Runtime | Path | Open |
-
-|---|---|---|
-
-| Go | [`drivers/go`](drivers/go) | `nextsql.Open(nextsql.Config{…})` |
-
-| Node.js 18+ | [`drivers/node`](drivers/node) | `connect({ address, user, password, tls })` |
-
-| Bun | [`drivers/bun`](drivers/bun) | same shape as Node |
-
-| Deno | [`drivers/deno`](drivers/deno) | `import { connect } from "./mod.ts"` |
-
-| PHP 8.1+ | [`drivers/php`](drivers/php) | `NextSQL\Client::connect([…])` |
-| Python 3.10+ | [`drivers/python`](drivers/python) | `nextsql.connect(nextsql.Config(…))` |
-| Ruby 3.0+ | [`drivers/ruby`](drivers/ruby) | `NextSQL.connect(NextSQL::Config.new(…))` |
+| Runtime | Package | Path | Open |
+|---|---|---|---|
+| Go | `github.com/bzync/nextsql/drivers/go` | [`drivers/go`](drivers/go) | `nextsql.Open(nextsql.Config{…})` |
+| Node.js 18+ | `@bzync/nextsql` (npm) | [`drivers/node`](drivers/node) | `connect({ address, user, password, tls })` |
+| Bun | repo tree | [`drivers/bun`](drivers/bun) | same shape as Node |
+| PHP 8.1+ | `bzync/nextsql` (Composer) | [`drivers/php`](drivers/php) | `NextSQL\Client::connect([…])` |
+| Python 3.10+ | `bzync-nextsql` (PyPI) | [`drivers/python`](drivers/python) | `nextsql.connect(nextsql.Config(…))` |
+| Ruby 3.0+ | `bzync-nextsql` (RubyGems) | [`drivers/ruby`](drivers/ruby) | `NextSQL.connect(NextSQL::Config.new(…))` |
 
 Shared TypeScript types live in [`drivers/js`](drivers/js).
 
@@ -419,8 +412,8 @@ Also in the production surface:
 - Online DEK rotation, key-version revocation (kills sessions), crypto-shred of the keystore
 
 - Production-gated `ENCRYPTED CLIENT` core: randomized server-opaque `NSCE1.`
-  fields with helpers and durable `FileFieldKeyring` lifecycle in the five
-  drivers in P25 scope (Go, Node.js/TypeScript, Bun, Deno, PHP), plus tested
+  fields with helpers and durable `FileFieldKeyring` lifecycle in the four
+  drivers in P25 scope (Go, Node.js/TypeScript, Bun, PHP), plus tested
   PITR and HA/failover. It remains capability-labeled `experimental` because
   no searchable/deterministic mode ships; Python/Ruby helpers remain open
 
@@ -629,7 +622,7 @@ cmd/nextsql-admin     NextSQL Admin — one binary, Setup/Operations/Studio mode
 
 internal/             engine (storage, WAL, MVCC, SQL, crypto, HA, …)
 
-drivers/              Go, Node, Bun, Deno, PHP, Python, Ruby + shared JS codec/types
+drivers/              Go, Node, Bun, PHP, Python, Ruby + shared JS codec/types
 
 tests/                integration, crash, HA
 
@@ -808,6 +801,10 @@ Treat NextSQL as an engine under measurement, not a drop-in production replaceme
 
 ## License
 
-The engine is proprietary. The Node.js package is `@bzync/nextsql` and is
-published/configured as a public MIT-licensed package; the other driver trees
-remain repository-distributed unless their package metadata says otherwise.
+MIT ([`LICENSE`](LICENSE)) — engine, CLI, server, and every official driver.
+
+The drivers are also published to their language registries under MIT:
+`@bzync/nextsql` (npm), `bzync/nextsql` (Composer / Packagist),
+`bzync-nextsql` (PyPI), `bzync-nextsql` (RubyGems), and
+`github.com/bzync/nextsql/drivers/go` (Go modules). The Bun client is
+repository-distributed.

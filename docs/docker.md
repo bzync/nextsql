@@ -14,16 +14,19 @@ cannot run `sh`.
 ## Prebuilt image
 
 Multi-arch images (`linux/amd64`, `linux/arm64`) are published to Docker Hub by
-the `Publish container image` workflow:
+the `Publish container image` workflow. Every tag is **write-once** — the
+repository is configured "All tags are immutable", so there is no moving
+`latest`, `edge`, or `0.0` pointer. Pin an explicit version:
 
 ```bash
-docker pull bzynchub/nextsql:0.0.1     # a released version
-docker pull bzynchub/nextsql:edge      # latest master build
+docker pull bzynchub/nextsql:0.0.1        # a released version
+docker pull bzynchub/nextsql:sha-0a1cc8e  # a specific build (master or release)
 ```
 
-Every build is also tagged `sha-<short>` for an immutable reference. The
-Compose files below build the image locally (`build: .`); to run a published
-image instead, replace `build: .` with `image: bzynchub/nextsql:0.0.1`.
+Each release publishes one `0.x.y` tag; every build (master pushes included)
+also gets an `sha-<short>` tag. The Compose files below build the image locally
+(`build: .`); to run a published image instead, replace `build: .` with
+`image: bzynchub/nextsql:0.0.1`.
 
 ## Building locally
 

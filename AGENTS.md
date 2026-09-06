@@ -119,8 +119,8 @@ audience + client binding, and non-interactive renewal. Embedded single-node
 mode is implemented on a separate bounded listener with issuer/verifier checks
 and a live native-user/ACL membership feed. Optional opaque introspection and
 JIT remain off. Field-level client encryption has an experimental
-SQL/catalog/server slice, helpers in the five drivers in P25 scope
-(Go/Node.js/TypeScript/Bun/Deno/PHP), tested PITR + HA/failover, and durable
+SQL/catalog/server slice, helpers in the four drivers in P25 scope
+(Go/Node.js/TypeScript/Bun/PHP), tested PITR + HA/failover, and durable
 `FileFieldKeyring` rotation/revocation. The Python and Ruby drivers added later
 do not yet expose field-encryption helpers. Password hashing has migrated
 to Argon2id (versioned records, PBKDF2 backward compatibility, transparent

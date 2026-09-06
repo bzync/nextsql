@@ -1,0 +1,67 @@
+name: Publish Python driver to PyPI
+
+# Publishes drivers/python as `bzync-nextsql` ("pip install bzync-nextsql", then
+# `import nextsql`). Triggered by pushing a tag like python-v0.1.0 — the tag
+# version must match nextsql.__version__, or the job fails before publishing.
+# Pure standard library, no runtime dependencies.
+#
+# Uses PyPI Trusted Publishing (OIDC) — configure a trusted publisher on PyPI
+# for project "bzync-nextsql" with workflow "pypi-publish-python-driver.yml"
+# and environment "pypi". No API token secret needed.
+
+on:
+  push:
+    tags:
+      - "python-v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to publish from (e.g. python-v0.1.0), for a manual re-run"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write # PyPI Trusted Publishing
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Verify tag matches nextsql.__version__
+        working-directory: drivers/python
+        run: |
+          ref="${{ inputs.tag || github.ref_name }}"
+          tag_version="${ref#python-v}"
+          pkg_version="$(python -c 'import nextsql; print(nextsql.__version__)')"
+          if [ "$tag_version" != "$pkg_version" ]; then
+            echo "::error::Tag $ref (version $tag_version) does not match nextsql.__version__ $pkg_version"
+            exit 1
+          fi
+
+      - name: Test
+        working-directory: drivers/python
+        run: python tests/test_protocol.py
+
+      - name: Build
+        working-directory: drivers/python
+        run: |
+          python -m pip install --upgrade build
+          python -m build
+
+      - name: Publish
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: drivers/python/dist

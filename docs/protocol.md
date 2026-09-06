@@ -11,7 +11,7 @@ version bump (a scalar value's header is byte-identical to before). A
 plain-string / native-list / wrapper param for a collection column is
 re-coerced server-side against the destination column type.
 
-Versioned NextSQL framing spoken by `nextsqld` and the official drivers (`drivers/go`, `drivers/node`, `drivers/bun`, `drivers/deno`, `drivers/php`, `drivers/python`, `drivers/ruby`). Node, Bun, and Deno ship TypeScript types (`drivers/js/types.d.ts`). Local SQL execution is unchanged (`docs/sql.md`). This document is the on-the-wire contract.
+Versioned NextSQL framing spoken by `nextsqld` and the official drivers (`drivers/go`, `drivers/node`, `drivers/bun`, `drivers/php`, `drivers/python`, `drivers/ruby`). Node and Bun ship TypeScript types (`drivers/js/types.d.ts`). Local SQL execution is unchanged (`docs/sql.md`). This document is the on-the-wire contract.
 
 ISO/IEC 9075-3:2023 SQL/CLI and ISO/IEC 9579:2000 RDA are conceptual design
 references. NextSQL does not expose those interfaces directly: NSQL remains the
@@ -67,22 +67,10 @@ const conn = await connect({
 });
 ```
 
-```js
-// Deno (drivers/deno)
-const conn = await connect({
-  address: "db.example.com:7210",
-  database: "production",
-  user: "app",
-  password: Deno.env.get("NEXTSQL_DATABASE_PASS"),
-  key: clientRoot, // 32-byte Uint8Array when the server requires a client key
-  tls: { ca: pem, servername: "db.example.com" },
-});
-```
-
 ```ts
-// TypeScript (Node, Bun, Deno)
-import { connect, type Config } from "nextsql"; // Bun/Node
-// import { connect, type Config } from "./mod.ts"; // Deno
+// TypeScript (Node, Bun)
+import { connect, type Config } from "@bzync/nextsql"; // Node (npm)
+// import { connect, type Config } from "./nextsql.js"; // Bun (repo-distributed)
 
 const cfg: Config = {
   address: "db.example.com:7210",

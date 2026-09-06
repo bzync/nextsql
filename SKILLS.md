@@ -146,7 +146,7 @@ landed — see `docs/system-catalog.md`.
 
 P25 landed mTLS/service identity, signed short-lived credentials, the
 external-IdP broker, field-level client encryption (all official drivers as
-of P25 — Go/Node/Bun/Deno/PHP; Python and Ruby, added later, do not yet
+of P25 — Go/Node/Bun/PHP; Python and Ruby, added later, do not yet
 implement it — PITR, HA/failover, and durable `FileFieldKeyring` key
 rotation/revocation), Argon2id password hashing, and audit-chain hardening —
 all production-gated.
@@ -372,7 +372,6 @@ Current official driver surface includes:
 - Go
 - Node.js
 - Bun
-- Deno
 - TypeScript types
 - PHP
 - Python
@@ -878,7 +877,7 @@ scope; `NSTK` rotatable keyset; `NSTR` fail-closed revocation; `SIGHUP` reload;
 The `NSIP` policy, standalone/embedded broker, interactive `nextsql login` /
 `logout` / `whoami` PKCE client, JWT client-credentials path, live embedded
 ACL feed, key-derived OIDC server audit labeling, field-level client
-encryption (core plus Go/Node.js/TypeScript/Bun/Deno/PHP helpers, PITR, and
+encryption (core plus Go/Node.js/TypeScript/Bun/PHP helpers, PITR, and
 HA/failover), stronger password hashing (Argon2id migration, transparent
 rehash, DoS benchmarks), and audit hardening (hash-chained + optionally
 Ed25519-signed `nextsql.audit`, `nextsql audit` verification tooling) are all

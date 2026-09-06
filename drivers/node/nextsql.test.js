@@ -38,6 +38,21 @@ function fieldKey(id, fill) {
   return { id, material: Buffer.alloc(32, fill) };
 }
 
+test('nextsql.d.ts type surface matches the shared drivers/js source', async () => {
+  const marker = 'export interface TLSOptions';
+  const [shared, local] = await Promise.all([
+    fs.readFile(path.join(__dirname, '..', 'js', 'types.d.ts'), 'utf8'),
+    fs.readFile(path.join(__dirname, 'nextsql.d.ts'), 'utf8'),
+  ]);
+  assert.ok(local.startsWith('//'), 'published copy keeps its own header');
+  assert.ok(!local.includes("from '../js"), 'published copy must not import from ../js');
+  assert.equal(
+    local.slice(local.indexOf(marker)),
+    shared.slice(shared.indexOf(marker)),
+    'drivers/node/nextsql.d.ts is out of sync with drivers/js/types.d.ts',
+  );
+});
+
 test('NSCE1 field encryption round-trip, rotation, and revocation', async () => {
   const v1 = fieldKey('v1', 1);
   const ring = new MemoryFieldKeyring(v1);
@@ -370,7 +385,7 @@ test('INTERVAL param round-trip, including negative nanos (D6)', () => {
   // (used for INTERVAL's nanosecond component, which is legitimately
   // negative, e.g. "-1 hour") called Buffer.writeBigUInt64LE directly on a
   // possibly-negative BigInt, which throws a RangeError instead of wrapping
-  // to the unsigned two's-complement bit pattern — unlike the JS/Bun/Deno
+  // to the unsigned two's-complement bit pattern — unlike the shared JS/Bun
   // driver's DataView.setBigUint64, which already wraps automatically. This
   // silently affected every pre-1970 TIMESTAMPTZ/TIMESTAMP too, since they
   // share the same helper; nothing in this suite exercised a negative value

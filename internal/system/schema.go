@@ -500,7 +500,7 @@ func Capabilities() [][]types.Value {
 		rowCap("covering_indexes", "supported", "INCLUDE covering indexes", "0.1.0"),
 		rowCap("distinct", "supported", "SELECT DISTINCT", "0.1.0"),
 		rowCap("encryption", "supported", "AES-256-GCM envelope", "0.1.0"),
-		rowCap("field_encryption_client", "experimental", "server-opaque randomized ENCRYPTED CLIENT fields; Go, Node.js/TypeScript, Bun, Deno, and PHP helpers", version.String),
+		rowCap("field_encryption_client", "experimental", "server-opaque randomized ENCRYPTED CLIENT fields; Go, Node.js/TypeScript, Bun, and PHP helpers", version.String),
 		rowCap("expression_indexes", "supported", "expression indexes", "0.1.0"),
 		rowCap("foreign_keys", "supported", "FOREIGN KEY constraints", "0.1.0"),
 		rowCap("fulltext", "supported", "full-text SEARCH with simple and language analyzers, prefix/fuzzy/typo matching, HIGHLIGHT/SNIPPET, multi-field indexes, per-field WEIGHT, and FACET histograms", "0.1.0"),

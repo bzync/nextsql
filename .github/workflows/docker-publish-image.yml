@@ -2,10 +2,14 @@ name: Publish container image
 
 # Builds the Dockerfile and pushes it to Docker Hub as docker.io/bzynchub/nextsql.
 # Pull requests that touch the image build it (amd64 only, for fast feedback)
-# but do not push. Pushes to master publish a moving `edge` tag; pushing a
-# release tag like v0.0.1 publishes the matching semver tags (0.0.1, 0.0, and
-# — once past 0.x — the major) plus `latest`. Every build also gets an
-# immutable `sha-<short>` tag.
+# but do not push. Pushing a release tag like v0.0.1 publishes exactly one
+# version tag (`0.0.1`). Every build (master pushes included) also gets an
+# `sha-<short>` tag.
+#
+# Every published tag is write-once: no moving `latest`/`edge`/`0.0` pointers.
+# The Docker Hub repository is configured "All tags are immutable", so a second
+# push to an existing tag is rejected — re-cutting a release means bumping the
+# version. Consumers pin an explicit `0.x.y` (or `sha-<short>`) tag.
 #
 # Images are multi-arch (linux/amd64, linux/arm64). The arm64 leg builds
 # under QEMU emulation, so it is slower than the native amd64 leg.
@@ -73,11 +77,13 @@ jobs:
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
           images: ${{ env.IMAGE }}
+          # The Docker Hub repo is "All tags are immutable" — only write-once
+          # tags. No moving pointers: no `latest` (flavor disables it), no
+          # `edge`, no `{{major}}.{{minor}}`/`{{major}}` rollups.
+          flavor: |
+            latest=false
           tags: |
-            type=edge,branch=master
             type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}},enable=${{ !startsWith(github.ref, 'refs/tags/v0.') }}
             type=sha,prefix=sha-,format=short
           labels: |
             org.opencontainers.image.title=NextSQL

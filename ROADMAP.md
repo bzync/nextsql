@@ -382,7 +382,7 @@ Also production-gated:
   issuer/verifier compatibility checks and a live native-user/ACL membership
   feed. Optional opaque-token introspection and JIT provisioning remain off;
 - field-level client encryption — experimental SQL/catalog/server slice plus
-  portable randomized `NSCE1.` helpers for Go, Node.js/TypeScript, Bun, Deno,
+  portable randomized `NSCE1.` helpers for Go, Node.js/TypeScript, Bun,
   and PHP, PITR (exact-ciphertext restore-to-target-LSN), replication/failover
   (no lost acknowledged ciphertext across a three-voter leader failover), and
   durable key-rotation/revocation (`FileFieldKeyring` in every official

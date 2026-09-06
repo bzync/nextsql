@@ -1,0 +1,61 @@
+name: Publish PHP driver to Packagist
+
+# Packagist resolves a package from a repository's root composer.json, but the
+# PHP driver lives in a subdirectory of this monorepo. This workflow splits
+# drivers/php/ into the standalone read-only mirror repo bzync/nextsql-php on
+# every php-v*.*.* tag; Packagist watches that mirror and picks up the new tag.
+#
+# The tag version must match drivers/php/composer.json (a "version" key is not
+# required there — Packagist derives it from the git tag on the mirror — so the
+# check below only guards the composer.json name).
+#
+# One-time setup:
+#   1. Create an empty github.com/bzync/nextsql-php repository.
+#   2. Submit https://github.com/bzync/nextsql-php to https://packagist.org
+#      once (it then auto-updates via the GitHub webhook Packagist installs).
+#   3. Add a PHP_SPLIT_TOKEN repository secret: a fine-grained PAT with
+#      Contents: read/write on bzync/nextsql-php.
+
+on:
+  push:
+    tags:
+      - "php-v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to split from (e.g. php-v0.1.0), for a manual re-run"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  split:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (full history — subtree split needs it)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      - name: Validate composer.json
+        run: |
+          php -r 'exit(json_decode(file_get_contents("drivers/php/composer.json"))->name === "bzync/nextsql" ? 0 : 1);' \
+            || { echo "::error::drivers/php/composer.json name must be bzync/nextsql"; exit 1; }
+
+      - name: Split drivers/php and push to the mirror
+        env:
+          SPLIT_TOKEN: ${{ secrets.PHP_SPLIT_TOKEN }}
+        run: |
+          set -euo pipefail
+          ref="${{ inputs.tag || github.ref_name }}"
+          version="${ref#php-v}"
+          git config user.name "nextsql-release"
+          git config user.email "release@bzync.com"
+          split_sha="$(git subtree split --prefix=drivers/php HEAD)"
+          git push "https://x-access-token:${SPLIT_TOKEN}@github.com/bzync/nextsql-php.git" \
+            "${split_sha}:refs/heads/master" --force
+          git push "https://x-access-token:${SPLIT_TOKEN}@github.com/bzync/nextsql-php.git" \
+            "${split_sha}:refs/tags/v${version}"

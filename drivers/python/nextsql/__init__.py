@@ -16,9 +16,12 @@
     finally:
         conn.close()
 
-Not published as a package — import it from this tree directly
-(``drivers/python`` on ``sys.path``), matching every other official driver.
+Published to PyPI as ``bzync-nextsql`` (``pip install bzync-nextsql``, then
+``import nextsql``). Zero runtime dependencies. It can also be imported straight
+from this tree with ``drivers/python`` on ``sys.path``.
 """
+
+__version__ = "0.1.0"
 
 from .client import (
     Config,

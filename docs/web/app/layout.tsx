@@ -26,7 +26,7 @@ export const viewport: Viewport = {
 };
 
 export const metadata: Metadata = {
-  metadataBase: new URL("https://nextsql.dev"),
+  metadataBase: new URL("https://nextsql.bzync.com"),
   applicationName: site.name,
   title: {
     default: `${site.name} — ${site.tagline}`,

@@ -94,7 +94,7 @@ The root still exists in RAM for the life of the unlocked process. That is not a
 Drivers:
 
 - Go: `Config.KeyProvider` (a `crypto.KeyProvider` that returns the root DEK).
-- Node / Bun / Deno: `key: <32-byte Buffer | Uint8Array>`.
+- Node / Bun: `key: <32-byte Buffer | Uint8Array>`.
 - PHP: `'key' => $clientRoot` (32-byte string).
 - Python: `key=` 32-byte `bytes`.
 - Ruby: `key:` 32-byte binary `String`.

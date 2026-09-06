@@ -80,10 +80,11 @@ Keep the root unlock key **off** the data volume in production. A production ins
 
 ## Docker
 
-Multi-arch images (`linux/amd64`, `linux/arm64`) are on Docker Hub:
+Multi-arch images (`linux/amd64`, `linux/arm64`) are on Docker Hub. Every tag is
+immutable — pin an explicit version, there is no `latest` or `edge`:
 
 ```bash
-docker pull bzynchub/nextsql:edge
+docker pull bzynchub/nextsql:0.0.1
 ```
 
 See [Docker](/docs/docker).
@@ -149,17 +150,17 @@ containers and source control.
 
 ## Drivers
 
-Official drivers ship with the engine. They are not a separate download.
+Official drivers are also in the repo tree under `drivers/` and are versioned
+independently of the engine.
 
-| Runtime | Import |
+| Runtime | Install |
 |---|---|
-| Go | `github.com/bzync/nextsql/drivers/go` |
-| Node.js 18+ | `drivers/node` (`@bzync/nextsql`) |
-| Bun | `drivers/bun` |
-| Deno | `drivers/deno` |
-| PHP 8.1+ | `drivers/php` |
-| Python 3.10+ | `drivers/python` |
-| Ruby 3.0+ | `drivers/ruby` |
+| Go | `go get github.com/bzync/nextsql/drivers/go` |
+| Node.js 18+ | `npm i @bzync/nextsql` |
+| Bun | `drivers/bun` (repo tree) |
+| PHP 8.1+ | `composer require bzync/nextsql` |
+| Python 3.10+ | `pip install bzync-nextsql` |
+| Ruby 3.0+ | `gem install bzync-nextsql` |
 
 See [Drivers](/docs/drivers).
 

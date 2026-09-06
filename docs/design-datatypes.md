@@ -56,8 +56,8 @@ Every new type below must state, before code starts: on-disk layout,
 index-key ordering (this is a clustered B+Tree engine — every orderable type
 needs a canonical total order, e.g. NaN/-0 handling for floats), CAST/coercion
 rules, and `ENCRYPTED CLIENT` eligibility (today an explicit allow-list:
-UUID/STRING/TEXT/DECIMAL/TIMESTAMPTZ/JSON/BOOL). Every new type is also 7x
-driver surface (Go/JS/Node/Bun/Deno/PHP/Python/Ruby).
+UUID/STRING/TEXT/DECIMAL/TIMESTAMPTZ/JSON/BOOL). Every new type is also
+driver surface across Go/JS(shared)/Node/Bun/PHP/Python/Ruby.
 
 ## 3. Sequenced plan
 

@@ -1,11 +1,22 @@
-# Node, Bun, and Deno
+# Node and Bun
 
-Shared TypeScript types live in [`drivers/js/types.d.ts`](https://github.com/bzync/nextsql/blob/main/drivers/js/types.d.ts). The Node and Bun clients have the same shape.
+The Node and Bun clients have the same shape and share the codec in
+[`drivers/js`](https://github.com/bzync/nextsql/tree/master/drivers/js).
+
+The Node client is published to npm as [`@bzync/nextsql`](https://www.npmjs.com/package/@bzync/nextsql)
+— MIT, zero runtime dependencies, TypeScript types bundled:
+
+```bash
+npm i @bzync/nextsql
+```
+
+The Bun client is repository-distributed — import it from `drivers/bun/` in the
+tree.
 
 ## Node.js / Bun
 
 ```js
-const { connect } = require("./drivers/node/nextsql"); // Bun: drivers/bun/nextsql.js
+const { connect } = require("@bzync/nextsql"); // Bun: import from ./drivers/bun/nextsql.js
 
 const conn = await connect({
   address: "127.0.0.1:7210",
@@ -27,22 +38,7 @@ await stmt.close();
 await conn.close();
 ```
 
-TypeScript: `import { connect, type Config } from "./drivers/node/nextsql"`.
-
-## Deno
-
-```ts
-import { connect } from "./drivers/deno/mod.ts";
-
-const conn = await connect({
-  address: "127.0.0.1:7210",
-  user: "app",
-  password: Deno.env.get("NEXTSQL_DATABASE_PASS"),
-  insecureNoTLS: true,
-});
-const res = await conn.exec("SELECT 1");
-await conn.close();
-```
+TypeScript: `import { connect, type Config } from "@bzync/nextsql"`.
 
 ## Typed parameters
 

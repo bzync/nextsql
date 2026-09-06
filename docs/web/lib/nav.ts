@@ -174,7 +174,7 @@ export const docsNav: NavGroup[] = [
         description: "nextsql.Open, Exec, Query, Prepare, and KeyProvider.",
       },
       {
-        title: "Node, Bun, Deno",
+        title: "Node, Bun",
         slug: "drivers-js",
         description: "connect(), typed parameters, and TypeScript types.",
       },

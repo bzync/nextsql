@@ -2,17 +2,16 @@
 
 Official drivers speak the native **NSQL v1** protocol. **Do not put keys or passwords in a URL.** TLS 1.3 is required off loopback.
 
-| Runtime | Path | Open |
+| Runtime | Install | Open |
 |---|---|---|
-| Go | [`drivers/go`](https://github.com/bzync/nextsql/tree/main/drivers/go) | `nextsql.Open(nextsql.Config{…})` |
-| Node.js 18+ | [`drivers/node`](https://github.com/bzync/nextsql/tree/main/drivers/node) | `connect({ address, user, password, tls })` |
-| Bun | [`drivers/bun`](https://github.com/bzync/nextsql/tree/main/drivers/bun) | same shape as Node |
-| Deno | [`drivers/deno`](https://github.com/bzync/nextsql/tree/main/drivers/deno) | `import { connect } from "./mod.ts"` |
-| PHP 8.1+ | [`drivers/php`](https://github.com/bzync/nextsql/tree/main/drivers/php) | `NextSQL\Client::connect([…])` |
-| Python 3.10+ | [`drivers/python`](https://github.com/bzync/nextsql/tree/main/drivers/python) | `nextsql.connect(nextsql.Config(…))` |
-| Ruby 3.0+ | [`drivers/ruby`](https://github.com/bzync/nextsql/tree/main/drivers/ruby) | `NextSQL.connect(NextSQL::Config.new(…))` |
+| Go | `go get github.com/bzync/nextsql/drivers/go` | `nextsql.Open(nextsql.Config{…})` |
+| Node.js 18+ | `npm i @bzync/nextsql` | `connect({ address, user, password, tls })` |
+| Bun | [`drivers/bun`](https://github.com/bzync/nextsql/tree/master/drivers/bun) (repo tree) | same shape as Node |
+| PHP 8.1+ | `composer require bzync/nextsql` | `NextSQL\Client::connect([…])` |
+| Python 3.10+ | `pip install bzync-nextsql` | `nextsql.connect(nextsql.Config(…))` |
+| Ruby 3.0+ | `gem install bzync-nextsql` | `NextSQL.connect(NextSQL::Config.new(…))` |
 
-Shared TypeScript types: [`drivers/js/types.d.ts`](https://github.com/bzync/nextsql/blob/main/drivers/js/types.d.ts).
+Shared TypeScript types: [`drivers/js/types.d.ts`](https://github.com/bzync/nextsql/blob/master/drivers/js/types.d.ts) (bundled into `@bzync/nextsql`).
 
 ## Common API
 
@@ -26,12 +25,12 @@ Every official driver also ships a cluster client (`OpenCluster` / `connectClust
 
 `realm` / `database` on the connect config select the hosted target on Hello. An empty database name selects the registered default. See [Hosting](/docs/hosting).
 
-All seven drivers encode the scalar type expansion (`BLOB`, integers, floats, `DATE`/`TIME`/`TIMESTAMP`/`INTERVAL`, `CHAR`/`VARCHAR`, `ENUM`) and collections (`STRUCT`/`ARRAY`/`MAP`). Field-encryption helpers exist in Go/JS/PHP only.
+All six drivers encode the scalar type expansion (`BLOB`, integers, floats, `DATE`/`TIME`/`TIMESTAMP`/`INTERVAL`, `CHAR`/`VARCHAR`, `ENUM`) and collections (`STRUCT`/`ARRAY`/`MAP`). Field-encryption helpers exist in Go/Node/Bun/PHP only.
 
 ## Language guides
 
 - [Go](/docs/drivers-go)
-- [Node, Bun, Deno](/docs/drivers-js)
+- [Node, Bun](/docs/drivers-js)
 - [PHP](/docs/drivers-php)
 - [Python](/docs/drivers-python)
 - [Ruby](/docs/drivers-ruby)

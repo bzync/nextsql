@@ -47,7 +47,7 @@ cmd/nextsql-bench         official benchmark tool
 cmd/nextsql-auth-broker   OIDC broker
 cmd/nextsql-admin         Setup / Operations / Studio
 internal/                 engine (storage, WAL, MVCC, SQL, crypto, HA, hosting, …)
-drivers/                  Go, Node, Bun, Deno, PHP, Python, Ruby + shared JS codec
+drivers/                  Go, Node, Bun, PHP, Python, Ruby + shared JS codec
 tests/                    integration, crash, HA
 docs/                     format and operations notes
 ```

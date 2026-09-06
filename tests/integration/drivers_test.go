@@ -119,59 +119,12 @@ func TestBunDriverLiveTLS(t *testing.T) {
 	}
 }
 
-func TestDenoDriverUnit(t *testing.T) {
-	deno, err := exec.LookPath("deno")
-	if err != nil {
-		t.Skip("deno not installed")
-	}
-	cmd := exec.Command(deno, "test", "--allow-net", "--allow-read", "--allow-write", "nextsql_test.js")
-	cmd.Dir = filepath.Join(repoRoot(t), "drivers", "deno")
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("deno unit: %v\n%s", err, out)
-	}
-}
-
-func TestDenoDriverLiveTLS(t *testing.T) {
-	deno, err := exec.LookPath("deno")
-	if err != nil {
-		t.Skip("deno not installed")
-	}
-	addr, _ := startTLSServer(t)
-	caPath := writeClientCA(t, addr)
-	cmd := exec.Command(deno, "run", "--allow-net", "--allow-env", "--allow-read", "live.ts")
-	cmd.Dir = filepath.Join(repoRoot(t), "drivers", "deno")
-	cmd.Env = append(os.Environ(),
-		"NEXTSQL_ADDR="+addr,
-		"NEXTSQL_CA="+caPath,
-		"NEXTSQL_DATABASE_USER=app",
-		"NEXTSQL_DATABASE_PASS=s3cret",
-	)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("deno live: %v\n%s", err, out)
-	}
-}
-
 func TestTypeScriptCheck(t *testing.T) {
 	root := repoRoot(t)
-	if deno, err := exec.LookPath("deno"); err == nil {
-		cmd := exec.Command(deno, "check", "mod.ts", "usage.ts", "live.ts")
-		cmd.Dir = filepath.Join(root, "drivers", "deno")
-		out, err := cmd.CombinedOutput()
-		if err != nil {
-			t.Fatalf("deno check: %v\n%s", err, out)
-		}
-	} else {
-		t.Log("deno not installed; skip deno check")
-	}
 
 	tsc := lookupTSC(t, root)
 	if tsc == nil {
-		if _, err := exec.LookPath("deno"); err != nil {
-			t.Skip("tsc and deno not installed")
-		}
-		return
+		t.Skip("tsc not installed")
 	}
 	for _, dir := range []string{
 		filepath.Join(root, "drivers", "node"),

@@ -1,8 +1,8 @@
 package version
 
 const (
-	// String is the development version of this increment.
-	String = "0.1.0-dev"
+	// String is the released version of this increment.
+	String = "0.0.1"
 
 	// Phase is the highest completed implementation phase (P28 in progress).
 	Phase = 27

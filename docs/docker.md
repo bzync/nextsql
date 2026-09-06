@@ -1,9 +1,15 @@
 # Docker installation
 
-The image runs `nextsqld` as the unprivileged `nextsql` user. Database files
-are persisted in `/var/lib/nextsql`; the root unlock key is persisted in the
-separate `/run/secrets` volume and is never placed in the database volume.
-Pages, WAL, and UNDO remain encrypted by default.
+The image runs `nextsqld` as the unprivileged `nextsql` user (uid 10001).
+Database files are persisted in `/var/lib/nextsql`; the root unlock key is
+persisted in the separate `/run/secrets` volume and is never placed in the
+database volume. Pages, WAL, and UNDO remain encrypted by default.
+
+The published image is a static Go runtime (`FROM scratch`): `nextsql`,
+`nextsqld`, and a small PID-1 wrapper (`nextsql-entrypoint`). There is no
+shell, package manager, or libc userland. `docker exec`/`podman exec` can
+still run `/usr/local/bin/nextsql` (see "Verifying the cluster" below); they
+cannot run `sh`.
 
 ## Prebuilt image
 
@@ -11,13 +17,13 @@ Multi-arch images (`linux/amd64`, `linux/arm64`) are published to Docker Hub by
 the `Publish container image` workflow:
 
 ```bash
-docker pull bzynchub/nextsql:0.1.0     # a released version
+docker pull bzynchub/nextsql:0.0.1     # a released version
 docker pull bzynchub/nextsql:edge      # latest master build
 ```
 
 Every build is also tagged `sha-<short>` for an immutable reference. The
 Compose files below build the image locally (`build: .`); to run a published
-image instead, replace `build: .` with `image: bzynchub/nextsql:0.1.0`.
+image instead, replace `build: .` with `image: bzynchub/nextsql:0.0.1`.
 
 ## Building locally
 
@@ -121,9 +127,9 @@ identity, so only one node may ever run `init`:
    failure, so every peer's Raft transport must already be reachable when
    that attempt fires.
 
-All of this is driven by `docker/entrypoint.sh` from environment variables —
-`NEXTSQL_SEED_TO` / `NEXTSQL_SEED_FROM` (the seed handoff),
-`NEXTSQL_NODE_ID` / `NEXTSQL_RAFT_BIND` / `NEXTSQL_RAFT_JOIN` /
+All of this is driven by `nextsql-entrypoint` (`internal/dockerentry`) from
+environment variables — `NEXTSQL_SEED_TO` / `NEXTSQL_SEED_FROM` (the seed
+handoff), `NEXTSQL_NODE_ID` / `NEXTSQL_RAFT_BIND` / `NEXTSQL_RAFT_JOIN` /
 `NEXTSQL_RAFT_BOOTSTRAP` (passed straight through to the matching `nextsqld`
 flags in `docs/ha.md` "Operations"), and `NEXTSQL_JOIN_WAIT` (the bootstrap
 node's pre-flight peer check, step 4 above). None of this fires unless those

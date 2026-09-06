@@ -2,7 +2,7 @@
 
 All notable changes to **NextSQL** are documented in this file.
 
-NextSQL is currently under active development as `0.1.0-dev`.
+NextSQL's first tagged release is `0.0.1`; development continues toward `0.1.0`.
 
 This changelog follows the project source-of-truth model:
 
@@ -21,6 +21,25 @@ A roadmap item is not recorded as completed here until its implementation, tests
 ---
 
 ## [Unreleased]
+
+## [0.0.1] — 2026-09-07
+
+First tagged release. Cut to exercise the release/publish pipeline; the engine
+is still pre-1.0 and under active development (see `TODO.md`). The container
+image publish workflow tags this as `bzynchub/nextsql:0.0.1`, `:0.0`, and
+`:latest`.
+
+### Changed — container image runtime is scratch (2026-09-07)
+
+- The published `bzynchub/nextsql` image no longer ships Debian bookworm
+  userland (`apt`, `glibc`, `openssl`, `pam`, `util-linux`, …). `nextsql`
+  and `nextsqld` are already static (`CGO_ENABLED=0`); Docker Hub Scout
+  was scoring unused OS packages (3 Critical / 13 High on
+  `sha-0a1cc8e` / `edge`). Runtime is now `FROM scratch` plus the CA
+  bundle, uid 10001, and a small Go PID-1 (`cmd/nextsql-entrypoint`,
+  `internal/dockerentry`) that preserves the Compose HA seed/join-wait
+  behaviour of the former `docker/entrypoint.sh`. There is no shell in
+  the image; `docker exec … nextsql` still works.
 
 ### Added — Docker Hub image publishing (2026-09-07)
 

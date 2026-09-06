@@ -188,7 +188,7 @@ name requires an explicit compatibility decision.
 
 ## Docker entrypoint variables
 
-The checked-in Docker entrypoint additionally accepts these wrapper settings:
+The container PID-1 (`nextsql-entrypoint`) additionally accepts these wrapper settings:
 
 | Variable | Meaning |
 |---|---|

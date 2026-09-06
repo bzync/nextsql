@@ -1,13 +1,17 @@
-.git
-.agents
-.codex
-.bench-results
-.bench-tmp
-docs/web/node_modules
-docs/web/.next
-data
-*.db
-*key
-*pw
-secrets
-tmp
+# Allow-list: exclude everything, then re-include only what the image build
+# needs (the nextsql / nextsqld / nextsql-entrypoint binaries compile from Go
+# source). Keeps the build context small and keeps secrets / local state out
+# of every layer and the build cache.
+*
+
+# Go module graph + the sources the binaries compile from.
+!go.mod
+!go.sum
+!cmd/
+!internal/
+!drivers/
+
+# Re-exclude noise inside the re-included trees.
+**/node_modules/
+**/*_test.go
+internal/admin/frontend/

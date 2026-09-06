@@ -1,6 +1,6 @@
 # Docker
 
-The image runs `nextsqld` as the unprivileged `nextsql` user. Database files persist in `/var/lib/nextsql`. The root unlock key lives on a **separate** `/run/secrets` volume and is never placed in the database volume. Pages, WAL, and UNDO stay encrypted by default. Compose is the supported container path; a first-class OCI non-interactive installer path is not implemented.
+The image runs `nextsqld` as the unprivileged `nextsql` user (uid 10001). Database files persist in `/var/lib/nextsql`. The root unlock key lives on a **separate** `/run/secrets` volume and is never placed in the database volume. Pages, WAL, and UNDO stay encrypted by default. The image is a static Go runtime (`FROM scratch`) with no shell; `docker exec` can still run `/usr/local/bin/nextsql`. Compose is the supported container path; a first-class OCI non-interactive installer path is not implemented.
 
 ## Single node
 

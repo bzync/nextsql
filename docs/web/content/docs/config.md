@@ -4,6 +4,7 @@
 nextsqld --data-dir DIR --key-file FILE [--instance-key-file FILE]
          [--listen 127.0.0.1:7210] [--config FILE]
          [--env-file PATH | --no-env]
+         [--production]
          [--tls-cert FILE --tls-key FILE [--tls-client-ca FILE [--tls-client-crl FILE]]]
          [--auth-broker-listen ADDR [--auth-broker-config FILE]]
          [--require-client-key]
@@ -33,6 +34,7 @@ Simple `key=value`. Comments start with `#`. Unknown keys are rejected. Command-
 data_dir=/var/lib/nextsql
 key_file=/etc/nextsql/root.key
 instance_key_file=/etc/nextsql/root.key.instance
+deployment_profile=developer
 listen_addr=127.0.0.1:7210
 log_level=info
 buffer_pages=1024
@@ -78,6 +80,14 @@ raft_join=
 raft_bootstrap=false
 ```
 
+`deployment_profile=production` is the durable live-server switch written by
+`nextsql setup --profile production`. `nextsqld --production` forces the same
+profile at start. Either path fail-closes if the unlock key sits on the data
+volume or if disk-watermark / drain / statement / idle timeouts are unset.
+The CLI setup default remains `developer`. Experimental capabilities
+(`field_encryption_client`, `hosting_isolation`) are not implied by the
+profile. See [Install](/docs/install).
+
 ## Admission and budgets
 
 Every `Exec` takes an in-flight slot. If all slots are busy, the query queues. If the queue is full or the wait exceeds `query_queue_wait_ms`, the server returns `unavailable` instead of growing without bound.
@@ -86,9 +96,9 @@ Defaults: 32 in-flight, 128 queued, 5 s wait.
 
 Per-query budgets (defaults): 64 MiB memory, 256 MiB spill, 1 GiB I/O, 30 s, 1 000 000 result rows / 64 MiB result bytes. Exceeding a budget fails with `exhausted`. Worker goroutines are bounded (`min(GOMAXPROCS, 8)` per query through a process pool).
 
-Wire defaults: 1 MiB packet, 1 MiB SQL, 256 parameters, 64 prepared statements per session, 128 concurrent sessions, 60 s idle. `max_connections` and `idle_timeout_ms` override the 128-session cap and 60 s idle deadline; `max_connections_per_user` (0 = unlimited) additionally caps concurrent authenticated connections held by one user name — an over-limit connection is rejected after authentication with `exhausted`, before a session is created. `max_connections_per_database`/`max_connections_per_realm` (both 0 = unlimited; P27's own last exit-gate item) work the same way, keyed on the resolved `(realm, database)` pair or realm name instead of the user name — a database's own counter and its realm's counter are independent, so exhausting one database's limit never blocks a connection to a different database in the same realm, while every database in a realm shares that realm's counter. All five are process-wide and node-local (not synchronized across a cluster).
+Wire defaults: 1 MiB packet, 1 MiB SQL, 256 parameters, 64 prepared statements per session, 128 concurrent sessions, 60 s idle. `max_connections` and `idle_timeout_ms` override the 128-session cap and 60 s idle deadline; `max_connections_per_user` (0 = unlimited) additionally caps concurrent authenticated connections held by one user name — an over-limit connection is rejected after authentication with `exhausted`, before a session is created. `max_connections_per_database`/`max_connections_per_realm` (both 0 = unlimited) work the same way, keyed on the resolved `(realm, database)` pair or realm name instead of the user name — a database's own counter and its realm's counter are independent, so exhausting one database's limit never blocks a connection to a different database in the same realm, while every database in a realm shares that realm's counter. All five are process-wide and node-local (not synchronized across a cluster).
 
-`max_open_databases` (default 8) bounds how many distinct databases this process will ever have open at once when hosting more than the primary one (multi-database hosting; see `docs/design-multidatabase-dbaas.md`) — an idle database is evicted (its buffer pool and file handles closed) to make room for a newly requested one, never rejected outright while under this limit. `max_total_buffer_pages` (default 0 = unbounded) is a second, independent gate on the same multi-database scenario: each open database's buffer pool commits `buffer_pages` frames in full at open (there is no dynamic per-page grant to shrink later), so with more than one database open at once the *count* limit above says nothing about total memory. When set, every database this process opens — the primary and every secondary — reserves against this one shared ceiling; an open that would exceed it fails `exhausted` rather than growing process memory without bound, and a database's reservation is released the moment it closes (including M2-3b-1 idle eviction), making room for another. Must be 0 or `>= buffer_pages`, since otherwise even the primary database could never open. A single-database deployment (no hosting registry) is unaffected by default.
+`max_open_databases` (default 8) bounds how many distinct databases this process will ever have open at once when hosting more than the primary one (multi-database hosting; see `docs/design-multidatabase-dbaas.md`) — an idle database is evicted (its buffer pool and file handles closed) to make room for a newly requested one, never rejected outright while under this limit. `max_total_buffer_pages` (default 0 = unbounded) is a second, independent gate on the same multi-database scenario: each open database's buffer pool commits `buffer_pages` frames in full at open (there is no dynamic per-page grant to shrink later), so with more than one database open at once the *count* limit above says nothing about total memory. When set, every database this process opens — the primary and every secondary — reserves against this one shared ceiling; an open that would exceed it fails `exhausted` rather than growing process memory without bound, and a database's reservation is released the moment it closes (including idle eviction), making room for another. Must be 0 or `>= buffer_pages`, since otherwise even the primary database could never open. A single-database deployment (no hosting registry) is unaffected by default.
 
 `task_workers` (default 0 = the same built-in default every individual database used before centralizing) sizes one shared worker pool that every open database's scheduled-task execution (`RUN WORKFLOW` fired by a `SCHEDULE`, or a queued `TASK`) submits claimed work to. Each database still polls its own due tasks on its own schedule independently; only the goroutines that actually execute claimed work are shared, so task-execution goroutine count no longer scales with the number of open databases the way it used to (each database spawning its own separate worker set).
 

@@ -45,13 +45,13 @@ export function SiteHeader({
 
   return (
     <>
-    <header className="portal-topbar sticky top-0 z-50 border-b border-black/[0.07] pt-[env(safe-area-inset-top)] dark:border-white/[0.06]">
+    <header className="portal-topbar sticky top-0 z-50 border-b pt-[env(safe-area-inset-top)]">
       <div className="mx-auto flex h-14 max-w-6xl items-center justify-between gap-2 px-4 sm:gap-6 sm:px-5">
         <div className="flex min-w-0 items-center gap-1.5">
           <button
             type="button"
             onClick={openMenu}
-            className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-lg text-slate-600 transition-colors hover:bg-black/5 hover:text-slate-900 dark:text-slate-400 dark:hover:bg-white/6 dark:hover:text-white lg:hidden"
+            className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-md text-muted transition-colors hover:bg-bg-hover hover:text-foreground lg:hidden"
             aria-label="Open menu"
             aria-expanded={menuOpen}
           >
@@ -74,7 +74,7 @@ export function SiteHeader({
               <button
                 type="button"
                 onClick={onSearch}
-                className="inline-flex h-10 w-10 items-center justify-center rounded-lg text-slate-600 transition-colors hover:bg-black/5 hover:text-slate-900 dark:text-slate-400 dark:hover:bg-white/6 dark:hover:text-white sm:hidden"
+                className="inline-flex h-10 w-10 items-center justify-center rounded-md text-muted transition-colors hover:bg-bg-hover hover:text-foreground md:hidden"
                 aria-label="Search documentation"
               >
                 <SearchIcon />
@@ -82,9 +82,9 @@ export function SiteHeader({
               <button
                 type="button"
                 onClick={onSearch}
-                className="ml-1 hidden h-8 items-center gap-2 rounded-lg border border-slate-300/80 bg-white px-2.5 text-[12px] text-slate-600 transition-all hover:border-slate-400/80 hover:text-slate-900 dark:border-white/[0.09] dark:bg-white/[0.045] dark:text-slate-400 dark:hover:border-white/[0.16] dark:hover:text-slate-200 sm:inline-flex"
+                className="ml-1 hidden h-8 w-[12.5rem] items-center gap-2 rounded-md border border-line bg-bg-elev px-2.5 text-[12.5px] text-muted transition-colors hover:border-line-strong hover:text-foreground md:inline-flex"
               >
-                Search
+                <span className="flex-1 text-left">Search docs</span>
                 <Kbd keys="/" />
               </button>
             </>
@@ -100,12 +100,12 @@ export function SiteHeader({
     </header>
     {showOverlay ? (
       <div className="fixed inset-0 z-[60] bg-bg pt-[env(safe-area-inset-top)] lg:hidden">
-        <div className="flex h-14 items-center justify-between border-b border-black/[0.07] px-4 dark:border-white/[0.06]">
+        <div className="flex h-14 items-center justify-between border-b border-line px-4">
           <Logo />
           <button
             type="button"
             onClick={() => setOpen(false)}
-            className="inline-flex h-10 w-10 items-center justify-center rounded-lg text-slate-500 hover:bg-black/5 hover:text-slate-900 dark:hover:bg-white/6 dark:hover:text-white"
+            className="inline-flex h-10 w-10 items-center justify-center rounded-md text-muted hover:bg-bg-hover hover:text-foreground"
             aria-label="Close menu"
           >
             <CloseIcon />
@@ -123,7 +123,7 @@ export function SiteHeader({
               key={href}
               href={href}
               onClick={() => setOpen(false)}
-              className="flex min-h-11 items-center rounded-lg px-3 text-[15px] text-slate-700 hover:bg-black/6 hover:text-slate-900 dark:text-slate-300 dark:hover:bg-white/6 dark:hover:text-white"
+              className="flex min-h-11 items-center rounded-md px-3 text-[15px] text-muted hover:bg-bg-hover hover:text-foreground"
             >
               {label}
             </Link>
@@ -147,8 +147,8 @@ function NavLink({
   external?: boolean;
 }) {
   const className = active
-    ? "flex h-8 items-center rounded-lg px-3 text-sm font-medium bg-black/[0.06] text-slate-900 dark:bg-white/[0.08] dark:text-white"
-    : "flex h-8 items-center rounded-lg px-3 text-sm font-medium text-slate-600 transition-colors hover:bg-black/5 hover:text-slate-900 dark:text-slate-400 dark:hover:bg-white/5 dark:hover:text-white";
+    ? "flex h-8 items-center rounded-md px-3 text-sm font-medium text-foreground"
+    : "flex h-8 items-center rounded-md px-3 text-sm font-medium text-muted transition-colors hover:bg-bg-hover hover:text-foreground";
   if (external) {
     return (
       <a href={href} className={className} target="_blank" rel="noreferrer">

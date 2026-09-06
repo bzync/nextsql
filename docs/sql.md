@@ -307,7 +307,7 @@ sharing one priority, so there is nothing to reorder there. There is still
 no visibility into which resource group a live session is assigned to
 (`system.sessions` has no `resource_group` column). See the Phase 27
 "Resource groups" checklist in `TODO.md`. `system.capabilities` row
-`resource_groups` stays `experimental`.
+`resource_groups` is `supported`.
 
 ## Catalog
 

@@ -42,10 +42,18 @@ DELETE FROM scan LIMIT 8192;
 
 ## Physical partitioning
 
-Bounded single-column `RANGE`, `HASH`, and `LIST` partitioning routes rows to
-local encrypted heaps and exposes pruning in `EXPLAIN`. Non-unique B+Tree,
-covering, partial, expression, JSON-path, and spatial indexes have one physical
-root per partition.
+`RANGE`, `HASH`, and `LIST` partitioning routes rows to local encrypted heaps
+and exposes pruning in `EXPLAIN`. Keys may span one to eight columns (RANGE
+tuple bounds `VALUES LESS THAN (a, b, …)`; LIST tuple membership
+`VALUES IN ((a, b), …)`; HASH SHA-256 over the canonical tuple). This is local
+physical partitioning, not distributed sharding, and never replaces realm or
+RBAC isolation.
+
+Non-unique B+Tree-family, covering, partial, expression, JSON-path, and spatial
+indexes have one physical root per partition. Plain-column secondary `UNIQUE`,
+FULLTEXT, and HNSW/`VECTOR` indexes are partition-local too. `NEAREST` merges
+every partition-local graph by distance and is pruning-aware for a partition-key
+residual predicate.
 
 ```sql
 CREATE TABLE events (
@@ -67,16 +75,22 @@ ALTER TABLE events DETACH PARTITION archived;
 `ATTACH` consumes an existing unpartitioned table named by the partition after
 streaming typed validation of its matching schema, indexes, and rows; no roots
 or rows are copied. `DETACH` publishes that owned member as an unpartitioned
-table of the same name. Both are atomic WAL/catalog ownership transfers. HASH
-membership changes, secondary `UNIQUE`, FULLTEXT, and HNSW partition indexes
-remain rejected. See the repository's `docs/partitioning.md` for exact DDL,
-RBAC, recovery, and lifecycle limits.
+table of the same name. Both are atomic WAL/catalog ownership transfers.
+
+`UPSERT` on RANGE/HASH/LIST tables hits the partition-local roots. Partial,
+expression, and JSON-path `UNIQUE`, partitioned-table foreign keys, and
+IVF / IVF-PQ / `SPARSE` on partitioned tables remain rejected.
+`PARTITION BY TENANT` is rejected; migrate leftover tenants with
+`nextsql hosting migrate-tenant`.
 
 `ANALYZE events` records exact stable-partition row counts plus bounded local
 column/index/vector sketches. Pruned plans use local costing only when every
 selected partition has a matching versioned sketch; otherwise they fall back
 to the global table distribution. Local samples cap at 4,096 rows and each
 encrypted catalog record caps at 64 entries per sketch class and 15 KiB total.
+
+See the repository's [`docs/partitioning.md`](https://github.com/bzync/nextsql/blob/main/docs/partitioning.md)
+for exact DDL, RBAC, recovery, and lifecycle limits.
 
 ## Foreign keys
 

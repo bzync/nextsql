@@ -53,8 +53,7 @@ Security-sensitive areas include:
 - TLS;
 - Raft/replication authentication;
 - audit integrity;
-- NextSQL Admin authorization (Setup/Operations/Studio modes);
-- Intelligence/RAG data access.
+- NextSQL Admin authorization (Setup/Operations/Studio modes).
 
 ---
 
@@ -103,20 +102,6 @@ Protocol implementations must validate:
 - result bounds;
 - cancellation state;
 - authentication state.
-
----
-
-## AI / Intelligence Security
-
-NextSQL Intelligence must treat retrieved rows, documents, comments, and external content as data, not trusted instructions.
-
-AI must not:
-
-- broaden permissions;
-- bypass tenant policy;
-- expose secrets;
-- execute destructive operations automatically;
-- override parser/binder/optimizer/RBAC/server validation.
 
 ---
 

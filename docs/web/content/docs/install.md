@@ -2,11 +2,11 @@
 
 Install the NextSQL **binaries**, then initialize a data directory.
 
-Published versioned builds, checksums, and a feature comparison are on [Downloads](/download).
+Published versioned builds, checksums, and a feature comparison are on [Downloads](/download). For a container, see [Docker](/docs/docker). For the GUI, see [Admin](/docs/admin).
 
 ## Packages
 
-Build Linux (`.deb`, `.tar.gz`, `.run`) and Windows (`.zip`, `setup.exe`) installers from a checkout:
+Build Linux (`.deb`, `.rpm`, `.tar.gz`, `.run`) and Windows (`.zip`, `setup.exe`) installers from a checkout:
 
 ```bash
 ./scripts/build-installers.sh
@@ -16,20 +16,31 @@ Build Linux (`.deb`, `.tar.gz`, `.run`) and Windows (`.zip`, `setup.exe`) instal
 |---|---|---|
 | Linux | `dist/nextsql_*_amd64.deb` | `sudo dpkg -i dist/nextsql_*_amd64.deb` |
 | Linux | `dist/nextsql-*-linux-amd64.run` | `sudo ./dist/nextsql-*-linux-amd64.run` |
-| Windows | `dist/nextsql-*-windows-amd64-setup.exe` | Run as Administrator (`/S` for silent) |
+| Windows | `dist/nextsql-*-windows-amd64-setup.exe` | Built; execution unverified |
 
-The packages copy `nextsql`, `nextsqld`, and `nextsql-bench` plus a default config. They do **not** create a data directory, write a root unlock key, or start the server. After install:
+The Linux packages copy `nextsql`, `nextsqld`, `nextsql-bench`, and `nextsql-admin` plus a default config. They do **not** create a data directory, write a root unlock key, or start the server. After install:
 
 ```bash
 printf 'secret\n' > /tmp/nextsql.pw && chmod 600 /tmp/nextsql.pw
-nextsql init --data-dir /var/lib/nextsql --key-file /etc/nextsql/root.key \
-  --user app --password-file /tmp/nextsql.pw
+nextsql setup --data-dir /var/lib/nextsql --key-file /etc/nextsql/root.key \
+  --profile production --preset balanced --user app --password-file /tmp/nextsql.pw
 sudo systemctl enable --now nextsql
 ```
 
-Windows defaults: binaries in `%ProgramFiles%\NextSQL`, data in `%ProgramData%\NextSQL\data`, key in `%ProgramData%\NextSQL\keys\root.key`. Start with `Start-Service NextSQL` after `nextsql init`.
+`nextsql setup` writes a validated `nextsql.conf`, initializes the encrypted store, and verifies the result. `nextsql init` remains the lower-level equivalent if you want to write the config yourself.
 
-Keep the root unlock key **off** the data volume in production. Details: [`packaging/README.md`](https://github.com/bzync/nextsql/blob/main/packaging/README.md).
+`--profile` is independent of `--preset` (buffer-pool sizing):
+
+| Profile | Default | Use |
+|---|---|---|
+| `developer` | CLI | local / loopback. `--skip-init` and a missing administrator are allowed. |
+| `production` | Setup-mode GUI | a live deployment. Fail-closed preflight plus operational defaults. |
+
+`production` writes `deployment_profile=production` and fills zero-valued disk-watermark, replica-lag, drain, statement/idle/lock timeout, and connection-limit fields. `nextsqld --production` forces the same profile at start even if the file still says `developer`. The preflight refuses an unlock key on the data volume, `--skip-init`, a mutating install without an administrator, and missing watermark / drain / statement / idle timeouts. tmpfs/ramfs is a warning (CI and some containers report it for `/tmp`).
+
+Linux `.tar.gz` / `.run` / `.deb` / `.rpm` and silent/offline/upgrade/repair paths are live-verified. Windows `setup.exe` is produced by the installer scripts; execution is **unverified** (no Windows host in this project). macOS packages are not a supported path. Recovery-key export/verification is not implemented.
+
+Keep the root unlock key **off** the data volume in production. A production install with `--key-file` inside `--data-dir` fails closed. Details: [`packaging/README.md`](https://github.com/bzync/nextsql/blob/main/packaging/README.md).
 
 ## Install with Go
 
@@ -39,46 +50,50 @@ Requires **Go 1.22+** so `go install` can fetch and compile the engine onto your
 go install github.com/bzync/nextsql/cmd/nextsql@latest
 go install github.com/bzync/nextsql/cmd/nextsqld@latest
 go install github.com/bzync/nextsql/cmd/nextsql-bench@latest
+go install github.com/bzync/nextsql/cmd/nextsql-auth-broker@latest
+go install github.com/bzync/nextsql/cmd/nextsql-admin@latest
 ```
 
 Confirm:
 
 ```bash
 nextsql version
-# nextsql 0.1.0-dev (phase 15)
+# nextsql 0.1.0-dev
 ```
 
-`nextsql` is the CLI. `nextsqld` is the server. `nextsql-bench` is optional (official measurements with encryption, WAL, and fsync on).
+`nextsql` is the CLI. `nextsqld` is the server. `nextsql-bench` is optional (official measurements with encryption, WAL, and fsync on). `nextsql-auth-broker` is the optional OIDC broker. `nextsql-admin` is the loopback Admin UI.
 
 Go puts binaries in `$(go env GOPATH)/bin` (often `~/go/bin`). Put that directory on your `PATH`.
 
 ## What you will create next
 
-A data directory is **not** a single file. After `nextsql init` and the first server start you typically have:
+A data directory is **not** a single file. After `nextsql init` / `nextsql setup` and the first server start you typically have:
 
 ```text
 DATA-DIR/
   nextsql.lock          advisory deployment/offline-migration lock
-  nextsql.instance      encrypted deployment/default realm/database registry
+  nextsql.conf          generated by nextsql setup (optional)
+  nextsql.instance      encrypted deployment/realm/database registry
   nextsql.instance.keys wrapped registry keys — never the registry root
   nextsql.db            encrypted pages (16 KiB logical)
   nextsql.db.keys       wrapped DEKs only — never the root unlock key
   nextsql.db.wal/       encrypted WAL control + segments
   nextsql.db.undo/      encrypted UNDO log
-  nextsql.users         password hashes (PBKDF2-HMAC-SHA256)
+  nextsql.users         versioned password hashes (Argon2id; legacy PBKDF2 readable)
   nextsql.acl           roles and grants
-  nextsql.audit         JSON-lines audit log (mode 0600)
+  nextsql.audit         JSON-lines audit log with an NSAC hash chain (mode 0600)
   raft/                 present only when Raft HA is enabled
 ```
 
 The database **root unlock key** is a separate `--key-file` (`NSKY`, mode
 `0600`). Initialization also creates a deployment registry root at
 `--instance-key-file` (default `KEY-FILE.instance`). Keep both **off** the data
-volume. The registry foundation currently verifies one default database; it is
-not yet selectable multi-database hosting.
+volume. One `nextsqld` can route connections to more than one registered
+database; see [Hosting](/docs/hosting).
 
 Automated installs may place the corresponding file paths and logical names in
-a protected mode-`0600` host env file and run `nextsql init --env-file PATH`:
+a protected mode-`0600` host env file and run `nextsql init --env-file PATH` or
+`nextsql setup`:
 `NEXTSQL_DATA_DIR`, `NEXTSQL_KEY_FILE`, `NEXTSQL_INSTANCE_KEY_FILE`,
 `NEXTSQL_REALM_NAME`, `NEXTSQL_DATABASE`, `NEXTSQL_SERVER_USER`, and
 `NEXTSQL_SERVER_PASSWORD_FILE` (preferred) or `NEXTSQL_SERVER_PASS`. These are
@@ -93,10 +108,12 @@ Official drivers ship with the engine. They are not a separate download.
 | Runtime | Import |
 |---|---|
 | Go | `github.com/bzync/nextsql/drivers/go` |
-| Node.js 18+ | `drivers/node` in the NextSQL tree |
+| Node.js 18+ | `drivers/node` (`@bzync/nextsql`) |
 | Bun | `drivers/bun` |
 | Deno | `drivers/deno` |
 | PHP 8.1+ | `drivers/php` |
+| Python 3.10+ | `drivers/python` |
+| Ruby 3.0+ | `drivers/ruby` |
 
 See [Drivers](/docs/drivers).
 
@@ -107,9 +124,11 @@ If you are changing the engine itself:
 ```bash
 git clone https://github.com/bzync/nextsql.git
 cd nextsql
-go build -o nextsql       ./cmd/nextsql
-go build -o nextsqld      ./cmd/nextsqld
-go build -o nextsql-bench ./cmd/nextsql-bench
+go build -o nextsql             ./cmd/nextsql
+go build -o nextsqld            ./cmd/nextsqld
+go build -o nextsql-bench       ./cmd/nextsql-bench
+go build -o nextsql-auth-broker ./cmd/nextsql-auth-broker
+go build -o nextsql-admin       ./cmd/nextsql-admin
 ```
 
 ```bash

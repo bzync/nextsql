@@ -1,6 +1,6 @@
 # Logical export and import
 
-Export is a **logical** snapshot (schema + committed rows). It is not a page-level backup and it is not PITR. Vector payloads are inlined; indexes are recreated on import.
+Export is a **logical** snapshot (schema + committed rows). It is not a page-level backup and it is not PITR. Vector payloads are inlined; indexes are recreated on import. Independently addressed export/import of a named hosted database is not implemented; these commands open the data directory you pass. See [Hosting](/docs/hosting).
 
 ```bash
 ./nextsql export \

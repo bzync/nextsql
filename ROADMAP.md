@@ -25,10 +25,9 @@ P24      complete — Full-text Search 2.0; compatibility, adversarial bounds, q
 P25      complete — Security 2.0; mTLS, short-lived credentials, external IdP broker, field-level client encryption, password-hash evolution, and audit-chain hardening all production-gated; exit gate closed 2026-09-02
 P26      complete — System catalog / introspection 2.0; virtual system schema, live session/security-administration tables, SHOW aliases, and an authoritative capability registry all production-gated; exit gate closed 2026-09-02
 P27      complete — lifecycle/drain, session controls, resource groups, operational CLI, rolling-upgrade, and connection-governance gate closed 2026-09-03
-P28      in progress — Setup/Operations largely complete; remaining recovery-key and Windows/macOS items are capability/environment blocked
+P28      in progress — Setup/Operations largely complete; production/developer deployment profile and fail-closed preflight landed; remaining recovery-key and Windows/macOS items are capability/environment blocked
 P29      in progress — M1 workspace + M2 streaming/virtualization + M3 bounded result tools/native inspectors + all five dedicated native explorers (JSON, Full-text, Vector, Hybrid, Geo) + Users/Roles, live Transaction/Lock, verified Audit, bounded per-tab plan comparison, and ANALYZE-only profiler implemented; MVP gate open
-P30      deferred to the next version — not in scope for the current release
-Hosting   partial — selectable bounded multi-realm/multi-database routing (M2) complete; M3 suspend/resume and drop landed; independent backup/PITR/key/HA lifecycle remains open
+Hosting   partial — selectable bounded multi-realm/multi-database routing (M2) complete; M3 suspend/resume, rename, and drop landed; independent backup/PITR/key/HA lifecycle remains open
 ```
 
 Cross-cutting baseline work also includes rich bounded operations over the
@@ -43,8 +42,9 @@ bootstrap, realm-scoped auth, storage caps, and bounded per-connection routing
 through `internal/dbmanager`. Idle secondary databases evict, open failures are
 quarantined, buffer memory is budgeted process-wide, and task execution/polling
 uses shared bounded infrastructure. Suspend/resume and offline managed-database
-drop are implemented. Rename, database-addressed backup/PITR/import/export,
-key lifecycle, registry DR/Raft, and multi-database HA remain open. See
+drop are implemented. Database-addressed backup/PITR/import/export,
+key lifecycle, registry DR/Raft, and multi-database HA remain open. Realm
+and database rename is implemented. See
 `docs/design-multidatabase-dbaas.md`.
 
 ---
@@ -468,9 +468,11 @@ administrator → summary → install → completion flow, delegating plan/insta
 to `nextsql setup`. Its Linux `.tar.gz`/`.run`/`.deb` packaging integration
 and M5 accessibility pass are complete; Setup and Operations modes share the
 same branded RUI shell/theme behavior, backed by real-Chrome keyboard and axe
-WCAG 2.2 A/AA regression tests. Remaining: recovery-key UX, Windows/macOS
-packaging and execution, full silent-install coverage, and upgrade/repair
-verification through the installer path.
+WCAG 2.2 A/AA regression tests. Developer and production deployment profiles
+plus a fail-closed production security preflight landed (log #208): the GUI
+defaults to production; `nextsqld` re-enforces `deployment_profile=production`
+at start. Remaining: recovery-key UX, Windows/macOS packaging and execution,
+and upgrade/repair verification through the installer path.
 
 ---
 
@@ -540,7 +542,10 @@ authoring stays in the editor and there is no cancel/retry-task or stream
 pause/resume control. IntelliSense also completes native JSON
 paths when the caret is inside a dotted path, offering only the paths a
 referenced table is actually indexed on (the sole JSON structure the
-server exposes metadata for) — never a guessed path. The RBAC boundary —
+server exposes metadata for) — never a guessed path. In a `NEAREST`
+clause it completes vector-typed column names and the `USING` metrics that
+column kind actually accepts; it does not complete inside `TO (...)`.
+The RBAC boundary —
 that a Studio session is confined to the logged-in user's own grants
 across every Studio route — is integration-test-covered
 (`TestAdminStudioEnforcesRBAC`). The operator can tag the current
@@ -594,7 +599,10 @@ the query request as a bounded positional array and are coerced to each
 placeholder's type by the server. The table inspector's **DDL** section
 shows the canonical `CREATE TABLE`/`CREATE INDEX` for the selected table,
 from a new `system.table_ddl` catalog view backed by the same renderer that
-produces backup/restore SQL export. Its bounded **Constraints** section unifies
+produces backup/restore SQL export. A **Design schema…** modal builds a new
+`CREATE TABLE` or `CREATE INDEX` (UNIQUE / FULLTEXT / VECTOR / SPATIAL)
+from a form with a live DDL preview and loads it into the editor for
+review — it never executes. Its bounded **Constraints** section unifies
 the already-authorized primary-key, UNIQUE-index, NOT-NULL, and foreign-key
 metadata without adding a server route. A read-only **Migrations** explorer
 shows the database's `nsql_schema_migrations` history — applied versions,
@@ -621,7 +629,10 @@ shared browser gate also runs Setup, Operations, and Studio at DPR 2, asserting
 their compact layouts, no page-level horizontal overflow or undersized raster
 source, loaded scalable fonts, and axe WCAG 2.2 AA before resetting device
 metrics; this closes Studio's browser/CSS high-DPI item without changing the
-unverified Windows/macOS package status. See
+unverified Windows/macOS package status. Explorer/inspector visibility and
+pane widths, plus the last authorized table name, persist in per-connection
+browser storage with accessible splitters and Hide/Show/Reset layout controls
+— never a credential. See
 `docs/design-admin-studio.md`.
 
 The open MVP expands that foundation into:
@@ -635,26 +646,10 @@ The open MVP expands that foundation into:
 
 ---
 
-## P30 — NextSQL Intelligence
+## Beyond the core product
 
-**Deferred to the next version — not in scope for the current release.**
-
-Built-in, permission-aware RAG/AI assistance for:
-
-- docs;
-- schema;
-- SQL;
-- performance;
-- security;
-- HA;
-- workflows;
-- CDC.
-
-AI remains optional and non-authoritative.
-
----
-
-## Beyond Core P30
+Former P30 (NextSQL Intelligence + built-in RAG) is **removed from the
+product**, not deferred. Do not implement it.
 
 Not part of the committed core roadmap:
 

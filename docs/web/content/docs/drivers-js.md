@@ -9,6 +9,8 @@ const { connect } = require("./drivers/node/nextsql"); // Bun: drivers/bun/nexts
 
 const conn = await connect({
   address: "127.0.0.1:7210",
+  realm: "default",
+  database: "default",
   user: "app",
   password: process.env.NEXTSQL_DATABASE_PASS,
   insecureNoTLS: true,
@@ -44,7 +46,9 @@ await conn.close();
 
 ## Typed parameters
 
-`{ kind: "uuid" | "decimal", value: "…" }`, numbers, strings, booleans, `Date`, `number[]` (vectors), `{ lon, lat }` (points), `{ west, south, east, north }` (boxes), or a plain object (JSON).
+`{ kind: "uuid" | "decimal", value: "…" }`, numbers, strings, booleans, `Date`, `number[]` (vectors), `{ lon, lat }` (points), `{ west, south, east, north }` (boxes), or a plain object (JSON). Explicit wrappers also cover `FLOAT32`/`FLOAT64`, `INTERVAL`, `ENUM`, collections, and `GEOMETRY`/`GEOGRAPHY`.
+
+Follower-read routing uses `connectCluster`. See [High availability](/docs/ha).
 
 Remote TLS:
 

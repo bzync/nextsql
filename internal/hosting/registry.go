@@ -495,6 +495,99 @@ func (r *Registry) LookupRealm(realmName string) (Realm, error) {
 	return Realm{}, nerr.New(nerr.NotFound, "hosting.LookupRealm", "unknown realm")
 }
 
+// RenameRealm durably changes a realm's logical name without changing its
+// stable ID or any on-disk path (ManagedDatabasePath is ID-based). A no-op
+// rename of the current name succeeds without a new generation. Colliding
+// with another realm's name fails AlreadyExists. Offline-only from the CLI
+// (the caller holds the data-dir lock); in-flight dbmanager entries are
+// keyed by ID, not name, so a rename does not require eviction.
+func (r *Registry) RenameRealm(realmID ID, newName string) error {
+	const op = "hosting.RenameRealm"
+	if r == nil {
+		return nerr.New(nerr.InvalidArgument, op, "nil registry")
+	}
+	name, err := normalizeName(newName, nerr.InvalidArgument)
+	if err != nil {
+		return err
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return nerr.New(nerr.Unavailable, op, "registry is closed")
+	}
+	next := cloneManifest(r.manifest)
+	idx := -1
+	for i := range next.Realms {
+		if next.Realms[i].ID == realmID {
+			idx = i
+			continue
+		}
+		if next.Realms[i].Name == name {
+			return nerr.New(nerr.AlreadyExists, op, "realm name is already registered")
+		}
+	}
+	if idx < 0 {
+		return nerr.New(nerr.NotFound, op, "unknown realm")
+	}
+	if next.Realms[idx].Name == name {
+		return nil
+	}
+	next.Realms[idx].Name = name
+	return r.persistLocked(next)
+}
+
+// RenameDatabase durably changes a database's logical name within its realm
+// without changing its stable ID, layout, or on-disk path. A no-op rename of
+// the current name succeeds without a new generation. Colliding with another
+// database in the same realm fails AlreadyExists. Deleting/tombstoned
+// databases cannot be renamed (their name stays as the historical record).
+func (r *Registry) RenameDatabase(realmID, databaseID ID, newName string) error {
+	const op = "hosting.RenameDatabase"
+	if r == nil {
+		return nerr.New(nerr.InvalidArgument, op, "nil registry")
+	}
+	name, err := normalizeName(newName, nerr.InvalidArgument)
+	if err != nil {
+		return err
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return nerr.New(nerr.Unavailable, op, "registry is closed")
+	}
+	next := cloneManifest(r.manifest)
+	for ri := range next.Realms {
+		if next.Realms[ri].ID != realmID {
+			continue
+		}
+		idx := -1
+		for di := range next.Realms[ri].Databases {
+			db := &next.Realms[ri].Databases[di]
+			if db.ID == databaseID {
+				idx = di
+				continue
+			}
+			if db.Name == name {
+				return nerr.New(nerr.AlreadyExists, op, "database name is already registered in this realm")
+			}
+		}
+		if idx < 0 {
+			return nerr.New(nerr.NotFound, op, "unknown database")
+		}
+		db := &next.Realms[ri].Databases[idx]
+		switch db.State {
+		case StateDeleting, StateTombstoned:
+			return nerr.New(nerr.Conflict, op, "deleted database cannot be renamed")
+		}
+		if db.Name == name {
+			return nil
+		}
+		db.Name = name
+		return r.persistLocked(next)
+	}
+	return nerr.New(nerr.NotFound, op, "unknown realm")
+}
+
 // SetDatabaseState durably applies one validated lifecycle transition.
 func (r *Registry) SetDatabaseState(realmID, databaseID ID, state State) error {
 	if r == nil {

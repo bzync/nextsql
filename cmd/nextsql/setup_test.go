@@ -315,6 +315,82 @@ func containsSubstring(haystack []string, needle string) bool {
 	return false
 }
 
+func TestSetupProductionProfileWritesLiveDefaults(t *testing.T) {
+	dataDir := filepath.Join(t.TempDir(), "data")
+	keyFile := filepath.Join(t.TempDir(), "root.key")
+	pw := filepath.Join(t.TempDir(), "pw")
+	if err := os.WriteFile(pw, []byte("s3cret-passphrase\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	err := setupCmd(smallSetupArgs(dataDir, keyFile,
+		"--profile", "production",
+		"--user", "app", "--password-file", pw))
+	if err != nil {
+		t.Fatalf("setupCmd --profile production: %v", err)
+	}
+	cfg, err := config.Load(filepath.Join(dataDir, "nextsql.conf"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.DeploymentProfile != config.ProfileProduction {
+		t.Fatalf("deployment_profile = %q", cfg.DeploymentProfile)
+	}
+	if cfg.DiskWatermarkCheckMS != config.ProductionDiskWatermarkCheckMS {
+		t.Errorf("disk_watermark_check_ms = %d", cfg.DiskWatermarkCheckMS)
+	}
+	if cfg.StatementTimeoutMS != config.ProductionStatementTimeoutMS {
+		t.Errorf("statement_timeout_ms = %d", cfg.StatementTimeoutMS)
+	}
+	if err := cfg.CheckProduction(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSetupProductionRequiresAdmin(t *testing.T) {
+	dataDir := filepath.Join(t.TempDir(), "data")
+	keyFile := filepath.Join(t.TempDir(), "root.key")
+	err := setupCmd(smallSetupArgs(dataDir, keyFile, "--profile", "production"))
+	if got := cli.Code(err); got != cli.ExitValidation {
+		t.Fatalf("exit code = %d, want %d; err = %v", got, cli.ExitValidation, err)
+	}
+	if _, statErr := os.Stat(filepath.Join(dataDir, "nextsql.conf")); statErr == nil {
+		t.Error("a rejected production install still wrote a config file")
+	}
+}
+
+func TestSetupProductionSkipInitRejected(t *testing.T) {
+	dataDir := filepath.Join(t.TempDir(), "data")
+	keyFile := filepath.Join(t.TempDir(), "root.key")
+	err := setupCmd(smallSetupArgs(dataDir, keyFile, "--profile", "production", "--skip-init"))
+	if got := cli.Code(err); got != cli.ExitValidation {
+		t.Fatalf("exit code = %d, want %d; err = %v", got, cli.ExitValidation, err)
+	}
+}
+
+func TestSetupProductionDryRunWithoutAdmin(t *testing.T) {
+	dataDir := filepath.Join(t.TempDir(), "data")
+	keyFile := filepath.Join(t.TempDir(), "root.key")
+	out, err := captureStdout(func() error {
+		return setupCmd(smallSetupArgs(dataDir, keyFile, "--profile", "production", "--dry-run", "--json"))
+	})
+	if err != nil {
+		t.Fatalf("dry-run production without admin should succeed: %v", err)
+	}
+	if strings.Contains(out, `"profile": "production"`) == false && strings.Contains(out, `"profile":"production"`) == false {
+		// indented JSON from encoder
+		if !strings.Contains(out, "production") {
+			t.Fatalf("expected production profile in JSON, got %s", out)
+		}
+	}
+	if !strings.Contains(out, "requires --user") {
+		t.Fatalf("expected an admin-required warning, got %s", out)
+	}
+	if _, statErr := os.Stat(dataDir); !os.IsNotExist(statErr) {
+		t.Error("dry-run created the data directory")
+	}
+}
+
 func TestSetupKeepFailedLeavesPartialInstall(t *testing.T) {
 	dataDir := filepath.Join(t.TempDir(), "data")
 	keyFile := filepath.Join(t.TempDir(), "root.key")

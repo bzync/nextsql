@@ -7,7 +7,7 @@
       "channel": "preview",
       "latest": true,
       "releasedAt": "2026-08-18T00:00:00.000Z",
-      "summary": "Phases 0\u201315 of the engine ship in this tree: storage, WAL, MVCC, SQL, optimizer, protocol, JSON, full-text, vectors, hybrid plans, security, backup/PITR/export, and Raft HA.",
+      "summary": "Storage, WAL, MVCC, SQL, optimizer, protocol, JSON, full-text, vectors, hybrid plans, security, backup/PITR/export, and Raft HA ship in this tree.",
       "highlights": [
         "One WAL, one MVCC, and one optimizer for SQL, JSON, vectors, full-text, and geo",
         "AES-256-GCM envelope encryption on by default",

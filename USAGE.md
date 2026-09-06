@@ -202,7 +202,7 @@ data directory (it auto-detects Setup mode):
 
 ```bash
 nextsql setup --data-dir /var/lib/nextsql --key-file /etc/nextsql/root.key \
-  --preset balanced --user app --password-file /tmp/nextsql.pw
+  --profile production --preset balanced --user app --password-file /tmp/nextsql.pw
 nextsql-admin                   # opens a token-authenticated loopback wizard (Setup mode)
 ```
 
@@ -2974,8 +2974,6 @@ P17/P18 added user-visible behavior that older copies of this manual did not des
 
 - P29 NextSQL Admin — Studio mode (web-based NextSQL Studio)
 
-- P30 NextSQL Intelligence + built-in RAG
-
 - Multi-primary writes are not part of the current roadmap core
 
 ### Existing functional limitations
@@ -3001,11 +2999,11 @@ P17/P18 added user-visible behavior that older copies of this manual did not des
 ### Planned features are not current syntax
 
 `PROJECT.md` describes the intended finished product. This manual does **not**
-expose unchecked P28–P30 grammar as usable syntax before implementation.
+expose unchecked P28–P29 grammar as usable syntax before implementation.
 P0–P27 shipped surfaces and the implemented P28 increments are documented
 above.
 
-For example, do not assume Studio or Intelligence syntax exists merely because
+For example, do not assume unimplemented Studio syntax exists merely because
 it appears in the intended product document.
 
 Check `TODO.md`, server capability metadata when available, and the matching-version manual before using a planned feature.

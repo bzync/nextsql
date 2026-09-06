@@ -10,6 +10,28 @@ authentication enabled. Hardware, filesystem, row width, query, indexes,
 cache condition, encryption, durability, and concurrency are part of the
 measurement, not optional footnotes.
 
+## Live production profile
+
+P0–P27 engine features that are production-gated are intended to run with
+this posture **out of the box**. Create the instance with:
+
+```bash
+nextsql setup --data-dir DIR --key-file FILE \
+  --profile production --user app --password-file /path/to/pw
+nextsqld --config DIR/nextsql.conf
+```
+
+`deployment_profile=production` in `nextsql.conf` is the durable switch.
+`nextsqld --production` forces the same profile for a process that was
+initialized as developer. Either path fail-closes if the unlock key sits
+on the data volume or if disk-watermark / drain / statement / idle
+timeouts are unset. Experimental capabilities (`field_encryption_client`,
+`hosting_isolation`) stay labeled experimental in `system.capabilities`
+and are not implied by the production profile.
+
+Setup-mode GUI defaults to Production. The CLI default remains `developer`
+so existing local `--skip-init` scripts keep working.
+
 ## Upgrade / format compatibility
 
 Every persisted family has a version and a compatibility window in

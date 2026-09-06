@@ -11,6 +11,8 @@ import nextsql
 
 conn = nextsql.connect(nextsql.Config(
     address="127.0.0.1:7210",
+    realm="default",
+    database="default",
     user="app",
     password="s3cret",
     insecure_no_tls=True,
@@ -41,7 +43,10 @@ expected (`int`/`float`/`Decimal` all encode as `DECIMAL`); `uuid.UUID` for
 treated as UTC); a `list[float]` (or `nextsql.Vector` for sparse vectors) for
 `VECTOR`/`SPARSEVECTOR`; `dict`/`list` for `JSON` (encoded as a JSON string
 parameter, decoded from the server's binary JSON on the way back);
-`nextsql.Point`/`Box`/`Line`/`Polygon` for the spatial types.
+`nextsql.Point`/`Box`/`Line`/`Polygon` for the WGS84 shapes; `nextsql.Geometry`
+for `GEOMETRY`/`GEOGRAPHY`; `datetime.date` / `time` plus `nextsql.Interval`
+for temporal values; `nextsql.EnumValue` / `StructValue` / `MapValue` for
+`ENUM` and collections. Field-encryption helpers are not in this driver.
 
 ## Cluster routing
 

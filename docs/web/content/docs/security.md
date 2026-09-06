@@ -1,4 +1,4 @@
-# Users, roles, and tenants
+# Users, roles, and isolation
 
 This is the honest contract. NextSQL is not unhackable, not “100% secure,” and does not survive a live unlocked host compromise.
 
@@ -23,14 +23,15 @@ Established crypto only: AES-256-GCM. No custom cipher, hash, MAC, KDF, or AEAD.
 The deployment registry uses a separate external root
 (`--instance-key-file`, default `--key-file.instance`) and independent
 `nextsql.instance.keys` envelope. It is not a login password. Keep both roots
-off the data volume. This M1 foundation does not yet implement realm-local
-authentication or selectable database engines.
+off the data volume. `nextsql setup --profile production` and `nextsqld
+--production` fail closed if an unlock key sits inside the data directory.
+Connections select a hosted realm and database; see [Hosting](/docs/hosting).
 
-Online DEK rotation, key-version revocation (kills sessions), and crypto-shred of the keystore are in the production surface. Field-level `ENCRYPTED CLIENT` columns are **experimental**: the randomized `NSCE1.` server/catalog path and Go, Node.js/TypeScript, Bun, Deno, and PHP helpers ship, while PITR and HA coverage remain open. The server stores only opaque ciphertext and rejects predicates, indexes, and search on these fields.
+Online DEK rotation, key-version revocation (kills sessions), and crypto-shred of the keystore are in the production surface. Field-level `ENCRYPTED CLIENT` columns stay **experimental** because no searchable or deterministic mode ships — a deliberate scope decision. The randomized `NSCE1.` server/catalog path, helpers in Go, Node.js/TypeScript, Bun, Deno, and PHP, PITR, HA/failover, and durable `FileFieldKeyring` rotation/revocation are implemented and tested. Python and Ruby drivers do not yet expose field-encryption helpers. The server stores only opaque ciphertext and rejects predicates, indexes, and search on these fields.
 
 ## Bootstrap
 
-`nextsql init --user` / `nextsqld --user` creates a user with `ADMIN` on `CLUSTER` and `CONNECT` on the database. Passwords are hashed (PBKDF2-HMAC-SHA256, 100 000 iterations). They are never stored plaintext.
+`nextsql init --user` / `nextsqld --user` creates a user with `ADMIN` on `CLUSTER` and `CONNECT` on the database. Passwords are hashed with **Argon2id** (versioned records). Legacy PBKDF2-HMAC-SHA256 hashes still verify and rehash transparently on login. They are never stored plaintext.
 
 ## SQL
 

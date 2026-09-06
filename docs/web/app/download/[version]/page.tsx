@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import Link from "next/link";
 import { notFound } from "next/navigation";
+import { AdjacentNav } from "@/components/AdjacentNav";
 import { Badge } from "@bzync/rui";
 import { CHANGE_KINDS, changeKindLabel, formatDate, getRelease, groupChanges, listReleases } from "@/lib/releases";
 import { PlatformDownloads } from "@/components/download/PlatformDownloads";
@@ -32,14 +33,15 @@ export default async function ReleasePage({ params }: { params: Promise<{ versio
 
   return (
     <main id="content" className="mx-auto max-w-6xl px-4 py-12 sm:px-5 sm:py-16">
-      <p className="text-[11px] font-medium text-slate-400 dark:text-slate-500">
+      <p className="kicker">
         <Link href="/download" className="hover:text-foreground">
-          downloads
-        </Link>{" "}
-        / {release.version}
+          Downloads
+        </Link>
+        <span className="mx-2 text-faint">/</span>
+        {release.version}
       </p>
       <div className="mt-3 flex flex-wrap items-center gap-2">
-        <h1 className="text-[2rem] font-bold tracking-[-0.035em]">{release.version}</h1>
+        <h1 className="text-[2rem] font-semibold tracking-[-0.028em]">{release.version}</h1>
         {release.latest ? <Badge>latest</Badge> : null}
         <Badge variant={release.channel === "stable" ? "info" : "warning"}>{release.channel}</Badge>
       </div>
@@ -51,7 +53,7 @@ export default async function ReleasePage({ params }: { params: Promise<{ versio
         <ul className="mt-6 max-w-2xl space-y-2">
           {release.highlights.map((item) => (
             <li key={item} className="flex gap-2 text-sm leading-6">
-              <span className="text-blue-500 dark:text-blue-400">•</span>
+              <span className="text-faint">•</span>
               <span>{item}</span>
             </li>
           ))}
@@ -71,7 +73,7 @@ export default async function ReleasePage({ params }: { params: Promise<{ versio
           {CHANGE_KINDS.map((kind) =>
             grouped[kind].length === 0 ? null : (
               <div key={kind}>
-                <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-faint">{changeKindLabel(kind)}</p>
+                <p className="kicker">{changeKindLabel(kind)}</p>
                 <ul className="mt-2 space-y-2">
                   {grouped[kind].map((change) => (
                     <li key={change.id} className="flex gap-3 text-sm leading-6">
@@ -88,28 +90,10 @@ export default async function ReleasePage({ params }: { params: Promise<{ versio
         </div>
       </section>
 
-      <nav className="mt-14 grid gap-3 sm:grid-cols-2">
-        {older ? (
-          <Link
-            href={`/download/${older.version}`}
-            className="rounded-lg border border-black/[0.10] bg-white/70 px-4 py-4 dark:border-white/[0.09] dark:bg-transparent"
-          >
-            <div className="text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-400">Previous</div>
-            <div className="mt-1 text-sm font-medium">{older.version}</div>
-          </Link>
-        ) : (
-          <span className="hidden sm:block" />
-        )}
-        {newer ? (
-          <Link
-            href={`/download/${newer.version}`}
-            className="rounded-lg border border-black/[0.10] bg-white/70 px-4 py-4 text-left sm:text-right dark:border-white/[0.09] dark:bg-transparent"
-          >
-            <div className="text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-400">Next</div>
-            <div className="mt-1 text-sm font-medium">{newer.version}</div>
-          </Link>
-        ) : null}
-      </nav>
+      <AdjacentNav
+        prev={older ? { href: `/download/${older.version}`, label: older.version } : undefined}
+        next={newer ? { href: `/download/${newer.version}`, label: newer.version } : undefined}
+      />
     </main>
   );
 }

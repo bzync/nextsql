@@ -79,7 +79,6 @@ P29      in progress — Studio M1–M3, five native explorers, Users/Roles,
          ANALYZE-only profiler, catalog-aware table/column IntelliSense
          (no keyword completion), and deterministic misspelled FROM/JOIN
          table-name suggestions implemented; MVP gate open
-P30      planned
 ```
 
 P28 is the current release gate — specifically the GUI installer, the only
@@ -184,7 +183,7 @@ Examples:
 - Never silently reduce ANN recall to improve latency.
 - Never weaken tenant isolation for convenience.
 - Never bypass parser/binder/planner architecture to make SQL syntax work quickly.
-- Never bypass RBAC through any NextSQL Admin mode, CLI, drivers, or Intelligence.
+- Never bypass RBAC through any NextSQL Admin mode, CLI, or drivers.
 - Never invent a custom cryptographic primitive.
 - Never introduce unbounded goroutines, allocations, result buffers, task queues, or subscriber queues.
 
@@ -459,7 +458,6 @@ Remaining phases are:
 ```text
 P28 NextSQL Admin — Setup + Operations modes  — in progress (Setup-mode GUI M1 landed; installer gate open)
 P29 NextSQL Admin — Studio mode                — in progress (M1–M3, focused native/developer-operations slices, bounded plan comparison/ANALYZE profiler, catalog-aware IntelliSense, and misspelled table-name suggestions landed; MVP gate open)
-P30 NextSQL Intelligence + built-in RAG        — planned
 ```
 
 P0–P27 are complete. P16's terminal 100M B+Tree soak remains a documented
@@ -478,7 +476,7 @@ Preserve these principles:
 - follower reads have explicit consistency semantics.
 - ANN performance always reports recall.
 - Studio is web-based and uses official/native interfaces.
-- Intelligence is optional and never overrides parser/binder/optimizer/RBAC/server validation.
+- NextSQL Intelligence / built-in RAG (former P30) is not in the product. Do not implement it.
 
 ---
 

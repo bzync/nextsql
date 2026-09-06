@@ -180,6 +180,76 @@ func TestBuildPlanRejectsInvalidLogLevel(t *testing.T) {
 	}
 }
 
+func TestBuildPlanProductionAppliesOperationalDefaults(t *testing.T) {
+	p := baseParams()
+	p.Profile = config.ProfileProduction
+	plan, err := BuildPlan(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.Profile != config.ProfileProduction {
+		t.Fatalf("profile = %q", plan.Profile)
+	}
+	cfg := plan.Config
+	if cfg.DeploymentProfile != config.ProfileProduction {
+		t.Fatalf("config profile = %q", cfg.DeploymentProfile)
+	}
+	if cfg.DiskWatermarkCheckMS != config.ProductionDiskWatermarkCheckMS {
+		t.Errorf("watermark = %d", cfg.DiskWatermarkCheckMS)
+	}
+	if cfg.StatementTimeoutMS != config.ProductionStatementTimeoutMS {
+		t.Errorf("statement timeout = %d", cfg.StatementTimeoutMS)
+	}
+	if cfg.MaxConnections != config.ProductionMaxConnections {
+		t.Errorf("max connections = %d", cfg.MaxConnections)
+	}
+	if err := cfg.CheckProduction(); err != nil {
+		t.Fatal(err)
+	}
+	if !hasWarningContaining(plan.Warnings, "backup_dir") {
+		t.Errorf("expected a backup_dir advisory, got %v", plan.Warnings)
+	}
+}
+
+func TestBuildPlanProductionRejectsKeyOnDataVolume(t *testing.T) {
+	p := baseParams()
+	p.Profile = config.ProfileProduction
+	p.KeyFile = p.DataDir + "/root.key"
+	if _, err := BuildPlan(p); err == nil {
+		t.Fatal("expected production preflight to reject a key on the data volume")
+	}
+}
+
+func TestBuildPlanProductionWarnsOnTmpfs(t *testing.T) {
+	p := baseParams()
+	p.Profile = config.ProfileProduction
+	p.Info.Filesystem = "tmpfs"
+	plan, err := BuildPlan(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasWarningContaining(plan.Warnings, "tmpfs") {
+		t.Errorf("expected a tmpfs advisory, got %v", plan.Warnings)
+	}
+}
+
+func TestBuildPlanDeveloperDefaultProfile(t *testing.T) {
+	p := baseParams()
+	plan, err := BuildPlan(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.Profile != config.ProfileDeveloper {
+		t.Fatalf("profile = %q", plan.Profile)
+	}
+	if plan.Config.DeploymentProfile != config.ProfileDeveloper {
+		t.Fatalf("config profile = %q", plan.Config.DeploymentProfile)
+	}
+	if plan.Config.DiskWatermarkCheckMS != 0 {
+		t.Errorf("developer must not enable disk watermarks by default, got %d", plan.Config.DiskWatermarkCheckMS)
+	}
+}
+
 func hasWarningContaining(warnings []string, substr string) bool {
 	for _, w := range warnings {
 		if strings.Contains(w, substr) {

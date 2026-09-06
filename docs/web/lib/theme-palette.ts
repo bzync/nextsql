@@ -43,7 +43,7 @@ export const themePalette: ThemePalette = {
   fonts: {
     sans: "var(--font-geist), ui-sans-serif, system-ui, sans-serif",
     mono: "var(--font-geist-mono), ui-monospace, monospace",
-    display: "var(--font-brand-face), ui-sans-serif, sans-serif",
+    display: "var(--font-geist), ui-sans-serif, system-ui, sans-serif",
   },
   colors: {
     primary: "#2563eb",
@@ -60,28 +60,28 @@ export const themePalette: ThemePalette = {
 
 export const themeLightPalette: ThemePalette = {
   colors: {
-    bg: "#f8fafc",
+    bg: "#f3f4f6",
     surface: "#ffffff",
     surfaceRaised: "#ffffff",
-    surfaceMuted: "rgba(15, 23, 42, 0.04)",
-    border: "rgba(15, 23, 42, 0.08)",
-    borderStrong: "rgba(15, 23, 42, 0.14)",
-    text: "#0f172a",
-    muted: "rgba(15, 23, 42, 0.05)",
-    mutedForeground: "#64748b",
+    surfaceMuted: "rgba(14, 21, 37, 0.045)",
+    border: "rgba(14, 21, 37, 0.09)",
+    borderStrong: "rgba(14, 21, 37, 0.16)",
+    text: "#0e1525",
+    muted: "rgba(14, 21, 37, 0.05)",
+    mutedForeground: "#4b5568",
   },
 };
 
 export const themeDarkPalette: ThemePalette = {
   colors: {
     bg: "#040912",
-    surface: "#060c1a",
-    surfaceRaised: "#0a1427",
-    surfaceMuted: "rgba(255, 255, 255, 0.06)",
-    border: "rgba(255, 255, 255, 0.08)",
-    borderStrong: "rgba(255, 255, 255, 0.14)",
-    text: "#ffffff",
-    muted: "rgba(255, 255, 255, 0.07)",
-    mutedForeground: "#94a3b8",
+    surface: "#0a101c",
+    surfaceRaised: "#0c1526",
+    surfaceMuted: "rgba(232, 237, 245, 0.055)",
+    border: "rgba(232, 237, 245, 0.09)",
+    borderStrong: "rgba(232, 237, 245, 0.15)",
+    text: "#e8edf5",
+    muted: "rgba(232, 237, 245, 0.07)",
+    mutedForeground: "#93a0b5",
   },
 };

@@ -6,7 +6,7 @@ Phase 28/29 cover NextSQL Admin, one application with three modes (see
 ```text
 Setup mode       → install / upgrade / repair / uninstall            (Phase 28)
 Operations mode  → server / cluster / security / backup / operations (Phase 28)
-Studio mode      → database development / SQL / data / schema / RAG  (Phase 29)
+Studio mode      → database development / SQL / data / schema        (Phase 29)
 ```
 
 This note covers the **automation backbone** shared by all of them:
@@ -38,6 +38,7 @@ printf 'a-strong-passphrase\n' > /tmp/nextsql.pw && chmod 600 /tmp/nextsql.pw
 nextsql setup \
   --data-dir /var/lib/nextsql \
   --key-file /etc/nextsql/root.key \
+  --profile production \
   --preset balanced \
   --user app --password-file /tmp/nextsql.pw
 ```
@@ -48,6 +49,40 @@ The generated config is written to `DATA-DIR/nextsql.conf` unless
 ```bash
 nextsqld --config /var/lib/nextsql/nextsql.conf
 ```
+
+### Deployment profiles
+
+`--profile` selects the live-server posture. It is independent of `--preset`
+(buffer-pool sizing).
+
+| Profile | Default | Use |
+|---|---|---|
+| `developer` | CLI default | local / loopback work. `--skip-init` and a missing administrator are allowed. |
+| `production` | Setup-mode GUI default | a live deployment. Fail-closed preflight plus production operational defaults. |
+
+`production` writes `deployment_profile=production` into `nextsql.conf` and
+fills zero-valued operational settings:
+
+- disk watermark checks (warn 85% / reject 95%, every 60s)
+- replica-lag warning checks (every 60s)
+- statement timeout 30s, idle timeout 60s, idle-transaction timeout 5m, lock timeout 30s
+- `max_connections=128`, `max_connections_per_user=32`
+- graceful drain already default (30s)
+
+The same profile is enforced when `nextsqld` starts. `nextsqld --production`
+forces it even if the file still says `developer`. The preflight refuses:
+
+- an unlock / instance key file inside the data directory
+- `--skip-init` (setup)
+- a mutating install without `--user` / `--password-file` (setup)
+- missing disk-watermark / drain / statement / idle timeouts (server start)
+
+A tmpfs/ramfs data volume is a warning, not a hard refusal — some CI and
+container paths report tmpfs for `/tmp` — but it is the wrong volume for a
+live database.
+
+Keep the root unlock key **off** the data volume. A production install with
+`--key-file /var/lib/nextsql/root.key` fails closed.
 
 ### Resource presets
 

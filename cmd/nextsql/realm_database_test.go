@@ -315,6 +315,100 @@ func TestDatabaseSuspendResumeCLI(t *testing.T) {
 	assertLookup(false, "") // routing works again
 }
 
+// TestRealmDatabaseRenameCLI is M3-2's end-to-end CLI test: durable name
+// change for a realm and a database, IDs and on-disk paths unchanged,
+// Lookup follows the new name, collisions fail closed, and the offline
+// --confirm / deployment-lock pattern matches suspend/drop.
+func TestRealmDatabaseRenameCLI(t *testing.T) {
+	dir, keyFile, instanceKeyFile := initBaseDeployment(t)
+	m := openTestRegistry(t, dir, instanceKeyFile)
+	defaultRealmName := m.Realms[0].Name
+	defaultDBName := m.Realms[0].Databases[0].Name
+	realmID := m.Realms[0].ID
+	dbID := m.Realms[0].Databases[0].ID
+	base := []string{"--data-dir", dir, "--key-file", keyFile, "--instance-key-file", instanceKeyFile}
+
+	if err := realmCmd(append([]string{"rename"}, append(append([]string(nil), base...), "--realm", defaultRealmName, "--to", "acme")...)); !nerr.HasCode(err, nerr.InvalidArgument) {
+		t.Fatalf("realm rename missing --confirm: %v", err)
+	}
+	if err := databaseCmd(append([]string{"rename"}, append(append([]string(nil), base...), "--realm", defaultRealmName, "--database", defaultDBName, "--to", "analytics")...)); !nerr.HasCode(err, nerr.InvalidArgument) {
+		t.Fatalf("database rename missing --confirm: %v", err)
+	}
+
+	held, err := hosting.AcquireDataDirLock(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := realmCmd(append([]string{"rename"}, append(append([]string(nil), base...), "--realm", defaultRealmName, "--to", "acme", "--confirm")...)); !nerr.HasCode(err, nerr.Unavailable) {
+		t.Fatalf("realm rename under deployment lock: %v", err)
+	}
+	if err := held.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := realmCmd(append([]string{"rename"}, append(append([]string(nil), base...), "--realm", "no-such-realm", "--to", "acme", "--confirm")...)); !nerr.HasCode(err, nerr.NotFound) {
+		t.Fatalf("realm rename unknown: %v", err)
+	}
+
+	if err := realmCmd(append([]string{"rename"}, append(append([]string(nil), base...), "--realm", defaultRealmName, "--to", "Acme", "--confirm")...)); err != nil {
+		t.Fatal(err)
+	}
+	m2 := openTestRegistry(t, dir, instanceKeyFile)
+	if m2.Realms[0].Name != "acme" || m2.Realms[0].ID != realmID {
+		t.Fatalf("realm rename not durable: %+v", m2.Realms[0])
+	}
+
+	openLookup := func(realm, database string) error {
+		t.Helper()
+		root, err := crypto.ReadKeyFile(instanceKeyFile)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer root.Zero()
+		reg, err := hosting.Open(hosting.Path(dir), root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer reg.Close()
+		_, _, lerr := reg.Lookup(realm, database)
+		return lerr
+	}
+	if err := openLookup(defaultRealmName, defaultDBName); !nerr.HasCode(err, nerr.NotFound) {
+		t.Fatalf("old realm name still routes: %v", err)
+	}
+	if err := openLookup("acme", defaultDBName); err != nil {
+		t.Fatalf("new realm name: %v", err)
+	}
+
+	otherKey := filepath.Join(t.TempDir(), "globex.key")
+	if err := createRealm(append(append([]string(nil), base...), "--realm", "globex", "--database", "main", "--database-key-file", otherKey, "--buffer-pages", "8")); err != nil {
+		t.Fatal(err)
+	}
+	if err := realmCmd(append([]string{"rename"}, append(append([]string(nil), base...), "--realm", "acme", "--to", "globex", "--confirm")...)); !nerr.HasCode(err, nerr.AlreadyExists) {
+		t.Fatalf("realm rename collision: %v", err)
+	}
+
+	if err := databaseCmd(append([]string{"rename"}, append(append([]string(nil), base...), "--realm", "acme", "--database", defaultDBName, "--to", "Analytics", "--confirm")...)); err != nil {
+		t.Fatal(err)
+	}
+	m3 := openTestRegistry(t, dir, instanceKeyFile)
+	var acme *hosting.Realm
+	for i := range m3.Realms {
+		if m3.Realms[i].Name == "acme" {
+			acme = &m3.Realms[i]
+		}
+	}
+	if acme == nil || acme.Databases[0].Name != "analytics" || acme.Databases[0].ID != dbID {
+		t.Fatalf("database rename not durable: %+v", acme)
+	}
+	if err := openLookup("acme", defaultDBName); !nerr.HasCode(err, nerr.NotFound) {
+		t.Fatalf("old database name still routes: %v", err)
+	}
+	if err := openLookup("acme", "analytics"); err != nil {
+		t.Fatalf("new database name: %v", err)
+	}
+}
+
 // TestDatabaseDropCLI is M3-3's end-to-end CLI test: it exercises the drop
 // pattern (offline, --confirm, deployment-lock-gated, identical shape to
 // suspend/resume) and then proves both halves of the delete actually

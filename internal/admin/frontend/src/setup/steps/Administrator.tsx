@@ -17,8 +17,13 @@ type FieldErrors = { user?: string; password?: string; confirm?: string };
 
 function fieldErrors(p: Params, confirmVal: string): FieldErrors {
   const errors: FieldErrors = {};
+  const production = p.profile === "production";
   const bothOrNeither = (p.adminUser === "") === (p.adminPassword === "");
-  if (!bothOrNeither) {
+  if (production && p.adminUser === "") {
+    errors.user = "Production profile requires an administrator username.";
+  } else if (production && p.adminPassword === "") {
+    errors.password = "Production profile requires an administrator password.";
+  } else if (!bothOrNeither) {
     if (p.adminUser === "") errors.user = "Enter a username, or clear the password below to skip this account.";
     else errors.password = "Enter a password, or clear the username above to skip this account.";
   } else if (p.adminPassword !== "" && p.adminPassword.length < 8) {
@@ -49,7 +54,11 @@ export function Administrator({
       <CardBody>
         <StepHeader
           title="Administrator account"
-          description="Optional, but recommended: this account can connect and administer the new database immediately. Leave both fields below blank to skip it — nothing about this step is required."
+          description={
+            params.profile === "production"
+              ? "Required for the production profile: this account can connect and administer the new database immediately."
+              : "Optional, but recommended: this account can connect and administer the new database immediately. Leave both fields below blank to skip it — nothing about this step is required."
+          }
         />
         <Text variant="muted" size="sm" style={{ marginTop: 12 }}>
           This password is sent once, over this local connection, straight into a private file

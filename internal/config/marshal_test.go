@@ -38,6 +38,7 @@ func TestMarshalRoundTripsFullyPopulated(t *testing.T) {
 	c.AuthFile = "/etc/nextsql/users"
 	c.ListenAddr = "10.0.0.5:7210"
 	c.LogLevel = "warn"
+	c.DeploymentProfile = ProfileProduction
 	c.BufferPages = 262144
 	c.TLSCert = "/etc/nextsql/tls.crt"
 	c.TLSKey = "/etc/nextsql/tls.key"

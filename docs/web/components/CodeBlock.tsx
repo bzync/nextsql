@@ -13,9 +13,9 @@ export function CodeBlock({
   title?: string;
 }) {
   return (
-    <div className="group relative overflow-hidden rounded-xl border border-black/10 bg-code-bg text-code-fg shadow-[0_18px_48px_-28px_rgba(15,23,42,0.45)] dark:border-white/10 dark:shadow-[0_18px_48px_-26px_rgba(0,0,0,0.90)]">
-      <div className="flex items-center justify-between border-b border-white/10 bg-white/[0.03] px-4 py-2.5">
-        <span className="font-mono text-xs text-slate-400">
+    <div className="group relative overflow-hidden rounded-md border border-white/10 bg-code-bg text-code-fg">
+      <div className="flex items-center justify-between border-b border-white/10 px-4 py-2">
+        <span className="font-mono text-[11px] text-slate-400">
           {title || lang || "code"}
         </span>
         <CopyButton

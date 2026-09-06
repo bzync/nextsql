@@ -215,7 +215,7 @@ Native wire protocol → TLS 1.3 → authn → authz
 One engine, not four stores glued together. Catalog mutations, secondary indexes, HNSW graphs, and inverted postings all go through the same WAL and transaction.
 
 Shipped CDC, automation, and bounded local partitioning surfaces, plus planned
-follower-read, Studio, and Intelligence features, must preserve the same native
+follower-read and Studio features, must preserve the same native
 correctness/security model rather than bypassing the engine through hidden side
 systems.
 
@@ -596,7 +596,6 @@ P26  System Catalog / Introspection 2.0
 P27  Operational Maturity / Workload Governance
 P28  NextSQL Admin — Setup + Operations modes
 P29  NextSQL Admin — Studio mode (NextSQL Studio)
-P30  NextSQL Intelligence + Built-in RAG
 ```
 
 Roadmap rules:
@@ -610,7 +609,7 @@ Roadmap rules:
 - follower reads expose explicit consistency semantics.
 - ANN performance always reports recall.
 - Studio uses native NextSQL APIs and never bypasses RBAC.
-- Intelligence is optional and never overrides parser, binder, optimizer, catalog, tenant policy, RBAC, or server validation.
+- NextSQL Intelligence / built-in RAG (former P30) is not in the product.
 
 ---
 
@@ -714,7 +713,7 @@ P25      complete — Security 2.0
 P26      complete — System Catalog / Introspection 2.0
 P27      complete — Operational Maturity / Workload Governance
 P28      in progress — NextSQL Admin (Setup + Operations modes); setup/lifecycle + Operations-mode MVP complete; installer gate open
-P29–P30 planned/open
+P29      in progress — Studio mode; MVP gate open
 ```
 
 P17 now includes shipped schema/storage-lifecycle work such as:
@@ -789,8 +788,7 @@ legacy `tenant_id` / `PARTITION BY TENANT` database into an isolated hosted
 deployment (`nextsql hosting migrate-tenant`). Distributed sharding is a
 separate future phase. Follower reads, Vector Engine 2.0, Full-text Search 2.0,
 Security 2.0, system introspection, and workload governance are complete. The
-roadmap continues through the remaining Setup-mode work, Studio mode, and
-NextSQL Intelligence/RAG.
+roadmap continues through the remaining Setup-mode work and Studio mode.
 
 P22–P27 are complete; P28 remains open until its installer gate is green. P19
 syntax and semantics are documented in `docs/workflows.md`; P20 and P21 are

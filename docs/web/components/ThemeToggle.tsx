@@ -1,19 +1,15 @@
 "use client";
 
-import { useEffect } from "react";
-import { ThemeToggle as RuiThemeToggle, useTheme } from "@bzync/rui";
+import { useEffect, useState } from "react";
+import { ThemeToggle as RuiThemeToggle } from "@bzync/rui";
 
 export function ThemeToggle({ className = "" }: { className?: string }) {
-  const { setTheme } = useTheme();
+  const [mounted, setMounted] = useState(false);
+  useEffect(() => setMounted(true), []);
 
-  useEffect(() => {
-    const requested = new URLSearchParams(window.location.search).get("theme");
-    if (requested === "light" || requested === "dark") {
-      setTheme(requested);
-    }
-    // Only ever apply the query override once, on mount.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  if (!mounted) {
+    return <span className="inline-flex h-10 w-10 sm:h-9 sm:w-9" aria-hidden="true" />;
+  }
 
   return (
     <RuiThemeToggle
@@ -21,7 +17,7 @@ export function ThemeToggle({ className = "" }: { className?: string }) {
       darkIcon={<MoonIcon />}
       lightLabel="Toggle theme"
       darkLabel="Toggle theme"
-      className={`h-10 w-10 rounded-lg border-transparent bg-transparent px-0 text-slate-600 shadow-none hover:border-transparent hover:bg-bg-hover hover:text-foreground sm:h-9 sm:w-9 dark:text-slate-400 ${className}`}
+      className={`h-10 w-10 rounded-md border-transparent bg-transparent px-0 text-muted shadow-none hover:border-transparent hover:bg-bg-hover hover:text-foreground sm:h-9 sm:w-9 ${className}`}
     />
   );
 }

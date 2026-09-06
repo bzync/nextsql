@@ -128,11 +128,13 @@ func hostingCmd(args []string) error {
 // design doc for the full sequence.
 func realmCmd(args []string) error {
 	if len(args) == 0 {
-		return nerr.New(nerr.InvalidArgument, "nextsql realm", "expected create")
+		return nerr.New(nerr.InvalidArgument, "nextsql realm", "expected create or rename")
 	}
 	switch args[0] {
 	case "create":
 		return createRealm(args[1:])
+	case "rename":
+		return renameRealm(args[1:])
 	default:
 		return nerr.New(nerr.InvalidArgument, "nextsql realm", "unknown realm command")
 	}
@@ -140,7 +142,7 @@ func realmCmd(args []string) error {
 
 func databaseCmd(args []string) error {
 	if len(args) == 0 {
-		return nerr.New(nerr.InvalidArgument, "nextsql database", "expected create, suspend, resume, or drop")
+		return nerr.New(nerr.InvalidArgument, "nextsql database", "expected create, suspend, resume, drop, or rename")
 	}
 	switch args[0] {
 	case "create":
@@ -151,6 +153,8 @@ func databaseCmd(args []string) error {
 		return setDatabaseState(args[1:], hosting.StateActive)
 	case "drop":
 		return dropDatabase(args[1:])
+	case "rename":
+		return renameDatabase(args[1:])
 	default:
 		return nerr.New(nerr.InvalidArgument, "nextsql database", "unknown database command")
 	}
@@ -223,6 +227,56 @@ func createRealm(args []string) error {
 		verb = "resumed"
 	}
 	fmt.Printf("realm %s %s database %s %s %s\n", realm.Name, realm.ID.String(), db.Name, db.ID.String(), verb)
+	return nil
+}
+
+// renameRealm is M3-2's CLI surface for a durable realm name change. The
+// stable ID and every on-disk path stay put (ManagedDatabasePath is
+// ID-based). Offline exclusive-lock pattern matches suspend/drop: fails
+// Unavailable against a running nextsqld. --confirm required. A collision
+// with another realm's name fails AlreadyExists; a no-op rename of the
+// current name succeeds without a new generation.
+func renameRealm(args []string) error {
+	const op = "nextsql realm rename"
+	fs := flag.NewFlagSet("realm rename", flag.ContinueOnError)
+	fs.String("data-dir", "", "deployment data directory")
+	fs.String("key-file", "", "database root unlock key file (used to locate KEY-FILE.instance)")
+	fs.String("instance-key-file", "", "deployment registry root key file (default KEY-FILE.instance)")
+	realm := fs.String("realm", "", "current realm name")
+	to := fs.String("to", "", "new realm name")
+	confirm := fs.Bool("confirm", false, "confirm the registry change")
+	fs.String("env-file", "", "load only this dotenv file")
+	fs.Bool("no-env", false, "do not load .env files")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	reg, ddl, settings, err := openHostingRegistryForCLI(op, fs, args, true)
+	if err != nil {
+		return err
+	}
+	defer reg.Close()
+	defer ddl.Close()
+	if settings.Supplied["realm"] {
+		*realm = settings.Realm
+	}
+	if *realm == "" || *to == "" {
+		return cli.LocalMissing(op, "--realm and --to are required")
+	}
+	if !*confirm {
+		return nerr.New(nerr.InvalidArgument, op, "--confirm is required")
+	}
+	m := reg.Manifest()
+	realmID, err := resolveRealmID(m, *realm)
+	if err != nil {
+		return err
+	}
+	object := strings.ToLower(strings.TrimSpace(*realm)) + "->" + strings.ToLower(strings.TrimSpace(*to))
+	if err := reg.RenameRealm(realmID, *to); err != nil {
+		auditLocal(settings.DataDir, security.ActionRealmRename, object, err)
+		return err
+	}
+	auditLocal(settings.DataDir, security.ActionRealmRename, object, nil)
+	fmt.Printf("realm %s renamed to %s\n", strings.ToLower(strings.TrimSpace(*realm)), strings.ToLower(strings.TrimSpace(*to)))
 	return nil
 }
 
@@ -563,9 +617,8 @@ func setDatabaseStorageCap(args []string) error {
 // data-dir lock, so it fails Unavailable against a running nextsqld — a
 // state edit is an overwrite, applied on the next restart, same as a cap
 // edit; a live control-plane op to suspend/resume without a restart is the
-// same documented follow-on as live cap changes). Rename and drop/
-// tombstone are separate, still-open M3 items — not this increment's
-// scope.
+// same documented follow-on as live cap changes). Rename (M3-2) and
+// drop/tombstone (M3-3) are separate slices.
 func setDatabaseState(args []string, target hosting.State) error {
 	verb, past, action := "suspend", "suspended", security.ActionDatabaseSuspend
 	if target == hosting.StateActive {
@@ -642,8 +695,8 @@ func setDatabaseState(args []string, target hosting.State) error {
 // erroring; a prior run that crashed after StateDeleting but before
 // reclaiming files resumes cleanly (os.RemoveAll is idempotent, and
 // CanTransition treats StateDeleting -> StateDeleting as a valid no-op).
-// Rename (M3-2), realm-level delete, and reclaiming an *open* database's
-// live buffer/task-pool footprint remain separate, still-open M3 items.
+// Realm-level delete and reclaiming an *open* database's live
+// buffer/task-pool footprint remain separate, still-open items.
 func dropDatabase(args []string) error {
 	const op = "nextsql database drop"
 	fs := flag.NewFlagSet("database drop", flag.ContinueOnError)
@@ -728,6 +781,64 @@ func dropDatabase(args []string) error {
 	}
 	auditLocal(settings.DataDir, security.ActionDatabaseDrop, object, nil)
 	fmt.Printf("realm %s database %s dropped\n", strings.ToLower(strings.TrimSpace(*realm)), strings.ToLower(strings.TrimSpace(*database)))
+	return nil
+}
+
+// renameDatabase is M3-2's CLI surface for a durable database name change
+// within a realm. The stable ID, layout, and on-disk path stay put.
+// Offline exclusive-lock pattern matches suspend/drop. --confirm required.
+// A collision with another database in the same realm fails AlreadyExists;
+// deleting/tombstoned databases cannot be renamed.
+func renameDatabase(args []string) error {
+	const op = "nextsql database rename"
+	fs := flag.NewFlagSet("database rename", flag.ContinueOnError)
+	fs.String("data-dir", "", "deployment data directory")
+	fs.String("key-file", "", "database root unlock key file (used to locate KEY-FILE.instance)")
+	fs.String("instance-key-file", "", "deployment registry root key file (default KEY-FILE.instance)")
+	realm := fs.String("realm", "", "realm name")
+	database := fs.String("database", "", "current logical database name")
+	to := fs.String("to", "", "new logical database name")
+	confirm := fs.Bool("confirm", false, "confirm the registry change")
+	fs.String("env-file", "", "load only this dotenv file")
+	fs.Bool("no-env", false, "do not load .env files")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	reg, ddl, settings, err := openHostingRegistryForCLI(op, fs, args, true)
+	if err != nil {
+		return err
+	}
+	defer reg.Close()
+	defer ddl.Close()
+	if settings.Supplied["realm"] {
+		*realm = settings.Realm
+	}
+	if settings.Supplied["database"] {
+		*database = settings.Database
+	}
+	if *realm == "" || *database == "" || *to == "" {
+		return cli.LocalMissing(op, "--realm, --database, and --to are required")
+	}
+	if !*confirm {
+		return nerr.New(nerr.InvalidArgument, op, "--confirm is required")
+	}
+	m := reg.Manifest()
+	realmID, err := resolveRealmID(m, *realm)
+	if err != nil {
+		return err
+	}
+	databaseID, err := resolveDatabaseID(m, realmID, *database)
+	if err != nil {
+		return err
+	}
+	object := strings.ToLower(strings.TrimSpace(*realm)) + "/" + strings.ToLower(strings.TrimSpace(*database)) + "->" + strings.ToLower(strings.TrimSpace(*to))
+	if err := reg.RenameDatabase(realmID, databaseID, *to); err != nil {
+		auditLocal(settings.DataDir, security.ActionDatabaseRename, object, err)
+		return err
+	}
+	auditLocal(settings.DataDir, security.ActionDatabaseRename, object, nil)
+	fmt.Printf("realm %s database %s renamed to %s\n",
+		strings.ToLower(strings.TrimSpace(*realm)), strings.ToLower(strings.TrimSpace(*database)), strings.ToLower(strings.TrimSpace(*to)))
 	return nil
 }
 
@@ -2757,7 +2868,8 @@ Usage:
                [--realm NAME --database NAME] [--user NAME --password-file FILE]
                [--env-file PATH | --no-env]
   nextsql setup --data-dir DIR --key-file FILE [--preset conservative|balanced|high-performance|custom]
-               [--buffer-pages N] [--listen HOST:PORT [--tls-cert FILE --tls-key FILE]]
+               [--profile developer|production] [--buffer-pages N]
+               [--listen HOST:PORT [--tls-cert FILE --tls-key FILE]]
                [--user NAME --password-file FILE] [--config-in FILE] [--config-out FILE]
                [--json] [--dry-run] [--force] [--skip-init]
   nextsql lifecycle detect --data-dir DIR [--config FILE] [--json]
@@ -2777,12 +2889,16 @@ Usage:
                [--realm NAME --database NAME] [--batch-rows N] --confirm
   nextsql realm create --data-dir DIR --key-file FILE [--instance-key-file FILE]
                --realm NAME --database NAME --database-key-file FILE [--buffer-pages N]
+  nextsql realm rename --data-dir DIR --key-file FILE [--instance-key-file FILE]
+               --realm NAME --to NAME --confirm
   nextsql database create --data-dir DIR --key-file FILE [--instance-key-file FILE]
                --realm NAME --name NAME --database-key-file FILE [--buffer-pages N]
   nextsql database suspend|resume --data-dir DIR --key-file FILE [--instance-key-file FILE]
                --realm NAME --database NAME --confirm
   nextsql database drop --data-dir DIR --key-file FILE [--instance-key-file FILE]
                --realm NAME --database NAME --confirm
+  nextsql database rename --data-dir DIR --key-file FILE [--instance-key-file FILE]
+               --realm NAME --database NAME --to NAME --confirm
   nextsql login --idp NAME [--addr HOST:PORT] [--idp-config FILE]
 	           [--database NAME] [--realm NAME] [--no-browser] [--timeout DURATION]
 	           [--client-credentials [--client-secret-file FILE]]

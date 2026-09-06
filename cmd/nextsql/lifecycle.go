@@ -858,6 +858,7 @@ func lifecycleRepair(args []string) error {
 	instanceKeyFile := fs.String("instance-key-file", "", "deployment-registry key file (default KEY-FILE.instance)")
 	configPath := fs.String("config", "", "config file (default DATA-DIR/nextsql.conf)")
 	preset := fs.String("preset", "", "resource preset for a regenerated config: conservative | balanced | high-performance | custom")
+	profile := fs.String("profile", "", "deployment profile for a regenerated config: developer | production (default developer)")
 	bufferPages := fs.Int("buffer-pages", 0, "explicit buffer pool pages for a regenerated config / verification open")
 	listen := fs.String("listen", config.DefaultListenAddr, "listen address for a regenerated config")
 	tlsCert := fs.String("tls-cert", "", "TLS certificate for a regenerated remote listen address")
@@ -877,6 +878,10 @@ func lifecycleRepair(args []string) error {
 	presetVal, err := setup.ParsePreset(*preset)
 	if err != nil {
 		return err
+	}
+	profileVal, err := config.ParseDeploymentProfile(*profile)
+	if err != nil {
+		return cli.Validation("nextsql lifecycle repair", err.Error())
 	}
 
 	confPath := *configPath
@@ -986,6 +991,7 @@ func lifecycleRepair(args []string) error {
 			Base:            config.Default(),
 			Info:            info,
 			Preset:          presetVal,
+			Profile:         profileVal,
 			DataDir:         *dataDir,
 			KeyFile:         *keyFile,
 			InstanceKeyFile: instKey,

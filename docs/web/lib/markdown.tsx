@@ -201,6 +201,15 @@ export function Markdown({ source }: { source: string }) {
             return (
               <Tag key={i} id={block.id}>
                 {renderInline(block.text)}
+                {block.level > 1 ? (
+                  <a
+                    href={`#${block.id}`}
+                    className="heading-anchor"
+                    aria-label={`Link to ${stripInline(block.text)}`}
+                  >
+                    #
+                  </a>
+                ) : null}
               </Tag>
             );
           }
@@ -226,7 +235,7 @@ export function Markdown({ source }: { source: string }) {
           }
           case "table":
             return (
-              <Table key={i}>
+              <Table key={i} density="compact">
                 <TableHeader>
                   <tr>
                     {block.headers.map((h, j) => (

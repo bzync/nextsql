@@ -74,8 +74,11 @@ func TestSystemCapabilities(t *testing.T) {
 			t.Fatalf("capability %q = %v, want supported", name, row)
 		}
 	}
-	if row := caps["follower_reads"]; len(row) != 4 || !contains(row[2].Str, "BOUNDED") || contains(row[2].Str, "no routing") {
+	if row := caps["follower_reads"]; len(row) != 4 || row[1].Str != "supported" || !contains(row[2].Str, "BOUNDED") || contains(row[2].Str, "no routing") {
 		t.Fatalf("stale follower_reads capability: %v", row)
+	}
+	if row := caps["resource_groups"]; len(row) != 4 || row[1].Str != "supported" || contains(row[2].Str, "not yet wired") {
+		t.Fatalf("stale resource_groups capability: %v", row)
 	}
 	if row := caps["field_encryption_client"]; len(row) != 4 || !contains(row[2].Str, "Node.js") || !contains(row[2].Str, "PHP") {
 		t.Fatalf("stale field_encryption_client capability: %v", row)

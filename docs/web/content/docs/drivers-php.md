@@ -7,6 +7,8 @@ require 'drivers/php/autoload.php';
 
 $conn = NextSQL\Client::connect([
     'address' => '127.0.0.1:7210',
+    'realm' => 'default',
+    'database' => 'default',
     'user' => 'app',
     'password' => getenv('NEXTSQL_DATABASE_PASS'),
     'insecureNoTLS' => true,
@@ -30,3 +32,5 @@ $conn = NextSQL\Client::connect([
 ```
 
 For `--require-client-key`, pass `'key' => $clientRoot` as a 32-byte string. Never put keys or passwords in a URL.
+
+Follower-read routing uses `NextSQL\Cluster::connect`. See [High availability](/docs/ha). Hosted connections take `'realm'` and `'database'`.

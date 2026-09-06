@@ -14,7 +14,7 @@ export function CodePanel({
 
 export const HYBRID_SQL = `CREATE TABLE products (
     id          UUID PRIMARY KEY DEFAULT UUID(),
-    tenant_id   UUID NOT NULL,
+    account_id  UUID NOT NULL,
     name        STRING NOT NULL,
     description TEXT,
     price       DECIMAL(12,2),

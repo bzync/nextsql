@@ -11,6 +11,11 @@ const PRESETS: Array<[Params["preset"], string, string]> = [
   ["custom", "Custom", "Set the buffer pool size yourself, in pages."],
 ];
 
+const PROFILES: Array<[Params["profile"], string, string]> = [
+  ["production", "Production (recommended)", "Live-server defaults: disk watermarks, drain and statement timeouts, and a fail-closed preflight. Requires an administrator account. Unlock key must stay off the data volume."],
+  ["developer", "Developer", "Loopback-friendly local defaults. Skip-init and a missing administrator are allowed. Do not expose this listener on a network."],
+];
+
 // ServiceOption renders the "start at boot" checkbox. It stays disabled with
 // an explaining reason in every state except "a matching, already-installed
 // unit was found" — checking is asynchronous (still in flight), unsupported
@@ -94,8 +99,35 @@ export function Resources({
   return (
     <Card variant="elevated">
       <CardBody>
-        <StepHeader title="Resource preset" />
+        <StepHeader title="Deployment profile" />
         <Stack gap="md" style={{ marginTop: 20 }}>
+          <RadioGroup
+            label="Choose a deployment profile"
+            value={params.profile}
+            onChange={(v) => {
+              const profile = v as Params["profile"];
+              patch(profile === "production" ? { profile, skipInit: false } : { profile });
+              onCheck();
+            }}
+          >
+            {PROFILES.map(([value, label, desc]) => (
+              <Radio key={value} value={value} label={label} description={desc} />
+            ))}
+          </RadioGroup>
+          {params.profile === "production" ? (
+            <Alert variant="success">
+              Production preflight will refuse a key file inside the data directory, --skip-init,
+              and an install without an administrator. A tmpfs/ramfs data volume is warned, not blocked.
+            </Alert>
+          ) : (
+            <Alert variant="warning">
+              Developer profile is for local work. Use Production for any live deployment.
+            </Alert>
+          )}
+        </Stack>
+
+        <Divider label="Resources" spacing="md" />
+        <Stack gap="md">
           <RadioGroup
             label="Choose a resource preset"
             value={params.preset}
@@ -125,8 +157,13 @@ export function Resources({
           <Checkbox
             id="skipInit"
             label="Write the configuration file only — don't initialize the database now"
-            description={params.skipInit ? "You can initialize it later with `nextsql setup --skip-init=false` or `nextsql init` against the generated config." : undefined}
-            checked={params.skipInit}
+            description={
+              params.profile === "production"
+                ? "Not available on the production profile — a live install must initialize the database with an administrator."
+                : (params.skipInit ? "You can initialize it later with `nextsql setup --skip-init=false` or `nextsql init` against the generated config." : undefined)
+            }
+            checked={params.skipInit && params.profile !== "production"}
+            disabled={params.profile === "production"}
             onChange={(e) => {
               const skipInit = e.target.checked;
               patch(skipInit ? { skipInit, adminUser: "", adminPassword: "", enableService: false } : { skipInit });

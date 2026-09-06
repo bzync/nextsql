@@ -10,6 +10,8 @@ require "nextsql"
 
 conn = NextSQL.connect(NextSQL::Config.new(
   address: "127.0.0.1:7210",
+  realm: "default",
+  database: "default",
   user: "app",
   password: "s3cret",
   insecure_no_tls: true,
@@ -41,7 +43,10 @@ standard library); `Time` for `TIMESTAMPTZ`; an `Array` of numbers (or
 `NextSQL::Vector` for sparse vectors) for `VECTOR`/`SPARSEVECTOR`;
 `Hash`/`Array` for `JSON` (encoded as a JSON string parameter, decoded from
 the server's binary JSON on the way back); `NextSQL::Point`/`Box`/`Line`/
-`Polygon` for the spatial types.
+`Polygon` for the WGS84 shapes; `NextSQL::Interval` / `EnumValue` for
+temporal and `ENUM` values; `NextSQL::Protocol::Geometry` /
+`StructValue` / `MapValue` for `GEOMETRY`/`GEOGRAPHY` and collections.
+Field-encryption helpers are not in this driver.
 
 ## Cluster routing
 

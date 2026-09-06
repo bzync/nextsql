@@ -524,7 +524,7 @@ func Capabilities() [][]types.Value {
 		rowCap(fmt.Sprintf("system_schema_v%d", SchemaVersion), "supported", fmt.Sprintf("stable system table column contract v%d", SchemaVersion), version.String),
 		rowCap("system_show_aliases", "supported", "SHOW aliases backed by canonical system views", version.String),
 		rowCap("tasks", "supported", "durable TASK execution", "0.1.0"),
-		rowCap("hosting_isolation", "experimental", "realm/database registry foundation; row tenancy removed", version.String),
+		rowCap("hosting_isolation", "experimental", "realm/database registry foundation; selectable multi-engine routing is production-usable, hosted HA/registry DR remain open", version.String),
 		rowCap("transactions", "supported", "BEGIN/COMMIT/ROLLBACK", "0.1.0"),
 		rowCap("triggers", "supported", "TRIGGER RUN WORKFLOW", "0.1.0"),
 		rowCap("upsert", "supported", "UPSERT with RETURNING", "0.1.0"),
@@ -539,7 +539,7 @@ func Capabilities() [][]types.Value {
 		rowCap("partitions_range", "supported", "RANGE partitioning", "0.1.0"),
 		rowCap("partitions_hash", "supported", "HASH partitioning", "0.1.0"),
 		rowCap("partitions_list", "supported", "LIST partitioning", "0.1.0"),
-		rowCap("follower_reads", "experimental", "STRONG, BOUNDED, and STALE routing in the server and official drivers; replica health in system.replica_health", version.String),
+		rowCap("follower_reads", "supported", "STRONG, BOUNDED, and STALE routing in the server and official drivers; replica health in system.replica_health", version.String),
 		rowCap("rebuild_index_online", "supported", "REBUILD INDEX ONLINE — non-partitioned B+Tree/UNIQUE/JSON-path/spatial indexes; vector/full-text/partitioned indexes still use the blocking REBUILD INDEX", version.String),
 		rowCap("mtls", "supported", "mutual TLS service identity; SIGHUP trust bundle/CRL rotation forces reauthentication", version.String),
 		rowCap("token_credentials", "supported", "signed short-lived NSSC1 credentials with rotatable keysets and revocation (nextsql token)", version.String),
@@ -547,7 +547,7 @@ func Capabilities() [][]types.Value {
 		rowCap("audit_chain", "supported", "tamper-evident NSAC hash-chain audit log with optional NSAK Ed25519 signing and verification (nextsql audit)", version.String),
 		rowCap("storage_caps", "supported", "hosting realm/database storage caps enforced on the write path", version.String),
 		rowCap("quotas_view", "supported", "advisory system.quotas surfacing of hosting storage caps with connected-database usage/percent/over-cap", version.String),
-		rowCap("resource_groups", "experimental", "CREATE/ALTER/DROP RESOURCE GROUP workload-governance descriptors (system.resource_groups); durable and RBAC-gated, not yet wired to query admission/scheduling", version.String),
+		rowCap("resource_groups", "supported", "CREATE/ALTER/DROP RESOURCE GROUP workload governance; SET/RESET RESOURCE GROUP joins a session; MAX_CONCURRENCY/MEMORY/WORKERS and PRIORITY admission ordering are enforced", version.String),
 	}
 	// Ensure deterministic order already sorted by name; sort to guarantee.
 	sort.Slice(rows, func(i, j int) bool {

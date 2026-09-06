@@ -152,7 +152,7 @@ multi-realm/multi-database routing is complete, with realm-scoped auth, bounded 
 handles/idle eviction, a shared buffer budget, and shared task workers/scheduling. M3
 suspend/resume and offline managed-database drop have landed; rename, independently
 addressed backup/PITR/key lifecycle, registry DR/Raft, and hosted HA remain open. Track
-its milestone state separately from the P0–P30 phase list.
+its milestone state separately from the P0–P29 phase list.
 
 ## Repository layout
 
@@ -203,7 +203,7 @@ correctness → durability → security → integrity → availability
 
 Concretely: never weaken fsync/WAL durability for benchmarks; never silently reduce ANN
 recall for latency; never weaken tenant isolation for convenience; never bypass RBAC
-through any surface (NextSQL Admin's any mode, CLI, drivers, Intelligence); never bypass the
+through any surface (NextSQL Admin's any mode, CLI, drivers); never bypass the
 parser/binder/planner to make SQL syntax work quickly.
 
 **Before modifying code**, identify: owning phase (`TODO.md`), persistent-format impact,

@@ -49,12 +49,12 @@ $conn = NextSQL\Client::connect([
   committed result; different-request reuse is `conflict`.
 - Follower reads use the additive `SetReadConsistency` frame (mode +
   `MAX STALENESS`) and the `NodeStatus` frame (key-free replica health). Every
-  official driver ships a cluster-routing client (Go `nextsql.Cluster`, JS
-  `connectCluster`, PHP `NextSQL\Cluster`) that routes eligible reads to a
-  healthy follower; the server enforces every barrier regardless. See
-  [HA](/docs/ha).
-- Initialized deployments validate a non-empty Hello database against the
-  registered logical default; empty selects that default for v1 compatibility.
-  This does not yet route among multiple engines.
+  official driver ships a cluster-routing client (Go `OpenCluster`, JS
+  `connectCluster`, PHP `NextSQL\Cluster::connect`, Python and Ruby
+  `connect_cluster`) that routes eligible reads to a healthy follower; the
+  server enforces every barrier regardless. See [HA](/docs/ha).
+- Initialized deployments select a realm and database on Hello. An empty
+  database name selects the registered default for v1 compatibility. See
+  [Hosting](/docs/hosting).
 
 See [Drivers](/docs/drivers) for language-specific examples and [TLS](/docs/tls) for unlock-over-TLS (`TypeUnlock`).

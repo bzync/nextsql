@@ -28,8 +28,8 @@ export function Logo({
       className={`inline-flex items-center gap-2 text-foreground ${className}`}
     >
       <Mark />
-      <span className="font-brand text-[14px] font-bold leading-none tracking-normal">
-        Next<span className="text-[13px] font-semibold text-blue-500 dark:text-blue-400">SQL</span>
+      <span className="text-[14.5px] font-semibold leading-none tracking-[-0.02em]">
+        NextSQL
       </span>
     </Link>
   );

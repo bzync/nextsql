@@ -15,6 +15,10 @@ func TestParamsValidate(t *testing.T) {
 		{"missing data dir", Params{KeyFile: "/k"}, true},
 		{"missing key file", Params{DataDir: "/d"}, true},
 		{"bad preset", Params{DataDir: "/d", KeyFile: "/k", Preset: "turbo"}, true},
+		{"bad profile", Params{DataDir: "/d", KeyFile: "/k", Profile: "staging"}, true},
+		{"production skip-init rejected", Params{DataDir: "/d", KeyFile: "/k", Profile: "production", SkipInit: true}, true},
+		{"production ok", Params{DataDir: "/d", KeyFile: "/k", Profile: "production"}, false},
+		{"developer skip-init ok", Params{DataDir: "/d", KeyFile: "/k", Profile: "developer", SkipInit: true}, false},
 		{"custom without buffer pages", Params{DataDir: "/d", KeyFile: "/k", Preset: "custom"}, true},
 		{"custom with buffer pages ok", Params{DataDir: "/d", KeyFile: "/k", Preset: "custom", BufferPages: 64}, false},
 		{"user without password", Params{DataDir: "/d", KeyFile: "/k", AdminUser: "app"}, true},
@@ -42,6 +46,7 @@ func TestParamsValidate(t *testing.T) {
 func TestParamsToArgsNeverContainsPassword(t *testing.T) {
 	p := Params{
 		DataDir: "/data", KeyFile: "/key", Preset: "custom", BufferPages: 128,
+		Profile:   "production",
 		AdminUser: "app", AdminPassword: "super-secret-password",
 		Realm: "r1", Database: "db1",
 	}
@@ -53,7 +58,7 @@ func TestParamsToArgsNeverContainsPassword(t *testing.T) {
 	if !strings.Contains(joined, "/tmp/pwfile") {
 		t.Fatalf("argv missing password-file path: %v", args)
 	}
-	want := []string{"--dry-run", "--data-dir", "/data", "--key-file", "/key", "--preset", "custom", "--buffer-pages", "128", "--user", "app", "--realm", "r1", "--database", "db1"}
+	want := []string{"--dry-run", "--data-dir", "/data", "--key-file", "/key", "--preset", "custom", "--profile", "production", "--buffer-pages", "128", "--user", "app", "--realm", "r1", "--database", "db1"}
 	for _, w := range want {
 		if !strings.Contains(joined, w) {
 			t.Errorf("args missing %q: %v", w, args)

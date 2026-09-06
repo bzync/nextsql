@@ -14,7 +14,7 @@ export function SiteFooter() {
           </p>
         </div>
         <div className="md:col-span-3">
-          <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-faint">Docs</p>
+          <p className="kicker">Docs</p>
           <ul className="mt-3 space-y-2 text-sm">
             <li>
               <Link href="/docs/introduction" className="text-muted transition-colors hover:text-foreground">
@@ -36,10 +36,15 @@ export function SiteFooter() {
                 Architecture
               </Link>
             </li>
+            <li>
+              <Link href="/docs/admin" className="text-muted transition-colors hover:text-foreground">
+                Admin
+              </Link>
+            </li>
           </ul>
         </div>
         <div className="md:col-span-3">
-          <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-faint">Product</p>
+          <p className="kicker">Product</p>
           <ul className="mt-3 space-y-2 text-sm">
             <li>
               <Link href="/download" className="text-muted transition-colors hover:text-foreground">
@@ -52,14 +57,14 @@ export function SiteFooter() {
               </Link>
             </li>
             <li>
-              <Link href="/docs/quick-start" className="text-muted transition-colors hover:text-foreground">
-                Quick start
-              </Link>
-            </li>
-            <li>
               <Link href="/docs/sql" className="text-muted transition-colors hover:text-foreground">
                 SQL dialect
               </Link>
+            </li>
+            <li>
+              <a href={site.github} className="text-muted transition-colors hover:text-foreground" target="_blank" rel="noreferrer">
+                GitHub
+              </a>
             </li>
             <li className="font-mono text-xs text-faint">{site.version}</li>
           </ul>

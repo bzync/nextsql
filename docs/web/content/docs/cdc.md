@@ -27,9 +27,11 @@ commit_lsn, resume_token, lag_lsn, before_image, after_image
 ```
 
 V1 identity is key-based: primary keys use hexadecimal NextSQL key encoding,
-and row images are disabled by default. Opt in for future changes with
+and row images are disabled by default. Opt in with
 `ALTER TABLE orders SET CDC IMAGES FULL`; restore the bounded default with
-`ALTER TABLE orders SET CDC IMAGES KEYS`. Full mode adds before images for
+`ALTER TABLE orders SET CDC IMAGES KEYS`. The `tenant` / `old_tenant` result
+columns are leftover encoding, not authorization — streams are scoped to the
+connection's selected database. Full mode adds before images for
 UPDATE/DELETE and after images for INSERT/UPDATE as hex `NSRW` values.
 `SUBSCRIBE` cannot run in an explicit transaction.
 Cancel the query context before closing the continuous result.

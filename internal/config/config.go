@@ -44,19 +44,23 @@ const (
 
 // Config holds process settings. Encryption keys are never represented here.
 type Config struct {
-	DataDir          string
-	KeyFile          string
-	InstanceKeyFile  string
-	AuthFile         string
-	ListenAddr       string
-	LogLevel         string
-	TLSCert          string
-	TLSKey           string
-	TLSClientCA      string
-	TLSClientCRL     string
-	TokenKeyset      string
-	TokenRevocations string
-	TokenAudience    string
+	DataDir         string
+	KeyFile         string
+	InstanceKeyFile string
+	AuthFile        string
+	ListenAddr      string
+	LogLevel        string
+	// DeploymentProfile is "developer" or "production". Empty is treated as
+	// developer for configs written before this field existed. Production
+	// fails closed at nextsqld start unless CheckProduction passes.
+	DeploymentProfile string
+	TLSCert           string
+	TLSKey            string
+	TLSClientCA       string
+	TLSClientCRL      string
+	TokenKeyset       string
+	TokenRevocations  string
+	TokenAudience     string
 	// TokenIdentitySourceHints maps verified NSTK key ids to an audit-only
 	// identity source. The only accepted source is "oidc". The map is never
 	// consulted until after the credential signature verifies.
@@ -333,6 +337,12 @@ func loadFrom(r io.Reader) (Config, error) {
 			cfg.ListenAddr = v
 		case "log_level":
 			cfg.LogLevel = v
+		case "deployment_profile":
+			profile, err := ParseDeploymentProfile(v)
+			if err != nil {
+				return Config{}, err
+			}
+			cfg.DeploymentProfile = profile
 		case "buffer_pages":
 			n, err := strconv.Atoi(v)
 			if err != nil || n < 1 {
@@ -594,6 +604,7 @@ func (c Config) Marshal() []byte {
 	str("auth_file", c.AuthFile)
 	str("listen_addr", c.ListenAddr)
 	str("log_level", c.LogLevel)
+	str("deployment_profile", c.DeploymentProfile)
 	num("buffer_pages", c.BufferPages)
 
 	str("tls_cert", c.TLSCert)
@@ -719,7 +730,7 @@ var settableKeys = func() map[string]bool {
 	// bool true — so Marshal emits one line per settable key.
 	probe := Config{
 		DataDir: "x", KeyFile: "x", InstanceKeyFile: "x", AuthFile: "x",
-		ListenAddr: "x", LogLevel: "x", BufferPages: 1,
+		ListenAddr: "x", LogLevel: "x", DeploymentProfile: "x", BufferPages: 1,
 		TLSCert: "x", TLSKey: "x", TLSClientCA: "x", TLSClientCRL: "x", RequireClientKey: true,
 		TokenKeyset: "x", TokenRevocations: "x", TokenAudience: "x",
 		TokenIdentitySourceHints: map[uint32]string{1: "x"},
@@ -1040,6 +1051,11 @@ func (c Config) Validate() error {
 	case "debug", "info", "warn", "error":
 	default:
 		return nerr.New(nerr.InvalidArgument, "config.Validate", "log_level must be debug, info, warn, or error")
+	}
+	if p := strings.TrimSpace(c.DeploymentProfile); p != "" {
+		if _, err := ParseDeploymentProfile(p); err != nil {
+			return nerr.New(nerr.InvalidArgument, "config.Validate", "deployment_profile must be developer or production")
+		}
 	}
 	if (c.RaftBind != "" || c.NodeID != "") && (c.RaftBind == "" || c.NodeID == "") {
 		return nerr.New(nerr.InvalidArgument, "config.Validate", "node_id and raft_bind must be set together")

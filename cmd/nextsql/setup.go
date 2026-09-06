@@ -39,6 +39,7 @@ func setupCmd(args []string) error {
 	keyFile := fs.String("key-file", "", "root unlock key file (created if missing; keep it off the data volume)")
 	instanceKeyFile := fs.String("instance-key-file", "", "deployment registry root key file (default KEY-FILE.instance)")
 	preset := fs.String("preset", "", "resource preset: conservative | balanced | high-performance | custom (default balanced)")
+	profile := fs.String("profile", "", "deployment profile: developer | production (default developer)")
 	bufferPages := fs.Int("buffer-pages", 0, "explicit buffer pool pages (overrides the preset)")
 	listen := fs.String("listen", config.DefaultListenAddr, "listen address; a non-loopback address requires --tls-cert/--tls-key")
 	logLevel := fs.String("log-level", config.DefaultLogLevel, "log level: debug | info | warn | error")
@@ -70,6 +71,13 @@ func setupCmd(args []string) error {
 	if err != nil {
 		return err
 	}
+	profileVal, err := config.ParseDeploymentProfile(*profile)
+	if err != nil {
+		return cli.Validation("nextsql setup", err.Error())
+	}
+	if profileVal == config.ProfileProduction && *skipInit {
+		return cli.Validation("nextsql setup", "production profile cannot use --skip-init: initialize the database with --user/--password-file")
+	}
 
 	base := config.Default()
 	if *configIn != "" {
@@ -94,6 +102,7 @@ func setupCmd(args []string) error {
 		Base:            base,
 		Info:            info,
 		Preset:          presetVal,
+		Profile:         profileVal,
 		DataDir:         *dataDir,
 		KeyFile:         *keyFile,
 		InstanceKeyFile: *instanceKeyFile,
@@ -137,8 +146,13 @@ func setupCmd(args []string) error {
 		InstanceKey:       plan.InstanceKeyFile,
 		InstanceKeyExists: instanceKeyExists,
 		AdminUser:         plan.AdminUser,
+		Profile:           plan.Profile,
 		Warnings:          append(append([]string{}, plan.Warnings...), keyFileAdvisories(*keyFile, keyFileExists, plan.InstanceKeyFile, instanceKeyExists)...),
 		DryRun:            *dryRun,
+	}
+
+	if !*dryRun && profileVal == config.ProfileProduction && *user == "" {
+		return cli.Validation("nextsql setup", "production profile requires --user and --password-file")
 	}
 
 	if *dryRun {
@@ -325,6 +339,7 @@ type setupResult struct {
 	InstanceKey       string       `json:"instance_key_file"`
 	InstanceKeyExists bool         `json:"instance_key_exists"`
 	AdminUser         string       `json:"admin_user,omitempty"`
+	Profile           string       `json:"profile"`
 	Initialized       bool         `json:"initialized"`
 	InitOutput        string       `json:"init_output,omitempty"`
 	Health            *setupHealth `json:"health,omitempty"`
@@ -483,6 +498,7 @@ func emitSetup(r setupResult, jsonOut bool) error {
 	fmt.Fprintf(w, "  data volume   %s free of %s (%s)\n",
 		humanIEC(r.Hardware.DiskFreeBytes), humanIEC(r.Hardware.DiskTotalBytes), fs)
 	fmt.Fprintf(w, "\nresource plan\n")
+	fmt.Fprintf(w, "  profile       %s\n", r.Profile)
 	fmt.Fprintf(w, "  preset        %s\n", r.Recommendation.Preset)
 	fmt.Fprintf(w, "  buffer pool   %d pages (%s)\n", r.Recommendation.BufferPages, humanIEC(r.Recommendation.BufferBytes))
 	fmt.Fprintf(w, "  rationale     %s\n", r.Recommendation.Rationale)

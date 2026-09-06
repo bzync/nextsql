@@ -1,12 +1,12 @@
 # Introduction
 
-NextSQL is a high-performance, encrypted-by-default multimodel database. Relational SQL, native JSON, vector search, full-text search, and geospatial types share **one ACID engine**, one WAL, and one query optimizer.
+NextSQL is a high-performance, encrypted-by-default multimodel database. Relational SQL, native JSON, vector search, full-text search, geospatial types, and nested collections share **one ACID engine**, one WAL, and one query optimizer.
 
 It is a new database. It is not PostgreSQL, MySQL, MongoDB, Elasticsearch, or a vector-store compatibility layer. It has its own storage format, SQL dialect, wire protocol (**NSQL v1**), and official drivers.
 
-Install the `nextsql` and `nextsqld` binaries, initialize a data directory, and start serving NSQL. Storage, WAL, MVCC, SQL, the optimizer, JSON, full-text, vectors, hybrid plans, security, backup/PITR/export, and Raft HA are in the engine.
+Install the `nextsql` and `nextsqld` binaries, initialize a data directory, and start serving NSQL. Storage, WAL, MVCC, SQL, the optimizer, JSON, full-text, vectors, hybrid plans, workflows, CDC, partitioning, security, backup/PITR/export, and Raft HA are in the engine.
 
-Hard limits and unimplemented SQL are listed under [Limits](/docs/limits).
+This site documents **0.1.0-dev**. A live install uses `nextsql setup --profile production`. NextSQL Admin Setup and Operations are usable; Studio is in progress. Treat the release as an engine under measurement until you have run `nextsql-bench --slo` and the crash/HA suites on your hardware. Hard limits and unimplemented SQL are listed under [Limits](/docs/limits).
 
 ## What you can do
 
@@ -28,9 +28,11 @@ The write path for that row is the same WAL, MVCC, encryption, and crash recover
 
 | Binary | Role |
 |---|---|
-| `nextsql` | CLI: init, exec, migrate, backup, restore, verify, export, import, diagnose, status, cluster |
+| `nextsql` | CLI: init, setup, lifecycle, exec, migrate, backup, restore, verify, export, import, diagnose, status, cluster, hosting, realm, database, audit, token, login |
 | `nextsqld` | Server. Speaks NSQL v1 on `--listen` (default `127.0.0.1:7210`) |
 | `nextsql-bench` | Official measurements. Encryption, WAL, and fsync stay on |
+| `nextsql-auth-broker` | Optional OIDC token-exchange broker. `nextsqld` never talks to an IdP |
+| `nextsql-admin` | NextSQL Admin: Setup, Operations, and Studio in one loopback web UI |
 
 ## Non-negotiable rules
 
@@ -48,8 +50,8 @@ Correctness, durability, security, integrity, availability, predictable latency,
 
 ## How to read these docs
 
-1. [Install](/docs/install) and the [quick start](/docs/quick-start) get a local instance running.
-2. The SQL chapters cover the dialect, each data model, and transactions.
-3. Operate covers users, CLI, migrations, TLS, backup, export, HA, and benches.
-4. Drivers speak NSQL v1 from Go, Node, Bun, Deno, and PHP.
+1. [Install](/docs/install), [Docker](/docs/docker), and the [quick start](/docs/quick-start) get a local instance running.
+2. The SQL chapters cover the dialect, each data model, workflows, and transactions.
+3. Operate covers users, CLI, migrations, TLS, backup, export, HA, hosting, Admin, and benches.
+4. Drivers speak NSQL v1 from Go, Node, Bun, Deno, PHP, Python, and Ruby.
 5. Internals document architecture, the wire protocol, and current limits.

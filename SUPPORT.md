@@ -53,8 +53,7 @@ Current open product work includes:
   silent and cross-platform execution, and accessibility validation;
 - production-gating the broader multi-database hosting track beyond completed
   M2 routing and landed M3 suspend/drop;
-- NextSQL Admin's Studio mode (NextSQL Studio);
-- NextSQL Intelligence/RAG.
+- NextSQL Admin's Studio mode (NextSQL Studio).
 
 ---
 

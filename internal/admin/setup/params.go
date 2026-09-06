@@ -19,6 +19,12 @@ var validPresets = map[string]bool{
 	"custom":           true,
 }
 
+var validProfiles = map[string]bool{
+	"":           true, // empty means "let nextsql setup default to developer"
+	"developer":  true,
+	"production": true,
+}
+
 // Params is the one shape shared by /api/v1/plan (dry-run preview) and
 // /api/v1/install (the real thing) — the Summary screen renders exactly what
 // Install will do because both calls build their `nextsql setup` argv from
@@ -39,6 +45,7 @@ type Params struct {
 	ConfigOut string `json:"configOut"`
 
 	Preset      string `json:"preset"`      // "" | conservative | balanced | high-performance | custom
+	Profile     string `json:"profile"`     // "" | developer | production
 	BufferPages int    `json:"bufferPages"` // only meaningful when Preset == "custom"
 
 	AdminUser     string `json:"adminUser"`
@@ -93,6 +100,12 @@ func (p Params) Validate() error {
 	if !validPresets[p.Preset] {
 		return nerr.New(nerr.InvalidArgument, "setup.Params", "preset must be one of: conservative, balanced, high-performance, custom")
 	}
+	if !validProfiles[p.Profile] {
+		return nerr.New(nerr.InvalidArgument, "setup.Params", "profile must be one of: developer, production")
+	}
+	if p.Profile == "production" && p.SkipInit {
+		return nerr.New(nerr.InvalidArgument, "setup.Params", "production profile cannot skip initialization")
+	}
 	if p.Preset == "custom" && p.BufferPages <= 0 {
 		return nerr.New(nerr.InvalidArgument, "setup.Params", "bufferPages must be positive when preset is custom")
 	}
@@ -137,6 +150,9 @@ func (p Params) toArgs(dryRun bool, passwordFile string) []string {
 	}
 	if p.Preset != "" {
 		args = append(args, "--preset", p.Preset)
+	}
+	if p.Profile != "" {
+		args = append(args, "--profile", p.Profile)
 	}
 	if p.Preset == "custom" && p.BufferPages > 0 {
 		args = append(args, "--buffer-pages", strconv.Itoa(p.BufferPages))

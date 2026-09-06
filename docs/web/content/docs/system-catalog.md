@@ -18,9 +18,23 @@ Capability consumers can query the supported `system_schema_v3` row in
 `system_show_aliases` advertises the convenience syntax.
 
 Catalog/storage tables (always visible, or filtered to tables you can
-`SELECT`): `capabilities`, `tables`, `columns`, `indexes`, `table_stats`,
-`index_stats`, `partitions`, `storage`, `replication` (alias `raft`),
-`replica_health`, `workflows`, `tasks`.
+`SELECT`): `capabilities`, `tables`, `columns`, `indexes`, `foreign_keys`,
+`table_ddl`, `triggers`, `schedules`, `table_stats`, `index_stats`,
+`partitions`, `storage`, `replication` (alias `raft`), `replica_health`,
+`workflows`, `tasks`.
+
+`system.foreign_keys` is one row per referencing column. `system.table_ddl`
+renders canonical `CREATE TABLE` / `CREATE INDEX`. `system.triggers` and
+`system.schedules` are the catalog objects behind [Workflows](/docs/workflows).
+
+`system.capabilities` rows that matter for current status:
+
+| Name | Status |
+|---|---|
+| `follower_reads` | `supported` |
+| `resource_groups` | `supported` |
+| `field_encryption_client` | `experimental` (no searchable/deterministic mode, by design) |
+| `hosting_isolation` | `experimental` (selectable routing is usable; hosted HA / registry DR remain open) |
 
 `system.storage.database` is the configured logical database name (`default`
 for unnamed embedded use), never the engine's filesystem path.
@@ -52,8 +66,27 @@ Security administration tables (admin-only — a non-admin sees zero rows):
 - `grants` — one row per persisted grant (`grantee, privilege, scope,
   object`); `privilege`/`scope` are rendered in `GRANT`/`REVOKE` grammar
   spelling.
+- `tls` — one row describing the live listener certificate (never a private
+  key or listen address).
+- `key_versions` — envelope rotation state (`kek`, `master`, and each DEK
+  domain). Never carries key material. Empty when no persistent envelope is
+  attached.
+- `audit_verify` / `audit_log` — bounded re-read of `nextsql.audit` (hash
+  chain, optional signatures; last 200 log rows).
 
-Workload governance (Phase 27, admin-only): `resource_groups` — one row per
+Operations tables (admin-only unless noted): `config` (running vs file
+settings; network addresses redacted), `metrics`, `server_log` (in-memory
+tail, not a durable store), `backups` (verified backups in `backup_dir`;
+needs `BACKUP` or `ADMIN`). `tls`, `config`, `metrics`, `server_log`, and
+`backups` are wired on the legacy/non-hosted engine that `nextsqld` opened
+at start. A session that routed to a hosted managed database sees those
+tables empty / “not attached”.
+
+Hosted-deployment tables (admin-only; empty on a legacy/non-hosted
+deployment): `realms`, `databases`, `quotas`. `quotas` is advisory — the
+write path still fail-closes at the storage cap.
+
+Workload governance (admin-only): `resource_groups` — one row per
 `CREATE RESOURCE GROUP` descriptor (`name, owner, max_concurrency,
 memory_bytes, workers, priority`; zero = unset/unbounded). Catalog-persisted
 and durable, and **enforced**: `SET RESOURCE GROUP name` (needs `USAGE`,
@@ -61,8 +94,9 @@ granted via `GRANT USAGE ON RESOURCE GROUP name TO grantee`) / `RESET
 RESOURCE GROUP` assign/clear a session's group. A non-zero `MAX_CONCURRENCY`
 adds a second admission gate on top of — never instead of — the process-wide
 one; non-zero `WORKERS`/`MEMORY` override the session's per-query limits.
-`PRIORITY` is stored but not yet enforced. See `docs/sql.md` "RESOURCE
-GROUP".
+`PRIORITY` is enforced on the process-wide admission gate only (ordering,
+never preemption). See `docs/sql.md` "RESOURCE GROUP". `system.capabilities`
+row `resource_groups` is `supported`.
 
 Convenience commands use the same RBAC-filtered sources:
 

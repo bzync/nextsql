@@ -5,6 +5,11 @@ nextsql init     --data-dir DIR --key-file FILE [--instance-key-file FILE]
                  [--realm NAME --database NAME]
                  [--user NAME --password-file FILE] [--buffer-pages N]
                  [--env-file PATH | --no-env]
+nextsql setup    --data-dir DIR --key-file FILE
+                 [--profile developer|production]
+                 [--preset conservative|balanced|high-performance|custom]
+                 [--user NAME --password-file FILE] [--json] [--dry-run]
+nextsql lifecycle detect|preflight|backup-config|upgrade|repair|uninstall
 nextsql hosting adopt --data-dir DIR --key-file FILE [--instance-key-file FILE]
                  [--realm NAME --database NAME] --confirm
                  [--env-file PATH | --no-env]
@@ -21,14 +26,24 @@ nextsql hosting set-database-cap --data-dir DIR --key-file FILE
                  [--instance-key-file FILE] --realm NAME --database NAME
                  [--realm-secret-file FILE] --cap-bytes N --confirm
 nextsql hosting show --data-dir DIR --key-file FILE [--instance-key-file FILE]
+nextsql realm create --data-dir DIR --key-file FILE
+                 --realm NAME --database NAME --database-key-file FILE
+nextsql realm rename --data-dir DIR --key-file FILE
+                 --realm NAME --to NAME --confirm
+nextsql database create --data-dir DIR --key-file FILE
+                 --realm NAME --name NAME --database-key-file FILE
+nextsql database suspend|resume|drop --data-dir DIR --key-file FILE
+                 --realm NAME --database NAME --confirm
+nextsql database rename --data-dir DIR --key-file FILE
+                 --realm NAME --database NAME --to NAME --confirm
 nextsql login    --idp NAME [--addr HOST:PORT] [--idp-config FILE]
                  [--database NAME] [--realm NAME] [--no-browser]
                  [--client-credentials [--client-secret-file FILE]]
 nextsql logout   (--idp NAME --addr HOST:PORT | --all)
 nextsql whoami   --idp NAME [--addr HOST:PORT] [--idp-config FILE] [--json]
 nextsql exec     [--addr HOST:PORT] [--user NAME] [--password-file FILE | --idp NAME]
-                 [--database NAME] [--tls-ca FILE | --insecure]
-                 [--env-file PATH | --no-env]
+                 [--realm NAME] [--database NAME] [--tls-ca FILE | --insecure]
+                 [--env-file PATH | --no-env] [--json]
                  [-c SQL | SQL]
 nextsql migrate  status|pending|version|validate|create|up|down|force|repair
                  [--dir DIR] [--addr HOST:PORT] [--user NAME]
@@ -47,8 +62,10 @@ nextsql status   [--addr HOST:PORT] [--user NAME] [--password-file FILE | --idp 
                  [--database NAME] [--tls-ca FILE | --insecure]
                  [--env-file PATH | --no-env]
 nextsql status --local [--data-dir DIR] [--key-file FILE]
-nextsql cluster status --data-dir DIR
+nextsql cluster status --data-dir DIR [--json]
+nextsql cluster transfer-leader|drain|maintenance|reconcile
 nextsql token    keygen|rotate|retire|list-keys|export-public|mint|revoke|verify
+nextsql audit    keygen|rotate|retire|list-keys|export-public|verify
 nextsql version
 nextsql help
 ```
@@ -102,12 +119,31 @@ secret file. Opaque-token introspection is not implemented.
 
 `--out` for backup and export must not already exist. The tool writes a temporary directory, verifies, then publishes atomically.
 
+`nextsql setup` is the non-interactive first-run path: it sizes a buffer pool
+from a resource preset, writes a validated `nextsql.conf`, initializes the
+store the same way `nextsql init` does, and verifies the result. `--profile
+production` (Setup-mode GUI default) fail-closes on a key in the data
+directory and on skip-init / missing administrator; the CLI default is
+`developer`. See [Install](/docs/install) and [Admin](/docs/admin).
+
+`nextsql lifecycle` covers detect / preflight / backup-config / upgrade /
+repair / uninstall for packaged installs. `upgrade` refuses to run while a
+server holds the data-directory lock; on a Raft member pass `--cluster-node`
+so the rolling procedure (transfer leadership → drain → stop → upgrade) is
+enforced.
+
 `nextsql init` creates an encrypted/versioned deployment registry and a
 separate external registry root. `--instance-key-file` defaults to
 `KEY-FILE.instance`; keep both roots off the data volume. `--realm` and
-`--database` default to `default`. The current M1 foundation registers and
-verifies this logical default, but one `nextsqld` still serves one database
-engine; selectable multi-database routing is not implemented yet.
+`--database` default to `default`. One `nextsqld` routes Hello to the
+selected registered database; see [Hosting](/docs/hosting).
+
+`nextsql audit` manages the tamper-evident `NSAC` hash chain and optional
+`NSAK` Ed25519 signatures on `nextsql.audit`. `verify` detects a tampered,
+reordered, or deleted line.
+
+`nextsql cluster transfer-leader`, `drain`, `maintenance enable|disable`, and
+`reconcile confirm` are the operational cluster verbs; `--json` is accepted.
 
 `nextsql hosting adopt` is the explicit offline path for an existing
 single-database `DATA-DIR/nextsql.db`. Stop `nextsqld` first. The command holds
@@ -173,10 +209,9 @@ NEXTSQL_SERVER_PASSWORD_FILE=/run/secrets/nextsql-admin
 
 `NEXTSQL_DATABASE` is the logical database created by `nextsql init`, adopted
 by `nextsql hosting adopt`, and selected in the client Hello. `NEXTSQL_REALM_NAME`
-currently configures init/adoption; selectable realm routing waits for protocol
-v2. `NEXTSQL_HOSTING_CONFIRM=true` may supply the explicit adoption confirmation
-for non-interactive provisioning. `NEXTSQL_ADDR` supplies `nextsqld`'s listen
-address as well as the client address.
+is the realm for init/adoption and for Hello routing. `NEXTSQL_HOSTING_CONFIRM=true`
+may supply the explicit adoption confirmation for non-interactive provisioning.
+`NEXTSQL_ADDR` supplies `nextsqld`'s listen address as well as the client address.
 
 Server/bootstrap credentials are deliberately distinct:
 `NEXTSQL_SERVER_USER` plus either `NEXTSQL_SERVER_PASSWORD_FILE` (recommended)

@@ -14,12 +14,50 @@
 }
 .nss-layout {
   display: grid;
-  grid-template-columns: minmax(190px, 0.7fr) minmax(420px, 1.8fr) minmax(280px, 1fr);
-  gap: 16px;
-  align-items: start;
+  grid-template-columns: var(--nss-explorer-w, 260px) 24px minmax(360px, 1fr) 24px var(--nss-inspector-w, 360px);
+  gap: 0;
+  align-items: stretch;
   min-width: 0;
 }
+.nss-layout--no-explorer {
+  grid-template-columns: minmax(360px, 1fr) 24px var(--nss-inspector-w, 360px);
+}
+.nss-layout--no-inspector {
+  grid-template-columns: var(--nss-explorer-w, 260px) 24px minmax(360px, 1fr);
+}
+.nss-layout--no-explorer.nss-layout--no-inspector {
+  grid-template-columns: minmax(0, 1fr);
+}
 .nss-layout > * { min-width: 0; }
+.nss-splitter {
+  width: 24px;
+  min-width: 24px;
+  min-height: 24px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  cursor: col-resize;
+  touch-action: none;
+  user-select: none;
+  position: relative;
+}
+.nss-splitter::after {
+  content: "";
+  position: absolute;
+  top: 12px;
+  bottom: 12px;
+  left: 10px;
+  right: 10px;
+  border-radius: 2px;
+  background: var(--color-border);
+}
+.nss-splitter:hover::after,
+.nss-splitter:focus-visible::after { background: var(--color-accent-500); }
+.nss-splitter:focus-visible {
+  outline: 2px solid var(--color-accent-500);
+  outline-offset: 2px;
+}
 .nss-explorer,
 .nss-editor-card,
 .nss-inspector { overflow: hidden; }
@@ -642,8 +680,12 @@
 .nss-loading { min-height: 48px; }
 
 @media (max-width: 1279px) {
-  .nss-layout { grid-template-columns: minmax(190px, 0.7fr) minmax(440px, 1.6fr); }
+  .nss-layout { grid-template-columns: var(--nss-explorer-w, 260px) 24px minmax(360px, 1fr); }
+  .nss-layout--no-explorer,
+  .nss-layout--no-explorer.nss-layout--no-inspector { grid-template-columns: minmax(0, 1fr); }
+  .nss-layout--no-inspector { grid-template-columns: var(--nss-explorer-w, 260px) 24px minmax(360px, 1fr); }
   .nss-inspector { grid-column: 1 / -1; }
+  .nss-splitter-inspector { display: none; }
 }
 
 @media (max-width: 799px) {
@@ -652,8 +694,12 @@
   .nss-editor-header,
   .nss-inspector-header,
   .nss-explorer-header { align-items: flex-start; flex-direction: column; }
-  .nss-layout { grid-template-columns: minmax(0, 1fr); }
+  .nss-layout,
+  .nss-layout--no-explorer,
+  .nss-layout--no-inspector,
+  .nss-layout--no-explorer.nss-layout--no-inspector { grid-template-columns: minmax(0, 1fr); }
   .nss-inspector { grid-column: auto; }
+  .nss-splitter { display: none; }
   .nss-object-list,
   .nss-tree { max-height: 240px; }
 }
@@ -661,6 +707,7 @@
 @media (prefers-contrast: more) {
   .nss-toolbar,
   .nss-object-button[aria-pressed="true"] { border-width: 2px; }
+  .nss-splitter::after { left: 9px; right: 9px; }
 }
 
 .nss-schema-diagram-scroll {

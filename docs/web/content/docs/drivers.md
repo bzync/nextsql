@@ -22,6 +22,12 @@ Address is `host:port` only. Values containing `://`, `key=`, or `password=` are
 
 When `nextsqld` is started with `--require-client-key`, the first authenticated client supplies the 32-byte root over TLS. See [TLS and client keys](/docs/tls).
 
+Every official driver also ships a cluster client (`OpenCluster` / `connectCluster` / `connect_cluster` / `NextSQL\Cluster::connect`) that sends eligible reads to a healthy follower under `STRONG` / `BOUNDED` / `STALE`. See [High availability](/docs/ha).
+
+`realm` / `database` on the connect config select the hosted target on Hello. An empty database name selects the registered default. See [Hosting](/docs/hosting).
+
+All seven drivers encode the scalar type expansion (`BLOB`, integers, floats, `DATE`/`TIME`/`TIMESTAMP`/`INTERVAL`, `CHAR`/`VARCHAR`, `ENUM`) and collections (`STRUCT`/`ARRAY`/`MAP`). Field-encryption helpers exist in Go/JS/PHP only.
+
 ## Language guides
 
 - [Go](/docs/drivers-go)

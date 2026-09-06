@@ -18,6 +18,8 @@ import (
 func main() {
 	conn, err := nextsql.Open(nextsql.Config{
 		Address:       "127.0.0.1:7210",
+		Realm:         "default",
+		Database:      "default",
 		User:          "app",
 		Password:      os.Getenv("NEXTSQL_DATABASE_PASS"),
 		InsecureNoTLS: true, // loopback only
@@ -43,7 +45,7 @@ func main() {
 	}
 
 	// Safe to retry after a timeout: the mutation and replay result commit
-	// atomically under this user/tenant-scoped key.
+	// atomically under this database-user-scoped key.
 	_, err = conn.ExecIdempotent(context.Background(), "order-20260826-42",
 		`INSERT INTO orders (id, status) VALUES ($1, $2)`,
 		types.StringValue("42"), types.StringValue("created"),
@@ -93,10 +95,14 @@ Experimental `ENCRYPTED CLIENT` columns use the separate `Config.FieldKeys`
 provider. Call `EncryptField(ctx, table, column, logicalValue)` before binding
 and `DecryptField(ctx, table, column, logicalType, resultValue)` after a bare
 projection. `MemoryFieldKeyring` is bounded convenience storage for keys already
-loaded from a secret manager; it is not a durable KMS. The field key is never
-sent to `nextsqld`. Equivalent helpers now ship in Node.js/TypeScript, Bun,
-Deno, and PHP; PITR and HA coverage remain open, so this capability is not
-production-gated.
+loaded from a secret manager; `FileFieldKeyring` is the durable rotation/
+revocation path. The field key is never sent to `nextsqld`. Equivalent helpers
+ship in Node.js/TypeScript, Bun, Deno, and PHP (not Python or Ruby). PITR and
+HA/failover are tested. The capability stays **experimental** because no
+searchable or deterministic mode ships.
+
+Follower-read routing uses `nextsql.OpenCluster` (`STRONG` / `BOUNDED` /
+`STALE`). See [High availability](/docs/ha).
 
 Multi-statement transactions are a session of `BEGIN` / statements / `COMMIT` on the same connection:
 

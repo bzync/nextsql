@@ -27,7 +27,7 @@ export function PlatformDownloads({ release }: { release: Release }) {
 
   if (release.artifacts.length === 0) {
     return (
-      <div className="rounded-lg border border-black/[0.08] px-4 py-4 text-sm text-muted dark:border-white/[0.08]">
+      <div className="rounded-md border border-line px-4 py-4 text-sm text-muted">
         No prebuilt binaries for this version yet. Install from source with{" "}
         <code className="rounded bg-bg-hover px-1 font-mono text-[12px]">go install github.com/bzync/nextsql/cmd/nextsql@{release.version === "0.1.0-dev" ? "latest" : `v${release.version}`}</code>
         .
@@ -45,8 +45,8 @@ export function PlatformDownloads({ release }: { release: Release }) {
             onClick={() => setPlatform(item)}
             className={
               item === platform
-                ? "rounded-lg bg-black/[0.06] px-3 py-1.5 text-sm font-medium dark:bg-white/[0.08]"
-                : "rounded-lg px-3 py-1.5 text-sm text-muted hover:bg-black/[0.04] dark:hover:bg-white/[0.05]"
+                ? "rounded-md bg-bg-hover px-3 py-1.5 text-sm font-medium"
+                : "rounded-md px-3 py-1.5 text-sm text-muted hover:bg-bg-hover"
             }
           >
             {platformLabel(item)}
@@ -64,7 +64,7 @@ export function PlatformDownloads({ release }: { release: Release }) {
 
 function ArtifactRow({ version, artifact }: { version: string; artifact: Artifact }) {
   return (
-    <li className="flex flex-col gap-2 rounded-lg border border-black/[0.08] px-4 py-3 sm:flex-row sm:items-center sm:justify-between dark:border-white/[0.08]">
+    <li className="flex flex-col gap-2 rounded-md border border-line px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
       <div className="min-w-0">
         <p className="text-sm font-medium">
           {kindLabel(artifact.kind)}

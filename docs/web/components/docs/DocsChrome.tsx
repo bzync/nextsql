@@ -38,17 +38,17 @@ export function DocsChrome({ children }: { children: React.ReactNode }) {
         onMenu={() => setMenu(true)}
         menuOpen={menu}
       />
-      <div className="mx-auto grid max-w-6xl grid-cols-1 lg:grid-cols-[224px_minmax(0,1fr)]">
-        <aside className="hidden border-r border-black/[0.07] dark:border-white/[0.07] lg:block">
-          <div className="sticky top-14 max-h-[calc(100vh-3.5rem)] overflow-auto px-2 py-6">
+      <div className="mx-auto grid max-w-6xl grid-cols-1 lg:grid-cols-[15.5rem_minmax(0,1fr)]">
+        <aside className="hidden border-r border-line lg:block">
+          <div className="sticky top-14 max-h-[calc(100vh-3.5rem)] overflow-auto px-3 py-7">
             <Sidebar pathname={pathname} />
           </div>
         </aside>
         <div className="min-w-0" id="content">
           {children}
-          <div className="border-t border-black/[0.07] px-4 py-5 font-mono text-[11px] text-slate-500 dark:border-white/[0.07] sm:px-8">
+          <div className="border-t border-line px-4 py-5 font-mono text-[11px] text-faint sm:px-8">
             {site.version} ·{" "}
-            <a href={site.github} className="hover:text-slate-900 dark:hover:text-white" target="_blank" rel="noreferrer">
+            <a href={site.github} className="hover:text-foreground" target="_blank" rel="noreferrer">
               GitHub
             </a>
           </div>
@@ -61,13 +61,13 @@ export function DocsChrome({ children }: { children: React.ReactNode }) {
             onClick={() => setMenu(false)}
             aria-label="Close menu"
           />
-          <div className="absolute inset-y-0 left-0 flex w-[min(88vw,20rem)] flex-col border-r border-line bg-bg pt-[env(safe-area-inset-top)] pb-[env(safe-area-inset-bottom)] shadow-xl">
+          <div className="absolute inset-y-0 left-0 flex w-[min(88vw,20rem)] flex-col border-r border-line bg-bg pt-[env(safe-area-inset-top)] pb-[env(safe-area-inset-bottom)]">
             <div className="flex h-14 items-center justify-between px-4">
               <span className="text-sm font-semibold">Docs</span>
               <button
                 type="button"
                 onClick={() => setMenu(false)}
-                className="inline-flex h-10 w-10 items-center justify-center rounded-lg text-slate-500 hover:bg-black/5 hover:text-slate-900 dark:hover:bg-white/6 dark:hover:text-white"
+                className="inline-flex h-10 w-10 items-center justify-center rounded-md text-muted hover:bg-bg-hover hover:text-foreground"
                 aria-label="Close menu"
               >
                 <CloseIcon />
@@ -101,10 +101,8 @@ function Sidebar({
   return (
     <nav aria-label="Documentation">
       {docsNav.map((group) => (
-        <div key={group.title} className="mb-5">
-          <p className="mb-1.5 px-3 text-[10px] font-bold uppercase tracking-widest text-slate-400 dark:text-slate-500">
-            {group.title}
-          </p>
+        <div key={group.title} className="mb-6">
+          <p className="kicker mb-1.5 px-2.5">{group.title}</p>
           <ul className="space-y-0.5">
             {group.items.map((item) => {
               const href = docHref(item.slug);
@@ -118,14 +116,14 @@ function Sidebar({
                     onClick={onNavigate}
                     aria-current={active ? "page" : undefined}
                     className={cn(
-                      "group relative flex min-h-11 items-center rounded-lg px-3 text-[14px] leading-none transition-all duration-150 lg:h-9 lg:min-h-0 lg:text-[13px]",
+                      "sidebar-link group relative flex min-h-11 items-center rounded-md border-0 px-2.5 text-[14px] leading-none shadow-none transition-colors duration-150 lg:h-8 lg:min-h-0 lg:text-[13px]",
                       active
-                        ? "bg-blue-50 font-semibold text-blue-700 dark:bg-blue-500/[0.13] dark:text-blue-300"
-                        : "text-slate-600 hover:bg-black/[0.04] hover:text-slate-900 dark:text-slate-400 dark:hover:bg-white/[0.055] dark:hover:text-slate-100",
+                        ? "bg-bg-hover font-medium text-foreground"
+                        : "text-muted hover:bg-bg-hover hover:text-foreground",
                     )}
                   >
                     {active ? (
-                      <span className="absolute top-1/2 left-0 h-4 w-[3px] -translate-y-1/2 rounded-r-full bg-blue-500 dark:bg-blue-400" />
+                      <span className="absolute top-1/2 left-0 h-3.5 w-[2px] -translate-y-1/2 rounded-full bg-accent" />
                     ) : null}
                     {item.title}
                   </Link>

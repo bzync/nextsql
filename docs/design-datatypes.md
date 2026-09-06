@@ -679,6 +679,6 @@ core-engine wiring's own live verification (log #97), and Bun/Deno share
 ## 4. What this track does NOT include
 
 Per `PROJECT.md`/`TODO.md` convention, this track gates no phase (P0-P27
-are closed; P28-P30 are next). Nothing here should be started opportunistically
+are closed; P28-P29 are next). Nothing here should be started opportunistically
 inside other phase/track work — each `D`-item gets its own increment log
 entry when picked up, same as M2's sub-items.

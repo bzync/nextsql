@@ -95,6 +95,7 @@ func run() error {
 	raftBind := fs.String("raft-bind", "", "Raft bind address (enables HA)")
 	raftJoin := fs.String("raft-join", "", "Raft peers as id=addr,id=addr (min 3 voters)")
 	raftBootstrap := fs.Bool("raft-bootstrap", false, "bootstrap this node with --raft-join")
+	production := fs.Bool("production", false, "force the production deployment profile and refuse to start unless the live-production preflight passes")
 	fs.String("env-file", "", "load only this dotenv file")
 	fs.Bool("no-env", false, "do not load .env files")
 	if err := fs.Parse(os.Args[1:]); err != nil {
@@ -180,7 +181,13 @@ func run() error {
 	if set["raft-bootstrap"] {
 		cfg.RaftBootstrap = *raftBootstrap
 	}
+	if *production {
+		cfg.ApplyProductionDefaults()
+	}
 	if err := cfg.Validate(); err != nil {
+		return err
+	}
+	if err := cfg.CheckProduction(); err != nil {
 		return err
 	}
 	if cfg.DataDir == "" {

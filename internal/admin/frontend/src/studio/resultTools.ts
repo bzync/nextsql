@@ -722,12 +722,40 @@ const VECTOR_METRICS_BY_KIND: Record<VectorColumnKind, VectorMetric[]> = {
   sparse: ["cosine", "inner_product"],
 };
 
+export const VECTOR_METRIC_SQL: Record<VectorMetric, string> = {
+  cosine: "COSINE",
+  l2: "L2",
+  inner_product: "INNER_PRODUCT",
+  hamming: "HAMMING",
+};
+
 function classifyVectorColumnType(type: string): VectorColumnKind | null {
   const upper = type.trim().toUpperCase();
   if (upper.startsWith("VECTOR<")) return "dense";
   if (upper.startsWith("BITVECTOR<")) return "bitvector";
   if (upper.startsWith("SPARSEVECTOR<")) return "sparse";
   return null;
+}
+
+// vectorColumnsFromResult lists the VECTOR/BITVECTOR/SPARSEVECTOR columns
+// in an authorized system.columns result. IntelliSense uses this as the
+// only vector metadata NextSQL exposes for completion (column kind + the
+// metrics that kind accepts). There is no per-element / per-dimension
+// catalog to complete inside a TO (...) literal.
+export function vectorColumnsFromResult(columns: StudioResultSet): VectorCatalogColumn[] {
+  const columnNameIndex = resultColumn(columns, "column_name");
+  const columnTypeIndex = resultColumn(columns, "type");
+  const out: VectorCatalogColumn[] = [];
+  if (columnNameIndex < 0 || columnTypeIndex < 0) return out;
+  for (const row of columns.rows ?? []) {
+    const name = row[columnNameIndex];
+    const type = row[columnTypeIndex];
+    if (typeof name !== "string" || typeof type !== "string") continue;
+    const kind = classifyVectorColumnType(type);
+    if (!kind) continue;
+    out.push({ name, type, kind, dimensions: declaredVectorDimensions(type), metrics: VECTOR_METRICS_BY_KIND[kind] });
+  }
+  return out;
 }
 
 // The Vector Explorer is catalog-driven the same way the Full-text Explorer
@@ -743,19 +771,7 @@ function classifyVectorColumnType(type: string): VectorColumnKind | null {
 // catalog cannot distinguish them; the explorer only ever surfaces "a vector
 // index exists and its status", identical to what the catalog can prove.
 export function vectorCatalog(detail: StudioTableDetail): VectorCatalog {
-  const columnNameIndex = resultColumn(detail.columns, "column_name");
-  const columnTypeIndex = resultColumn(detail.columns, "type");
-  const columns: VectorCatalogColumn[] = [];
-  if (columnNameIndex >= 0 && columnTypeIndex >= 0) {
-    for (const row of detail.columns.rows) {
-      const name = row[columnNameIndex];
-      const type = row[columnTypeIndex];
-      if (typeof name !== "string" || typeof type !== "string") continue;
-      const kind = classifyVectorColumnType(type);
-      if (!kind) continue;
-      columns.push({ name, type, kind, dimensions: declaredVectorDimensions(type), metrics: VECTOR_METRICS_BY_KIND[kind] });
-    }
-  }
+  const columns = vectorColumnsFromResult(detail.columns);
 
   const kindIndex = resultColumn(detail.indexes, "kind");
   const indexNameIndex = resultColumn(detail.indexes, "index_name");
@@ -2067,6 +2083,12 @@ export function replaceAllMatches(text: string, matches: FindMatch[], replacemen
 // (optionally schema-qualified) identifier — so a table whose name needs
 // quoting simply won't get column suggestions; it can still be typed by
 // hand and queried normally.
+//
+// Vector-aware completion is the same catalog-only rule applied to the
+// NEAREST clause: after NEAREST it offers VECTOR/BITVECTOR/SPARSEVECTOR
+// columns from a referenced table; after USING it offers the metrics that
+// column kind actually accepts. There is no per-element vector catalog, so
+// the TO (...) literal is not a completion slot.
 
 export const MAX_SQL_SUGGESTIONS = 50;
 export const MAX_REFERENCED_TABLES = 8;
@@ -2140,11 +2162,102 @@ export type TableColumnsCache = Record<string, string[] | "loading" | "error">;
 export type TableJSONPathCache = Record<string, string[]>;
 
 export type SQLSuggestion = {
-  kind: "table" | "column" | "json-path";
+  kind: "table" | "column" | "json-path" | "vector-column" | "vector-metric";
   label: string;
   insertText: string;
   table?: string;
 };
+
+export type TableVectorCache = Record<string, VectorCatalogColumn[]>;
+
+export type NearestSuggestContext =
+  | { slot: "column"; start: number; end: number; typed: string }
+  | { slot: "metric"; start: number; end: number; typed: string; column: string };
+
+// currentNearestContext detects the two NEAREST-clause slots IntelliSense
+// can complete from catalog metadata: the vector column after NEAREST, and
+// the metric after USING. Inside TO (...) there is no per-element catalog,
+// so that slot returns null and the ordinary table/column list is not
+// swapped in either — the caller only switches when this is non-null.
+// Bare identifiers only, matching extractReferencedTables / currentWordRange;
+// a quoted identifier is left to the operator. The scan is confined to the
+// current statement (text after the last semicolon) so a later USING cannot
+// attach to an earlier NEAREST.
+export function currentNearestContext(text: string, cursor: number): NearestSuggestContext | null {
+  const word = currentWordRange(text, cursor);
+  const before = text.slice(0, word.start);
+  const stmtBefore = before.slice(before.lastIndexOf(";") + 1);
+  const typed = text.slice(word.start, Math.max(word.start, Math.min(cursor, word.end)));
+  if (/\bNEAREST\s+$/i.test(stmtBefore)) {
+    return { slot: "column", start: word.start, end: word.end, typed };
+  }
+  const metric = stmtBefore.match(/\bNEAREST\s+([A-Za-z_][A-Za-z0-9_]*)\s+TO\b[\s\S]*?\bUSING\s+$/i);
+  if (metric) {
+    return { slot: "metric", start: word.start, end: word.end, typed, column: metric[1] };
+  }
+  return null;
+}
+
+export function rankNearestColumnSuggestions(
+  typed: string,
+  referencedTables: string[],
+  cache: TableVectorCache,
+  limit = MAX_SQL_SUGGESTIONS,
+): SQLSuggestion[] {
+  const lower = typed.toLowerCase();
+  const seen = new Set<string>();
+  const out: SQLSuggestion[] = [];
+  for (const table of referencedTables) {
+    const columns = cache[table];
+    if (!Array.isArray(columns)) continue;
+    for (const column of [...columns].sort((a, b) => a.name.localeCompare(b.name))) {
+      if (seen.has(column.name) || column.name.toLowerCase() === lower) continue;
+      if (lower.length > 0 && !column.name.toLowerCase().startsWith(lower)) continue;
+      seen.add(column.name);
+      out.push({
+        kind: "vector-column",
+        label: `${column.name} — ${table} · ${column.type}`,
+        insertText: column.name,
+        table,
+      });
+      if (out.length >= limit) return out;
+    }
+  }
+  return out;
+}
+
+export function rankNearestMetricSuggestions(
+  typed: string,
+  columnName: string,
+  referencedTables: string[],
+  cache: TableVectorCache,
+  limit = MAX_SQL_SUGGESTIONS,
+): SQLSuggestion[] {
+  let column: VectorCatalogColumn | undefined;
+  for (const table of referencedTables) {
+    const columns = cache[table];
+    if (!Array.isArray(columns)) continue;
+    column = columns.find((candidate) => candidate.name === columnName);
+    if (column) break;
+  }
+  if (!column) return [];
+  const resolved = column;
+  const lower = typed.toLowerCase();
+  const out: SQLSuggestion[] = [];
+  for (const metric of resolved.metrics) {
+    const sqlName = VECTOR_METRIC_SQL[metric];
+    if (sqlName.toLowerCase() === lower) continue;
+    if (lower.length > 0 && !sqlName.toLowerCase().startsWith(lower)) continue;
+    out.push({
+      kind: "vector-metric",
+      label: `${sqlName} — ${resolved.name} · ${resolved.type}`,
+      insertText: sqlName,
+      table: referencedTables.find((table) => (cache[table] ?? []).some((candidate) => candidate.name === columnName)),
+    });
+    if (out.length >= limit) return out;
+  }
+  return out;
+}
 
 // jsonPathIndexPaths extracts the dotted native JSON-path target of each
 // single-column JSON-path index on a table, from its authorized
@@ -2415,6 +2528,14 @@ export function environmentStorageKey(realm: string, database: string, user: str
 export function editorDraftStorageKey(realm: string, database: string, user: string): string {
   const seg = (s: string) => (s || "default").replace(/[^A-Za-z0-9_.-]/g, "_");
   return `nextsql-studio-drafts:${seg(realm)}:${seg(database)}:${seg(user || "unknown")}`;
+}
+
+// layoutStorageKey is the localStorage slot for this connection's IDE
+// layout (pane visibility + widths + last selected table name). Same
+// per-connection scoping as the draft buffers. Never a credential.
+export function layoutStorageKey(realm: string, database: string, user: string): string {
+  const seg = (s: string) => (s || "default").replace(/[^A-Za-z0-9_.-]/g, "_");
+  return `nextsql-studio-layout:${seg(realm)}:${seg(database)}:${seg(user || "unknown")}`;
 }
 
 // --- Recent connections (realm/database quick-switch) -----------------
@@ -3055,6 +3176,89 @@ export function editorDraftsWorthRestoring(drafts: EditorDrafts | null, defaultS
   if (drafts.tabs.length > 1) return true;
   const only = drafts.tabs[0];
   return only.sql.trim() !== "" && only.sql.trim() !== defaultSQL.trim();
+}
+
+// --- Layout persistence without credentials ----------------------------
+//
+// Explorer/inspector visibility and pixel widths, plus the last selected
+// table *name*, are mirrored to localStorage per connection. SQL, results,
+// query history, parameters, and any credential are out of scope — those
+// either already have their own codec or must never persist. Malformed
+// storage yields the default layout rather than a throw.
+
+export const DEFAULT_EXPLORER_WIDTH = 260;
+export const DEFAULT_INSPECTOR_WIDTH = 360;
+export const MIN_EXPLORER_WIDTH = 190;
+export const MAX_EXPLORER_WIDTH = 480;
+export const MIN_INSPECTOR_WIDTH = 280;
+export const MAX_INSPECTOR_WIDTH = 560;
+export const LAYOUT_WIDTH_STEP = 16;
+export const MAX_LAYOUT_TABLE_NAME = 128;
+
+export type StudioLayout = {
+  explorerVisible: boolean;
+  inspectorVisible: boolean;
+  explorerWidth: number;
+  inspectorWidth: number;
+  selectedTable: string | null;
+};
+
+export const DEFAULT_STUDIO_LAYOUT: StudioLayout = {
+  explorerVisible: true,
+  inspectorVisible: true,
+  explorerWidth: DEFAULT_EXPLORER_WIDTH,
+  inspectorWidth: DEFAULT_INSPECTOR_WIDTH,
+  selectedTable: null,
+};
+
+export function clampLayoutWidth(value: unknown, min: number, max: number, fallback: number): number {
+  const n = typeof value === "number" ? value : typeof value === "string" ? Number(value) : Number.NaN;
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(max, Math.max(min, Math.round(n)));
+}
+
+export function stepLayoutWidth(value: number, delta: number, min: number, max: number): number {
+  return clampLayoutWidth(value + delta, min, max, value);
+}
+
+export function serializeStudioLayout(layout: StudioLayout): string {
+  const selected = typeof layout.selectedTable === "string" ? layout.selectedTable.trim() : "";
+  return JSON.stringify({
+    v: 1,
+    explorerVisible: layout.explorerVisible !== false,
+    inspectorVisible: layout.inspectorVisible !== false,
+    explorerWidth: clampLayoutWidth(layout.explorerWidth, MIN_EXPLORER_WIDTH, MAX_EXPLORER_WIDTH, DEFAULT_EXPLORER_WIDTH),
+    inspectorWidth: clampLayoutWidth(layout.inspectorWidth, MIN_INSPECTOR_WIDTH, MAX_INSPECTOR_WIDTH, DEFAULT_INSPECTOR_WIDTH),
+    selectedTable: selected ? selected.slice(0, MAX_LAYOUT_TABLE_NAME) : null,
+  });
+}
+
+export function parseStudioLayout(raw: string | null | undefined): StudioLayout {
+  if (!raw) return { ...DEFAULT_STUDIO_LAYOUT };
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return { ...DEFAULT_STUDIO_LAYOUT };
+  }
+  if (!parsed || typeof parsed !== "object") return { ...DEFAULT_STUDIO_LAYOUT };
+  const rec = parsed as Record<string, unknown>;
+  const selected = typeof rec.selectedTable === "string" ? rec.selectedTable.trim() : "";
+  return {
+    explorerVisible: rec.explorerVisible !== false,
+    inspectorVisible: rec.inspectorVisible !== false,
+    explorerWidth: clampLayoutWidth(rec.explorerWidth, MIN_EXPLORER_WIDTH, MAX_EXPLORER_WIDTH, DEFAULT_EXPLORER_WIDTH),
+    inspectorWidth: clampLayoutWidth(rec.inspectorWidth, MIN_INSPECTOR_WIDTH, MAX_INSPECTOR_WIDTH, DEFAULT_INSPECTOR_WIDTH),
+    selectedTable: selected ? selected.slice(0, MAX_LAYOUT_TABLE_NAME) : null,
+  };
+}
+
+export function resetStudioLayout(selectedTable: string | null): StudioLayout {
+  const name = typeof selectedTable === "string" ? selectedTable.trim() : "";
+  return {
+    ...DEFAULT_STUDIO_LAYOUT,
+    selectedTable: name ? name.slice(0, MAX_LAYOUT_TABLE_NAME) : null,
+  };
 }
 
 export function rankObjectMatches(
@@ -4132,4 +4336,647 @@ export function dmlDefaultColumns(
     };
   }
   return { setColumns: [], whereColumns: primary };
+}
+
+// ---------------------------------------------------------------------------
+// Table / index designer.
+//
+// Builds a CREATE TABLE or CREATE INDEX statement *template* from a form
+// state into the editor for review — the same never-execute boundary as the
+// DML builder / data generator / import: no server route, and the emitted
+// text faces confirm-before-run and server-side RBAC like any hand-typed
+// statement. Types come from a closed NextSQL kind list assembled here
+// (never interpolating free-text type SQL). Identifiers are always quoted.
+// PRIMARY KEY is required (catalog.TableFromAST). nsql_ table names are
+// rejected (catalog.ReservedName). Collections / ENUM / GEOMETRY subtypes
+// stay out of this form — they need nested-type UI the designer does not
+// pretend to have.
+// ---------------------------------------------------------------------------
+
+export const MAX_DESIGNER_COLUMNS = 64;
+export const MAX_DESIGNER_INDEX_COLUMNS = 16;
+export const MAX_FULLTEXT_INDEX_COLUMNS = 8;
+export const MAX_DESIGNER_IDENT_CHARS = 128;
+export const MAX_DESIGNER_CHAR_LEN = 65535;
+export const MAX_DESIGNER_VECTOR_DIM = 8192;
+export const MAX_DESIGNER_DECIMAL_PRECISION = 38;
+export const MAX_DESIGNER_DEFAULT_CHARS = 256;
+export const MAX_DESIGNER_JSON_PATH_SEGMENTS = 8;
+
+export type DesignerTypeKind =
+  | "INT8" | "INT16" | "INT32" | "INT64"
+  | "UINT8" | "UINT16" | "UINT32" | "UINT64"
+  | "DECIMAL" | "STRING" | "TEXT" | "CHAR" | "VARCHAR" | "BOOL" | "UUID" | "BLOB"
+  | "DATE" | "TIME" | "TIMESTAMP" | "TIMESTAMPTZ" | "INTERVAL"
+  | "FLOAT32" | "FLOAT64" | "JSON"
+  | "VECTOR_F32" | "VECTOR_F16" | "VECTOR_I8" | "BITVECTOR" | "SPARSEVECTOR"
+  | "POINT" | "BOX" | "LINESTRING" | "POLYGON"
+  | "GEOMETRY" | "GEOGRAPHY";
+
+export const DESIGNER_TYPE_KINDS: DesignerTypeKind[] = [
+  "INT64", "INT32", "INT16", "INT8",
+  "UINT64", "UINT32", "UINT16", "UINT8",
+  "DECIMAL", "STRING", "TEXT", "CHAR", "VARCHAR", "BOOL", "UUID", "BLOB",
+  "DATE", "TIME", "TIMESTAMP", "TIMESTAMPTZ", "INTERVAL",
+  "FLOAT32", "FLOAT64", "JSON",
+  "VECTOR_F32", "VECTOR_F16", "VECTOR_I8", "BITVECTOR", "SPARSEVECTOR",
+  "POINT", "BOX", "LINESTRING", "POLYGON",
+  "GEOMETRY", "GEOGRAPHY",
+];
+
+export const DESIGNER_TYPE_LABELS: Record<DesignerTypeKind, string> = {
+  INT8: "INT8",
+  INT16: "INT16",
+  INT32: "INT32",
+  INT64: "INT64",
+  UINT8: "UINT8",
+  UINT16: "UINT16",
+  UINT32: "UINT32",
+  UINT64: "UINT64",
+  DECIMAL: "DECIMAL(p,s)",
+  STRING: "STRING",
+  TEXT: "TEXT",
+  CHAR: "CHAR(n)",
+  VARCHAR: "VARCHAR(n)",
+  BOOL: "BOOL",
+  UUID: "UUID",
+  BLOB: "BLOB",
+  DATE: "DATE",
+  TIME: "TIME",
+  TIMESTAMP: "TIMESTAMP",
+  TIMESTAMPTZ: "TIMESTAMPTZ",
+  INTERVAL: "INTERVAL",
+  FLOAT32: "FLOAT32",
+  FLOAT64: "FLOAT64",
+  JSON: "JSON",
+  VECTOR_F32: "VECTOR<F32,N>",
+  VECTOR_F16: "VECTOR<F16,N>",
+  VECTOR_I8: "VECTOR<I8,N>",
+  BITVECTOR: "BITVECTOR<N>",
+  SPARSEVECTOR: "SPARSEVECTOR<N>",
+  POINT: "POINT",
+  BOX: "BOX",
+  LINESTRING: "LINESTRING",
+  POLYGON: "POLYGON",
+  GEOMETRY: "GEOMETRY",
+  GEOGRAPHY: "GEOGRAPHY",
+};
+
+export type DesignerDefaultKind = "none" | "uuid" | "now" | "ai" | "literal";
+export type DesignerFKAction = "RESTRICT" | "CASCADE" | "SET NULL" | "SET DEFAULT";
+export type DesignerIndexKind = "btree" | "unique" | "fulltext" | "vector" | "spatial";
+export type DesignerVectorMethod = "HNSW" | "IVF" | "IVFPQ" | "SPARSE";
+export type DesignerVectorQuant = "NONE" | "F16" | "I8";
+export type DesignerFTAnalyzer = "simple" | "english" | "french" | "german" | "spanish";
+
+export type DesignerColumn = {
+  id: string;
+  name: string;
+  typeKind: DesignerTypeKind;
+  // CHAR/VARCHAR rune length; DECIMAL precision; VECTOR/BITVECTOR/SPARSEVECTOR dimension.
+  typeParam: number;
+  // DECIMAL scale only.
+  typeScale: number;
+  notNull: boolean;
+  primaryKey: boolean;
+  defaultKind: DesignerDefaultKind;
+  defaultLiteral: string;
+};
+
+export type CreateTableState = {
+  table: string;
+  columns: DesignerColumn[];
+  fkEnabled: boolean;
+  fkColumns: string[];
+  fkRefTable: string;
+  fkRefColumns: string[];
+  fkOnDelete: DesignerFKAction;
+  fkOnUpdate: DesignerFKAction;
+};
+
+export type CreateIndexState = {
+  name: string;
+  table: string;
+  kind: DesignerIndexKind;
+  columns: string[];
+  include: string[];
+  jsonPath: string;
+  analyzer: DesignerFTAnalyzer;
+  vectorMethod: DesignerVectorMethod;
+  vectorQuant: DesignerVectorQuant;
+  ivfLists: number;
+  ivfProbes: number;
+  ivfSubspaces: number;
+};
+
+export type DesignerBuildResult =
+  | { sql: string; error: null }
+  | { sql: null; error: string };
+
+export function newDesignerColumn(id: string, overrides?: Partial<DesignerColumn>): DesignerColumn {
+  const typeKind = overrides?.typeKind ?? "STRING";
+  return {
+    id,
+    name: "",
+    notNull: false,
+    primaryKey: false,
+    defaultKind: "none",
+    defaultLiteral: "",
+    ...overrides,
+    typeKind,
+    typeParam: overrides?.typeParam ?? designerTypeParamDefault(typeKind),
+    typeScale: overrides?.typeScale ?? 0,
+  };
+}
+
+export function defaultCreateTableState(): CreateTableState {
+  return {
+    table: "new_table",
+    columns: [
+      newDesignerColumn("c1", {
+        name: "id",
+        typeKind: "UUID",
+        notNull: true,
+        primaryKey: true,
+        defaultKind: "uuid",
+      }),
+      newDesignerColumn("c2", {
+        name: "name",
+        typeKind: "STRING",
+        notNull: true,
+      }),
+    ],
+    fkEnabled: false,
+    fkColumns: [],
+    fkRefTable: "",
+    fkRefColumns: [],
+    fkOnDelete: "RESTRICT",
+    fkOnUpdate: "RESTRICT",
+  };
+}
+
+export function defaultCreateIndexState(table = ""): CreateIndexState {
+  return {
+    name: "",
+    table,
+    kind: "btree",
+    columns: [],
+    include: [],
+    jsonPath: "",
+    analyzer: "simple",
+    vectorMethod: "HNSW",
+    vectorQuant: "NONE",
+    ivfLists: 16,
+    ivfProbes: 0,
+    ivfSubspaces: 8,
+  };
+}
+
+export function designerTypeParamDefault(kind: DesignerTypeKind): number {
+  switch (kind) {
+    case "CHAR":
+      return 1;
+    case "VARCHAR":
+      return 255;
+    case "DECIMAL":
+      return 18;
+    case "VECTOR_F32":
+    case "VECTOR_F16":
+    case "VECTOR_I8":
+    case "BITVECTOR":
+    case "SPARSEVECTOR":
+      return 8;
+    default:
+      return 0;
+  }
+}
+
+export function designerTypeNeedsLength(kind: DesignerTypeKind): boolean {
+  return kind === "CHAR" || kind === "VARCHAR";
+}
+
+export function designerTypeNeedsDecimal(kind: DesignerTypeKind): boolean {
+  return kind === "DECIMAL";
+}
+
+export function designerTypeNeedsDimension(kind: DesignerTypeKind): boolean {
+  return (
+    kind === "VECTOR_F32" ||
+    kind === "VECTOR_F16" ||
+    kind === "VECTOR_I8" ||
+    kind === "BITVECTOR" ||
+    kind === "SPARSEVECTOR"
+  );
+}
+
+function designerIdentError(name: string, role: string, opts?: { reservedTable?: boolean }): string | null {
+  const trimmed = name.trim();
+  if (!trimmed) return `${role} is required.`;
+  if (trimmed.length > MAX_DESIGNER_IDENT_CHARS) {
+    return `${role} is longer than ${MAX_DESIGNER_IDENT_CHARS} characters.`;
+  }
+  if (/[\u0000-\u001f]/.test(trimmed)) return `${role} contains a control character.`;
+  if (opts?.reservedTable && trimmed.toLowerCase().startsWith("nsql_")) {
+    return `${role} cannot use the reserved nsql_ prefix.`;
+  }
+  return null;
+}
+
+export function designerColumnTypeSQL(column: DesignerColumn): DesignerBuildResult {
+  const kind = column.typeKind;
+  const param = Number.isFinite(column.typeParam) ? Math.trunc(column.typeParam) : NaN;
+  const scale = Number.isFinite(column.typeScale) ? Math.trunc(column.typeScale) : NaN;
+  switch (kind) {
+    case "CHAR":
+    case "VARCHAR":
+      if (!Number.isInteger(param) || param < 1 || param > MAX_DESIGNER_CHAR_LEN) {
+        return { sql: null, error: `${kind} length must be an integer from 1 to ${MAX_DESIGNER_CHAR_LEN}.` };
+      }
+      return { sql: `${kind}(${param})`, error: null };
+    case "DECIMAL":
+      if (!Number.isInteger(param) || param < 1 || param > MAX_DESIGNER_DECIMAL_PRECISION) {
+        return { sql: null, error: `DECIMAL precision must be an integer from 1 to ${MAX_DESIGNER_DECIMAL_PRECISION}.` };
+      }
+      if (!Number.isInteger(scale) || scale < 0 || scale > param) {
+        return { sql: null, error: "DECIMAL scale must be an integer from 0 to the precision." };
+      }
+      return { sql: `DECIMAL(${param},${scale})`, error: null };
+    case "VECTOR_F32":
+    case "VECTOR_F16":
+    case "VECTOR_I8":
+    case "BITVECTOR": {
+      if (!Number.isInteger(param) || param < 1 || param > MAX_DESIGNER_VECTOR_DIM) {
+        return { sql: null, error: `Vector dimension must be an integer from 1 to ${MAX_DESIGNER_VECTOR_DIM}.` };
+      }
+      const elem = kind === "VECTOR_F32" ? "F32" : kind === "VECTOR_F16" ? "F16" : kind === "VECTOR_I8" ? "I8" : null;
+      return { sql: elem ? `VECTOR<${elem},${param}>` : `BITVECTOR<${param}>`, error: null };
+    }
+    case "SPARSEVECTOR":
+      if (!Number.isInteger(param) || param < 1 || param > 65535) {
+        return { sql: null, error: "SPARSEVECTOR dimension must be an integer from 1 to 65535." };
+      }
+      return { sql: `SPARSEVECTOR<${param}>`, error: null };
+    default:
+      return { sql: kind, error: null };
+  }
+}
+
+function designerDefaultSQL(column: DesignerColumn, typeSQL: string): DesignerBuildResult {
+  switch (column.defaultKind) {
+    case "none":
+      return { sql: "", error: null };
+    case "uuid":
+      return { sql: " DEFAULT UUID()", error: null };
+    case "now":
+      return { sql: " DEFAULT NOW()", error: null };
+    case "ai":
+      if (!typeSQL.startsWith("DECIMAL")) {
+        return { sql: null, error: `DEFAULT AI() is only valid on a DECIMAL column, not ${typeSQL}.` };
+      }
+      return { sql: " DEFAULT AI()", error: null };
+    case "literal": {
+      const raw = column.defaultLiteral.trim();
+      if (!raw) return { sql: null, error: `Column "${column.name.trim() || column.id}" needs a DEFAULT literal.` };
+      if (raw.length > MAX_DESIGNER_DEFAULT_CHARS) {
+        return { sql: null, error: `DEFAULT literal is longer than ${MAX_DESIGNER_DEFAULT_CHARS} characters.` };
+      }
+      if (/^-?\d+(?:\.\d+)?$/.test(raw) || raw === "TRUE" || raw === "FALSE" || raw === "NULL") {
+        return { sql: ` DEFAULT ${raw}`, error: null };
+      }
+      return { sql: ` DEFAULT ${quoteSQLString(raw)}`, error: null };
+    }
+    default:
+      return { sql: null, error: "Unknown DEFAULT kind." };
+  }
+}
+
+export function buildCreateTableSQL(state: CreateTableState): DesignerBuildResult {
+  const tableErr = designerIdentError(state.table, "Table name", { reservedTable: true });
+  if (tableErr) return { sql: null, error: tableErr };
+  const table = state.table.trim();
+  if (!state.columns.length) return { sql: null, error: "Add at least one column." };
+  if (state.columns.length > MAX_DESIGNER_COLUMNS) {
+    return { sql: null, error: `A table can declare at most ${MAX_DESIGNER_COLUMNS} columns in this designer.` };
+  }
+
+  type PreparedColumn = {
+    name: string;
+    typeSQL: string;
+    defSQL: string;
+    primaryKey: boolean;
+    notNull: boolean;
+  };
+  const seen = new Set<string>();
+  const prepared: PreparedColumn[] = [];
+  for (const column of state.columns) {
+    const nameErr = designerIdentError(column.name, "Column name");
+    if (nameErr) return { sql: null, error: nameErr };
+    const name = column.name.trim();
+    if (seen.has(name.toLowerCase())) return { sql: null, error: `Column "${name}" is listed twice.` };
+    seen.add(name.toLowerCase());
+    const type = designerColumnTypeSQL(column);
+    if (type.error || !type.sql) return { sql: null, error: type.error ?? "Invalid column type." };
+    if (column.primaryKey && (type.sql.startsWith("VECTOR<") || type.sql.startsWith("BITVECTOR<") || type.sql.startsWith("SPARSEVECTOR<"))) {
+      return { sql: null, error: `Column "${name}" cannot be a PRIMARY KEY — vector types are not valid keys.` };
+    }
+    const def = designerDefaultSQL(column, type.sql);
+    if (def.error || def.sql === null) return { sql: null, error: def.error ?? "Invalid DEFAULT." };
+    prepared.push({
+      name,
+      typeSQL: type.sql,
+      defSQL: def.sql,
+      primaryKey: column.primaryKey,
+      notNull: column.notNull || column.primaryKey,
+    });
+  }
+
+  const pk = prepared.filter((column) => column.primaryKey);
+  if (pk.length === 0) return { sql: null, error: "PRIMARY KEY is required." };
+  const inlinePK = pk.length === 1;
+  const body: string[] = [];
+  for (const column of prepared) {
+    let line = `  ${quoteIdentifier(column.name)} ${column.typeSQL}`;
+    // Inline PRIMARY KEY only when this is the sole key column, matching
+    // internal/catalog/ddl.CreateTableSQL.
+    if (inlinePK && column.primaryKey) line += " PRIMARY KEY";
+    else if (column.notNull) line += " NOT NULL";
+    line += column.defSQL;
+    body.push(line);
+  }
+  if (!inlinePK) {
+    body.push(`  PRIMARY KEY (${pk.map((column) => quoteIdentifier(column.name)).join(", ")})`);
+  }
+
+  if (state.fkEnabled) {
+    if (state.fkColumns.length === 0) return { sql: null, error: "Choose at least one foreign-key column." };
+    const refErr = designerIdentError(state.fkRefTable, "Referenced table", { reservedTable: true });
+    if (refErr) return { sql: null, error: refErr };
+    if (state.fkRefColumns.length === 0) return { sql: null, error: "Choose at least one referenced column." };
+    if (state.fkColumns.length !== state.fkRefColumns.length) {
+      return { sql: null, error: "Foreign-key and referenced column lists must be the same length." };
+    }
+    const localSeen = new Set<string>();
+    for (const name of state.fkColumns) {
+      if (!seen.has(name.trim().toLowerCase())) {
+        return { sql: null, error: `Foreign-key column "${name}" is not a column of this table.` };
+      }
+      if (localSeen.has(name.trim().toLowerCase())) {
+        return { sql: null, error: `Foreign-key column "${name}" is listed twice.` };
+      }
+      localSeen.add(name.trim().toLowerCase());
+    }
+    const refSeen = new Set<string>();
+    for (const name of state.fkRefColumns) {
+      const err = designerIdentError(name, "Referenced column");
+      if (err) return { sql: null, error: err };
+      if (refSeen.has(name.trim().toLowerCase())) {
+        return { sql: null, error: `Referenced column "${name.trim()}" is listed twice.` };
+      }
+      refSeen.add(name.trim().toLowerCase());
+    }
+    const del = state.fkOnDelete;
+    const up = state.fkOnUpdate;
+    if (!isDesignerFKAction(del) || !isDesignerFKAction(up)) {
+      return { sql: null, error: "Unknown foreign-key action." };
+    }
+    body.push(
+      `  FOREIGN KEY (${state.fkColumns.map((name) => quoteIdentifier(name.trim())).join(", ")}) ` +
+        `REFERENCES ${quoteIdentifier(state.fkRefTable.trim())} ` +
+        `(${state.fkRefColumns.map((name) => quoteIdentifier(name.trim())).join(", ")}) ` +
+        `ON DELETE ${del} ON UPDATE ${up}`,
+    );
+  }
+
+  return {
+    sql: `CREATE TABLE ${quoteIdentifier(table)} (\n${body.join(",\n")}\n);`,
+    error: null,
+  };
+}
+
+function isDesignerFKAction(value: string): value is DesignerFKAction {
+  return value === "RESTRICT" || value === "CASCADE" || value === "SET NULL" || value === "SET DEFAULT";
+}
+
+export type DesignerIndexColumnClass =
+  | "text"
+  | "json"
+  | "vector-dense"
+  | "vector-bit"
+  | "vector-sparse"
+  | "geo"
+  | "other";
+
+export function designerIndexColumnClass(type: string): DesignerIndexColumnClass {
+  const upper = type.trim().toUpperCase();
+  if (upper === "STRING" || upper === "TEXT" || upper.startsWith("CHAR(") || upper.startsWith("VARCHAR(")) {
+    return "text";
+  }
+  if (upper === "JSON") return "json";
+  if (upper.startsWith("VECTOR<")) return "vector-dense";
+  if (upper.startsWith("BITVECTOR<")) return "vector-bit";
+  if (upper.startsWith("SPARSEVECTOR<")) return "vector-sparse";
+  if (
+    upper === "POINT" ||
+    upper === "BOX" ||
+    upper === "LINESTRING" ||
+    upper === "POLYGON" ||
+    upper.startsWith("GEOMETRY") ||
+    upper.startsWith("GEOGRAPHY")
+  ) {
+    return "geo";
+  }
+  return "other";
+}
+
+function parseDesignerJSONPath(raw: string): DesignerBuildResult & { segments?: string[] } {
+  const trimmed = raw.trim();
+  if (!trimmed) return { sql: "", error: null, segments: [] };
+  const parts = trimmed.split(".").map((part) => part.trim()).filter((part) => part.length > 0);
+  if (parts.length === 0) return { sql: null, error: "JSON path has no segments." };
+  if (parts.length > MAX_DESIGNER_JSON_PATH_SEGMENTS) {
+    return { sql: null, error: `JSON path can have at most ${MAX_DESIGNER_JSON_PATH_SEGMENTS} segments.` };
+  }
+  for (const part of parts) {
+    const err = designerIdentError(part, "JSON path segment");
+    if (err) return { sql: null, error: err };
+  }
+  return {
+    sql: parts.map((part) => `.${quoteIdentifier(part)}`).join(""),
+    error: null,
+    segments: parts,
+  };
+}
+
+export function buildCreateIndexSQL(
+  state: CreateIndexState,
+  columns: { name: string; type: string }[],
+): DesignerBuildResult {
+  const nameErr = designerIdentError(state.name, "Index name");
+  if (nameErr) return { sql: null, error: nameErr };
+  const tableErr = designerIdentError(state.table, "Table name");
+  if (tableErr) return { sql: null, error: tableErr };
+  if (columns.length === 0) return { sql: null, error: "This table exposes no columns to index." };
+  if (state.columns.length === 0) return { sql: null, error: "Choose at least one index column." };
+
+  const byName = new Map(columns.map((column) => [column.name, column]));
+  const seen = new Set<string>();
+  const resolved: { name: string; type: string }[] = [];
+  for (const name of state.columns) {
+    const column = byName.get(name);
+    if (!column) return { sql: null, error: `Index column "${name}" is not a column of ${state.table.trim()}.` };
+    if (seen.has(name)) return { sql: null, error: `Index column "${name}" is listed twice.` };
+    seen.add(name);
+    resolved.push(column);
+  }
+
+  const includeSeen = new Set<string>();
+  const include: { name: string; type: string }[] = [];
+  if (state.kind === "btree" || state.kind === "unique") {
+    for (const name of state.include) {
+      const column = byName.get(name);
+      if (!column) return { sql: null, error: `INCLUDE column "${name}" is not a column of ${state.table.trim()}.` };
+      if (seen.has(name)) return { sql: null, error: `Column "${name}" cannot be both a key and an INCLUDE column.` };
+      if (includeSeen.has(name)) return { sql: null, error: `INCLUDE column "${name}" is listed twice.` };
+      includeSeen.add(name);
+      include.push(column);
+    }
+  } else if (state.include.length > 0) {
+    return { sql: null, error: "INCLUDE is only valid on a B+Tree index." };
+  }
+
+  const jsonPath = parseDesignerJSONPath(state.jsonPath);
+  if (jsonPath.error) return { sql: null, error: jsonPath.error };
+  if ((jsonPath.segments?.length ?? 0) > 0) {
+    if (state.kind !== "btree" && state.kind !== "unique") {
+      return { sql: null, error: "A JSON path is only valid on a B+Tree index." };
+    }
+    if (resolved.length !== 1 || designerIndexColumnClass(resolved[0].type) !== "json") {
+      return { sql: null, error: "A JSON path requires exactly one JSON key column." };
+    }
+  }
+
+  switch (state.kind) {
+    case "btree":
+    case "unique": {
+      if (resolved.length > MAX_DESIGNER_INDEX_COLUMNS) {
+        return { sql: null, error: `A B+Tree index can list at most ${MAX_DESIGNER_INDEX_COLUMNS} key columns in this designer.` };
+      }
+      const verb = state.kind === "unique" ? "CREATE UNIQUE INDEX" : "CREATE INDEX";
+      const keys = resolved.map((column, index) => {
+        const ident = quoteIdentifier(column.name);
+        if (index === 0 && (jsonPath.segments?.length ?? 0) > 0) return ident + (jsonPath.sql ?? "");
+        return ident;
+      });
+      let sql = `${verb} ${quoteIdentifier(state.name.trim())} ON ${quoteIdentifier(state.table.trim())} (${keys.join(", ")})`;
+      if (include.length > 0) {
+        sql += ` INCLUDE (${include.map((column) => quoteIdentifier(column.name)).join(", ")})`;
+      }
+      return { sql: `${sql};`, error: null };
+    }
+    case "fulltext": {
+      if (resolved.length > MAX_FULLTEXT_INDEX_COLUMNS) {
+        return { sql: null, error: `A FULLTEXT index can list at most ${MAX_FULLTEXT_INDEX_COLUMNS} columns.` };
+      }
+      for (const column of resolved) {
+        if (designerIndexColumnClass(column.type) !== "text") {
+          return { sql: null, error: `Column "${column.name}" is ${column.type}, not STRING/TEXT/CHAR/VARCHAR — FULLTEXT cannot index it.` };
+        }
+      }
+      const analyzer = state.analyzer;
+      if (analyzer !== "simple" && analyzer !== "english" && analyzer !== "french" && analyzer !== "german" && analyzer !== "spanish") {
+        return { sql: null, error: "Unknown full-text analyzer." };
+      }
+      let sql =
+        `CREATE FULLTEXT INDEX ${quoteIdentifier(state.name.trim())} ON ${quoteIdentifier(state.table.trim())} ` +
+        `(${resolved.map((column) => quoteIdentifier(column.name)).join(", ")})`;
+      if (analyzer !== "simple") sql += ` WITH (ANALYZER = '${analyzer}')`;
+      return { sql: `${sql};`, error: null };
+    }
+    case "vector": {
+      if (resolved.length !== 1) return { sql: null, error: "A VECTOR index covers exactly one column." };
+      const column = resolved[0];
+      const klass = designerIndexColumnClass(column.type);
+      if (klass !== "vector-dense" && klass !== "vector-bit" && klass !== "vector-sparse") {
+        return { sql: null, error: `Column "${column.name}" is ${column.type}, not a vector type.` };
+      }
+      const method = state.vectorMethod;
+      if (method === "SPARSE" && klass !== "vector-sparse") {
+        return { sql: null, error: "USING SPARSE is only valid on a SPARSEVECTOR column." };
+      }
+      if (method !== "SPARSE" && klass === "vector-sparse") {
+        return { sql: null, error: "A SPARSEVECTOR column can only use USING SPARSE." };
+      }
+      if ((method === "IVF" || method === "IVFPQ") && klass !== "vector-dense") {
+        return { sql: null, error: `USING ${method} is only valid on a real-valued VECTOR column.` };
+      }
+      if (klass === "vector-bit" && method !== "HNSW") {
+        return { sql: null, error: "A BITVECTOR column uses USING HNSW (Hamming graph) or no vector index." };
+      }
+      let using: string;
+      if (method === "HNSW") {
+        using = " USING HNSW";
+        if (klass === "vector-dense" && (state.vectorQuant === "F16" || state.vectorQuant === "I8")) {
+          using += ` WITH (QUANTIZATION = '${state.vectorQuant}')`;
+        } else if (state.vectorQuant !== "NONE" && klass !== "vector-dense") {
+          return { sql: null, error: "Quantization is only valid on a real-valued HNSW index." };
+        }
+      } else if (method === "SPARSE") {
+        using = " USING SPARSE";
+      } else if (method === "IVF" || method === "IVFPQ") {
+        const lists = Math.trunc(state.ivfLists);
+        if (!Number.isInteger(lists) || lists < 1) {
+          return { sql: null, error: `${method} LISTS must be an integer ≥ 1.` };
+        }
+        const probes = Math.trunc(state.ivfProbes);
+        if (state.ivfProbes && (!Number.isInteger(probes) || probes < 1)) {
+          return { sql: null, error: `${method} PROBES must be an integer ≥ 1 when set.` };
+        }
+        if (method === "IVF") {
+          using = ` USING IVF WITH (LISTS = ${lists}`;
+          if (probes >= 1) using += `, PROBES = ${probes}`;
+          using += ")";
+        } else {
+          const subspaces = Math.trunc(state.ivfSubspaces);
+          if (!Number.isInteger(subspaces) || subspaces < 1) {
+            return { sql: null, error: "IVFPQ SUBSPACES must be an integer ≥ 1." };
+          }
+          using = ` USING IVFPQ WITH (LISTS = ${lists}`;
+          if (probes >= 1) using += `, PROBES = ${probes}`;
+          using += `, SUBSPACES = ${subspaces})`;
+        }
+      } else {
+        return { sql: null, error: "Unknown vector index method." };
+      }
+      return {
+        sql:
+          `CREATE VECTOR INDEX ${quoteIdentifier(state.name.trim())} ON ${quoteIdentifier(state.table.trim())} ` +
+          `(${quoteIdentifier(column.name)})${using};`,
+        error: null,
+      };
+    }
+    case "spatial": {
+      if (resolved.length !== 1) return { sql: null, error: "A SPATIAL index covers exactly one column." };
+      const column = resolved[0];
+      if (designerIndexColumnClass(column.type) !== "geo") {
+        return { sql: null, error: `Column "${column.name}" is ${column.type}, not a geo type.` };
+      }
+      return {
+        sql:
+          `CREATE SPATIAL INDEX ${quoteIdentifier(state.name.trim())} ON ${quoteIdentifier(state.table.trim())} ` +
+          `(${quoteIdentifier(column.name)});`,
+        error: null,
+      };
+    }
+    default:
+      return { sql: null, error: "Unknown index kind." };
+  }
+}
+
+export function designerIndexKindOptions(columns: { name: string; type: string }[]): DesignerIndexKind[] {
+  const classes = new Set(columns.map((column) => designerIndexColumnClass(column.type)));
+  const kinds: DesignerIndexKind[] = ["btree", "unique"];
+  if (classes.has("text")) kinds.push("fulltext");
+  if (classes.has("vector-dense") || classes.has("vector-bit") || classes.has("vector-sparse")) kinds.push("vector");
+  if (classes.has("geo")) kinds.push("spatial");
+  return kinds;
 }

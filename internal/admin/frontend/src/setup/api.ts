@@ -38,6 +38,7 @@ export type Params = {
   keyFile: string;
   configOut: string;
   preset: "" | "conservative" | "balanced" | "high-performance" | "custom";
+  profile: "" | "developer" | "production";
   bufferPages: number;
   adminUser: string;
   adminPassword: string;
@@ -56,6 +57,7 @@ export function defaultParams(): Params {
     keyFile: "",
     configOut: "",
     preset: "balanced",
+    profile: "production",
     bufferPages: 0,
     adminUser: "",
     adminPassword: "",
@@ -103,6 +105,7 @@ export type PlanResult = {
   instance_key_file: string;
   instance_key_exists: boolean;
   admin_user?: string;
+  profile?: string;
   initialized: boolean;
   init_output?: string;
   health?: { ok: boolean; format_compatible: boolean; tables: number; durable_lsn: number };

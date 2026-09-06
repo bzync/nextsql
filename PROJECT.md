@@ -97,9 +97,6 @@ NextSQL Admin
   Setup       — install / initialize / upgrade / repair / uninstall
   Operations  — server / cluster / security / backup / maintenance UI
   Studio      — native NextSQL database development IDE
-
-NextSQL Intelligence
-  Version-aware, permission-aware, RAG-grounded assistant inside Studio mode
 ```
 
 All products must use official NextSQL interfaces and server truth.
@@ -267,7 +264,7 @@ single Raft leader for writes
 + native local partitioning
 ```
 
-**Automatic distributed sharding and multi-primary writes are not part of the P30 core contract.**
+**Automatic distributed sharding and multi-primary writes are not part of the core product contract.**
 
 ---
 
@@ -988,7 +985,6 @@ Additional separated domains can include:
 - temp/spill
 - replication
 - task/workflow metadata
-- Intelligence local secure state where necessary
 
 Do not use one permanent key for all purposes.
 
@@ -1171,7 +1167,6 @@ Permission scopes include:
 - maintenance
 - CDC
 - administration
-- Intelligence metadata/tool permissions where applicable
 
 Least privilege is the default.
 
@@ -2096,7 +2091,7 @@ It is authoritative for:
 - unsupported features
 - feature/version metadata
 
-NextSQL Admin (all modes, including Intelligence) and drivers must negotiate against server capabilities rather than assuming feature availability.
+NextSQL Admin (all modes) and drivers must negotiate against server capabilities rather than assuming feature availability.
 
 All system views obey RBAC and realm/database boundaries.
 
@@ -2196,7 +2191,7 @@ shell and three modes:
 
 - **Setup mode** (this section) — first-run install/upgrade/repair/uninstall lifecycle.
 - **Operations mode** (§47) — day-to-day server/cluster/security/backup administration.
-- **Studio mode** (§48-§67) — the database development IDE, including Intelligence.
+- **Studio mode** (§48–§55) — the database development IDE. Intelligence / RAG is not in the product (§56).
 
 The three modes share one process, one visual/accessibility baseline, and one product
 identity; they differ in what they connect to and what credentials they require, not in
@@ -2297,7 +2292,6 @@ Target users:
 - developers
 - DBAs
 - data engineers
-- AI/RAG developers
 - backend engineers
 - system architects
 
@@ -2556,504 +2550,27 @@ Studio includes dedicated experiences for:
 
 ---
 
-# 56. NextSQL Intelligence
-
-NextSQL Intelligence is the built-in context-aware assistant in Studio.
-
-It is **not** a generic PostgreSQL/MySQL chatbot.
-
-Its answer model is:
-
-```text
-actual connected server capabilities
-+ matching-version official NextSQL docs
-+ authorized live schema/catalog
-+ current SQL/error/plan context
-+ authorized metrics
-→ controlled retrieval/context orchestration
-→ optional AI model
-→ grounded answer with sources
-```
-
-The deterministic engine must never depend on AI for:
-
-- parsing
-- binding
-- optimization
-- execution
-- transactions
-- WAL
-- recovery
-- encryption
-- authorization
-- Raft
-- backup
-- integrity
-
-Studio remains fully usable if AI is disabled or unavailable.
-
----
-
-# 57. Intelligence Capability Awareness
-
-`system.capabilities` is authoritative.
-
-Intelligence receives:
-
-- server version
-- NSQL version
-- feature state
-- version-added metadata
-- deprecation metadata
-- documentation references
-
-It must not present planned features as installed features.
-
-It must correctly handle:
-
-- newer Studio + older server
-- older Studio + newer server
-
----
-
-# 58. Versioned Intelligence Knowledge Base
-
-Studio packages/version-controls official NextSQL knowledge.
-
-Corpus may include:
-
-- PROJECT
-- PLAN
-- TODO
-- official SQL docs
-- optimizer docs
-- execution docs
-- JSON docs
-- FTS docs
-- vector docs
-- geo docs
-- MVCC docs
-- WAL/recovery docs
-- security docs
-- protocol docs
-- backup/restore docs
-- operations docs
-- HA docs
-- workflow docs
-- CDC docs
-- partitioning docs
-- maintenance docs
-
-Knowledge chunks use stable hashes so only changed chunks need re-indexing after upgrades.
-
-A dedicated internal database may be used:
-
-```text
-nextsql_intelligence
-```
-
-It must remain logically separate from user databases.
-
-Retrieval uses:
-
-- full-text/BM25
-- vector retrieval when embeddings exist
-- hybrid retrieval when both exist
-- BM25-only fallback if embeddings are unavailable
-
-Official docs retrieval filters against the connected server's version/capabilities.
-
----
-
-# 59. Self-RAG / Dogfooding
-
-NextSQL Intelligence should use NextSQL itself for its official knowledge retrieval where practical.
-
-```text
-NextSQL docs
-→ NextSQL tables
-→ native full-text index
-→ native vector index
-→ native hybrid optimizer
-→ Studio Intelligence
-```
-
-No external vector database is required for the built-in knowledge base.
-
-Measure:
-
-- retrieval latency
-- Recall@K
-- MRR
-- NDCG where applicable
-- citation correctness
-
----
-
-# 60. Intelligence Context Orchestration
-
-Typed context includes concepts such as:
-
-```text
-ServerContext
-CapabilityContext
-DatabaseContext
-SchemaContext
-TableContext
-IndexContext
-QueryContext
-PlanContext
-ErrorContext
-DocumentationContext
-RealmContext
-SecurityPolicyContext
-```
-
-Context priority:
-
-```text
-1. current selection/query
-2. current error/plan
-3. exact referenced schema objects
-4. server capabilities
-5. matching-version official docs
-6. nearby related objects
-7. broader NextSQL docs
-```
-
-The orchestrator must:
-
-- select context by intent
-- avoid dumping entire schemas
-- deduplicate
-- rerank
-- compress
-- enforce token budgets
-- cache safely
-- compact old conversation context
-
----
-
-# 61. Intelligence Permissions and Privacy
-
-AI context must respect exactly the same authorization boundaries as the user.
-
-Never send to an external model provider:
-
-- raw root keys
-- passwords
-- tokens
-- private keys
-- secrets
-- unauthorized tables/columns
-- cross-realm/database rows
-- fields marked with an AI-deny policy
-
-Support explicit policy such as:
-
-```text
-AI_DENY
-```
-
-or final equivalent for columns/data that must never leave the local trust boundary.
-
-Production policy should support metadata-only AI operation.
-
-Users must be able to preview/redact context before external transmission where appropriate.
-
----
-
-# 62. Intelligence Provider Abstraction
-
-AI is provider-optional.
-
-Maintain abstractions for:
-
-- chat/completion provider
-- embedding provider
-- model selection
-- token limits
-- timeout
-- retries
-- credential storage
-- provider privacy settings
-- audit metadata
-
-No single AI vendor may become a correctness dependency.
-
-AI provider failure must not interrupt database operation or normal Studio usage.
-
----
-
-# 63. Intelligence Tool Layer
-
-AI actions use typed, permission-aware tools.
-
-Examples:
-
-- inspect capabilities
-- inspect schema
-- inspect table/index metadata
-- retrieve matching-version docs
-- inspect EXPLAIN
-- inspect authorized metrics
-- draft SQL
-- validate SQL
-- generate RAG schema/query
-- explain workflow/CDC definitions
-
-Generated SQL is not automatically trusted.
-
-Dangerous actions require:
-
-- explicit user intent
-- server authorization
-- production safety checks
-- confirmation where applicable
-
----
-
-# 64. Intelligence Prompt-Injection Boundary
-
-Retrieved data is **data**, not trusted instructions.
-
-Untrusted content includes:
-
-- user table rows
-- document text
-- comments
-- imported RAG documents
-- external HTML/PDF content
-
-Retrieved text must never be allowed to:
-
-- change system policy
-- broaden RBAC
-- reveal secrets
-- invoke unauthorized tools
-- switch realm/database identity
-- override production safeguards
-
-Maintain a prompt-injection test corpus.
-
----
-
-# 65. Intelligence Assistant Modes
-
-## SQL Assistant
-
-Can:
-
-- explain native SQL
-- generate native SQL
-- fix parser/binder errors
-- explain query behavior
-- propose safer rewrites
-
-## Performance Assistant
-
-Can:
-
-- explain real plans
-- compare estimates vs actuals
-- identify scans/index choices
-- recommend evidence-backed improvements
-
-Never invent metrics.
-
-## Schema Assistant
-
-Can:
-
-- explain schema
-- suggest indexes
-- explain dependencies
-- propose native DDL
-
-## RAG Assistant
-
-Can:
-
-- generate native RAG schema
-- generate hybrid retrieval SQL
-- inspect vector dimensions
-- inspect FTS availability
-- explain hybrid ranking
-- recommend retrieval improvements from real metrics/configuration
-
-## Security Assistant
-
-Can explain permitted metadata for:
-
-- TLS
-- encryption
-- RBAC
-- audit
-- rotation
-
-It never retrieves raw keys.
-
-## HA Assistant
-
-Can explain:
-
-- cluster status
-- leader/follower state
-- lag
-- actual failover events
-
-It must say when evidence is insufficient.
-
-## Workflow / CDC Assistant
-
-Can generate/review definitions only when supported by the connected server.
-
----
-
-# 66. Intelligence Chat UX
-
-Studio provides:
-
-- dedicated chat panel/workspace
-- visible connection
-- visible database
-- visible realm/database
-- visible server version
-- context chips
-- manual add/remove context
-- selection actions: Explain / Fix / Optimize / Generate / Ask
-- error “Ask NextSQL Intelligence”
-- plan-node explanation
-- vector-index explanation
-- grounding indicators
-- clickable citations
-- redacted Markdown export
-
-Grounding indicators may distinguish:
-
-```text
-Docs
-Live Schema
-Plan
-Metrics
-Capabilities
-```
-
----
-
-# 67. RAG Playground
-
-RAG Playground is distinct from Intelligence.
-
-```text
-NextSQL Intelligence
-→ helps developers use NextSQL
-
-RAG Playground
-→ helps developers build/test RAG systems using NextSQL
-```
-
-Provide a wizard to configure:
-
-- knowledge table
-- text column
-- metadata columns
-- vector column
-- optional application filter column
-- retrieval mode: FULLTEXT / VECTOR / HYBRID
-- top-K
-
-Generated schema/configuration must be transparent.
-
-No hidden proprietary “magic” store.
-
-Document ingestion target formats:
-
-- TXT
-- Markdown
-- HTML
-- PDF
-- JSON
-- CSV
-
-Pipeline:
-
-```text
-parse
-→ normalize
-→ chunk
-→ embed
-→ insert
-→ index
-```
-
-Chunking options include:
-
-- character
-- token
-- paragraph
-- heading-aware
-- overlap
-
-Store document/chunk lineage.
-
-Validate vector dimensions.
-
-Retrieval inspector exposes:
-
-- source
-- section
-- metadata
-- BM25 rank
-- vector rank
-- hybrid rank
-- distance where meaningful
-- source context
-
-Evaluation includes:
-
-- Recall@K
-- MRR
-- NDCG
-- BM25 vs vector vs hybrid comparison
-- retrieval latency
-- embedding latency
-- model latency
-- token usage
-- cache hits
-
-Answers support source citations.
-
----
-
-# 68. Deterministic RETRIEVER Research
-
-After Studio RAG proves the model, NextSQL may research a native deterministic retrieval object such as:
-
-```sql
-CREATE RETRIEVER ...
-RETRIEVE ... FOR $query;
-```
-
-A RETRIEVER, if adopted, encapsulates:
-
-- table
-- text column
-- vector column
-- filters
-- retrieval mode
-- top-K
-
-It remains:
-
-- deterministic
-- transactional
-- RBAC-aware
-- realm/database-aware
-
-LLM generation remains outside `nextsqld`.
-
-This is **Research** until explicitly production-gated.
+# 56. NextSQL Intelligence, RAG Playground, and RETRIEVER — not in product
+
+These were the former **P30** phase (NextSQL Intelligence + built-in RAG,
+including a Studio assistant, RAG Playground, and research toward
+`CREATE RETRIEVER`). They are **removed from the product**. They are not
+deferred, not planned, and not a later-version commitment.
+
+Do not implement:
+
+- a Studio AI assistant, chat panel, or “Ask NextSQL Intelligence” action
+- a RAG Playground product surface
+- `CREATE RETRIEVER` / `RETRIEVE` as an Intelligence/RAG object
+- an Intelligence knowledge base, provider layer, or tool layer
+- Intelligence-specific encryption domains, RBAC privileges, or capabilities
+
+Studio is a native database development IDE without an AI assistant.
+Full-text search, vector search, and hybrid SQL remain ordinary engine
+features; they are not an Intelligence product.
+
+LLM-inside-the-optimizer and LLM-required-for-correctness remain rejected
+(see §77).
 
 ---
 
@@ -3234,7 +2751,7 @@ It is complete only after implementation, tests, docs, and its exit gate are gre
 
 # 73. Product UX and Safety Contract
 
-Applies to NextSQL Admin (Setup, Operations, and Studio modes) and Intelligence.
+Applies to NextSQL Admin (Setup, Operations, and Studio modes).
 
 All user-facing products should provide:
 
@@ -3330,8 +2847,6 @@ Canonical system introspection
 Operational workload governance
 Official drivers
 NextSQL Admin (Setup / Operations / Studio modes)
-NextSQL Intelligence
-RAG Playground
 ```
 
 with long-term quality objectives:
@@ -3388,9 +2903,15 @@ mandatory in production mode
 
 ---
 
-# 77. Explicitly Deferred Beyond the Core P30 Product
+# 77. Explicitly Deferred or Rejected Beyond the Core Product
 
-The following are **not** required to consider the P30 product family complete:
+The following are **not** required to consider the product family complete:
+
+## Removed from product (former P30)
+
+- NextSQL Intelligence
+- RAG Playground
+- `CREATE RETRIEVER` / Intelligence-layer retrieval objects
 
 ## Deferred
 
@@ -3457,7 +2978,7 @@ If a feature is only designed but not implemented/tested:
 
 # 79. Final Guiding Principle
 
-> **NextSQL must be fast without weakening correctness, encrypted without pretending custom cryptography is safer, highly available without risking split brain, multimodel without becoming several loosely coupled databases, intelligent without making AI a correctness dependency, and professional without allowing tooling to bypass the engine's security model.**
+> **NextSQL must be fast without weakening correctness, encrypted without pretending custom cryptography is safer, highly available without risking split brain, multimodel without becoming several loosely coupled databases, and professional without allowing tooling to bypass the engine's security model.**
 
 The finished system is not merely a database executable.
 
@@ -3478,7 +2999,6 @@ Engine
 + Installer
 + Manager
 + Studio
-+ Intelligence / RAG
 ```
 
 all built around one authoritative NextSQL engine.

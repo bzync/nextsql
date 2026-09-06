@@ -151,6 +151,7 @@ type Params struct {
 	Base            config.Config
 	Info            sysinfo.Info
 	Preset          Preset
+	Profile         string // developer | production; empty means developer
 	DataDir         string
 	KeyFile         string
 	InstanceKeyFile string
@@ -179,6 +180,7 @@ type Plan struct {
 	InstanceKeyFile string         `json:"instance_key_file"`
 	AdminUser       string         `json:"admin_user,omitempty"`
 	RunInit         bool           `json:"run_init"`
+	Profile         string         `json:"profile"`
 	Warnings        []string       `json:"warnings"`
 }
 
@@ -187,6 +189,11 @@ type Plan struct {
 // error if the resulting config is otherwise invalid. It performs no I/O.
 func BuildPlan(p Params) (Plan, error) {
 	cfg := p.Base
+
+	profile, err := config.ParseDeploymentProfile(p.Profile)
+	if err != nil {
+		return Plan{}, err
+	}
 
 	cfg.DataDir = p.DataDir
 	cfg.KeyFile = p.KeyFile
@@ -209,6 +216,12 @@ func BuildPlan(p Params) (Plan, error) {
 	rec := Recommend(p.Info, p.Preset, p.BufferPages)
 	cfg.BufferPages = rec.BufferPages
 
+	if profile == config.ProfileProduction {
+		cfg.ApplyProductionDefaults()
+	} else {
+		cfg.DeploymentProfile = config.ProfileDeveloper
+	}
+
 	loopback := isLoopbackAddr(cfg.ListenAddr)
 	hasTLS := cfg.TLSCert != "" && cfg.TLSKey != ""
 	if !loopback && !hasTLS {
@@ -218,8 +231,11 @@ func BuildPlan(p Params) (Plan, error) {
 	if err := cfg.Validate(); err != nil {
 		return Plan{}, nerr.Wrap(nerr.InvalidArgument, "setup.BuildPlan", "invalid configuration", err)
 	}
+	if err := cfg.CheckProduction(); err != nil {
+		return Plan{}, err
+	}
 
-	warnings := advisories(p.Info, cfg, rec, p.AdminUser, loopback)
+	warnings := advisories(p.Info, cfg, rec, p.AdminUser, loopback, profile)
 
 	return Plan{
 		Info:            p.Info,
@@ -233,18 +249,23 @@ func BuildPlan(p Params) (Plan, error) {
 		InstanceKeyFile: cfg.InstanceKeyFile,
 		AdminUser:       p.AdminUser,
 		RunInit:         p.RunInit,
+		Profile:         profile,
 		Warnings:        warnings,
 	}, nil
 }
 
-func advisories(info sysinfo.Info, cfg config.Config, rec Recommendation, adminUser string, loopback bool) []string {
+func advisories(info sysinfo.Info, cfg config.Config, rec Recommendation, adminUser string, loopback bool, profile string) []string {
 	var w []string
 	if info.RAMBytes == 0 {
 		w = append(w, "physical RAM was not detected; buffer pool left at the built-in default — set --buffer-pages explicitly for a tuned deployment")
 	}
 	switch info.Filesystem {
 	case "tmpfs", "ramfs":
-		w = append(w, "data volume filesystem is "+info.Filesystem+": contents will not survive a reboot — choose a persistent --data-dir for production")
+		msg := "data volume filesystem is " + info.Filesystem + ": contents will not survive a reboot — choose a persistent --data-dir for production"
+		if profile == config.ProfileProduction {
+			msg = "production profile on a " + info.Filesystem + " data volume: contents will not survive a reboot — use a persistent --data-dir"
+		}
+		w = append(w, msg)
 	case "overlay":
 		w = append(w, "data volume filesystem is overlay (typical of a container's writable layer): use a mounted volume so data outlives the container")
 	}
@@ -258,10 +279,23 @@ func advisories(info sysinfo.Info, cfg config.Config, rec Recommendation, adminU
 		}
 	}
 	if adminUser == "" {
-		w = append(w, "no --user/--password-file given: the database will initialize without a bootstrap administrator — create one before exposing the server")
+		if profile == config.ProfileProduction {
+			w = append(w, "production profile requires --user/--password-file before the database is initialized — dry-run is allowed, a real install is not")
+		} else {
+			w = append(w, "no --user/--password-file given: the database will initialize without a bootstrap administrator — create one before exposing the server")
+		}
 	}
 	if !loopback {
 		w = append(w, "listen address "+cfg.ListenAddr+" is not loopback: ensure the host firewall restricts access to trusted networks")
+	}
+	if config.KeyOnDataVolume(cfg.DataDir, cfg.KeyFile) {
+		w = append(w, "unlock key file is inside the data directory; keep it off the data volume in production")
+	}
+	if profile == config.ProfileProduction && cfg.BackupDir == "" {
+		w = append(w, "backup_dir is unset: set it (or wal_archive) before relying on this instance for recovery")
+	}
+	if profile == config.ProfileDeveloper && !loopback {
+		w = append(w, "developer profile on a non-loopback listen address: use --profile production for a live deployment")
 	}
 	return w
 }

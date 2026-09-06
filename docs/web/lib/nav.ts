@@ -28,6 +28,11 @@ export const docsNav: NavGroup[] = [
         slug: "quick-start",
         description: "Initialize a data directory, start nextsqld, and run SQL.",
       },
+      {
+        title: "Docker",
+        slug: "docker",
+        description: "Run nextsqld in a container, with the root key off the data volume.",
+      },
     ],
   },
   {
@@ -51,12 +56,12 @@ export const docsNav: NavGroup[] = [
       {
         title: "Full-text search",
         slug: "fulltext",
-        description: "Inverted indexes, BM25 ranking, phrases, and English stemming.",
+        description: "Inverted indexes, BM25, analyzers, prefix, fuzzy, highlight, and facets.",
       },
       {
         title: "Vectors",
         slug: "vectors",
-        description: "VECTOR<F32,N>, NEAREST, HNSW, and distance functions.",
+        description: "VECTOR, BITVECTOR, SPARSEVECTOR, HNSW, IVF, IVF-PQ, and NEAREST.",
       },
       {
         title: "Hybrid queries",
@@ -66,7 +71,17 @@ export const docsNav: NavGroup[] = [
       {
         title: "Geospatial",
         slug: "geo",
-        description: "WGS84 POINT, BOX, distances, and spatial indexes.",
+        description: "WGS84 POINT/BOX/LINESTRING/POLYGON plus GEOMETRY and GEOGRAPHY.",
+      },
+      {
+        title: "Collections",
+        slug: "collections",
+        description: "STRUCT, ARRAY, and MAP columns with nested field and element access.",
+      },
+      {
+        title: "Workflows",
+        slug: "workflows",
+        description: "WORKFLOW, TRIGGER, SCHEDULE, and durable TASK execution.",
       },
       {
         title: "Transactions",
@@ -86,7 +101,7 @@ export const docsNav: NavGroup[] = [
       {
         title: "Users, roles, and isolation",
         slug: "security",
-        description: "Password auth, RBAC, hosted database isolation, and the honest threat model.",
+        description: "Argon2id, RBAC, tokens, OIDC, mTLS, and the honest threat model.",
       },
       {
         title: "Command line",
@@ -121,7 +136,17 @@ export const docsNav: NavGroup[] = [
       {
         title: "High availability",
         slug: "ha",
-        description: "Three-node Raft, quorum commits, and failover targets.",
+        description: "Three-node Raft, quorum commits, follower reads, and failover.",
+      },
+      {
+        title: "Hosting",
+        slug: "hosting",
+        description: "Realms, selectable databases, storage caps, suspend, and drop.",
+      },
+      {
+        title: "Admin",
+        slug: "admin",
+        description: "nextsql-admin Setup, Operations, and Studio modes.",
       },
       {
         title: "Diagnostics and benches",
@@ -198,6 +223,10 @@ export function allDocs(): NavItem[] {
 
 export function findDoc(slug: string): NavItem | undefined {
   return allDocs().find((item) => item.slug === slug);
+}
+
+export function findDocGroup(slug: string): NavGroup | undefined {
+  return docsNav.find((group) => group.items.some((item) => item.slug === slug));
 }
 
 export function adjacentDocs(slug: string): {

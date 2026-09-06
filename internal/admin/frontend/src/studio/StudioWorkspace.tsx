@@ -53,6 +53,7 @@ import { SchemaDiagramExplorer } from "./SchemaDiagramExplorer";
 import { DataGeneratorExplorer } from "./DataGeneratorExplorer";
 import { ImportExplorer } from "./ImportExplorer";
 import { DMLBuilderExplorer } from "./DMLBuilderExplorer";
+import { SchemaDesignerExplorer, type SchemaDesignerMode } from "./SchemaDesignerExplorer";
 import { ObjectSearch } from "./ObjectSearch";
 import { CommandPalette, type StudioCommand } from "./CommandPalette";
 import { SwitchConnection } from "./SwitchConnection";
@@ -61,8 +62,15 @@ import { SchemaTree } from "./SchemaTree";
 import { ResultGrid } from "./ResultGrid";
 import {
   STUDIO_ENVIRONMENTS,
+  DEFAULT_STUDIO_LAYOUT,
+  LAYOUT_WIDTH_STEP,
+  MAX_EXPLORER_WIDTH,
+  MAX_INSPECTOR_WIDTH,
+  MIN_EXPLORER_WIDTH,
+  MIN_INSPECTOR_WIDTH,
   applyTableNameFix,
   currentJSONPathRange,
+  currentNearestContext,
   currentWordRange,
   editorDraftStorageKey,
   editorDraftsWorthRestoring,
@@ -73,9 +81,12 @@ import {
   grantStateFromRow,
   isStudioEnvironment,
   jsonPathIndexPaths,
+  layoutStorageKey,
   namesFromResult,
+  parseStudioLayout,
   queryResultSummary,
   realmScopeWarning,
+  resetStudioLayout,
   nextMatchIndex,
   previousMatchIndex,
   parseEditorDrafts,
@@ -90,15 +101,20 @@ import {
   MAX_SAVED_QUERY_IMPORT_BYTES,
   MAX_TABLE_CONSTRAINT_ROWS,
   rankJSONPathSuggestions,
+  rankNearestColumnSuggestions,
+  rankNearestMetricSuggestions,
   rankSQLSuggestions,
   removeSavedQuery,
   replaceAllMatches,
   savedQueryStorageKey,
   serializeEditorDrafts,
   serializeSavedQueries,
+  serializeStudioLayout,
+  stepLayoutWidth,
   upsertSavedQuery,
   suggestTableNameFixes,
   tableConstraintsResult,
+  vectorColumnsFromResult,
   withCachedTableLoading,
   type FindMatch,
   type ExplainPlanSnapshot,
@@ -113,6 +129,7 @@ import {
   type TableColumnsCache,
   type TableJSONPathCache,
   type TableNameFix,
+  type TableVectorCache,
 } from "./resultTools";
 
 const DEFAULT_SQL = "SELECT * FROM system.capabilities ORDER BY name";
@@ -258,6 +275,75 @@ type ScriptStatementResult = {
 
 const MAX_SCRIPT_CONFIRM_REASONS = 10;
 
+function LayoutSplitter({
+  label,
+  value,
+  min,
+  max,
+  invert,
+  className,
+  onChange,
+}: {
+  label: string;
+  value: number;
+  min: number;
+  max: number;
+  invert?: boolean;
+  className?: string;
+  onChange: (next: number) => void;
+}) {
+  const drag = useRef<{ pointerId: number; startX: number; startW: number } | null>(null);
+
+  const applyDelta = useCallback(
+    (dx: number) => {
+      onChange(stepLayoutWidth(drag.current?.startW ?? value, invert ? -dx : dx, min, max));
+    },
+    [invert, max, min, onChange, value],
+  );
+
+  return (
+    <div
+      role="separator"
+      aria-orientation="vertical"
+      aria-label={label}
+      aria-valuenow={value}
+      aria-valuemin={min}
+      aria-valuemax={max}
+      tabIndex={0}
+      className={className ? `nss-splitter ${className}` : "nss-splitter"}
+      onPointerDown={(event) => {
+        event.currentTarget.setPointerCapture(event.pointerId);
+        drag.current = { pointerId: event.pointerId, startX: event.clientX, startW: value };
+      }}
+      onPointerMove={(event) => {
+        if (!drag.current || drag.current.pointerId !== event.pointerId) return;
+        applyDelta(event.clientX - drag.current.startX);
+      }}
+      onPointerUp={(event) => {
+        if (drag.current?.pointerId === event.pointerId) drag.current = null;
+      }}
+      onLostPointerCapture={() => {
+        drag.current = null;
+      }}
+      onKeyDown={(event) => {
+        if (event.key === "ArrowLeft") {
+          event.preventDefault();
+          onChange(stepLayoutWidth(value, invert ? LAYOUT_WIDTH_STEP : -LAYOUT_WIDTH_STEP, min, max));
+        } else if (event.key === "ArrowRight") {
+          event.preventDefault();
+          onChange(stepLayoutWidth(value, invert ? -LAYOUT_WIDTH_STEP : LAYOUT_WIDTH_STEP, min, max));
+        } else if (event.key === "Home") {
+          event.preventDefault();
+          onChange(min);
+        } else if (event.key === "End") {
+          event.preventDefault();
+          onChange(max);
+        }
+      }}
+    />
+  );
+}
+
 export function StudioWorkspace({
   who,
   onUnauthorized,
@@ -278,10 +364,27 @@ export function StudioWorkspace({
   const [bootstrapError, setBootstrapError] = useState<string | null>(null);
   const [loadingBootstrap, setLoadingBootstrap] = useState(true);
   const [filter, setFilter] = useState("");
-  const [selectedTable, setSelectedTable] = useState<string | null>(null);
+  // Layout persistence: pane visibility/widths and the last selected table
+  // name (never SQL, results, or a credential). Hydrated once from this
+  // connection's localStorage slot; a missing/malformed value is the default.
+  const layoutKey = layoutStorageKey(who.realm ?? "", who.database ?? "", who.user ?? "");
+  const [initialLayout] = useState(() => {
+    try {
+      return parseStudioLayout(window.localStorage.getItem(layoutKey));
+    } catch {
+      return { ...DEFAULT_STUDIO_LAYOUT };
+    }
+  });
+  const [explorerVisible, setExplorerVisible] = useState(initialLayout.explorerVisible);
+  const [inspectorVisible, setInspectorVisible] = useState(initialLayout.inspectorVisible);
+  const [explorerWidth, setExplorerWidth] = useState(initialLayout.explorerWidth);
+  const [inspectorWidth, setInspectorWidth] = useState(initialLayout.inspectorWidth);
+  const restoredTable = useRef(initialLayout.selectedTable);
+  const restoredTableApplied = useRef(false);
+  const [selectedTable, setSelectedTable] = useState<string | null>(initialLayout.selectedTable);
   const [detail, setDetail] = useState<StudioTableDetail | null>(null);
   const [detailError, setDetailError] = useState<string | null>(null);
-  const [loadingDetail, setLoadingDetail] = useState(false);
+  const [loadingDetail, setLoadingDetail] = useState(() => Boolean(initialLayout.selectedTable));
   // Crash recovery: mirror the editor tab buffers (title + SQL only) to
   // localStorage keyed by this connection, and rehydrate them on load so a
   // crash / accidental close / reload does not lose unsaved work.
@@ -358,6 +461,8 @@ export function StudioWorkspace({
   const [dataGeneratorOpen, setDataGeneratorOpen] = useState(false);
   const [importOpen, setImportOpen] = useState(false);
   const [dmlBuilderOpen, setDmlBuilderOpen] = useState(false);
+  const [schemaDesignerOpen, setSchemaDesignerOpen] = useState(false);
+  const [schemaDesignerMode, setSchemaDesignerMode] = useState<SchemaDesignerMode>("table");
   const [schemaDiagramOpen, setSchemaDiagramOpen] = useState(false);
   const [schemaGraph, setSchemaGraph] = useState<StudioSchemaGraph | null>(null);
   const [schemaGraphLoading, setSchemaGraphLoading] = useState(false);
@@ -373,6 +478,7 @@ export function StudioWorkspace({
   const [activeSuggestionIndex, setActiveSuggestionIndex] = useState(0);
   const [tableColumnsCache, setTableColumnsCache] = useState<TableColumnsCache>({});
   const [tableJSONPathCache, setTableJSONPathCache] = useState<TableJSONPathCache>({});
+  const [tableVectorCache, setTableVectorCache] = useState<TableVectorCache>({});
   const tableFetchOrder = useRef<string[]>([]);
   const findInputRef = useRef<HTMLInputElement>(null);
   const activeQuery = useRef<string | null>(null);
@@ -444,6 +550,34 @@ export function StudioWorkspace({
     }, 500);
     return () => window.clearTimeout(handle);
   }, [tabs, activeTabId, draftKey]);
+
+  useEffect(() => {
+    const handle = window.setTimeout(() => {
+      try {
+        window.localStorage.setItem(
+          layoutKey,
+          serializeStudioLayout({
+            explorerVisible,
+            inspectorVisible,
+            explorerWidth,
+            inspectorWidth,
+            selectedTable,
+          }),
+        );
+      } catch {
+        /* best effort — a private/blocked window just does not persist layout */
+      }
+    }, 200);
+    return () => window.clearTimeout(handle);
+  }, [layoutKey, explorerVisible, inspectorVisible, explorerWidth, inspectorWidth, selectedTable]);
+
+  const resetLayout = useCallback(() => {
+    const next = resetStudioLayout(selectedTable);
+    setExplorerVisible(next.explorerVisible);
+    setInspectorVisible(next.inspectorVisible);
+    setExplorerWidth(next.explorerWidth);
+    setInspectorWidth(next.inspectorWidth);
+  }, [selectedTable]);
 
   const discardRestoredDrafts = useCallback(() => {
     try {
@@ -682,17 +816,24 @@ export function StudioWorkspace({
   // only JSON structure NextSQL exposes metadata for — instead of the plain
   // table/column list.
   const jsonPathContext = useMemo(() => currentJSONPathRange(sql, cursorPos), [sql, cursorPos]);
+  const nearestContext = useMemo(() => currentNearestContext(sql, cursorPos), [sql, cursorPos]);
   const suggestions = useMemo(() => {
     if (!suggestOpen) return [];
     if (jsonPathContext) {
       return rankJSONPathSuggestions(jsonPathContext.typed, referencedTables, tableJSONPathCache);
     }
+    if (nearestContext?.slot === "column") {
+      return rankNearestColumnSuggestions(nearestContext.typed, referencedTables, tableVectorCache);
+    }
+    if (nearestContext?.slot === "metric") {
+      return rankNearestMetricSuggestions(nearestContext.typed, nearestContext.column, referencedTables, tableVectorCache);
+    }
     return rankSQLSuggestions(suggestPrefix, catalogTableNames, referencedTables, tableColumnsCache);
-  }, [suggestOpen, jsonPathContext, suggestPrefix, catalogTableNames, referencedTables, tableColumnsCache, tableJSONPathCache]);
+  }, [suggestOpen, jsonPathContext, nearestContext, suggestPrefix, catalogTableNames, referencedTables, tableColumnsCache, tableJSONPathCache, tableVectorCache]);
 
   useEffect(() => {
     setActiveSuggestionIndex(0);
-  }, [suggestOpen, suggestPrefix, jsonPathContext?.typed]);
+  }, [suggestOpen, suggestPrefix, jsonPathContext?.typed, nearestContext?.slot, nearestContext?.typed]);
 
   // RUI's CodeEditor has no completion/overlay primitive and no way to pass
   // through arbitrary aria-* props, so the ARIA 1.2 combobox-with-listbox-
@@ -735,6 +876,7 @@ export function StudioWorkspace({
           if (!mounted.current) return;
           setTableColumnsCache((prev) => (table in prev ? { ...prev, [table]: namesFromResult(data.columns, "column_name") } : prev));
           setTableJSONPathCache((prev) => ({ ...prev, [table]: jsonPathIndexPaths(data.indexes) }));
+          setTableVectorCache((prev) => ({ ...prev, [table]: vectorColumnsFromResult(data.columns) }));
         })
         .catch(() => {
           if (!mounted.current) return;
@@ -1018,6 +1160,29 @@ export function StudioWorkspace({
         if (mounted.current && detailRequest.current === name) setLoadingDetail(false);
       });
   }, [handleFailure]);
+
+  useEffect(() => {
+    if (restoredTableApplied.current) return;
+    const name = restoredTable.current;
+    if (!bootstrap) {
+      if (bootstrapError) {
+        restoredTableApplied.current = true;
+        setLoadingDetail(false);
+      }
+      return;
+    }
+    restoredTableApplied.current = true;
+    if (!name) {
+      setLoadingDetail(false);
+      return;
+    }
+    if (allTables.includes(name)) {
+      selectTable(name);
+      return;
+    }
+    setSelectedTable(null);
+    setLoadingDetail(false);
+  }, [bootstrap, bootstrapError, allTables, selectTable]);
 
   const loadFullTextTable = useCallback(async (name: string): Promise<StudioTableDetail> => {
     try {
@@ -1586,6 +1751,8 @@ export function StudioWorkspace({
       { id: "data-generator", label: "Generate development data…", keywords: "seed rows insert synthetic fixture mock sample", run: () => setDataGeneratorOpen(true) },
       { id: "import-data", label: "Import CSV / JSON data…", keywords: "load file tsv ndjson insert upload", run: () => setImportOpen(true) },
       { id: "dml-builder", label: "Parameterized INSERT / UPDATE / DELETE…", keywords: "dml template placeholder $1 bind statement write", run: () => setDmlBuilderOpen(true) },
+      { id: "design-table", label: "Design table…", keywords: "create table schema ddl columns primary key foreign key", run: () => { setSchemaDesignerMode("table"); setSchemaDesignerOpen(true); } },
+      { id: "design-index", label: "Design index…", keywords: "create index unique fulltext vector spatial btree", run: () => { setSchemaDesignerMode("index"); setSchemaDesignerOpen(true); } },
       { id: "grant-builder", label: "GRANT / REVOKE builder…", keywords: "privileges rbac permissions", run: () => setGrantBuilderOpen(true) },
       { id: "explorer-fulltext", label: "Open Full-text explorer", keywords: "search bm25", run: () => setFullTextExplorerOpen(true) },
       { id: "explorer-vector", label: "Open Vector explorer", keywords: "ann nearest embedding", run: () => setVectorExplorerOpen(true) },
@@ -1596,12 +1763,15 @@ export function StudioWorkspace({
       { id: "explorer-audit", label: "Open Audit log", keywords: "verify trail", run: openAuditExplorer },
       { id: "explorer-workflows", label: "Open Workflows, tasks & change streams", keywords: "trigger schedule cdc", run: openWorkflowExplorer },
       { id: "explorer-migrations", label: "Open Schema migration history", keywords: "migrate version dirty schema lifecycle", run: openMigrationExplorer },
+      { id: "toggle-explorer", label: explorerVisible ? "Hide database explorer" : "Show database explorer", keywords: "layout pane sidebar", run: () => setExplorerVisible((v) => !v) },
+      { id: "toggle-inspector", label: inspectorVisible ? "Hide inspector" : "Show inspector", keywords: "layout pane details", run: () => setInspectorVisible((v) => !v) },
+      { id: "reset-layout", label: "Reset layout", keywords: "panes widths default", run: resetLayout },
     ];
   }, [
     running, checkingSQL, splittingScript, hasSelection, sql, cancelRequested,
     addTab, requestRun, requestRunScript, cancelQuery, openSuggest, openObjectSearch,
     openSecurityExplorer, openActivityExplorer, openAuditExplorer, openWorkflowExplorer,
-    openMigrationExplorer,
+    openMigrationExplorer, explorerVisible, inspectorVisible, resetLayout,
   ]);
 
   useEffect(() => {
@@ -1731,6 +1901,15 @@ export function StudioWorkspace({
             onChange={(value) => setEnvironment(isStudioEnvironment(value) ? value : null)}
           />
           <Text size="sm" variant="muted">Catalog and queries use this authenticated NSQL session.</Text>
+          {!explorerVisible ? (
+            <Button variant="outline" size="sm" onClick={() => setExplorerVisible(true)}>Show explorer</Button>
+          ) : null}
+          {!inspectorVisible ? (
+            <Button variant="outline" size="sm" onClick={() => setInspectorVisible(true)}>Show inspector</Button>
+          ) : null}
+          {!explorerVisible ? (
+            <Button variant="ghost" size="sm" onClick={() => setPaletteOpen(true)} title="Command palette (Ctrl/Cmd+K)">Commands</Button>
+          ) : null}
         </Inline>
       </div>
 
@@ -1759,13 +1938,25 @@ export function StudioWorkspace({
         />
       ) : null}
 
-      <div className="nss-layout">
+      <div
+        className={[
+          "nss-layout",
+          explorerVisible ? "" : "nss-layout--no-explorer",
+          inspectorVisible ? "" : "nss-layout--no-inspector",
+        ].filter(Boolean).join(" ")}
+        style={{
+          ["--nss-explorer-w" as string]: `${explorerWidth}px`,
+          ["--nss-inspector-w" as string]: `${inspectorWidth}px`,
+        }}
+      >
+        {explorerVisible ? (
         <Card variant="bordered" className="nss-explorer">
           <CardHeader className="nss-explorer-header">
             <CardTitle as="h2">Database explorer</CardTitle>
             <Inline gap="xs" align="center" wrap>
               <Button variant="ghost" size="sm" onClick={() => setPaletteOpen(true)} title="Command palette (Ctrl/Cmd+K)">Commands</Button>
               <Button variant="outline" size="sm" onClick={openObjectSearch}>Search objects…</Button>
+              <Button variant="ghost" size="sm" onClick={() => setExplorerVisible(false)}>Hide explorer</Button>
             </Inline>
           </CardHeader>
           <CardBody className="nss-explorer-body">
@@ -1790,6 +1981,16 @@ export function StudioWorkspace({
             />
           </CardBody>
         </Card>
+        ) : null}
+        {explorerVisible ? (
+          <LayoutSplitter
+            label="Resize database explorer"
+            value={explorerWidth}
+            min={MIN_EXPLORER_WIDTH}
+            max={MAX_EXPLORER_WIDTH}
+            onChange={setExplorerWidth}
+          />
+        ) : null}
 
         <Card variant="bordered" className="nss-editor-card">
           <CardHeader className="nss-editor-header">
@@ -1823,12 +2024,22 @@ export function StudioWorkspace({
                 <PopoverContent className="nss-suggest-panel">
                   <Stack gap="sm">
                     <Text size="sm" weight="medium">
-                      {jsonPathContext ? "Indexed JSON paths" : "SQL suggestions"}
+                      {jsonPathContext
+                        ? "Indexed JSON paths"
+                        : nearestContext?.slot === "column"
+                          ? "Vector columns"
+                          : nearestContext?.slot === "metric"
+                            ? "Vector metrics"
+                            : "SQL suggestions"}
                     </Text>
                     <Text size="xs" variant="muted">
                       {jsonPathContext
                         ? "Native JSON paths that a referenced table has an index on — the only JSON structure the server exposes metadata for."
-                        : "Catalog table and column names only — no keywords. Ctrl+Space reopens; type to filter, Up/Down/Enter/Esc work without leaving the editor."}
+                        : nearestContext?.slot === "column"
+                          ? "VECTOR / BITVECTOR / SPARSEVECTOR columns on a referenced table — the only vector metadata the catalog exposes for completion."
+                          : nearestContext?.slot === "metric"
+                            ? "Metrics the NEAREST column's declared type actually accepts. There is no per-element vector metadata to complete inside TO (…)."
+                            : "Catalog table and column names only — no keywords. Ctrl+Space reopens; type to filter, Up/Down/Enter/Esc work without leaving the editor."}
                     </Text>
                     <ul id="studio-suggest-listbox" role="listbox" aria-label="SQL suggestions" className="nss-suggest-list">
                       {suggestions.length === 0 ? (
@@ -1844,7 +2055,15 @@ export function StudioWorkspace({
                             onClick={() => acceptSuggestion(suggestion)}
                           >
                             <Badge variant={suggestion.kind === "table" ? "info" : "muted"} size="sm">
-                              {suggestion.kind === "table" ? "Table" : suggestion.kind === "json-path" ? "JSON path" : "Column"}
+                              {suggestion.kind === "table"
+                                ? "Table"
+                                : suggestion.kind === "json-path"
+                                  ? "JSON path"
+                                  : suggestion.kind === "vector-column"
+                                    ? "Vector"
+                                    : suggestion.kind === "vector-metric"
+                                      ? "Metric"
+                                      : "Column"}
                             </Badge>
                             <span>{suggestion.label}</span>
                           </li>
@@ -1853,7 +2072,11 @@ export function StudioWorkspace({
                     </ul>
                     {referencedTables.some((table) => tableColumnsCache[table] === "loading") ? (
                       <Text size="xs" variant="muted">
-                        {jsonPathContext ? "Loading index metadata…" : "Loading columns…"}
+                        {jsonPathContext
+                          ? "Loading index metadata…"
+                          : nearestContext
+                            ? "Loading vector columns…"
+                            : "Loading columns…"}
                       </Text>
                     ) : null}
                   </Stack>
@@ -1986,6 +2209,13 @@ export function StudioWorkspace({
               </Button>
               <Button variant="outline" size="sm" onClick={() => setDmlBuilderOpen(true)}>
                 Parameterized DML…
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => { setSchemaDesignerMode("table"); setSchemaDesignerOpen(true); }}
+              >
+                Design schema…
               </Button>
               <input
                 ref={savedFileInput}
@@ -2299,6 +2529,18 @@ export function StudioWorkspace({
           </CardBody>
         </Card>
 
+        {inspectorVisible ? (
+          <LayoutSplitter
+            className="nss-splitter-inspector"
+            label="Resize inspector"
+            value={inspectorWidth}
+            min={MIN_INSPECTOR_WIDTH}
+            max={MAX_INSPECTOR_WIDTH}
+            invert
+            onChange={setInspectorWidth}
+          />
+        ) : null}
+        {inspectorVisible ? (
         <Card variant="bordered" className="nss-inspector">
           <CardHeader className="nss-inspector-header">
             <Stack gap="xs">
@@ -2307,9 +2549,12 @@ export function StudioWorkspace({
                 {selectedTable ? "Authorized catalog metadata" : "Features reported by this server"}
               </Text>
             </Stack>
-            {selectedTable ? (
-              <Button variant="outline" size="sm" onClick={insertTableQuery}>Insert SELECT</Button>
-            ) : null}
+            <Inline gap="xs" align="center" wrap>
+              {selectedTable ? (
+                <Button variant="outline" size="sm" onClick={insertTableQuery}>Insert SELECT</Button>
+              ) : null}
+              <Button variant="ghost" size="sm" onClick={() => setInspectorVisible(false)}>Hide inspector</Button>
+            </Inline>
           </CardHeader>
           <CardBody className="nss-inspector-body">
             {loadingDetail ? (
@@ -2440,6 +2685,7 @@ export function StudioWorkspace({
             )}
           </CardBody>
         </Card>
+        ) : null}
       </div>
 
       {pendingRun ? (
@@ -2656,6 +2902,17 @@ export function StudioWorkspace({
           initialTable={selectedTable}
           initialDetail={detail}
           loadTable={loadFullTextTable}
+        />
+      ) : null}
+      {schemaDesignerOpen ? (
+        <SchemaDesignerExplorer
+          onClose={() => setSchemaDesignerOpen(false)}
+          onInsert={setSQL}
+          tables={allTables}
+          initialTable={selectedTable}
+          initialDetail={detail}
+          loadTable={loadFullTextTable}
+          initialMode={schemaDesignerMode}
         />
       ) : null}
     </Stack>

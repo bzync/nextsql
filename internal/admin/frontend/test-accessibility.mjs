@@ -1872,6 +1872,53 @@ async function testOperateMode() {
     );
     assert.equal(streamCalls, callsBeforeDml, "building a DML template must not execute anything");
 
+    // Table / index designer: builds CREATE TABLE / CREATE INDEX into the
+    // editor from a form. It never executes; the operator reviews and runs.
+    const callsBeforeDesigner = streamCalls;
+    await setSQL("SELECT 1");
+    assert.equal(await clickButton("Design schema…"), true, "the Design schema control should be available");
+    await browser.waitFor("document.querySelector('[role=dialog] h2')?.textContent === 'Design a table'", "the table designer to open");
+    await browser.waitFor("document.querySelector('[role=dialog]')?.textContent.includes('CREATE TABLE \"new_table\"')", "the default CREATE TABLE preview to render");
+    await browser.waitFor("document.querySelector('[role=dialog]')?.textContent.includes('PRIMARY KEY DEFAULT UUID()')", "the default id UUID primary key to render");
+    await runAxe(browser, axe.source, "Studio table designer");
+    assert.equal(
+      await browser.evaluate(`(() => {
+        const radio = [...document.querySelectorAll('[role=dialog] input[type=radio]')].find((r) => r.value === 'index');
+        radio?.click();
+        return Boolean(radio);
+      })()`),
+      true,
+      "the Index object kind should be selectable",
+    );
+    await browser.waitFor("document.querySelector('[role=dialog] h2')?.textContent === 'Design an index'", "switching to index rebuilds the title");
+    await browser.evaluate(`(() => {
+      const el = document.getElementById('designer-index-name');
+      if (!el) return false;
+      const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+      setter.call(el, 'ix_articles_id');
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+      return true;
+    })()`);
+    await browser.waitFor(
+      `[...document.querySelectorAll('[role=dialog] input[type=checkbox]')].some((c) => (c.labels?.[0]?.textContent ?? '').includes('id'))`,
+      "authorized index columns to render",
+    );
+    await browser.evaluate(`(() => {
+      const box = [...document.querySelectorAll('[role=dialog] input[type=checkbox]')].find((c) => (c.labels?.[0]?.textContent ?? '').includes('id'));
+      box?.click();
+      return Boolean(box);
+    })()`);
+    await browser.waitFor("document.querySelector('[role=dialog]')?.textContent.includes('CREATE INDEX \"ix_articles_id\"')", "the generated CREATE INDEX preview to render");
+    await runAxe(browser, axe.source, "Studio index designer");
+    assert.equal(await clickDialogButton("Insert into editor"), true, "the index DDL should be insertable without execution");
+    await browser.waitFor("document.querySelector('[role=dialog]') === null", "the schema designer to close after inserting");
+    assert.match(
+      await browser.evaluate(`document.querySelector('[aria-label="SQL editor"]')?.value ?? ''`),
+      /^CREATE INDEX "ix_articles_id" ON "articles"/,
+      "Insert should replace the active tab with the generated CREATE INDEX",
+    );
+    assert.equal(streamCalls, callsBeforeDesigner, "designing schema must not execute anything");
+
     // Global object search: a keyboard-driven finder over table + workflow
     // names, no fetch per object. Typing filters; Enter opens the table.
     assert.equal(await clickButton("Search objects…"), true, "the object search control should be available");
@@ -2104,6 +2151,52 @@ async function testOperateMode() {
       "accepting a JSON-path suggestion replaces the whole dotted path",
     );
 
+    // Vector-aware completion: NEAREST column names and USING metrics come
+    // from the referenced table's authorized VECTOR/BITVECTOR/SPARSEVECTOR
+    // columns — never a guessed path inside TO (...).
+    const nearestPrefix = "SELECT * FROM articles NEAREST ";
+    await setSQL(nearestPrefix);
+    await setCursor(nearestPrefix.length);
+    assert.equal(await editorKeydown({ key: " ", ctrlKey: true }), true, "Ctrl+Space should open completion after NEAREST");
+    await browser.waitFor(
+      'document.querySelector(\'[role=dialog][aria-label="SQL suggestions"]\')?.textContent.includes("Vector columns")',
+      "the panel to switch to vector-column mode",
+    );
+    await browser.waitFor(
+      'document.querySelector(\'[role=dialog][aria-label="SQL suggestions"] [role=option]\')?.textContent.includes("embedding — articles")',
+      "the VECTOR column to be offered",
+    );
+    await runAxe(browser, axe.source, "Studio SQL suggestions (vector columns)");
+    assert.equal(await clickSuggestOption("embedding — articles · VECTOR<F32,3>"), true, "clicking the vector-column suggestion should be possible");
+    await browser.waitFor(
+      'document.querySelector(\'[aria-label="SQL editor"]\')?.value === "SELECT * FROM articles NEAREST embedding"',
+      "accepting a vector-column suggestion fills the NEAREST column slot",
+    );
+
+    const metricPrefix = "SELECT * FROM articles NEAREST embedding TO (1, 0, 0.5) USING ";
+    await setSQL(metricPrefix);
+    await setCursor(metricPrefix.length);
+    assert.equal(await editorKeydown({ key: " ", ctrlKey: true }), true, "Ctrl+Space should open completion after USING");
+    await browser.waitFor(
+      'document.querySelector(\'[role=dialog][aria-label="SQL suggestions"]\')?.textContent.includes("Vector metrics")',
+      "the panel to switch to vector-metric mode",
+    );
+    await browser.waitFor(
+      'document.querySelector(\'[role=dialog][aria-label="SQL suggestions"] [role=option]\')?.textContent.includes("COSINE")',
+      "the dense-vector COSINE metric to be offered",
+    );
+    assert.equal(
+      await browser.evaluate(`[...document.querySelectorAll('[role=dialog][aria-label="SQL suggestions"] [role=option]')].some((o) => o.textContent.includes("HAMMING"))`),
+      false,
+      "HAMMING must not be offered for a VECTOR<F32,N> column",
+    );
+    await runAxe(browser, axe.source, "Studio SQL suggestions (vector metrics)");
+    assert.equal(await clickSuggestOption("COSINE — embedding · VECTOR<F32,3>"), true, "clicking the metric suggestion should be possible");
+    await browser.waitFor(
+      'document.querySelector(\'[aria-label="SQL editor"]\')?.value === "SELECT * FROM articles NEAREST embedding TO (1, 0, 0.5) USING COSINE"',
+      "accepting a metric suggestion fills the USING slot",
+    );
+
     // Deterministic misspelled table-name suggestions: a bare FROM/JOIN
     // target that matches no real table, but is one edit away from the
     // only real table in this fixture ("articles"), gets a live, polite
@@ -2225,6 +2318,49 @@ async function testOperateMode() {
       false,
       "the notice should dismiss after Start fresh",
     );
+
+    // Layout persistence: hide the explorer, reload, and confirm the pane
+    // stays hidden without storing a credential. The last selected table
+    // (articles, from earlier in this suite) is restored in the inspector.
+    assert.equal(await clickButton("Hide explorer"), true, "Hide explorer should be available");
+    await browser.waitFor(
+      "document.body.textContent.includes('Database explorer') === false",
+      "the explorer pane to unmount",
+    );
+    await browser.waitFor(
+      `(() => { try { return Object.keys(localStorage).some((k) => k.startsWith('nextsql-studio-layout:') && localStorage.getItem(k).includes('"explorerVisible":false')); } catch { return false; } })()`,
+      "the hidden explorer to be mirrored to localStorage",
+    );
+    assert.equal(
+      await browser.evaluate(`(() => { try { return Object.keys(localStorage).some((k) => k.startsWith('nextsql-studio-layout:') && /password|secret|token/i.test(localStorage.getItem(k))); } catch { return false; } })()`),
+      false,
+      "the layout document must not store a credential",
+    );
+    await browser.reload();
+    await browser.waitFor("document.querySelector('h1')?.textContent === 'Studio'", "Studio to re-mount after layout reload");
+    await browser.waitFor(
+      "document.body.textContent.includes('Show explorer') === true && document.body.textContent.includes('Database explorer') === false",
+      "the explorer to stay hidden after reload",
+    );
+    await browser.waitFor(
+      `[...document.querySelectorAll('h2')].some((h) => h.textContent.trim() === 'articles')`,
+      "the last selected table to be restored in the inspector",
+    );
+    await runAxe(browser, axe.source, "Studio restored hidden explorer layout");
+    assert.equal(await clickButton("Show explorer"), true, "Show explorer should restore the pane");
+    await browser.waitFor("document.body.textContent.includes('Database explorer')", "the explorer pane to return");
+    assert.equal(
+      await browser.evaluate("Boolean(document.querySelector('[aria-label=\"Resize database explorer\"]'))"),
+      true,
+      "the explorer splitter should be present when the pane is shown",
+    );
+    assert.equal(await clickButton("Hide inspector"), true, "Hide inspector should be available");
+    await browser.waitFor(
+      "document.body.textContent.includes('Show inspector') === true",
+      "Show inspector to appear after hiding the inspector",
+    );
+    await runAxe(browser, axe.source, "Studio hidden inspector layout");
+    assert.equal(await clickButton("Show inspector"), true, "Show inspector should restore the pane");
 
     console.log("operate-mode accessibility audit passed (login/overview/Studio workspace + axe WCAG 2.2 AA tags)");
   });

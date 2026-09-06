@@ -18,7 +18,8 @@
 > tag folders, a
 > read-only Workflows, trigger/schedule relationships, tasks &
 > change-streams explorer with a bounded accessible workflow diagram,
-> indexed-JSON-path completion in the editor,
+> indexed-JSON-path completion and vector-aware NEAREST/USING completion
+> in the editor,
 > a production environment tag + read-only safety mode, switch-realm/database
 > connection re-targeting, a per-session read-consistency mode, a
 > recent-connections quick-switch, a global command palette, git-friendly file
@@ -31,8 +32,12 @@
 > CSV / JSON / NDJSON import (a bounded, type-checked `INSERT`-script builder
 > that maps a pasted or loaded document onto the target table's columns), and
 > parameterized `INSERT` / `UPDATE` / `DELETE` generation (a `$1..$N` statement
-> template built from a table's authorized columns into the editor), and
-> browser/CSS high-DPI verification at DPR 2
+> template built from a table's authorized columns into the editor),
+> browser/CSS high-DPI verification at DPR 2, layout persistence without
+> credentials (explorer/inspector visibility and pane widths plus the last
+> authorized table name in per-connection `localStorage`), vector-aware
+> NEAREST/USING completion, and a table / index designer (`CREATE TABLE` /
+> `CREATE INDEX` form with live native DDL preview into the editor)
 > implemented; the
 > RBAC boundary is integration-test-covered (`TestAdminStudioEnforcesRBAC`),
 > closing the MVP exit-gate RBAC and "Prepared parameters" lines
@@ -140,6 +145,22 @@ accidentally inherit the high-density viewport.
 This closes the Studio shell's browser/CSS-level high-DPI checklist item. It
 does not convert the still-unexecuted Windows/macOS packages into supported or
 tested platform claims; those remain tracked under Phase 28 packaging.
+
+### Layout persistence without credentials
+
+Studio's three-pane shell now has a resizable layout worth persisting. Column
+splitters (`role="separator"`, 24px hit target, pointer drag plus Arrow/Home/End)
+set explorer and inspector pixel widths; Hide/Show controls unmount a pane;
+**Reset layout** in the command palette restores the default widths and shows
+both panes. Those preferences, plus the last selected table *name*, are
+mirrored to per-connection `localStorage` (`nextsql-studio-layout:…`) by a
+bounded codec (`serializeStudioLayout` / `parseStudioLayout`). Malformed
+storage is the default layout. SQL buffers already have their own crash-recovery
+codec; results, query history, parameters, and any credential are never written
+here. On load, a stored table is re-opened only if it still appears in the
+authorized bootstrap list — a renamed or unauthorized table is dropped rather
+than guessed. Compact breakpoints still collapse the grid and hide the
+splitters, so the DPR-2 single-column assertion is unchanged.
 
 ### Dedicated JSON Explorer
 
@@ -1194,6 +1215,46 @@ The Studio query-tab strip switched from wrapping to multiple rows to a single
 horizontally scrolling row at the same time, so a crowded tab bar no longer
 lands wrapped rows behind the find/replace popover.
 
+### Table / index designer
+
+A "Design schema…" control in the Studio SQL workspace (database-explorer
+scope, reachable also as command-palette **Design table…** / **Design
+index…**). Like the data generator, CSV/JSON import, and parameterized DML
+builder, it produces reviewable SQL text into the active editor tab and
+**never executes** — no server route (index mode reuses
+`GET /api/v1/studio/table` for the target table's authorized
+`system.columns`), and the emitted text faces confirm-before-run and
+server-side RBAC like any hand-typed statement. The form's preview is the
+live DDL the operator will run, which is the remaining half of "Generated
+native DDL preview" after the inspector's read-only canonical DDL (log
+#188).
+
+`buildCreateTableSQL` / `buildCreateIndexSQL` (`resultTools.ts`) are pure.
+
+**Table.** Columns come from a closed NextSQL type-kind list assembled here
+(CHAR/VARCHAR length, DECIMAL precision/scale, VECTOR/BITVECTOR/SPARSEVECTOR
+dimension) — never interpolating free-text type SQL. `PRIMARY KEY` is
+required (`catalog.TableFromAST`); a single key column is inline, a
+composite key is a table-level clause. Table names using the reserved
+`nsql_` prefix are rejected. `DEFAULT` is `UUID()` / `NOW()` / `AI()` (AI()
+only on DECIMAL) or a bounded literal. VECTOR/BITVECTOR/SPARSEVECTOR cannot
+be keys. One optional `FOREIGN KEY` names local columns plus a referenced
+table/columns and `ON DELETE` / `ON UPDATE`. Collections, ENUM, and
+GEOMETRY subtypes stay out of the form — they need nested-type UI this
+designer does not pretend to have.
+
+**Index.** Kind is `btree` / `unique` / `fulltext` / `vector` / `spatial`,
+restricted to what the authorized columns can actually support. B+Tree
+indexes may add a JSON path on a single JSON key column and INCLUDE
+columns; FULLTEXT is 1–8 STRING/TEXT/CHAR/VARCHAR columns with an optional
+analyzer; VECTOR method/quantization/IVF options are restricted to the
+column kind (SPARSE only on SPARSEVECTOR, IVF/IVFPQ only on dense VECTOR);
+SPATIAL is one geo column.
+
+Caps: 64 table columns, 16 btree keys, 8 fulltext fields, 128-character
+identifiers, CHAR 65535, DECIMAL 38, VECTOR dim 8192. Every name is
+rendered through `quoteIdentifier`.
+
 ### Catalog-aware IntelliSense
 
 A bounded, keyboard-operable suggestion list (SQL-editor scope), reachable
@@ -1279,9 +1340,23 @@ has resolved — that begin with what has been typed. These paths come from
 route). It is never an inferred or free-typed path, only one that is
 actually indexed — the same ambiguous-rather-than-guess discipline the
 misspelled-table suggestions below use. Accepting one replaces the whole
-dotted-path range. Non-indexed JSON structure, and vector-column
-completion, are deliberately not offered: there is no comparable
-per-column metadata to complete them against without guessing.
+dotted-path range. Non-indexed JSON structure is deliberately not offered:
+there is no JSON schema to complete against without guessing.
+
+**Vector-aware completion**: the catalog *does* expose per-column vector
+metadata — the column's declared `VECTOR` / `BITVECTOR` / `SPARSEVECTOR`
+type and the metrics that kind accepts (the same `vectorCatalog` /
+`VECTOR_METRICS_BY_KIND` the Vector Explorer already uses). When
+`currentNearestContext` detects the caret in a `NEAREST` column slot or a
+`USING` metric slot of the current statement, the suggestion list switches
+to `rankNearestColumnSuggestions` or `rankNearestMetricSuggestions`.
+Columns come from `vectorColumnsFromResult` on the same `api.studioTable()`
+response IntelliSense already fetches (`tableVectorCache`, no new route).
+Metrics are the exact SQL spellings (`COSINE` / `L2` / `INNER_PRODUCT` /
+`HAMMING`) that column kind accepts; a `BITVECTOR` column never offers a
+real-valued metric. Inside `TO (...)` there is still no per-element catalog,
+so that slot is not a completion context — the same refuse-to-guess rule as
+non-indexed JSON. `CREATE INDEX … USING` is not a NEAREST slot.
 
 Inline **parser/binder diagnostics** remain open and were assessed this
 round: `internal/sql/lexer.Token` does carry a byte `Pos`, and the parser
@@ -1560,9 +1635,10 @@ anywhere in the workspace (a `window` `keydown` listener) or via the
 every entry maps to an existing handler — New query tab, Run query / Run
 script / Cancel (each disabled exactly when its toolbar button is),
 Suggest, Saved queries…, Search objects…, Switch connection…, Schema
-diagram…, the GRANT/REVOKE builder, and each dedicated explorer
+diagram…, the GRANT/REVOKE builder, each dedicated explorer
 (Full-text / Vector / Hybrid / Geo / Users & roles / Transactions & locks
-/ Audit / Workflows).
+/ Audit / Workflows), Hide/Show explorer, Hide/Show inspector, and Reset
+layout.
 
 `rankCommandMatches` (pure, unit-tested) is the same exact→prefix→
 substring→subsequence scoring as `rankObjectMatches`, but it also searches
@@ -1757,6 +1833,7 @@ surface.
 | TIMESTAMPTZ UTC/local inspector | yes | yes | offset/UTC unit + real-browser modal | no |
 | Studio accessibility baseline | M1 states | yes | real Chrome + axe WCAG 2.2 A/AA tags | no |
 | High-DPI browser rendering | Main shell / UX scope | yes | real Chrome at DPR 2: compact Setup/Operations/Studio layouts, no page overflow, raster-source density, scalable-font readiness, axe WCAG 2.2 AA, metric reset | no |
+| Layout persistence without credentials | Main shell / UX scope | yes | pure `serializeStudioLayout`/`parseStudioLayout` unit (round-trip/garbage/clamp/truncate/no-credential) + real-Chrome hide-explorer→localStorage→reload-stays-hidden/restores-selected-table/axe/show-splitter/hide-inspector | no |
 | RBAC boundary (limited user confined to grants across every route) | design invariant | yes | `TestAdminStudioEnforcesRBAC` — real ACL, negative-path over bootstrap/table/query/workflows + zero-row admin views | closes the MVP exit-gate RBAC line |
 | Confirm-before-run destructive-statement warning | partial connection-manager scope | yes | classification unit + live NSQL parse + real-browser confirm/cancel/axe | no |
 | Visible cross-database administration warning (realm-wide users/roles) | Developer operations / connection-manager scope | yes | parsed-AST positive/negative unit cases + live HTTP/NSQL analysis + pure realm/database label tests + real-browser single/script confirm/cancel/both-reasons/axe | no |
@@ -1780,6 +1857,7 @@ surface.
 | Saved profile/OS credential manager | yes | no | no | no |
 | Catalog-aware IntelliSense (table/column completion) | SQL editor scope | yes | extraction/ranking/word-range/cache-eviction pure unit + real-browser click/keyboard/cache-reuse/axe | no |
 | Indexed-JSON-path completion | SQL editor scope | yes | path-extraction/range-detection/prefix-rank pure unit + real-browser dotted-path mode-switch/accept/axe | no |
+| Vector-aware completion (NEAREST column + USING metric) | SQL editor scope | yes | `currentNearestContext`/`vectorColumnsFromResult`/`rankNearestColumnSuggestions`/`rankNearestMetricSuggestions` pure unit (kind-restricted metrics, CREATE INDEX USING ignored, unresolved table empty) + real-browser NEAREST/USING mode-switch/accept/axe, HAMMING not offered for VECTOR<F32,N> | no |
 | Deterministic misspelled FROM/JOIN table-name suggestions | SQL editor scope (partial) | yes | Levenshtein/detection/tie/bound/apply pure unit + real-browser live-notice/fix/disappear/no-false-positive/axe | no |
 | Parser/binder diagnostics | yes | no | no | no |
 | Query profiler breakdown | EXPLAIN/profiler scope | yes | duration/profile/bound pure unit + real-browser metrics/caveat/table/axe | no |
@@ -1802,6 +1880,9 @@ surface.
 | Data generator for development | Developer-operations scope | yes | pure `dataGenColumns` / `dataGenFieldKind` / `buildDataGeneratorSQL` unit tests (ordinal order, unsupported-type detection, deterministic-per-seed, NOT-NULL-no-default block, 100-row batching, identifier/string quoting, bounds) + real-browser open/preview/not-generatable-badge/Insert-without-execution/axe; no route (reuses `studio/table`) | no |
 | CSV / JSON / NDJSON import for development | Developer-operations scope | yes | pure `parseImportText` / `autoImportMapping` / `buildImportInsertSQL` unit tests (RFC 4180 quoting/escapes/embedded delimiter, JSON key-union, NDJSON, exact case-insensitive auto-map, ordinal output order, type-checked int/bool/JSON cells with named row errors, empty→NULL / NOT-NULL block, double-map rejection, 100-row batching, identifier/string quoting, malformed-document errors, MAX_IMPORT_ROWS truncation) + real-browser paste-CSV/preview/non-importable-columns-named/Insert-without-execution/axe; no route (reuses `studio/table`) | no |
 | Parameterized INSERT / UPDATE / DELETE generation | Developer-operations / data-editing scope | yes | pure `buildParameterizedDML` / `dmlDefaultColumns` unit tests (per-kind defaults, INSERT placeholder-per-column + NOT-NULL-no-default block + defaulted-column omission, UPDATE SET-then-WHERE param order + SET/WHERE-overlap + WHERE-required, DELETE composite key, unknown/duplicate column names, `MAX_QUERY_PARAMS` ceiling, identifier quoting) + real-browser open/INSERT-template/switch-to-DELETE/Insert-without-execution/axe; no route (reuses `studio/table`) | no |
+| Table designer | Database explorer scope | yes | pure `buildCreateTableSQL` unit (default UUID PK, reserved `nsql_` prefix, missing/composite PK, VECTOR-PK rejection, AI() only on DECIMAL, CHAR/VECTOR/DECIMAL type SQL, quoting, FK clause) + real-browser Design-schema open/preview/axe; no route | no |
+| Index designer | Database explorer scope | yes | pure `buildCreateIndexSQL` unit (btree INCLUDE, unique, JSON path, fulltext analyzer + non-text rejection, HNSW F16, IVFPQ, SPARSE-kind restriction, spatial, unknown/include-overlap, quoting) + real-browser switch-to-index/name+key/Insert-without-execution/axe; no route (reuses `studio/table`) | no |
+| Generated native DDL preview (live, as you edit) | Database explorer scope | yes | designer preview is the same quoted native DDL Insert loads into the editor; covered by the table/index designer unit + real-browser preview assertions | no |
 
 “Production-gated” remains **no** for the implemented rows because the Studio
 MVP exit gate includes the open connection manager (profiles, OS credential
@@ -1821,7 +1902,7 @@ lazy-loaded schema tree, per-table foreign-key inspection (outbound
 constraints + an inbound "Referenced by" grid), a schema-relationship
 diagram and a global object search in the database explorer, the read-only
 Workflows, trigger/schedule relationships, tasks & change-streams explorer,
-indexed-JSON-path completion,
+indexed-JSON-path completion, vector-aware NEAREST/USING completion,
 the production environment tag + read-only safety mode, switch-realm/database
 connection re-targeting, a per-session read-consistency mode
 (strong/bounded/stale), a recent-connections quick-switch, a global
@@ -1839,7 +1920,11 @@ table-inspector **Dependencies** panel (inbound FKs + triggers defined on
 the table, from `system.triggers`), and **parameterized
 `INSERT` / `UPDATE` / `DELETE` generation** (a `$1..$N` statement template
 built from a table's authorized columns into the editor, bound in the existing
-Parameters panel) are now
+Parameters panel), **layout persistence without credentials** (resizable
+explorer/inspector panes, hide/show, last authorized table name, per-connection
+`localStorage`, never a secret), and a **table / index designer** (a form that
+emits native `CREATE TABLE` / `CREATE INDEX` into the editor with live DDL
+preview, never executing) are now
 implemented; the RBAC boundary is integration-test-covered.
 The next coherent Studio work should preserve this boundary and choose one
 of:
@@ -1866,10 +1951,11 @@ of:
    credential store — plus a full recent-connections *home screen* first
    need a real multi-target connection model, not just new form fields;
 2. the remaining SQL-editor scope: source-position parser/binder
-   diagnostics and vector-aware completion
+   diagnostics
    (execute-selection, query history, multi-tab editing, execute script,
    find/replace, catalog-aware IntelliSense, deterministic misspelled
-   table-name suggestions, indexed-JSON-path completion, crash recovery
+   table-name suggestions, indexed-JSON-path completion, vector-aware
+   NEAREST/USING completion, crash recovery
    for unsaved buffers, saved queries with tag folders, git-friendly
    file export/import of the saved-query set, positional prepared
    parameters, and the global command palette above are the
@@ -1887,8 +1973,9 @@ of:
    JSON-path-completion round — the lexer carries token positions but ~100
    parser error sites and the binder's name-resolution errors all discard
    them, so surfacing them is a core-decoder change, not a frontend slice;
-   vector-aware completion has no per-column metadata to complete against
-   the way an indexed JSON path does); or
+   vector-aware completion is implemented for the two slots the catalog
+   actually describes — the NEAREST column and the USING metric — and
+   still refuses to guess inside TO (...)); or
 3. the remaining Developer operations migration workspace. The **read side**
    is now implemented: a read-only migration history explorer over the
    reserved `nsql_schema_migrations` table (`GET /api/v1/studio/migrations`,
@@ -1953,12 +2040,13 @@ of:
    inbound "Referenced by" grid with the triggers defined on the table, read
    from `system.triggers` (`table_name` filter, a third non-`required`
    table-detail query; the schema tree gains a matching per-table **Triggers**
-   sub-branch). What remains blocked here is the rest of a full dependency view
-   — workflow / trigger *bodies* that free-reference a table need a source-text
-   catalog contract that does not exist, and NextSQL has no views — and a
-   table/index *designer* (a materially
-   larger write-path form feature, not a reused read; its live DDL preview
-   would reuse this same renderer). NextSQL has no
+   sub-branch). The table/index *designer* is implemented: a form that emits
+   native `CREATE TABLE` / `CREATE INDEX` into the editor for review, with live
+   DDL preview as you edit, never executing (closed type list, required
+   PRIMARY KEY, kind-restricted index options). What remains blocked here is
+   the rest of a full dependency view — workflow / trigger *bodies* that
+   free-reference a table need a source-text catalog contract that does not
+   exist, and NextSQL has no views. NextSQL has no
    `CHECK` constraint or `system.constraints` view — "constraints" in this
    engine are PK (`system.tables.pk`), `UNIQUE` (a unique `system.indexes`
    row), `NOT NULL` (`system.columns.not_null`), and FK

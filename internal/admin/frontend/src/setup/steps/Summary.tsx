@@ -33,6 +33,10 @@ export function Summary({
             <DescriptionDetails>{params.configOut || "(default: inside the data directory)"}</DescriptionDetails>
           </DescriptionItem>
           <DescriptionItem>
+            <DescriptionTerm>Deployment profile</DescriptionTerm>
+            <DescriptionDetails>{params.profile || "developer"}</DescriptionDetails>
+          </DescriptionItem>
+          <DescriptionItem>
             <DescriptionTerm>Resource preset</DescriptionTerm>
             <DescriptionDetails>{params.preset}{params.preset === "custom" ? ` (${params.bufferPages} pages)` : ""}</DescriptionDetails>
           </DescriptionItem>

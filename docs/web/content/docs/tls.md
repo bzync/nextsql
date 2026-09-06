@@ -96,10 +96,13 @@ Drivers:
 - Go: `Config.KeyProvider` (a `crypto.KeyProvider` that returns the root DEK).
 - Node / Bun / Deno: `key: <32-byte Buffer | Uint8Array>`.
 - PHP: `'key' => $clientRoot` (32-byte string).
+- Python: `key=` 32-byte `bytes`.
+- Ruby: `key:` 32-byte binary `String`.
 
-Field-level `ENCRYPTED CLIENT` columns are experimental: the randomized
-`NSCE1.` SQL/catalog/server path and Go, Node.js/TypeScript, Bun, Deno, and PHP
-helpers are implemented; PITR and HA/failover coverage remain open.
-mTLS service certificates, live rotation, X.509 CRL revocation, and signed
-short-lived credentials are implemented as described above; OCSP and external
-IdP integration are not.
+Field-level `ENCRYPTED CLIENT` columns stay **experimental**: the randomized
+`NSCE1.` SQL/catalog/server path, Go/JS/PHP helpers, PITR, HA/failover, and
+durable `FileFieldKeyring` rotation/revocation are implemented and tested.
+Python and Ruby have no field-encryption helpers. No searchable or
+deterministic mode ships. mTLS service certificates, live rotation, X.509 CRL
+revocation, signed short-lived credentials, and the OIDC broker are
+implemented; OCSP, opaque-token introspection, and JIT provisioning are not.

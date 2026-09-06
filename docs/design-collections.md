@@ -205,5 +205,5 @@ scalars?).
 ## 5. Source of truth
 
 Mirrored in `TODO.md` under "Cross-cutting track — Collections." Gates no
-phase (P0-P27 closed; P28-P30 next). See `docs/design-datatypes.md` D9 for
+phase (P0-P27 closed; P28-P29 next). See `docs/design-datatypes.md` D9 for
 the original one-paragraph flag that prompted this split.

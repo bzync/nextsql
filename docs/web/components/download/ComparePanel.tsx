@@ -37,18 +37,16 @@ export function ComparePanel({ releases }: { releases: Release[] }) {
   if (releases.length === 0) return null;
 
   return (
-    <section className="rounded-xl border border-black/[0.08] p-5 sm:p-6 dark:border-white/[0.08]">
-      <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-blue-500 dark:text-blue-400">
-        Compare
-      </p>
-      <h2 className="mt-2 text-xl font-bold tracking-[-0.03em] sm:text-2xl">What changed between versions</h2>
+    <section className="rounded-md border border-line p-5 sm:p-6">
+      <p className="kicker">Compare</p>
+      <h2 className="mt-2 text-xl font-semibold tracking-[-0.022em] sm:text-2xl">What changed between versions</h2>
       <p className="mt-2 max-w-2xl text-sm leading-6 text-muted">
         Pick two published releases. The list includes every added, changed, fixed, removed, and breaking note in
         that range.
       </p>
       <div className="mt-5 grid gap-3 sm:grid-cols-2">
         <div className="text-sm">
-          <span className="mb-1.5 block text-[11px] font-semibold uppercase tracking-[0.16em] text-faint">From</span>
+          <span className="kicker mb-1.5 block">From</span>
           <Select
             value={from}
             onChange={(value) => setFrom(value)}
@@ -57,7 +55,7 @@ export function ComparePanel({ releases }: { releases: Release[] }) {
           />
         </div>
         <div className="text-sm">
-          <span className="mb-1.5 block text-[11px] font-semibold uppercase tracking-[0.16em] text-faint">To</span>
+          <span className="kicker mb-1.5 block">To</span>
           <Select
             value={to}
             onChange={(value) => setTo(value)}

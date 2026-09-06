@@ -22,8 +22,82 @@ A roadmap item is not recorded as completed here until its implementation, tests
 
 ## [Unreleased]
 
-> Phase 30 (NextSQL Intelligence / built-in RAG) is deferred to the next
-> version and is not being implemented in this release.
+### Added — Docker Hub image publishing (2026-09-07)
+
+- `.github/workflows/docker-publish-image.yml` builds the `Dockerfile` and
+  pushes multi-arch (`linux/amd64`, `linux/arm64`) images to
+  `docker.io/bzynchub/nextsql`: `edge` from `master`, semver tags from
+  `v*.*.*` release tags, and an immutable `sha-<short>` on every build.
+  Pull requests touching the image build it without pushing. Requires the
+  `DOCKERHUB_USERNAME` / `DOCKERHUB_TOKEN` repository secrets.
+- `Dockerfile` build stage now cross-compiles from `$BUILDPLATFORM` using
+  `GOOS`/`GOARCH` instead of emulating the Go toolchain under QEMU for the
+  non-native target, so the arm64 build no longer runs the compiler emulated.
+
+### Added — live-production profile and fail-closed preflight (2026-09-06)
+
+- `nextsql setup --profile production|developer` writes
+  `deployment_profile=` plus, for production, disk-watermark, replica-lag,
+  drain, statement/idle/lock timeout, and connection-limit defaults.
+- Production setup refuses `--skip-init`, an unlock key on the data
+  volume, and a mutating install without `--user`/`--password-file`.
+  Dry-run still reports the missing administrator as a warning. A
+  tmpfs/ramfs data volume is a production warning, not a hard refusal.
+- `nextsqld --production` (and any config with
+  `deployment_profile=production`) re-runs the same preflight at start and
+  refuses to serve if it fails.
+- Setup-mode GUI defaults to Production, requires an administrator, and
+  disables skip-init on that profile.
+- `system.capabilities`: `follower_reads` and `resource_groups` are
+  `supported` (they were already production-gated; the registry was stale).
+  `field_encryption_client` and `hosting_isolation` stay `experimental`.
+  See `TODO.md` log #208.
+
+### Changed — former P30 NextSQL Intelligence / built-in RAG removed from the product (2026-09-06)
+
+- NextSQL Intelligence, RAG Playground, and `CREATE RETRIEVER` are **not in
+  the product**. They are not deferred. Studio is a native IDE without an
+  AI assistant. Full-text, vector, and hybrid search remain ordinary SQL.
+  See `TODO.md` log #207 and `PROJECT.md` §56.
+
+### Added — realm/database rename (Multi-database hosting M3-2, 2026-09-06)
+
+- `nextsql realm rename --realm OLD --to NEW --confirm` and
+  `nextsql database rename --realm R --database OLD --to NEW --confirm`
+  change a managed realm or database's logical name without moving files or
+  changing its stable ID. Colliding names fail closed; deleting/tombstoned
+  databases cannot be renamed. Offline exclusive-lock CLI, same shape as
+  suspend/drop. See `TODO.md` log #206.
+
+### Added — NextSQL Admin Studio: table / index designer (P29, 2026-09-06)
+
+- Studio can now design a `CREATE TABLE` or `CREATE INDEX` from a form
+  (**Design schema…**, also command-palette **Design table…** /
+  **Design index…**) and load the native DDL into the editor for review. It
+  never executes the statement. Types come from a closed NextSQL kind list;
+  a primary key is required; `nsql_` table names are rejected; index kind is
+  restricted to what the authorized columns can actually support (B+Tree,
+  UNIQUE, FULLTEXT, VECTOR, SPATIAL). Live preview updates as the form
+  changes. See `TODO.md` log #205.
+
+### Added — NextSQL Admin Studio: vector-aware completion (P29, 2026-09-06)
+
+- The SQL editor's IntelliSense now completes `NEAREST` vector-column names
+  and `USING` metrics from authorized `VECTOR` / `BITVECTOR` / `SPARSEVECTOR`
+  columns on referenced tables (the same catalog fetch already used for
+  table/column and JSON-path completion). Metrics are restricted to the
+  column kind — a dense `VECTOR` column is never offered `HAMMING`. The
+  `TO (...)` literal is not a completion slot: NextSQL exposes no
+  per-element vector catalog. See `TODO.md` log #204.
+
+### Added — NextSQL Admin Studio: layout persistence without credentials (P29, 2026-09-06)
+
+- Studio now remembers explorer/inspector visibility and pane widths, plus the
+  last selected table name, in per-connection browser storage. No SQL, result,
+  query history, parameter, or credential is stored in that document. Accessible
+  column splitters resize the panes; Hide/Show controls and a command-palette
+  **Reset layout** restore the defaults. A stored table is re-opened only if it
+  still appears in the authorized catalog. See `TODO.md` log #203.
 
 ### Verified — NextSQL Admin high-DPI browser rendering (P29, 2026-09-06)
 

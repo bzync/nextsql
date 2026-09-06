@@ -11,7 +11,11 @@
 > below still says "the Installer"/"GUI installer" — read that as "Setup mode".
 
 > Status: **M1, M3, M5, and M6 complete; M4 (packaging integration) landed for
-> the tarball/.run/.deb Linux artifacts (2026-09-05).** Architecture decision
+> the tarball/.run/.deb Linux artifacts (2026-09-05).** Developer and
+> production deployment profiles plus the production security preflight
+> landed 2026-09-06 (log #208): the Resources step defaults to Production,
+> requires an administrator, and disables skip-init on that profile.
+> Architecture decision
 > made via `AskUserQuestion`; the serving backbone + working wizard flow
 > (welcome → data directory/key file → resource preset [+ remote listen/TLS,
 > M3 + start-at-boot, M6] → administrator account → summary → install →
@@ -34,7 +38,7 @@ takes over from there within the same `nextsql-admin` process/shell — see
 ```text
 Setup mode       → install / upgrade / repair / uninstall            (this doc)
 Operations mode  → server / cluster / security / backup / operations (docs/design-admin-operations.md)
-Studio mode      → database development / SQL / data / schema / RAG  (Phase 29, not yet built)
+Studio mode      → database development / SQL / data / schema        (Phase 29)
 ```
 
 ## 1. Architecture decision — local web app driving `nextsql setup`

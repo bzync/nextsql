@@ -1,5 +1,22 @@
 # Diagnostics and benches
 
+## Live production profile
+
+Production installs are intended to run with this posture out of the box:
+
+```bash
+nextsql setup --data-dir DIR --key-file FILE \
+  --profile production --user app --password-file /path/to/pw
+nextsqld --config DIR/nextsql.conf
+```
+
+`deployment_profile=production` in `nextsql.conf` is the durable switch.
+`nextsqld --production` forces it for a process that was initialized as
+developer. Either path fail-closes if the unlock key sits on the data volume
+or if disk-watermark / drain / statement / idle timeouts are unset.
+`field_encryption_client` and `hosting_isolation` stay labeled experimental
+in `system.capabilities` and are not implied by the profile.
+
 ## Diagnose and status
 
 ```bash
@@ -12,7 +29,7 @@
 
 `nextsql status --local` is the data-directory inspect: format-family versions plus opened table count, `durable_lsn` / `checkpoint_lsn` / `next_lsn`, isolated-page count, query/error/commit counters, admission inflight/queue, and cluster fields when Raft is running.
 
-`diagnose` checks format-family versions (currently all **v1**) and plaintext headers. A newer or older-than-min file fails closed — there is no silent rewrite. `diagnose` does not need a key.
+`diagnose` checks format-family versions and plaintext headers. Most families are **v1**; the catalog descriptor (`NSCT`) is at **v12** (readable 1..12). A newer or older-than-min file fails closed — there is no silent rewrite. `diagnose` does not need a key.
 
 Isolated pages are a fail-closed corruption path (`*.isolated`). NextSQL never returns a known corrupted record.
 
@@ -36,6 +53,7 @@ Official numbers keep encryption, WAL, `fsync`, checksums, MVCC, and authenticat
 # comparisons
 ./nextsql-bench --partition --partition-rows 40000   # RANGE-partitioned vs unpartitioned
 ./nextsql-bench --readscale --readscale-rows 10000   # STRONG vs STALE/BOUNDED reads across a 3-node cluster
+./nextsql-bench --vecquant                           # F32/F16/I8, quantised HNSW, IVF, IVF-PQ, sparse
 ```
 
 `--slo` seeds a throwaway encrypted database and measures cached PK lookup, secondary-index equality, durable single-row INSERT/UPDATE, bulk INSERT plus `COUNT(*)` / `GROUP BY` / range / join at each scale, hybrid `WHERE`+`SEARCH`+`NEAREST`, and HNSW recall@10 / recall@100.

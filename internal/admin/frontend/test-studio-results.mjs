@@ -919,6 +919,98 @@ try {
   }
 
   {
+    // Vector-aware completion: NEAREST column + USING metric from catalog
+    // column kind. Never completes inside TO (...).
+    const columns = {
+      columns: ["column_name", "type"],
+      rows: [
+        ["id", "INT64"],
+        ["embedding", "VECTOR<F32,3>"],
+        ["bits", "BITVECTOR<8>"],
+        ["sparse", "SPARSEVECTOR<16>"],
+        ["title", "STRING"],
+      ],
+    };
+    const vec = tools.vectorColumnsFromResult(columns);
+    assert.deepEqual(vec.map((c) => c.name), ["embedding", "bits", "sparse"], "only vector-typed columns are offered");
+    assert.deepEqual(vec[0].metrics, ["cosine", "l2", "inner_product"]);
+    assert.deepEqual(vec[1].metrics, ["hamming"]);
+    assert.deepEqual(vec[2].metrics, ["cosine", "inner_product"]);
+    assert.deepEqual(tools.vectorColumnsFromResult({ columns: ["x"], rows: [] }), [], "a result without column_name/type yields nothing");
+
+    const afterNearest = "SELECT * FROM articles NEAREST ";
+    const colCtx = tools.currentNearestContext(afterNearest, afterNearest.length);
+    assert.deepEqual(colCtx, { slot: "column", start: afterNearest.length, end: afterNearest.length, typed: "" }, "caret after NEAREST is a vector-column slot");
+    const partial = "SELECT * FROM articles NEAREST emb";
+    const partialCtx = tools.currentNearestContext(partial, partial.length);
+    assert.equal(partialCtx?.slot, "column");
+    assert.equal(partialCtx?.typed, "emb");
+    assert.equal(tools.currentNearestContext("SELECT * FROM articles WHERE id = 1", 20), null, "a non-NEAREST caret is not a vector slot");
+    const createUsing = "CREATE VECTOR INDEX x ON t (embedding) USING ";
+    assert.equal(tools.currentNearestContext(createUsing, createUsing.length), null, "CREATE INDEX USING is not a NEAREST metric slot");
+
+    const afterUsing = "SELECT * FROM articles NEAREST embedding TO (1, 0, 0.5) USING ";
+    const metricCtx = tools.currentNearestContext(afterUsing, afterUsing.length);
+    assert.equal(metricCtx?.slot, "metric");
+    assert.equal(metricCtx?.column, "embedding");
+    assert.equal(metricCtx?.typed, "");
+    const prior = "SELECT * FROM t NEAREST embedding TO (1) USING COSINE; SELECT 1 USING ";
+    assert.equal(tools.currentNearestContext(prior, prior.length), null, "USING in a later statement does not attach to an earlier NEAREST");
+
+    const cache = { articles: vec };
+    assert.deepEqual(
+      tools.rankNearestColumnSuggestions("", ["articles"], cache).map((s) => s.insertText),
+      ["bits", "embedding", "sparse"],
+      "an empty prefix lists every vector column, sorted",
+    );
+    assert.deepEqual(
+      tools.rankNearestColumnSuggestions("emb", ["articles"], cache).map((s) => s.insertText),
+      ["embedding"],
+      "prefix narrows to the matching vector column",
+    );
+    assert.deepEqual(
+      tools.rankNearestColumnSuggestions("embedding", ["articles"], cache),
+      [],
+      "an exact match offers nothing more to complete",
+    );
+    assert.deepEqual(
+      tools.rankNearestColumnSuggestions("", ["missing"], cache),
+      [],
+      "a table whose vector metadata has not resolved contributes nothing, never a guess",
+    );
+    assert.ok(
+      tools.rankNearestColumnSuggestions("", ["articles"], cache).every((s) => s.kind === "vector-column"),
+      "vector-column suggestions carry their own kind",
+    );
+
+    assert.deepEqual(
+      tools.rankNearestMetricSuggestions("", "embedding", ["articles"], cache).map((s) => s.insertText),
+      ["COSINE", "L2", "INNER_PRODUCT"],
+      "a dense VECTOR column offers exactly the three real-valued metrics",
+    );
+    assert.deepEqual(
+      tools.rankNearestMetricSuggestions("", "bits", ["articles"], cache).map((s) => s.insertText),
+      ["HAMMING"],
+      "a BITVECTOR column offers only HAMMING",
+    );
+    assert.deepEqual(
+      tools.rankNearestMetricSuggestions("C", "embedding", ["articles"], cache).map((s) => s.insertText),
+      ["COSINE"],
+      "metric prefix is case-insensitive against the SQL spelling",
+    );
+    assert.deepEqual(
+      tools.rankNearestMetricSuggestions("", "title", ["articles"], cache),
+      [],
+      "a non-vector column name yields no metric list, never every metric",
+    );
+    assert.deepEqual(
+      tools.rankNearestMetricSuggestions("", "embedding", ["missing"], cache),
+      [],
+      "an unresolved table contributes no metrics",
+    );
+  }
+
+  {
     // Unified table-constraint view: the four constraint shapes come from
     // their existing authorized catalog sources, not a guessed new schema.
     const constraintDetail = {
@@ -1150,6 +1242,39 @@ try {
     assert.equal(tools.editorDraftsWorthRestoring({ tabs: [{ title: "Query 1", sql: "" }], activeIndex: 0 }, DEFAULT), false, "an empty buffer is not worth restoring");
     assert.equal(tools.editorDraftsWorthRestoring({ tabs: [{ title: "Query 1", sql: "SELECT 42" }], activeIndex: 0 }, DEFAULT), true, "an edited buffer is worth restoring");
     assert.equal(tools.editorDraftsWorthRestoring({ tabs: [{ title: "a", sql: DEFAULT }, { title: "b", sql: DEFAULT }], activeIndex: 0 }, DEFAULT), true, "more than one tab is always worth restoring");
+  }
+
+  {
+    // Layout persistence codec — pane visibility/widths + last table name,
+    // never a credential or SQL buffer.
+    const layout = {
+      explorerVisible: false,
+      inspectorVisible: true,
+      explorerWidth: 300,
+      inspectorWidth: 400,
+      selectedTable: "articles",
+    };
+    assert.deepEqual(tools.parseStudioLayout(tools.serializeStudioLayout(layout)), layout, "layout round-trips");
+    assert.deepEqual(tools.parseStudioLayout(null), tools.DEFAULT_STUDIO_LAYOUT, "missing storage is the default layout");
+    assert.deepEqual(tools.parseStudioLayout("not json"), tools.DEFAULT_STUDIO_LAYOUT, "garbage parses to the default, not a throw");
+    assert.deepEqual(tools.parseStudioLayout("{}").explorerVisible, true, "a missing visibility flag defaults to shown");
+    assert.equal(tools.parseStudioLayout('{"explorerVisible":false}').explorerVisible, false, "an explicit hide is kept");
+    assert.equal(tools.parseStudioLayout('{"selectedTable":"  orders  "}').selectedTable, "orders", "a selected table name is trimmed");
+    assert.equal(tools.parseStudioLayout('{"selectedTable":""}').selectedTable, null, "an empty selected table is dropped");
+    const longName = "t".repeat(tools.MAX_LAYOUT_TABLE_NAME + 20);
+    assert.equal(tools.parseStudioLayout(tools.serializeStudioLayout({ ...tools.DEFAULT_STUDIO_LAYOUT, selectedTable: longName })).selectedTable.length, tools.MAX_LAYOUT_TABLE_NAME, "an oversized table name is truncated");
+    assert.equal(tools.parseStudioLayout('{"explorerWidth":12}').explorerWidth, tools.MIN_EXPLORER_WIDTH, "an undersized explorer width clamps to min");
+    assert.equal(tools.parseStudioLayout('{"explorerWidth":9000}').explorerWidth, tools.MAX_EXPLORER_WIDTH, "an oversized explorer width clamps to max");
+    assert.equal(tools.parseStudioLayout('{"inspectorWidth":"nope"}').inspectorWidth, tools.DEFAULT_INSPECTOR_WIDTH, "a non-numeric width falls back");
+    assert.equal(tools.clampLayoutWidth(12.4, 190, 480, 260), 190);
+    assert.equal(tools.stepLayoutWidth(260, tools.LAYOUT_WIDTH_STEP, tools.MIN_EXPLORER_WIDTH, tools.MAX_EXPLORER_WIDTH), 276);
+    assert.equal(tools.stepLayoutWidth(tools.MAX_EXPLORER_WIDTH, tools.LAYOUT_WIDTH_STEP, tools.MIN_EXPLORER_WIDTH, tools.MAX_EXPLORER_WIDTH), tools.MAX_EXPLORER_WIDTH, "a step past max clamps");
+    const reset = tools.resetStudioLayout("orders");
+    assert.equal(reset.explorerVisible, true);
+    assert.equal(reset.explorerWidth, tools.DEFAULT_EXPLORER_WIDTH);
+    assert.equal(reset.selectedTable, "orders", "reset keeps the selected table and restores pane defaults");
+    assert.match(tools.layoutStorageKey("r a", "db", "user"), /^nextsql-studio-layout:/);
+    assert.equal(JSON.parse(tools.serializeStudioLayout(layout)).password, undefined, "the layout document has no credential field");
   }
 
   {
@@ -1673,6 +1798,253 @@ try {
       tools.buildParameterizedDML({ table: 'a"b', kind: "insert", setColumns: ['c"l'], whereColumns: [] }, evilCols).sql,
       'INSERT INTO "a""b" ("c""l")\n  VALUES ($1);',
     );
+  }
+
+  {
+    // Table / index designer: CREATE TABLE / CREATE INDEX templates, never execute.
+
+    const def = tools.defaultCreateTableState();
+    const created = tools.buildCreateTableSQL(def);
+    assert.equal(created.error, null);
+    assert.equal(
+      created.sql,
+      'CREATE TABLE "new_table" (\n  "id" UUID PRIMARY KEY DEFAULT UUID(),\n  "name" STRING NOT NULL\n);',
+    );
+
+    assert.match(tools.buildCreateTableSQL({ ...def, table: "" }).error, /Table name is required/);
+    assert.match(tools.buildCreateTableSQL({ ...def, table: "nsql_secret" }).error, /reserved nsql_ prefix/);
+    assert.match(
+      tools.buildCreateTableSQL({
+        ...def,
+        columns: def.columns.map((c) => ({ ...c, primaryKey: false })),
+      }).error,
+      /PRIMARY KEY is required/,
+    );
+    assert.match(
+      tools.buildCreateTableSQL({
+        ...def,
+        columns: [def.columns[0], { ...def.columns[1], name: "id" }],
+      }).error,
+      /listed twice/,
+    );
+
+    const composite = tools.buildCreateTableSQL({
+      ...def,
+      table: "orders",
+      columns: [
+        tools.newDesignerColumn("a", { name: "tenant", typeKind: "STRING", primaryKey: true, notNull: true }),
+        tools.newDesignerColumn("b", { name: "id", typeKind: "UUID", primaryKey: true, defaultKind: "uuid" }),
+        tools.newDesignerColumn("c", { name: "qty", typeKind: "INT64" }),
+      ],
+    });
+    assert.equal(
+      composite.sql,
+      'CREATE TABLE "orders" (\n  "tenant" STRING NOT NULL,\n  "id" UUID NOT NULL DEFAULT UUID(),\n  "qty" INT64,\n  PRIMARY KEY ("tenant", "id")\n);',
+    );
+
+    const decimalAI = tools.buildCreateTableSQL({
+      ...def,
+      columns: [
+        tools.newDesignerColumn("pk", {
+          name: "id",
+          typeKind: "DECIMAL",
+          typeParam: 18,
+          typeScale: 0,
+          primaryKey: true,
+          defaultKind: "ai",
+        }),
+      ],
+    });
+    assert.equal(decimalAI.sql, 'CREATE TABLE "new_table" (\n  "id" DECIMAL(18,0) PRIMARY KEY DEFAULT AI()\n);');
+    assert.match(
+      tools.buildCreateTableSQL({
+        ...def,
+        columns: [tools.newDesignerColumn("pk", { name: "id", typeKind: "UUID", primaryKey: true, defaultKind: "ai" })],
+      }).error,
+      /DEFAULT AI\(\) is only valid on a DECIMAL column/,
+    );
+
+    const vectorPK = tools.buildCreateTableSQL({
+      ...def,
+      columns: [tools.newDesignerColumn("pk", { name: "id", typeKind: "VECTOR_F32", typeParam: 8, primaryKey: true })],
+    });
+    assert.match(vectorPK.error, /cannot be a PRIMARY KEY/);
+
+    const charCol = tools.designerColumnTypeSQL(tools.newDesignerColumn("x", { typeKind: "CHAR", typeParam: 4 }));
+    assert.equal(charCol.sql, "CHAR(4)");
+    assert.match(tools.designerColumnTypeSQL(tools.newDesignerColumn("x", { typeKind: "CHAR", typeParam: 0 })).error, /CHAR length/);
+    assert.equal(
+      tools.designerColumnTypeSQL(tools.newDesignerColumn("x", { typeKind: "VECTOR_F16", typeParam: 3 })).sql,
+      "VECTOR<F16,3>",
+    );
+    assert.equal(
+      tools.designerColumnTypeSQL(tools.newDesignerColumn("x", { typeKind: "DECIMAL", typeParam: 10, typeScale: 2 })).sql,
+      "DECIMAL(10,2)",
+    );
+
+    const quoted = tools.buildCreateTableSQL({
+      ...def,
+      table: 'a"b',
+      columns: [
+        tools.newDesignerColumn("pk", {
+          name: 'c"l',
+          typeKind: "STRING",
+          primaryKey: true,
+          defaultKind: "literal",
+          defaultLiteral: "it's",
+        }),
+      ],
+    });
+    assert.equal(quoted.sql, `CREATE TABLE "a""b" (\n  "c""l" STRING PRIMARY KEY DEFAULT 'it''s'\n);`);
+
+    const withFK = tools.buildCreateTableSQL({
+      ...def,
+      table: "items",
+      columns: [
+        tools.newDesignerColumn("pk", { name: "id", typeKind: "UUID", primaryKey: true, defaultKind: "uuid" }),
+        tools.newDesignerColumn("fk", { name: "owner_id", typeKind: "UUID" }),
+      ],
+      fkEnabled: true,
+      fkColumns: ["owner_id"],
+      fkRefTable: "users",
+      fkRefColumns: ["id"],
+      fkOnDelete: "CASCADE",
+      fkOnUpdate: "RESTRICT",
+    });
+    assert.match(withFK.sql, /FOREIGN KEY \("owner_id"\) REFERENCES "users" \("id"\) ON DELETE CASCADE ON UPDATE RESTRICT/);
+    assert.match(
+      tools.buildCreateTableSQL({
+        ...def,
+        fkEnabled: true,
+        fkColumns: ["nope"],
+        fkRefTable: "users",
+        fkRefColumns: ["id"],
+        fkOnDelete: "RESTRICT",
+        fkOnUpdate: "RESTRICT",
+      }).error,
+      /not a column of this table/,
+    );
+
+    const ixCols = [
+      { name: "id", type: "INT64" },
+      { name: "label", type: "STRING" },
+      { name: "body", type: "TEXT" },
+      { name: "meta", type: "JSON" },
+      { name: "embedding", type: "VECTOR<F32,8>" },
+      { name: "bits", type: "BITVECTOR<8>" },
+      { name: "sparse", type: "SPARSEVECTOR<128>" },
+      { name: "loc", type: "POINT" },
+      { name: "note", type: "STRING" },
+    ];
+    assert.deepEqual(tools.designerIndexKindOptions(ixCols), ["btree", "unique", "fulltext", "vector", "spatial"]);
+
+    const btree = tools.buildCreateIndexSQL(
+      { ...tools.defaultCreateIndexState("orders"), name: "ix_label", columns: ["label"], include: ["note"] },
+      ixCols,
+    );
+    assert.equal(btree.sql, 'CREATE INDEX "ix_label" ON "orders" ("label") INCLUDE ("note");');
+
+    const unique = tools.buildCreateIndexSQL(
+      { ...tools.defaultCreateIndexState("orders"), name: "ux_label", kind: "unique", columns: ["label"] },
+      ixCols,
+    );
+    assert.equal(unique.sql, 'CREATE UNIQUE INDEX "ux_label" ON "orders" ("label");');
+
+    const jsonPath = tools.buildCreateIndexSQL(
+      { ...tools.defaultCreateIndexState("orders"), name: "ix_cat", columns: ["meta"], jsonPath: "category.kind" },
+      ixCols,
+    );
+    assert.equal(jsonPath.sql, 'CREATE INDEX "ix_cat" ON "orders" ("meta"."category"."kind");');
+    assert.match(
+      tools.buildCreateIndexSQL(
+        { ...tools.defaultCreateIndexState("orders"), name: "ix_bad", columns: ["label"], jsonPath: "category" },
+        ixCols,
+      ).error,
+      /exactly one JSON key column/,
+    );
+
+    const ft = tools.buildCreateIndexSQL(
+      { ...tools.defaultCreateIndexState("orders"), name: "ft_body", kind: "fulltext", columns: ["label", "body"], analyzer: "english" },
+      ixCols,
+    );
+    assert.equal(ft.sql, `CREATE FULLTEXT INDEX "ft_body" ON "orders" ("label", "body") WITH (ANALYZER = 'english');`);
+    assert.match(
+      tools.buildCreateIndexSQL(
+        { ...tools.defaultCreateIndexState("orders"), name: "ft_bad", kind: "fulltext", columns: ["embedding"] },
+        ixCols,
+      ).error,
+      /FULLTEXT cannot index it/,
+    );
+
+    const hnsw = tools.buildCreateIndexSQL(
+      {
+        ...tools.defaultCreateIndexState("orders"),
+        name: "vn_emb",
+        kind: "vector",
+        columns: ["embedding"],
+        vectorMethod: "HNSW",
+        vectorQuant: "F16",
+      },
+      ixCols,
+    );
+    assert.equal(hnsw.sql, `CREATE VECTOR INDEX "vn_emb" ON "orders" ("embedding") USING HNSW WITH (QUANTIZATION = 'F16');`);
+
+    const ivfpq = tools.buildCreateIndexSQL(
+      {
+        ...tools.defaultCreateIndexState("orders"),
+        name: "vn_pq",
+        kind: "vector",
+        columns: ["embedding"],
+        vectorMethod: "IVFPQ",
+        ivfLists: 16,
+        ivfProbes: 4,
+        ivfSubspaces: 8,
+      },
+      ixCols,
+    );
+    assert.equal(
+      ivfpq.sql,
+      'CREATE VECTOR INDEX "vn_pq" ON "orders" ("embedding") USING IVFPQ WITH (LISTS = 16, PROBES = 4, SUBSPACES = 8);',
+    );
+
+    assert.match(
+      tools.buildCreateIndexSQL(
+        { ...tools.defaultCreateIndexState("orders"), name: "vn_bad", kind: "vector", columns: ["embedding"], vectorMethod: "SPARSE" },
+        ixCols,
+      ).error,
+      /USING SPARSE is only valid on a SPARSEVECTOR column/,
+    );
+    const sparse = tools.buildCreateIndexSQL(
+      { ...tools.defaultCreateIndexState("orders"), name: "vn_sp", kind: "vector", columns: ["sparse"], vectorMethod: "SPARSE" },
+      ixCols,
+    );
+    assert.equal(sparse.sql, 'CREATE VECTOR INDEX "vn_sp" ON "orders" ("sparse") USING SPARSE;');
+
+    const spatial = tools.buildCreateIndexSQL(
+      { ...tools.defaultCreateIndexState("orders"), name: "sp_loc", kind: "spatial", columns: ["loc"] },
+      ixCols,
+    );
+    assert.equal(spatial.sql, 'CREATE SPATIAL INDEX "sp_loc" ON "orders" ("loc");');
+
+    assert.match(
+      tools.buildCreateIndexSQL(
+        { ...tools.defaultCreateIndexState("orders"), name: "ix_missing", columns: ["nope"] },
+        ixCols,
+      ).error,
+      /is not a column of orders/,
+    );
+    assert.match(
+      tools.buildCreateIndexSQL(
+        { ...tools.defaultCreateIndexState("orders"), name: "ix_inc", columns: ["label"], include: ["label"] },
+        ixCols,
+      ).error,
+      /cannot be both a key and an INCLUDE column/,
+    );
+    const quotedIx = tools.buildCreateIndexSQL(
+      { ...tools.defaultCreateIndexState('a"b'), name: 'ix"1', columns: ['c"l'] },
+      [{ name: 'c"l', type: "STRING" }],
+    );
+    assert.equal(quotedIx.sql, 'CREATE INDEX "ix""1" ON "a""b" ("c""l");');
   }
 
   console.log("Studio result helper tests passed");

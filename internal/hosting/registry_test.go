@@ -597,6 +597,111 @@ func testBootstrap(t *testing.T, state State) Bootstrap {
 	}
 }
 
+func TestRenameRealmAndDatabase(t *testing.T) {
+	dir := t.TempDir()
+	path := Path(dir)
+	root := testRoot(t)
+	reg, _, err := EnsureBootstrap(path, root, testBootstrap(t, StateActive))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reg.Close()
+	m := reg.Manifest()
+	realmID := m.DefaultRealm
+	dbID := m.DefaultDatabase
+	gen := m.Generation
+
+	if err := reg.RenameRealm(realmID, "Acme"); err != nil {
+		t.Fatal(err)
+	}
+	m = reg.Manifest()
+	if m.Realms[0].Name != "acme" {
+		t.Fatalf("realm name: %q", m.Realms[0].Name)
+	}
+	if m.Realms[0].ID != realmID {
+		t.Fatal("realm ID changed")
+	}
+	if m.Generation <= gen {
+		t.Fatal("rename did not persist a new generation")
+	}
+	if _, _, err := reg.Lookup("customer-a", "production"); !nerr.HasCode(err, nerr.NotFound) {
+		t.Fatalf("old realm name still routes: %v", err)
+	}
+	if _, db, err := reg.Lookup("acme", "production"); err != nil || db.ID != dbID {
+		t.Fatalf("new realm name: %v %+v", err, db)
+	}
+
+	gen = m.Generation
+	if err := reg.RenameRealm(realmID, "acme"); err != nil {
+		t.Fatal(err)
+	}
+	if reg.Manifest().Generation != gen {
+		t.Fatal("no-op realm rename wrote a generation")
+	}
+
+	_, _, created, err := reg.CreateRealm("globex", "main", testIdentity(t), "/run/keys/globex.key")
+	if err != nil || !created {
+		t.Fatalf("create second realm: created=%v err=%v", created, err)
+	}
+	if err := reg.RenameRealm(realmID, "globex"); !nerr.HasCode(err, nerr.AlreadyExists) {
+		t.Fatalf("realm name collision: %v", err)
+	}
+	if err := reg.RenameRealm(ID{0xff}, "other"); !nerr.HasCode(err, nerr.NotFound) {
+		t.Fatalf("unknown realm: %v", err)
+	}
+
+	if err := reg.RenameDatabase(realmID, dbID, "Analytics"); err != nil {
+		t.Fatal(err)
+	}
+	m = reg.Manifest()
+	if m.Realms[0].Databases[0].Name != "analytics" {
+		t.Fatalf("database name: %q", m.Realms[0].Databases[0].Name)
+	}
+	if m.Realms[0].Databases[0].ID != dbID {
+		t.Fatal("database ID changed")
+	}
+	if _, _, err := reg.Lookup("acme", "production"); !nerr.HasCode(err, nerr.NotFound) {
+		t.Fatalf("old database name still routes: %v", err)
+	}
+	if _, db, err := reg.Lookup("acme", "analytics"); err != nil || db.ID != dbID {
+		t.Fatalf("new database name: %v %+v", err, db)
+	}
+
+	staging, _, err := reg.CreateDatabase(realmID, "staging", testIdentity(t), "/run/keys/staging.key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.SetDatabaseState(realmID, staging.ID, StateActive); err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.RenameDatabase(realmID, dbID, "staging"); !nerr.HasCode(err, nerr.AlreadyExists) {
+		t.Fatalf("database name collision: %v", err)
+	}
+
+	if err := reg.SetDatabaseState(realmID, dbID, StateSuspended); err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.RenameDatabase(realmID, dbID, "warehouse"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := reg.Lookup("acme", "warehouse"); !nerr.HasCode(err, nerr.Unavailable) {
+		t.Fatalf("renamed suspended database should still fail closed: %v", err)
+	}
+
+	if err := reg.SetDatabaseState(realmID, staging.ID, StateDeleting); err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.RenameDatabase(realmID, staging.ID, "gone"); !nerr.HasCode(err, nerr.Conflict) {
+		t.Fatalf("deleting database rename: %v", err)
+	}
+	if err := reg.SetDatabaseState(realmID, staging.ID, StateTombstoned); err != nil {
+		t.Fatal(err)
+	}
+	if err := reg.RenameDatabase(realmID, staging.ID, "gone"); !nerr.HasCode(err, nerr.Conflict) {
+		t.Fatalf("tombstoned database rename: %v", err)
+	}
+}
+
 func TestPathIsDataDirRelative(t *testing.T) {
 	dir := t.TempDir()
 	if got, want := Path(dir), filepath.Join(dir, RegistryFileName); got != want {

@@ -55,7 +55,7 @@ Every read runs in one mode (session default `STRONG`):
 
 Every official driver ships a cluster routing client (`OpenCluster` / `connectCluster` / `NextSQL\Cluster::connect`) that sends eligible reads to a healthy follower and everything else to the leader. `nextsql-bench --readscale` measures the barrier cost and leader read-offload. Full argument: [`docs/ha.md`](https://github.com/bzync/nextsql/blob/main/docs/ha.md) "Consistency model and sign-off".
 
-A wiped replica is restored with `nextsql backup` / `restore` (same identity and keys), then rejoined. Raft logs are ciphertext (replication DEK). HA is not a substitute for backups.
+Replica repair has two proven paths: a lagging follower that reconnects, and a wiped replica restored with `nextsql backup` / `restore` (same identity and keys) then rejoined with `AddVoter`. Raft logs are ciphertext (replication DEK). HA is not a substitute for backups. Hosted multi-database HA (one Raft group per hosted database, or a shared cluster spanning the registry) is not implemented.
 
 On Raft, connect migrators and writers to the **leader**.
 

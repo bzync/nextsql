@@ -463,8 +463,7 @@ NextSQL Engine
 └── nextsql-admin (P28-29; one binary, three modes)
     ├── Setup mode      (P28; formerly nextsql-install — GUI M1/M3/M5/M6 complete)
     ├── Operations mode (P28; formerly nextsql-manager — MVP complete)
-    ├── Studio mode     (P29; not yet built — placeholder only)
-    └── Intelligence    (P30; lives inside Studio mode)
+    └── Studio mode     (P29)
 ```
 
 The server remains authoritative.
@@ -474,33 +473,7 @@ directly, in every mode.
 
 ---
 
-## 18. Intelligence Boundary
-
-NextSQL Intelligence is optional.
-
-It may inspect authorized:
-
-- docs;
-- schema;
-- EXPLAIN;
-- metrics;
-- index metadata;
-- current query/error.
-
-It must never override:
-
-- parser;
-- binder;
-- optimizer;
-- RBAC;
-- tenant policy;
-- server validation.
-
-Retrieved text is data, not trusted instructions.
-
----
-
-## 19. Source of Truth
+## 18. Source of Truth
 
 ```text
 PROJECT.md      product end-state

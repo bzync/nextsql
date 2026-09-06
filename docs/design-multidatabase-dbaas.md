@@ -3,8 +3,9 @@
 > Status: **ACCEPTED DESIGN — M1 FOUNDATION COMPLETE, M2 COMPLETE
 > (M2-1/M2-2/M2-3a/M2-3b-1/M2-3b-2/M2-3b-3a/M2-3b-3b/M2-3b-3c/M2-4a/M2-4b-1/
 > M2-5/M2-6 LANDED), M3-1 LANDED 2026-09-04 (suspend/resume enforcement),
+> M3-2 LANDED 2026-09-06 (realm/database rename),
 > M3-3 LANDED 2026-09-04 (offline drop/tombstone physical reclamation);
-> M3-2, M3-4, M3-5 NOT STARTED; NOT PRODUCTION-GATED**
+> M3-4, M3-5 NOT STARTED; NOT PRODUCTION-GATED**
 >
 > This document is a design and delivery plan. `TODO.md` remains authoritative
 > for implementation status and sequencing. Nothing in this document changes a
@@ -1007,6 +1008,11 @@ Unlike `create`, this pair is enforced, not just recorded: `nextsqld`'s
 any new connection to a suspended database once the process is restarted
 with the updated registry.
 
+**M3-2, landed 2026-09-06, implements `realm rename` / `database rename`**
+— same offline exclusive-lock shape. The stable ID and every on-disk path
+stay put; `Lookup` follows the new name. Collisions fail `AlreadyExists`.
+Deleting/tombstoned databases cannot be renamed.
+
 **M3-3, landed 2026-09-04, implements `database drop`** — same offline shape
 again. `StateDeleting`/`StateTombstoned` and `Lookup`'s fail-closed handling
 of both already existed; this adds the missing physical half: transition to
@@ -1015,8 +1021,9 @@ directory (db file + `.keys`/`.wal`/`.undo`/`.isolated` sidecars, all
 colocated under it), transition to `StateTombstoned`. Idempotent and
 resumable across a crash at any step. Scoped to `LayoutManaged` databases
 and never the deployment default (§16 M3-3 has the full writeup). `realm
-suspend`/`resume`, `database rename`, and every `list`/`status`/`plan`/
-`operation` verb below remain unimplemented (M3-2, M2-4b-2, §16).
+suspend`/`resume` remain unimplemented (M2-4b-2); `database rename` and
+`realm rename` landed as M3-2. Every `list`/`status`/`plan`/`operation`
+verb below remains unimplemented.
 
 Administrative surface should include native, machine-readable equivalents of:
 
@@ -1529,14 +1536,22 @@ increment" decomposition discipline), now that M2 is complete, into:
   resume` + restart — `acme/prod` accepts connections again and its
   earlier row survived untouched. See `TODO.md` log #112 for the full
   writeup.
-- **M3-2 — rename.** Not started. A durable name change for an existing
-  realm or database, distinct from its stable `ID` (every `ManagedDatabasePath`/
-  audit/registry reference is already ID-based, so renaming should not by
-  itself require touching physical files) — needs its own scoping pass for
-  in-flight-connection behavior (an open `dbmanager` entry is keyed by ID,
-  not name, so a rename likely needs no eviction, but that must be verified,
-  not assumed) and collision handling against another realm/database
-  already holding the target name.
+- **M3-2 — rename (LANDED 2026-09-06).** A durable name change for an
+  existing realm or database, distinct from its stable `ID`.
+  `ManagedDatabasePath` / audit / registry references are ID-based, so
+  renaming does not touch physical files. `Registry.RenameRealm` /
+  `RenameDatabase` persist one encrypted generation; a no-op rename of the
+  current name succeeds without a generation; colliding with another
+  realm's name (or another database in the same realm) fails
+  `AlreadyExists`; deleting/tombstoned databases cannot be renamed.
+  `Lookup` follows the new name and fails `NotFound` on the old one.
+  Offline CLI `nextsql realm rename --realm OLD --to NEW --confirm` and
+  `nextsql database rename --realm R --database OLD --to NEW --confirm`,
+  same exclusive data-dir lock as suspend/drop (fails `Unavailable`
+  against a running `nextsqld`), so there is never a live `dbmanager`
+  entry to evict — `dbmanager` is keyed by ID anyway. Audit actions
+  `realm.rename` / `database.rename`. Tests: `TestRenameRealmAndDatabase`,
+  `TestRealmDatabaseRenameCLI`.
 - **M3-3 — drop/tombstone (LANDED 2026-09-04).** `StateDeleting`/
   `StateTombstoned` already existed in the state machine and `CanTransition`
   already allowed `StateActive/StateSuspended/StateProvisioning/StateFailed →
@@ -1564,7 +1579,7 @@ increment" decomposition discipline), now that M2 is complete, into:
   crashed after the first state write but before reclaiming files resumes
   cleanly on retry (`os.RemoveAll` is itself idempotent). New
   `security.ActionDatabaseDrop` audit action. **Deliberately out of scope
-  for this slice** (unchanged open items): rename (M3-2), realm-level
+  for this slice** (unchanged open items): realm-level
   delete (part of the still-open M2-4b-2 realm-suspend gap), and reclaiming
   a database's live buffer-pool/`TaskRuntime` footprint if it happens to be
   open in `dbmanager` at the moment of deletion — not reachable today
@@ -1612,8 +1627,8 @@ increment" decomposition discipline), now that M2 is complete, into:
 
 Exit: one database can crash, restore, rotate, suspend, or be deleted without
 incorrect results, key use, state loss, or service interruption in another.
-Not yet met — M3-1 (suspend) and M3-3 (drop/tombstone, offline) are landed;
-rename, crash/restore/rotate (M3-2, M3-4, M3-5) remain open.
+Not yet met — M3-1 (suspend), M3-2 (rename), and M3-3 (drop/tombstone,
+offline) are landed; crash/restore/rotate (M3-4, M3-5) remain open.
 
 ### M4 — Workload governance and subscription enforcement
 

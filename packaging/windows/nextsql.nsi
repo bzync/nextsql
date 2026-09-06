@@ -8,7 +8,7 @@
 !include "FileFunc.nsh"
 
 !ifndef PRODUCT_VERSION
-  !define PRODUCT_VERSION "0.1.0-dev"
+  !define PRODUCT_VERSION "0.0.1"
 !endif
 !ifndef PRODUCT_VERSION_CSV
   !define PRODUCT_VERSION_CSV "0.1.0.0"

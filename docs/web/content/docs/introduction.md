@@ -6,7 +6,7 @@ It is a new database. It is not PostgreSQL, MySQL, MongoDB, Elasticsearch, or a 
 
 Install the `nextsql` and `nextsqld` binaries, initialize a data directory, and start serving NSQL. Storage, WAL, MVCC, SQL, the optimizer, JSON, full-text, vectors, hybrid plans, workflows, CDC, partitioning, security, backup/PITR/export, and Raft HA are in the engine.
 
-This site documents **0.1.0-dev**. A live install uses `nextsql setup --profile production`. NextSQL Admin Setup and Operations are usable; Studio is in progress. Treat the release as an engine under measurement until you have run `nextsql-bench --slo` and the crash/HA suites on your hardware. Hard limits and unimplemented SQL are listed under [Limits](/docs/limits).
+This site documents **0.0.1**. A live install uses `nextsql setup --profile production`. NextSQL Admin Setup and Operations are usable; Studio is in progress. Treat the release as an engine under measurement until you have run `nextsql-bench --slo` and the crash/HA suites on your hardware. Hard limits and unimplemented SQL are listed under [Limits](/docs/limits).
 
 ## What you can do
 

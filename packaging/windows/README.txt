@@ -17,8 +17,8 @@ initialize a data directory.
 
 Silent:
 
-  NextSQL-0.1.0-dev-windows-amd64-setup.exe /S
-  NextSQL-0.1.0-dev-windows-amd64-setup.exe /uninstall /S
+  NextSQL-0.0.1-windows-amd64-setup.exe /S
+  NextSQL-0.0.1-windows-amd64-setup.exe /uninstall /S
 
 Zip / PowerShell
 ----------------

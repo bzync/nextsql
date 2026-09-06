@@ -1,5 +1,5 @@
 -- migrate:up 20260818120000 create_customers
--- NextSQL 0.1.0-dev: one statement per request; this file is split on ';'.
+-- NextSQL 0.0.1: one statement per request; this file is split on ';'.
 -- Do not include BEGIN/COMMIT/ROLLBACK.
 CREATE TABLE customers (
     tenant_id  UUID NOT NULL,

@@ -1,6 +1,6 @@
 # NextSQL Usage Manual
 
-End-to-end user documentation for **NextSQL 0.1.0-dev**. This manual documents the **currently usable product surface**, not every capability planned in `PROJECT.md`.
+End-to-end user documentation for **NextSQL 0.0.1**. This manual documents the **currently usable product surface**, not every capability planned in `PROJECT.md`.
 
 NextSQL is a new database. It is not PostgreSQL, MySQL, MongoDB, Elasticsearch, or a vector-store compatibility layer. It has its own storage format, SQL dialect, wire protocol (NSQL v1), and official drivers.
 
@@ -13,7 +13,7 @@ execution gates are open. Multi-database hosting M2 is complete; M3
 suspend/resume and offline drop are landed, while independent backup/PITR,
 key, and HA lifecycle remain open.
 
-Treat 0.1.0-dev as an engine under measurement, not a drop-in production replacement, until you have run `nextsql-bench --slo` plus the relevant crash, recovery, security, and HA suites on your hardware.
+Treat 0.0.1 as an engine under measurement, not a drop-in production replacement, until you have run `nextsql-bench --slo` plus the relevant crash, recovery, security, and HA suites on your hardware.
 
 Documentation roles:
 
@@ -239,7 +239,7 @@ Confirm:
 
 ./nextsql version
 
-# nextsql 0.1.0-dev
+# nextsql 0.0.1
 
 ```
 
@@ -1741,7 +1741,7 @@ NEXTSQL_INSECURE=true
 
 NEXTSQL_MIGRATION_DIR=./migrations
 
-# NEXTSQL_DATABASE is optional; leave unset on 0.1.0-dev
+# NEXTSQL_DATABASE is optional; leave unset on 0.0.1
 
 ```
 
@@ -2984,7 +2984,7 @@ P17/P18 added user-visible behavior that older copies of this manual did not des
 
 - IVF / IVF-PQ / `USING SPARSE` are not available on partitioned tables; a process-local IVF-PQ cache and a `BITVECTOR`/Hamming `--vecquant` row remain documented follow-ons
 
-### Known measurement / correctness notes (0.1.0-dev)
+### Known measurement / correctness notes (0.0.1)
 
 - Large sequential SQL `DELETE` is correct after the leaf-merge fix. Official 10M timing methodology is published in `docs/ops.md`.
 

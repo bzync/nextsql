@@ -17,7 +17,7 @@ need_cmd() {
 	command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"
 }
 
-# Product version as committed (e.g. 0.1.0-dev).
+# Product version as committed (e.g. 0.0.1).
 version_string() {
 	local f="$ROOT/internal/version/version.go"
 	local v
@@ -26,13 +26,13 @@ version_string() {
 	printf '%s\n' "$v"
 }
 
-# Debian upstream version: 0.1.0-dev -> 0.1.0~dev so it sorts before 0.1.0.
+# Debian upstream version: 0.0.1 -> 0.1.0~dev so it sorts before 0.1.0.
 # Do not write '~' inline in ${var/a/b}: bash expands a bare tilde to $HOME.
 deb_version() {
 	awk -v v="$1" 'BEGIN { sub("-", "~", v); print v "-1" }'
 }
 
-# Windows FILEVERSION / ProductVersion: 0.1.0-dev -> 0.1.0.0
+# Windows FILEVERSION / ProductVersion: 0.0.1 -> 0.1.0.0
 win_version() {
 	local v="$1"
 	v="${v%%-*}"
@@ -40,7 +40,7 @@ win_version() {
 	printf '%s.%s.%s.0\n' "${a:-0}" "${b:-0}" "${c:-0}"
 }
 
-# Safe file token: 0.1.0-dev stays 0.1.0-dev.
+# Safe file token: 0.0.1 stays 0.0.1.
 file_version() {
 	printf '%s\n' "$1"
 }

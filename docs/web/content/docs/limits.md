@@ -1,6 +1,6 @@
 # Limits and current gaps
 
-This is still **0.1.0-dev**. Treat it as an engine under measurement, not a drop-in production replacement, until you have run `nextsql-bench --slo` and the crash/HA suites on your hardware.
+This is still **0.0.1**. Treat it as an engine under measurement, not a drop-in production replacement, until you have run `nextsql-bench --slo` and the crash/HA suites on your hardware.
 
 A live install uses `nextsql setup --profile production` (Setup-mode GUI default) so `nextsqld` fail-closes instead of shipping developer defaults. NextSQL Admin Setup and Operations are usable; Studio is in progress. NextSQL Intelligence / built-in RAG is not in the product.
 
@@ -39,7 +39,7 @@ A live install uses `nextsql setup --profile production` (Setup-mode GUI default
 
 Windows/macOS packaged Admin execution and a recovery-key Setup flow remain environment-blocked. Linux `.tar.gz` / `.run` / `.deb` / `.rpm` and silent/offline/upgrade/repair paths are live-verified.
 
-## Known measurement notes (0.1.0-dev)
+## Known measurement notes (0.0.1)
 
 - Large sequential SQL `DELETE` is correct after the leaf-merge fix. Official 10M warm-process and cold-open timings are published with their affected-row count methodology in `docs/ops.md`.
 - 100M-row analytics are published. The 1M-vector HNSW baseline is the corrected distinct-vector v10 run (p95 **8.061 ms**, recall@10 **1.000**, recall@100 **0.998**). The terminal 100M-operation randomized B+Tree invariant soak is a deferred standalone measurement, not a release gate (best retained evidence: 44M clean operations).

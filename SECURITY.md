@@ -12,7 +12,7 @@ Encryption protects persisted data and TLS protects remote transport.
 
 ## Supported Development Status
 
-NextSQL is currently `0.1.0-dev`.
+NextSQL is currently `0.0.1`.
 
 Security guarantees should be treated as development-stage until the applicable release gates and security suites are green.
 

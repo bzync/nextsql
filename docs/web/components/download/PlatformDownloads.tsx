@@ -35,7 +35,7 @@ export function PlatformDownloads({ release }: { release: Release }) {
     return (
       <div className="rounded-md border border-line px-4 py-4 text-sm text-muted">
         No prebuilt binaries for this version yet. Install from source with{" "}
-        <code className="rounded bg-bg-hover px-1 font-mono text-[12px]">go install github.com/bzync/nextsql/cmd/nextsql@{release.version === "0.1.0-dev" ? "latest" : `v${release.version}`}</code>
+        <code className="rounded bg-bg-hover px-1 font-mono text-[12px]">go install github.com/bzync/nextsql/cmd/nextsql@{release.version === "0.0.1" ? "latest" : `v${release.version}`}</code>
         .
       </div>
     );

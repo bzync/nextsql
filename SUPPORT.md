@@ -5,7 +5,7 @@
 NextSQL is currently:
 
 ```text
-0.1.0-dev
+0.0.1
 ```
 
 It is an active development database engine under measurement.

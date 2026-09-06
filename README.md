@@ -22,7 +22,7 @@ SQL/PSM, SQL/MED, SQL/Schemata, SQL/MDA, and SQL/PGQ), ISO/IEC 9579:2000 RDA
 principles, TCP with TLS 1.3, and Unicode/UTF-8. This is a design baseline, not
 a blanket conformance claim; see [`docs/standards.md`](docs/standards.md).
 
-**Version:** 0.1.0-dev · **Status:** P28 installer gate in progress; P0–P27 complete · **Module:** [`github.com/bzync/nextsql`](https://github.com/bzync/nextsql)
+**Version:** 0.0.1 · **Status:** P28 installer gate in progress; P0–P27 complete · **Module:** [`github.com/bzync/nextsql`](https://github.com/bzync/nextsql)
 
 ```sql
 
@@ -694,7 +694,7 @@ For implementation status, sequencing, dependencies, and phase gates, `TODO.md` 
 
 ## Status
 
-NextSQL remains **0.1.0-dev**.
+NextSQL remains **0.0.1**.
 
 Current development state:
 

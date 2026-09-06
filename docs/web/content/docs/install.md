@@ -2,39 +2,39 @@
 
 Install the NextSQL **binaries**, then initialize a data directory.
 
-Published packages, checksums, and a feature comparison are on [Downloads](/download). Direct files: [GitHub release v0.1.0-dev](https://github.com/bzync/nextsql/releases/tag/v0.1.0-dev). For a container, see [Docker](/docs/docker). For the GUI, see [Admin](/docs/admin).
+Published packages, checksums, and a feature comparison are on [Downloads](/download). Direct files: [GitHub release v0.0.1](https://github.com/bzync/nextsql/releases/tag/v0.0.1). For a container, see [Docker](/docs/docker). For the GUI, see [Admin](/docs/admin).
 
 The packages copy `nextsql`, `nextsqld`, `nextsql-bench`, and `nextsql-admin` plus a default config. They do **not** create a data directory, write a root unlock key, or start the server.
 
 ## Linux x64
 
-Verify the file against [SHA256SUMS](https://github.com/bzync/nextsql/releases/download/v0.1.0-dev/SHA256SUMS) before you run it.
+Verify the file against [SHA256SUMS](https://github.com/bzync/nextsql/releases/download/v0.0.1/SHA256SUMS) before you run it.
 
 ### Debian / Ubuntu (`.deb`)
 
 ```bash
-curl -fsSL -O https://github.com/bzync/nextsql/releases/download/v0.1.0-dev/nextsql_0.1.0-dev_amd64.deb
-curl -fsSL -O https://github.com/bzync/nextsql/releases/download/v0.1.0-dev/SHA256SUMS
+curl -fsSL -O https://github.com/bzync/nextsql/releases/download/v0.0.1/nextsql_0.0.1_amd64.deb
+curl -fsSL -O https://github.com/bzync/nextsql/releases/download/v0.0.1/SHA256SUMS
 sha256sum -c --ignore-missing SHA256SUMS
-sudo dpkg -i nextsql_0.1.0-dev_amd64.deb
+sudo dpkg -i nextsql_0.0.1_amd64.deb
 ```
 
 ### Self-extracting installer (`.run`)
 
 ```bash
-curl -fsSL -O https://github.com/bzync/nextsql/releases/download/v0.1.0-dev/nextsql-0.1.0-dev-linux-amd64.run
-curl -fsSL -O https://github.com/bzync/nextsql/releases/download/v0.1.0-dev/SHA256SUMS
+curl -fsSL -O https://github.com/bzync/nextsql/releases/download/v0.0.1/nextsql-0.0.1-linux-amd64.run
+curl -fsSL -O https://github.com/bzync/nextsql/releases/download/v0.0.1/SHA256SUMS
 sha256sum -c --ignore-missing SHA256SUMS
-chmod +x nextsql-0.1.0-dev-linux-amd64.run
-sudo ./nextsql-0.1.0-dev-linux-amd64.run
+chmod +x nextsql-0.0.1-linux-amd64.run
+sudo ./nextsql-0.0.1-linux-amd64.run
 ```
 
 ### Portable tarball
 
 ```bash
-curl -fsSL -O https://github.com/bzync/nextsql/releases/download/v0.1.0-dev/nextsql-0.1.0-dev-linux-amd64.tar.gz
-tar -xzf nextsql-0.1.0-dev-linux-amd64.tar.gz
-sudo ./nextsql-0.1.0-dev-linux-amd64/install.sh
+curl -fsSL -O https://github.com/bzync/nextsql/releases/download/v0.0.1/nextsql-0.0.1-linux-amd64.tar.gz
+tar -xzf nextsql-0.0.1-linux-amd64.tar.gz
+sudo ./nextsql-0.0.1-linux-amd64/install.sh
 ```
 
 `install.sh` defaults to system-wide (`/usr/local`) as root, or `--user` (`~/.local`) otherwise. The systemd unit is installed but **not** enabled.
@@ -43,12 +43,12 @@ There is no Linux ARM64 package in this snapshot. Use [Docker](/docs/docker) (`l
 
 ## Windows x64
 
-Download from [Downloads](/download) or the [GitHub release](https://github.com/bzync/nextsql/releases/tag/v0.1.0-dev):
+Download from [Downloads](/download) or the [GitHub release](https://github.com/bzync/nextsql/releases/tag/v0.0.1):
 
 | Artifact | What |
 |---|---|
-| `nextsql-0.1.0-dev-windows-amd64-setup.exe` | GUI installer (UAC). Silent: `setup.exe /S` |
-| `nextsql-0.1.0-dev-windows-amd64.zip` | Binaries + `install.ps1` / `uninstall.ps1` |
+| `nextsql-0.0.1-windows-amd64-setup.exe` | GUI installer (UAC). Silent: `setup.exe /S` |
+| `nextsql-0.0.1-windows-amd64.zip` | Binaries + `install.ps1` / `uninstall.ps1` |
 
 Default install: `%ProgramFiles%\NextSQL`. Data: `%ProgramData%\NextSQL\data`. Key: `%ProgramData%\NextSQL\keys\root.key`. The `NextSQL` service is demand-start and is not started by the installer.
 
@@ -104,7 +104,7 @@ Confirm:
 
 ```bash
 nextsql version
-# nextsql 0.1.0-dev
+# nextsql 0.0.1
 ```
 
 `nextsql` is the CLI. `nextsqld` is the server. `nextsql-bench` is optional (official measurements with encryption, WAL, and fsync on). `nextsql-auth-broker` is the optional OIDC broker. `nextsql-admin` is the loopback Admin UI.

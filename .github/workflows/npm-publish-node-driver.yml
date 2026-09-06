@@ -4,6 +4,13 @@ name: Publish Node driver to npm
 # by pushing a tag like node-v0.1.0 — the tag version must match
 # drivers/node/package.json's "version" field, or the job fails before
 # publishing. Zero runtime dependencies, so no lockfile/install step needed.
+#
+# Auth: npm CLI >= 11.5.1 uses GitHub OIDC (Trusted Publishing) when a trusted
+# publisher is configured for @bzync/nextsql on npmjs.com, and otherwise falls
+# back to NODE_AUTH_TOKEN. The FIRST publish creates the package and must use
+# the NPM_TOKEN secret (npm has no pending-publisher flow); once the package
+# exists, add a trusted publisher (repo bzync/nextsql, this workflow file) and
+# the NPM_TOKEN secret can be removed.
 
 on:
   push:
@@ -22,7 +29,7 @@ defaults:
 
 permissions:
   contents: read
-  id-token: write # for npm provenance
+  id-token: write # npm provenance + Trusted Publishing
 
 jobs:
   publish:
@@ -36,8 +43,11 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v7
         with:
-          node-version: "20"
+          node-version: "24"
           registry-url: "https://registry.npmjs.org"
+
+      - name: Use an OIDC-capable npm
+        run: npm install -g npm@latest
 
       - name: Verify tag matches package.json version
         run: |

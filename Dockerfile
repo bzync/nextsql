@@ -1,7 +1,7 @@
 # Run the compiler on the build host's native architecture and cross-compile to
 # the target — CGO is disabled, so this is a pure Go cross-build and avoids
 # emulating the whole toolchain under QEMU for non-native target platforms.
-FROM --platform=$BUILDPLATFORM golang:1.23-bookworm AS build
+FROM --platform=$BUILDPLATFORM golang:1.27-bookworm AS build
 
 WORKDIR /src
 COPY go.mod go.sum ./

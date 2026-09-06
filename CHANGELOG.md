@@ -22,6 +22,15 @@ A roadmap item is not recorded as completed here until its implementation, tests
 
 ## [Unreleased]
 
+### Security
+
+- Bump `golang.org/x/crypto` 0.55.0 → 0.56.0 (GO-2026-6354, GO-2026-6355:
+  DoS in `golang.org/x/crypto/ssh` channel handling). NextSQL does not use the
+  `ssh` package — `govulncheck` reports no reachable call — but the module
+  version is compiled into the release binaries and image scanners (Trivy,
+  `vuln-type: library`) flag it as a fixable HIGH. Requires `go` directive
+  1.25.0 → 1.26.0 (x/crypto 0.56.0's minimum).
+
 ## [0.0.1] — 2026-09-07
 
 First tagged release. Cut to exercise the release/publish pipeline; the engine

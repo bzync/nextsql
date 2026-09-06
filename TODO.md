@@ -2771,7 +2771,7 @@ note.
 
 ## Installer UX
 
-- [x] Modern welcome screen with version/architecture/channel — `nextsql-install`'s Welcome step shows version/phase/OS/elevation (log #135); no "channel" concept exists in this repo (single rolling `0.1.0-dev`), so that part is N/A rather than done
+- [x] Modern welcome screen with version/architecture/channel — `nextsql-install`'s Welcome step shows version/phase/OS/elevation (log #135); no "channel" concept exists in this repo (single rolling pre-1.0 line), so that part is N/A rather than done
 - [x] Standard vs Advanced installation — the Resources step's "Advanced" toggle switches to `nextsql setup --skip-init` (write the config only, don't initialize a database now), skipping the Administrator step since it would have no effect (log #136)
 - [x] Component selection — NextSQL has no optional install components (single engine, single binary); `docs/design-installer-gui.md` M3 treats this line as the wizard's advanced-options surface (skip-init, custom buffer pages, remote listen + TLS), all three of which are now landed (M1 logs #135/#136, remote listen + TLS log #138)
 - [x] Data-directory picker + capacity/permission validation — the Location step's "Check" (and auto-check on Continue) runs `nextsql setup --dry-run` live and renders disk free/total + warnings before anything is written (log #135); permission errors surface as the real error from the dry run rather than a separate pre-flight

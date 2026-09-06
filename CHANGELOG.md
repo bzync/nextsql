@@ -4218,7 +4218,10 @@ The following phases remain planned/open and are **not** current shipped functio
 
 ---
 
-## [0.1.0-dev]
+## Pre-release development history
+
+Everything below predates the first tagged release (`0.0.1`); it is kept as a
+single bucket rather than reconstructed into version sections.
 
 ### Added
 
@@ -4622,7 +4625,7 @@ Performance figures are hardware/context-specific engineering targets or measure
 
 ### Known limitations
 
-- `0.1.0-dev` remains under measurement.
+- The engine remains under measurement.
 - P16 is not yet closed.
 - `REBUILD INDEX ... ONLINE` is not implemented.
 - Partition-wise aggregation/join waits for native physical partitioning.

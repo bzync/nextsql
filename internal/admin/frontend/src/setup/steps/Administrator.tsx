@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Button, Card, CardBody, Checkbox, Inline, Input, Stack, Text } from "@bzync/rui";
+import { Button, Card, CardBody, Checkbox, Input, Stack, Text } from "@bzync/rui";
 import type { Params } from "../api";
 import { StepHeader } from "../components/StepHeader";
 import { passwordStrength } from "../util";
@@ -50,9 +50,10 @@ export function Administrator({
   const hasError = errors.user !== undefined || errors.password !== undefined || errors.confirm !== undefined;
 
   return (
-    <Card variant="elevated">
+    <Card variant="bordered">
       <CardBody>
         <StepHeader
+          kicker="Step 4 of 6"
           title="Administrator account"
           description={
             params.profile === "production"
@@ -83,10 +84,10 @@ export function Administrator({
           />
           <Checkbox id="showPasswords" label="Show passwords" checked={show} onChange={(e) => setShow(e.target.checked)} />
         </Stack>
-        <Inline justify="between" style={{ marginTop: 20 }}>
+        <div className="nsi-actions">
           <Button variant="outline" onClick={onBack}>Back</Button>
           <Button variant="primary" disabled={hasError} onClick={onNext}>Continue</Button>
-        </Inline>
+        </div>
       </CardBody>
     </Card>
   );

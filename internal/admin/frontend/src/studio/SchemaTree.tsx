@@ -1,5 +1,6 @@
 import { useCallback, useRef, useState, type ReactNode } from "react";
 import { EmptyState, Inline, Spinner, Text } from "@bzync/rui";
+import { Icon, type IconName } from "../shared/icons";
 import { ApiError, type StudioResultSet, type StudioTableDetail, type StudioWorkflowOverview } from "../ops/api";
 
 // SchemaTree is the Database explorer's lazy-loaded object tree. The table
@@ -103,6 +104,7 @@ function messageOf(error: unknown): string {
 function Disclosure({
   id,
   label,
+  icon,
   count,
   open,
   onToggle,
@@ -110,6 +112,7 @@ function Disclosure({
 }: {
   id: string;
   label: string;
+  icon?: IconName;
   count?: number;
   open: boolean;
   onToggle: () => void;
@@ -124,7 +127,8 @@ function Disclosure({
         aria-controls={`${id}-group`}
         onClick={onToggle}
       >
-        <span aria-hidden="true" className="nss-tree-caret">{open ? "▾" : "▸"}</span>
+        <Icon name={open ? "chevron-down" : "chevron-right"} size={14} className="nss-tree-caret" />
+        {icon ? <Icon name={icon} size={14} className="nss-tree-icon" /> : null}
         <span className="nss-tree-branch-label">{label}</span>
         {typeof count === "number" ? <span className="nss-tree-count">{count}</span> : null}
       </button>
@@ -236,6 +240,7 @@ export function SchemaTree({
         <Disclosure
           id={`table-${name}-columns`}
           label="Columns"
+          icon="list"
           count={columns.length}
           open={isOpen(`table:${name}:columns`)}
           onToggle={() => toggle(`table:${name}:columns`)}
@@ -254,6 +259,7 @@ export function SchemaTree({
         <Disclosure
           id={`table-${name}-indexes`}
           label="Indexes"
+          icon="layers"
           count={indexes.length}
           open={isOpen(`table:${name}:indexes`)}
           onToggle={() => toggle(`table:${name}:indexes`)}
@@ -272,6 +278,7 @@ export function SchemaTree({
         <Disclosure
           id={`table-${name}-foreign-keys`}
           label="Foreign keys"
+          icon="network"
           count={foreignKeys.length}
           open={isOpen(`table:${name}:foreign-keys`)}
           onToggle={() => toggle(`table:${name}:foreign-keys`)}
@@ -291,6 +298,7 @@ export function SchemaTree({
           <Disclosure
             id={`table-${name}-triggers`}
             label="Triggers"
+            icon="play"
             count={triggers.length}
             open={isOpen(`table:${name}:triggers`)}
             onToggle={() => toggle(`table:${name}:triggers`)}
@@ -342,6 +350,7 @@ export function SchemaTree({
       <Disclosure
         id="schema-tables"
         label="Tables"
+        icon="table"
         count={tables.length}
         open={isOpen("tables")}
         onToggle={() => toggle("tables")}
@@ -365,7 +374,7 @@ export function SchemaTree({
                   aria-label={`${isOpen(`table:${name}`) ? "Collapse" : "Expand"} ${name}`}
                   onClick={() => toggleTable(name)}
                 >
-                  <span aria-hidden="true">{isOpen(`table:${name}`) ? "▾" : "▸"}</span>
+                  <Icon name={isOpen(`table:${name}`) ? "chevron-down" : "chevron-right"} size={14} />
                 </button>
                 <button
                   type="button"
@@ -376,7 +385,7 @@ export function SchemaTree({
                     if (!isOpen(`table:${name}`)) toggleTable(name);
                   }}
                 >
-                  <span aria-hidden="true">▦</span>
+                  <Icon name="table" size={14} className="nss-tree-icon" />
                   <span>{name}</span>
                 </button>
               </div>
@@ -409,6 +418,7 @@ export function SchemaTree({
       <Disclosure
         id="schema-workflows"
         label="Workflows"
+        icon="activity"
         count={workflows.status === "ready" ? workflowLeaves(workflows.data).length : undefined}
         open={isOpen("workflows")}
         onToggle={toggleWorkflows}

@@ -1,5 +1,6 @@
 import { Badge, Card, CardBody, CardHeader, CardTitle, Inline, Stack, Text } from "@bzync/rui";
 import type { ResultSet } from "./api";
+import { Icon } from "../shared/icons";
 
 // AuditVerifyCard turns system.audit_verify's single generic result row into
 // a labeled fact sheet instead of a raw table. It is shared by Operations
@@ -20,7 +21,12 @@ export function AuditVerifyCard({ auditVerify }: { auditVerify: ResultSet }) {
   return (
     <Card variant="bordered">
       <CardHeader>
-        <CardTitle as="h3">Audit chain</CardTitle>
+        <CardTitle as="h3">
+          <Inline gap="xs" align="center" wrap={false}>
+            <Icon name="shield" size={16} />
+            Audit chain
+          </Inline>
+        </CardTitle>
       </CardHeader>
       <CardBody>
         <Stack gap="sm">

@@ -30,18 +30,32 @@
 > for user/role creation and removal, and a deterministic development data
 > generator (`INSERT`-script builder over authorized `system.columns`), a
 > CSV / JSON / NDJSON import (a bounded, type-checked `INSERT`-script builder
-> that maps a pasted or loaded document onto the target table's columns), and
-> parameterized `INSERT` / `UPDATE` / `DELETE` generation (a `$1..$N` statement
+> that maps a pasted or loaded document onto the target table's columns), a
+> vector dataset import (the same, for an embedding field onto a `VECTOR` /
+> `BITVECTOR` / `SPARSEVECTOR` column, validated against declared dimensions),
+> and parameterized `INSERT` / `UPDATE` / `DELETE` generation (a `$1..$N` statement
 > template built from a table's authorized columns into the editor),
 > browser/CSS high-DPI verification at DPR 2, layout persistence without
 > credentials (explorer/inspector visibility and pane widths plus the last
 > authorized table name in per-connection `localStorage`), vector-aware
 > NEAREST/USING completion, and a table / index designer (`CREATE TABLE` /
-> `CREATE INDEX` form with live native DDL preview into the editor)
+> `CREATE INDEX` form with live native DDL preview into the editor), and a
+> client-side **SQL formatter** (a Format button / Shift+Alt+F that reflows
+> the editor buffer through a comment-preserving tokenizer guarded by a
+> re-tokenize equivalence check, never executing), a vector dataset
+> importer, **live parser diagnostics** (a debounced connection-free
+> `POST /api/v1/studio/query/diagnostics` locating each statement in the
+> buffer that fails to parse, with a Go-to-error control — grammar errors
+> only, the binder half stays open), and an **editable data grid** with
+> staged-change review and atomic transactional commit/discard (in-place
+> cell editing, row deletion/insertion staging, a review modal, and a
+> `BEGIN; ... COMMIT;` script executed over the authenticated session
+> connection with automatic rollback on failure)
 > implemented; the
 > RBAC boundary is integration-test-covered (`TestAdminStudioEnforcesRBAC`),
-> closing the MVP exit-gate RBAC and "Prepared parameters" lines
-> (2026-09-06).**
+> closing the MVP exit-gate RBAC, "Prepared parameters", and
+> "Table inspector/data editor" lines
+> (2026-09-08).**
 > This document distinguishes the implemented slices from the
 > larger Studio MVP in `TODO.md`; it does not close the P29 exit gate.
 
@@ -471,6 +485,15 @@ to open the new connection, and never stored anywhere.
   so the session stays exactly as it was — verified end to end by
   `TestAdminStudioWorkspaceOverNSQL` (a wrong-password reconnect returns
   401 and a follow-up `SELECT 1` on the same session still succeeds).
+* **Live reachability** — Studio's toolbar **Connected** badge is not
+  decorative. Ops and Studio share `GET /api/v1/connection`, which pings
+  the session's official-driver socket (`SELECT 1`, 3 s timeout, skip if a
+  query already holds the connection). The admin cookie can outlive a dead
+  nextsqld process; a failed probe returns HTTP 200 `{connected:false}` so
+  the operator is not signed out, the badge flips to **Disconnected**, and
+  Run is disabled until the probe succeeds again (5 s poll while the tab is
+  visible, plus Retry). `GET /api/v1/session` still does not touch
+  nextsqld — CSRF recovery must not depend on the database being up.
 * **Client** — the toolbar shows the target `nextsqld` address (new
   `Bootstrap.server_addr`, display only) next to the user/realm/database
   label, and a **Switch connection…** button opens `SwitchConnection.tsx`
@@ -854,8 +877,9 @@ re-matching) and applies it through the ordinary `setSQL` path.
 ### GRANT/REVOKE builder
 
 A form-driven generator for `GRANT`/`REVOKE` statements (Developer operations
-scope), reachable from a "Grant / Revoke…" button next to Run/Run
-script/History. It is entirely client-side and adds **no new server route**:
+scope), reachable from **More → Grant / Revoke…** (the editor toolbar's
+three-dot overflow, next to Run/Run script/History). It is entirely
+client-side and adds **no new server route**:
 it only generates SQL text and inserts it into the active editor tab via the
 same `setSQL` path `insertTableQuery` already uses — it never executes or
 analyzes anything itself, so the existing confirm-before-run check and
@@ -913,8 +937,9 @@ item, not this builder.
 
 ### Users & roles privilege explorer
 
-A read-only view (Developer operations scope), reachable from a "Users &
-roles…" button next to "Grant / Revoke…". Like the GRANT/REVOKE builder, it
+A read-only view (Developer operations scope), reachable from **More →
+Users & roles…** (the same three-dot overflow as Grant / Revoke). Like the
+GRANT/REVOKE builder, it
 adds **no new server route**: it reads the same admin-only `GET
 /api/v1/security` (`internal/admin/ops.handleSecurity`) that both Operations
 mode's own Security view and the GRANT/REVOKE builder's grantee suggestions
@@ -1174,7 +1199,39 @@ is on (this cannot distinguish a JSON `null` from a JSON `""` — an accepted
 limitation); an empty value for a **NOT NULL column with no `DEFAULT`** is a
 blocking error, as is such a column left unmapped. `VECTOR` / geo /
 collection / `BLOB` columns are named as non-importable and are not offered
-as mapping targets.
+as mapping targets — a `VECTOR` / `BITVECTOR` / `SPARSEVECTOR` column has its
+own dedicated path (below).
+
+### Vector dataset import
+
+An "Import vector dataset…" toolbar button and command-palette entry
+(Developer-operations scope). The generic CSV/JSON importer above refuses
+`VECTOR` / `BITVECTOR` / `SPARSEVECTOR` columns because a generic text cell
+is not a vector; this dedicated path fills that gap for a development
+embedding dataset, under the same never-execute boundary and with no server
+route (it reuses `GET /api/v1/studio/table`).
+
+`buildVectorImportSQL` (`resultTools.ts`, pure) maps **exactly one** document
+field onto the table's vector column — its cell parsed by the same
+`parseVectorLiteralInput` grammar the Vector Explorer uses (a bracketed
+`[…]`, a parenthesized `(…)`, or a bare comma list; a JSON array field
+serialises to `[…]` naturally) and validated against the column's **declared
+dimensions** and, for a `BITVECTOR`, its 0/1 domain — and optionally maps
+other fields onto the table's scalar columns, reusing the generic importer's
+per-kind cell validation (`importValue`). `autoVectorImportField` resolves
+the embedding field (exact case-insensitive name match → first unclaimed
+field → first field) into an always-editable `Select`. It emits `INSERT`
+statements with the exact native parenthesized vector literal
+(`docs/vector.md`: `INSERT INTO docs (sig) VALUES ((1, 0, …));`), column
+order following catalog ordinal, every identifier `quoteIdentifier`-quoted,
+batched at `IMPORT_ROWS_PER_STATEMENT` = 100. Bounds: the shared
+`MAX_IMPORT_INPUT_BYTES` = 8 MiB input and `MAX_IMPORT_SQL_BYTES` = 1 MiB
+output ceilings, plus a vector-specific `MAX_VECTOR_IMPORT_ROWS` = 1,000 row
+cap and a `MAX_VECTOR_IMPORT_VALUES` = 262,144 rows×dimensions ceiling that
+fails with an actionable "import fewer rows" message before the SQL ceiling
+would. A `SPARSEVECTOR` column takes the same dense parenthesized form — the
+server coerces the zeros away. A wrong-length or non-finite vector is a
+named `Row N, column "…": …` error, never silently padded.
 
 ### Parameterized INSERT / UPDATE / DELETE generation
 
@@ -1301,8 +1358,10 @@ that many distinct tables — the same simple insertion-order bound
 **Accessible without a caret-anchored popup**: `@bzync/rui`'s `CodeEditor`
 is a plain controlled-textarea wrapper with no ref forwarding, no
 cursor-pixel-position callback, and no completion/overlay primitive at
-all — exactly why the design doc already flags SQL formatting and syntax
-highlighting as blocked for a frontend-only slice. Rather than trying to
+all — exactly why the design doc flags NextSQL-native syntax
+highlighting as blocked for a frontend-only slice (SQL formatting, which
+only rewrites the buffer text and needs no overlay, is implemented — see
+§7). Rather than trying to
 float a popup at the caret, the suggestion list reuses the existing
 `Popover`/`PopoverContent` primitive the Find/Replace panel already uses
 (a toolbar-anchored, non-modal `role="dialog"`), and the underlying
@@ -1358,14 +1417,32 @@ real-valued metric. Inside `TO (...)` there is still no per-element catalog,
 so that slot is not a completion context — the same refuse-to-guess rule as
 non-indexed JSON. `CREATE INDEX … USING` is not a NEAREST slot.
 
-Inline **parser/binder diagnostics** remain open and were assessed this
-round: `internal/sql/lexer.Token` does carry a byte `Pos`, and the parser
-holds the offending token at every error site, but every
-`nerr.New(nerr.Syntax, "sql.parser", …)` call (about a hundred of them)
-discards it, and the binder's "unknown column"/"unknown table" errors
-never carry the identifier name either (see the misspelled-table section).
-Threading source positions through those paths is a change to a core
-untrusted-input decoder, not a frontend slice, so it stays deferred.
+Inline **parser diagnostics** are implemented; **binder** diagnostics
+remain open. The parser half was done without touching the ~100 individual
+`nerr.New(nerr.Syntax, "sql.parser", …)` sites: `parser.ParseDiag` wraps
+`Parse` and, on any failure, attaches `p.tok.Pos` — the byte offset of the
+token the parser stopped on (`internal/sql/lexer.Token.Pos`), which is where
+the parser leaves `p.tok` because it returns up the stack without advancing
+past the first error — plus the underlying message with its `nextsql
+syntax:` prefix stripped. `studio.Diagnostics` splits the editor buffer with
+the same `';'`-in-string/comment-safe lexer pass `SplitScript` uses,
+`ParseDiag`s each statement, and maps each statement-local offset back to a
+whole-buffer UTF-16 offset + 1-based line/column (`POST
+/api/v1/studio/query/diagnostics`, parser-only, no connection, no query
+slot). The editor runs it debounced as you type and renders one warning per
+broken statement under the editor with a **Go to error** control — RUI's
+`CodeEditor` still has no text-overlay primitive, so this is a strip, not an
+inline squiggle. It is advisory: nextsqld re-parses, binds, and authorizes
+on Run.
+
+The **binder** half — "unknown column" / "unknown table" with a source
+position — stays open for two reasons: the binder's name-resolution errors
+discard both the identifier and its position (see the misspelled-table
+section), *and* `nextsql-admin` has no catalog of its own to resolve names
+against (the RBAC boundary — it is a pure protocol client). Surfacing those
+needs either the binder to carry positions and nextsqld to return them in
+its NSQL error frame, or a catalog-introspection surface in the Admin layer
+— both larger than a frontend slice.
 
 ### Deterministic misspelled table-name suggestions
 
@@ -1433,6 +1510,55 @@ name (working from the last span backward so earlier offsets stay valid)
 and touches nothing else in the buffer; the fix is never applied
 automatically. Nothing is fetched or executed to compute or apply a fix —
 purely a pure/synchronous rewrite of already-loaded state.
+
+### Live parser diagnostics
+
+The editor reports **where a statement fails to parse** as you type, using
+the same grammar `nextsqld` binds and runs. It is advisory — the server
+re-parses, binds, and authorizes on Run — and covers **grammar** errors
+only; an unresolved table or column name is reported by the server when the
+statement actually executes (the binder half; see §7 option 2 and the
+parser/binder-diagnostics note above).
+
+Server side, `parser.ParseDiag(src) (ast.Stmt, *SyntaxDiag, error)` is `Parse`
+plus a location. It changed **none** of the ~100 individual
+`nerr.New(nerr.Syntax, "sql.parser", …)` sites: at the top of `Parse`, on
+every failure path, it captures `p.tok.Pos` — the byte offset of the token
+the parser stopped on. That works because the parser returns straight up the
+call stack on its first error without advancing `p.tok`, so the current
+token *is* the offending one by the time `ParseDiag` reads it. The message
+is the underlying `*nerr.Error`'s `.Message` (no `nextsql syntax:` prefix).
+`err != nil` and `diag != nil` are always set together; the offset can equal
+`len(src)` for a statement that ends prematurely.
+
+`studio.Diagnostics(sql)` turns that into buffer coordinates. It splits the
+editor buffer with `splitStatementSpans` — the identical
+`';'`-in-string/comment-safe lexer pass `SplitScript` uses, keeping each
+trimmed fragment's byte span — `ParseDiag`s each statement, and maps each
+statement-local offset back to a whole-buffer UTF-16 offset plus a 1-based
+line and (UTF-16) column (`locateInBuffer` / `utf16Len`, so an astral-plane
+rune earlier in the buffer does not shift the marker). One `Diagnostic` per
+statement that fails to parse (the parser stops at its first error), in
+buffer order; a valid buffer returns an empty slice. Empty/oversized stay
+request errors like `Analyze`; a buffer that will not tokenize at all is
+reported as one diagnostic at the lexer's stopping point rather than an
+error, so the editor can still point at it.
+
+`POST /api/v1/studio/query/diagnostics` (`handleStudioDiagnostics`, authed +
+CSRF, bounded by `ValidateSQL` and `MaxScriptStatements`) is parser-only: it
+opens no driver connection and never touches the session's query slot, the
+same trust level as `/query/analyze` and `/query/split`.
+
+The editor runs it debounced (400 ms) on the active buffer, race-guarded by
+a sequence ref, and clears the strip on an empty buffer, a 401, or any
+network error — it must never block a run. Results render as an
+`aria-live="polite"` strip of `Alert variant="warning"` under the editor
+(next to the misspelled-table strip, and `polite` for the same reason — it
+recomputes as you type), each "Line L, column C: message." with a **Go to
+error** button that focuses the textarea and selects the token at `offset`.
+There is no inline squiggle: `@bzync/rui`'s `CodeEditor` has no
+text-overlay primitive at all — the strip is the surface. Capped at 20
+entries.
 
 ### Table statistics inspection
 
@@ -1638,7 +1764,9 @@ Suggest, Saved queries…, Search objects…, Switch connection…, Schema
 diagram…, the GRANT/REVOKE builder, each dedicated explorer
 (Full-text / Vector / Hybrid / Geo / Users & roles / Transactions & locks
 / Audit / Workflows), Hide/Show explorer, Hide/Show inspector, and Reset
-layout.
+layout. The dedicated explorers and builders are also listed in the
+editor toolbar **More** (three-dot) overflow so the primary Run/Find/History
+row stays scannable.
 
 `rankCommandMatches` (pure, unit-tested) is the same exact→prefix→
 substring→subsequence scoring as `rankObjectMatches`, but it also searches
@@ -1648,6 +1776,52 @@ command out entirely (there is nothing to run). The palette is a `Modal`
 with a `role="combobox"` input and a `role="listbox"` of commands (Arrow
 keys, Enter, Escape) — the same shape as the object finder. No route, no
 server surface, no new state beyond an open flag.
+
+### Editable data grid, staged-change review & transactional commit
+
+The Studio MVP exit-gate line "Table inspector/data editor" needed a write
+path, not just the M1 read-only inspector. `detectEditableTable(sql,
+catalogTables)` restricts editing to a single-table `SELECT` with no
+join/union and no `system.*` table; `isResultEditable(result, pkColumns)`
+additionally requires the table to have primary-key columns and every one
+of them to be present in the result set — a query that projects away the
+key cannot be edited, since there is nothing safe to key an `UPDATE`/
+`DELETE` on. `extractRowPK`/`makeRowKey` turn a result row into a
+serialized primary-key tuple used as the staging map key, so composite
+keys and re-edits of the same row coalesce correctly.
+
+Edits are staged, not applied immediately: `stageCellUpdate` records a
+per-cell change (reverting to no-op if the value is restored to the
+original), `stageRowDelete`/`stageRowInsert` mark row deletion and new-row
+records, and `stagedChangesCount`/`stagedChangesSummary` track counts for
+the UI. `formatCellSQLLiteral` renders a typed value as a native SQL
+literal (quoting strings/JSON, `NULL`, unquoted numeric/boolean). None of
+this touches the connection — it is pure state in `StudioWorkspace`, the
+same "reviewable text, not a live write" boundary as the data generator,
+importers, and DML/DDL builders, except the generated script is the thing
+that actually runs.
+
+`buildStagedChangeSQL` compiles all staged updates/deletes/inserts into one
+`BEGIN; ...; COMMIT;` script, ordered updates-then-deletes-then-inserts,
+bounded by `MAX_STAGED_CHANGES` (500) and `MAX_STAGED_SQL_BYTES` (512 KiB)
+so an unbounded edit session cannot build an unbounded transaction.
+`EditCellModal` (NULL toggle, type badge, original-vs-modified diff,
+multiline JSON) and `AddRowModal` (per-column type badges/NULL flags) collect
+the staged values; `ResultGrid` shows modified cells, deleted rows, and
+inserted rows with distinct highlighting and a staged-change count bar;
+`StagedChangesReviewModal` lists every staged change with per-item removal,
+discard-all, and a copyable/insert-into-editor preview of the compiled
+script before anything runs.
+
+Commit itself (`commitStagedChanges` in `StudioWorkspace.tsx`) executes the
+compiled statements sequentially over the operator's own authenticated
+session connection — the same official-driver connection every other
+Studio query uses, so RBAC applies exactly as it would to hand-typed SQL.
+Any statement failure issues `ROLLBACK;` so no dirty transaction state is
+left open, and a successful commit re-runs the active tab's query to
+refresh the grid from the now-committed data. There is no new server
+route: this is client-composed SQL executed through the existing query
+path.
 
 ## 2. Architecture and trust boundary
 
@@ -1696,6 +1870,7 @@ require its per-session `X-NSM-CSRF` token.
 
 | Route | Purpose | Bound |
 |---|---|---|
+| `GET /api/v1/connection` | Live nextsqld reachability for this admin session (`connected` true/false). Shared by Ops and Studio. Does not sign the operator out when the database is down. | 3 s ping; skipped while a query holds the connection |
 | `GET /api/v1/studio/bootstrap` | `system.capabilities`, the authorized table list, and the target `nextsqld` address (`server_addr`, display only) | 1,000 tables; detail omitted |
 | `POST /api/v1/studio/reconnect` | Re-target the session's connection to a different realm/database on the same `nextsqld` (fresh authenticated connection; password used once, never stored) | 128-byte bare-identifier names; 15 s open; `409` if a query is in flight |
 | `POST /api/v1/studio/read-consistency` | Set the session's read-consistency mode (`strong`/`bounded`/`stale`) — a live session-control frame on the current connection, reads only | mode enum; `0…1 h` staleness bound; `409` if a query is in flight |
@@ -1859,7 +2034,8 @@ surface.
 | Indexed-JSON-path completion | SQL editor scope | yes | path-extraction/range-detection/prefix-rank pure unit + real-browser dotted-path mode-switch/accept/axe | no |
 | Vector-aware completion (NEAREST column + USING metric) | SQL editor scope | yes | `currentNearestContext`/`vectorColumnsFromResult`/`rankNearestColumnSuggestions`/`rankNearestMetricSuggestions` pure unit (kind-restricted metrics, CREATE INDEX USING ignored, unresolved table empty) + real-browser NEAREST/USING mode-switch/accept/axe, HAMMING not offered for VECTOR<F32,N> | no |
 | Deterministic misspelled FROM/JOIN table-name suggestions | SQL editor scope (partial) | yes | Levenshtein/detection/tie/bound/apply pure unit + real-browser live-notice/fix/disappear/no-false-positive/axe | no |
-| Parser/binder diagnostics | yes | no | no | no |
+| Parser diagnostics (live, grammar errors) | yes | yes | `parser.ParseDiag` offset unit + `FuzzParse` invariant + `studio.Diagnostics` line/column/multi-statement unit + `ops` handler auth/CSRF/parse-failure + `TestAdminStudioWorkspaceOverNSQL` clean/broken buffer (compiles; not run — concurrent session holds the Admin port) | no |
+| Binder diagnostics (unresolved table/column + position) | yes | no | no | no |
 | Query profiler breakdown | EXPLAIN/profiler scope | yes | duration/profile/bound pure unit + real-browser metrics/caveat/table/axe | no |
 | GRANT/REVOKE builder | Developer operations scope | yes | pure SQL-generation unit (every scope shape, both grant/revoke, quoting) + real-browser fill/preview/insert/cancel/axe | no |
 | Dedicated Vector Explorer | yes | yes | catalog/parse/metric/build pure unit + live-server metric-enforcement regression + real-browser select/inspector/insert/run/axe | no |
@@ -1879,10 +2055,12 @@ surface.
 | Schema migration history explorer (read-only, `nsql_schema_migrations`) | Developer-operations migration-workspace scope (read side) | yes | new `GET /api/v1/studio/migrations` (non-`required` read; `present=false` on absent/invisible table) + `TestAdminStudioWorkspaceOverNSQL` (present=false on fresh DB → CREATE reserved table + row → present=true, row surfaces) + no-session 401 list + real-browser open/applied-row/dirty-alert/no-apply-or-repair-button/axe/Refresh-re-reads | no |
 | Data generator for development | Developer-operations scope | yes | pure `dataGenColumns` / `dataGenFieldKind` / `buildDataGeneratorSQL` unit tests (ordinal order, unsupported-type detection, deterministic-per-seed, NOT-NULL-no-default block, 100-row batching, identifier/string quoting, bounds) + real-browser open/preview/not-generatable-badge/Insert-without-execution/axe; no route (reuses `studio/table`) | no |
 | CSV / JSON / NDJSON import for development | Developer-operations scope | yes | pure `parseImportText` / `autoImportMapping` / `buildImportInsertSQL` unit tests (RFC 4180 quoting/escapes/embedded delimiter, JSON key-union, NDJSON, exact case-insensitive auto-map, ordinal output order, type-checked int/bool/JSON cells with named row errors, empty→NULL / NOT-NULL block, double-map rejection, 100-row batching, identifier/string quoting, malformed-document errors, MAX_IMPORT_ROWS truncation) + real-browser paste-CSV/preview/non-importable-columns-named/Insert-without-execution/axe; no route (reuses `studio/table`) | no |
+| Vector dataset import for development | Developer-operations scope | yes | pure `buildVectorImportSQL` / `autoVectorImportField` unit tests (NDJSON array embedding + scalar column, ordinal column order, exact-name field resolution, wrong-dimension named row error, embedding-field-required, NOT-NULL scalar block, quoted CSV vector cell, BITVECTOR 0/1 domain, rows×dimensions ceiling, identifier quoting, no-vector-column message) — reuses the generic importer's `parseImportText` / `importValue` and the Vector Explorer's `parseVectorLiteralInput`; no route (reuses `studio/table`) | no |
 | Parameterized INSERT / UPDATE / DELETE generation | Developer-operations / data-editing scope | yes | pure `buildParameterizedDML` / `dmlDefaultColumns` unit tests (per-kind defaults, INSERT placeholder-per-column + NOT-NULL-no-default block + defaulted-column omission, UPDATE SET-then-WHERE param order + SET/WHERE-overlap + WHERE-required, DELETE composite key, unknown/duplicate column names, `MAX_QUERY_PARAMS` ceiling, identifier quoting) + real-browser open/INSERT-template/switch-to-DELETE/Insert-without-execution/axe; no route (reuses `studio/table`) | no |
 | Table designer | Database explorer scope | yes | pure `buildCreateTableSQL` unit (default UUID PK, reserved `nsql_` prefix, missing/composite PK, VECTOR-PK rejection, AI() only on DECIMAL, CHAR/VECTOR/DECIMAL type SQL, quoting, FK clause) + real-browser Design-schema open/preview/axe; no route | no |
 | Index designer | Database explorer scope | yes | pure `buildCreateIndexSQL` unit (btree INCLUDE, unique, JSON path, fulltext analyzer + non-text rejection, HNSW F16, IVFPQ, SPARSE-kind restriction, spatial, unknown/include-overlap, quoting) + real-browser switch-to-index/name+key/Insert-without-execution/axe; no route (reuses `studio/table`) | no |
 | Generated native DDL preview (live, as you edit) | Database explorer scope | yes | designer preview is the same quoted native DDL Insert loads into the editor; covered by the table/index designer unit + real-browser preview assertions | no |
+| Editable data grid, staged-change review & transactional commit | Data-editing scope / MVP exit-gate "Table inspector/data editor" | yes | pure `detectEditableTable`/`isResultEditable`/`extractRowPK`/`makeRowKey`/`stageCellUpdate`/`stageRowDelete`/`stageRowInsert`/`buildStagedChangeSQL` unit tests (updates, deletions, insertions, composite keys, revert-to-original coalescing, bounds) + `npm run build`/`go build ./cmd/nextsql-admin` | closes the MVP exit-gate "Table inspector/data editor" line |
 
 “Production-gated” remains **no** for the implemented rows because the Studio
 MVP exit gate includes the open connection manager (profiles, OS credential
@@ -1915,16 +2093,23 @@ read-only schema-migration history explorer (`nsql_schema_migrations`
 via `GET /api/v1/studio/migrations`), a development data generator
 (`INSERT`-script builder over authorized `system.columns`), a
 CSV / JSON / NDJSON import (a type-checked `INSERT`-script builder that maps
-a pasted or loaded document onto the target table's columns), a
+a pasted or loaded document onto the target table's columns), a vector
+dataset import (its vector-typed counterpart — one embedding field onto a
+`VECTOR` / `BITVECTOR` / `SPARSEVECTOR` column, validated against declared
+dimensions), a
 table-inspector **Dependencies** panel (inbound FKs + triggers defined on
 the table, from `system.triggers`), and **parameterized
 `INSERT` / `UPDATE` / `DELETE` generation** (a `$1..$N` statement template
 built from a table's authorized columns into the editor, bound in the existing
 Parameters panel), **layout persistence without credentials** (resizable
 explorer/inspector panes, hide/show, last authorized table name, per-connection
-`localStorage`, never a secret), and a **table / index designer** (a form that
+`localStorage`, never a secret), a **table / index designer** (a form that
 emits native `CREATE TABLE` / `CREATE INDEX` into the editor with live DDL
-preview, never executing) are now
+preview, never executing), and **live parser diagnostics** (a debounced
+`POST /api/v1/studio/query/diagnostics` — parser-only, no connection —
+locating each statement in the buffer that fails to parse, shown as a strip
+with a Go-to-error control; grammar errors only, the binder half stays open)
+are now
 implemented; the RBAC boundary is integration-test-covered.
 The next coherent Studio work should preserve this boundary and choose one
 of:
@@ -1950,29 +2135,42 @@ of:
    `nextsqld` hosts — with their own TLS/mTLS material and an OS-keychain
    credential store — plus a full recent-connections *home screen* first
    need a real multi-target connection model, not just new form fields;
-2. the remaining SQL-editor scope: source-position parser/binder
+2. the remaining SQL-editor scope: source-position **binder**
    diagnostics
    (execute-selection, query history, multi-tab editing, execute script,
    find/replace, catalog-aware IntelliSense, deterministic misspelled
    table-name suggestions, indexed-JSON-path completion, vector-aware
-   NEAREST/USING completion, crash recovery
+   NEAREST/USING completion, live parser diagnostics, crash recovery
    for unsaved buffers, saved queries with tag folders, git-friendly
    file export/import of the saved-query set, positional prepared
-   parameters, and the global command palette above are the
-   editor/shell slices already implemented; column-level
+   parameters, a **SQL formatter**, and the global command palette above are
+   the editor/shell slices already implemented; column-level
    misspelling suggestions are deliberately not among them — see that
    section's rationale on why only FROM/JOIN table names are safely
-   deterministic without real AST access; SQL formatting and NextSQL-native
-   syntax highlighting are both blocked — formatting on the lexer
-   discarding comments and folding identifier case, so a safe
-   implementation needs source-position-based reconstruction plus its own
-   comment-preserving design, not a token-`Lit` rewrite; highlighting on
-   `@bzync/rui`'s `CodeEditor` having no highlight-overlay primitive at
-   all — both materially larger than this frontend can make alone in one
-   slice; source-position parser/binder diagnostics were assessed in the
-   JSON-path-completion round — the lexer carries token positions but ~100
-   parser error sites and the binder's name-resolution errors all discard
-   them, so surfacing them is a core-decoder change, not a frontend slice;
+   deterministic without real AST access. **SQL formatting is now
+   implemented** (a **Format** button / command-palette entry / Shift+Alt+F
+   over pure `formatSQL` in `resultTools.ts`): the earlier "blocked" note
+   assumed reusing `internal/sql/lexer` (which discards comments and folds
+   case); the shipped formatter is instead a self-contained,
+   comment-preserving tokenizer plus a clause-level reflow, guarded by a
+   strict re-tokenize equivalence check (keywords case-insensitive, every
+   other token and every comment byte-for-byte and in order) that returns
+   the buffer unchanged on any mismatch, any unterminated
+   string/comment/quoted-identifier, or a > 1 MiB buffer — so it can only
+   ever change whitespace and keyword case, never meaning. It never
+   executes and adds no route; parenthesized groups (column-def lists,
+   VALUES tuples, subqueries) are kept on one line by design.
+   NextSQL-native syntax highlighting stays blocked on `@bzync/rui`'s
+   `CodeEditor` having no highlight-overlay primitive at all — materially
+   larger than this frontend can make alone in one slice; **live parser
+   diagnostics are now implemented** without touching the ~100 individual
+   parser error sites — `parser.ParseDiag` attaches the stopped-on token's
+   byte offset at the top of `Parse`, `studio.Diagnostics` maps it per
+   statement back to the buffer, and a debounced strip under the editor
+   shows it with a Go-to-error control (see the parser/binder-diagnostics
+   subsection above); the **binder** half — unresolved table/column names
+   with a position — is what stays a core-decoder change, and additionally
+   needs a name-resolution surface the Admin client does not have;
    vector-aware completion is implemented for the two slots the catalog
    actually describes — the NEAREST column and the USING metric — and
    still refuses to guess inside TO (...)); or
@@ -1997,17 +2195,32 @@ of:
    script into the editor — the same never-execute boundary, no route. A
    protocol-only client cannot instead *stream* bulk rows into the server
    without its own admission/backpressure design; a reviewable script needs
-   none. **Parameterized `INSERT` / `UPDATE` / `DELETE` generation** is also
+   none. **Vector dataset import** is the vector-typed counterpart of that
+   importer (`buildVectorImportSQL`): it maps one embedding field onto a
+   `VECTOR` / `BITVECTOR` / `SPARSEVECTOR` column (validated against declared
+   dimensions and the 0/1 domain by the Vector Explorer's own
+   `parseVectorLiteralInput`), any other fields onto scalar columns, and
+   emits the native parenthesized vector literal — same boundary, no route,
+   with a rows×dimensions ceiling on top of the shared byte bounds.
+   **Parameterized `INSERT` / `UPDATE` / `DELETE` generation** is also
    implemented here — `buildParameterizedDML` emits a `$1..$N` statement
    template for a table from its authorized columns into the editor (bound in
    the existing Parameters panel), the same never-execute boundary, no route;
-   `UPDATE`/`DELETE` require an explicit WHERE key. What remains in this
+   `UPDATE`/`DELETE` require an explicit WHERE key. **The data-editing
+   bucket is also now implemented**: an editable result grid
+   (`detectEditableTable`/`isResultEditable`/`ResultGrid`) with
+   in-place cell editing, row deletion/insertion staging
+   (`stageCellUpdate`/`stageRowDelete`/`stageRowInsert`), a staged-change
+   review modal (`StagedChangesReviewModal`), and atomic transactional
+   commit/discard (`buildStagedChangeSQL` compiled into a bounded
+   `BEGIN; ... COMMIT;` script, executed over the session connection with
+   automatic `ROLLBACK;` on failure) — see the "Editable data grid" section
+   above. Unlike every other bucket item this one *does* write, but only
+   through the operator's own authenticated connection, so RBAC applies
+   exactly as it would to hand-typed SQL. What remains in this
    Developer-operations bucket is *streaming* bulk
    import and a `nextsql-bench` result viewer (needs bench result artifacts a
-   protocol-only client never holds), plus the rest of the data-editing bucket
-   — an editable result grid with staged-change review and transactional
-   commit/discard, a materially larger write-path feature than a reviewable
-   script. The detailed EXPLAIN/profiler checklist
+   protocol-only client never holds). The detailed EXPLAIN/profiler checklist
    is complete with the tree, plan comparison, and bounded ANALYZE-only
    profile above; or
 4. the remaining database-explorer schema tooling. Table/index statistics

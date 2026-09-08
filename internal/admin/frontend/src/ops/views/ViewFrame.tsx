@@ -1,5 +1,5 @@
 import type { ReactNode } from "react";
-import { Alert, List, ListItem, Spinner, Stack } from "@bzync/rui";
+import { Alert, List, ListItem, Spinner, Stack, Text } from "@bzync/rui";
 
 // ViewFrame renders the common loading / error / warnings scaffolding around a
 // Manager read-model view.
@@ -14,7 +14,14 @@ export function ViewFrame({
   warnings?: string[];
   children: ReactNode;
 }) {
-  if (loading) return <Spinner />;
+  if (loading) {
+    return (
+      <div className="nsm-loading" role="status" aria-live="polite">
+        <Spinner size="sm" />
+        <Text variant="muted">Loading…</Text>
+      </div>
+    );
+  }
   if (error)
     return (
       <Alert variant="error" title="Could not load this view">

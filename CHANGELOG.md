@@ -22,6 +22,205 @@ A roadmap item is not recorded as completed here until its implementation, tests
 
 ## [Unreleased]
 
+### Fixed — NextSQL Admin: a long backup logged the operator out (2026-09-08)
+
+- `Back up now` is allowed 30 minutes server-side (it copies, seals and restore-tests every file), but an Operations session went idle after 15 minutes and the idle clock was stamped only when a request *started*. Since the Backups view keeps its button disabled for the whole call and auto-refresh is off by default, the browser sent nothing in between: the sweeper evicted the session mid-backup and the operator was bounced to the login screen the moment their backup returned.
+- A session with a request in flight is no longer counted as idle, and the idle clock now restarts when the request finishes rather than when it began — so the idle window starts when the operator could next act. The absolute `--session-lifetime` is unchanged and still applies: it is a security bound, not an activity measure.
+
+### Changed — NextSQL Admin: Databases is a realm → database → tables tree, and backup actions hold their in-flight state (2026-09-08)
+
+- **Data › Databases** no longer splits the catalog across flat Tables, Databases and Realms tabs. Realm rows expand to the databases in that realm, and a database row expands to its tables — one tree that matches how the catalog is actually nested. Realm and database rows keep everything the old tables showed (state, layout, storage cap, delegated realm root, database count) as row badges. A non-multi-realm deployment simply has no realm level, and a deployment with no registry at all still gets one row — the connected database — so the table list never disappears with the tab.
+- Only the **connected** database expands to a table list: `system.tables` is the catalog of the database this session is connected to, and one connection binds one realm and one database. Expanding any other database says so and names the sign-in that would reach it, instead of showing an empty or borrowed list.
+- **Backups**: `Back up now` and a row's `Verify` both run a full restore test on the server, which can take minutes on a large database. The confirmation dialog now closes on confirm and the button that started the action carries a spinner, stays disabled, and holds both until the call finishes — on the row, so it is clear *which* backup is being verified. Other backup actions are disabled while one runs, so a second restore test cannot be started by accident. A button showing a spinner also keeps an accessible name, which it previously lost.
+
+### Added — `prealloc_ahead_pages`: the per-database preallocation runway is configurable (2026-09-08)
+
+- A brand-new, **empty** database occupied ~257 MiB. That is not overhead per row: the allocator preallocates a fixed 16384-page (~256 MiB) runway ahead of the highest allocated page via `fallocate` in mode 0, which reserves real blocks rather than making the file sparse. The cost is paid **once per database**, so a host running many small databases pays it many times over — 10 databases is 2.56 GB before a single row.
+- `prealloc_ahead_pages` now sets the runway, via the config file / `SET CONFIG` for `nextsqld`, or `--prealloc-ahead-pages` on the `nextsql` commands that create a database (`init`, `realm create`, `database create`). **The default is unchanged at 16384 pages**, so no existing deployment changes behaviour; `prealloc_ahead_pages = 64` yields a 1.04 MiB empty database instead of 257 MiB. Values below 1 are refused rather than silently disabling preallocation.
+- The `EnsureCapacity` docstring claimed "a slack of 1024 pages" while the constant was 16384 — 16× apart. Corrected, and the per-database footprint is now documented in `docs/storage-format.md`.
+
+### Fixed — hot backups of a live database failed as "corruption" (2026-09-08)
+
+- `BACKUP DATABASE` against an actively-written database failed with `corruption: source size changed during copy`, leaving no backup. Nothing was actually corrupt: `backup.sealFile` records the source size once at the start, then read the file **to EOF** and required the bytes copied to equal that recorded size — so any write that extended the file mid-copy made the copy longer than the header said and the backup was rejected. The busier the database, the more reliably its backups failed, which is exactly when they matter.
+- A backup member is defined as the file's first `st.Size()` bytes — the consistent prefix as of the moment the backup started — with WAL replay from the checkpoint LSN covering everything written afterwards. The read is now bounded to that snapshot, so growth during the copy is ignored. The size check is kept, and still catches the genuine failure it was meant to catch: a source that *shrank* mid-copy.
+- `TestCreateFromEngineUnderConcurrentWrites` existed but reported only "~1 concurrent writes during it" — a single write that never extended the file — which is why this survived. Verified against a live 269 MB database under continuous writes: the backup now completes, is restore-tested, and is recorded in `system.backups`.
+
+### Fixed — NextSQL Admin offered a role as its own recipient (2026-09-08)
+
+- The **Role membership** form listed every user *and* role as a recipient, including the role being granted — so `testrole` appeared under "Grant to" while `testrole` was the selected role. Granting a role to itself records a meaningless self-membership: the engine's `GrantRole` only checks that the role exists, and its fixpoint expansion tolerates the cycle rather than rejecting it, so nothing would have complained.
+- The selected role is now excluded from its own recipient list (a role may still be granted to a *different* role — nested roles are expanded transitively), and the server refuses `role == grantee` outright, case-insensitively, so a hand-crafted request cannot create one either.
+
+### Added — NextSQL Admin: RBAC forms are pick-lists, and backup_dir is settable from Backups (2026-09-08)
+
+- The **Grant / revoke privilege** form is now dropdowns end to end. Table, column, resource-group, role, and grantee are chosen from what the server reports the operator may actually see — `system.tables`, `system.columns`, and `system.resource_groups` join the Security read model as non-required, RBAC-filtered reads — instead of being typed from memory. Choosing a table narrows the column list to that table's columns. Only SCHEMA and FUNCTION stay typed, because no catalog view enumerates them, and the field says so.
+- Every picker **explains itself when there is nothing to choose** rather than showing a dead dropdown: an empty grantee list says no users or roles are visible and that one must exist to receive a grant; an empty table list says so; and so on.
+- **backup_dir** can now be set from the Backups view. The old copy told the operator to edit `nextsql.conf` and restart, without saying how, and hid the real precondition — `SET CONFIG` only persists when `nextsqld` was started from a configuration file. The view now offers a directory field writing through the existing config route, and when the node was started from flags it says exactly that and names the fix (`--config /path/to/nextsql.conf`) instead of surfacing the engine's raw "nothing to persist" error.
+
+### Fixed — NextSQL Admin: wide tables were clipped, tab strips had no scroll affordance (2026-09-08)
+
+- A result table wider than its container was **unreachable**: RUI's `Table` wraps itself in a rounded card with `overflow: hidden`, which sat between the table and the labeled scroll container. The card clipped the overflow and hid it from the scroller above, whose `scrollWidth` therefore never grew — measured as a 1087px audit-log table inside a 792px scroller reporting `scrollWidth` 792 and refusing to scroll. The inner element now sizes to its content and the card no longer clips, so the same table reports `scrollWidth` 1088 and scrolls.
+- A tab strip with more triggers than fit scrolls, but RUI hides its scrollbar, leaving no affordance and — on a mouse with no horizontal wheel — no way to reach the tabs past the edge. Operations tab strips now show a slim, draggable scrollbar.
+- The top-bar search button label is now just "Search…".
+
+### Fixed — NextSQL Admin: tab icons and labels misaligned (2026-09-08)
+
+- In a tab strip with enough triggers to fill the row (Diagnostics' nine metric categories: Throughput, Latency, Encryption, Storage, Replication, Maintenance, CDC, Runtime, Constraints), each trigger's contents **wrapped onto two lines** — icon on one, label and count on the next. `align="center"` only centres items *within* a flex line, so the icon ended up 11.8px above its own label. Measured in a real browser; the trigger box was 59.8px tall instead of 36px.
+- The icon must never separate from the label it names, so the `Inline` inside a `TabsTrigger` no longer wraps (24 occurrences across Overview, Activity, Databases, Cluster, Maintenance, Security, and Diagnostics — all the same latent defect, visible only once a strip runs out of width). The strip itself was already horizontally scrollable, so a long row still reaches every tab.
+- Also corrected a stale expectation in the browser accessibility suite: the Studio result grid's selection status now reads "1 of 250 selected" rather than "1 selected", which had been left failing.
+
+### Added — NextSQL Admin: RBAC administration in Operations mode (2026-09-08)
+
+- The Security view could only **read** users, roles, and grants: there was no write counterpart to the Cluster / Maintenance / Config / Backups action routes, so creating a principal or changing a grant meant hand-writing SQL in the Studio editor.
+- New `POST /api/v1/security/action` plus matching UI: **create user** (with password confirmation), **create role**, **drop user** / **drop role** behind an explicit confirmation, **role membership** (grant/revoke a role to a principal), and a **privilege grant/revoke** form covering every documented privilege and scope, including `COLUMN table.column` and `RESOURCE GROUP`.
+- Requests are **structured, never raw SQL**. The server renders the documented statement from a closed set of ops, privileges, and scopes; every interpolated name must pass the plain-identifier check first, and a password is escaped as a SQL string literal and never logged or echoed in an error.
+- Statements run on the **operator's own authenticated connection**, so server-side RBAC remains the only authority — the route can grant nothing the signed-in operator could not grant by typing the same statement, and the engine's refusal surfaces as `403`. Session + CSRF are required, like every other mutating route.
+
+### Fixed — ungrouped aggregate over empty input returned no row (2026-09-08)
+
+- `SELECT COUNT(*) FROM t WHERE <matches nothing>` returned **zero rows** instead of one row containing `0`; `SUM` / `AVG` / `MIN` / `MAX` likewise returned no row instead of one `NULL` row. Drivers surface "no rows in result set" for that, so a routine existence/size check either errored or silently read as "missing" rather than "none".
+- An aggregate with no `GROUP BY` is defined over one implicit group covering the whole input, so it now always reports exactly one row. Fixed centrally in `aggregate.Hash.Finish()` (every hash/stream/parallel/partition-wise path merges into one table before finishing) plus the `planner.Empty` short-circuit in `execSelect`, which returned early for a constant-false filter without running the pending aggregate.
+- A natively empty table (`SELECT COUNT(*) FROM empty`) was already correct, which is why this only showed up with a filter. `GROUP BY` still correctly returns zero rows on empty input.
+- Covered by `aggregate.TestUngroupedEmptyInputEmitsOneRow` / `TestGroupedEmptyInputEmitsNoRows` and the executor-level `TestUngroupedAggregateOverEmptyInput` (both the runtime-empty and constant-false paths).
+
+### Fixed — `CREATE DATABASE` created unreachable orphans on registry-backed deployments (2026-09-08)
+
+- On a deployment with a hosting registry (every `nextsql init` deployment), the SQL statement created a bare sibling database file with no realm, no registry record, and no routing entry. Nothing could ever connect to it — `Hello` resolves names through the registry, so the new name returned `not_found: unknown database` — while the file still consumed a full database's worth of disk, and it never appeared in `SHOW DATABASES`, `system.databases`, or the Admin Databases view.
+- It now fails closed with `invalid_argument` naming the supported path (`nextsql database create`), and leaves no file behind. `IF NOT EXISTS` does not bypass the refusal. Embedded deployments with no registry keep the sibling-file behavior.
+- Covered by `executor.TestCreateDatabaseFailsClosedOnRegistryBackedDeployment`; documented in `docs/sql.md`.
+
+### Fixed — NextSQL Admin login showed hardcoded test placeholders (2026-09-08)
+
+- The Operations-mode sign-in form shipped `(test_db)` and `(test_realm)` as the Database and Realm placeholder text — leftover local test values presented to every operator as if they were the server's defaults. Both placeholders are removed; the existing "Optional" hints stay.
+
+### Added — NextSQL Admin Studio editable data grid, staged-change review & transactional commit (2026-09-08)
+
+- Studio query results now support **in-place cell editing**, **row deletion staging**, **row insertion staging**, a **staged-change review modal**, and **atomic transactional commit/discard** over the authenticated session connection (`BEGIN; ... COMMIT;`).
+- Single-table queries without joins or unions over user catalog tables are detected as editable (`detectEditableTable`) when all required primary key columns are present (`isResultEditable`).
+- Active cells can be edited via modal (`EditCellModal`, double-click or Edit cell button) with type badge, NULL toggle, and modified diff indicators; rows can be staged for deletion (`stageRowDelete`) or inserted (`stageRowInsert` via `AddRowModal`).
+- Staged changes are clearly highlighted in the result grid (`nss-cell-modified`, `nss-row-deleted`, `nss-row-inserted`) and summarized in a prominent banner (`.nss-staged-bar`) with a **Review & Commit…** review modal (`StagedChangesReviewModal`) that enables per-item removal, discard-all, and transactional SQL script preview with copy and open-in-editor actions.
+- Committing runs the statements inside an explicit `BEGIN; ... COMMIT;` transaction on the session connection with automatic rollback on failure, and refreshes the query results on success.
+
+### Added — NextSQL Admin Studio live parser diagnostics (2026-09-07)
+
+- The Studio SQL editor now shows **where a statement fails to parse** as you
+  type: a debounced strip under the editor with one entry per broken
+  statement ("Line L, column C: <reason>.") and a **Go to error** button that
+  jumps the caret to the offending token. It is advisory — nextsqld still
+  parses, binds, and authorizes on Run — and covers **grammar** errors only;
+  an unknown table or column is still reported by the server when the
+  statement executes (the Admin client has no catalog of its own).
+- New parser-only endpoint `POST /api/v1/studio/query/diagnostics` (no driver
+  connection, no query slot, authed + CSRF like `/query/analyze` and
+  `/query/split`). It splits the buffer with the same
+  `';'`-in-string/comment-safe lexer pass Execute Script uses and reports
+  each statement's first parse error mapped back to a whole-buffer line and
+  column.
+- `internal/sql/parser` gains `ParseDiag` (`Parse` is now a wrapper over it):
+  on any failure it returns the byte offset of the token the parser stopped
+  on, without changing the ~100 individual parser error sites.
+- RUI's `CodeEditor` has no text-overlay primitive, so this is a strip rather
+  than an inline squiggle — the same constraint that blocks NextSQL-native
+  syntax highlighting. Binder ("unknown column"/"unknown table") diagnostics
+  with a source position remain open.
+
+### Added — NextSQL Admin Studio vector dataset import (2026-09-07)
+
+- Studio gains an **Import vector dataset…** action (Data toolbar menu +
+  command palette) for loading a development embedding dataset. It maps one
+  document field of embeddings onto a table's `VECTOR` / `BITVECTOR` /
+  `SPARSEVECTOR` column and any other fields onto its scalar columns, then
+  builds `INSERT` statements into the active editor tab **for review** — it
+  never executes and adds no server route (it reuses `GET /api/v1/studio/table`
+  for the target table's authorized `system.columns`).
+- Each embedding cell (a JSON array, a bracketed `[1, 2, 3]`, a parenthesized
+  `(1, 2, 3)`, or a bare comma list) is validated against the column's
+  declared dimensions and, for a `BITVECTOR`, its 0/1 domain — a wrong-length
+  or non-finite vector is a named `Row N` error, never silently padded. The
+  emitted literal is the exact native parenthesized form
+  (`INSERT INTO docs (sig) VALUES ((1, 0, …));`); a `SPARSEVECTOR` column
+  takes the same dense form and the server coerces the zeros away.
+- Bounded: the shared 8 MiB input / 1 MiB output ceilings plus a
+  1,000-row cap and a 262,144 rows×dimensions ceiling that fails with an
+  actionable message. Scalar cells reuse the CSV/JSON importer's per-kind
+  validation and 100-row batching. Pure `buildVectorImportSQL` /
+  `autoVectorImportField` (`resultTools.ts`), unit-tested.
+
+### Added — NextSQL Admin Studio SQL formatter (2026-09-07)
+
+- The Studio query editor gains a **Format** button (also Shift+Alt+F, also a
+  command-palette entry) that reflows the active tab's SQL for readability:
+  normalized whitespace, uppercased keywords, a line break before each
+  top-level clause keyword / `JOIN` / statement-level `AND`/`OR`, and
+  one-per-line `SELECT`/`SET`/`VALUES` lists. It is a self-contained,
+  comment-preserving client-side formatter (`formatSQL` in `resultTools.ts`) —
+  not built on the server lexer, which discards comments and folds case.
+- It never runs anything and adds no server route. A strict safety net
+  re-tokenizes the formatted text and returns the buffer **unchanged** unless
+  the significant-token stream is byte-for-byte identical (keywords aside) —
+  as it also does for an unterminated string/comment/quoted identifier or a
+  buffer over 1 MiB. Parenthesized groups (column-definition lists, `VALUES`
+  tuples, subqueries) are kept on one line by design.
+
+### Fixed — NextSQL Admin Studio connection status (2026-09-07)
+
+- Studio no longer shows a static **Connected** badge. Ops and Studio now
+  share a live probe of the session's nextsqld driver connection
+  (`GET /api/v1/connection`). If nextsqld is down, both surfaces show
+  unreachable/Disconnected (the admin session cookie stays valid so editor
+  buffers are not thrown away). Run is disabled until the probe succeeds
+  again. Polls every 5 s while the tab is visible.
+
+### Changed — NextSQL Admin Studio More menu (2026-09-07)
+
+- Studio's query editor keeps Run, Run script, Cancel, Suggest, Find, Saved,
+  and History on the toolbar. Explorers and builders (full-text, vector,
+  hybrid, geo, grants, users, audit, transactions, workflows, migrations,
+  schema diagram, schema designer, generate/import data, parameterized DML)
+  now open from a **More** control with a three-dot icon, grouped by Search /
+  Security / Operations / Schema / Data. Capability-gated items stay in the
+  menu and disable when the server does not report support. Command palette
+  entries are unchanged.
+
+### Changed — NextSQL Admin console visual language (2026-09-07)
+
+- Operations, Setup, and Studio now share a denser operator-console chrome:
+  grouped sidebar with a stroke icon on every nav item (collapses to an
+  icon-only rail), identity chip, compact topbar, section panels around
+  catalog tables, and a two-pane sign-in layout on wide screens. Layouts
+  stack or scroll at the existing 899px / 760px / 799px breakpoints (phone
+  through desktop) without a horizontal page overflow. Presentational only
+  — routes, RBAC, and API behavior are unchanged.
+
+### Changed — NextSQL Admin Setup shows actionable errors (2026-09-07)
+
+- When `nextsql setup` (or the form validator) rejects a plan or install, the
+  Setup wizard now leads with a plain-language headline and next step written
+  for a first-run operator instead of the raw `nextsql invalid_argument: …`
+  text. The verbatim engine message is always kept one "Technical details"
+  click away (expanded automatically when the input is unrecognized), so no
+  information is lost. Covers the recognized failure classes: a non-loopback
+  listen address without TLS, an existing config or initialized database, a
+  production profile missing an administrator / unlock key / resource-policy
+  setting, an unlock key left on the data volume, unwritable target paths, a
+  full disk, a failed post-install health check, and a missing `nextsql`
+  binary. Purely presentational — the engine/CLI stays the one authority on
+  what failed. See `docs/design-admin-setup.md`.
+
+### Changed — container first-start initialization (2026-09-07)
+
+- The container image now performs first-start initialization through
+  `nextsql setup` (the same non-interactive backbone the OS installers use)
+  instead of a bare `nextsql init`. It sizes the buffer pool from a resource
+  preset, applies a deployment profile, writes `nextsql.conf` into the data
+  volume, and `nextsqld` loads that file (`--config`) on every subsequent
+  start. New environment variables: `NEXTSQL_PROFILE` (`developer` default /
+  `production`), `NEXTSQL_PRESET`, and `NEXTSQL_CONFIG_FILE`.
+  `NEXTSQL_PROFILE=production` writes `deployment_profile=production` plus the
+  production operational defaults and runs the fail-closed production preflight
+  on every start — a production container without a bootstrap administrator,
+  with the unlock key on the data volume, or with a non-loopback listen and no
+  TLS 1.3 does not start. See `docs/docker.md`.
+
 ### Removed
 
 - **The Deno driver (`drivers/deno`) is removed.** The official driver set is
@@ -41,6 +240,11 @@ A roadmap item is not recorded as completed here until its implementation, tests
   `gem-publish-ruby-driver.yml`, `pypi-publish-python-driver.yml`,
   `packagist-split-php-driver.yml` (git-subtree split to a `bzync/nextsql-php`
   mirror that Packagist watches).
+- One-shot driver release: pushing a single `drivers-v0.1.0` tag (or running
+  the `Release drivers` workflow with a version) verifies every driver manifest
+  is at that version and then publishes npm + PyPI + RubyGems + Packagist in
+  parallel. The four per-driver workflows are now `workflow_call` reusable and
+  still fire on their own `<lang>-v*` tags for a single-driver release.
 - `drivers/node/nextsql.d.ts` and `drivers/bun/nextsql.d.ts` are now
   self-contained copies of the shared `drivers/js/types.d.ts` (with a drift
   guard test) instead of a `from '../js/types'` re-export that would not
@@ -58,17 +262,18 @@ A roadmap item is not recorded as completed here until its implementation, tests
   `vuln-type: library`) flag it as a fixable HIGH. Requires `go` directive
   1.25.0 → 1.26.0 (x/crypto 0.56.0's minimum).
 
-### Changed — immutable container image tags (2026-09-07)
+### Changed — release-tag-only container image publishing (2026-09-07)
 
 - The `bzynchub/nextsql` Docker Hub repository is set to "All tags are
-  immutable". `.github/workflows/docker-publish-image.yml` no longer publishes
-  moving tags: `latest` is disabled, and the `edge`, `{{major}}.{{minor}}`,
-  and `{{major}}` patterns are removed. A release tag `v0.x.y` now publishes
-  exactly `0.x.y`; every build still gets an `sha-<short>` tag. Both tag
-  shapes are write-once — re-cutting a release means bumping the version.
-  Consumers pin an explicit `0.x.y` or `sha-<short>`. The `:latest`, `:0.0`,
-  and `:edge` tags created by the 0.0.1 publish are stale and can be deleted
-  from Docker Hub.
+  immutable", and `.github/workflows/docker-publish-image.yml` now publishes
+  an image **only from a `v*.*.*` release tag push**, producing exactly one
+  write-once `0.x.y` tag. It emits no moving tags (`latest` disabled; `edge`,
+  `{{major}}.{{minor}}`, `{{major}}` removed) and **no per-commit `sha-<short>`
+  tags** — master pushes and pull requests build and Trivy-scan the image for
+  CI signal but never push it. Re-cutting a release means bumping the version.
+  The stale `:latest`, `:0.0`, `:edge`, and `sha-*` tags on Docker Hub are
+  left over from the earlier scheme and can be deleted; the workflow does not
+  touch them.
 
 ## [0.0.1] — 2026-09-07
 

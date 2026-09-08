@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -70,7 +71,7 @@ func TestConfigRequiresCAOrInsecure(t *testing.T) {
 
 func TestReadModelsRequireSession(t *testing.T) {
 	s := testServer(t)
-	for _, p := range []string{"/api/v1/overview", "/api/v1/databases", "/api/v1/activity", "/api/v1/security", "/api/v1/cluster", "/api/v1/maintenance", "/api/v1/config", "/api/v1/diagnostics", "/api/v1/diagnostics/bundle", "/api/v1/backups", "/api/v1/studio/bootstrap", "/api/v1/studio/table?name=t", "/api/v1/studio/workflows", "/api/v1/studio/schema-graph", "/api/v1/studio/migrations"} {
+	for _, p := range []string{"/api/v1/overview", "/api/v1/databases", "/api/v1/activity", "/api/v1/security", "/api/v1/cluster", "/api/v1/maintenance", "/api/v1/config", "/api/v1/diagnostics", "/api/v1/diagnostics/bundle", "/api/v1/backups", "/api/v1/connection", "/api/v1/studio/bootstrap", "/api/v1/studio/table?name=t", "/api/v1/studio/workflows", "/api/v1/studio/schema-graph", "/api/v1/studio/migrations"} {
 		rec := httptest.NewRecorder()
 		s.Handler().ServeHTTP(rec, httptest.NewRequest("GET", p, nil))
 		if rec.Code != http.StatusUnauthorized {
@@ -283,6 +284,68 @@ func TestStudioSplitTokenizesScript(t *testing.T) {
 	}
 }
 
+func TestStudioDiagnosticsRequiresAuthAndCSRF(t *testing.T) {
+	s := testServer(t)
+	body := `{"sql":"SELECT 1"}`
+
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest("POST", "/api/v1/studio/query/diagnostics", strings.NewReader(body)))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("no session: want 401, got %d", rec.Code)
+	}
+
+	sess, err := s.sessions.create(nil, "op", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest("POST", "/api/v1/studio/query/diagnostics", strings.NewReader(body))
+	req.AddCookie(&http.Cookie{Name: sessionCookie, Value: sess.id})
+	rec = httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("no CSRF: want 403, got %d", rec.Code)
+	}
+}
+
+func TestStudioDiagnosticsReportsParseFailures(t *testing.T) {
+	s := testServer(t)
+	sess, err := s.sessions.create(nil, "op", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	post := func(body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest("POST", "/api/v1/studio/query/diagnostics", strings.NewReader(body))
+		req.AddCookie(&http.Cookie{Name: sessionCookie, Value: sess.id})
+		req.Header.Set(csrfHeader, sess.csrf)
+		rec := httptest.NewRecorder()
+		s.Handler().ServeHTTP(rec, req)
+		return rec
+	}
+
+	rec := post(`{"sql":"SELECT id FROM users WHERE id = 1"}`)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"diagnostics":[]`) {
+		t.Fatalf("valid buffer: want 200 with no diagnostics, got %d (%s)", rec.Code, rec.Body.String())
+	}
+
+	rec = post(`{"sql":"SELECT 1;\nSELECT id FROM users WHRE id = 1"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("broken buffer: want 200, got %d (%s)", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"line":2`) {
+		t.Fatalf("diagnostic should be line 2 (buffer-relative): %s", rec.Body.String())
+	}
+
+	rec = post(`{"sql":"` + strings.Repeat("x", studio.MaxSQLBytes+1) + `"}`)
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversized: want 413, got %d (%s)", rec.Code, rec.Body.String())
+	}
+
+	rec = post(`{"sql":"SELECT 1","unexpected":true}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("unknown field: want 400, got %d (%s)", rec.Code, rec.Body.String())
+	}
+}
+
 func TestStudioTableRejectsInterpolationInput(t *testing.T) {
 	s := testServer(t)
 	sess, err := s.sessions.create(nil, "op", "", "")
@@ -371,6 +434,50 @@ func TestSessionSetReadConsistencyGuards(t *testing.T) {
 	}
 }
 
+func TestSessionPingGuards(t *testing.T) {
+	sess := &session{}
+	if err := sess.ping(context.Background()); !nerr.HasCode(err, nerr.Unavailable) {
+		t.Fatalf("ping with no connection: want unavailable, got %v", err)
+	}
+
+	// A query in flight owns the connection lock. ping must not wait on it
+	// or report the session as down — the in-flight query is the live probe.
+	sess.mu.Lock()
+	err := sess.ping(context.Background())
+	sess.mu.Unlock()
+	if err != nil {
+		t.Fatalf("ping while busy: want nil (still connected), got %v", err)
+	}
+}
+
+func TestConnectionProbeReportsDisconnectedWithoutConn(t *testing.T) {
+	s := testServer(t)
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/api/v1/connection", nil))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("no session: want 401, got %d", rec.Code)
+	}
+
+	sess, err := s.sessions.create(nil, "op", "maindb", "acme")
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest("GET", "/api/v1/connection", nil)
+	req.AddCookie(&http.Cookie{Name: sessionCookie, Value: sess.id})
+	rec = httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, `"connected":false`) {
+		t.Fatalf("nil conn should be disconnected: %s", body)
+	}
+	if !strings.Contains(body, `"server_addr":"127.0.0.1:7210"`) {
+		t.Fatalf("probe should still name the configured nextsqld: %s", body)
+	}
+}
+
 func TestStatusWriterPreservesStreamingFlush(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	w := &statusWriter{ResponseWriter: recorder, status: http.StatusOK}
@@ -456,6 +563,120 @@ func TestSessionStoreExpiry(t *testing.T) {
 	}
 	if st.len() != 0 {
 		t.Fatalf("expired session not evicted: len=%d", st.len())
+	}
+}
+
+// A long Operations action (BACKUP DATABASE is allowed 30 minutes) must not
+// be swept out from under itself: while a request is in flight the session is
+// not idle, so the operator is not logged out the moment the action returns.
+func TestSessionInFlightRequestHoldsOffIdleExpiry(t *testing.T) {
+	st := newSessionStore(4, time.Millisecond, time.Hour)
+	defer st.close()
+	sess, _ := st.create(nil, "a", "", "")
+
+	sess.beginRequest()
+	time.Sleep(3 * time.Millisecond)
+	st.sweep()
+	if st.get(sess.id) == nil {
+		t.Fatal("session with a request in flight was expired as idle")
+	}
+
+	// The idle clock restarts when the request finishes, not when it started.
+	sess.endRequest()
+	if st.get(sess.id) == nil {
+		t.Fatal("session expired immediately after a long request finished")
+	}
+	time.Sleep(3 * time.Millisecond)
+	if st.get(sess.id) != nil {
+		t.Fatal("idle session still returned once no request is in flight")
+	}
+}
+
+// End to end through the auth middleware: an action that outlives the idle
+// timeout survives a sweep, and the operator's next request still works
+// instead of 401-ing them back to the login screen.
+func TestLongActionSurvivesIdleSweep(t *testing.T) {
+	s, err := New(Config{
+		ServerAddr:      "127.0.0.1:7210",
+		InsecureServer:  true,
+		IdleTimeout:     5 * time.Millisecond,
+		SessionLifetime: time.Hour,
+	}, Options{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	sess, err := s.sessions.create(nil, "op", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	entered, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	h := s.authed(func(w http.ResponseWriter, r *http.Request, _ *session) {
+		once.Do(func() { close(entered) })
+		<-release
+		w.WriteHeader(http.StatusOK)
+	})
+	call := func() int {
+		req := httptest.NewRequest("GET", "/api/v1/backups", nil)
+		req.AddCookie(&http.Cookie{Name: sessionCookie, Value: sess.id})
+		rec := httptest.NewRecorder()
+		h(rec, req)
+		return rec.Code
+	}
+
+	done := make(chan int, 1)
+	go func() { done <- call() }()
+
+	<-entered
+	time.Sleep(20 * time.Millisecond) // well past the idle timeout
+	s.sessions.sweep()
+	close(release)
+
+	if code := <-done; code != http.StatusOK {
+		t.Fatalf("long action returned %d; the session was swept mid-request", code)
+	}
+	if code := call(); code != http.StatusOK {
+		t.Fatalf("follow-up request returned %d; the operator was logged out by their own long action", code)
+	}
+}
+
+// The absolute lifetime is a security bound, not an activity measure: an
+// in-flight request does not extend it.
+func TestSessionInFlightRequestDoesNotExtendLifetime(t *testing.T) {
+	st := newSessionStore(4, time.Hour, time.Millisecond)
+	defer st.close()
+	sess, _ := st.create(nil, "a", "", "")
+	sess.beginRequest()
+	defer sess.endRequest()
+	time.Sleep(3 * time.Millisecond)
+	if st.get(sess.id) != nil {
+		t.Fatal("session outlived --session-lifetime because a request was in flight")
+	}
+}
+
+// The in-flight count is per request, so concurrent requests on one session
+// (a read-model refresh alongside a running action) cannot drop it early.
+func TestSessionRequestCountIsBalanced(t *testing.T) {
+	s := &session{createdAt: time.Now(), lastSeen: time.Now()}
+	s.beginRequest()
+	s.beginRequest()
+	s.endRequest()
+	old := time.Now().Add(time.Hour)
+	if s.expired(old, time.Minute, 24*time.Hour) {
+		t.Fatal("session expired while one of two requests was still in flight")
+	}
+	s.endRequest()
+	if !s.expired(old, time.Minute, 24*time.Hour) {
+		t.Fatal("session did not go idle after every request finished")
+	}
+	// An unbalanced endRequest must not underflow into a permanently
+	// un-expirable session.
+	s.endRequest()
+	if !s.expired(old, time.Minute, 24*time.Hour) {
+		t.Fatal("in-flight count underflowed")
 	}
 }
 
@@ -660,6 +881,25 @@ func TestBackupActionSQL(t *testing.T) {
 		}
 		if err != nil || got != c.want {
 			t.Fatalf("%s/%q: got (%q, %v), want %q", c.op, c.name, got, err, c.want)
+		}
+	}
+}
+
+func TestBackupDirState(t *testing.T) {
+	s := func(v string) *string { return &v }
+	cases := []struct {
+		name string
+		in   resultJSON
+		want string
+	}{
+		{"configured", resultJSON{Columns: []string{"name"}, Rows: [][]*string{{s("data_dir")}, {s("backup_dir")}}}, "configured"},
+		{"unset", resultJSON{Columns: []string{"name"}, Rows: [][]*string{{s("data_dir")}, {s("key_file")}}}, "unset"},
+		{"unknown-empty", resultJSON{Columns: []string{"name"}, Rows: [][]*string{}}, "unknown"},
+		{"unknown-no-column", resultJSON{Columns: []string{}, Rows: [][]*string{}}, "unknown"},
+	}
+	for _, c := range cases {
+		if got := backupDirState(c.in); got != c.want {
+			t.Errorf("%s: got %q, want %q", c.name, got, c.want)
 		}
 	}
 }

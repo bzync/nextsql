@@ -1,0 +1,122 @@
+name: Release drivers
+
+# One entry point to publish every official driver package at the same version.
+#
+#   git tag drivers-v0.1.0 && git push origin drivers-v0.1.0
+#     -> checks drivers/{node,bun,python,ruby} manifests all read 0.1.0 and
+#        drivers/php/composer.json name, then publishes in parallel:
+#          @bzync/nextsql  -> npm
+#          bzync-nextsql   -> PyPI
+#          bzync-nextsql   -> RubyGems
+#          bzync/nextsql   -> Packagist (via the bzync/nextsql-php mirror)
+#
+# `workflow_dispatch` takes an explicit `version` for a manual re-run; the
+# manifests at the run's commit must already be at that version.
+#
+# Each registry job reuses the per-driver workflow, so a single `<lang>-v*` tag
+# (node-v*, python-v*, ruby-v*, php-v*) still publishes that one driver on its
+# own. Secrets flow via `secrets: inherit` (NPM_TOKEN, PHP_SPLIT_TOKEN);
+# npm / PyPI / RubyGems otherwise authenticate with OIDC Trusted Publishing.
+#
+# The Go driver (github.com/bzync/nextsql/drivers/go) is NOT here — it is part
+# of the main Go module and ships with the engine's own `v*` release tag, not
+# on an independent version.
+#
+# The four jobs are independent: a failure in one registry does not stop the
+# others, so a bad run can leave a partial release. Re-run the failed job (or
+# its standalone `<lang>-v*` tag) once fixed.
+
+on:
+  push:
+    tags:
+      - "drivers-v*.*.*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Driver version to publish, e.g. 0.1.0 (must already be committed in every driver manifest)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write # forwarded to the reusable publish workflows for OIDC
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      ref: ${{ steps.r.outputs.ref }}
+      version: ${{ steps.r.outputs.version }}
+    steps:
+      - name: Resolve ref and version
+        id: r
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "version=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+            echo "ref=${{ github.sha }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${GITHUB_REF_NAME#drivers-v}" >> "$GITHUB_OUTPUT"
+            echo "ref=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.r.outputs.ref }}
+
+      - name: Every driver manifest must be at the release version
+        run: |
+          set -u
+          want='${{ steps.r.outputs.version }}'
+          rc=0
+          need() {
+            if [ "$2" != "$want" ]; then
+              echo "::error::$1 is '$2', expected '$want'"
+              rc=1
+            else
+              echo "ok  $1 = $2"
+            fi
+          }
+          need "drivers/node/package.json" "$(node -p 'require("./drivers/node/package.json").version')"
+          need "drivers/bun/package.json"  "$(node -p 'require("./drivers/bun/package.json").version')"
+          need "drivers/python" "$(cd drivers/python && python3 -c 'import nextsql; print(nextsql.__version__)')"
+          need "drivers/ruby"   "$(ruby -Idrivers/ruby/lib -rnextsql/version -e 'print NextSQL::VERSION')"
+          name="$(php -r 'echo json_decode(file_get_contents("drivers/php/composer.json"))->name;')"
+          if [ "$name" != "bzync/nextsql" ]; then
+            echo "::error::drivers/php/composer.json name is '$name', expected 'bzync/nextsql'"
+            rc=1
+          else
+            echo "ok  drivers/php/composer.json name = $name"
+          fi
+          exit $rc
+
+  npm:
+    needs: resolve
+    uses: ./.github/workflows/npm-publish-node-driver.yml
+    secrets: inherit
+    with:
+      ref: ${{ needs.resolve.outputs.ref }}
+      version: ${{ needs.resolve.outputs.version }}
+
+  pypi:
+    needs: resolve
+    uses: ./.github/workflows/pypi-publish-python-driver.yml
+    secrets: inherit
+    with:
+      ref: ${{ needs.resolve.outputs.ref }}
+      version: ${{ needs.resolve.outputs.version }}
+
+  rubygems:
+    needs: resolve
+    uses: ./.github/workflows/gem-publish-ruby-driver.yml
+    secrets: inherit
+    with:
+      ref: ${{ needs.resolve.outputs.ref }}
+      version: ${{ needs.resolve.outputs.version }}
+
+  packagist:
+    needs: resolve
+    uses: ./.github/workflows/packagist-split-php-driver.yml
+    secrets: inherit
+    with:
+      ref: ${{ needs.resolve.outputs.ref }}
+      version: ${{ needs.resolve.outputs.version }}

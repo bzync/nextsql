@@ -14,18 +14,19 @@ cannot run `sh`.
 ## Prebuilt image
 
 Multi-arch images (`linux/amd64`, `linux/arm64`) are published to Docker Hub by
-the `Publish container image` workflow. Every tag is **write-once** — the
-repository is configured "All tags are immutable", so there is no moving
-`latest`, `edge`, or `0.0` pointer. Pin an explicit version:
+the `Publish container image` workflow. **Only a release tag push (`v*.*.*`)
+publishes an image** — master pushes and pull requests build and Trivy-scan the
+image but never push it, so there are no `sha-<short>` or `edge` tags. Every
+published tag is **write-once** — the repository is configured "All tags are
+immutable", so there is no moving `latest`, `edge`, or `0.0` pointer. Each
+release publishes exactly one `0.x.y` tag:
 
 ```bash
 docker pull bzynchub/nextsql:0.0.1        # a released version
-docker pull bzynchub/nextsql:sha-0a1cc8e  # a specific build (master or release)
 ```
 
-Each release publishes one `0.x.y` tag; every build (master pushes included)
-also gets an `sha-<short>` tag. The Compose files below build the image locally
-(`build: .`); to run a published image instead, replace `build: .` with
+The Compose files below build the image locally (`build: .`); to run a
+published image instead, replace `build: .` with
 `image: bzynchub/nextsql:0.0.1`.
 
 ## Building locally
@@ -75,6 +76,46 @@ docker compose down -v              # destroys database and key volumes
 `docker compose down -v` is destructive and removes the persisted database and
 unlock key.
 
+## First-start initialization and configuration
+
+On first start (an empty `/var/lib/nextsql`), `nextsql-entrypoint` initializes
+the database through **`nextsql setup`** — the same non-interactive backbone
+the OS installers use (`docs/install.md`). It sizes the buffer pool from a
+resource preset, applies the deployment profile, initializes the database,
+and writes `nextsql.conf` into the data volume. Every subsequent start passes
+that file to `nextsqld` with `--config`, so the deployment profile, buffer
+sizing, and operational timeouts persist across restarts. `nextsqld` still
+takes its data-dir, key-file, and listen address from the environment as
+before — those override the file.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `NEXTSQL_PROFILE` | `developer` | `production` writes `deployment_profile=production` plus the production operational defaults (disk-watermark, replica-lag, statement/idle/lock timeouts, connection limits, drain) and runs the fail-closed production preflight on every `nextsqld` start. |
+| `NEXTSQL_PRESET` | `balanced` | Buffer-pool sizing preset: `conservative` (10% of RAM) / `balanced` (25%) / `high-performance` (50%) / `custom`. `NEXTSQL_BUFFER_PAGES` still overrides it. |
+| `NEXTSQL_CONFIG_FILE` | `$NEXTSQL_DATA_DIR/nextsql.conf` | Where the generated config is written and read from. |
+
+The production profile fails closed: it requires a bootstrap administrator
+(`NEXTSQL_SERVER_USER` + a password), the unlock key kept **off** the data
+volume (the image's default `/run/secrets/root.key` already satisfies this),
+and — like `nextsqld` itself — TLS 1.3 for any non-loopback listen address.
+A production container that cannot satisfy these does not start.
+
+```bash
+docker run -d --name nextsql -p 7210:7210 \
+  -v nextsql-data:/var/lib/nextsql -v nextsql-keys:/run/secrets \
+  --secret nextsql-app-password,type=mount,target=/run/bootstrap/app-password \
+  --secret nextsql-server-crt,type=mount,target=/run/tls/server.crt \
+  --secret nextsql-server-key,type=mount,target=/run/tls/server.key \
+  -e NEXTSQL_SERVER_USER=app \
+  -e NEXTSQL_SERVER_PASSWORD_FILE=/run/bootstrap/app-password \
+  -e NEXTSQL_TLS_CERT=/run/tls/server.crt -e NEXTSQL_TLS_KEY=/run/tls/server.key \
+  -e NEXTSQL_PROFILE=production \
+  bzynchub/nextsql:0.0.1
+```
+
+`backup_dir` is not set by the container; set it (or a WAL archive) and take
+`nextsql backup`s before relying on a container instance for recovery.
+
 ## Multi-node HA cluster
 
 `docker-compose.ha.yml` runs a 3-node Raft cluster (`internal/replication`,
@@ -106,14 +147,14 @@ docker compose -f docker-compose.ha.yml up --build -d
 
 Every replica of one database must share the same identity and root unlock
 key (`docs/ha.md` "All replicas of one database share the keystore / root
-unlock key") — there is no CLI flag to give `nextsql init` an existing
-identity, so only one node may ever run `init`:
+unlock key") — there is no CLI flag to give `nextsql setup`/`nextsql init` an
+existing identity, so only one node may ever initialize:
 
-1. **`node-a`** (the Raft bootstrap node) runs `nextsql init` into its own
-   volume on first start, then `nextsql backup`s that freshly-initialized
-   (still pre-Raft, so trivially small) database into the shared
-   `nextsql-seed` volume.
-2. **`node-b`/`node-c`** never run `init`. Each waits for `node-a`'s backup
+1. **`node-a`** (the Raft bootstrap node) runs `nextsql setup` into its own
+   volume on first start (writing its `nextsql.conf`), then `nextsql backup`s
+   that freshly-initialized (still pre-Raft, so trivially small) database
+   into the shared `nextsql-seed` volume.
+2. **`node-b`/`node-c`** never run `setup`/`init`. Each waits for `node-a`'s backup
    to reach the `verified` state (`docs/backup.md` "On-disk layout" — the
    marker file written last, after hash checks and a restore-test open),
    then runs `nextsql restore` from it. This is exactly the same
@@ -138,6 +179,12 @@ flags in `docs/ha.md` "Operations"), and `NEXTSQL_JOIN_WAIT` (the bootstrap
 node's pre-flight peer check, step 4 above). None of this fires unless those
 variables are set, so the plain single-node `docker-compose.yml` is
 unaffected.
+
+Only `node-a` runs `nextsql setup`, so only `node-a` has a generated
+`nextsql.conf`; the restore-joined followers run without one (a generated
+per-node config on a follower is not yet wired — hosted HA remains an open
+track). `NEXTSQL_PROFILE=production` therefore currently applies its config
+and preflight to the bootstrap node only.
 
 ### Verifying the cluster
 

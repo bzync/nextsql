@@ -521,6 +521,68 @@ func TestAnalyzeReportsSyntaxErrors(t *testing.T) {
 	}
 }
 
+func TestDiagnosticsLocatesParseFailures(t *testing.T) {
+	// A clean buffer yields nothing.
+	if d, err := Diagnostics("SELECT id FROM users WHERE id = 1"); err != nil || len(d) != 0 {
+		t.Fatalf("Diagnostics(valid) = %v, %v; want no diagnostics", d, err)
+	}
+
+	// A single broken statement: the caret lands on the offending token and
+	// line/column are 1-based.
+	d, err := Diagnostics("SELECT id\nFROM users WHRE id = 1")
+	if err != nil {
+		t.Fatalf("Diagnostics: %v", err)
+	}
+	if len(d) != 1 {
+		t.Fatalf("Diagnostics = %v, want exactly one", d)
+	}
+	if d[0].Line != 2 {
+		t.Errorf("diagnostic line = %d, want 2", d[0].Line)
+	}
+	if d[0].Message == "" || strings.HasPrefix(d[0].Message, "nextsql ") {
+		t.Errorf("diagnostic message = %q, want a clean reason", d[0].Message)
+	}
+	if got := "SELECT id\nFROM users WHRE id = 1"[byteOffsetForTest(t, d[0].Offset, "SELECT id\nFROM users WHRE id = 1"):]; !strings.HasPrefix(got, "id = 1") {
+		t.Errorf("diagnostic offset points at %q, want the trailing \"id\"", got)
+	}
+
+	// Only the broken statement in a multi-statement buffer is reported, and
+	// its offset is mapped back to the whole buffer.
+	d, err = Diagnostics("SELECT 1;\nSELECT FROM;\nSELECT 3")
+	if err != nil {
+		t.Fatalf("Diagnostics(script): %v", err)
+	}
+	if len(d) != 1 {
+		t.Fatalf("Diagnostics(script) = %v, want one (the middle statement)", d)
+	}
+	if d[0].Line != 2 {
+		t.Errorf("script diagnostic line = %d, want 2", d[0].Line)
+	}
+
+	// Empty / oversized stay request errors, like Analyze.
+	if _, err := Diagnostics("   "); !nerr.HasCode(err, nerr.InvalidArgument) {
+		t.Errorf("Diagnostics(empty) err = %v, want invalid_argument", err)
+	}
+	if _, err := Diagnostics(strings.Repeat("a", MaxSQLBytes+1)); !nerr.HasCode(err, nerr.Exhausted) {
+		t.Errorf("Diagnostics(oversized) err = %v, want exhausted", err)
+	}
+
+	// A comment-only buffer is "nothing wrong yet", not an error.
+	if d, err := Diagnostics("-- just a note\n"); err != nil || len(d) != 0 {
+		t.Errorf("Diagnostics(comment only) = %v, %v; want no diagnostics", d, err)
+	}
+}
+
+// byteOffsetForTest converts a UTF-16 code-unit offset back to a byte offset
+// for an all-BMP test string (where the two coincide).
+func byteOffsetForTest(t *testing.T, u16 int, s string) int {
+	t.Helper()
+	if u16 < 0 || u16 > len(s) {
+		t.Fatalf("offset %d out of range for %q", u16, s)
+	}
+	return u16
+}
+
 func TestSplitScriptOneAndMany(t *testing.T) {
 	stmts, err := SplitScript("CREATE TABLE t (id UUID);")
 	if err != nil || len(stmts) != 1 || !strings.Contains(stmts[0], "CREATE TABLE") {

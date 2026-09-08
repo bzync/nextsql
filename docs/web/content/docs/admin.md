@@ -48,8 +48,8 @@ Studio is in progress on the same Operations session. Current surfaces include:
 - authenticated SQL editor with bounded streaming typed results, copy/export, session-scoped lock-wait cancel, tabs/scripts/history/find, crash recovery for unsaved tabs, and layout persistence without credentials
 - catalog-aware table/column IntelliSense (no keyword completion), misspelled `FROM`/`JOIN` table-name suggestions, indexed JSON-path completion, and vector-aware `NEAREST` / `USING` completion
 - positional `$1..$N` prepared parameters
-- five dedicated native explorers (JSON, full-text, vector, hybrid, geo)
-- Users & roles, live Transactions & locks, verified Audit, Workflows/tasks/change streams, schema-migration history
+- five dedicated native explorers (JSON, full-text, vector, hybrid, geo), opened from the editor **More** menu
+- Users & roles, live Transactions & locks, verified Audit, Workflows/tasks/change streams, schema-migration history (also under **More**)
 - table inspector: statistics, foreign keys, inbound “Referenced by”, constraints, DDL, dependencies
 - schema-relationship diagram, global object search, command palette (Ctrl/Cmd+K)
 - bounded per-tab EXPLAIN comparison and an ANALYZE-only profiler

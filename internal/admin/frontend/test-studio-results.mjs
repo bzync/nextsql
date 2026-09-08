@@ -1705,6 +1705,136 @@ try {
   }
 
   {
+    // Vector dataset import → bounded INSERT-script builder for embeddings.
+    const columnsResult = (rows) => ({
+      columns: ["table_name", "column_name", "ordinal", "type", "not_null", "is_primary", "default_value"],
+      column_types: ["STRING", "STRING", "DECIMAL", "STRING", "BOOL", "BOOL", "STRING"],
+      rows,
+      truncated: false,
+      elapsed_ms: 0,
+    });
+    const detail = {
+      name: "docs",
+      columns: columnsResult([
+        ["docs", "id", "1", "INT64", "true", "true", null],
+        ["docs", "title", "2", "STRING", "false", "false", null],
+        ["docs", "embedding", "3", "VECTOR<F32,3>", "true", "false", null],
+      ]),
+    };
+    const cols = tools.dataGenColumns(detail);
+    const vectorCols = tools.vectorColumnsFromResult(detail.columns);
+    const embedding = vectorCols.find((c) => c.name === "embedding");
+    assert.equal(embedding.kind, "dense");
+    assert.equal(embedding.dimensions, 3);
+
+    const build = (opts) => tools.buildVectorImportSQL({
+      table: "docs", columns: cols, vectorColumn: embedding, emptyAsNull: true,
+      scalarMapping: {}, ...opts,
+    });
+
+    // NDJSON with an array-valued embedding field + a scalar column.
+    const ndjson = tools.parseImportText(
+      '{"id":1,"title":"a","embedding":[0.1,0.2,0.3]}\n{"id":2,"title":"b","embedding":[1,0,-1]}\n',
+      "ndjson",
+    );
+    const good = build({ parsed: ndjson, vectorField: "embedding", scalarMapping: { id: "id", title: "title" } });
+    assert.equal(good.error, null);
+    assert.match(good.sql, /^INSERT INTO "docs" \("id", "title", "embedding"\) VALUES\n/);
+    assert.match(good.sql, /\(1, 'a', \(0\.1, 0\.2, 0\.3\)\),/);
+    assert.match(good.sql, /\(2, 'b', \(1, 0, -1\)\);$/);
+    assert.equal(good.rows, 2);
+    assert.equal(good.statements, 1);
+    assert.equal(good.truncated, false);
+
+    // autoVectorImportField prefers an exact case-insensitive name match.
+    assert.equal(tools.autoVectorImportField(["id", "Embedding", "x"], "embedding", {}), "Embedding");
+    assert.equal(tools.autoVectorImportField(["id", "vec"], "embedding", { id: "id" }), "vec");
+
+    // A wrong-length vector is a named per-row error, never silently padded.
+    const badDim = tools.parseImportText('{"id":1,"embedding":[0.1,0.2]}\n', "ndjson");
+    assert.match(
+      build({ parsed: badDim, vectorField: "embedding", scalarMapping: { id: "id" } }).error,
+      /Row 1, column "embedding": .*3 dimensions; this vector has 2/,
+    );
+
+    // The embedding field is required (the column is NOT NULL, no default).
+    assert.match(
+      build({ parsed: ndjson, vectorField: "", scalarMapping: { id: "id", title: "title" } }).error,
+      /Map a document field to the vector column/,
+    );
+
+    // A NOT NULL scalar column with no mapped field blocks the build.
+    assert.match(
+      build({ parsed: ndjson, vectorField: "embedding", scalarMapping: { title: "title" } }).error,
+      /Column "id" is NOT NULL and has no default/,
+    );
+
+    // CSV with a quoted vector cell; column list follows catalog ordinal.
+    const csv = tools.parseImportText('embedding,id\n"[1, 2, 3]",7\n', "csv");
+    const csvBuild = build({ parsed: csv, vectorField: "embedding", scalarMapping: { id: "id" } });
+    assert.equal(csvBuild.error, null);
+    assert.match(csvBuild.sql, /\("id", "embedding"\) VALUES\n  \(7, \(1, 2, 3\)\);/);
+
+    // BITVECTOR column rejects non 0/1 values.
+    const bitDetail = {
+      name: "sigs",
+      columns: columnsResult([
+        ["sigs", "sig", "1", "BITVECTOR<4>", "true", "false", null],
+      ]),
+    };
+    const bitCol = tools.vectorColumnsFromResult(bitDetail.columns).find((c) => c.name === "sig");
+    assert.match(
+      tools.buildVectorImportSQL({
+        table: "sigs", columns: tools.dataGenColumns(bitDetail), vectorColumn: bitCol, emptyAsNull: true,
+        scalarMapping: {}, vectorField: "sig",
+        parsed: tools.parseImportText('{"sig":[1,0,2,1]}\n', "ndjson"),
+      }).error,
+      /BITVECTOR values must be exactly 0 or 1/,
+    );
+
+    // Rows × dimensions ceiling → an actionable error, not a giant statement.
+    const wideDetail = {
+      name: "w",
+      columns: columnsResult([["w", "e", "1", "VECTOR<F32,1000>", "true", "false", null]]),
+    };
+    const wideCol = tools.vectorColumnsFromResult(wideDetail.columns).find((c) => c.name === "e");
+    const wideLines = [];
+    for (let i = 0; i < 400; i++) {
+      wideLines.push(JSON.stringify({ e: new Array(1000).fill(0) }));
+    }
+    assert.match(
+      tools.buildVectorImportSQL({
+        table: "w", columns: tools.dataGenColumns(wideDetail), vectorColumn: wideCol, emptyAsNull: true,
+        scalarMapping: {}, vectorField: "e",
+        parsed: tools.parseImportText(wideLines.join("\n"), "ndjson"),
+      }).error,
+      /exceeds the .* import ceiling/,
+    );
+
+    // Identifier quoting is always applied.
+    const evilDetail = {
+      name: 'a"b',
+      columns: columnsResult([['a"b', 'e"c', "1", "VECTOR<F32,2>", "true", "false", null]]),
+    };
+    const evilCol = tools.vectorColumnsFromResult(evilDetail.columns).find((c) => c.name === 'e"c');
+    const evil = tools.buildVectorImportSQL({
+      table: 'a"b', columns: tools.dataGenColumns(evilDetail), vectorColumn: evilCol, emptyAsNull: true,
+      scalarMapping: {}, vectorField: "e",
+      parsed: tools.parseImportText('{"e":[1,2]}\n', "ndjson"),
+    });
+    assert.match(evil.sql, /^INSERT INTO "a""b" \("e""c"\) VALUES\n  \(\(1, 2\)\);/);
+
+    // No vector column selected → a clear message.
+    assert.match(
+      tools.buildVectorImportSQL({
+        table: "docs", columns: cols, vectorColumn: null, emptyAsNull: true,
+        scalarMapping: {}, vectorField: "embedding", parsed: ndjson,
+      }).error,
+      /VECTOR, BITVECTOR, or SPARSEVECTOR column/,
+    );
+  }
+
+  {
     // Parameterized INSERT / UPDATE / DELETE generation.
     const columnsResult = (rows) => ({
       columns: ["table_name", "column_name", "ordinal", "type", "not_null", "is_primary", "default_value"],
@@ -2045,6 +2175,208 @@ try {
       [{ name: 'c"l', type: "STRING" }],
     );
     assert.equal(quotedIx.sql, 'CREATE INDEX "ix""1" ON "a""b" ("c""l");');
+  }
+
+  // SQL formatter — reflow, keyword casing, comment preservation, and the
+  // fail-closed safety net (formatSQL never alters what a statement means).
+  {
+    assert.equal(
+      tools.formatSQL("select a,b from t where x=1 and y=2 order by a"),
+      "SELECT a,\n  b\nFROM t\nWHERE x = 1\n  AND y = 2\nORDER BY a",
+    );
+    assert.equal(
+      tools.formatSQL("SELECT * FROM t   WHERE  a  BETWEEN 1 AND 10"),
+      "SELECT *\nFROM t\nWHERE a BETWEEN 1 AND 10",
+      "BETWEEN ... AND is not broken across lines",
+    );
+    assert.equal(
+      tools.formatSQL("select count(*) from orders o join items i on o.id=i.order_id"),
+      "SELECT count(*)\nFROM orders o\nJOIN items i\n  ON o.id = i.order_id",
+      "only lexer keywords are cased — a function name like count() is left as written",
+    );
+    assert.equal(
+      tools.formatSQL("select uuid() as id -- comment\nfrom t"),
+      "SELECT UUID() AS id -- comment\nFROM t",
+      "a trailing line comment keeps its own line and is preserved verbatim",
+    );
+    assert.equal(
+      tools.formatSQL("insert into t (a,b) values (1,2),(3,4)"),
+      "INSERT INTO t (a, b)\nVALUES (1, 2),\n  (3, 4)",
+    );
+    assert.equal(
+      tools.formatSQL("select 'a, b' as s, x from t where c <> -1"),
+      "SELECT 'a, b' AS s,\n  x\nFROM t\nWHERE c <> -1",
+      "commas and keywords inside a string literal are untouched; unary minus attaches",
+    );
+    assert.equal(
+      tools.formatSQL("create table m (v vector<f32,3>)"),
+      "CREATE TABLE m (v VECTOR<F32,3>)",
+      "vector type parameters are not spread out",
+    );
+    assert.equal(
+      tools.formatSQL("select a from t;select b from u"),
+      "SELECT a\nFROM t;\n\nSELECT b\nFROM u",
+    );
+    // Fail-closed: an unterminated string is returned untouched.
+    assert.equal(tools.formatSQL("select 'oops from t"), "select 'oops from t");
+    // Fail-closed: an unterminated block comment is returned untouched.
+    assert.equal(tools.formatSQL("select 1 /* nope"), "select 1 /* nope");
+    // A non-keyword identifier keeps its exact case; only keywords are cased.
+    assert.equal(tools.formatSQL("Select MyCol From MyTable"), "SELECT MyCol\nFROM MyTable");
+    // Idempotent: formatting already-formatted SQL is a no-op.
+    const once = tools.formatSQL("select a,b from t where x=1");
+    assert.equal(tools.formatSQL(once), once);
+    // Every formatter output re-tokenizes to the same significant stream as
+    // its input (this is the guarantee the fail-closed net enforces).
+    for (const q of [
+      "select a,b,c from t",
+      "update t set a=1,b=2 where id=$1",
+      "delete from t where id in (1,2,3)",
+      "select x from a left outer join b on a.k=b.k where a.v>=10 or a.v<0",
+      "SELECT c FROM t /* mid */ WHERE q = x'deadbeef'",
+      "select * from docs search body for 'hot chocolate' nearest embedding to (0.1,0.2) using cosine limit 5",
+    ]) {
+      const formatted = tools.formatSQL(q);
+      const nospace = (s) => s.replace(/\s+/g, "").toLowerCase();
+      assert.equal(nospace(formatted), nospace(q), `formatter changed tokens for: ${q}`);
+    }
+  }
+
+  // Editable data grid & staged-change review.
+  {
+    const tables = ["articles", "users", "order_items"];
+
+    // detectEditableTable
+    assert.equal(tools.detectEditableTable("SELECT * FROM articles", tables), "articles");
+    assert.equal(tools.detectEditableTable("select id, title from \"articles\" where id = 1", tables), "articles");
+    assert.equal(tools.detectEditableTable("SELECT * FROM Articles", tables), "articles");
+    assert.equal(tools.detectEditableTable("SELECT * FROM missing_table", tables), null);
+    assert.equal(tools.detectEditableTable("SELECT * FROM system.tables", tables), null);
+    assert.equal(tools.detectEditableTable("SELECT * FROM nsql_schema_migrations", tables), null);
+    assert.equal(tools.detectEditableTable("SELECT a.id, u.name FROM articles a JOIN users u ON a.author_id = u.id", tables), null);
+    assert.equal(tools.detectEditableTable("SELECT * FROM articles UNION SELECT * FROM users", tables), null);
+    assert.equal(tools.detectEditableTable("UPDATE articles SET title = 'x'", tables), null);
+
+    // isResultEditable
+    const sampleResult = {
+      columns: ["id", "title", "author_id"],
+      column_types: ["INT64", "STRING", "INT64"],
+      rows: [["1", "First post", "10"]],
+      truncated: false,
+      elapsed_ms: 1,
+    };
+    assert.equal(tools.isResultEditable(sampleResult, ["id"]).editable, true);
+    assert.equal(tools.isResultEditable(sampleResult, ["missing_pk"]).editable, false);
+    assert.equal(tools.isResultEditable(sampleResult, []).editable, false);
+    assert.equal(tools.isResultEditable({ columns: [], rows: [] }, ["id"]).editable, false);
+
+    // makeRowKey & extractRowPK
+    const pkVals = tools.extractRowPK(["1", "First post", "10"], sampleResult.columns, ["id"]);
+    assert.deepEqual(pkVals, { id: "1" });
+    assert.equal(tools.makeRowKey(pkVals), "id=1");
+
+    const compositePKVals = tools.extractRowPK(["100", "200", "5"], ["user_id", "item_id", "qty"], ["item_id", "user_id"]);
+    assert.deepEqual(compositePKVals, { item_id: "200", user_id: "100" });
+    assert.equal(tools.makeRowKey(compositePKVals), "item_id=200|user_id=100");
+
+    // formatCellSQLLiteral
+    assert.equal(tools.formatCellSQLLiteral(null, "STRING"), "NULL");
+    assert.equal(tools.formatCellSQLLiteral("42", "INT64"), "42");
+    assert.equal(tools.formatCellSQLLiteral("3.1415", "DECIMAL(10,4)"), "3.1415");
+    assert.equal(tools.formatCellSQLLiteral("true", "BOOL"), "TRUE");
+    assert.equal(tools.formatCellSQLLiteral("false", "BOOL"), "FALSE");
+    assert.equal(tools.formatCellSQLLiteral("Hello 'world'", "STRING"), "'Hello ''world'''");
+
+    // Staging changes: updates, deletes, inserts
+    let changes = tools.createEmptyStagedChanges("articles", ["id"], {
+      id: "INT64",
+      title: "STRING",
+      author_id: "INT64",
+    });
+    assert.equal(tools.stagedChangesCount(changes), 0);
+    assert.equal(tools.stagedChangesSummary(changes), "No staged changes");
+
+    // 1. Stage update
+    const upd1 = tools.stageCellUpdate(changes, "id=1", { id: "1" }, "title", "STRING", "First post", "Updated Title");
+    assert.equal(upd1.error, null);
+    changes = upd1.changes;
+    assert.equal(tools.stagedChangesCount(changes), 1);
+    assert.equal(tools.stagedChangesSummary(changes), "1 update");
+
+    // Stage another column on the same row -> coalesced under rowKey "id=1"
+    const upd2 = tools.stageCellUpdate(changes, "id=1", { id: "1" }, "author_id", "INT64", "10", "25");
+    assert.equal(upd2.error, null);
+    changes = upd2.changes;
+    assert.equal(tools.stagedChangesCount(changes), 2);
+    assert.equal(tools.stagedChangesSummary(changes), "2 updates");
+
+    // Reverting an update back to original value removes the staged update
+    const revert = tools.stageCellUpdate(changes, "id=1", { id: "1" }, "author_id", "INT64", "10", "10");
+    assert.equal(revert.error, null);
+    changes = revert.changes;
+    assert.equal(tools.stagedChangesCount(changes), 1);
+
+    // 2. Stage delete on row id=2
+    const del1 = tools.stageRowDelete(changes, "id=2", { id: "2" }, ["2", "Second post", "11"]);
+    assert.equal(del1.error, null);
+    changes = del1.changes;
+    assert.equal(tools.stagedChangesCount(changes), 2);
+    assert.equal(tools.stagedChangesSummary(changes), "1 update, 1 deletion");
+
+    // Updating a deleted row fails
+    const badUpd = tools.stageCellUpdate(changes, "id=2", { id: "2" }, "title", "STRING", "Second post", "Cannot edit");
+    assert.match(badUpd.error, /marked for deletion/);
+
+    // Unmarking delete
+    const undel = tools.stageRowDelete(changes, "id=2", { id: "2" }, ["2", "Second post", "11"]);
+    assert.equal(undel.error, null);
+    changes = undel.changes;
+    assert.equal(tools.stagedChangesCount(changes), 1);
+    assert.equal(tools.stagedChangesSummary(changes), "1 update");
+
+    // Re-delete for SQL build test
+    changes = tools.stageRowDelete(changes, "id=2", { id: "2" }, ["2", "Second post", "11"]).changes;
+
+    // 3. Stage insert
+    const ins1 = tools.stageRowInsert(changes, { id: "3", title: "New Article", author_id: "99" });
+    assert.equal(ins1.error, null);
+    changes = ins1.changes;
+    assert.equal(tools.stagedChangesCount(changes), 3);
+    assert.equal(tools.stagedChangesSummary(changes), "1 update, 1 deletion, 1 insertion");
+
+    // 4. Build transactional SQL
+    const built = tools.buildStagedChangeSQL(changes);
+    assert.equal(built.error, null);
+    assert.equal(built.statements[0], "BEGIN;");
+    assert.equal(built.statements[built.statements.length - 1], "COMMIT;");
+
+    // Check statements contents
+    assert.ok(built.statements.some((s) => s.includes("UPDATE \"articles\" SET \"title\" = 'Updated Title' WHERE \"id\" = 1;")));
+    assert.ok(built.statements.some((s) => s.includes("DELETE FROM \"articles\" WHERE \"id\" = 2;")));
+    assert.ok(built.statements.some((s) => s.includes("INSERT INTO \"articles\"")));
+
+    // Composite primary key handling
+    let compositeChanges = tools.createEmptyStagedChanges("order_items", ["order_id", "line_no"], {
+      order_id: "INT64",
+      line_no: "INT64",
+      qty: "INT64",
+    });
+    compositeChanges = tools.stageCellUpdate(
+      compositeChanges,
+      "line_no=1|order_id=500",
+      { order_id: "500", line_no: "1" },
+      "qty",
+      "INT64",
+      "2",
+      "5",
+    ).changes;
+    const compositeBuilt = tools.buildStagedChangeSQL(compositeChanges);
+    assert.equal(compositeBuilt.error, null);
+    assert.ok(compositeBuilt.statements.some((s) => s.includes("WHERE \"order_id\" = 500 AND \"line_no\" = 1;")));
+
+    // Empty changes
+    const emptyBuilt = tools.buildStagedChangeSQL(tools.createEmptyStagedChanges("articles", ["id"]));
+    assert.match(emptyBuilt.error, /No staged changes/);
   }
 
   console.log("Studio result helper tests passed");

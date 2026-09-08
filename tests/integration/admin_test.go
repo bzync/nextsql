@@ -32,6 +32,7 @@ func startManager(t *testing.T, serverAddr string) string {
 	}
 	srv, err := admin.New(admin.Config{
 		Mode:          admin.ModeOperate,
+		Listen:        "127.0.0.1:0",
 		ServerAddr:    serverAddr,
 		ServerTLSCA:   caPath,
 		ServerTLSName: "localhost",
@@ -112,6 +113,14 @@ func TestAdminOpsLoginOverviewLogout(t *testing.T) {
 	csrf, _ := body["csrf_token"].(string)
 	if csrf == "" {
 		t.Fatal("no csrf_token in login response")
+	}
+
+	res, connStatus := doJSON(t, c, "GET", base+"/api/v1/connection", "", nil)
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("connection: want 200, got %d (%v)", res.StatusCode, connStatus)
+	}
+	if connected, _ := connStatus["connected"].(bool); !connected {
+		t.Fatalf("live nextsqld should report connected: %v", connStatus)
 	}
 
 	// Overview reflects server truth from system.*.
@@ -407,6 +416,13 @@ func TestAdminOpsLoginOverviewLogout(t *testing.T) {
 	if _, ok := bkbody["restore_hint"].(string); !ok {
 		t.Fatalf("backups: missing restore_hint")
 	}
+	// backup_state is derived from system.config, which reports zero rows in
+	// this harness (no config source wired — see the M8 assertion below), so
+	// the Manager cannot tell configured from unset and must say "unknown"
+	// rather than a misleading "unset".
+	if got, _ := bkbody["backup_state"].(string); got != "unknown" {
+		t.Fatalf("backups: want backup_state \"unknown\" (no config source), got %q", got)
+	}
 	bcreate, _ := doJSON(t, c, "POST", base+"/api/v1/backups/action", csrf, map[string]any{"op": "create"})
 	if bcreate.StatusCode != http.StatusConflict {
 		t.Fatalf("backup create with no backup_dir: want 409, got %d", bcreate.StatusCode)
@@ -427,7 +443,7 @@ func TestAdminOpsLoginOverviewLogout(t *testing.T) {
 	if res.StatusCode != http.StatusNoContent {
 		t.Fatalf("logout: want 204, got %d", res.StatusCode)
 	}
-	for _, p := range []string{"/api/v1/overview", "/api/v1/databases", "/api/v1/activity", "/api/v1/security", "/api/v1/cluster", "/api/v1/maintenance", "/api/v1/config", "/api/v1/diagnostics", "/api/v1/backups"} {
+	for _, p := range []string{"/api/v1/overview", "/api/v1/databases", "/api/v1/activity", "/api/v1/security", "/api/v1/cluster", "/api/v1/maintenance", "/api/v1/config", "/api/v1/diagnostics", "/api/v1/backups", "/api/v1/connection"} {
 		res, _ = doJSON(t, c, "GET", base+p, "", nil)
 		if res.StatusCode != http.StatusUnauthorized {
 			t.Fatalf("%s after logout: want 401, got %d", p, res.StatusCode)
@@ -873,6 +889,36 @@ func TestAdminStudioWorkspaceOverNSQL(t *testing.T) {
 		t.Fatalf("analyze syntax error: want 400, got %d (%v)", res.StatusCode, analysis)
 	}
 
+	// The editor's live parse-diagnostics strip: the same grammar, one
+	// location per broken statement, mapped back to the whole buffer. Also
+	// parser-only — no connection, no query slot.
+	res, diagClean := doJSON(t, c, "POST", base+"/api/v1/studio/query/diagnostics", csrf, map[string]any{
+		"sql": "SELECT id FROM studio_items WHERE id = 1",
+	})
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("diagnostics valid: want 200, got %d (%v)", res.StatusCode, diagClean)
+	}
+	if ds, _ := diagClean["diagnostics"].([]any); len(ds) != 0 {
+		t.Fatalf("diagnostics for a valid buffer: want none, got %v", diagClean)
+	}
+	res, diagBroken := doJSON(t, c, "POST", base+"/api/v1/studio/query/diagnostics", csrf, map[string]any{
+		"sql": "SELECT 1;\nSELECT id FROM studio_items WHRE id = 1",
+	})
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("diagnostics broken: want 200, got %d (%v)", res.StatusCode, diagBroken)
+	}
+	ds, _ := diagBroken["diagnostics"].([]any)
+	if len(ds) != 1 {
+		t.Fatalf("diagnostics: want exactly one for the second statement, got %v", diagBroken)
+	}
+	d0, _ := ds[0].(map[string]any)
+	if line, _ := d0["line"].(float64); line != 2 {
+		t.Fatalf("diagnostic line: want 2 (buffer-relative), got %v (%v)", d0["line"], diagBroken)
+	}
+	if msg, _ := d0["message"].(string); msg == "" || strings.HasPrefix(msg, "nextsql ") {
+		t.Fatalf("diagnostic message: want a clean reason, got %q", d0["message"])
+	}
+
 	// Exercise the browser cancellation endpoint against a query that is
 	// deterministically waiting on a real transaction lock. BEGIN on the
 	// Studio connection first also proves cancellation is scoped to that
@@ -1090,6 +1136,7 @@ func startManagerInsecure(t *testing.T, serverAddr string) string {
 	t.Helper()
 	srv, err := admin.New(admin.Config{
 		Mode:           admin.ModeOperate,
+		Listen:         "127.0.0.1:0",
 		ServerAddr:     serverAddr,
 		InsecureServer: true,
 	}, admin.Options{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})

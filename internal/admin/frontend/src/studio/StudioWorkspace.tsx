@@ -15,7 +15,6 @@ import {
   Heading,
   Inline,
   Input,
-  Kbd,
   Popover,
   PopoverContent,
   Select,
@@ -23,12 +22,15 @@ import {
   Stack,
   Text,
 } from "@bzync/rui";
+import { Icon, type IconName } from "../shared/icons";
 import {
   ApiError,
   api,
   type Activity,
   type Security,
+  type ServerConnection,
   type StudioAnalysis,
+  type StudioDiagnostic,
   type StudioBootstrap,
   type StudioReadConsistency,
   type StudioQueryParam,
@@ -52,6 +54,7 @@ import { MigrationExplorer } from "./MigrationExplorer";
 import { SchemaDiagramExplorer } from "./SchemaDiagramExplorer";
 import { DataGeneratorExplorer } from "./DataGeneratorExplorer";
 import { ImportExplorer } from "./ImportExplorer";
+import { VectorImportExplorer } from "./VectorImportExplorer";
 import { DMLBuilderExplorer } from "./DMLBuilderExplorer";
 import { SchemaDesignerExplorer, type SchemaDesignerMode } from "./SchemaDesignerExplorer";
 import { ObjectSearch } from "./ObjectSearch";
@@ -73,11 +76,13 @@ import {
   currentNearestContext,
   currentWordRange,
   editorDraftStorageKey,
+  detectEditableTable,
   editorDraftsWorthRestoring,
   environmentStorageKey,
   extractQueryParams,
   extractReferencedTables,
   findAllMatches,
+  formatSQL,
   grantStateFromRow,
   isStudioEnvironment,
   jsonPathIndexPaths,
@@ -87,6 +92,7 @@ import {
   queryResultSummary,
   realmScopeWarning,
   resetStudioLayout,
+  resultColumn,
   nextMatchIndex,
   previousMatchIndex,
   parseEditorDrafts,
@@ -113,7 +119,9 @@ import {
   stepLayoutWidth,
   upsertSavedQuery,
   suggestTableNameFixes,
+  tableColumnTypesRecord,
   tableConstraintsResult,
+  tablePKColumns,
   vectorColumnsFromResult,
   withCachedTableLoading,
   type FindMatch,
@@ -348,10 +356,20 @@ export function StudioWorkspace({
   who,
   onUnauthorized,
   onConnectionChanged,
+  serverConnection,
+  connectionChecking,
+  onRetryConnection,
+  routeTable,
+  onSelectRouteTable,
 }: {
   who: Whoami;
   onUnauthorized: () => void;
   onConnectionChanged: (next: { realm: string; database: string }) => void;
+  serverConnection: ServerConnection | null;
+  connectionChecking: boolean;
+  onRetryConnection: () => void;
+  routeTable?: string;
+  onSelectRouteTable?: (table: string) => void;
 }) {
   const [bootstrap, setBootstrap] = useState<StudioBootstrap | null>(null);
   const [switchOpen, setSwitchOpen] = useState(false);
@@ -433,6 +451,7 @@ export function StudioWorkspace({
   const [hasSelection, setHasSelection] = useState(false);
   const [history, setHistory] = useState<StudioHistoryEntry[]>([]);
   const [historyOpen, setHistoryOpen] = useState(false);
+  const [moreOpen, setMoreOpen] = useState(false);
   const [grantBuilderOpen, setGrantBuilderOpen] = useState(false);
   const [grantPrefill, setGrantPrefill] = useState<GrantBuilderState | null>(null);
   const [fullTextExplorerOpen, setFullTextExplorerOpen] = useState(false);
@@ -460,6 +479,7 @@ export function StudioWorkspace({
   const [objectSearchOpen, setObjectSearchOpen] = useState(false);
   const [dataGeneratorOpen, setDataGeneratorOpen] = useState(false);
   const [importOpen, setImportOpen] = useState(false);
+  const [vectorImportOpen, setVectorImportOpen] = useState(false);
   const [dmlBuilderOpen, setDmlBuilderOpen] = useState(false);
   const [schemaDesignerOpen, setSchemaDesignerOpen] = useState(false);
   const [schemaDesignerMode, setSchemaDesignerMode] = useState<SchemaDesignerMode>("table");
@@ -473,6 +493,9 @@ export function StudioWorkspace({
   const [findMatchCase, setFindMatchCase] = useState(false);
   const [currentMatchIndex, setCurrentMatchIndex] = useState<number | null>(null);
   const [replaceStatus, setReplaceStatus] = useState<string | null>(null);
+  const [formatNotice, setFormatNotice] = useState<string | null>(null);
+  const [parseDiags, setParseDiags] = useState<StudioDiagnostic[]>([]);
+  const diagSeq = useRef(0);
   const [suggestOpen, setSuggestOpen] = useState(false);
   const [cursorPos, setCursorPos] = useState(0);
   const [activeSuggestionIndex, setActiveSuggestionIndex] = useState(0);
@@ -899,6 +922,107 @@ export function StudioWorkspace({
     setSQL(applyTableNameFix(sql, fix));
   }, [sql, setSQL]);
 
+  // Live parse diagnostics: a debounced round trip to the server's own
+  // grammar (POST /studio/query/diagnostics — no connection, no query slot)
+  // reports where each statement in the buffer fails to parse. RUI's
+  // CodeEditor has no text-overlay primitive, so this renders as a strip
+  // under the editor with a jump-to-error control rather than an inline
+  // squiggle. Advisory only — the server still parses/binds/authorizes on
+  // Run — and grammar-only: an unknown table or column is reported by
+  // nextsqld when the statement actually executes, not here. A network or
+  // auth failure clears the strip; it must never block a run.
+  useEffect(() => {
+    const buffer = sql;
+    if (!buffer.trim()) {
+      setParseDiags([]);
+      return;
+    }
+    const seq = ++diagSeq.current;
+    const handle = window.setTimeout(() => {
+      api
+        .studioDiagnostics(buffer)
+        .then((report) => {
+          if (!mounted.current || diagSeq.current !== seq) return;
+          setParseDiags(report.diagnostics.slice(0, 20));
+        })
+        .catch((error: unknown) => {
+          if (!mounted.current || diagSeq.current !== seq) return;
+          if (error instanceof ApiError && error.status === 401) {
+            onUnauthorized();
+            return;
+          }
+          setParseDiags([]);
+        });
+    }, 400);
+    return () => window.clearTimeout(handle);
+  }, [sql, onUnauthorized]);
+
+  // jumpToDiagnostic moves the real textarea caret to a diagnostic's
+  // position (offset is a UTF-16 code-unit index, matching JS string
+  // indexing) and selects the token there so the operator sees where the
+  // parser stopped.
+  const jumpToDiagnostic = useCallback((diag: StudioDiagnostic) => {
+    const textarea = editorHost.current?.querySelector("textarea");
+    if (!textarea) return;
+    const start = Math.max(0, Math.min(diag.offset, textarea.value.length));
+    const end = Math.min(textarea.value.length, start + 1);
+    requestAnimationFrame(() => {
+      textarea.focus();
+      textarea.setSelectionRange(start, end);
+      setCursorPos(start);
+    });
+  }, []);
+
+  // Editable data grid & transactional changes
+  const editableTable = useMemo(() => {
+    if (!result || !sql) return null;
+    return detectEditableTable(sql, catalogTableNames);
+  }, [result, sql, catalogTableNames]);
+
+  const [editableDetail, setEditableDetail] = useState<StudioTableDetail | null>(null);
+
+  useEffect(() => {
+    if (!editableTable) {
+      setEditableDetail(null);
+      return;
+    }
+    if (selectedTable === editableTable && detail) {
+      setEditableDetail(detail);
+      return;
+    }
+    let active = true;
+    api.studioTable(editableTable)
+      .then((data) => {
+        if (active) setEditableDetail(data);
+      })
+      .catch(() => {
+        if (active) setEditableDetail(null);
+      });
+    return () => {
+      active = false;
+    };
+  }, [editableTable, selectedTable, detail]);
+
+  const editablePKs = useMemo(() => {
+    if (!editableTable) return [];
+    if (editableDetail) return tablePKColumns(editableDetail);
+    if (bootstrap?.tables) {
+      const nameIdx = resultColumn(bootstrap.tables, "name");
+      const pkIdx = resultColumn(bootstrap.tables, "pk");
+      if (nameIdx >= 0 && pkIdx >= 0) {
+        const row = bootstrap.tables.rows.find((r) => (r[nameIdx] ?? "").toLowerCase() === editableTable.toLowerCase());
+        const pk = row ? row[pkIdx] : null;
+        if (pk) return [pk];
+      }
+    }
+    return [];
+  }, [editableTable, editableDetail, bootstrap?.tables]);
+
+  const editableColTypes = useMemo(() => {
+    if (editableDetail) return tableColumnTypesRecord(editableDetail);
+    return {};
+  }, [editableDetail]);
+
   const openSuggest = useCallback(() => {
     setSuggestOpen(true);
     requestAnimationFrame(() => editorHost.current?.querySelector("textarea")?.focus());
@@ -1128,6 +1252,61 @@ export function StudioWorkspace({
   const vectorSupported = useMemo(() => capabilityAvailable(bootstrap, "vector"), [bootstrap]);
   const hybridSupported = fullTextSupported && vectorSupported;
   const geoSupported = useMemo(() => capabilityAvailable(bootstrap, "geo"), [bootstrap]);
+
+  const moreGroups = useMemo(() => {
+    const run = (action: () => void) => {
+      setMoreOpen(false);
+      action();
+    };
+    const groups: { label: string; items: { label: string; icon: IconName; disabled?: boolean; title?: string; run: () => void }[] }[] = [
+      {
+        label: "Search",
+        items: [
+          { label: "Full-text…", icon: "search", disabled: !fullTextSupported, title: fullTextSupported ? "Build a native SEARCH query" : "This server does not report fulltext support", run: () => run(() => setFullTextExplorerOpen(true)) },
+          { label: "Vector…", icon: "layers", disabled: !vectorSupported, title: vectorSupported ? "Build a native NEAREST query" : "This server does not report vector support", run: () => run(() => setVectorExplorerOpen(true)) },
+          { label: "Hybrid…", icon: "network", disabled: !hybridSupported, title: hybridSupported ? "Build a native structured filter + SEARCH + NEAREST query" : "This server does not report both fulltext and vector support", run: () => run(() => setHybridExplorerOpen(true)) },
+          { label: "Geo…", icon: "map-pin", disabled: !geoSupported, title: geoSupported ? "Build a native DWITHIN/WITHIN query over a POINT column" : "This server does not report geo support", run: () => run(() => setGeoExplorerOpen(true)) },
+        ],
+      },
+      {
+        label: "Security",
+        items: [
+          { label: "Grant / Revoke…", icon: "key", run: () => run(openGrantBuilder) },
+          { label: "Users & roles…", icon: "users", run: () => run(openSecurityExplorer) },
+          { label: "Audit…", icon: "shield", run: () => run(openAuditExplorer) },
+        ],
+      },
+      {
+        label: "Operations",
+        items: [
+          { label: "Transactions & locks…", icon: "lock", run: () => run(openActivityExplorer) },
+          { label: "Workflows & CDC…", icon: "activity", run: () => run(openWorkflowExplorer) },
+          { label: "Migrations…", icon: "clock", run: () => run(openMigrationExplorer) },
+        ],
+      },
+      {
+        label: "Schema",
+        items: [
+          { label: "Schema diagram…", icon: "network", run: () => run(openSchemaDiagram) },
+          { label: "Design schema…", icon: "table", run: () => run(() => { setSchemaDesignerMode("table"); setSchemaDesignerOpen(true); }) },
+        ],
+      },
+      {
+        label: "Data",
+        items: [
+          { label: "Generate data…", icon: "plus", run: () => run(() => setDataGeneratorOpen(true)) },
+          { label: "Import data…", icon: "download", run: () => run(() => setImportOpen(true)) },
+          { label: "Import vector dataset…", icon: "download", run: () => run(() => setVectorImportOpen(true)) },
+          { label: "Parameterized DML…", icon: "file", run: () => run(() => setDmlBuilderOpen(true)) },
+        ],
+      },
+    ];
+    return groups;
+  }, [
+    fullTextSupported, vectorSupported, hybridSupported, geoSupported,
+    openGrantBuilder, openSecurityExplorer, openAuditExplorer,
+    openActivityExplorer, openWorkflowExplorer, openMigrationExplorer, openSchemaDiagram,
+  ]);
   const jsonExplorerContext = useMemo(() => {
     if (!selectedTable || !detail) return undefined;
     return {
@@ -1146,6 +1325,7 @@ export function StudioWorkspace({
   const selectTable = useCallback((name: string) => {
     detailRequest.current = name;
     setSelectedTable(name);
+    onSelectRouteTable?.(name);
     setDetail(null);
     setDetailError(null);
     setLoadingDetail(true);
@@ -1159,11 +1339,11 @@ export function StudioWorkspace({
       .finally(() => {
         if (mounted.current && detailRequest.current === name) setLoadingDetail(false);
       });
-  }, [handleFailure]);
+  }, [handleFailure, onSelectRouteTable]);
 
   useEffect(() => {
     if (restoredTableApplied.current) return;
-    const name = restoredTable.current;
+    const name = routeTable && allTables.includes(routeTable) ? routeTable : restoredTable.current;
     if (!bootstrap) {
       if (bootstrapError) {
         restoredTableApplied.current = true;
@@ -1182,7 +1362,13 @@ export function StudioWorkspace({
     }
     setSelectedTable(null);
     setLoadingDetail(false);
-  }, [bootstrap, bootstrapError, allTables, selectTable]);
+  }, [bootstrap, bootstrapError, allTables, selectTable, routeTable]);
+
+  useEffect(() => {
+    if (routeTable && allTables.includes(routeTable) && selectedTable !== routeTable) {
+      selectTable(routeTable);
+    }
+  }, [routeTable, allTables, selectedTable, selectTable]);
 
   const loadFullTextTable = useCallback(async (name: string): Promise<StudioTableDetail> => {
     try {
@@ -1322,6 +1508,31 @@ export function StudioWorkspace({
     updateTab(tabId, { sql: target });
     void executeQuery(tabId, target, false, null);
   }, [activeTabId, executeQuery, running, updateTab]);
+
+  const commitStagedChanges = useCallback(async (_fullSQL: string, statements: string[]) => {
+    if (running || !statements || statements.length === 0) return;
+    const tabId = activeTabId;
+    const currentSQL = sql;
+    const id = queryID();
+    setRunning(true);
+    setRunningTabId(tabId);
+    try {
+      for (const stmt of statements) {
+        await api.studioQuery({ query_id: id, sql: stmt });
+      }
+    } catch (err) {
+      try {
+        await api.studioQuery({ query_id: queryID(), sql: "ROLLBACK;" });
+      } catch {
+        // ignore rollback error
+      }
+      throw err;
+    } finally {
+      setRunning(false);
+      setRunningTabId(null);
+    }
+    void executeQuery(tabId, currentSQL, false);
+  }, [activeTabId, executeQuery, running, sql]);
 
   const loadFromHistory = useCallback((entry: StudioHistoryEntry) => {
     setSQL(entry.sql);
@@ -1547,6 +1758,31 @@ export function StudioWorkspace({
     requestAnimationFrame(() => findInputRef.current?.focus());
   }, [selectedSQL]);
 
+  // Reflow the active tab's SQL for readability. formatSQL never runs
+  // anything and returns the buffer untouched when it cannot reformat
+  // safely (an unterminated string/comment, or a reflow that would not
+  // re-tokenize identically) — so the worst case is "nothing changed".
+  const formatBuffer = useCallback(() => {
+    const current = tabs.find((t) => t.id === activeTabId)?.sql ?? "";
+    if (!current.trim()) {
+      setFormatNotice("Nothing to format.");
+      return;
+    }
+    const next = formatSQL(current);
+    if (next === current) {
+      setFormatNotice("Already formatted, or it could not be reformatted safely.");
+      return;
+    }
+    updateTab(activeTabId, { sql: next });
+    setFormatNotice("Formatted.");
+  }, [tabs, activeTabId, updateTab]);
+
+  useEffect(() => {
+    if (!formatNotice) return;
+    const timer = window.setTimeout(() => setFormatNotice(null), 4000);
+    return () => window.clearTimeout(timer);
+  }, [formatNotice]);
+
   const focusMatch = useCallback((index: number, matches: FindMatch[]) => {
     const textarea = editorHost.current?.querySelector("textarea");
     const match = matches[index];
@@ -1621,6 +1857,10 @@ export function StudioWorkspace({
       event.preventDefault();
       event.stopPropagation();
       void requestRun();
+    } else if (event.code === "KeyF" && event.shiftKey && event.altKey && !event.ctrlKey && !event.metaKey) {
+      event.preventDefault();
+      event.stopPropagation();
+      formatBuffer();
     } else if ((event.key === "f" || event.key === "F") && (event.ctrlKey || event.metaKey)) {
       event.preventDefault();
       event.stopPropagation();
@@ -1651,7 +1891,7 @@ export function StudioWorkspace({
         }
       }
     }
-  }, [acceptSuggestion, activeSuggestionIndex, openFind, openSuggest, requestRun, suggestOpen, suggestions]);
+  }, [acceptSuggestion, activeSuggestionIndex, formatBuffer, openFind, openSuggest, requestRun, suggestOpen, suggestions]);
 
   const insertTableQuery = useCallback(() => {
     if (selectedTable) setSQL(`SELECT * FROM ${selectedTable} LIMIT 100`);
@@ -1744,12 +1984,14 @@ export function StudioWorkspace({
       { id: "run-script", label: "Run script", keywords: "execute all statements", disabled: busy || hasSelection || !sql.trim(), run: () => void requestRunScript() },
       { id: "cancel", label: "Cancel running query", keywords: "stop abort", disabled: !running || cancelRequested, run: () => void cancelQuery() },
       { id: "suggest", label: "Suggest table / column names", hint: "Ctrl+Space", keywords: "autocomplete intellisense", run: openSuggest },
+      { id: "format-sql", label: "Format SQL", hint: "Shift+Alt+F", keywords: "reflow pretty print indent beautify tidy", disabled: !sql.trim(), run: formatBuffer },
       { id: "saved", label: "Saved queries…", keywords: "snippets folders tags", run: () => setSavedOpen(true) },
       { id: "search-objects", label: "Search objects…", keywords: "find table workflow", run: openObjectSearch },
       { id: "switch-connection", label: "Switch connection…", keywords: "realm database reconnect", run: () => setSwitchOpen(true) },
       { id: "schema-diagram", label: "Schema diagram…", keywords: "er foreign keys relationships", run: () => setSchemaDiagramOpen(true) },
       { id: "data-generator", label: "Generate development data…", keywords: "seed rows insert synthetic fixture mock sample", run: () => setDataGeneratorOpen(true) },
       { id: "import-data", label: "Import CSV / JSON data…", keywords: "load file tsv ndjson insert upload", run: () => setImportOpen(true) },
+      { id: "import-vector-dataset", label: "Import vector dataset…", keywords: "embedding vector bitvector sparsevector ndjson load insert ann", run: () => setVectorImportOpen(true) },
       { id: "dml-builder", label: "Parameterized INSERT / UPDATE / DELETE…", keywords: "dml template placeholder $1 bind statement write", run: () => setDmlBuilderOpen(true) },
       { id: "design-table", label: "Design table…", keywords: "create table schema ddl columns primary key foreign key", run: () => { setSchemaDesignerMode("table"); setSchemaDesignerOpen(true); } },
       { id: "design-index", label: "Design index…", keywords: "create index unique fulltext vector spatial btree", run: () => { setSchemaDesignerMode("index"); setSchemaDesignerOpen(true); } },
@@ -1769,7 +2011,7 @@ export function StudioWorkspace({
     ];
   }, [
     running, checkingSQL, splittingScript, hasSelection, sql, cancelRequested,
-    addTab, requestRun, requestRunScript, cancelQuery, openSuggest, openObjectSearch,
+    addTab, requestRun, requestRunScript, cancelQuery, openSuggest, formatBuffer, openObjectSearch,
     openSecurityExplorer, openActivityExplorer, openAuditExplorer, openWorkflowExplorer,
     openMigrationExplorer, explorerVisible, inspectorVisible, resetLayout,
   ]);
@@ -1820,6 +2062,18 @@ export function StudioWorkspace({
         </Alert>
       ) : null}
 
+      {serverConnection && !serverConnection.connected ? (
+        <Alert variant="error" title="nextsqld is not connected" role="alert">
+          <Inline gap="sm" align="center" wrap>
+            <Text size="sm">
+              {serverConnection.error || "The Admin session is still signed in, but this workspace cannot reach nextsqld."}
+              {" "}Queries will fail until the server is reachable again. Sign in again if the process restarted.
+            </Text>
+            <Button variant="outline" size="sm" icon={<Icon name="refresh" size={14} />} onClick={onRetryConnection}>Retry</Button>
+          </Inline>
+        </Alert>
+      ) : null}
+
       {environment === "production" ? (
         <Alert variant="warning" title="Production environment" role="alert">
           <Inline gap="sm" align="center" wrap>
@@ -1842,9 +2096,17 @@ export function StudioWorkspace({
 
       <div className="nss-toolbar" aria-label="Studio connection context">
         <Inline gap="sm" align="center" wrap>
-          <Badge variant="success" dot>Connected</Badge>
-          {bootstrap?.server_addr ? (
-            <Text size="sm" variant="muted" title={`nextsqld ${bootstrap.server_addr}`}>{bootstrap.server_addr}</Text>
+          {serverConnection && !serverConnection.connected ? (
+            <Badge variant="error" dot>Disconnected</Badge>
+          ) : connectionChecking && !serverConnection ? (
+            <Badge variant="muted" dot>Checking…</Badge>
+          ) : (
+            <Badge variant="success" dot>Connected</Badge>
+          )}
+          {(serverConnection?.server_addr || bootstrap?.server_addr) ? (
+            <Text size="sm" variant="muted" title={`nextsqld ${serverConnection?.server_addr || bootstrap?.server_addr}`}>
+              {serverConnection?.server_addr || bootstrap?.server_addr}
+            </Text>
           ) : null}
           <Text size="sm" variant="muted" title={contextLabel}>{contextLabel}</Text>
           {bootstrap ? (
@@ -1861,10 +2123,13 @@ export function StudioWorkspace({
           ) : null}
         </Inline>
         <Inline gap="sm" align="center" wrap>
-          <Button variant="outline" size="sm" onClick={() => setSwitchOpen(true)}>Switch connection…</Button>
+          <Button variant="outline" size="sm" icon={<Icon name="plug" size={14} />} onClick={() => setSwitchOpen(true)}>Switch connection…</Button>
           <Select
             id="studio-read-consistency"
             label="Read consistency"
+            labelClassName="sr-only"
+            wrapperClassName="nss-toolbar-select"
+            triggerClassName="nss-toolbar-select-trigger"
             options={[
               { value: "strong", label: "Strong" },
               { value: "bounded", label: "Bounded" },
@@ -1882,6 +2147,9 @@ export function StudioWorkspace({
             <Input
               id="studio-read-staleness"
               label="Max staleness (s)"
+              labelClassName="sr-only"
+              wrapperClassName="nss-toolbar-staleness"
+              placeholder="Staleness (s)"
               type="number"
               min={0}
               value={String(stalenessSec)}
@@ -1893,6 +2161,9 @@ export function StudioWorkspace({
           <Select
             id="studio-environment"
             label="Environment"
+            labelClassName="sr-only"
+            wrapperClassName="nss-toolbar-select"
+            triggerClassName="nss-toolbar-select-trigger"
             options={[
               { value: "", label: "Not set" },
               ...STUDIO_ENVIRONMENTS.map((env) => ({ value: env, label: env })),
@@ -1900,15 +2171,14 @@ export function StudioWorkspace({
             value={environment ?? ""}
             onChange={(value) => setEnvironment(isStudioEnvironment(value) ? value : null)}
           />
-          <Text size="sm" variant="muted">Catalog and queries use this authenticated NSQL session.</Text>
           {!explorerVisible ? (
-            <Button variant="outline" size="sm" onClick={() => setExplorerVisible(true)}>Show explorer</Button>
+            <Button variant="outline" size="sm" icon={<Icon name="folder" size={14} />} onClick={() => setExplorerVisible(true)}>Show explorer</Button>
           ) : null}
           {!inspectorVisible ? (
-            <Button variant="outline" size="sm" onClick={() => setInspectorVisible(true)}>Show inspector</Button>
+            <Button variant="outline" size="sm" icon={<Icon name="search" size={14} />} onClick={() => setInspectorVisible(true)}>Show inspector</Button>
           ) : null}
           {!explorerVisible ? (
-            <Button variant="ghost" size="sm" onClick={() => setPaletteOpen(true)} title="Command palette (Ctrl/Cmd+K)">Commands</Button>
+            <Button variant="ghost" size="sm" icon={<Icon name="terminal" size={14} />} onClick={() => setPaletteOpen(true)} title="Command palette (Ctrl/Cmd+K)">Commands</Button>
           ) : null}
         </Inline>
       </div>
@@ -1952,10 +2222,15 @@ export function StudioWorkspace({
         {explorerVisible ? (
         <Card variant="bordered" className="nss-explorer">
           <CardHeader className="nss-explorer-header">
-            <CardTitle as="h2">Database explorer</CardTitle>
+            <CardTitle as="h2">
+              <Inline gap="xs" align="center" wrap={false}>
+                <Icon name="database" size={16} />
+                Database explorer
+              </Inline>
+            </CardTitle>
             <Inline gap="xs" align="center" wrap>
-              <Button variant="ghost" size="sm" onClick={() => setPaletteOpen(true)} title="Command palette (Ctrl/Cmd+K)">Commands</Button>
-              <Button variant="outline" size="sm" onClick={openObjectSearch}>Search objects…</Button>
+              <Button variant="ghost" size="sm" icon={<Icon name="terminal" size={14} />} onClick={() => setPaletteOpen(true)} title="Command palette (Ctrl/Cmd+K)">Commands</Button>
+              <Button variant="outline" size="sm" icon={<Icon name="search" size={14} />} onClick={openObjectSearch}>Search objects…</Button>
               <Button variant="ghost" size="sm" onClick={() => setExplorerVisible(false)}>Hide explorer</Button>
             </Inline>
           </CardHeader>
@@ -1995,31 +2270,38 @@ export function StudioWorkspace({
         <Card variant="bordered" className="nss-editor-card">
           <CardHeader className="nss-editor-header">
             <Stack gap="xs">
-              <CardTitle as="h2">Query editor</CardTitle>
+              <CardTitle as="h2">
+                <Inline gap="xs" align="center" wrap={false}>
+                  <Icon name="studio" size={16} />
+                  Query editor
+                </Inline>
+              </CardTitle>
               <Text size="sm" variant="muted">
                 One statement · 1 MiB SQL · 25 second timeout
                 {hasSelection ? " · a selection runs only the highlighted text" : ""}
               </Text>
             </Stack>
-            <Inline gap="sm" align="center" wrap>
-              <Text as="span" size="sm" variant="muted">Run</Text>
-              <Kbd keys={["Ctrl", "Enter"]} size="sm" />
-              <Button variant="primary" size="sm" onClick={() => void requestRun()} disabled={running || checkingSQL || splittingScript || (!hasSelection && !sql.trim())}>
-                {otherTabRunning ? "Busy…" : running ? "Running…" : checkingSQL ? "Checking…" : hasSelection ? "Run selection" : "Run query"}
-              </Button>
-              <Button variant="outline" size="sm" onClick={() => void requestRunScript()} disabled={running || checkingSQL || splittingScript || hasSelection || !sql.trim()}>
-                {splittingScript ? "Splitting…" : "Run script"}
-              </Button>
-              <Button variant="outline" size="sm" onClick={() => void cancelQuery()} disabled={!running || cancelRequested}>
-                {cancelRequested ? "Canceling…" : "Cancel"}
-              </Button>
+            <div className="nss-editor-actions">
+              <div className="nss-action-group">
+                <Button variant="primary" size="sm" icon={<Icon name="play" size={14} />} onClick={() => void requestRun()} disabled={running || checkingSQL || splittingScript || (serverConnection !== null && !serverConnection.connected) || (!hasSelection && !sql.trim())} title="Run query (Ctrl+Enter)">
+                  {otherTabRunning ? "Busy…" : running ? "Running…" : checkingSQL ? "Checking…" : hasSelection ? "Run selection" : "Run query"}
+                </Button>
+                <Button variant="outline" size="sm" icon={<Icon name="list" size={14} />} onClick={() => void requestRunScript()} disabled={running || checkingSQL || splittingScript || hasSelection || (serverConnection !== null && !serverConnection.connected) || !sql.trim()} title="Run script">
+                  {splittingScript ? "Splitting…" : "Run script"}
+                </Button>
+                <Button variant="outline" size="sm" icon={<Icon name="stop" size={14} />} onClick={() => void cancelQuery()} disabled={!running || cancelRequested} title="Cancel query">
+                  {cancelRequested ? "Canceling…" : "Cancel"}
+                </Button>
+              </div>
+              <div className="nss-toolbar-sep" aria-hidden="true" />
+              <div className="nss-action-group">
               <Popover
                 open={suggestOpen}
                 onOpenChange={(open) => (open ? openSuggest() : setSuggestOpen(false))}
                 ariaLabel="SQL suggestions"
                 side="bottom"
                 align="start"
-                trigger={<Button variant="outline" size="sm" onClick={openSuggest}>Suggest</Button>}
+                trigger={<Button variant="outline" size="sm" icon={<Icon name="search" size={14} />} onClick={openSuggest}>Suggest</Button>}
               >
                 <PopoverContent className="nss-suggest-panel">
                   <Stack gap="sm">
@@ -2082,6 +2364,15 @@ export function StudioWorkspace({
                   </Stack>
                 </PopoverContent>
               </Popover>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={formatBuffer}
+                disabled={!sql.trim()}
+                title="Reflow this tab's SQL (Shift+Alt+F) — never runs anything"
+              >
+                Format
+              </Button>
               <Popover
                 open={findOpen}
                 onOpenChange={setFindOpen}
@@ -2144,157 +2435,126 @@ export function StudioWorkspace({
                   </Stack>
                 </PopoverContent>
               </Popover>
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={() => setFullTextExplorerOpen(true)}
-                disabled={!fullTextSupported}
-                title={fullTextSupported ? "Build a native SEARCH query" : "This server does not report fulltext support"}
-              >
-                Full-text…
-              </Button>
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={() => setVectorExplorerOpen(true)}
-                disabled={!vectorSupported}
-                title={vectorSupported ? "Build a native NEAREST query" : "This server does not report vector support"}
-              >
-                Vector…
-              </Button>
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={() => setHybridExplorerOpen(true)}
-                disabled={!hybridSupported}
-                title={hybridSupported ? "Build a native structured filter + SEARCH + NEAREST query" : "This server does not report both fulltext and vector support"}
-              >
-                Hybrid…
-              </Button>
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={() => setGeoExplorerOpen(true)}
-                disabled={!geoSupported}
-                title={geoSupported ? "Build a native DWITHIN/WITHIN query over a POINT column" : "This server does not report geo support"}
-              >
-                Geo…
-              </Button>
-              <Button variant="outline" size="sm" onClick={openGrantBuilder}>
-                Grant / Revoke…
-              </Button>
-              <Button variant="outline" size="sm" onClick={openSecurityExplorer}>
-                Users & roles…
-              </Button>
-              <Button variant="outline" size="sm" onClick={openActivityExplorer}>
-                Transactions & locks…
-              </Button>
-              <Button variant="outline" size="sm" onClick={openAuditExplorer}>
-                Audit…
-              </Button>
-              <Button variant="outline" size="sm" onClick={openWorkflowExplorer}>
-                Workflows & CDC…
-              </Button>
-              <Button variant="outline" size="sm" onClick={openMigrationExplorer}>
-                Migrations…
-              </Button>
-              <Button variant="outline" size="sm" onClick={openSchemaDiagram}>
-                Schema diagram…
-              </Button>
-              <Button variant="outline" size="sm" onClick={() => setDataGeneratorOpen(true)}>
-                Generate data…
-              </Button>
-              <Button variant="outline" size="sm" onClick={() => setImportOpen(true)}>
-                Import data…
-              </Button>
-              <Button variant="outline" size="sm" onClick={() => setDmlBuilderOpen(true)}>
-                Parameterized DML…
-              </Button>
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={() => { setSchemaDesignerMode("table"); setSchemaDesignerOpen(true); }}
-              >
-                Design schema…
-              </Button>
-              <input
-                ref={savedFileInput}
-                type="file"
-                accept="application/json,.json"
-                hidden
-                onChange={(event) => {
-                  const file = event.currentTarget.files?.[0];
-                  event.currentTarget.value = "";
-                  if (file) importSavedQueriesFromFile(file);
-                }}
-              />
-              <SavedQueries
-                open={savedOpen}
-                onOpenChange={setSavedOpen}
-                queries={savedQueries}
-                currentSQL={sql}
-                onSave={saveCurrentQuery}
-                onUpdateSQL={updateSavedQuerySQL}
-                onRename={renameSavedQuery}
-                onDelete={deleteSavedQuery}
-                onLoad={loadSavedQuery}
-                onExport={exportSavedQueriesToFile}
-                onImport={requestSavedQueryImport}
-              />
-              <Popover
-                open={historyOpen}
-                onOpenChange={setHistoryOpen}
-                ariaLabel="Query history"
-                side="bottom"
-                align="end"
-                trigger={
-                  <Button variant="outline" size="sm">
-                    History{history.length ? ` (${history.length})` : ""}
-                  </Button>
-                }
-              >
-                <PopoverContent className="nss-history-panel">
-                  <Stack gap="sm">
-                    <Inline gap="sm" align="center" justify="between">
-                      <Text size="sm" weight="medium">Query history</Text>
-                      <Button variant="ghost" size="sm" onClick={clearHistory} disabled={!history.length}>Clear</Button>
-                    </Inline>
-                    <Text size="xs" variant="muted">This session only — not saved between reloads.</Text>
-                    {history.length ? (
-                      <ul className="nss-history-list" aria-label="Recent statements">
-                        {history.map((entry) => (
-                          <li key={entry.id}>
-                            <button
-                              type="button"
-                              className="nss-history-item"
-                              onClick={() => loadFromHistory(entry)}
-                              title={entry.sql}
-                            >
-                              <span className="nss-history-sql">{historyPreview(entry.sql)}</span>
-                              <Inline gap="xs" align="center">
-                                <Badge
-                                  size="sm"
-                                  variant={entry.outcome === "success" ? "success" : entry.outcome === "error" ? "error" : "muted"}
-                                >
-                                  {entry.outcome}
-                                </Badge>
-                                {entry.outcome === "success" ? (
-                                  <Text as="span" size="xs" variant="muted">
-                                    {(entry.rowCount ?? 0).toLocaleString()} rows · {(entry.elapsedMs ?? 0).toLocaleString()} ms
-                                  </Text>
-                                ) : null}
-                              </Inline>
-                            </button>
-                          </li>
+              </div>
+              <div className="nss-toolbar-sep" aria-hidden="true" />
+              <div className="nss-action-group">
+                <Popover
+                  open={moreOpen}
+                  onOpenChange={setMoreOpen}
+                  ariaLabel="More Studio tools"
+                  side="bottom"
+                  align="end"
+                  wrapperClassName="nss-more"
+                  className="nss-more-panel"
+                  trigger={
+                    <Button variant="outline" size="sm" icon={<Icon name="more" size={14} />} aria-label="More Studio tools" title="More tools">
+                      More
+                    </Button>
+                  }
+                >
+                  <PopoverContent className="nss-more-menu">
+                    {moreGroups.map((group) => (
+                      <div key={group.label} className="nss-more-group">
+                        <p className="nss-more-group-label">{group.label}</p>
+                        {group.items.map((item) => (
+                          <button
+                            key={item.label}
+                            type="button"
+                            className="nss-more-item"
+                            disabled={item.disabled}
+                            title={item.title}
+                            onClick={item.run}
+                          >
+                            <Icon name={item.icon} size={14} />
+                            <span>{item.label}</span>
+                          </button>
                         ))}
-                      </ul>
-                    ) : (
-                      <Text size="sm" variant="muted">No queries run yet this session.</Text>
-                    )}
-                  </Stack>
-                </PopoverContent>
-              </Popover>
-            </Inline>
+                      </div>
+                    ))}
+                  </PopoverContent>
+                </Popover>
+              </div>
+              <div className="nss-toolbar-sep" aria-hidden="true" />
+              <div className="nss-action-group">
+                <input
+                  ref={savedFileInput}
+                  type="file"
+                  accept="application/json,.json"
+                  hidden
+                  onChange={(event) => {
+                    const file = event.currentTarget.files?.[0];
+                    event.currentTarget.value = "";
+                    if (file) importSavedQueriesFromFile(file);
+                  }}
+                />
+                <SavedQueries
+                  open={savedOpen}
+                  onOpenChange={setSavedOpen}
+                  queries={savedQueries}
+                  currentSQL={sql}
+                  onSave={saveCurrentQuery}
+                  onUpdateSQL={updateSavedQuerySQL}
+                  onRename={renameSavedQuery}
+                  onDelete={deleteSavedQuery}
+                  onLoad={loadSavedQuery}
+                  onExport={exportSavedQueriesToFile}
+                  onImport={requestSavedQueryImport}
+                />
+                <Popover
+                  open={historyOpen}
+                  onOpenChange={setHistoryOpen}
+                  ariaLabel="Query history"
+                  side="bottom"
+                  align="end"
+                  trigger={
+                    <Button variant="outline" size="sm">
+                      History{history.length ? ` (${history.length})` : ""}
+                    </Button>
+                  }
+                >
+                  <PopoverContent className="nss-history-panel">
+                    <Stack gap="sm">
+                      <Inline gap="sm" align="center" justify="between">
+                        <Text size="sm" weight="medium">Query history</Text>
+                        <Button variant="ghost" size="sm" onClick={clearHistory} disabled={!history.length}>Clear</Button>
+                      </Inline>
+                      <Text size="xs" variant="muted">This session only — not saved between reloads.</Text>
+                      {history.length ? (
+                        <ul className="nss-history-list" aria-label="Recent statements">
+                          {history.map((entry) => (
+                            <li key={entry.id}>
+                              <button
+                                type="button"
+                                className="nss-history-item"
+                                onClick={() => loadFromHistory(entry)}
+                                title={entry.sql}
+                              >
+                                <span className="nss-history-sql">{historyPreview(entry.sql)}</span>
+                                <Inline gap="xs" align="center">
+                                  <Badge
+                                    size="sm"
+                                    variant={entry.outcome === "success" ? "success" : entry.outcome === "error" ? "error" : "muted"}
+                                  >
+                                    {entry.outcome}
+                                  </Badge>
+                                  {entry.outcome === "success" ? (
+                                    <Text as="span" size="xs" variant="muted">
+                                      {(entry.rowCount ?? 0).toLocaleString()} rows · {(entry.elapsedMs ?? 0).toLocaleString()} ms
+                                    </Text>
+                                  ) : null}
+                                </Inline>
+                              </button>
+                            </li>
+                          ))}
+                        </ul>
+                      ) : (
+                        <Text size="sm" variant="muted">No queries run yet this session.</Text>
+                      )}
+                    </Stack>
+                  </PopoverContent>
+                </Popover>
+              </div>
+            </div>
           </CardHeader>
           <CardBody className="nss-editor-body">
             <div className="nss-tab-strip" aria-label="Query tabs">
@@ -2347,6 +2607,11 @@ export function StudioWorkspace({
                 maxRows={28}
               />
             </div>
+            {formatNotice ? (
+              <Text size="xs" variant="muted" role="status" className="nss-format-notice">
+                {formatNotice}
+              </Text>
+            ) : null}
             {/* aria-live="polite" (not role="alert") deliberately: this recomputes
                 on every keystroke, unlike the explicit-action confirm/error alerts
                 above, so it must never interrupt like an assertive alert would. */}
@@ -2360,6 +2625,29 @@ export function StudioWorkspace({
                       </Text>
                       <Button variant="outline" size="sm" onClick={() => applyFix(fix)}>
                         {`Use "${fix.suggestion}" instead`}
+                      </Button>
+                    </Inline>
+                  </Alert>
+                ))}
+              </div>
+            ) : null}
+            {/* Live parse diagnostics. aria-live="polite" for the same reason
+                as the table-fix strip above — it recomputes as you type and
+                must not interrupt. Advisory: the server re-parses on Run. */}
+            {parseDiags.length > 0 ? (
+              <div className="nss-parse-diags" aria-live="polite">
+                {parseDiags.map((diag, index) => (
+                  <Alert
+                    key={`${diag.offset}-${index}`}
+                    variant="warning"
+                    title={parseDiags.length > 1 ? `Syntax error (${index + 1} of ${parseDiags.length})` : "Syntax error"}
+                  >
+                    <Inline gap="sm" align="center" wrap>
+                      <Text as="span" size="sm">
+                        {`Line ${diag.line}, column ${diag.column}: ${diag.message}.`}
+                      </Text>
+                      <Button variant="outline" size="sm" onClick={() => jumpToDiagnostic(diag)}>
+                        Go to error
                       </Button>
                     </Inline>
                   </Alert>
@@ -2514,6 +2802,11 @@ export function StudioWorkspace({
                       planBaseline={activeTab.planBaseline}
                       onPinPlan={(planBaseline) => updateTab(activeTabId, { planBaseline })}
                       onClearPlanBaseline={() => updateTab(activeTabId, { planBaseline: null })}
+                      editableTable={editableTable}
+                      pkColumns={editablePKs}
+                      columnTypes={editableColTypes}
+                      onCommitChanges={commitStagedChanges}
+                      onOpenInEditor={(newSql) => setSQL(newSql)}
                     />
                   </section>
                 ) : (
@@ -2544,14 +2837,19 @@ export function StudioWorkspace({
         <Card variant="bordered" className="nss-inspector">
           <CardHeader className="nss-inspector-header">
             <Stack gap="xs">
-              <CardTitle as="h2">{selectedTable ?? "Server capabilities"}</CardTitle>
+              <CardTitle as="h2">
+                <Inline gap="xs" align="center" wrap={false}>
+                  <Icon name={selectedTable ? "table" : "layers"} size={16} />
+                  {selectedTable ?? "Server capabilities"}
+                </Inline>
+              </CardTitle>
               <Text size="sm" variant="muted">
                 {selectedTable ? "Authorized catalog metadata" : "Features reported by this server"}
               </Text>
             </Stack>
             <Inline gap="xs" align="center" wrap>
               {selectedTable ? (
-                <Button variant="outline" size="sm" onClick={insertTableQuery}>Insert SELECT</Button>
+                <Button variant="outline" size="sm" icon={<Icon name="play" size={14} />} onClick={insertTableQuery}>Insert SELECT</Button>
               ) : null}
               <Button variant="ghost" size="sm" onClick={() => setInspectorVisible(false)}>Hide inspector</Button>
             </Inline>
@@ -2887,6 +3185,16 @@ export function StudioWorkspace({
       {importOpen ? (
         <ImportExplorer
           onClose={() => setImportOpen(false)}
+          onInsert={setSQL}
+          tables={allTables}
+          initialTable={selectedTable}
+          initialDetail={detail}
+          loadTable={loadFullTextTable}
+        />
+      ) : null}
+      {vectorImportOpen ? (
+        <VectorImportExplorer
+          onClose={() => setVectorImportOpen(false)}
           onInsert={setSQL}
           tables={allTables}
           initialTable={selectedTable}

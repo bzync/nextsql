@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/bzync/nextsql/internal/nerr"
 	"github.com/bzync/nextsql/internal/sql/ast"
@@ -574,6 +575,141 @@ func isBlankFragment(frag string) bool {
 	lx := lexer.New(frag)
 	tok := lx.Next()
 	return tok.Kind == lexer.EOF && lx.Err() == nil
+}
+
+// stmtSpan is the byte range of one non-blank statement fragment within an
+// editor buffer, whitespace already trimmed on both sides — start/end index
+// the same string splitStatementSpans was given.
+type stmtSpan struct{ start, end int }
+
+// splitStatementSpans is splitStatements with the buffer offsets kept, so a
+// per-statement parse diagnostic can be mapped back to the whole buffer. It
+// applies the identical ';'-in-string/comment-safe lexer pass and the same
+// blank/comment-only fragment filter.
+func splitStatementSpans(src string) ([]stmtSpan, error) {
+	lx := lexer.New(src)
+	var spans []stmtSpan
+	start := 0
+	for {
+		tok := lx.Next()
+		if err := lx.Err(); err != nil {
+			return nil, err
+		}
+		if tok.Kind != lexer.Semi && tok.Kind != lexer.EOF {
+			continue
+		}
+		raw := src[start:tok.Pos]
+		frag := strings.TrimSpace(raw)
+		if frag != "" && !isBlankFragment(frag) {
+			lead := start + (len(raw) - len(strings.TrimLeftFunc(raw, unicode.IsSpace)))
+			spans = append(spans, stmtSpan{start: lead, end: lead + len(frag)})
+		}
+		if tok.Kind == lexer.EOF {
+			return spans, nil
+		}
+		start = tok.Pos + len(tok.Lit)
+	}
+}
+
+// Diagnostic locates a parse failure in one editor buffer, in the coordinates
+// the browser textarea uses: Offset counts UTF-16 code units from the start
+// of the buffer; Line and Column are 1-based, Column also in UTF-16 code
+// units within its line. Message carries no "nextsql syntax:" prefix.
+//
+// It is advisory. nextsqld's parser/binder stay the sole authority on whether
+// a statement is valid, and this covers grammar errors only — an unresolved
+// table or column name is reported by the server when the statement actually
+// runs, not here (Studio has no catalog of its own to resolve against).
+type Diagnostic struct {
+	Message string `json:"message"`
+	Offset  int    `json:"offset"`
+	Line    int    `json:"line"`
+	Column  int    `json:"column"`
+}
+
+// DiagnosticReport is the editor's live parse-diagnostics response: one entry
+// per statement in the buffer that does not parse, in buffer order. Empty
+// when the whole buffer parses.
+type DiagnosticReport struct {
+	Diagnostics []Diagnostic `json:"diagnostics"`
+}
+
+// Diagnostics parses every statement in one editor buffer with the same
+// grammar the executor uses and returns one location per statement that fails
+// to parse (the parser stops at its first error, so never more than one per
+// statement). A fully valid buffer returns an empty slice. It opens no driver
+// connection and touches no query slot.
+//
+// An empty or oversized buffer is a request error, matching Analyze. A buffer
+// that will not tokenize at all is reported as a single diagnostic at the
+// lexer's stopping point rather than an error, so the editor can still point
+// the operator at it.
+func Diagnostics(sql string) ([]Diagnostic, error) {
+	if err := ValidateSQL(sql); err != nil {
+		return nil, err
+	}
+	spans, err := splitStatementSpans(sql)
+	if err != nil {
+		if _, diag, perr := parser.ParseDiag(sql); perr != nil && diag != nil {
+			return []Diagnostic{locateInBuffer(sql, diag.Offset, diag.Message)}, nil
+		}
+		return nil, nerr.Wrap(nerr.Syntax, "studio.Diagnostics", "script could not be tokenized", err)
+	}
+	if len(spans) > MaxScriptStatements {
+		return nil, nerr.New(nerr.Exhausted, "studio.Diagnostics",
+			fmt.Sprintf("script exceeds the %d-statement Studio limit", MaxScriptStatements))
+	}
+	out := make([]Diagnostic, 0, len(spans))
+	for _, sp := range spans {
+		frag := sql[sp.start:sp.end]
+		_, diag, perr := parser.ParseDiag(frag)
+		if perr == nil || diag == nil {
+			continue
+		}
+		off := diag.Offset
+		if off < 0 {
+			off = 0
+		}
+		if off > len(frag) {
+			off = len(frag)
+		}
+		out = append(out, locateInBuffer(sql, sp.start+off, diag.Message))
+	}
+	return out, nil
+}
+
+// locateInBuffer converts a byte offset into src to the browser textarea's
+// coordinates: a UTF-16 code-unit offset from the buffer start plus a 1-based
+// line and (UTF-16) column.
+func locateInBuffer(src string, byteOff int, msg string) Diagnostic {
+	if byteOff < 0 {
+		byteOff = 0
+	}
+	if byteOff > len(src) {
+		byteOff = len(src)
+	}
+	prefix := src[:byteOff]
+	line := 1 + strings.Count(prefix, "\n")
+	col := 1 + utf16Len(prefix)
+	if i := strings.LastIndexByte(prefix, '\n'); i >= 0 {
+		col = 1 + utf16Len(prefix[i+1:])
+	}
+	return Diagnostic{Message: msg, Offset: utf16Len(prefix), Line: line, Column: col}
+}
+
+// utf16Len counts the UTF-16 code units s encodes to (JS string length), so a
+// diagnostic offset lands on the right character in the editor even when the
+// buffer contains astral-plane runes.
+func utf16Len(s string) int {
+	n := 0
+	for _, r := range s {
+		if r > 0xFFFF {
+			n += 2
+		} else {
+			n++
+		}
+	}
+	return n
 }
 
 func ValidateSQL(sql string) error {

@@ -43,7 +43,7 @@ export function App() {
     <>
       <AuthBackdrop aria-hidden="true" />
       <main className="nsm-login-page bg-bg text-foreground">
-        <Card variant="elevated" role="status" aria-live="polite">
+        <Card variant="bordered" role="status" aria-live="polite">
           <CardBody>
             <Inline gap="sm" align="center">
               <Spinner size="sm" />

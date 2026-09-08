@@ -202,6 +202,7 @@ export function App() {
               <Wordmark size="md" className="nsi-brand" />
               <ThemeSelect />
             </div>
+            <span className="nsi-mode">Setup</span>
             <nav className="sr-only" aria-label="Installation progress">
               <List>
                 {STEPS.map((item, index) => (

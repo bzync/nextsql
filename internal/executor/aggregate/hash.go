@@ -306,6 +306,11 @@ func (h *Hash) emit(st *state) []types.Value {
 }
 
 // Finish returns aggregated rows (in first-seen group order, then spilled).
+//
+// An ungrouped aggregate is defined over one implicit group covering the whole
+// input, so it yields exactly one row even when no row ever arrived — COUNT is
+// 0, every other aggregate is NULL. Only a grouped aggregate collapses to zero
+// rows on empty input, because there is then no group to report.
 func (h *Hash) Finish() ([][]types.Value, error) {
 	var out [][]types.Value
 	for _, k := range h.order {
@@ -317,6 +322,9 @@ func (h *Hash) Finish() ([][]types.Value, error) {
 			return nil, err
 		}
 		out = append(out, merged...)
+	}
+	if len(out) == 0 && len(h.groups) == 0 {
+		out = append(out, h.emit(&state{accs: make([]aggAcc, len(h.specs))}))
 	}
 	return out, nil
 }

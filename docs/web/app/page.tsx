@@ -80,7 +80,7 @@ function Hero() {
         <div className="flex flex-col items-center text-center lg:items-start lg:text-left">
           <p className="kicker">Native multimodel database</p>
           <h1 className="mt-3 max-w-[22ch] text-[2.2rem] font-semibold leading-[1.12] tracking-[-0.028em] sm:text-[2.75rem] lg:text-[3.15rem]">
-            One engine for SQL, JSON, vectors, and search.
+            One engine for SQL, JSON, vectors, search, and geo.
           </h1>
           <p className="mt-4 max-w-[42ch] text-[16px] leading-relaxed text-muted sm:mt-5 sm:text-[17px]">
             Relational data, native JSON, full-text, vectors, and geo share one WAL,

@@ -309,6 +309,7 @@ async function testOperateMode() {
   let studioTableCalls = 0;
   let studioWorkflowsCalls = 0;
   let studioMigrationsCalls = 0;
+  let releaseBackupVerify = null;
 
   await withServer((request, response) => {
     const url = new URL(request.url, "http://127.0.0.1");
@@ -325,6 +326,10 @@ async function testOperateMode() {
     if (url.pathname === "/api/v1/session" && request.method === "DELETE") {
       authenticated = false;
       return json(response, 200, {});
+    }
+    if (url.pathname === "/api/v1/connection") {
+      if (!authenticated) return json(response, 401, { error: "not signed in" });
+      return json(response, 200, { connected: true, server_addr: "127.0.0.1:7210", user: "operator", database: "default", realm: "default" });
     }
     if (url.pathname === "/api/v1/security") {
       securityCalls++;
@@ -366,6 +371,50 @@ async function testOperateMode() {
           rows: [["9001:1", "articles", "exclusive", "true"]],
         },
       });
+    }
+    if (url.pathname === "/api/v1/databases") {
+      // Two realms, one of them named only by system.databases (the caller
+      // cannot see it in system.realms), so the tree's orphan grouping is
+      // exercised; "default" is the realm/database this session is on.
+      return json(response, 200, {
+        generated_at: new Date(0).toISOString(),
+        hosted: true,
+        storage: result,
+        realms: {
+          columns: ["realm_id", "name", "state", "database_count", "storage_cap_bytes", "realm_root_delegated"],
+          rows: [["r-1", "default", "active", "2", "10737418240", "false"]],
+        },
+        databases: {
+          columns: ["realm_id", "realm_name", "database_id", "name", "state", "layout", "storage_cap_bytes"],
+          rows: [
+            ["r-1", "default", "db-1", "default", "active", "managed", "1073741824"],
+            ["r-1", "default", "db-2", "reports", "active", "managed", "0"],
+            ["r-9", "archive", "db-3", "cold", "suspended", "legacy_default", "0"],
+          ],
+        },
+        tables: {
+          columns: ["name", "id", "column_count", "pk", "legacy_tenant_column"],
+          rows: [["articles", "7", "5", "id", "false"], ["authors", "8", "3", "id", "false"]],
+        },
+        table_stats: { columns: ["table_name", "row_count"], rows: [["articles", "42"]] },
+      });
+    }
+    if (url.pathname === "/api/v1/backups" && request.method === "GET") {
+      return json(response, 200, {
+        generated_at: new Date(0).toISOString(),
+        backup_state: "configured",
+        restore_hint: "nextsql restore --data-dir /var/lib/nextsql --from backup-1",
+        backups: {
+          columns: ["name", "created_at", "database_id", "checkpoint_lsn"],
+          rows: [["backup-1", "2026-09-08T10:00:00Z", "db-1", "4711"]],
+        },
+      });
+    }
+    if (url.pathname === "/api/v1/backups/action" && request.method === "POST") {
+      // Held open so the in-flight button state can be observed, exactly as a
+      // real restore test would hold it.
+      releaseBackupVerify = () => json(response, 200, { columns: ["verified", "problem"], rows: [["yes", ""]] });
+      return;
     }
     if (url.pathname === "/api/v1/overview") {
       return json(response, 200, {
@@ -488,6 +537,21 @@ async function testOperateMode() {
           ],
         },
       });
+    }
+    if (url.pathname === "/api/v1/studio/query/diagnostics" && request.method === "POST") {
+      let data = "";
+      request.on("data", (chunk) => { data += chunk; });
+      request.on("end", () => {
+        let sql = "";
+        try { sql = JSON.parse(data).sql ?? ""; } catch { sql = ""; }
+        // A deliberately broken buffer for the audit surfaces one diagnostic;
+        // anything else parses clean.
+        if (/\bWHRE\b/i.test(sql)) {
+          return json(response, 200, { diagnostics: [{ message: "unexpected token after statement", offset: sql.toUpperCase().indexOf("WHRE"), line: 1, column: sql.toUpperCase().indexOf("WHRE") + 1 }] });
+        }
+        return json(response, 200, { diagnostics: [] });
+      });
+      return;
     }
     if (url.pathname === "/api/v1/studio/query/analyze" && request.method === "POST") {
       let data = "";
@@ -622,10 +686,97 @@ async function testOperateMode() {
     await runAxe(browser, axe.source, "Operations overview");
     assert.equal(await browser.evaluate("document.querySelector('.nsa-skip')?.getAttribute('href')"), "#admin-main");
     assert.equal(await browser.evaluate("document.querySelector('.nsm-sidebar nav')?.getAttribute('aria-label')"), "Operations");
+    const sidebarIcons = await browser.evaluate(`(() => {
+      const items = [...document.querySelectorAll(".nsm-sidebar nav button.nsm-nav-item")];
+      return {
+        count: items.length,
+        withIcon: items.filter((item) => item.querySelector("svg.nsm-nav-icon, .nsm-nav-icon")).length,
+        labels: items.map((item) => item.querySelector(".nsm-nav-label, .truncate")?.textContent?.trim() ?? item.textContent?.trim() ?? ""),
+      };
+    })()`);
+    assert.equal(sidebarIcons.count, 10, "Operations sidebar should list every workspace");
+    assert.equal(sidebarIcons.withIcon, 10, "every Operations sidebar item must have an icon");
+    assert.deepEqual(sidebarIcons.labels, [
+      "Overview", "Activity", "Databases", "Studio", "Cluster",
+      "Backups", "Maintenance", "Security", "Configuration", "Diagnostics",
+    ]);
     await highDensityCheck(
       browser,
       "Operations overview",
       "getComputedStyle(document.querySelector('.nsm-sidebar')).display === 'none' && getComputedStyle(document.querySelector('.nsm-mobile-nav')).display !== 'none'",
+    );
+
+    // Databases: the catalog tree (realm -> database -> tables). The old flat
+    // Tables/Realms tabs are gone, so the tree is the only way to reach a
+    // table list, and only the connected database can produce one.
+    const openView = (label) => `(() => {
+      const item = [...document.querySelectorAll(".nsm-sidebar nav button.nsm-nav-item")]
+        .find((b) => b.textContent.trim().startsWith(${JSON.stringify(label)}));
+      item?.click();
+      return Boolean(item);
+    })()`;
+    assert.equal(await browser.evaluate(openView("Databases")), true, "a Databases nav entry should exist");
+    await browser.waitFor("document.querySelector('h1')?.textContent === 'Databases'", "the Databases view");
+    await browser.waitFor("document.querySelectorAll('.nsm-tree-row').length > 0", "the catalog tree");
+    const databaseTabs = await browser.evaluate(`[...document.querySelectorAll('[role=tab]')].map((t) => t.textContent.replace(/\\s+/g, " ").trim())`);
+    assert.equal(
+      databaseTabs.some((t) => t.startsWith("Tables") || t.startsWith("Realms")),
+      false,
+      "Tables and Realms are rows in the tree now, not tabs",
+    );
+    const realmRows = await browser.evaluate(`[...document.querySelectorAll('.nsm-tree > .nsm-tree-list > .nsm-tree-node > .nsm-tree-row')].map((r) => ({
+      text: r.textContent.replace(/\\s+/g, " ").trim(),
+      expanded: r.getAttribute("aria-expanded"),
+    }))`);
+    assert.equal(realmRows.length, 2, "one row per realm, including a realm only system.databases names");
+    assert.equal(realmRows[0].expanded, "true", "the connected realm starts expanded");
+    assert.equal(realmRows[0].text.includes("connected"), true);
+    // The connected database lists its tables; a sibling explains why it cannot.
+    await browser.evaluate(`[...document.querySelectorAll('.nsm-tree-body .nsm-tree-row')].find((r) => r.textContent.includes("default"))?.click()`);
+    await browser.waitFor("document.body.textContent.includes('articles')", "the connected database's tables");
+    await browser.evaluate(`[...document.querySelectorAll('.nsm-tree-body .nsm-tree-row')].find((r) => r.textContent.includes("reports"))?.click()`);
+    await browser.waitFor(
+      "document.body.textContent.includes('Sign in with reports selected')",
+      "the explanation for a database this session is not connected to",
+    );
+    await runAxe(browser, axe.source, "Operations databases tree");
+
+    // Backups: a create/verify runs a server-side restore test, so the button
+    // that started it must hold a disabled spinner until the call settles —
+    // and keep an accessible name while the spinner hides its label.
+    assert.equal(await browser.evaluate(openView("Backups")), true, "a Backups nav entry should exist");
+    await browser.waitFor("document.querySelector('h1')?.textContent === 'Backups'", "the Backups view");
+    await browser.waitFor("document.body.textContent.includes('backup-1')", "the backup row");
+    await browser.evaluate(`[...document.querySelectorAll("button")].find((b) => b.textContent.trim() === "Verify")?.click()`);
+    await browser.waitFor("document.querySelector('[role=dialog]')", "the verify confirmation");
+    await browser.evaluate(`(() => {
+      const dialog = document.querySelector('[role=dialog]');
+      [...dialog.querySelectorAll("button")].find((b) => b.textContent.trim() === "Verify")?.click();
+    })()`);
+    await browser.waitFor("document.body.textContent.includes('Verifying…')", "the in-flight Verify button");
+    const verifying = await browser.evaluate(`(() => {
+      const button = [...document.querySelectorAll("button")].find((b) => b.textContent.trim() === "Verifying…");
+      const others = [...document.querySelectorAll("button")].filter((b) => b.textContent.trim() === "Verify");
+      return {
+        disabled: button.disabled,
+        busy: button.getAttribute("aria-busy"),
+        label: button.getAttribute("aria-label"),
+        dialogOpen: Boolean(document.querySelector('[role=dialog]')),
+        otherVerifyEnabled: others.filter((b) => !b.disabled).length,
+      };
+    })()`);
+    assert.equal(verifying.disabled, true, "the Verify button stays disabled while the backup is verified");
+    assert.equal(verifying.busy, "true");
+    assert.equal(verifying.label, "Verifying… backup-1", "a spinning button still needs an accessible name");
+    assert.equal(verifying.dialogOpen, false, "the confirmation closes; the row carries the in-flight state");
+    assert.equal(verifying.otherVerifyEnabled, 0, "no second verification can be started meanwhile");
+    await runAxe(browser, axe.source, "Operations backups verifying");
+    releaseBackupVerify();
+    await browser.waitFor("document.body.textContent.includes('hash chain intact')", "the verify result");
+    assert.equal(
+      await browser.evaluate(`[...document.querySelectorAll("button")].some((b) => b.textContent.trim() === "Verify" && !b.disabled)`),
+      true,
+      "the Verify button returns to its idle state once the call settles",
     );
 
     // Studio: authenticated development workspace, reachable through the
@@ -641,6 +792,7 @@ async function testOperateMode() {
     assert.equal(await browser.evaluate("window.location.hash"), "#!/studio", "selecting Studio should update the URL route");
     assert.equal(await browser.evaluate("document.querySelector('[aria-label=\"SQL editor\"]') !== null"), true, "the SQL editor should have an accessible name");
     assert.equal(await browser.evaluate("document.body.textContent.includes('127.0.0.1:7210')"), true, "the toolbar should show the nextsqld the session targets");
+    await browser.waitFor("document.body.textContent.includes('Connected')", "Studio live connection status");
     await runAxe(browser, axe.source, "Studio workspace");
     await highDensityCheck(
       browser,
@@ -833,7 +985,7 @@ async function testOperateMode() {
     })()`), true, "bounded result actions should be present");
 
     await browser.evaluate(`document.querySelector('section[aria-labelledby="studio-results-title"] input[aria-label="Select result row 1"]')?.click()`);
-    await browser.waitFor("document.body.textContent.includes('1 selected')", "a selected result row");
+    await browser.waitFor("document.body.textContent.includes('1 of 250 selected')", "a selected result row");
 
     const inspectCell = async (title, expected) => {
       const selected = await browser.evaluate(`(() => {
@@ -946,6 +1098,31 @@ async function testOperateMode() {
       button?.click();
       return Boolean(button);
     })()`);
+    const clickMoreItem = async (label) => {
+      const opened = await browser.evaluate(`(() => {
+        const trigger = [...document.querySelectorAll("button")].find((item) => item.getAttribute("aria-label") === "More Studio tools");
+        if (!trigger) return false;
+        if (trigger.getAttribute("aria-expanded") !== "true") trigger.click();
+        return true;
+      })()`);
+      assert.equal(opened, true, `More Studio tools should be available for ${label}`);
+      await browser.waitFor(
+        `[...document.querySelectorAll('[role=dialog][aria-label="More Studio tools"] button')].some((item) => item.textContent.trim() === ${JSON.stringify(label)})`,
+        `the More menu item ${label}`,
+      );
+      const clicked = await browser.evaluate(`(() => {
+        const item = [...document.querySelectorAll('[role=dialog][aria-label="More Studio tools"] button')].find((el) => el.textContent.trim() === ${JSON.stringify(label)});
+        item?.click();
+        return Boolean(item);
+      })()`);
+      if (clicked) {
+        await browser.waitFor(
+          `document.querySelector('[role=dialog][aria-label="More Studio tools"]') === null`,
+          "the More menu to close after choosing " + label,
+        );
+      }
+      return clicked;
+    };
     const waitForStreamCalls = async (min, message) => {
       const until = Date.now() + 4_000;
       while (Date.now() < until) {
@@ -1349,6 +1526,13 @@ async function testOperateMode() {
       return true;
     })()`);
 
+    assert.equal(await clickByAriaLabel("More Studio tools"), true, "the More Studio tools control should be available");
+    await browser.waitFor(`document.querySelector('[role=dialog][aria-label="More Studio tools"]')`, "the More Studio tools menu");
+    assert.equal(await browser.evaluate(`[...document.querySelectorAll('[role=dialog][aria-label="More Studio tools"] button')].some((item) => item.textContent.trim() === "Full-text…")`), true, "explorers should live in the More menu");
+    await runAxe(browser, axe.source, "Studio more tools menu");
+    await clickByAriaLabel("More Studio tools");
+    await browser.waitFor(`document.querySelector('[role=dialog][aria-label="More Studio tools"]') === null`, "the More menu to close");
+
     // Full-text Explorer: derives the table, eligible fields, and candidate
     // index from the authorized Studio catalog; generates/copies native SQL
     // without executing on Insert; and runs through the ordinary bounded
@@ -1364,7 +1548,7 @@ async function testOperateMode() {
       return true;
     })()`);
     const callsBeforeFullTextInsert = streamCalls;
-    assert.equal(await clickButton("Full-text…"), true, "the capability-gated Full-text Explorer control should be available");
+    assert.equal(await clickMoreItem("Full-text…"), true, "the capability-gated Full-text Explorer control should be available");
     await browser.waitFor("document.querySelector('[role=dialog] h2')?.textContent === 'Full-text Explorer'", "the Full-text Explorer to open");
     await browser.waitFor("document.querySelector('[role=dialog]')?.textContent.includes('ix_articles_text')", "the authorized full-text index metadata");
     assert.equal(await browser.evaluate("document.getElementById('fulltext-table')?.textContent.includes('articles')"), true, "the explorer should select the visible table");
@@ -1382,7 +1566,7 @@ async function testOperateMode() {
     assert.equal(await browser.evaluate(`document.querySelector('[aria-label="SQL editor"]')?.value`), fullTextSQL, "Insert should put the exact generated SEARCH statement in the active tab");
     assert.equal(streamCalls, callsBeforeFullTextInsert, "inserting a full-text query must not execute it");
 
-    assert.equal(await clickButton("Full-text…"), true, "the Full-text Explorer should reopen from a clean form");
+    assert.equal(await clickMoreItem("Full-text…"), true, "the Full-text Explorer should reopen from a clean form");
     await browser.waitFor("document.querySelector('[role=dialog]')?.textContent.includes('ix_articles_text')", "the full-text catalog to reload");
     assert.equal(await setFullTextQuery("database performance"), true, "the reopened search phrase should accept input");
     await browser.waitFor(`document.querySelector('[role=dialog]')?.textContent.includes(${JSON.stringify(fullTextSQL)})`, "the runnable full-text SQL preview");
@@ -1413,7 +1597,7 @@ async function testOperateMode() {
       return true;
     })()`);
     const callsBeforeVectorInsert = streamCalls;
-    assert.equal(await clickButton("Vector…"), true, "the capability-gated Vector Explorer control should be available");
+    assert.equal(await clickMoreItem("Vector…"), true, "the capability-gated Vector Explorer control should be available");
     await browser.waitFor("document.querySelector('[role=dialog] h2')?.textContent === 'Vector Explorer'", "the Vector Explorer to open");
     await browser.waitFor("document.querySelector('[role=dialog]')?.textContent.includes('ix_embedding_hnsw')", "the authorized vector index metadata");
     assert.equal(await browser.evaluate("document.getElementById('vector-table')?.textContent.includes('articles')"), true, "the explorer should select the visible table");
@@ -1433,7 +1617,7 @@ async function testOperateMode() {
     assert.equal(await browser.evaluate(`document.querySelector('[aria-label="SQL editor"]')?.value`), vectorSQL, "Insert should put the exact generated NEAREST statement in the active tab");
     assert.equal(streamCalls, callsBeforeVectorInsert, "inserting a vector query must not execute it");
 
-    assert.equal(await clickButton("Vector…"), true, "the Vector Explorer should reopen from a clean form");
+    assert.equal(await clickMoreItem("Vector…"), true, "the Vector Explorer should reopen from a clean form");
     await browser.waitFor("document.querySelector('[role=dialog]')?.textContent.includes('ix_embedding_hnsw')", "the vector catalog to reload");
     assert.equal(await setVectorInput("1, 0, 0.5"), true, "the reopened vector textarea should accept input");
     await browser.waitFor(`document.querySelector('[role=dialog]')?.textContent.includes(${JSON.stringify(vectorSQL)})`, "the runnable vector SQL preview");
@@ -1475,7 +1659,7 @@ async function testOperateMode() {
     };
 
     const callsBeforeHybridInsert = streamCalls;
-    assert.equal(await clickButton("Hybrid…"), true, "the capability-gated Hybrid Explorer control should be available (fulltext and vector both supported)");
+    assert.equal(await clickMoreItem("Hybrid…"), true, "the capability-gated Hybrid Explorer control should be available (fulltext and vector both supported)");
     await browser.waitFor("document.querySelector('[role=dialog] h2')?.textContent === 'Hybrid Explorer'", "the Hybrid Explorer to open");
     await browser.waitFor("document.querySelector('[role=dialog]')?.textContent.includes('ix_articles_text')", "the authorized full-text index metadata");
     assert.equal(await browser.evaluate("document.getElementById('hybrid-table')?.textContent.includes('articles')"), true, "the explorer should select the visible table");
@@ -1492,7 +1676,7 @@ async function testOperateMode() {
     assert.equal(await browser.evaluate(`document.querySelector('[aria-label="SQL editor"]')?.value`), hybridSQL, "Insert should put the exact generated hybrid statement in the active tab");
     assert.equal(streamCalls, callsBeforeHybridInsert, "inserting a hybrid query must not execute it");
 
-    assert.equal(await clickButton("Hybrid…"), true, "the Hybrid Explorer should reopen from a clean form");
+    assert.equal(await clickMoreItem("Hybrid…"), true, "the Hybrid Explorer should reopen from a clean form");
     await browser.waitFor("document.querySelector('[role=dialog]')?.textContent.includes('ix_articles_text')", "the hybrid catalog to reload");
     await fillHybridForm();
     const callsBeforeHybridExplain = streamCalls;
@@ -1503,7 +1687,7 @@ async function testOperateMode() {
     await browser.waitFor("document.querySelector('[aria-label=\"EXPLAIN view\"]') !== null", "the existing graphical EXPLAIN tree should render with no new rendering code");
     await runAxe(browser, axe.source, "Studio Hybrid Explorer plan");
 
-    assert.equal(await clickButton("Hybrid…"), true, "the Hybrid Explorer should reopen a second time");
+    assert.equal(await clickMoreItem("Hybrid…"), true, "the Hybrid Explorer should reopen a second time");
     await browser.waitFor("document.querySelector('[role=dialog]')?.textContent.includes('ix_articles_text')", "the hybrid catalog to reload again");
     await fillHybridForm();
     const callsBeforeHybridRun = streamCalls;
@@ -1533,7 +1717,7 @@ async function testOperateMode() {
     })()`);
 
     const callsBeforeGeoInsert = streamCalls;
-    assert.equal(await clickButton("Geo…"), true, "the capability-gated Geo Explorer control should be available");
+    assert.equal(await clickMoreItem("Geo…"), true, "the capability-gated Geo Explorer control should be available");
     await browser.waitFor("document.querySelector('[role=dialog] h2')?.textContent === 'Geo Explorer'", "the Geo Explorer to open");
     await browser.waitFor("document.querySelector('[role=dialog]')?.textContent.includes('ix_loc_spatial')", "the authorized spatial index metadata");
     assert.equal(await browser.evaluate("document.getElementById('geo-table')?.textContent.includes('articles')"), true, "the explorer should select the visible table");
@@ -1552,7 +1736,7 @@ async function testOperateMode() {
     assert.equal(await browser.evaluate(`document.querySelector('[aria-label="SQL editor"]')?.value`), geoPointSQL, "Insert should put the exact generated DWITHIN statement in the active tab");
     assert.equal(streamCalls, callsBeforeGeoInsert, "inserting a geo query must not execute it");
 
-    assert.equal(await clickButton("Geo…"), true, "the Geo Explorer should reopen from a clean form");
+    assert.equal(await clickMoreItem("Geo…"), true, "the Geo Explorer should reopen from a clean form");
     await browser.waitFor("document.querySelector('[role=dialog]')?.textContent.includes('ix_loc_spatial')", "the geo catalog to reload");
     assert.equal(await setDialogNumberInput("geo-lon", -73.9857), true, "the reopened longitude field should accept input");
     assert.equal(await setDialogNumberInput("geo-lat", 40.7484), true, "the reopened latitude field should accept input");
@@ -1564,7 +1748,7 @@ async function testOperateMode() {
     assert.equal(lastStreamSQL, geoPointSQL, "the server should receive exactly the SQL shown in the explorer preview");
 
     const geoPolygonSQL = `SELECT * FROM "articles" WHERE WITHIN("loc", POLYGON('((-74.1 40.6, -73.8 40.6, -73.8 40.9, -74.1 40.6))')) LIMIT 10`;
-    assert.equal(await clickButton("Geo…"), true, "the Geo Explorer should reopen for the polygon mode");
+    assert.equal(await clickMoreItem("Geo…"), true, "the Geo Explorer should reopen for the polygon mode");
     await browser.waitFor("document.querySelector('[role=dialog]')?.textContent.includes('ix_loc_spatial')", "the geo catalog to reload a third time");
     await browser.evaluate("document.getElementById('geo-mode')?.click()");
     await browser.waitFor("document.getElementById('geo-mode')?.getAttribute('aria-expanded') === 'true'", "the query-shape menu to open");
@@ -1583,7 +1767,7 @@ async function testOperateMode() {
     await browser.waitFor("document.querySelector('[role=dialog]') === null", "the Geo Explorer to close after inserting the polygon query");
     assert.equal(await browser.evaluate(`document.querySelector('[aria-label="SQL editor"]')?.value`), geoPolygonSQL, "Insert should put the exact generated WITHIN statement in the active tab");
 
-    assert.equal(await clickButton("Grant / Revoke…"), true, "the Grant/Revoke builder control should be available");
+    assert.equal(await clickMoreItem("Grant / Revoke…"), true, "the Grant/Revoke builder control should be available");
     await browser.waitFor("document.querySelector('[role=dialog]') !== null", "the GRANT/REVOKE builder to open");
     assert.equal(await browser.evaluate(`document.querySelector('[role=dialog]')?.textContent.includes("Grantee is required.")`), true, "an empty builder should show its validation error, not a malformed statement");
     assert.equal(await browser.evaluate(`[...document.querySelectorAll('[role=dialog] button')].find((b) => b.textContent.trim() === "Insert into editor")?.disabled`), true, "Insert should be disabled until the statement is valid");
@@ -1611,7 +1795,7 @@ async function testOperateMode() {
       "confirming the builder should replace the active tab's SQL buffer, not execute anything itself",
     );
 
-    assert.equal(await clickButton("Grant / Revoke…"), true, "the builder should be reopenable");
+    assert.equal(await clickMoreItem("Grant / Revoke…"), true, "the builder should be reopenable");
     await browser.waitFor("document.querySelector('[role=dialog]') !== null", "the builder to reopen");
     assert.equal(await browser.evaluate(`document.querySelector('[role=dialog] input[placeholder="orders"]')?.value`), "", "reopening the builder should start from a clean form, not the previous statement");
     assert.equal(await clickDialogButton("Cancel"), true, "Cancel should be available");
@@ -1628,7 +1812,7 @@ async function testOperateMode() {
     // Each grant row's "Revoke" action must hand its exact grantee/
     // privilege/scope/object back into the existing GRANT/REVOKE builder,
     // prefilled, rather than a fresh blank form.
-    assert.equal(await clickButton("Users & roles…"), true, "the Users & roles explorer control should be available");
+    assert.equal(await clickMoreItem("Users & roles…"), true, "the Users & roles explorer control should be available");
     await browser.waitFor("document.querySelector('[role=dialog] h2')?.textContent === 'Users & roles'", "the Users & roles explorer to open");
     assert.equal(await browser.evaluate("document.querySelector('[role=dialog]')?.textContent.includes('app')"), true, "a real system.users row should render");
     assert.equal(await browser.evaluate("document.querySelector('[role=dialog]')?.textContent.includes('analyst')"), true, "a real system.roles row should render");
@@ -1649,7 +1833,7 @@ async function testOperateMode() {
       "inserting the prefilled revoke should replace the active tab's SQL buffer with exactly that statement",
     );
 
-    assert.equal(await clickButton("Users & roles…"), true, "the Users & roles explorer should reopen");
+    assert.equal(await clickMoreItem("Users & roles…"), true, "the Users & roles explorer should reopen");
     await browser.waitFor("document.querySelector('[role=dialog] h2')?.textContent === 'Users & roles'", "the explorer to reopen");
     assert.equal(await clickDialogButton("Grant / Revoke…"), true, "the explorer footer's Grant/Revoke button should open a fresh, unprefilled builder");
     await browser.waitFor(`document.querySelector('[role=dialog]')?.textContent.includes('Grantee is required.')`, "a fresh builder opened from the explorer footer must start blank, not reuse the last revoke prefill");
@@ -1662,7 +1846,7 @@ async function testOperateMode() {
     // Refresh must each fetch a new snapshot; no cross-session kill action
     // exists in the server, so this view must not invent one.
     const activityBeforeOpen = activityCalls;
-    assert.equal(await clickButton("Transactions & locks…"), true, "the Transactions & locks explorer control should be available");
+    assert.equal(await clickMoreItem("Transactions & locks…"), true, "the Transactions & locks explorer control should be available");
     await browser.waitFor("document.querySelector('[role=dialog] h2')?.textContent === 'Transactions & locks'", "the Transactions & locks explorer to open");
     await waitForActivityCalls(activityBeforeOpen + 1, "opening the explorer should fetch a live activity snapshot");
     await browser.waitFor("document.querySelector('[role=dialog]')?.textContent.includes('9001:1')", "the live activity snapshot to render");
@@ -1680,7 +1864,7 @@ async function testOperateMode() {
     await browser.waitFor("document.querySelector('[role=dialog]') === null", "the activity explorer to close");
 
     const activityBeforeReopen = activityCalls;
-    assert.equal(await clickButton("Transactions & locks…"), true, "the activity explorer should reopen");
+    assert.equal(await clickMoreItem("Transactions & locks…"), true, "the activity explorer should reopen");
     await browser.waitFor("document.querySelector('[role=dialog] h2')?.textContent === 'Transactions & locks'", "the activity explorer to reopen");
     await waitForActivityCalls(activityBeforeReopen + 1, "reopening should not reuse a stale activity snapshot without refetching");
     assert.equal(await clickDialogButton("Close"), true, "Close should dismiss the reopened activity explorer");
@@ -1691,7 +1875,7 @@ async function testOperateMode() {
     // refresh rather than reuse the Users & roles cache and must expose no
     // mutation control for the append-only server audit log.
     const securityBeforeAuditOpen = securityCalls;
-    assert.equal(await clickButton("Audit…"), true, "the Audit viewer control should be available");
+    assert.equal(await clickMoreItem("Audit…"), true, "the Audit viewer control should be available");
     await browser.waitFor("document.querySelector('[role=dialog] h2')?.textContent === 'Audit viewer'", "the Audit viewer to open");
     await waitForSecurityCalls(securityBeforeAuditOpen + 1, "opening Audit should re-read the live verified tail");
     await browser.waitFor("document.querySelector('[role=dialog]')?.textContent.includes('Chain verified')", "the audit-chain verification state to render");
@@ -1713,7 +1897,7 @@ async function testOperateMode() {
     await browser.waitFor("document.querySelector('[role=dialog]') === null", "the Audit viewer to close");
 
     const securityBeforeAuditReopen = securityCalls;
-    assert.equal(await clickButton("Audit…"), true, "the Audit viewer should reopen");
+    assert.equal(await clickMoreItem("Audit…"), true, "the Audit viewer should reopen");
     await browser.waitFor("document.querySelector('[role=dialog] h2')?.textContent === 'Audit viewer'", "the Audit viewer to reopen");
     await waitForSecurityCalls(securityBeforeAuditReopen + 1, "reopening Audit should not reuse a stale verified tail");
     assert.equal(await clickDialogButton("Close"), true, "Close should dismiss the reopened Audit viewer");
@@ -1724,7 +1908,7 @@ async function testOperateMode() {
     // subscription state means a refetch on every open; definitions stay
     // inspect-only and expose no cancel/retry/pause mutation control.
     const workflowsBeforeOpen = studioWorkflowsCalls;
-    assert.equal(await clickButton("Workflows & CDC…"), true, "the Workflows & CDC explorer control should be available");
+    assert.equal(await clickMoreItem("Workflows & CDC…"), true, "the Workflows & CDC explorer control should be available");
     await browser.waitFor("document.querySelector('[role=dialog] h2')?.textContent?.includes('Workflows') === true", "the Workflows & CDC explorer to open");
     await waitForWorkflowsCalls(workflowsBeforeOpen + 1, "opening Workflows & CDC should read the live catalog");
     assert.equal(await browser.evaluate("document.querySelector('[role=dialog]')?.textContent.includes('rollup_daily')"), true, "a visible workflow should render");
@@ -1755,7 +1939,7 @@ async function testOperateMode() {
     // Live server state (the CLI can apply a migration any time) means a
     // refetch on every open and Refresh; no apply/down/repair mutation control.
     const migrationsBeforeOpen = studioMigrationsCalls;
-    assert.equal(await clickButton("Migrations…"), true, "the Migrations explorer control should be available");
+    assert.equal(await clickMoreItem("Migrations…"), true, "the Migrations explorer control should be available");
     await browser.waitFor("document.querySelector('[role=dialog] h2')?.textContent?.includes('Schema migration history') === true", "the Migrations explorer to open");
     await waitForMigrationsCalls(migrationsBeforeOpen + 1, "opening Migrations should read the live history");
     await browser.waitFor("document.querySelector('[role=dialog]')?.textContent.includes('add_articles') === true", "an applied migration row should render");
@@ -1771,7 +1955,7 @@ async function testOperateMode() {
     // Schema relationships: a read-only ER view over the whole
     // system.foreign_keys catalog. The SVG carries a text label and the
     // grouped relationship list is its always-visible text alternative.
-    assert.equal(await clickButton("Schema diagram…"), true, "the Schema diagram control should be available");
+    assert.equal(await clickMoreItem("Schema diagram…"), true, "the Schema diagram control should be available");
     await browser.waitFor("document.querySelector('[role=dialog] h2')?.textContent?.includes('Schema relationships') === true", "the Schema relationships explorer to open");
     await browser.waitFor("document.querySelector('[role=dialog] svg[role=img]') !== null", "the foreign-key diagram to render as a labelled image");
     assert.match(
@@ -1794,7 +1978,7 @@ async function testOperateMode() {
     // a type it cannot produce is badged and left out when nullable.
     const callsBeforeDataGen = streamCalls;
     await setSQL("SELECT 1");
-    assert.equal(await clickButton("Generate data…"), true, "the Generate data control should be available");
+    assert.equal(await clickMoreItem("Generate data…"), true, "the Generate data control should be available");
     await browser.waitFor("document.querySelector('[role=dialog] h2')?.textContent === 'Generate development data'", "the data generator to open");
     await browser.waitFor("document.querySelector('[role=dialog]')?.textContent.includes('INSERT INTO \"articles\"')", "the generated INSERT preview to render");
     assert.equal(
@@ -1817,7 +2001,7 @@ async function testOperateMode() {
     // never executes; unsupported column types are not offered as targets.
     const callsBeforeImport = streamCalls;
     await setSQL("SELECT 1");
-    assert.equal(await clickButton("Import data…"), true, "the Import data control should be available");
+    assert.equal(await clickMoreItem("Import data…"), true, "the Import data control should be available");
     await browser.waitFor("document.querySelector('[role=dialog] h2')?.textContent === 'Import CSV / JSON data'", "the import explorer to open");
     await browser.evaluate(`(() => {
       const el = document.getElementById('import-source');
@@ -1847,7 +2031,7 @@ async function testOperateMode() {
     // bound in the editor's Parameters panel.
     const callsBeforeDml = streamCalls;
     await setSQL("SELECT 1");
-    assert.equal(await clickButton("Parameterized DML…"), true, "the Parameterized DML control should be available");
+    assert.equal(await clickMoreItem("Parameterized DML…"), true, "the Parameterized DML control should be available");
     await browser.waitFor("document.querySelector('[role=dialog] h2')?.textContent === 'Parameterized INSERT / UPDATE / DELETE'", "the DML builder to open");
     await browser.waitFor("document.querySelector('[role=dialog]')?.textContent.includes('INSERT INTO \"articles\"')", "the generated INSERT template to render");
     await browser.waitFor("document.querySelector('[role=dialog]')?.textContent.includes('($1, $2, $3, $4, $5, $6)')", "every column becomes a positional placeholder");
@@ -1876,7 +2060,7 @@ async function testOperateMode() {
     // editor from a form. It never executes; the operator reviews and runs.
     const callsBeforeDesigner = streamCalls;
     await setSQL("SELECT 1");
-    assert.equal(await clickButton("Design schema…"), true, "the Design schema control should be available");
+    assert.equal(await clickMoreItem("Design schema…"), true, "the Design schema control should be available");
     await browser.waitFor("document.querySelector('[role=dialog] h2')?.textContent === 'Design a table'", "the table designer to open");
     await browser.waitFor("document.querySelector('[role=dialog]')?.textContent.includes('CREATE TABLE \"new_table\"')", "the default CREATE TABLE preview to render");
     await browser.waitFor("document.querySelector('[role=dialog]')?.textContent.includes('PRIMARY KEY DEFAULT UUID()')", "the default id UUID primary key to render");

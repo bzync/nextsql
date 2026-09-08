@@ -1,4 +1,4 @@
-import { Alert, Button, Card, CardBody, DescriptionDetails, DescriptionItem, DescriptionList, DescriptionTerm, Inline } from "@bzync/rui";
+import { Alert, Button, Card, CardBody, DescriptionDetails, DescriptionItem, DescriptionList, DescriptionTerm } from "@bzync/rui";
 import type { Params, RunResult } from "../api";
 import { StepHeader } from "../components/StepHeader";
 
@@ -16,9 +16,9 @@ export function Summary({
     : "unknown — press Check on the previous step";
 
   return (
-    <Card variant="elevated">
+    <Card variant="bordered">
       <CardBody>
-        <StepHeader title="Review" description="Nothing has been created yet. Installing will:" />
+        <StepHeader kicker="Step 5 of 6" title="Review" description="Nothing has been created yet. Installing will:" />
         <DescriptionList columns={1} density="compact" style={{ marginTop: 20 }}>
           <DescriptionItem>
             <DescriptionTerm>Data directory</DescriptionTerm>
@@ -72,10 +72,10 @@ export function Summary({
           Write down the unlock key file path above. It is required every time the server starts
           and is never uploaded or recoverable by NextSQL if lost.
         </Alert>
-        <Inline justify="between" style={{ marginTop: 20 }}>
+        <div className="nsi-actions">
           <Button variant="outline" onClick={onBack}>Back</Button>
           <Button variant="primary" onClick={onInstall}>Install</Button>
-        </Inline>
+        </div>
       </CardBody>
     </Card>
   );

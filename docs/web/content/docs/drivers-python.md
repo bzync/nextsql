@@ -1,12 +1,18 @@
 # Python driver
 
 Python 3.10+ (stdlib only — `socket`, `ssl`, `decimal`, `json`; no external
-dependencies). Path: [`drivers/python`](https://github.com/bzync/nextsql/tree/main/drivers/python).
-Not published to PyPI — import it from this tree directly.
+dependencies). MIT, versioned independently of the engine (package `0.1.0`).
+
+```bash
+pip install bzync-nextsql
+```
+
+The distribution is `bzync-nextsql`; the import name is `nextsql`. Source:
+[`drivers/python`](https://github.com/bzync/nextsql/tree/master/drivers/python) —
+you can also vendor it straight from the tree (`sys.path.insert(0, "drivers/python")`).
 
 ```python
-import sys
-sys.path.insert(0, "drivers/python")
+import decimal
 import nextsql
 
 conn = nextsql.connect(nextsql.Config(

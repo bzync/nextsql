@@ -134,6 +134,12 @@ paths, whether the database was initialized, the health-check result, and
 any warnings. Combined with the exit codes below it is the intended
 interface for the OS installers and container init.
 
+The container image's `nextsql-entrypoint` (`internal/dockerentry`) drives
+`nextsql setup` on first start from environment variables
+(`NEXTSQL_PROFILE`, `NEXTSQL_PRESET`, `NEXTSQL_SERVER_USER`, …), writes the
+generated `nextsql.conf` into the data volume, and passes it to `nextsqld`
+with `--config` on every start — see `docs/docker.md`.
+
 ### Exit codes
 
 `nextsql setup` uses the shared `nextsql` exit-code scheme (`internal/cli`):

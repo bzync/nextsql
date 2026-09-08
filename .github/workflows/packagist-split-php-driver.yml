@@ -2,12 +2,15 @@ name: Publish PHP driver to Packagist
 
 # Packagist resolves a package from a repository's root composer.json, but the
 # PHP driver lives in a subdirectory of this monorepo. This workflow splits
-# drivers/php/ into the standalone read-only mirror repo bzync/nextsql-php on
-# every php-v*.*.* tag; Packagist watches that mirror and picks up the new tag.
+# drivers/php/ into the standalone read-only mirror repo bzync/nextsql-php and
+# pushes a `v<version>` tag there; Packagist watches that mirror and picks it up.
 #
-# The tag version must match drivers/php/composer.json (a "version" key is not
-# required there — Packagist derives it from the git tag on the mirror — so the
-# check below only guards the composer.json name).
+# Three ways in:
+#   * push a tag `php-v0.1.0`                           (this driver only)
+#   * `workflow_dispatch` with ref + version            (manual re-run)
+#   * called by `release-drivers.yml` via workflow_call (all drivers at once)
+# A "version" key is not required in drivers/php/composer.json — Packagist
+# derives it from the mirror's git tag — so the check below only guards the name.
 #
 # One-time setup:
 #   1. Create an empty github.com/bzync/nextsql-php repository.
@@ -20,10 +23,24 @@ on:
   push:
     tags:
       - "php-v*.*.*"
+  workflow_call:
+    inputs:
+      ref:
+        description: "Git ref to check out and split from"
+        required: false
+        type: string
+      version:
+        description: "Version to tag on the mirror"
+        required: false
+        type: string
   workflow_dispatch:
     inputs:
-      tag:
-        description: "Tag to split from (e.g. php-v0.1.0), for a manual re-run"
+      ref:
+        description: "Git ref to check out (default: this ref)"
+        required: false
+        type: string
+      version:
+        description: "Version to publish, e.g. 0.1.0 (default: derived from a php-v* tag)"
         required: false
         type: string
 
@@ -37,7 +54,7 @@ jobs:
       - name: Checkout (full history — subtree split needs it)
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.tag || github.ref }}
+          ref: ${{ inputs.ref || github.ref }}
           fetch-depth: 0
 
       - name: Validate composer.json
@@ -45,17 +62,23 @@ jobs:
           php -r 'exit(json_decode(file_get_contents("drivers/php/composer.json"))->name === "bzync/nextsql" ? 0 : 1);' \
             || { echo "::error::drivers/php/composer.json name must be bzync/nextsql"; exit 1; }
 
+      - name: Resolve version
+        id: v
+        run: |
+          version="${{ inputs.version }}"
+          if [ -z "$version" ]; then version="${GITHUB_REF_NAME#php-v}"; fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
       - name: Split drivers/php and push to the mirror
         env:
           SPLIT_TOKEN: ${{ secrets.PHP_SPLIT_TOKEN }}
+          VERSION: ${{ steps.v.outputs.version }}
         run: |
           set -euo pipefail
-          ref="${{ inputs.tag || github.ref_name }}"
-          version="${ref#php-v}"
           git config user.name "nextsql-release"
           git config user.email "release@bzync.com"
           split_sha="$(git subtree split --prefix=drivers/php HEAD)"
           git push "https://x-access-token:${SPLIT_TOKEN}@github.com/bzync/nextsql-php.git" \
             "${split_sha}:refs/heads/master" --force
           git push "https://x-access-token:${SPLIT_TOKEN}@github.com/bzync/nextsql-php.git" \
-            "${split_sha}:refs/tags/v${version}"
+            "${split_sha}:refs/tags/v${VERSION}"

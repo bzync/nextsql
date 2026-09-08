@@ -1,11 +1,17 @@
 # Ruby driver
 
 Ruby 3.0+ (stdlib only — `socket`, `openssl`, `bigdecimal`, `json`; no
-gem dependencies). Path: [`drivers/ruby`](https://github.com/bzync/nextsql/tree/main/drivers/ruby).
-Not published as a gem — require it from this tree directly.
+gem dependencies). MIT, versioned independently of the engine (gem `0.1.0`).
+
+```bash
+gem install bzync-nextsql
+```
+
+The gem is `bzync-nextsql`; you load it with `require "nextsql"`. Source:
+[`drivers/ruby`](https://github.com/bzync/nextsql/tree/master/drivers/ruby) — you
+can also vendor it straight from the tree (`$LOAD_PATH.unshift("drivers/ruby/lib")`).
 
 ```ruby
-$LOAD_PATH.unshift("drivers/ruby/lib")
 require "nextsql"
 
 conn = NextSQL.connect(NextSQL::Config.new(

@@ -1,9 +1,13 @@
 name: Publish Node driver to npm
 
-# Publishes drivers/node as @bzync/nextsql ("npm i @bzync/nextsql"). Triggered
-# by pushing a tag like node-v0.1.0 — the tag version must match
-# drivers/node/package.json's "version" field, or the job fails before
-# publishing. Zero runtime dependencies, so no lockfile/install step needed.
+# Publishes drivers/node as @bzync/nextsql ("npm i @bzync/nextsql").
+#
+# Three ways in:
+#   * push a tag `node-v0.1.0`                          (this driver only)
+#   * `workflow_dispatch` with ref + version            (manual re-run)
+#   * called by `release-drivers.yml` via workflow_call (all drivers at once)
+# The resolved version must match drivers/node/package.json "version", or the
+# job fails before publishing. Zero runtime dependencies.
 #
 # Auth: npm CLI >= 11.5.1 uses GitHub OIDC (Trusted Publishing) when a trusted
 # publisher is configured for @bzync/nextsql on npmjs.com, and otherwise falls
@@ -16,10 +20,24 @@ on:
   push:
     tags:
       - "node-v*.*.*"
+  workflow_call:
+    inputs:
+      ref:
+        description: "Git ref to check out and publish from"
+        required: false
+        type: string
+      version:
+        description: "Version to verify against the manifest and publish"
+        required: false
+        type: string
   workflow_dispatch:
     inputs:
-      tag:
-        description: "Tag to publish from (e.g. node-v0.1.0), for a manual re-run"
+      ref:
+        description: "Git ref to check out (default: this ref)"
+        required: false
+        type: string
+      version:
+        description: "Version to publish, e.g. 0.1.0 (default: derived from a node-v* tag)"
         required: false
         type: string
 
@@ -38,7 +56,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.tag || github.ref }}
+          ref: ${{ inputs.ref || github.ref }}
 
       - name: Set up Node.js
         uses: actions/setup-node@v7
@@ -49,13 +67,19 @@ jobs:
       - name: Use an OIDC-capable npm
         run: npm install -g npm@latest
 
-      - name: Verify tag matches package.json version
+      - name: Resolve version
+        id: v
         run: |
-          ref="${{ inputs.tag || github.ref_name }}"
-          tag_version="${ref#node-v}"
-          pkg_version="$(node -p "require('./package.json').version")"
-          if [ "$tag_version" != "$pkg_version" ]; then
-            echo "::error::Tag $ref (version $tag_version) does not match package.json version $pkg_version"
+          version="${{ inputs.version }}"
+          if [ -z "$version" ]; then version="${GITHUB_REF_NAME#node-v}"; fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Verify version matches package.json
+        run: |
+          want="${{ steps.v.outputs.version }}"
+          have="$(node -p "require('./package.json').version")"
+          if [ "$want" != "$have" ]; then
+            echo "::error::Requested version $want does not match package.json version $have"
             exit 1
           fi
 

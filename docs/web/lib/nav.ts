@@ -31,7 +31,7 @@ export const docsNav: NavGroup[] = [
       {
         title: "Docker",
         slug: "docker",
-        description: "Run nextsqld in a container, with the root key off the data volume.",
+        description: "Prebuilt Docker Hub image, Compose, HA cluster, and Podman.",
       },
     ],
   },

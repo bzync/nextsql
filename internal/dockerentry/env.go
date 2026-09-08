@@ -12,6 +12,7 @@ const (
 	defaultListen       = "0.0.0.0:7210"
 	defaultPasswordFile = "/run/bootstrap/password"
 	dbFileName          = "nextsql.db"
+	confFileName        = "nextsql.conf"
 	verifiedMarker      = "verified"
 )
 
@@ -24,6 +25,9 @@ type Env struct {
 	PasswordFile  string
 	ServerUser    string
 	ServerPass    string
+	Profile       string
+	Preset        string
+	ConfigFile    string
 	SeedFrom      string
 	SeedTo        string
 	AuthFile      string
@@ -48,13 +52,17 @@ func LoadEnv(getenv func(string) string) Env {
 		}
 		return fallback
 	}
+	dataDir := get("NEXTSQL_DATA_DIR", defaultDataDir)
 	return Env{
-		DataDir:       get("NEXTSQL_DATA_DIR", defaultDataDir),
+		DataDir:       dataDir,
 		KeyFile:       get("NEXTSQL_KEY_FILE", defaultKeyFile),
 		Listen:        get("NEXTSQL_LISTEN", defaultListen),
 		PasswordFile:  get("NEXTSQL_SERVER_PASSWORD_FILE", defaultPasswordFile),
 		ServerUser:    getenv("NEXTSQL_SERVER_USER"),
 		ServerPass:    getenv("NEXTSQL_SERVER_PASS"),
+		Profile:       getenv("NEXTSQL_PROFILE"),
+		Preset:        getenv("NEXTSQL_PRESET"),
+		ConfigFile:    get("NEXTSQL_CONFIG_FILE", filepath.Join(dataDir, confFileName)),
 		SeedFrom:      getenv("NEXTSQL_SEED_FROM"),
 		SeedTo:        getenv("NEXTSQL_SEED_TO"),
 		AuthFile:      getenv("NEXTSQL_AUTH_FILE"),
@@ -73,6 +81,15 @@ func LoadEnv(getenv func(string) string) Env {
 
 func (e Env) dbPath() string {
 	return filepath.Join(e.DataDir, dbFileName)
+}
+
+// configPath is the nextsql.conf the entrypoint generates on first start and
+// passes to nextsqld on every start. NEXTSQL_CONFIG_FILE overrides it.
+func (e Env) configPath() string {
+	if e.ConfigFile != "" {
+		return e.ConfigFile
+	}
+	return filepath.Join(e.DataDir, confFileName)
 }
 
 func (e Env) seedVerifiedPath() string {

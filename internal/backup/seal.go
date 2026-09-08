@@ -56,12 +56,22 @@ func sealFile(dek *crypto.DEK, name string, srcPath, dstPath string, genBase uin
 	}
 	h.Write(hdr)
 
+	// A hot backup copies a live file: the engine keeps extending it while
+	// this runs, so reading to EOF would copy more than the size recorded in
+	// the header above and then fail the equality check below as if the file
+	// were corrupt. The member is defined as the file's first st.Size() bytes
+	// — the consistent prefix as of the moment the backup started — and WAL
+	// replay from the checkpoint LSN covers everything written after it.
+	// Bound the read to that snapshot so growth is ignored; the check below
+	// still catches the genuine failure, a source that shrank mid-copy.
+	src := io.LimitReader(in, st.Size())
+
 	buf := make([]byte, defaultChunk)
 	var chunk uint32
 	var wrote int64
 	gen := genBase
 	for {
-		n, rerr := io.ReadFull(in, buf)
+		n, rerr := io.ReadFull(src, buf)
 		if n > 0 {
 			if gen == 0 {
 				return 0, 0, sum, 0, nerr.New(nerr.Internal, "backup.sealFile", "generation 0 is reserved")

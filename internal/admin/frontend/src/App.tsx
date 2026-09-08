@@ -25,7 +25,7 @@ export function App() {
       <>
         <AuthBackdrop aria-hidden="true" />
         <main className="nsa-loading-page bg-bg text-foreground">
-          <Card variant="elevated" role="status" aria-live="polite">
+          <Card variant="bordered" role="status" aria-live="polite">
             <CardBody>
               <Inline gap="sm" align="center">
                 <Spinner size="sm" />
@@ -43,7 +43,7 @@ export function App() {
       <>
         <AuthBackdrop aria-hidden="true" />
         <main className="nsa-loading-page bg-bg text-foreground">
-          <Card variant="elevated">
+          <Card variant="bordered">
             <CardBody>
               <Alert variant="error" title="Could not reach NextSQL Admin">{state.message}</Alert>
             </CardBody>

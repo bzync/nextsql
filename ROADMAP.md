@@ -638,8 +638,8 @@ browser storage with accessible splitters and Hide/Show/Reset layout controls
 The open MVP expands that foundation into:
 
 - saved multi-environment connection management and secure OS credential storage;
-- source-position parser/binder diagnostics and a data-editing grid;
-- general spatial preview and safe data editing;
+- source-position binder diagnostics (parser diagnostics and the data-editing grid are done);
+- general spatial preview;
 - profiling;
 - multimodel tools;
 - workflow/task/CDC tooling.

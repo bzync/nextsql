@@ -25,6 +25,7 @@ import (
 	"github.com/bzync/nextsql/internal/security"
 	"github.com/bzync/nextsql/internal/sql/types"
 	"github.com/bzync/nextsql/internal/storage"
+	"github.com/bzync/nextsql/internal/storage/file"
 	"github.com/bzync/nextsql/internal/storage/format"
 	"github.com/bzync/nextsql/internal/upgrade"
 	"github.com/bzync/nextsql/internal/version"
@@ -170,11 +171,15 @@ func createRealm(args []string) error {
 	databaseName := fs.String("database", "", "new realm's first database name")
 	databaseKeyFile := fs.String("database-key-file", "", "root unlock key file for the new database (created if missing)")
 	bufferPages := fs.Int("buffer-pages", config.DefaultBufferPages, "buffer pool pages for the new database")
+	preallocAhead := fs.Int("prealloc-ahead-pages", config.DefaultPreallocAheadPages, "storage preallocation runway in 16 KiB pages (default ~256 MiB); lower it for containers or many small databases")
 	fs.String("env-file", "", "load only this dotenv file")
 	fs.Bool("no-env", false, "do not load .env files")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	// Process-wide storage preallocation runway, applied before the database
+	// file is created so the new file claims only the configured amount.
+	file.SetCapacityAhead(*preallocAhead)
 	reg, ddl, settings, err := openHostingRegistryForCLI(op, fs, args, true)
 	if err != nil {
 		return err
@@ -290,11 +295,15 @@ func createDatabase(args []string) error {
 	databaseName := fs.String("name", "", "new database name")
 	databaseKeyFile := fs.String("database-key-file", "", "root unlock key file for the new database (created if missing)")
 	bufferPages := fs.Int("buffer-pages", config.DefaultBufferPages, "buffer pool pages for the new database")
+	preallocAhead := fs.Int("prealloc-ahead-pages", config.DefaultPreallocAheadPages, "storage preallocation runway in 16 KiB pages (default ~256 MiB); lower it for containers or many small databases")
 	fs.String("env-file", "", "load only this dotenv file")
 	fs.Bool("no-env", false, "do not load .env files")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	// Process-wide storage preallocation runway, applied before the database
+	// file is created so the new file claims only the configured amount.
+	file.SetCapacityAhead(*preallocAhead)
 	reg, ddl, settings, err := openHostingRegistryForCLI(op, fs, args, true)
 	if err != nil {
 		return err
@@ -1382,6 +1391,7 @@ func initDB(args []string) error {
 	user := fs.String("user", "", "optional bootstrap user")
 	passwordFile := fs.String("password-file", "", "password file for --user")
 	bufferPages := fs.Int("buffer-pages", config.DefaultBufferPages, "buffer pool pages")
+	preallocAhead := fs.Int("prealloc-ahead-pages", config.DefaultPreallocAheadPages, "storage preallocation runway in 16 KiB pages (default ~256 MiB); lower it for containers or many small databases")
 	realmName := fs.String("realm", "default", "bootstrap subscription realm name")
 	databaseName := fs.String("database", "default", "bootstrap logical database name")
 	instanceKeyFile := fs.String("instance-key-file", "", "deployment registry root key file (default KEY-FILE.instance)")
@@ -1391,6 +1401,9 @@ func initDB(args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	// Process-wide storage preallocation runway, applied before the database
+	// file is created so the new file claims only the configured amount.
+	file.SetCapacityAhead(*preallocAhead)
 	settings, err := cli.Resolve(fs, args)
 	if err != nil {
 		return err

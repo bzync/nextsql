@@ -23,26 +23,68 @@ func (p *Parser) nextSubqueryID() uint64 {
 	return p.subqueryID
 }
 
+// SyntaxDiag locates a parse failure within the source. Offset is a 0-based
+// byte offset into the string passed to ParseDiag, pointing at the token the
+// parser stopped on (or, for a lexer error, where scanning halted); it can be
+// equal to len(src) when the statement ended prematurely. Message is the
+// reason with no "nextsql syntax:" prefix. A SyntaxDiag is advisory location
+// metadata for an editor — the parser still stops at the first error, so it
+// reports one position per statement, not every problem.
+type SyntaxDiag struct {
+	Offset  int
+	Message string
+}
+
+// Parse turns one SQL statement into an AST. It is ParseDiag without the
+// location.
 func Parse(src string) (ast.Stmt, error) {
+	stmt, _, err := ParseDiag(src)
+	return stmt, err
+}
+
+// ParseDiag is Parse plus a source location for a failure. On success diag is
+// nil and err is nil. On failure diag is non-nil (its Offset points at the
+// offending token) and err is the same typed error Parse returns — the two
+// are always set together. Callers that do not need the location use Parse.
+func ParseDiag(src string) (ast.Stmt, *SyntaxDiag, error) {
 	p := &Parser{lx: lexer.New(src)}
 	p.next()
 	if p.tok.Kind == lexer.EOF {
-		return nil, nerr.New(nerr.Syntax, "sql.parser", "empty statement")
+		return nil, p.diag(nil, "empty statement"), nerr.New(nerr.Syntax, "sql.parser", "empty statement")
 	}
 	stmt, err := p.stmt()
 	if err != nil {
-		return nil, err
+		return nil, p.diag(err, ""), err
 	}
 	if p.tok.Kind == lexer.Semi {
 		p.next()
 	}
 	if p.tok.Kind != lexer.EOF {
-		return nil, nerr.New(nerr.Syntax, "sql.parser", "unexpected token after statement")
+		return nil, p.diag(nil, "unexpected token after statement"), nerr.New(nerr.Syntax, "sql.parser", "unexpected token after statement")
 	}
 	if err := p.lx.Err(); err != nil {
-		return nil, err
+		return nil, p.diag(err, ""), err
 	}
-	return stmt, nil
+	return stmt, nil, nil
+}
+
+// diag builds a SyntaxDiag for the current parser position. When msg is empty
+// the message is taken from err (a *nerr.Error's Message, else err.Error()).
+func (p *Parser) diag(err error, msg string) *SyntaxDiag {
+	if msg == "" {
+		if ne, ok := err.(*nerr.Error); ok && ne != nil {
+			msg = ne.Message
+		} else if err != nil {
+			msg = err.Error()
+		} else {
+			msg = "syntax error"
+		}
+	}
+	off := p.tok.Pos
+	if off < 0 {
+		off = 0
+	}
+	return &SyntaxDiag{Offset: off, Message: msg}
 }
 
 func (p *Parser) next() {

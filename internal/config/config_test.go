@@ -1,6 +1,7 @@
 package config
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -776,6 +777,46 @@ func TestDiffState(t *testing.T) {
 			if !s.RestartRequired {
 				t.Fatalf("listen_addr differs but RestartRequired=false: %+v", s)
 			}
+		}
+	}
+}
+
+// TestPreallocAheadPagesRoundTrip pins the storage preallocation runway as a
+// real configuration key. The runway is claimed with fallocate as actual
+// blocks, so it is a fixed per-database on-disk cost — the 16384-page default
+// makes an empty database occupy ~257 MiB — and a deployment that runs many
+// small databases, or a container, needs to be able to lower it.
+func TestPreallocAheadPagesRoundTrip(t *testing.T) {
+	if got := Default().PreallocAheadPages; got != DefaultPreallocAheadPages {
+		t.Fatalf("default = %d, want %d", got, DefaultPreallocAheadPages)
+	}
+
+	cfg, err := loadFrom(bytes.NewReader([]byte("prealloc_ahead_pages = 64\n")))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.PreallocAheadPages != 64 {
+		t.Fatalf("parsed = %d, want 64", cfg.PreallocAheadPages)
+	}
+
+	// It must survive Marshal → Load, which is also what makes it a settable
+	// key: settableKeys is derived from Marshal's own output.
+	again, err := loadFrom(bytes.NewReader(cfg.Marshal()))
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if again.PreallocAheadPages != 64 {
+		t.Fatalf("round-tripped = %d, want 64", again.PreallocAheadPages)
+	}
+	if !settableKeys["prealloc_ahead_pages"] {
+		t.Fatal("prealloc_ahead_pages must be settable via SET CONFIG")
+	}
+
+	// A runway of zero or less would disable preallocation entirely rather
+	// than tuning it, so it is refused at load rather than silently accepted.
+	for _, bad := range []string{"0", "-1", "abc"} {
+		if _, err := loadFrom(bytes.NewReader([]byte("prealloc_ahead_pages = " + bad + "\n"))); err == nil {
+			t.Fatalf("prealloc_ahead_pages = %s must be refused", bad)
 		}
 	}
 }

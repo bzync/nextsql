@@ -66,6 +66,12 @@ func TestLoadEnvDefaults(t *testing.T) {
 	if env.PasswordFile != defaultPasswordFile {
 		t.Fatalf("password file default: %q", env.PasswordFile)
 	}
+	if env.ConfigFile != filepath.Join(defaultDataDir, confFileName) {
+		t.Fatalf("config file default: %q", env.ConfigFile)
+	}
+	if env.Profile != "" || env.Preset != "" {
+		t.Fatalf("profile/preset default: %+v", env)
+	}
 }
 
 func TestLoadEnvOverrides(t *testing.T) {
@@ -73,10 +79,18 @@ func TestLoadEnvOverrides(t *testing.T) {
 		"NEXTSQL_DATA_DIR": "/data",
 		"NEXTSQL_LISTEN":   "127.0.0.1:9",
 		"NEXTSQL_NODE_ID":  "node-a",
+		"NEXTSQL_PROFILE":  "production",
+		"NEXTSQL_PRESET":   "high-performance",
 	}
 	env := LoadEnv(func(k string) string { return vals[k] })
 	if env.DataDir != "/data" || env.Listen != "127.0.0.1:9" || env.NodeID != "node-a" {
 		t.Fatalf("overrides: %+v", env)
+	}
+	if env.Profile != "production" || env.Preset != "high-performance" {
+		t.Fatalf("profile/preset overrides: %+v", env)
+	}
+	if env.ConfigFile != "/data/nextsql.conf" {
+		t.Fatalf("config file follows data dir: %q", env.ConfigFile)
 	}
 }
 
@@ -189,7 +203,7 @@ func TestFirstStartRequiresPassword(t *testing.T) {
 	}
 }
 
-func TestInitWithPasswordFileThenExec(t *testing.T) {
+func TestSetupWithPasswordFileThenExec(t *testing.T) {
 	dir := t.TempDir()
 	pw := filepath.Join(dir, "pw")
 	if err := os.WriteFile(pw, []byte("secret\n"), 0o644); err != nil {
@@ -202,6 +216,11 @@ func TestInitWithPasswordFileThenExec(t *testing.T) {
 		Listen:       "0.0.0.0:7210",
 		ServerUser:   "app",
 		PasswordFile: pw,
+		Profile:      "production",
+		Preset:       "conservative",
+		TLSCert:      "/c",
+		TLSKey:       "/k",
+		ConfigFile:   filepath.Join(dir, confFileName),
 		NodeID:       "solo",
 	}
 	code := run(env, rec.Runtime)
@@ -211,26 +230,89 @@ func TestInitWithPasswordFileThenExec(t *testing.T) {
 	if len(rec.runs) != 1 {
 		t.Fatalf("runs: %q", rec.runs)
 	}
-	got := rec.runs[0]
-	wantPrefix := []string{"/usr/local/bin/nextsql", "init", "--data-dir", dir, "--key-file", "/key", "--user", "app", "--password-file", pw}
-	if strings.Join(got, " ") != strings.Join(wantPrefix, " ") {
-		t.Fatalf("init args: %q", got)
+	got := strings.Join(rec.runs[0], " ")
+	want := "/usr/local/bin/nextsql setup --data-dir " + dir + " --key-file /key --user app --password-file " + pw +
+		" --config-out " + filepath.Join(dir, confFileName) + " --listen 0.0.0.0:7210" +
+		" --profile production --preset conservative --tls-cert /c --tls-key /k"
+	if got != want {
+		t.Fatalf("setup args:\n got %q\nwant %q", got, want)
 	}
 	if rec.exec[0] != "/usr/local/bin/nextsqld" {
 		t.Fatalf("exec %q", rec.exec)
 	}
 }
 
-func TestInitWithServerPassSkipsPasswordFile(t *testing.T) {
+func TestSetupWithServerPassWritesTempPasswordFile(t *testing.T) {
 	dir := t.TempDir()
 	rec := newRecorder()
+	var seenPath string
+	rec.Run = func(name string, args []string) error {
+		rec.runs = append(rec.runs, append([]string{name}, args...))
+		for i, a := range args {
+			if a == "--password-file" && i+1 < len(args) {
+				seenPath = args[i+1]
+			}
+		}
+		// The password file must still exist (and hold the password) while
+		// `nextsql setup` runs.
+		b, err := os.ReadFile(seenPath)
+		if err != nil {
+			t.Fatalf("password file unreadable during setup: %v", err)
+		}
+		if string(b) != "secret\n" {
+			t.Fatalf("password file content %q", b)
+		}
+		return nil
+	}
 	env := Env{DataDir: dir, KeyFile: "/key", Listen: "0.0.0.0:7210", ServerUser: "app", ServerPass: "secret", PasswordFile: filepath.Join(dir, "missing")}
 	if code := run(env, rec.Runtime); code != 0 {
 		t.Fatalf("code=%d log=%q", code, rec.log.String())
 	}
-	got := strings.Join(rec.runs[0], " ")
-	if strings.Contains(got, "--password-file") {
-		t.Fatalf("unexpected password-file: %q", got)
+	if seenPath == "" {
+		t.Fatal("no --password-file passed to setup")
+	}
+	if _, err := os.Stat(seenPath); !os.IsNotExist(err) {
+		t.Fatalf("temp password file not cleaned up: %v", err)
+	}
+}
+
+func TestSetupConfigPassedToServerWhenPresent(t *testing.T) {
+	dir := t.TempDir()
+	conf := filepath.Join(dir, confFileName)
+	rec := newRecorder()
+	rec.Run = func(name string, args []string) error {
+		rec.runs = append(rec.runs, append([]string{name}, args...))
+		// emulate `nextsql setup` writing the generated config
+		return os.WriteFile(conf, []byte("deployment_profile=production\n"), 0o640)
+	}
+	env := Env{DataDir: dir, KeyFile: "/key", Listen: "0.0.0.0:7210", ServerUser: "app", ServerPass: "secret", PasswordFile: filepath.Join(dir, "missing")}
+	if code := run(env, rec.Runtime); code != 0 {
+		t.Fatalf("code=%d log=%q", code, rec.log.String())
+	}
+	if len(rec.exec) < 3 || rec.exec[1] != "--config" || rec.exec[2] != conf {
+		t.Fatalf("expected --config %s first in server args, got %q", conf, rec.exec)
+	}
+}
+
+func TestExistingConfigPassedToServerWithoutReinit(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, dbFileName), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	conf := filepath.Join(dir, confFileName)
+	if err := os.WriteFile(conf, []byte("deployment_profile=production\n"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	rec := newRecorder()
+	env := Env{DataDir: dir, KeyFile: "/key", Listen: "0.0.0.0:7210"}
+	if code := run(env, rec.Runtime); code != 0 {
+		t.Fatalf("code=%d log=%q", code, rec.log.String())
+	}
+	if len(rec.runs) != 0 {
+		t.Fatalf("unexpected setup on existing db: %q", rec.runs)
+	}
+	if len(rec.exec) < 3 || rec.exec[1] != "--config" || rec.exec[2] != conf {
+		t.Fatalf("expected --config %s first, got %q", conf, rec.exec)
 	}
 }
 

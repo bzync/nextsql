@@ -8,16 +8,20 @@ import {
   CardHeader,
   CardTitle,
   ConfirmDialog,
-  Heading,
   Inline,
   NumberInput,
   Stack,
+  Tabs,
+  TabsContent,
+  TabsList,
+  TabsTrigger,
   Text,
 } from "@bzync/rui";
 import { api, ApiError, type ClusterAction } from "../api";
 import { useReadModel } from "../useReadModel";
 import { ResultTable } from "../ResultTable";
 import { ViewFrame } from "./ViewFrame";
+import { Icon } from "../../shared/icons";
 
 type ActionCopy = {
   title: string;
@@ -115,7 +119,12 @@ export function Cluster({ onUnauthorized }: { onUnauthorized: () => void }) {
           ) : null}
           <Card variant="bordered">
             <CardHeader>
-              <CardTitle as="h3">Cluster actions</CardTitle>
+              <CardTitle as="h3">
+                <Inline gap="xs" align="center" wrap={false}>
+                  <Icon name="wrench" size={16} />
+                  Cluster actions
+                </Inline>
+              </CardTitle>
             </CardHeader>
             <CardBody>
               <Stack gap="sm">
@@ -123,7 +132,7 @@ export function Cluster({ onUnauthorized }: { onUnauthorized: () => void }) {
                   Each action requires cluster ADMIN and runs on the node this session is
                   connected to. Confirm before running.
                 </Text>
-                <Inline gap="sm" wrap align="center">
+                <div className="nsm-action-row">
                   <Inline gap="xs" align="center">
                     <NumberInput
                       aria-label="Drain timeout (ms), 0 = node default"
@@ -133,32 +142,49 @@ export function Cluster({ onUnauthorized }: { onUnauthorized: () => void }) {
                       onChange={setDrainTimeoutMs}
                       style={{ width: 140 }}
                     />
-                    <Button variant="outline" onClick={() => setPending("drain")}>Drain node…</Button>
+                    <Button variant="outline" icon={<Icon name="stop" size={14} />} onClick={() => setPending("drain")}>Drain node…</Button>
                   </Inline>
-                  <Button variant="outline" onClick={() => setPending("transfer_leader")}>
+                  <Button variant="outline" icon={<Icon name="cluster" size={14} />} onClick={() => setPending("transfer_leader")}>
                     Transfer leadership…
                   </Button>
-                  <Button variant="outline" onClick={() => setPending("maintenance_enable")}>
+                  <Button variant="outline" icon={<Icon name="wrench" size={14} />} onClick={() => setPending("maintenance_enable")}>
                     Enable maintenance…
                   </Button>
-                  <Button variant="outline" onClick={() => setPending("maintenance_disable")}>
+                  <Button variant="outline" icon={<Icon name="check" size={14} />} onClick={() => setPending("maintenance_disable")}>
                     Disable maintenance…
                   </Button>
-                  <Button variant="outline" onClick={() => setPending("reconcile_confirm")}>
+                  <Button variant="outline" icon={<Icon name="check" size={14} />} onClick={() => setPending("reconcile_confirm")}>
                     Confirm reconciled…
                   </Button>
-                </Inline>
+                </div>
               </Stack>
             </CardBody>
           </Card>
-          <Stack gap="xs">
-            <Heading as="h3" size="sm">Replication</Heading>
-            <ResultTable result={data.replication} />
-          </Stack>
-          <Stack gap="xs">
-            <Heading as="h3" size="sm">Replica health</Heading>
-            <ResultTable result={data.replica_health} empty="No replica health rows (standalone node)" />
-          </Stack>
+          <Tabs defaultValue="replication" className="mt-4">
+            <TabsList className="mb-4">
+              <TabsTrigger value="replication">
+                <Inline gap="xs" align="center" wrap={false}>
+                  <Icon name="network" size={14} />
+                  <span>Replication</span>
+                  <Badge variant="muted" size="sm">{data.replication.rows.length}</Badge>
+                </Inline>
+              </TabsTrigger>
+              <TabsTrigger value="replica_health">
+                <Inline gap="xs" align="center" wrap={false}>
+                  <Icon name="activity" size={14} />
+                  <span>Replica health</span>
+                  <Badge variant="muted" size="sm">{data.replica_health.rows.length}</Badge>
+                </Inline>
+              </TabsTrigger>
+            </TabsList>
+
+            <TabsContent value="replication">
+              <ResultTable result={data.replication} label="Replication" />
+            </TabsContent>
+            <TabsContent value="replica_health">
+              <ResultTable result={data.replica_health} empty="No replica health rows (standalone node)" label="Replica health" />
+            </TabsContent>
+          </Tabs>
         </>
       ) : null}
       {copy ? (

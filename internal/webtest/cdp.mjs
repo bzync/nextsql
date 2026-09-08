@@ -2,7 +2,7 @@
 // P28 browser accessibility checks. Chrome itself is intentionally external;
 // axe-core remains a package-local development dependency in each frontend.
 import { spawn } from "node:child_process";
-import { accessSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { accessSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -147,6 +147,16 @@ export async function launchChrome(url, { width = 1280, height = 900 } = {}) {
     press,
     reload,
     insertText: (text) => send("Input.insertText", { text }),
+    captureScreenshot: async ({ path, clip } = {}) => {
+      const result = await send("Page.captureScreenshot", {
+        format: "png",
+        fromSurface: true,
+        ...(clip ? { clip: { ...clip, scale: 1 } } : {}),
+      });
+      const buffer = Buffer.from(result.data, "base64");
+      if (path) writeFileSync(path, buffer);
+      return buffer;
+    },
     emulateMedia: (features) => send("Emulation.setEmulatedMedia", { features }),
     emulateDeviceMetrics: ({ width, height, deviceScaleFactor = 1, mobile = false }) => send("Emulation.setDeviceMetricsOverride", {
       width,

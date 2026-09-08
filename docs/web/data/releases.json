@@ -11,7 +11,7 @@
       "highlights": [
         "One WAL, one MVCC, and one optimizer for SQL, JSON, vectors, full-text, and geo",
         "AES-256-GCM envelope encryption on by default",
-        "Native NSQL v1 protocol with official Go, JS, and PHP drivers"
+        "Native NSQL v1 protocol with official Go, Node, Bun, PHP, Python, and Ruby drivers"
       ],
       "changes": [
         {
@@ -72,7 +72,7 @@
           "id": "c10",
           "kind": "added",
           "area": "Drivers",
-          "text": "Official Go, Node/Bun, and PHP drivers. Keys never go in a URL."
+          "text": "Official Go, Node, Bun, PHP, Python, and Ruby drivers (npm @bzync/nextsql, Composer bzync/nextsql, PyPI/RubyGems bzync-nextsql). Keys never go in a URL."
         }
       ],
       "artifacts": [

@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 
 	"github.com/bzync/nextsql/internal/crypto"
 	"github.com/bzync/nextsql/internal/nerr"
@@ -275,10 +276,39 @@ func (m *Manager) WriteLogical(id format.PageID, logical []byte) error {
 	return err
 }
 
-const capacityAhead = 16384 // ~256 MiB of physical pages
+// DefaultCapacityAhead is the allocation runway kept ahead of the highest
+// allocated page, in 16 KiB physical pages: 16384 pages is ~256 MiB.
+//
+// The runway is claimed with fallocate in mode 0, which reserves real blocks
+// rather than making the file sparse, so it is a genuine on-disk cost from the
+// moment a database is created — a brand-new, empty database occupies ~257 MiB
+// (its handful of live pages plus this runway). That is deliberate: extending
+// the file on every bulk write is far more expensive. It is a poor trade for a
+// container, an embedded deployment, or a host running many small databases,
+// where the fixed cost is paid per database, so it is configurable
+// (prealloc_ahead_pages) rather than fixed.
+const DefaultCapacityAhead = 16384
 
-// EnsureCapacity preallocates the data file through page next (exclusive)
-// plus a slack of 1024 pages so bulk Alloc does not extend on every write.
+// capacityAhead is process-wide because nextsql.conf is per node: every
+// database this process opens shares the setting. Stored atomically so a
+// startup write cannot race a concurrent open.
+var capacityAhead atomic.Int64
+
+func init() { capacityAhead.Store(DefaultCapacityAhead) }
+
+// SetCapacityAhead overrides the preallocation runway for every database this
+// process subsequently opens or creates. Call it once at startup, before
+// opening any database. A value below 1 is ignored, so a misconfigured node
+// keeps the default rather than silently disabling preallocation entirely.
+func SetCapacityAhead(pages int) {
+	if pages < 1 {
+		return
+	}
+	capacityAhead.Store(int64(pages))
+}
+
+// EnsureCapacity preallocates the data file through page next (exclusive) plus
+// the configured runway, so bulk Alloc does not extend the file on every write.
 func (m *Manager) EnsureCapacity(next format.PageID) error {
 	if m == nil {
 		return nil
@@ -289,7 +319,7 @@ func (m *Manager) EnsureCapacity(next format.PageID) error {
 	if f == nil {
 		return nil
 	}
-	end := next + capacityAhead
+	end := next + format.PageID(capacityAhead.Load())
 	return diskio.Preallocate(f, format.PhysicalOffset(end))
 }
 

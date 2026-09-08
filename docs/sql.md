@@ -163,6 +163,8 @@ cluster `ADMIN` is required because maintenance crosses tenant boundaries.
 
 `CREATE DATABASE name` creates a new database file named `name` next to the current file, using the same key provider. It is not a catalog object inside the current file, is not WAL-replicated with the current database, and cannot run inside a transaction.
 
+It is supported **only on an embedded deployment that has no deployment registry**. On a registry-backed deployment (anything initialized by `nextsql init`, which is every `nextsqld` deployment) it fails closed with `invalid_argument`: the sibling file it would create carries no realm, no registry record, and no routing entry, so no client could ever connect to it — `Hello` resolves realm/database names through the registry — while it would still consume a full database's worth of disk. Managed databases are provisioned through the registry with `nextsql database create` (and realms with `nextsql realm create`), which are offline commands: `nextsqld` holds the exclusive data-directory lock while it runs. `IF NOT EXISTS` does not soften the refusal.
+
 `CLUSTER TRANSFER LEADER` asks a Raft-clustered deployment's current leader
 to hand off to another voter (`replication.Cluster.TransferLeadership`), for
 a planned handoff ahead of a restart or maintenance window rather than
@@ -353,6 +355,13 @@ column, the planner uses `OrderedDistinct` and removes adjacent duplicates from
 the sorted stream without building a hash table. For a single-table projection
 containing a complete primary key or complete `NOT NULL` UNIQUE-index key,
 `IndexDistinct` proves the rows are already unique and elides duplicate work.
+
+An aggregate with **no `GROUP BY`** is defined over one implicit group covering
+the whole input, so it returns exactly one row even when nothing matched:
+`COUNT` is `0` and `SUM` / `AVG` / `MIN` / `MAX` are `NULL`. This holds however
+the input became empty — an empty table, a filter that matches no row, or a
+constant-false filter folded away by the planner. With a `GROUP BY` there is no
+group to report, so empty input returns zero rows.
 
 `HAVING` runs after aggregation and before DISTINCT, ordering, and limits. It
 may reference grouped expressions that appear in the output, selected aggregate

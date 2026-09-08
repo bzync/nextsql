@@ -1,6 +1,7 @@
 import { useState } from "react";
 import {
   Alert,
+  Badge,
   Button,
   Card,
   CardBody,
@@ -8,16 +9,21 @@ import {
   CardTitle,
   Checkbox,
   ConfirmDialog,
-  Heading,
+  Inline,
   Input,
   Select,
   Stack,
+  Tabs,
+  TabsContent,
+  TabsList,
+  TabsTrigger,
   Text,
 } from "@bzync/rui";
 import { api, ApiError, type MaintainScope, type ResultSet } from "../api";
 import { useReadModel } from "../useReadModel";
 import { ResultTable } from "../ResultTable";
 import { ViewFrame } from "./ViewFrame";
+import { Icon } from "../../shared/icons";
 
 type PendingAction =
   | { kind: "analyze"; target: string }
@@ -122,7 +128,12 @@ export function Maintenance({ onUnauthorized }: { onUnauthorized: () => void }) 
 
           <Card variant="bordered">
             <CardHeader>
-              <CardTitle as="h3">Statistics — ANALYZE</CardTitle>
+              <CardTitle as="h3">
+                <Inline gap="xs" align="center" wrap={false}>
+                  <Icon name="diagnostics" size={16} />
+                  Statistics — ANALYZE
+                </Inline>
+              </CardTitle>
             </CardHeader>
             <CardBody>
               <Stack gap="sm">
@@ -137,6 +148,7 @@ export function Maintenance({ onUnauthorized }: { onUnauthorized: () => void }) 
                   />
                   <Button
                     variant="outline"
+                    icon={<Icon name="diagnostics" size={14} />}
                     onClick={() => setPending({ kind: "analyze", target: analyzeTarget.trim() })}
                   >
                     Analyze…
@@ -148,7 +160,12 @@ export function Maintenance({ onUnauthorized }: { onUnauthorized: () => void }) 
 
           <Card variant="bordered">
             <CardHeader>
-              <CardTitle as="h3">Rebuild index</CardTitle>
+              <CardTitle as="h3">
+                <Inline gap="xs" align="center" wrap={false}>
+                  <Icon name="layers" size={16} />
+                  Rebuild index
+                </Inline>
+              </CardTitle>
             </CardHeader>
             <CardBody>
               <Stack gap="sm">
@@ -165,6 +182,7 @@ export function Maintenance({ onUnauthorized }: { onUnauthorized: () => void }) 
                   />
                   <Button
                     variant="outline"
+                    icon={<Icon name="refresh" size={14} />}
                     disabled={!rebuildTarget.trim()}
                     onClick={() => setPending({ kind: "rebuild_index", target: rebuildTarget.trim(), online: rebuildOnline })}
                   >
@@ -177,7 +195,12 @@ export function Maintenance({ onUnauthorized }: { onUnauthorized: () => void }) 
 
           <Card variant="bordered">
             <CardHeader>
-              <CardTitle as="h3">Storage reclamation — MAINTAIN</CardTitle>
+              <CardTitle as="h3">
+                <Inline gap="xs" align="center" wrap={false}>
+                  <Icon name="hard-drive" size={16} />
+                  Storage reclamation — MAINTAIN
+                </Inline>
+              </CardTitle>
             </CardHeader>
             <CardBody>
               <Stack gap="sm">
@@ -204,6 +227,7 @@ export function Maintenance({ onUnauthorized }: { onUnauthorized: () => void }) 
                   ) : null}
                   <Button
                     variant="outline"
+                    icon={<Icon name="wrench" size={14} />}
                     disabled={maintainScope !== "database" && !maintainTarget.trim()}
                     onClick={() =>
                       setPending({ kind: "maintain", scope: maintainScope, target: maintainTarget.trim() })
@@ -216,22 +240,51 @@ export function Maintenance({ onUnauthorized }: { onUnauthorized: () => void }) 
             </CardBody>
           </Card>
 
-          <Stack gap="xs">
-            <Heading as="h3" size="sm">Tables</Heading>
-            <ResultTable result={data.tables} empty="No user tables" />
-          </Stack>
-          <Stack gap="xs">
-            <Heading as="h3" size="sm">Table statistics</Heading>
-            <ResultTable result={data.table_stats} empty="No statistics collected yet" />
-          </Stack>
-          <Stack gap="xs">
-            <Heading as="h3" size="sm">Indexes</Heading>
-            <ResultTable result={data.indexes} empty="No indexes" />
-          </Stack>
-          <Stack gap="xs">
-            <Heading as="h3" size="sm">Index statistics</Heading>
-            <ResultTable result={data.index_stats} empty="No statistics collected yet" />
-          </Stack>
+          <Tabs defaultValue="tables" className="mt-4">
+            <TabsList className="mb-4">
+              <TabsTrigger value="tables">
+                <Inline gap="xs" align="center" wrap={false}>
+                  <Icon name="table" size={14} />
+                  <span>Tables</span>
+                  <Badge variant="muted" size="sm">{data.tables.rows.length}</Badge>
+                </Inline>
+              </TabsTrigger>
+              <TabsTrigger value="table_stats">
+                <Inline gap="xs" align="center" wrap={false}>
+                  <Icon name="diagnostics" size={14} />
+                  <span>Table statistics</span>
+                  <Badge variant="muted" size="sm">{data.table_stats.rows.length}</Badge>
+                </Inline>
+              </TabsTrigger>
+              <TabsTrigger value="indexes">
+                <Inline gap="xs" align="center" wrap={false}>
+                  <Icon name="layers" size={14} />
+                  <span>Indexes</span>
+                  <Badge variant="muted" size="sm">{data.indexes.rows.length}</Badge>
+                </Inline>
+              </TabsTrigger>
+              <TabsTrigger value="index_stats">
+                <Inline gap="xs" align="center" wrap={false}>
+                  <Icon name="activity" size={14} />
+                  <span>Index statistics</span>
+                  <Badge variant="muted" size="sm">{data.index_stats.rows.length}</Badge>
+                </Inline>
+              </TabsTrigger>
+            </TabsList>
+
+            <TabsContent value="tables">
+              <ResultTable result={data.tables} empty="No user tables" label="Tables" />
+            </TabsContent>
+            <TabsContent value="table_stats">
+              <ResultTable result={data.table_stats} empty="No statistics collected yet" label="Table statistics" />
+            </TabsContent>
+            <TabsContent value="indexes">
+              <ResultTable result={data.indexes} empty="No indexes" label="Indexes" />
+            </TabsContent>
+            <TabsContent value="index_stats">
+              <ResultTable result={data.index_stats} empty="No statistics collected yet" label="Index statistics" />
+            </TabsContent>
+          </Tabs>
         </>
       ) : null}
       {copy ? (

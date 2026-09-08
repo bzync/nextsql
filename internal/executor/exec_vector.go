@@ -101,7 +101,19 @@ func (s *Session) execSelect(plan planner.Logical) (*Result, error) {
 			if facet != nil {
 				names = []string{"facet", "value", "count"}
 			}
-			return &Result{Columns: append([]string(nil), names...)}, nil
+			res := &Result{Columns: append([]string(nil), names...)}
+			// An ungrouped aggregate over a provably empty input (a
+			// constant-false filter folded to Empty) still reports its one
+			// implicit group. Run it over no rows so the values match every
+			// other aggregation path exactly.
+			if agg != nil && facet == nil && len(agg.Groups) == 0 {
+				rows, err := s.runAggregate(agg, nil)
+				if err != nil {
+					return nil, err
+				}
+				res.Rows = rows
+			}
+			return res, nil
 		default:
 			goto done
 		}

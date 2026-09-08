@@ -21,6 +21,15 @@ export type Whoami = {
   csrf_token: string;
 };
 
+export type ServerConnection = {
+  connected: boolean;
+  server_addr: string;
+  user: string;
+  database: string;
+  realm: string;
+  error?: string;
+};
+
 export type LoginBody = {
   user: string;
   password: string;
@@ -68,6 +77,11 @@ export type Security = {
   key_versions: ResultSet;
   audit_verify: ResultSet;
   audit_log: ResultSet;
+  // Grantable objects for the RBAC forms. Non-required reads: an operator
+  // whose RBAC hides them simply gets fewer choices, never an error.
+  tables: ResultSet;
+  columns: ResultSet;
+  resource_groups: ResultSet;
   warnings?: string[];
 };
 
@@ -105,6 +119,29 @@ export type MaintenanceActionRequest = {
   online?: boolean;
 };
 
+// Security administration. Every field is structured — the server renders the
+// statement text from a closed set of ops, privileges, and scopes, and the
+// operator's own server-side RBAC decides whether it is allowed.
+export type SecurityOp =
+  | "create_user" | "drop_user"
+  | "create_role" | "drop_role"
+  | "grant_role" | "revoke_role"
+  | "grant" | "revoke";
+
+export type SecurityActionRequest = {
+  op: SecurityOp;
+  name?: string;
+  password?: string;
+  role?: string;
+  grantee?: string;
+  all_privileges?: boolean;
+  privileges?: string[];
+  scope?: string;
+  object?: string;
+  column_table?: string;
+  column_name?: string;
+};
+
 export type Config = {
   generated_at: string;
   config: ResultSet;
@@ -124,9 +161,15 @@ export type Diagnostics = {
   warnings?: string[];
 };
 
+// backup_state: "configured" — the node has a backup_dir; "unset" — it does
+// not (BACKUP DATABASE would fail); "unknown" — the operator holds BACKUP but
+// not cluster ADMIN and cannot read system.config to tell.
+export type BackupState = "configured" | "unset" | "unknown";
+
 export type Backups = {
   generated_at: string;
   backups: ResultSet;
+  backup_state: BackupState;
   restore_hint: string;
   warnings?: string[];
 };
@@ -249,6 +292,22 @@ export type StudioAnalysis = {
   // realm, not just the one this Studio session targets. Drives an extra
   // confirm-before-run line naming the realm.
   realm_scoped?: boolean;
+};
+
+// StudioDiagnostic locates one parse failure in the editor buffer, in the
+// same coordinates a textarea uses: offset counts UTF-16 code units from the
+// buffer start; line and column are 1-based (column in UTF-16 units). It is
+// advisory — the server's parser/binder stay authoritative — and covers
+// grammar errors only, never unresolved table/column names.
+export type StudioDiagnostic = {
+  message: string;
+  offset: number;
+  line: number;
+  column: number;
+};
+
+export type StudioDiagnosticReport = {
+  diagnostics: StudioDiagnostic[];
 };
 
 export type StudioScript = {
@@ -446,10 +505,13 @@ export const api = {
   whoami: () => request<Whoami>("GET", "/api/v1/session"),
   login: (b: LoginBody) => request<Whoami>("POST", "/api/v1/session", b),
   logout: () => request<void>("DELETE", "/api/v1/session"),
+  connection: () => request<ServerConnection>("GET", "/api/v1/connection"),
   overview: () => request<Overview>("GET", "/api/v1/overview"),
   databases: () => request<Databases>("GET", "/api/v1/databases"),
   activity: () => request<Activity>("GET", "/api/v1/activity"),
   security: () => request<Security>("GET", "/api/v1/security"),
+  securityAction: (body: SecurityActionRequest) =>
+    request<ResultSet>("POST", "/api/v1/security/action", body),
   cluster: () => request<Cluster>("GET", "/api/v1/cluster"),
   clusterAction: (action: ClusterAction, timeoutMs?: number) =>
     request<ResultSet>("POST", "/api/v1/cluster/action", { action, timeout_ms: timeoutMs ?? 0 }),
@@ -476,6 +538,8 @@ export const api = {
     request<StudioAnalysis>("POST", "/api/v1/studio/query/analyze", { sql }),
   studioSplit: (sql: string) =>
     request<StudioScript>("POST", "/api/v1/studio/query/split", { sql }),
+  studioDiagnostics: (sql: string) =>
+    request<StudioDiagnosticReport>("POST", "/api/v1/studio/query/diagnostics", { sql }),
   studioCancel: (queryId: string) =>
     request<{ canceled: boolean; query_id: string }>("POST", "/api/v1/studio/query/cancel", { query_id: queryId }),
   studioReconnect: (body: StudioReconnectBody) =>

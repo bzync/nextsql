@@ -510,7 +510,7 @@ export function buildJSONPathQuery(table: string, column: string, path: JSONPath
   return `SELECT ${nativeJSONPath(column, path)} FROM ${quoteIdentifier(table)} LIMIT 100`;
 }
 
-function resultColumn(result: StudioResultSet, name: string): number {
+export function resultColumn(result: StudioResultSet, name: string): number {
   return result.columns.findIndex((column) => column === name);
 }
 
@@ -4200,6 +4200,177 @@ export function autoImportMapping(fields: string[], columns: DataGenColumn[]): R
 }
 
 // ---------------------------------------------------------------------------
+// Vector dataset import — a bounded INSERT-script builder for embedding data.
+//
+// The CSV / JSON / NDJSON importer above deliberately refuses VECTOR /
+// BITVECTOR / SPARSEVECTOR columns ("cannot be imported from a text value"):
+// a generic text cell is not a vector. This dedicated path fills that gap for
+// a development embedding dataset. It maps exactly one document field onto a
+// table's vector column — that cell parsed as a bracketed `[…]`, parenthesized
+// `(…)`, or bare comma list and validated against the column's declared
+// dimensions (and, for a BITVECTOR, its 0/1 domain) by the same
+// `parseVectorLiteralInput` grammar the Vector Explorer uses — and optionally
+// maps other fields onto the table's scalar columns, reusing the generic
+// importer's per-kind cell validation (`importValue`). It emits batched
+// INSERT statements with the exact native parenthesized vector literal
+// (`docs/vector.md`: `INSERT INTO docs (sig) VALUES ((1, 0, …));`). Same
+// never-execute boundary and no server route — it reuses
+// `GET /api/v1/studio/table`. A SPARSEVECTOR column takes the same dense
+// parenthesized form; the server coerces the zeros away.
+// ---------------------------------------------------------------------------
+
+export const MAX_VECTOR_IMPORT_ROWS = 1_000;
+// Rows × declared-dimensions ceiling. An embedding row carries far more values
+// than a scalar CSV row, so this caps the emitted literal payload with an
+// actionable message before the generic 1 MiB SQL ceiling
+// (`MAX_IMPORT_SQL_BYTES`) would cut it off less helpfully.
+export const MAX_VECTOR_IMPORT_VALUES = 262_144;
+
+export type VectorImportBuildResult =
+  | { sql: string; error: null; rows: number; statements: number; truncated: boolean }
+  | { sql: null; error: string };
+
+// autoVectorImportField picks the document field that most likely holds the
+// embedding: an exact case-insensitive match to the vector column name, then
+// the first field a scalar auto-mapping did not already claim, then the first
+// field. Never a guess that silently overrides an operator's later choice —
+// the modal always shows the resolved field in an editable Select.
+export function autoVectorImportField(
+  fields: string[],
+  vectorColumnName: string,
+  scalarMapping: Record<string, string>,
+): string {
+  if (fields.length === 0) return "";
+  const exact = fields.find((f) => f.toLowerCase() === vectorColumnName.toLowerCase());
+  if (exact) return exact;
+  const unclaimed = fields.find((f) => !scalarMapping[f]);
+  return unclaimed ?? fields[0];
+}
+
+export function buildVectorImportSQL(opts: {
+  table: string;
+  columns: DataGenColumn[]; // full dataGenColumns(detail): vector column carries its ordinal
+  vectorColumn: VectorCatalogColumn | null;
+  vectorField: string; // document field mapped to the vector column
+  scalarMapping: Record<string, string>; // other field -> scalar column name ("" = skip)
+  parsed: ParsedImport;
+  emptyAsNull: boolean;
+}): VectorImportBuildResult {
+  const table = opts.table.trim();
+  if (!table) return { sql: null, error: "Select a target table." };
+  if (!opts.vectorColumn) {
+    return { sql: null, error: "Select the table's VECTOR, BITVECTOR, or SPARSEVECTOR column." };
+  }
+  const vectorColumn = opts.vectorColumn;
+  if (opts.parsed.error) return { sql: null, error: opts.parsed.error };
+  if (opts.parsed.rows.length === 0) {
+    return { sql: null, error: "Load a document with a header row and at least one data row." };
+  }
+
+  const fieldIndex = new Map(opts.parsed.fields.map((f, i) => [f, i]));
+  if (!opts.vectorField || !fieldIndex.has(opts.vectorField)) {
+    return { sql: null, error: "Map a document field to the vector column." };
+  }
+
+  const vectorMeta = opts.columns.find((c) => c.name === vectorColumn.name);
+  const vectorOrdinal = vectorMeta ? vectorMeta.ordinal : Number.MAX_SAFE_INTEGER;
+  const vectorNotNull = vectorMeta ? vectorMeta.notNull : false;
+  const vectorHasDefault = vectorMeta ? vectorMeta.hasDefault : false;
+
+  // Resolve the scalar targets with the generic importer's own rules.
+  const byName = new Map(opts.columns.map((c) => [c.name, c]));
+  const scalarTargets: { column: DataGenColumn; field: string }[] = [];
+  const claimed = new Set<string>([vectorColumn.name]);
+  for (const field of opts.parsed.fields) {
+    if (field === opts.vectorField) continue;
+    const targetName = opts.scalarMapping[field];
+    if (!targetName) continue;
+    if (targetName === vectorColumn.name) {
+      return { sql: null, error: `Column "${targetName}" is the vector column — only the vector field maps to it.` };
+    }
+    const column = byName.get(targetName);
+    if (!column) return { sql: null, error: `Field "${field}" is mapped to "${targetName}", which is not a column of ${table}.` };
+    if (claimed.has(targetName)) return { sql: null, error: `Two fields are mapped to the column "${targetName}".` };
+    if (!column.supported) {
+      return { sql: null, error: `Column "${targetName}" has type ${column.type}, which cannot be imported from a text value.` };
+    }
+    claimed.add(targetName);
+    scalarTargets.push({ column, field });
+  }
+
+  for (const column of opts.columns) {
+    if (column === vectorMeta) continue;
+    if (column.notNull && !column.hasDefault && !claimed.has(column.name)) {
+      return { sql: null, error: `Column "${column.name}" is NOT NULL and has no default — map a field to it.` };
+    }
+  }
+
+  const rows = opts.parsed.rows.slice(0, MAX_VECTOR_IMPORT_ROWS);
+  const truncated = opts.parsed.truncated || opts.parsed.rows.length > MAX_VECTOR_IMPORT_ROWS;
+
+  const dims = vectorColumn.dimensions;
+  if (dims != null && dims * rows.length > MAX_VECTOR_IMPORT_VALUES) {
+    return {
+      sql: null,
+      error: `${rows.length.toLocaleString()} rows × ${dims} dimensions exceeds the ${MAX_VECTOR_IMPORT_VALUES.toLocaleString()}-value import ceiling — import fewer rows at a time.`,
+    };
+  }
+
+  const columnOrder = [
+    { name: vectorColumn.name, ordinal: vectorOrdinal, vector: true as const },
+    ...scalarTargets.map((t) => ({ name: t.column.name, ordinal: t.column.ordinal, vector: false as const })),
+  ].sort((a, b) => a.ordinal - b.ordinal);
+
+  const scalarByName = new Map(scalarTargets.map((t) => [t.column.name, t]));
+  const vectorRawIndex = fieldIndex.get(opts.vectorField)!;
+
+  const tuples: string[] = [];
+  for (let r = 0; r < rows.length; r++) {
+    const row = rows[r];
+    const values: string[] = [];
+    for (const entry of columnOrder) {
+      if (entry.vector) {
+        const raw = row[vectorRawIndex] ?? "";
+        if (raw.trim() === "" && opts.emptyAsNull) {
+          if (vectorNotNull && !vectorHasDefault) {
+            return { sql: null, error: `Row ${r + 1}: column "${vectorColumn.name}" is NOT NULL but the value is empty.` };
+          }
+          values.push("NULL");
+          continue;
+        }
+        const parsedVector = parseVectorLiteralInput(raw, vectorColumn);
+        if (parsedVector.values === null) {
+          return { sql: null, error: `Row ${r + 1}, column "${vectorColumn.name}": ${parsedVector.error}` };
+        }
+        values.push(buildVectorLiteral(parsedVector.values));
+        continue;
+      }
+      const target = scalarByName.get(entry.name)!;
+      const raw = row[fieldIndex.get(target.field) ?? -1] ?? "";
+      const converted = importValue(target.column, raw, opts.emptyAsNull, r + 1);
+      if (converted.sql === null) return { sql: null, error: converted.error };
+      values.push(converted.sql);
+    }
+    tuples.push(`(${values.join(", ")})`);
+  }
+
+  const columnList = columnOrder.map((c) => quoteIdentifier(c.name)).join(", ");
+  const header = `INSERT INTO ${quoteIdentifier(table)} (${columnList}) VALUES`;
+  const statements: string[] = [];
+  for (let start = 0; start < tuples.length; start += IMPORT_ROWS_PER_STATEMENT) {
+    statements.push(`${header}\n  ${tuples.slice(start, start + IMPORT_ROWS_PER_STATEMENT).join(",\n  ")};`);
+  }
+  const sql = statements.join("\n\n");
+  if (utf8ByteLength(sql) > MAX_IMPORT_SQL_BYTES) {
+    return {
+      sql: null,
+      error: `The generated SQL would exceed ${(MAX_IMPORT_SQL_BYTES / 1024).toFixed(0)} KiB — import fewer rows at a time.`,
+    };
+  }
+  return { sql, error: null, rows: rows.length, statements: statements.length, truncated };
+}
+
+// ---------------------------------------------------------------------------
 // Parameterized INSERT / UPDATE / DELETE generation.
 //
 // Builds a positional-parameter ($1..$N) DML *template* for a target table
@@ -4979,4 +5150,822 @@ export function designerIndexKindOptions(columns: { name: string; type: string }
   if (classes.has("vector-dense") || classes.has("vector-bit") || classes.has("vector-sparse")) kinds.push("vector");
   if (classes.has("geo")) kinds.push("spatial");
   return kinds;
+}
+
+// --- SQL formatter --------------------------------------------------------
+//
+// formatSQL reflows a NextSQL statement (or a `;`-separated script) for
+// readability: it normalizes whitespace, uppercases recognized keywords, and
+// breaks a line before each major clause keyword. It is deliberately NOT
+// built on `internal/sql/lexer` — that lexer discards comments and folds
+// identifier case, so it cannot be reversed into source text. This is a
+// self-contained, comment-preserving tokenizer with a strict safety net:
+// the formatted text is re-tokenized and its significant-token stream
+// (keyword tokens compared case-insensitively, every other token byte for
+// byte, comments included and in order) must be identical to the input's.
+// Any mismatch, any unterminated string / quoted identifier / block comment,
+// or an over-size buffer returns the input UNCHANGED — the formatter never
+// risks altering what a statement means. Known limitations, by design:
+// parenthesized groups (column definition lists, VALUES tuples, subqueries)
+// are kept on one line, and an `AND` / `OR` inside `CASE` or `BETWEEN` at
+// statement level is not treated specially beyond those two guards.
+export const MAX_FORMAT_SQL_BYTES = 1 << 20; // matches the editor's 1 MiB SQL bound
+
+type FmtTokKind =
+  | "word" | "number" | "string" | "qident" | "blob"
+  | "param" | "punct" | "line-comment" | "block-comment" | "ws";
+
+type FmtTok = { kind: FmtTokKind; text: string };
+
+// The lexer keyword table (internal/sql/lexer/lexer.go). Casing any of these
+// is safe: a keyword token outside a string / quoted identifier / comment
+// carries no case significance in NSQL.
+const FORMAT_KEYWORDS = new Set<string>(
+  (
+    "create table index unique on insert into values select distinct from where update set delete begin " +
+    "commit rollback primary key not null default and or between in is limit offset as true false " +
+    "transaction read committed snapshot serializable uuid string text blob int8 int16 int32 int64 " +
+    "uint8 uint16 uint32 uint64 char varchar enum float32 float64 decimal timestamptz timestamp date time " +
+    "interval json struct array map vector bitvector sparsevector f32 f16 i8 explain analyze maintain point " +
+    "box location linestring polygon spatial geometry geography fulltext search for nearest to using hnsw " +
+    "cosine l2 inner_product hamming join inner left right full cross outer group having by drop user role " +
+    "grant revoke identified cluster database schema column function backup replication administration " +
+    "connect execute all privileges admin reset foreign references constraint cascade restrict action match " +
+    "alter add rename rebuild order asc desc if exists case when then else end union intersect except with " +
+    "over schedule every at cron upsert returning workflow run trigger before after each show task tasks " +
+    "cancel subscribe encrypted client transfer leader resource drain maintenance enable disable reconcile confirm"
+  ).split(" "),
+);
+
+// Clause keywords that start a fresh line at statement level (depth 0). Join
+// keywords are handled separately so `LEFT OUTER JOIN` stays on one line.
+const FORMAT_NEWLINE_KEYWORDS = new Set<string>([
+  "select", "from", "where", "having", "limit", "offset", "values", "set",
+  "returning", "search", "nearest", "for", "group", "order", "union",
+  "intersect", "except",
+]);
+
+const FORMAT_JOIN_WORDS = new Set<string>([
+  "join", "inner", "left", "right", "full", "cross", "outer",
+]);
+
+const FORMAT_VECTOR_TYPE_WORDS = new Set<string>(["vector", "bitvector", "sparsevector"]);
+
+// Keywords that take a parenthesized argument list directly (a parametric
+// type or a value constructor), so `VARCHAR(255)` / `POINT(x, y)` keep the
+// `(` attached. Every other keyword before a `(` keeps a space: `IN (…)`,
+// `VALUES (…)`, `t (a, b)`.
+const FORMAT_CALL_KEYWORDS = new Set<string>([
+  "char", "varchar", "decimal", "enum", "uuid", "point", "box", "linestring",
+  "polygon", "geometry", "geography", "struct", "array", "map", "location",
+]);
+
+class FmtLexError extends Error {}
+
+function isFmtDigit(c: string): boolean {
+  return c >= "0" && c <= "9";
+}
+
+function isFmtIdentStart(c: string): boolean {
+  return (
+    c === "_" ||
+    (c >= "A" && c <= "Z") ||
+    (c >= "a" && c <= "z") ||
+    c.charCodeAt(0) > 127
+  );
+}
+
+function isFmtIdentPart(c: string): boolean {
+  return isFmtIdentStart(c) || isFmtDigit(c);
+}
+
+// tokenizeSQLForFormat mirrors internal/sql/lexer's token boundaries but
+// keeps comments and never folds case. It throws FmtLexError on an
+// unterminated construct so the caller can bail out and leave the SQL alone.
+function tokenizeSQLForFormat(src: string): FmtTok[] {
+  const toks: FmtTok[] = [];
+  const n = src.length;
+  let i = 0;
+  while (i < n) {
+    const c = src[i];
+    if (c === " " || c === "\t" || c === "\n" || c === "\r") {
+      let j = i + 1;
+      while (j < n && (src[j] === " " || src[j] === "\t" || src[j] === "\n" || src[j] === "\r")) j++;
+      toks.push({ kind: "ws", text: src.slice(i, j) });
+      i = j;
+      continue;
+    }
+    if (c === "-" && src[i + 1] === "-") {
+      let j = i + 2;
+      while (j < n && src[j] !== "\n") j++;
+      toks.push({ kind: "line-comment", text: src.slice(i, j) });
+      i = j;
+      continue;
+    }
+    if (c === "/" && src[i + 1] === "*") {
+      let j = i + 2;
+      while (j + 1 < n && !(src[j] === "*" && src[j + 1] === "/")) j++;
+      if (!(src[j] === "*" && src[j + 1] === "/")) throw new FmtLexError("unterminated block comment");
+      j += 2;
+      toks.push({ kind: "block-comment", text: src.slice(i, j) });
+      i = j;
+      continue;
+    }
+    if (c === "'") {
+      let j = i + 1;
+      for (;;) {
+        if (j >= n) throw new FmtLexError("unterminated string");
+        if (src[j] === "'") {
+          if (src[j + 1] === "'") { j += 2; continue; }
+          j++;
+          break;
+        }
+        j++;
+      }
+      toks.push({ kind: "string", text: src.slice(i, j) });
+      i = j;
+      continue;
+    }
+    if (c === '"') {
+      let j = i + 1;
+      for (;;) {
+        if (j >= n) throw new FmtLexError("unterminated quoted identifier");
+        if (src[j] === '"') {
+          if (src[j + 1] === '"') { j += 2; continue; }
+          j++;
+          break;
+        }
+        j++;
+      }
+      toks.push({ kind: "qident", text: src.slice(i, j) });
+      i = j;
+      continue;
+    }
+    if ((c === "x" || c === "X") && src[i + 1] === "'") {
+      let j = i + 2;
+      while (j < n && src[j] !== "'") j++;
+      if (j >= n) throw new FmtLexError("unterminated blob literal");
+      j++;
+      toks.push({ kind: "blob", text: src.slice(i, j) });
+      i = j;
+      continue;
+    }
+    if (c === "$" && isFmtDigit(src[i + 1] ?? "")) {
+      let j = i + 1;
+      while (j < n && isFmtDigit(src[j])) j++;
+      toks.push({ kind: "param", text: src.slice(i, j) });
+      i = j;
+      continue;
+    }
+    if (isFmtDigit(c) || (c === "." && isFmtDigit(src[i + 1] ?? ""))) {
+      let j = i;
+      while (j < n && isFmtDigit(src[j])) j++;
+      if (src[j] === ".") {
+        j++;
+        while (j < n && isFmtDigit(src[j])) j++;
+      }
+      toks.push({ kind: "number", text: src.slice(i, j) });
+      i = j;
+      continue;
+    }
+    if (isFmtIdentStart(c)) {
+      let j = i + 1;
+      while (j < n && isFmtIdentPart(src[j])) j++;
+      toks.push({ kind: "word", text: src.slice(i, j) });
+      i = j;
+      continue;
+    }
+    if (c === "<" && (src[i + 1] === ">" || src[i + 1] === "=")) {
+      toks.push({ kind: "punct", text: src.slice(i, i + 2) });
+      i += 2;
+      continue;
+    }
+    if ((c === ">" || c === "!") && src[i + 1] === "=") {
+      toks.push({ kind: "punct", text: src.slice(i, i + 2) });
+      i += 2;
+      continue;
+    }
+    toks.push({ kind: "punct", text: c });
+    i++;
+  }
+  return toks;
+}
+
+function fmtKeywordCased(text: string): string {
+  return FORMAT_KEYWORDS.has(text.toLowerCase()) ? text.toUpperCase() : text;
+}
+
+function sameFormatTokenStream(a: FmtTok[], b: FmtTok[]): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    const x = a[i];
+    const y = b[i];
+    if (x.kind !== y.kind) return false;
+    if (x.kind === "word") {
+      if (x.text.toLowerCase() !== y.text.toLowerCase()) return false;
+      // A non-keyword identifier must keep its exact original case.
+      if (!FORMAT_KEYWORDS.has(x.text.toLowerCase()) && x.text !== y.text) return false;
+    } else if (x.text !== y.text) {
+      return false;
+    }
+  }
+  return true;
+}
+
+const FORMAT_UNARY_PREV_PUNCT = new Set<string>([
+  "(", ",", "=", "<", ">", "<=", ">=", "<>", "!=", "+", "-", "*", "/",
+]);
+
+type FmtSigTok = FmtTok & { wsBefore: boolean };
+
+function renderFormattedSQL(sig: FmtSigTok[]): string {
+  const INDENT = "  ";
+  let out = "";
+  let atLineStart = true;
+  let curIndent = 0;
+  let depth = 0;
+  let caseDepth = 0;
+  let typeArgDepth = 0;
+  let betweenPending = false;
+  let attachNext = false;
+  let pendingBreak: { indent: number; blank: boolean } | null = null;
+  let prev: FmtTok | null = null;
+  // The current top-level clause. A comma only starts a new line inside a
+  // clause whose operands are conventionally one-per-line (a SELECT / SET /
+  // VALUES list); in FROM / GROUP BY / ORDER BY / SEARCH a comma stays inline.
+  let clauseCtx = "";
+  const COMMA_BREAK_CLAUSES = new Set<string>(["select", "set", "values", "returning"]);
+
+  const breakLine = (indent: number, blank: boolean) => {
+    out = out.replace(/[ \t]+$/, "");
+    out += blank ? "\n\n" : "\n";
+    out += INDENT.repeat(indent);
+    curIndent = indent;
+    atLineStart = true;
+  };
+
+  for (let k = 0; k < sig.length; k++) {
+    const t = sig[k];
+    const lc = t.kind === "word" ? t.text.toLowerCase() : "";
+    const prevLc = prev && prev.kind === "word" ? prev.text.toLowerCase() : "";
+    const topLevel = depth === 0 && caseDepth === 0 && typeArgDepth === 0;
+
+    // 1. Decide whether this token starts a new line.
+    if (k === 0) {
+      if (topLevel && FORMAT_NEWLINE_KEYWORDS.has(lc)) clauseCtx = lc;
+    } else if (pendingBreak) {
+      breakLine(pendingBreak.indent, pendingBreak.blank);
+    } else if (topLevel && t.kind === "word") {
+      if (lc === "and" || lc === "or") {
+        if (!(lc === "and" && betweenPending)) breakLine(1, false);
+      } else if (FORMAT_JOIN_WORDS.has(lc)) {
+        // Break only on the first word of the join phrase.
+        if (!FORMAT_JOIN_WORDS.has(prevLc)) { breakLine(0, false); clauseCtx = "join"; }
+      } else if (lc === "on") {
+        breakLine(1, false);
+      } else if (FORMAT_NEWLINE_KEYWORDS.has(lc)) {
+        breakLine(0, false);
+        clauseCtx = lc;
+      }
+    }
+    pendingBreak = null;
+
+    // 2. Decide the separator before the token text.
+    const vectorTypeOpener =
+      t.kind === "punct" && t.text === "<" && FORMAT_VECTOR_TYPE_WORDS.has(prevLc);
+    const unarySign =
+      t.kind === "punct" &&
+      (t.text === "+" || t.text === "-") &&
+      (prev === null ||
+        (prev.kind === "punct" && FORMAT_UNARY_PREV_PUNCT.has(prev.text)) ||
+        (prev.kind === "word" && FORMAT_KEYWORDS.has(prevLc)));
+
+    let space = true;
+    if (atLineStart || prev === null) {
+      space = false;
+    } else if (attachNext) {
+      space = false;
+    } else if (t.kind === "punct" && (t.text === "," || t.text === ";" || t.text === ")")) {
+      space = false;
+    } else if (t.kind === "punct" && t.text === ".") {
+      space = false;
+    } else if (prev.kind === "punct" && (prev.text === "." || prev.text === "(")) {
+      space = false;
+    } else if (
+      t.kind === "punct" && t.text === "(" &&
+      (prev.kind === "word" && FORMAT_CALL_KEYWORDS.has(prevLc))
+    ) {
+      // A parametric type / constructor keyword: `VARCHAR(255)`.
+      space = false;
+    } else if (
+      t.kind === "punct" && t.text === "(" && !t.wsBefore &&
+      (prev.kind === "qident" ||
+        (prev.kind === "punct" && prev.text === ")") ||
+        (prev.kind === "word" && !FORMAT_KEYWORDS.has(prevLc)))
+    ) {
+      // Ambiguous `name(` — could be a function call or a bare table before a
+      // column list. Honor whatever spacing the author used in the source.
+      space = false;
+    } else if (typeArgDepth > 0 && t.kind === "punct" && (t.text === ">" || t.text === ",")) {
+      space = false;
+    } else if (vectorTypeOpener) {
+      space = false;
+    }
+
+    if (space) out += " ";
+    out += t.kind === "word" ? fmtKeywordCased(t.text) : t.text;
+    atLineStart = false;
+    attachNext = false;
+
+    // 3. Update structural state after the token.
+    if (t.kind === "punct") {
+      if (t.text === "(") depth++;
+      else if (t.text === ")") depth = Math.max(0, depth - 1);
+      else if (vectorTypeOpener) typeArgDepth++;
+      else if (t.text === ">" && typeArgDepth > 0) typeArgDepth--;
+    } else if (t.kind === "word") {
+      if (lc === "case") caseDepth++;
+      else if (lc === "end") caseDepth = Math.max(0, caseDepth - 1);
+      else if (lc === "between") betweenPending = true;
+      else if (lc === "and") betweenPending = false;
+    }
+    if (t.kind === "word" && (FORMAT_NEWLINE_KEYWORDS.has(lc) || lc === "or")) betweenPending = false;
+
+    attachNext =
+      (t.kind === "punct" && (t.text === "(" || t.text === ".")) ||
+      unarySign ||
+      vectorTypeOpener ||
+      (typeArgDepth > 0 && t.kind === "punct" && t.text === ",");
+
+    // 4. Queue a forced break for the next token where required.
+    if (t.kind === "line-comment") {
+      pendingBreak = { indent: curIndent, blank: false };
+    } else if (t.kind === "punct" && t.text === ";") {
+      pendingBreak = { indent: 0, blank: true };
+      depth = 0;
+      caseDepth = 0;
+      typeArgDepth = 0;
+      betweenPending = false;
+      clauseCtx = "";
+    } else if (
+      t.kind === "punct" && t.text === "," &&
+      depth === 0 && caseDepth === 0 && typeArgDepth === 0 &&
+      COMMA_BREAK_CLAUSES.has(clauseCtx)
+    ) {
+      pendingBreak = { indent: 1, blank: false };
+      betweenPending = false;
+    }
+
+    prev = t;
+  }
+
+  return out;
+}
+
+// formatSQL returns a reflowed copy of the SQL, or the input unchanged when
+// it cannot do so without risking a semantic change (see the section
+// comment above). The caller compares the return value to its input to
+// decide whether anything changed.
+export function formatSQL(input: string): string {
+  if (!input || !input.trim()) return input;
+  if (utf8ByteLength(input) > MAX_FORMAT_SQL_BYTES) return input;
+
+  let inTokens: FmtTok[];
+  try {
+    inTokens = tokenizeSQLForFormat(input);
+  } catch {
+    return input;
+  }
+  const inSig: FmtSigTok[] = [];
+  let sawWs = false;
+  for (const tok of inTokens) {
+    if (tok.kind === "ws") { sawWs = true; continue; }
+    inSig.push({ ...tok, wsBefore: sawWs });
+    sawWs = false;
+  }
+  if (inSig.length === 0) return input;
+
+  const rendered = renderFormattedSQL(inSig)
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .replace(/^\s+/, "")
+    .replace(/\s+$/, "");
+
+  let outTokens: FmtTok[];
+  try {
+    outTokens = tokenizeSQLForFormat(rendered);
+  } catch {
+    return input;
+  }
+  const outSig = outTokens.filter((t) => t.kind !== "ws");
+  if (!sameFormatTokenStream(inSig, outSig)) return input;
+
+  return rendered === input.replace(/^\s+/, "").replace(/\s+$/, "") ? input : rendered;
+}
+
+// ---------------------------------------------------------------------------
+// Editable data grid & staged-change review.
+//
+// In-memory staged modifications (cell updates, row deletions, row insertions)
+// over an authorized table whose primary-key columns are present in the
+// query result. Changes are reviewed before execution, previewed as a native
+// transactional SQL script (BEGIN; ... COMMIT;), and executed transactionally
+// through the session's official-driver connection or loaded into the editor.
+// ---------------------------------------------------------------------------
+
+export const MAX_STAGED_CHANGES = 500;
+export const MAX_STAGED_SQL_BYTES = 512 * 1024;
+
+export type StagedUpdate = {
+  kind: "update";
+  table: string;
+  rowKey: string;
+  pkValues: Record<string, string | null>;
+  column: string;
+  columnType: string;
+  oldValue: string | null;
+  newValue: string | null;
+};
+
+export type StagedDelete = {
+  kind: "delete";
+  table: string;
+  rowKey: string;
+  pkValues: Record<string, string | null>;
+  rowValues: (string | null)[];
+};
+
+export type StagedInsert = {
+  kind: "insert";
+  table: string;
+  tempId: string;
+  values: Record<string, string | null>;
+};
+
+export type StagedChange = StagedUpdate | StagedDelete | StagedInsert;
+
+export type StagedChanges = {
+  table: string;
+  pkColumns: string[];
+  columnTypes: Record<string, string>;
+  updates: Record<string, Record<string, StagedUpdate>>;
+  deletes: Record<string, StagedDelete>;
+  inserts: StagedInsert[];
+};
+
+export type StagedBuildResult = {
+  sql: string | null;
+  statements: string[];
+  error: string | null;
+};
+
+export function createEmptyStagedChanges(
+  table: string,
+  pkColumns: string[],
+  columnTypes: Record<string, string> = {},
+): StagedChanges {
+  return {
+    table,
+    pkColumns,
+    columnTypes,
+    updates: {},
+    deletes: {},
+    inserts: [],
+  };
+}
+
+export function stagedChangesCount(changes: StagedChanges | null | undefined): number {
+  if (!changes) return 0;
+  let count = 0;
+  for (const rowKey of Object.keys(changes.updates)) {
+    count += Object.keys(changes.updates[rowKey] || {}).length;
+  }
+  count += Object.keys(changes.deletes || {}).length;
+  count += (changes.inserts || []).length;
+  return count;
+}
+
+export function stagedChangesSummary(changes: StagedChanges | null | undefined): string {
+  if (!changes) return "No staged changes";
+  let updateCount = 0;
+  for (const rowKey of Object.keys(changes.updates)) {
+    updateCount += Object.keys(changes.updates[rowKey] || {}).length;
+  }
+  const deleteCount = Object.keys(changes.deletes || {}).length;
+  const insertCount = (changes.inserts || []).length;
+  const parts: string[] = [];
+  if (updateCount > 0) parts.push(`${updateCount} ${updateCount === 1 ? "update" : "updates"}`);
+  if (deleteCount > 0) parts.push(`${deleteCount} ${deleteCount === 1 ? "deletion" : "deletions"}`);
+  if (insertCount > 0) parts.push(`${insertCount} ${insertCount === 1 ? "insertion" : "insertions"}`);
+  return parts.length > 0 ? parts.join(", ") : "No staged changes";
+}
+
+export function tablePKColumns(detail: StudioTableDetail | null | undefined): string[] {
+  if (!detail || !detail.columns || !detail.columns.rows) return [];
+  const nameIdx = resultColumn(detail.columns, "column_name");
+  const primaryIdx = resultColumn(detail.columns, "is_primary");
+  if (nameIdx < 0 || primaryIdx < 0) return [];
+  const pks: string[] = [];
+  for (const row of detail.columns.rows) {
+    const isPrim = (row[primaryIdx] ?? "").trim().toLowerCase() === "true";
+    const name = row[nameIdx];
+    if (isPrim && name) {
+      pks.push(name);
+    }
+  }
+  return pks;
+}
+
+export function tableColumnTypesRecord(detail: StudioTableDetail | null | undefined): Record<string, string> {
+  if (!detail || !detail.columns || !detail.columns.rows) return {};
+  const nameIdx = resultColumn(detail.columns, "column_name");
+  const typeIdx = resultColumn(detail.columns, "type");
+  if (nameIdx < 0 || typeIdx < 0) return {};
+  const map: Record<string, string> = {};
+  for (const row of detail.columns.rows) {
+    const name = row[nameIdx];
+    const type = row[typeIdx];
+    if (name && type) {
+      map[name] = type;
+    }
+  }
+  return map;
+}
+
+export function detectEditableTable(sql: string, catalogTables: string[]): string | null {
+  if (!sql) return null;
+  const trimmed = sql.trim();
+  if (!/^SELECT\b/i.test(trimmed)) return null;
+  if (/\b(?:JOIN|UNION)\b/i.test(trimmed)) return null;
+
+  const match = /\bFROM\s+(?:"([^"]+)"|([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?))/i.exec(trimmed);
+  if (!match) return null;
+  const raw = match[1] ?? match[2];
+  if (!raw) return null;
+  const clean = raw.trim();
+  if (clean.toLowerCase().startsWith("system.") || clean.toLowerCase().startsWith("nsql_")) {
+    return null;
+  }
+  const found = catalogTables.find((t) => t.toLowerCase() === clean.toLowerCase());
+  return found ?? null;
+}
+
+export function isResultEditable(
+  result: StudioResultSet | null | undefined,
+  pkColumns: string[],
+): { editable: boolean; reason?: string } {
+  if (!result || !result.columns || result.columns.length === 0) {
+    return { editable: false, reason: "No result columns available." };
+  }
+  if (!pkColumns || pkColumns.length === 0) {
+    return { editable: false, reason: "Table has no primary key defined." };
+  }
+  const resultCols = new Set(result.columns.map((c) => c.toLowerCase()));
+  const missing = pkColumns.filter((pk) => !resultCols.has(pk.toLowerCase()));
+  if (missing.length > 0) {
+    return {
+      editable: false,
+      reason: `Primary key column(s) missing from result: ${missing.join(", ")}.`,
+    };
+  }
+  return { editable: true };
+}
+
+export function extractRowPK(
+  row: (string | null)[],
+  columns: string[],
+  pkColumns: string[],
+): Record<string, string | null> {
+  const pkMap: Record<string, string | null> = {};
+  for (const pk of pkColumns) {
+    const idx = columns.findIndex((c) => c.toLowerCase() === pk.toLowerCase());
+    pkMap[pk] = idx >= 0 ? (row[idx] ?? null) : null;
+  }
+  return pkMap;
+}
+
+export function makeRowKey(pkValues: Record<string, string | null>): string {
+  const keys = Object.keys(pkValues).sort();
+  return keys.map((k) => `${k}=${pkValues[k] ?? "NULL"}`).join("|");
+}
+
+export function formatCellSQLLiteral(value: string | null, type: string): string {
+  if (value === null) return "NULL";
+  const kind = dataGenFieldKind(type);
+  switch (kind) {
+    case "int":
+    case "decimal": {
+      const trimmed = value.trim();
+      if (/^-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?$/.test(trimmed)) {
+        return trimmed;
+      }
+      return quoteSQLString(value);
+    }
+    case "bool": {
+      const lower = value.trim().toLowerCase();
+      if (lower === "true" || lower === "1") return "TRUE";
+      if (lower === "false" || lower === "0") return "FALSE";
+      return quoteSQLString(value);
+    }
+    default:
+      return quoteSQLString(value);
+  }
+}
+
+export function stageCellUpdate(
+  current: StagedChanges,
+  rowKey: string,
+  pkValues: Record<string, string | null>,
+  column: string,
+  columnType: string,
+  oldValue: string | null,
+  newValue: string | null,
+): { changes: StagedChanges; error: string | null } {
+  if (current.deletes[rowKey]) {
+    return { changes: current, error: "Cannot update a row marked for deletion." };
+  }
+
+  if (newValue === oldValue) {
+    if (!current.updates[rowKey] || !current.updates[rowKey][column]) {
+      return { changes: current, error: null };
+    }
+    const nextUpdates = { ...current.updates };
+    const rowUpdates = { ...nextUpdates[rowKey] };
+    delete rowUpdates[column];
+    if (Object.keys(rowUpdates).length === 0) {
+      delete nextUpdates[rowKey];
+    } else {
+      nextUpdates[rowKey] = rowUpdates;
+    }
+    return { changes: { ...current, updates: nextUpdates }, error: null };
+  }
+
+  const curCount = stagedChangesCount(current);
+  const isExisting = Boolean(current.updates[rowKey]?.[column]);
+  if (!isExisting && curCount >= MAX_STAGED_CHANGES) {
+    return { changes: current, error: `Maximum ${MAX_STAGED_CHANGES} staged changes reached.` };
+  }
+
+  const nextUpdates = { ...current.updates };
+  const rowUpdates = { ...(nextUpdates[rowKey] || {}) };
+  rowUpdates[column] = {
+    kind: "update",
+    table: current.table,
+    rowKey,
+    pkValues,
+    column,
+    columnType,
+    oldValue,
+    newValue,
+  };
+  nextUpdates[rowKey] = rowUpdates;
+  return { changes: { ...current, updates: nextUpdates }, error: null };
+}
+
+export function stageRowDelete(
+  current: StagedChanges,
+  rowKey: string,
+  pkValues: Record<string, string | null>,
+  rowValues: (string | null)[],
+): { changes: StagedChanges; error: string | null } {
+  const nextDeletes = { ...current.deletes };
+  const nextUpdates = { ...current.updates };
+
+  if (nextDeletes[rowKey]) {
+    delete nextDeletes[rowKey];
+    return { changes: { ...current, deletes: nextDeletes }, error: null };
+  }
+
+  const curCount = stagedChangesCount(current);
+  if (curCount >= MAX_STAGED_CHANGES) {
+    return { changes: current, error: `Maximum ${MAX_STAGED_CHANGES} staged changes reached.` };
+  }
+
+  delete nextUpdates[rowKey];
+  nextDeletes[rowKey] = {
+    kind: "delete",
+    table: current.table,
+    rowKey,
+    pkValues,
+    rowValues,
+  };
+  return { changes: { ...current, updates: nextUpdates, deletes: nextDeletes }, error: null };
+}
+
+export function stageRowInsert(
+  current: StagedChanges,
+  values: Record<string, string | null>,
+): { changes: StagedChanges; error: string | null } {
+  const curCount = stagedChangesCount(current);
+  if (curCount >= MAX_STAGED_CHANGES) {
+    return { changes: current, error: `Maximum ${MAX_STAGED_CHANGES} staged changes reached.` };
+  }
+
+  const tempId = `new-row-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+  const item: StagedInsert = {
+    kind: "insert",
+    table: current.table,
+    tempId,
+    values,
+  };
+  return {
+    changes: { ...current, inserts: [...current.inserts, item] },
+    error: null,
+  };
+}
+
+export function removeStagedInsert(current: StagedChanges, tempId: string): StagedChanges {
+  return {
+    ...current,
+    inserts: current.inserts.filter((ins) => ins.tempId !== tempId),
+  };
+}
+
+export function buildStagedChangeSQL(changes: StagedChanges): StagedBuildResult {
+  const total = stagedChangesCount(changes);
+  if (total === 0) {
+    return { sql: null, statements: [], error: "No staged changes to commit." };
+  }
+  if (total > MAX_STAGED_CHANGES) {
+    return { sql: null, statements: [], error: `Cannot commit more than ${MAX_STAGED_CHANGES} changes at once.` };
+  }
+
+  const tableIdent = quoteIdentifier(changes.table);
+  const stmts: string[] = [];
+
+  const buildPKPredicate = (pkValues: Record<string, string | null>): string => {
+    const parts: string[] = [];
+    for (const pk of changes.pkColumns) {
+      const val = pkValues[pk] ?? null;
+      const type = changes.columnTypes[pk] || "STRING";
+      if (val === null) {
+        parts.push(`${quoteIdentifier(pk)} IS NULL`);
+      } else {
+        parts.push(`${quoteIdentifier(pk)} = ${formatCellSQLLiteral(val, type)}`);
+      }
+    }
+    return parts.join(" AND ");
+  };
+
+  // 1. UPDATE statements (grouped by row)
+  for (const rowKey of Object.keys(changes.updates)) {
+    const colUpdates = changes.updates[rowKey];
+    const cols = Object.keys(colUpdates);
+    if (cols.length === 0) continue;
+
+    const first = colUpdates[cols[0]];
+    const setClauses = cols.map((col) => {
+      const upd = colUpdates[col];
+      const type = upd.columnType || changes.columnTypes[col] || "STRING";
+      return `${quoteIdentifier(col)} = ${formatCellSQLLiteral(upd.newValue, type)}`;
+    });
+
+    const whereClause = buildPKPredicate(first.pkValues);
+    stmts.push(`UPDATE ${tableIdent} SET ${setClauses.join(", ")} WHERE ${whereClause};`);
+  }
+
+  // 2. DELETE statements
+  for (const rowKey of Object.keys(changes.deletes)) {
+    const del = changes.deletes[rowKey];
+    const whereClause = buildPKPredicate(del.pkValues);
+    stmts.push(`DELETE FROM ${tableIdent} WHERE ${whereClause};`);
+  }
+
+  // 3. INSERT statements
+  for (const ins of changes.inserts) {
+    const cols = Object.keys(ins.values).filter((k) => ins.values[k] !== undefined);
+    if (cols.length === 0) continue;
+
+    const colIdents = cols.map(quoteIdentifier).join(", ");
+    const valLiterals = cols
+      .map((col) => {
+        const val = ins.values[col] ?? null;
+        const type = changes.columnTypes[col] || "STRING";
+        return formatCellSQLLiteral(val, type);
+      })
+      .join(", ");
+
+    stmts.push(`INSERT INTO ${tableIdent} (${colIdents}) VALUES (${valLiterals});`);
+  }
+
+  if (stmts.length === 0) {
+    return { sql: null, statements: [], error: "No statements generated from staged changes." };
+  }
+
+  const allStatements = ["BEGIN;", ...stmts, "COMMIT;"];
+  const fullSQL = allStatements.join("\n");
+
+  if (utf8ByteLength(fullSQL) > MAX_STAGED_SQL_BYTES) {
+    return {
+      sql: null,
+      statements: [],
+      error: `Generated SQL exceeds size limit of ${MAX_STAGED_SQL_BYTES / 1024} KiB.`,
+    };
+  }
+
+  return {
+    sql: fullSQL,
+    statements: allStatements,
+    error: null,
+  };
 }

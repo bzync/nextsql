@@ -1,15 +1,16 @@
 name: Publish container image
 
 # Builds the Dockerfile and pushes it to Docker Hub as docker.io/bzynchub/nextsql.
-# Pull requests that touch the image build it (amd64 only, for fast feedback)
-# but do not push. Pushing a release tag like v0.0.1 publishes exactly one
-# version tag (`0.0.1`). Every build (master pushes included) also gets an
-# `sha-<short>` tag.
+# ONLY a release tag push (`v*.*.*`) publishes an image. master pushes and
+# pull requests that touch the image build it and scan it (amd64 only, for
+# fast feedback) but never push — no `sha-<short>` tag, no `edge` tag, nothing.
+# Pushing a release tag like v0.0.1 publishes exactly one version tag (`0.0.1`).
 #
-# Every published tag is write-once: no moving `latest`/`edge`/`0.0` pointers.
-# The Docker Hub repository is configured "All tags are immutable", so a second
-# push to an existing tag is rejected — re-cutting a release means bumping the
-# version. Consumers pin an explicit `0.x.y` (or `sha-<short>`) tag.
+# Every published tag is write-once: no moving `latest`/`edge`/`0.0` pointers,
+# and no per-commit `sha-` tags. The Docker Hub repository is configured "All
+# tags are immutable", so a second push to an existing tag is rejected —
+# re-cutting a release means bumping the version. Consumers pin an explicit
+# `0.x.y` tag.
 #
 # Images are multi-arch (linux/amd64, linux/arm64). The arm64 leg builds
 # under QEMU emulation, so it is slower than the native amd64 leg.
@@ -66,7 +67,7 @@ jobs:
         uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
 
       - name: Log in to Docker Hub
-        if: github.event_name != 'pull_request'
+        if: startsWith(github.ref, 'refs/tags/v')
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
@@ -79,12 +80,14 @@ jobs:
           images: ${{ env.IMAGE }}
           # The Docker Hub repo is "All tags are immutable" — only write-once
           # tags. No moving pointers: no `latest` (flavor disables it), no
-          # `edge`, no `{{major}}.{{minor}}`/`{{major}}` rollups.
+          # `edge`, no `{{major}}.{{minor}}`/`{{major}}` rollups, and no
+          # per-commit `sha-` tags. The only tag emitted is the `v*.*.*`
+          # release version, so on any non-tag ref this list is empty and the
+          # publish step below is skipped.
           flavor: |
             latest=false
           tags: |
             type=semver,pattern={{version}}
-            type=sha,prefix=sha-,format=short
           labels: |
             org.opencontainers.image.title=NextSQL
             org.opencontainers.image.description=Native, encrypted-by-default multimodel database engine
@@ -112,13 +115,16 @@ jobs:
           vuln-type: os,library
           severity: CRITICAL,HIGH
 
+      # Only a release tag publishes. On master / PR / manual dispatch this step
+      # is skipped entirely — the scan build above is the CI signal there.
       - name: Build and push
         id: push
+        if: startsWith(github.ref, 'refs/tags/v')
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
-          platforms: ${{ github.event_name == 'pull_request' && 'linux/amd64' || 'linux/amd64,linux/arm64' }}
-          push: ${{ github.event_name != 'pull_request' }}
+          platforms: linux/amd64,linux/arm64
+          push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           annotations: ${{ steps.meta.outputs.annotations }}

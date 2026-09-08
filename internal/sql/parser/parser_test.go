@@ -1999,3 +1999,49 @@ func TestParseResourceGroupRejectsInvalid(t *testing.T) {
 		}
 	}
 }
+
+func TestParseDiagLocatesFailure(t *testing.T) {
+	cases := []struct {
+		src      string
+		wantPos  int
+		contains string
+	}{
+		// caret sits on the token the parser could not accept
+		{"SELECT * FROM", 13, ""}, // premature EOF: offset == len(src)
+		// "WHRE" is swallowed as an implicit table alias, so the parser
+		// stops on "id" at offset 25 — the first token it truly cannot place.
+		{"SELECT * FROM users WHRE id = 1", 25, "unexpected token after statement"},
+		{"SELECT FROM users", 7, ""}, // FROM where a select item was expected
+		{"SELECT 1; SELECT 2", 10, "unexpected token after statement"},
+		{"", 0, "empty statement"},
+		{"   \n  ", 6, "empty statement"},
+	}
+	for _, tc := range cases {
+		stmt, diag, err := ParseDiag(tc.src)
+		if err == nil || diag == nil {
+			t.Fatalf("ParseDiag(%q): expected a failure, got stmt=%v diag=%v err=%v", tc.src, stmt, diag, err)
+		}
+		if diag.Offset != tc.wantPos {
+			t.Errorf("ParseDiag(%q): offset = %d, want %d (message %q)", tc.src, diag.Offset, tc.wantPos, diag.Message)
+		}
+		if diag.Message == "" {
+			t.Errorf("ParseDiag(%q): empty message", tc.src)
+		}
+		if strings.HasPrefix(diag.Message, "nextsql ") {
+			t.Errorf("ParseDiag(%q): message still carries the nextsql prefix: %q", tc.src, diag.Message)
+		}
+		if tc.contains != "" && !strings.Contains(diag.Message, tc.contains) {
+			t.Errorf("ParseDiag(%q): message %q does not contain %q", tc.src, diag.Message, tc.contains)
+		}
+	}
+}
+
+func TestParseDiagCleanOnSuccess(t *testing.T) {
+	stmt, diag, err := ParseDiag("SELECT id FROM users WHERE id = 1")
+	if err != nil || diag != nil || stmt == nil {
+		t.Fatalf("ParseDiag(valid): stmt=%v diag=%v err=%v", stmt, diag, err)
+	}
+	if _, err := Parse("SELECT id FROM users"); err != nil {
+		t.Fatalf("Parse delegates to ParseDiag and regressed: %v", err)
+	}
+}

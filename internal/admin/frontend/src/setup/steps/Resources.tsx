@@ -1,6 +1,7 @@
 import { Alert, Button, Card, CardBody, Checkbox, Divider, Inline, Input, NumberInput, Radio, RadioGroup, Stack, Text } from "@bzync/rui";
 import type { Params, RunResult, ServiceStatus } from "../api";
 import { PathField } from "../components/PathField";
+import { SetupErrorAlert } from "../components/SetupErrorAlert";
 import { StepHeader } from "../components/StepHeader";
 import { humanBytes, looksNonLoopback } from "../util";
 
@@ -97,9 +98,9 @@ export function Resources({
   const hasBothTLS = !!params.tlsCert && !!params.tlsKey;
 
   return (
-    <Card variant="elevated">
+    <Card variant="bordered">
       <CardBody>
-        <StepHeader title="Deployment profile" />
+        <StepHeader kicker="Step 3 of 6" title="Deployment profile" />
         <Stack gap="md" style={{ marginTop: 20 }}>
           <RadioGroup
             label="Choose a deployment profile"
@@ -219,14 +220,14 @@ export function Resources({
           </>
         ) : null}
 
-        {planError ? <Alert variant="error" style={{ marginTop: 20 }}>{planError}</Alert> : null}
-        <Inline justify="between" style={{ marginTop: 20 }}>
+        {planError ? <SetupErrorAlert raw={planError} style={{ marginTop: 20 }} /> : null}
+        <div className="nsi-actions">
           <Button variant="outline" onClick={onBack}>Back</Button>
           <Inline gap="sm">
             <Button variant="secondary" onClick={onCheck}>Check</Button>
             <Button variant="primary" onClick={onNext}>Continue</Button>
           </Inline>
-        </Inline>
+        </div>
       </CardBody>
     </Card>
   );

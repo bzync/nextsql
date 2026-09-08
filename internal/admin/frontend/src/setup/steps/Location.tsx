@@ -1,6 +1,7 @@
 import { Alert, Button, Card, CardBody, DescriptionDetails, DescriptionItem, DescriptionList, DescriptionTerm, Inline, List, ListItem, Stack, Text } from "@bzync/rui";
 import type { Params, RunResult } from "../api";
 import { PathField } from "../components/PathField";
+import { SetupErrorAlert } from "../components/SetupErrorAlert";
 import { StepHeader } from "../components/StepHeader";
 import { humanBytes } from "../util";
 
@@ -19,9 +20,10 @@ export function Location({
   const keyFileExists = r?.key_file_exists;
 
   return (
-    <Card variant="elevated">
+    <Card variant="bordered">
       <CardBody>
         <StepHeader
+          kicker="Step 2 of 6"
           title="Data directory & unlock key"
           description="The data directory holds the encrypted database. The key file unlocks it and must never leave this machine — keep it off the data volume in production."
         />
@@ -53,7 +55,7 @@ export function Location({
             )
           ) : null}
 
-          {planError ? <Alert variant="error">{planError}</Alert> : null}
+          {planError ? <SetupErrorAlert raw={planError} /> : null}
           {r?.hardware ? (
             <DescriptionList columns={1} density="compact">
               <DescriptionItem>
@@ -70,13 +72,13 @@ export function Location({
             </List>
           ) : null}
         </Stack>
-        <Inline justify="between" style={{ marginTop: 20 }}>
+        <div className="nsi-actions">
           <Button variant="outline" onClick={onBack}>Back</Button>
           <Inline gap="sm">
             <Button variant="secondary" onClick={onCheck}>Check</Button>
             <Button variant="primary" onClick={onNext}>Continue</Button>
           </Inline>
-        </Inline>
+        </div>
       </CardBody>
     </Card>
   );

@@ -97,6 +97,31 @@ func (s *Server) handleWhoami(w http.ResponseWriter, _ *http.Request, sess *sess
 	})
 }
 
+// handleConnection reports whether this admin session's driver connection
+// can still reach nextsqld. The admin cookie can be valid while the
+// nextsqld socket is dead; this probe is the live status Ops and Studio
+// share. It stays HTTP 200 on a reachable session (connected true/false)
+// so a down database does not look like a signed-out operator.
+func (s *Server) handleConnection(w http.ResponseWriter, r *http.Request, sess *session) {
+	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+	defer cancel()
+	realm, database := sess.target()
+	out := map[string]any{
+		"server_addr": s.cfg.ServerAddr,
+		"user":        sess.user,
+		"database":    database,
+		"realm":       realm,
+	}
+	if err := sess.ping(ctx); err != nil {
+		out["connected"] = false
+		out["error"] = userError(err)
+		writeJSON(w, http.StatusOK, out)
+		return
+	}
+	out["connected"] = true
+	writeJSON(w, http.StatusOK, out)
+}
+
 func (s *Server) handleLogout(w http.ResponseWriter, _ *http.Request, sess *session) {
 	s.sessions.remove(sess.id)
 	clearSessionCookie(w, s.tls)
@@ -262,6 +287,13 @@ func (s *Server) handleSecurity(w http.ResponseWriter, r *http.Request, sess *se
 		{key: "key_versions", sql: "SELECT * FROM system.key_versions ORDER BY key_name"},
 		{key: "audit_verify", sql: "SELECT * FROM system.audit_verify"},
 		{key: "audit_log", sql: "SELECT * FROM system.audit_log ORDER BY seq DESC"},
+		// Grantable objects, so the RBAC forms can offer real choices
+		// instead of asking an operator to type a name from memory. All
+		// three are ordinary RBAC-filtered catalog reads and none is
+		// required: a caller who cannot see them just gets fewer choices.
+		{key: "tables", sql: "SELECT name FROM system.tables ORDER BY name"},
+		{key: "columns", sql: "SELECT table_name, column_name FROM system.columns ORDER BY table_name, ordinal"},
+		{key: "resource_groups", sql: "SELECT name FROM system.resource_groups ORDER BY name"},
 	})
 	if err != nil {
 		writeBundleError(w, err)
@@ -276,6 +308,10 @@ func (s *Server) handleSecurity(w http.ResponseWriter, r *http.Request, sess *se
 		"key_versions": b.Tables["key_versions"],
 		"audit_verify": b.Tables["audit_verify"],
 		"audit_log":    b.Tables["audit_log"],
+
+		"tables":          b.Tables["tables"],
+		"columns":         b.Tables["columns"],
+		"resource_groups": b.Tables["resource_groups"],
 	}
 	if len(b.Warnings) > 0 {
 		out["warnings"] = b.Warnings
@@ -489,7 +525,9 @@ func (s *Server) handleDiagnosticsBundle(w http.ResponseWriter, r *http.Request,
 
 // handleBackups is the M5 Backups read-model: system.backups — the verified
 // backups in the node's configured backup_dir, oldest first. Admin/BACKUP
-// gated server-side; zero rows when no backup_dir is configured. The write
+// gated server-side; zero rows when no backup_dir is configured. `backup_state`
+// (configured | unset | unknown, derived from system.config) lets the view
+// explain a missing backup_dir before BACKUP DATABASE is attempted. The write
 // side is handleBackupAction (BACKUP DATABASE / VERIFY BACKUP). Restore and
 // PITR are not a Manager operation — you cannot restore a running server
 // into itself — so the view surfaces the CLI command instead.
@@ -499,6 +537,7 @@ func (s *Server) handleBackups(w http.ResponseWriter, r *http.Request, sess *ses
 
 	b, err := runBundle(ctx, sess, []querySpec{
 		{key: "backups", sql: "SELECT * FROM system.backups ORDER BY created_at DESC", required: true},
+		{key: "cfg", sql: "SELECT name FROM system.config"},
 	})
 	if err != nil {
 		writeBundleError(w, err)
@@ -507,6 +546,7 @@ func (s *Server) handleBackups(w http.ResponseWriter, r *http.Request, sess *ses
 	out := map[string]any{
 		"generated_at": b.GeneratedAt,
 		"backups":      b.Tables["backups"],
+		"backup_state": backupDirState(b.Tables["cfg"]),
 		"restore_hint": "Restore is offline-only (a running server cannot restore into itself). " +
 			"Stop nextsqld, then: nextsql restore --from <backup_dir>/<name> --data-dir <DIR> --key-file <KEY> " +
 			"[--wal-archive DIR] [--until-lsn N | --until RFC3339]",
@@ -515,6 +555,45 @@ func (s *Server) handleBackups(w http.ResponseWriter, r *http.Request, sess *ses
 		out["warnings"] = b.Warnings
 	}
 	writeJSON(w, http.StatusOK, out)
+}
+
+// backupDirState classifies whether this node has a backup_dir configured,
+// from the `name` column of system.config. A real nextsqld always reports at
+// least data_dir there, so an entirely empty result means the operator holds
+// the BACKUP privilege but not cluster ADMIN and cannot read system.config
+// (systemConfigRows returns zero rows, not an error, for a non-admin) — that
+// is reported "unknown" rather than a misleading "unset". The Backups view
+// uses this to explain the missing-backup_dir case up front instead of
+// letting BACKUP DATABASE fail with a raw "no backup directory configured".
+func backupDirState(cfg resultJSON) string {
+	nameCol := -1
+	for i, c := range cfg.Columns {
+		if c == "name" {
+			nameCol = i
+			break
+		}
+	}
+	if nameCol < 0 {
+		return "unknown"
+	}
+	var sawAny, sawBackupDir bool
+	for _, row := range cfg.Rows {
+		if nameCol >= len(row) || row[nameCol] == nil {
+			continue
+		}
+		sawAny = true
+		if *row[nameCol] == "backup_dir" {
+			sawBackupDir = true
+		}
+	}
+	switch {
+	case sawBackupDir:
+		return "configured"
+	case sawAny:
+		return "unset"
+	default:
+		return "unknown"
+	}
 }
 
 type backupActionRequest struct {

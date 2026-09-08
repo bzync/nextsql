@@ -1,12 +1,13 @@
 import { Alert, Button, Card, CardBody, CodeBlock, Inline, Spinner, Stack, Text } from "@bzync/rui";
 import type { Params, PlanResult, ServiceOutcome } from "../api";
+import { SetupErrorAlert } from "../components/SetupErrorAlert";
 import { StepHeader } from "../components/StepHeader";
 
 export function InstallProgress() {
   return (
-    <Card variant="elevated" role="status" aria-live="polite" aria-atomic="true">
+    <Card variant="bordered" role="status" aria-live="polite" aria-atomic="true">
       <CardBody>
-        <StepHeader title="Installing…" />
+        <StepHeader kicker="Step 6 of 6" title="Installing…" />
         <Inline gap="sm" align="center" style={{ marginTop: 20 }}>
           <Spinner size="sm" />
           <Text variant="muted">Creating the database and verifying it. This usually takes a few seconds.</Text>
@@ -29,22 +30,22 @@ export function Completion({
 }) {
   if (finished) {
     return (
-      <Card variant="elevated">
+      <Card variant="bordered">
         <CardBody>
-          <StepHeader title="Setup finished" description="The Setup service has stopped. You can close this tab." />
+          <StepHeader kicker="Complete" title="Setup finished" description="The Setup service has stopped. You can close this tab." />
         </CardBody>
       </Card>
     );
   }
   if (error) {
     return (
-      <Card variant="elevated">
+      <Card variant="bordered">
         <CardBody>
-          <StepHeader title="Setup failed" />
-          <Alert variant="error" style={{ marginTop: 20 }}>{error}</Alert>
-          <Inline justify="start" style={{ marginTop: 20 }}>
+          <StepHeader kicker="Step 6 of 6" title="Setup failed" />
+          <SetupErrorAlert raw={error} style={{ marginTop: 20 }} />
+          <div className="nsi-actions">
             <Button variant="outline" onClick={onBackToSummary}>Back to summary</Button>
-          </Inline>
+          </div>
         </CardBody>
       </Card>
     );
@@ -69,9 +70,9 @@ export function Completion({
   const showNextStep = !service || !service.active;
 
   return (
-    <Card variant="elevated">
+    <Card variant="bordered">
       <CardBody>
-        <StepHeader title={params.skipInit ? "Configuration written" : "NextSQL is ready"} />
+        <StepHeader kicker="Complete" title={params.skipInit ? "Configuration written" : "NextSQL is ready"} />
         <Stack gap="sm" style={{ marginTop: 20 }}>
           {health ? (
             <Alert variant={health.ok ? "success" : "error"}>
@@ -88,9 +89,9 @@ export function Completion({
             </>
           ) : null}
         </Stack>
-        <Inline justify="end" style={{ marginTop: 20 }}>
+        <div className="nsi-actions">
           <Button variant="primary" onClick={onFinish}>Finish</Button>
-        </Inline>
+        </div>
       </CardBody>
     </Card>
   );

@@ -6,10 +6,11 @@
 }
 .nsi-page {
   min-height: 100vh;
+  min-height: 100dvh;
   display: flex;
-  align-items: center;
+  align-items: stretch;
   justify-content: center;
-  padding: 32px 20px;
+  padding: 16px;
   box-sizing: border-box;
 }
 .nsi-shell {
@@ -17,12 +18,12 @@
   max-width: 640px;
   display: flex;
   flex-direction: column;
-  gap: 20px;
+  gap: 16px;
 }
 .nsi-rail {
   display: flex;
   flex-direction: column;
-  gap: 16px;
+  gap: 14px;
 }
 .nsi-brand-row {
   display: flex;
@@ -41,33 +42,73 @@
 }
 .nsi-stepper-mobile {
   width: 100%;
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
 }
+.nsi-mode {
+  display: inline-flex;
+  align-items: center;
+  width: fit-content;
+  padding: 1px 6px;
+  border: 1px solid var(--color-border);
+  border-radius: 4px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--color-muted-foreground, var(--color-foreground-muted));
+}
+.nsi-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 24px;
+  padding-top: 16px;
+  border-top: 1px solid var(--color-border);
+}
+.nsi-actions > :last-child { margin-left: auto; }
 
 /* >=760px: data/administrator step content plus a resting stepper column
    comfortably fit side by side without either feeling cramped — below
    that, stacking (mobile pattern below) reads better than a squeezed
    two-column layout. */
 @media (min-width: 760px) {
+  .nsi-page {
+    padding: 0;
+    align-items: stretch;
+  }
   .nsi-shell {
-    max-width: 880px;
+    max-width: none;
+    min-height: 100vh;
+    min-height: 100dvh;
     flex-direction: row;
-    align-items: flex-start;
-    gap: 40px;
+    align-items: stretch;
+    gap: 0;
   }
   .nsi-rail {
-    width: 200px;
-    flex: 0 0 200px;
+    width: 248px;
+    flex: 0 0 248px;
+    padding: 28px 20px;
+    border-right: 1px solid var(--color-border);
+    background: var(--color-surface);
     position: sticky;
-    top: 32px;
+    top: 0;
+    height: 100vh;
+    height: 100dvh;
+    overflow-y: auto;
   }
   .nsi-main {
     flex: 1 1 auto;
+    padding: 40px 48px 48px;
+    max-width: 720px;
   }
   .nsi-rail-footer {
     display: flex;
     flex-direction: column;
     gap: 2px;
-    margin-top: 8px;
+    margin-top: auto;
+    padding-top: 16px;
   }
   .nsi-stepper-desktop {
     display: block;
@@ -75,6 +116,10 @@
   .nsi-stepper-mobile {
     display: none;
   }
+}
+
+@media (min-width: 1280px) {
+  .nsi-main { padding-left: 64px; }
 }
 
 /* Path fields (PathField) read as filesystem paths, not prose — a
@@ -106,10 +151,38 @@ pre.nsi-code {
   font-size: 13px;
 }
 
-@media (prefers-contrast: more) {
-  .nsi-path-list {
-    border-width: 2px;
+/* The "Technical details" disclosure inside a rewritten setup error. The
+   verbatim engine message stays one click away rather than fronting the
+   first-run operator. */
+.nsi-error-detail > summary {
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 600;
+  width: fit-content;
+}
+.nsi-error-detail > summary:focus-visible {
+  outline: 2px solid currentColor;
+  outline-offset: 2px;
+}
+.nsi-error-detail[open] > summary {
+  margin-bottom: 8px;
+}
+
+@media (max-width: 759px) {
+  .nsi-actions {
+    position: sticky;
+    bottom: 0;
+    z-index: 2;
+    margin: 20px -4px -4px;
+    padding: 12px 4px calc(12px + env(safe-area-inset-bottom, 0px));
+    background: var(--color-bg);
   }
+}
+
+@media (prefers-contrast: more) {
+  .nsi-path-list,
+  .nsi-rail,
+  .nsi-mode { border-width: 2px; }
   .nsi-path-list [aria-selected="true"] {
     outline: 2px solid currentColor;
     outline-offset: -2px;

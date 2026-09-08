@@ -16,9 +16,11 @@ import (
 const (
 	DefaultListenAddr  = "127.0.0.1:7210"
 	DefaultBufferPages = 1024
-	DefaultLogLevel    = "info"
-	DefaultMaxInflight = 32
-	DefaultMaxQueue    = 128
+	// DefaultPreallocAheadPages mirrors file.DefaultCapacityAhead (~256 MiB).
+	DefaultPreallocAheadPages = 16384
+	DefaultLogLevel           = "info"
+	DefaultMaxInflight        = 32
+	DefaultMaxQueue           = 128
 	// DefaultMaxOpenDatabases bounds how many distinct databases a single
 	// nextsqld process will ever open at once via dbmanager (M2-3a). An
 	// opened database is never evicted in this slice, so this is also a
@@ -71,8 +73,15 @@ type Config struct {
 	AuthBrokerConfig string
 	AuthBrokerListen string
 	BufferPages      int
-	RequireClientKey bool
-	AuditFile        string
+	// PreallocAheadPages is the allocation runway preallocated ahead of the
+	// highest allocated page, in 16 KiB pages. It is claimed with fallocate
+	// as real blocks, so it is a fixed on-disk cost per database: the default
+	// 16384 pages (~256 MiB) means even an empty database occupies ~257 MiB.
+	// Lower it for containers, embedded use, or a host running many small
+	// databases, where that cost is paid once per database.
+	PreallocAheadPages int
+	RequireClientKey   bool
+	AuditFile          string
 	// AuditSigningKeyset is an optional NSAK signer keyset. When configured,
 	// nextsqld verifies the retained signed segment before append and signs
 	// every new audit record. Private key material stays outside the database.
@@ -202,14 +211,15 @@ type Config struct {
 
 func Default() Config {
 	return Config{
-		ListenAddr:       DefaultListenAddr,
-		LogLevel:         DefaultLogLevel,
-		BufferPages:      DefaultBufferPages,
-		MaxInflight:      DefaultMaxInflight,
-		MaxOpenDatabases: DefaultMaxOpenDatabases,
-		MaxQueryQueue:    DefaultMaxQueue,
-		QueueWaitMS:      DefaultQueueWaitMS,
-		DrainTimeoutMS:   DefaultDrainTimeoutMS,
+		ListenAddr:         DefaultListenAddr,
+		LogLevel:           DefaultLogLevel,
+		BufferPages:        DefaultBufferPages,
+		PreallocAheadPages: DefaultPreallocAheadPages,
+		MaxInflight:        DefaultMaxInflight,
+		MaxOpenDatabases:   DefaultMaxOpenDatabases,
+		MaxQueryQueue:      DefaultMaxQueue,
+		QueueWaitMS:        DefaultQueueWaitMS,
+		DrainTimeoutMS:     DefaultDrainTimeoutMS,
 	}
 }
 
@@ -349,6 +359,12 @@ func loadFrom(r io.Reader) (Config, error) {
 				return Config{}, nerr.New(nerr.InvalidArgument, "config.Load", "buffer_pages must be a positive integer")
 			}
 			cfg.BufferPages = n
+		case "prealloc_ahead_pages":
+			n, err := strconv.Atoi(v)
+			if err != nil || n < 1 {
+				return Config{}, nerr.New(nerr.InvalidArgument, "config.Load", "prealloc_ahead_pages must be a positive integer")
+			}
+			cfg.PreallocAheadPages = n
 		case "auth_file":
 			cfg.AuthFile = v
 		case "tls_cert":
@@ -606,6 +622,7 @@ func (c Config) Marshal() []byte {
 	str("log_level", c.LogLevel)
 	str("deployment_profile", c.DeploymentProfile)
 	num("buffer_pages", c.BufferPages)
+	num("prealloc_ahead_pages", c.PreallocAheadPages)
 
 	str("tls_cert", c.TLSCert)
 	str("tls_key", c.TLSKey)
@@ -730,7 +747,7 @@ var settableKeys = func() map[string]bool {
 	// bool true — so Marshal emits one line per settable key.
 	probe := Config{
 		DataDir: "x", KeyFile: "x", InstanceKeyFile: "x", AuthFile: "x",
-		ListenAddr: "x", LogLevel: "x", DeploymentProfile: "x", BufferPages: 1,
+		ListenAddr: "x", LogLevel: "x", DeploymentProfile: "x", BufferPages: 1, PreallocAheadPages: 1,
 		TLSCert: "x", TLSKey: "x", TLSClientCA: "x", TLSClientCRL: "x", RequireClientKey: true,
 		TokenKeyset: "x", TokenRevocations: "x", TokenAudience: "x",
 		TokenIdentitySourceHints: map[uint32]string{1: "x"},

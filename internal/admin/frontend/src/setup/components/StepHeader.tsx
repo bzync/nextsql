@@ -9,15 +9,17 @@ import { Heading, Stack, Text } from "@bzync/rui";
 import type { ReactNode } from "react";
 
 export function StepHeader({
-  title, description, level = "h2", size = "md",
+  title, description, level = "h2", size = "md", kicker,
 }: {
   title: ReactNode;
   description?: ReactNode;
   level?: "h1" | "h2";
   size?: "md" | "lg";
+  kicker?: ReactNode;
 }) {
   return (
     <Stack gap="xs">
+      {kicker ? <Text className="nsa-kicker">{kicker}</Text> : null}
       <Heading id="installer-step-title" tabIndex={-1} as={level} size={size}>{title}</Heading>
       {description ? <Text variant="muted">{description}</Text> : null}
     </Stack>

@@ -68,11 +68,13 @@ func (s *Server) Close() error {
 func (s *Server) routes() {
 	s.mux.HandleFunc("POST /api/v1/session", s.handleLogin)
 	s.mux.HandleFunc("GET /api/v1/session", s.authed(s.handleWhoami))
+	s.mux.HandleFunc("GET /api/v1/connection", s.authed(s.handleConnection))
 	s.mux.HandleFunc("DELETE /api/v1/session", s.authed(s.handleLogout))
 	s.mux.HandleFunc("GET /api/v1/overview", s.authed(s.handleOverview))
 	s.mux.HandleFunc("GET /api/v1/databases", s.authed(s.handleDatabases))
 	s.mux.HandleFunc("GET /api/v1/activity", s.authed(s.handleActivity))
 	s.mux.HandleFunc("GET /api/v1/security", s.authed(s.handleSecurity))
+	s.mux.HandleFunc("POST /api/v1/security/action", s.authed(s.handleSecurityAction))
 	s.mux.HandleFunc("GET /api/v1/cluster", s.authed(s.handleCluster))
 	s.mux.HandleFunc("POST /api/v1/cluster/action", s.authed(s.handleClusterAction))
 	s.mux.HandleFunc("GET /api/v1/maintenance", s.authed(s.handleMaintenance))
@@ -90,6 +92,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/v1/studio/migrations", s.authed(s.handleStudioMigrations))
 	s.mux.HandleFunc("POST /api/v1/studio/query/analyze", s.authed(s.handleStudioAnalyze))
 	s.mux.HandleFunc("POST /api/v1/studio/query/split", s.authed(s.handleStudioSplit))
+	s.mux.HandleFunc("POST /api/v1/studio/query/diagnostics", s.authed(s.handleStudioDiagnostics))
 	s.mux.HandleFunc("POST /api/v1/studio/query", s.authed(s.handleStudioQuery))
 	s.mux.HandleFunc("POST /api/v1/studio/query/stream", s.authed(s.handleStudioQueryStream))
 	s.mux.HandleFunc("POST /api/v1/studio/query/cancel", s.authed(s.handleStudioCancel))
@@ -152,7 +155,8 @@ func (s *Server) authed(h func(http.ResponseWriter, *http.Request, *session)) ht
 				return
 			}
 		}
-		sess.touch()
+		sess.beginRequest()
+		defer sess.endRequest()
 		h(w, r, sess)
 	}
 }

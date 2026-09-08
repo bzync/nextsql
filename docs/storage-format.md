@@ -165,6 +165,26 @@ Rollback discards the queue. A reclamation failure leaves the logical DDL
 committed and is exposed by `executor.DB.LastReclaimError`; it never makes a
 page eligible by guessing.
 
+### Preallocation runway
+
+The allocator keeps a runway of unused pages preallocated ahead of the highest
+allocated page, so bulk writes do not extend the file on every allocation. The
+runway is claimed with `fallocate` in mode 0, which reserves **real blocks** —
+the file is not sparse — so it is a genuine on-disk cost from the moment a
+database is created.
+
+The default runway is 16384 pages (~256 MiB), which means a brand-new, empty
+database occupies about **257 MiB**: its handful of live pages plus the runway.
+That trade is deliberate for a single large database, and a poor one for a
+container, an embedded deployment, or a host running many small databases,
+where the cost is paid once per database.
+
+`prealloc_ahead_pages` (config file / `SET CONFIG`, or `--prealloc-ahead-pages`
+on the `nextsql` commands that create a database) sets it. It is process-wide,
+matching `nextsql.conf`'s per-node scope, and applies to every database the
+process opens or creates. Values below 1 are refused rather than silently
+disabling preallocation.
+
 ## Checksums and failure
 
 - Superblock: CRC32C. Mismatch fails closed.

@@ -181,7 +181,14 @@ session ends.
 5. **Expiry** — idle timeout (default 15 min since `lastSeen`) and absolute
    timeout (default 12 h since `createdAt`). A single bounded sweeper
    goroutine evicts expired sessions once a minute and closes their
-   connections.
+   connections. A session with a request **in flight** is never idle
+   (`beginRequest`/`endRequest` around the `authed` handler; the idle clock
+   restarts when the request finishes): an action can outlive the idle
+   timeout — `BACKUP DATABASE` is allowed 30 minutes — while the view keeps
+   its button disabled and the SPA sends nothing else, and evicting the
+   session mid-action logged the operator out the moment the backup returned.
+   The absolute lifetime is *not* held off this way: it is a security bound,
+   not an activity measure.
 6. **Bounded** — at most `--max-sessions` (default 16) concurrent sessions;
    login past that returns 503. No unbounded goroutines, maps, or
    connections.
@@ -204,6 +211,8 @@ DELETE /api/v1/session       logout
 GET    /api/v1/overview      Overview read-model (slice M1)
 GET    /api/v1/databases     Databases & Storage read-model (slice M2)
 GET    /api/v1/activity      Connections & Activity read-model (slice M3)
+GET    /api/v1/security      Users/roles/grants/TLS/keys/audit read-model (M4)
+POST   /api/v1/security/action  RBAC administration (M4 write half)
 ```
 
 Later slices add `/api/v1/security/*`, `/backups`, `/cluster`,
@@ -238,7 +247,7 @@ later; MVP is flags only):
 | `--tls-client-cert` / `--tls-client-key` | — | mTLS to `nextsqld`. |
 | `--insecure` | false | Allow a plaintext `nextsqld` connection (loopback only). |
 | `--max-sessions` | 16 | Concurrent operator sessions. |
-| `--idle-timeout` | 15m | Session idle expiry. |
+| `--idle-timeout` | 15m | Session idle expiry (a request in flight is not idle). |
 | `--session-lifetime` | 12h | Session absolute expiry. |
 | `--log-level` | info | `debug`/`info`/`warn`/`error`. |
 | `--grant-port-80` | false | Linux only: run `setcap cap_net_bind_service=+ep` on this installed binary so a later `--listen 127.0.0.1:80` doesn't need root, then exit. Opt-in — the default listener is unaffected and needs no such grant. Typically run once via `sudo`, since only root can add file capabilities. |
@@ -257,6 +266,17 @@ only official interfaces. Order is roughly by operator value.
   — `system.storage`, `system.databases` / `system.realms` (a `hosted` flag;
   empty on a single-database deployment, reported not errored),
   `system.tables`, `system.table_stats`.
+  **View reshaped 2026-09-08 (log #228)**: the flat Tables / Databases /
+  Realms tabs became one **catalog tree** — realm rows expand to their
+  databases, database rows expand to their tables (nested `aria-expanded`
+  disclosure rows, not an ARIA tree). Databases join realms by `realm_id`;
+  a database whose realm is not visible in `system.realms` is grouped under
+  its own `realm_name` rather than dropped, and a deployment with neither
+  table populated still gets one row — the connected database — so the table
+  list keeps a home. `system.tables` is the **connected** database's catalog
+  (one Ops connection binds one realm+database at handshake), so only the
+  connected database expands to tables; any other says why instead of
+  showing an empty or borrowed list. The read-model is unchanged.
 - **M3 — Connections & Activity** *(landed, log #120)*: `GET /api/v1/activity`
   — `system.sessions`, `system.active_queries`, `system.transactions`,
   `system.locks`. **Correction from the original plan**: NextSQL has no
@@ -273,6 +293,34 @@ only official interfaces. Order is roughly by operator value.
   Security view. Those three tables are already admin-only server-side —
   see `docs/system-catalog.md` "Security administration tables" — so the
   handler adds no RBAC of its own.
+  **RBAC administration landed 2026-09-08 (log #223)**: `POST
+  /api/v1/security/action` completes M4's write half. Until it, RBAC could
+  only be *read* here — there was no counterpart to the Cluster / Maintenance
+  / Config / Backups action routes — so creating a principal or changing a
+  grant meant hand-writing SQL in Studio. The route takes a **structured**
+  request (`op` plus named fields), never raw SQL, and renders the documented
+  statement server-side from a closed set of ops
+  (`create_user`, `drop_user`, `create_role`, `drop_role`, `grant_role`,
+  `revoke_role`, `grant`, `revoke`), the closed privilege list, and the
+  closed scope list. Every interpolated name must first pass `validIdent`, so
+  the interpolation is provably safe rather than relying on the server to
+  reject a malformed statement afterwards; a password is escaped as a SQL
+  string literal (`''` doubling, the lexer's only escape) and never logged or
+  echoed in an error. The statement runs on the operator's own authenticated
+  connection, so `internal/executor/security.go` remains the sole authority
+  on who may administer RBAC — the route can grant nothing the signed-in
+  operator could not grant by typing the same statement, and the engine's
+  refusal surfaces as 403. The Security view gains the matching UI
+  (`internal/admin/frontend/src/ops/SecurityAdmin.tsx`): create user (with
+  password confirmation), create role, drop user/role behind an explicit
+  confirmation, role membership, and a privilege grant/revoke form whose
+  privilege and scope choices mirror the Studio builder. The confirmation
+  message lives in the parent view rather than the toolbar because applying a
+  change reloads the read model and `ViewFrame` swaps its children for a
+  spinner, which would otherwise unmount the message before it could be read.
+  `alter` is absent from the privilege list on purpose: it lexes as a reserved
+  keyword outside the GRANT privilege-list grammar, so `GRANT ALTER ON …`
+  does not parse.
   **TLS status landed 2026-09-04 (log #125)**: a new `system.tls` table
   (`internal/system/schema.go`) backed by `executor.DB.TLSStatus()`, a
   settable-callback field on `*DB` (`SetTLSStatusSource`, mirroring the
@@ -431,6 +479,15 @@ only official interfaces. Order is roughly by operator value.
   stay CLI-only** — a running server cannot restore into itself, the same
   inherent limit as M6's `DRAIN` (which exits the process). `PROJECT.md` §47
   updated for the new SQL surface.
+  **`backup_dir` not configured (refinement)**: `GET /api/v1/backups` also
+  returns `backup_state` — `configured` / `unset` / `unknown`, derived from
+  whether `system.config` lists a `backup_dir` row (`unknown` when the
+  operator holds `BACKUP` but not cluster `ADMIN` and so cannot read
+  `system.config`). When it is `unset` the view disables "Back up now" and
+  explains that `backup_dir` must be set (Configuration view / `nextsql.conf`)
+  and `nextsqld` restarted; a `create`/`verify` that still reaches a node with
+  no `backup_dir` (the `unknown` case) has its raw `nerr.Unavailable` wire
+  string rewritten to the same remediation text rather than shown verbatim.
   **Known limitation**: `BACKUP DATABASE` is the first runtime caller of
   `Engine.Checkpoint()` on a live (not-closing) engine — the engine's own
   doc comment already anticipates "a caller that … produce[s] a consistent
@@ -439,6 +496,17 @@ only official interfaces. Order is roughly by operator value.
   write load is not yet stress-tested. The restore-test gate still rejects a
   copy that did not come out consistent; a concurrent-load backup stress
   test is a good follow-on.
+  **In-flight state (refinement, log #228)**: both actions run a full
+  restore test server-side and can take minutes (log #227 measured ~100s on
+  a 269 MB database). The confirm dialog therefore closes on confirm and the
+  originating control — "Back up now…", or that one row's **Verify** —
+  carries the spinner, stays disabled, and keeps both for the whole call, so
+  the row identifies *which* backup is being verified; every other backup
+  action is disabled meanwhile, so one operator cannot start a second
+  restore test by accident. RUI's `Button` hides its label
+  (`visibility:hidden`) behind the spinner while `loading`, which would
+  leave the control with no accessible name, so each loading button is given
+  an explicit `aria-label` prefixed with its visible text.
 - **M6 — Cluster landed 2026-09-04 (log #123)**: `GET /api/v1/cluster`
   (`system.replication` + `system.replica_health`, both already
   always-visible) and `POST /api/v1/cluster/action` issuing the exact

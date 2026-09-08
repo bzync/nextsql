@@ -24,6 +24,18 @@ func (s *Session) execCreateDatabase(p planner.CreateDatabase) (*Result, error) 
 	if err := validateDBName(p.Name); err != nil {
 		return nil, err
 	}
+	// This statement creates a bare sibling file, which only means anything on
+	// an embedded deployment that has no deployment registry. On a
+	// registry-backed deployment the file would carry no realm, no registry
+	// record, and no routing entry, so nothing could ever connect to it
+	// (Hello resolves names through the registry) while it still consumed a
+	// full database's worth of disk. Fail closed instead of leaving an
+	// unreachable orphan behind; managed databases are provisioned through the
+	// registry.
+	if s.hostingRegistry != nil {
+		return nil, nerr.New(nerr.InvalidArgument, "executor.CreateDatabase",
+			"CREATE DATABASE is not supported on a registry-backed deployment: a database created this way has no registry record and cannot be connected to; provision it with \"nextsql database create\" instead")
+	}
 	dir := filepath.Dir(s.db.path)
 	if s.db.path == "" && s.db.Eng != nil {
 		dir = filepath.Dir(s.db.Eng.Path())

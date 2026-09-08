@@ -39,6 +39,7 @@ type session struct {
 	// change while a read-model handler is reading them.
 	stateMu     sync.Mutex
 	lastSeen    time.Time
+	inFlight    int
 	activeQuery *activeStudioQuery
 	// readMode is "" (⇒ strong), "bounded", or "stale"; readMaxStalenessMS
 	// is the BOUNDED freshness bound in milliseconds (0 ⇒ server default).
@@ -129,10 +130,41 @@ func (s *session) touch() {
 	s.stateMu.Unlock()
 }
 
+// beginRequest marks one authenticated request as in flight and refreshes the
+// idle clock; endRequest clears it and restarts the clock from the moment the
+// request finished. A session with a request in flight is never *idle*: an
+// Operations action can legitimately outlive the idle timeout (BACKUP DATABASE
+// is allowed 30 minutes, a cluster drain up to its own timeout) while the SPA
+// sends nothing else, because the view keeps the originating button disabled
+// for the whole call and auto-refresh is off by default. Without this, the
+// sweeper evicted the session mid-action and the operator was logged out the
+// moment their backup returned.
+//
+// The absolute session lifetime is deliberately *not* held off this way — it
+// is a security bound, not an activity measure.
+func (s *session) beginRequest() {
+	s.stateMu.Lock()
+	s.inFlight++
+	s.lastSeen = time.Now()
+	s.stateMu.Unlock()
+}
+
+func (s *session) endRequest() {
+	s.stateMu.Lock()
+	if s.inFlight > 0 {
+		s.inFlight--
+	}
+	s.lastSeen = time.Now()
+	s.stateMu.Unlock()
+}
+
 func (s *session) expired(now time.Time, idle, lifetime time.Duration) bool {
 	s.stateMu.Lock()
 	defer s.stateMu.Unlock()
-	return now.Sub(s.lastSeen) > idle || now.Sub(s.createdAt) > lifetime
+	if now.Sub(s.createdAt) > lifetime {
+		return true
+	}
+	return s.inFlight == 0 && now.Sub(s.lastSeen) > idle
 }
 
 // resultJSON is the generic shape every result set is rendered as: string (or
@@ -294,6 +326,29 @@ func (s *session) cancelStudioQuery(queryID string) bool {
 	}
 	cancel()
 	return true
+}
+
+// ping checks that the session's driver connection can still talk to
+// nextsqld. A query already in flight means the connection is in use, so
+// ping reports healthy without interrupting it. A closed or dead connection
+// returns Unavailable. Callers must not treat ping failure as session
+// expiry — the admin cookie is independent of the nextsqld socket.
+func (s *session) ping(ctx context.Context) error {
+	if !s.mu.TryLock() {
+		return nil
+	}
+	defer s.mu.Unlock()
+	if s.conn == nil {
+		return nerr.New(nerr.Unavailable, "ops.session.ping", "session connection is closed")
+	}
+	rows, err := s.conn.Query(ctx, "SELECT 1")
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+	}
+	return rows.Err()
 }
 
 func (s *session) close() {

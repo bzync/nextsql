@@ -14,12 +14,21 @@ func Main() int {
 }
 
 func run(env Env, rt Runtime) int {
-	if err := bootstrap(env, rt); err != nil {
-		return exitErr(rt, err)
-	}
+	// Validate the server flags before mutating anything so a split TLS pair
+	// or a bad mTLS combination fails fast, ahead of first-start setup.
 	args, err := env.serverArgs()
 	if err != nil {
 		return exitErr(rt, err)
+	}
+	if err := bootstrap(env, rt); err != nil {
+		return exitErr(rt, err)
+	}
+	// nextsqld does not auto-load a config file; pass the one `nextsql setup`
+	// generated (deployment profile, resource sizing, operational timeouts).
+	// It goes first so the explicit data-dir/key-file/listen/TLS flags already
+	// in args win over it.
+	if cfg := env.configPath(); exists(cfg) {
+		args = append([]string{"--config", cfg}, args...)
 	}
 	if err := waitPeers(env, rt); err != nil {
 		return exitErr(rt, err)
@@ -48,7 +57,7 @@ func bootstrap(env Env, rt Runtime) error {
 			if err := restoreFromSeed(env, rt); err != nil {
 				return err
 			}
-		} else if err := initDataDir(env, rt); err != nil {
+		} else if err := setupDataDir(env, rt); err != nil {
 			return err
 		}
 	}
@@ -66,28 +75,82 @@ func bootstrap(env Env, rt Runtime) error {
 	return nil
 }
 
-func initDataDir(env Env, rt Runtime) error {
+// setupDataDir performs the first-start non-interactive initialization through
+// `nextsql setup` — the same hardened backbone the OS installers use. It sizes
+// the buffer pool from a resource preset, applies the deployment profile
+// (developer by default; NEXTSQL_PROFILE=production writes
+// deployment_profile=production plus the production operational defaults and
+// runs the fail-closed security preflight), initializes the database, and
+// writes nextsql.conf into the data volume for nextsqld to load on every
+// subsequent start.
+func setupDataDir(env Env, rt Runtime) error {
 	if env.ServerUser == "" {
 		return usage("first start requires NEXTSQL_SERVER_USER")
 	}
+	pwFile, cleanup, err := bootstrapPasswordFile(env)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
 	args := []string{
-		"init",
+		"setup",
 		"--data-dir", env.DataDir,
 		"--key-file", env.KeyFile,
 		"--user", env.ServerUser,
+		"--password-file", pwFile,
+		"--config-out", env.configPath(),
+		"--listen", env.Listen,
 	}
-	switch {
-	case passwordFileReadable(env.PasswordFile):
-		args = append(args, "--password-file", env.PasswordFile)
-	case env.ServerPass != "":
-		// nextsql init reads NEXTSQL_SERVER_PASS from the inherited environment.
-	default:
-		return usage("first start requires NEXTSQL_SERVER_PASSWORD_FILE or NEXTSQL_SERVER_PASS")
+	if env.Profile != "" {
+		args = append(args, "--profile", env.Profile)
+	}
+	if env.Preset != "" {
+		args = append(args, "--preset", env.Preset)
+	}
+	if env.BufferPages != "" {
+		args = append(args, "--buffer-pages", env.BufferPages)
+	}
+	// serverArgs has already rejected a half-set TLS pair by the time we run.
+	if env.TLSCert != "" && env.TLSKey != "" {
+		args = append(args, "--tls-cert", env.TLSCert, "--tls-key", env.TLSKey)
 	}
 	if err := rt.Run(rt.NextSQL, args); err != nil {
-		return fail("init: %v", err)
+		return fail("setup: %v", err)
 	}
 	return nil
+}
+
+// bootstrapPasswordFile resolves the bootstrap administrator password to a
+// file path for the one `nextsql setup` call. A readable
+// NEXTSQL_SERVER_PASSWORD_FILE is used as-is; an env-only NEXTSQL_SERVER_PASS
+// is written to a private (0600) temp file that the returned cleanup removes
+// — `nextsql setup` requires --password-file because its init step runs with
+// --no-env and never reads NEXTSQL_SERVER_PASS.
+func bootstrapPasswordFile(env Env) (path string, cleanup func(), err error) {
+	noop := func() {}
+	if passwordFileReadable(env.PasswordFile) {
+		return env.PasswordFile, noop, nil
+	}
+	if env.ServerPass == "" {
+		return "", noop, usage("first start requires NEXTSQL_SERVER_PASSWORD_FILE or NEXTSQL_SERVER_PASS")
+	}
+	f, err := os.CreateTemp("", "nextsql-bootstrap-*")
+	if err != nil {
+		return "", noop, fail("bootstrap password: %v", err)
+	}
+	name := f.Name()
+	remove := func() { _ = os.Remove(name) }
+	if _, err := f.WriteString(env.ServerPass + "\n"); err != nil {
+		_ = f.Close()
+		remove()
+		return "", noop, fail("bootstrap password: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		remove()
+		return "", noop, fail("bootstrap password: %v", err)
+	}
+	return name, remove, nil
 }
 
 func restoreFromSeed(env Env, rt Runtime) error {

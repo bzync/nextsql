@@ -8,6 +8,8 @@
     "build": "node build.mjs",
     "typecheck": "tsc --noEmit",
     "test:studio": "node test-studio-results.mjs",
+    "test:setup": "node test-setup-errors.mjs",
+    "test:revision": "node test-admin-ui-revision.mjs",
     "test:a11y": "npm run build && node test-accessibility.mjs"
   },
   "dependencies": {

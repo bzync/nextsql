@@ -31,8 +31,8 @@ export function Wordmark({
       style={{ gap: Math.round(markPx * 0.32) }}
     >
       <Mark size={markPx} decorative />
-      <Text as="span" weight="bold" wrap="nowrap" style={{ fontSize: textPx, letterSpacing: "-0.01em", lineHeight: 1 }}>
-        Next<Text as="span" weight="bold" className="text-accent-500">SQL</Text>
+      <Text as="span" weight="bold" wrap="nowrap" style={{ fontSize: textPx, letterSpacing: "-0.02em", lineHeight: 1 }}>
+        NextSQL
       </Text>
     </Inline>
   );

@@ -80,8 +80,9 @@ Keep the root unlock key **off** the data volume in production. A production ins
 
 ## Docker
 
-Multi-arch images (`linux/amd64`, `linux/arm64`) are on Docker Hub. Every tag is
-immutable — pin an explicit version, there is no `latest` or `edge`:
+Multi-arch images (`linux/amd64`, `linux/arm64`) are on Docker Hub, published
+only from a tagged release. Every tag is immutable — pin an explicit version,
+there is no `latest`, `edge`, or per-commit tag:
 
 ```bash
 docker pull bzynchub/nextsql:0.0.1

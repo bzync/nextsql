@@ -36,10 +36,20 @@ html, body, #root {
 }
 body {
   margin: 0;
+  font-feature-settings: "cv05", "ss01", "tnum";
+  -webkit-font-smoothing: antialiased;
 }
 #root ul {
   margin: 4px 0 0;
   padding-left: 18px;
+}
+
+/* Product-level density. RUI's default radii/shadows read as a marketing
+   surface; Admin is an operator console, so flatten chrome without
+   restyling every primitive. */
+:root {
+  --nsa-radius: 6px;
+  --nsa-sidebar-w: 232px;
 }
 
 /* Shared skip-link, used by both the Setup wizard shell and the Operations
@@ -64,22 +74,66 @@ body {
 
 /* Shared theme selector (shared/ThemeSelect.tsx). */
 .nsa-theme-select {
-  width: 150px;
+  width: 156px;
+  min-width: 156px;
 }
 .nsa-theme-trigger {
-  min-height: 36px;
+  width: 100% !important;
+  min-height: 32px;
+  font-size: 13px;
+  white-space: nowrap !important;
+}
+.nsa-theme-trigger span {
+  white-space: nowrap !important;
+  overflow: visible !important;
+}
+
+.nsa-identity {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  max-width: 280px;
+  padding: 3px 8px 3px 6px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--nsa-radius);
+  background: var(--color-surface-muted, var(--color-surface));
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.3;
+  color: var(--color-foreground);
+}
+.nsa-identity > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.nsa-identity svg {
+  flex: none;
+  color: var(--color-muted-foreground, var(--color-foreground-muted));
+}
+
+.nsa-kicker {
+  margin: 0;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--color-muted-foreground, var(--color-foreground-muted));
 }
 
 /* The mode-detection loading/error card shown by the top-level App.tsx
    before Setup or Operations mounts. */
 .nsa-loading-page {
   min-height: 100vh;
+  min-height: 100dvh;
   display: flex;
   align-items: center;
   justify-content: center;
-  padding: 32px 20px;
+  padding: 24px 16px;
   box-sizing: border-box;
 }
+.nsa-loading-page > * { width: 100%; max-width: 440px; }
 
 /* rui 0.0.9's Stepper descriptions and alert/status body variants use a
    fixed slate utility color that misses AA contrast on this shell's
@@ -112,3 +166,26 @@ span.text-xs.font-mono.text-slate-400 {
     outline-color: Highlight;
   }
 }
+
+/* Tab triggers: ensure horizontal alignment of icons, labels, and badges */
+[role="tab"] {
+  display: inline-flex !important;
+  flex-direction: row !important;
+  align-items: center !important;
+  justify-content: center;
+  gap: 6px;
+  vertical-align: middle;
+  white-space: nowrap;
+}
+
+[role="tab"] > span {
+  display: inline-flex;
+  align-items: center;
+}
+
+[role="tab"] svg {
+  display: inline-block;
+  vertical-align: middle;
+  flex-shrink: 0;
+}
+

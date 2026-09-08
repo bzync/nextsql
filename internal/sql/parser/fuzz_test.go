@@ -117,5 +117,27 @@ func FuzzParse(f *testing.F) {
 		if stmt == nil {
 			t.Fatalf("nil stmt without error")
 		}
+
+		// ParseDiag must agree with Parse and, on failure, always hand back
+		// an in-range offset an editor can point at.
+		dstmt, diag, derr := ParseDiag(src)
+		if (derr != nil) != (err != nil) {
+			t.Fatalf("ParseDiag/Parse disagree on error for %q", src)
+		}
+		if derr != nil {
+			if diag == nil {
+				t.Fatalf("ParseDiag returned an error but no diag for %q", src)
+			}
+			if diag.Offset < 0 || diag.Offset > len(src) {
+				t.Fatalf("ParseDiag offset %d out of [0,%d] for %q", diag.Offset, len(src), src)
+			}
+			if diag.Message == "" {
+				t.Fatalf("ParseDiag empty message for %q", src)
+			}
+			return
+		}
+		if diag != nil || dstmt == nil {
+			t.Fatalf("ParseDiag: clean parse but diag=%v stmt=%v for %q", diag, dstmt, src)
+		}
 	})
 }

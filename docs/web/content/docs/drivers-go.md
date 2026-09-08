@@ -1,6 +1,10 @@
 # Go driver
 
-Path: [`drivers/go`](https://github.com/bzync/nextsql/tree/main/drivers/go). Import `github.com/bzync/nextsql/drivers/go`.
+```bash
+go get github.com/bzync/nextsql/drivers/go
+```
+
+Import path `github.com/bzync/nextsql/drivers/go` (package `nextsql`). Source: [`drivers/go`](https://github.com/bzync/nextsql/tree/master/drivers/go). Versioned independently of the engine.
 
 ```go
 package main

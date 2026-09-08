@@ -458,6 +458,34 @@ and responsive rail/navigation behavior. Manager retains a wider maximum
 content canvas because operational result tables require it; product roles
 and security boundaries remain separate.
 
+### Actionable error messages (2026-09-07)
+
+`nextsql setup` and the shared `Params` validator are the one authority on
+what a plan (`/api/v1/plan`) or install (`/api/v1/install`) rejects, and the
+wizard still surfaces their exact text — but no longer as the *only* thing a
+first-run operator sees. `explainSetupError` (`src/setup/util.ts`, a pure
+function, unit-tested via `npm run test:setup`) matches the raw message
+against the known failure classes and returns a plain-language `title` +
+`action`, plus the verbatim `detail` and a `detailOpen` hint. `SetupErrorAlert`
+(`src/setup/components/`) renders it as the existing `Alert variant="error"`
+with the headline as its title, the next step as its body, and the raw
+message inside a `<details>` "Technical details" disclosure — collapsed for a
+recognized error, expanded automatically when the text is unrecognized so
+nothing is ever hidden. The three places a raw setup error reached the UI
+(the Location and Resources steps' plan-check banner, the Install step's
+failure card) all render through it.
+
+Recognized classes: non-loopback listen address without TLS; an existing
+config file or an already-initialized data directory; the production profile
+missing an administrator, an unlock key, or a resource-policy setting
+(`*_timeout_ms`, disk watermark); an unlock key left on the data volume; the
+production profile with "write config only"; an unwritable target path
+(`permission denied` / `operation not permitted`); a full disk; a failed
+post-install health check; and a missing/unrunnable `nextsql` binary.
+Anything else falls back to a generic "Setup couldn't finish" with the raw
+message shown expanded. This is presentation only — it never changes an
+outcome, retries, or suppresses an error, and it adds no API surface.
+
 ## 3. API surface (M1)
 
 All under the single-operator token described above. Every request/response

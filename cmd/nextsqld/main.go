@@ -32,6 +32,7 @@ import (
 	"github.com/bzync/nextsql/internal/security"
 	"github.com/bzync/nextsql/internal/storage"
 	"github.com/bzync/nextsql/internal/storage/buffer"
+	"github.com/bzync/nextsql/internal/storage/file"
 	"github.com/bzync/nextsql/internal/version"
 )
 
@@ -196,6 +197,10 @@ func run() error {
 	if !cfg.RequireClientKey && cfg.KeyFile == "" && cfg.InstanceKeyFile == "" {
 		return nerr.New(nerr.InvalidArgument, "nextsqld", "--key-file (or, for a manifest-bootstrapped deployment, --instance-key-file) is required unless --require-client-key is set")
 	}
+	// Apply the storage preallocation runway before any database is opened
+	// or created: it is process-wide, matching nextsql.conf's own per-node
+	// scope, and every database this node serves shares it.
+	file.SetCapacityAhead(cfg.PreallocAheadPages)
 	dataDirLock, err := hosting.AcquireDataDirLock(cfg.DataDir)
 	if err != nil {
 		return err

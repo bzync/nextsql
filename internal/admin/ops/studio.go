@@ -440,6 +440,31 @@ func (s *Server) handleStudioQueryStream(w http.ResponseWriter, r *http.Request,
 	})
 }
 
+// handleStudioDiagnostics parses every statement in the editor buffer with
+// the executor's own grammar and returns a parse-failure location for each
+// broken statement, for the editor's live diagnostics strip. Like analyze/
+// split it opens no driver connection and never touches the session's query
+// slot; the server's parser/binder/RBAC stay authoritative. Unresolved names
+// are not reported here — Studio has no catalog to resolve against — the real
+// executor reports those when the statement runs.
+func (s *Server) handleStudioDiagnostics(w http.ResponseWriter, r *http.Request, sess *session) {
+	var req studio.AnalyzeRequest
+	if err := decodeStudioJSON(w, r, &req, maxStudioRequestBody); err != nil {
+		writeError(w, studioDecodeErrorStatus(err), userError(err))
+		return
+	}
+	diags, err := studio.Diagnostics(req.SQL)
+	if err != nil {
+		status := http.StatusBadRequest
+		if nerr.HasCode(err, nerr.Exhausted) {
+			status = http.StatusRequestEntityTooLarge
+		}
+		writeError(w, status, userError(err))
+		return
+	}
+	writeJSON(w, http.StatusOK, studio.DiagnosticReport{Diagnostics: diags})
+}
+
 // handleStudioSplit tokenizes an Execute Script buffer into individually
 // runnable statements without opening a driver connection or touching the
 // session's query slot — the same trust level as handleStudioAnalyze.

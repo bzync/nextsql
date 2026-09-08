@@ -167,3 +167,62 @@ func TestParallelAgg(t *testing.T) {
 		t.Fatalf("%d", len(rows))
 	}
 }
+
+// TestUngroupedEmptyInputEmitsOneRow pins the SQL rule that an aggregate with
+// no GROUP BY is defined over one implicit group spanning the whole input, so
+// it reports exactly one row even when the input is empty: COUNT is 0 and
+// every other aggregate is NULL. A filter that matches nothing previously
+// returned zero rows here, which drivers surface as "no rows in result set"
+// rather than a count of 0.
+func TestUngroupedEmptyInputEmitsOneRow(t *testing.T) {
+	b := scheduler.NewBudget(nil, scheduler.DefaultLimits())
+	defer b.Close()
+	specs := []Spec{
+		{Fun: "count", Col: -1},
+		{Fun: "count", Col: 0},
+		{Fun: "sum", Col: 1},
+		{Fun: "avg", Col: 1},
+		{Fun: "min", Col: 0},
+		{Fun: "max", Col: 0},
+	}
+	h := New(nil, specs, nil, b)
+	defer h.Close()
+	rows, err := h.Finish()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("ungrouped empty aggregate returned %d rows, want 1", len(rows))
+	}
+	row := rows[0]
+	if len(row) != len(specs) {
+		t.Fatalf("row has %d columns, want %d", len(row), len(specs))
+	}
+	if row[0].Null || row[0].Dec.String() != "0" {
+		t.Fatalf("COUNT(*) = %v, want 0", row[0])
+	}
+	if row[1].Null || row[1].Dec.String() != "0" {
+		t.Fatalf("COUNT(col) = %v, want 0", row[1])
+	}
+	for i, name := range []string{"SUM", "AVG", "MIN", "MAX"} {
+		if !row[i+2].Null {
+			t.Fatalf("%s over empty input = %v, want NULL", name, row[i+2])
+		}
+	}
+}
+
+// TestGroupedEmptyInputEmitsNoRows is the other half of the rule: with a
+// GROUP BY there is no group to report, so empty input stays zero rows.
+func TestGroupedEmptyInputEmitsNoRows(t *testing.T) {
+	b := scheduler.NewBudget(nil, scheduler.DefaultLimits())
+	defer b.Close()
+	h := New([]int{0}, []Spec{{Fun: "count", Col: -1}}, nil, b)
+	defer h.Close()
+	rows, err := h.Finish()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("grouped empty aggregate returned %d rows, want 0", len(rows))
+	}
+}

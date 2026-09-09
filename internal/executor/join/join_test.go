@@ -386,3 +386,56 @@ func TestFullHashRefusesSpill(t *testing.T) {
 		t.Fatal("expected FULL to refuse spill")
 	}
 }
+
+func TestRightHashJoin(t *testing.T) {
+	b := scheduler.NewBudget(nil, scheduler.DefaultLimits())
+	defer b.Close()
+	lTypes := []types.Type{types.String(), types.String()}
+	rTypes := []types.Type{types.String(), types.String()}
+	left := [][]types.Value{
+		{types.StringValue("1"), types.StringValue("L1")},
+		{types.StringValue("2"), types.StringValue("L2")},
+		{types.Null(types.String()), types.StringValue("Lnull")},
+	}
+	right := [][]types.Value{
+		{types.StringValue("1"), types.StringValue("R1")},
+		{types.StringValue("3"), types.StringValue("R3")},
+		{types.Null(types.String()), types.StringValue("Rnull")},
+	}
+	h, err := HashJoin(left, right, []int{0}, []int{0}, ast.JoinRight, lTypes, rTypes, nil, b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// RIGHT join emits matched rows (1: L1+R1) and unmatched right rows (3: R3, NULL: Rnull).
+	// It does NOT emit unmatched left rows (2: L2, NULL: Lnull).
+	if len(h) != 3 {
+		t.Fatalf("right hash len=%d %+v", len(h), h)
+	}
+	// First row is matched row from left in left's order
+	if h[0][0].Str != "1" || h[0][1].Str != "L1" || h[0][2].Str != "1" || h[0][3].Str != "R1" {
+		t.Fatalf("row 0 want match: %+v", h[0])
+	}
+	// Following rows are unmatched right rows with NULL left prefix
+	if !h[1][0].Null || !h[1][1].Null || h[1][2].Str != "3" || h[1][3].Str != "R3" {
+		t.Fatalf("row 1 want unmatched R3: %+v", h[1])
+	}
+	if !h[2][0].Null || !h[2][1].Null || !h[2][2].Null || h[2][3].Str != "Rnull" {
+		t.Fatalf("row 2 want unmatched Rnull: %+v", h[2])
+	}
+}
+
+func TestRightHashRefusesSpill(t *testing.T) {
+	b := scheduler.NewBudget(nil, scheduler.Limits{Workers: 1, Memory: 200, Disk: 1 << 20, IO: 1 << 20, BatchSize: 64})
+	defer b.Close()
+	left := [][]types.Value{{types.StringValue("1"), types.StringValue("L1")}}
+	var right [][]types.Value
+	pad := strings.Repeat("k", 80)
+	for i := 0; i < 40; i++ {
+		right = append(right, []types.Value{types.StringValue(strconv.Itoa(i) + pad), types.StringValue("R")})
+	}
+	_, err := HashJoin(left, right, []int{0}, []int{0}, ast.JoinRight, nil, nil, nil, b)
+	if err == nil {
+		t.Fatal("expected RIGHT to refuse spill")
+	}
+}
+

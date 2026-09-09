@@ -1616,7 +1616,10 @@ func TestAlterTableAddConstraint(t *testing.T) {
 	execOK(t, s, `INSERT INTO orders (id, customer_id) VALUES ('o2', 'missing')`)
 }
 
-func TestCreateDatabase(t *testing.T) {
+// CREATE DATABASE was removed with multi-database hosting: one deployment,
+// one database. It must be refused by the parser, and it must not have left
+// a sibling database file behind.
+func TestCreateDatabaseIsRemoved(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "main")
 	keys := testKeys(t)
@@ -1626,27 +1629,14 @@ func TestCreateDatabase(t *testing.T) {
 	}
 	defer db.Close()
 	s := db.Session()
-	execOK(t, s, `CREATE DATABASE app`)
-	sib := filepath.Join(dir, "app")
-	st, err := os.Stat(sib)
-	if err != nil || st.IsDir() {
-		t.Fatalf("sibling %v %v", st, err)
+	for _, sql := range []string{`CREATE DATABASE app`, `CREATE DATABASE IF NOT EXISTS app`} {
+		if _, err := s.Exec(sql); !nerr.HasCode(err, nerr.Syntax) {
+			t.Fatalf("%s: %v", sql, err)
+		}
 	}
-	other, err := Open(sib, keys, 16)
-	if err != nil {
-		t.Fatal(err)
+	if _, err := os.Stat(filepath.Join(dir, "app")); !os.IsNotExist(err) {
+		t.Fatalf("a sibling database file was created: %v", err)
 	}
-	defer other.Close()
-	execOK(t, other.Session(), `CREATE TABLE t (id STRING PRIMARY KEY)`)
-	execOK(t, s, `CREATE DATABASE IF NOT EXISTS app`)
-	if _, err := s.Exec(`CREATE DATABASE app`); !nerr.HasCode(err, nerr.AlreadyExists) {
-		t.Fatalf("dup: %v", err)
-	}
-	execOK(t, s, `BEGIN`)
-	if _, err := s.Exec(`CREATE DATABASE other`); !nerr.HasCode(err, nerr.InvalidArgument) {
-		t.Fatalf("in txn: %v", err)
-	}
-	execOK(t, s, `ROLLBACK`)
 }
 
 func TestExplainOrderBy(t *testing.T) {

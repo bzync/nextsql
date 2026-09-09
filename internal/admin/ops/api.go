@@ -23,7 +23,10 @@ type loginRequest struct {
 	User     string `json:"user"`
 	Password string `json:"password"`
 	Database string `json:"database"`
-	Realm    string `json:"realm"`
+	// Realm is decoded only to refuse it: multi-realm hosting was removed, so
+	// a caller naming a realm asked for something this server will not do.
+	// Silently ignoring it would connect them somewhere they did not choose.
+	Realm string `json:"realm"`
 }
 
 type loginResponse struct {
@@ -55,7 +58,11 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	base.User = req.User
 	base.Password = req.Password
 	base.Database = strings.TrimSpace(req.Database)
-	base.Realm = strings.TrimSpace(req.Realm)
+	if strings.TrimSpace(req.Realm) != "" {
+		writeError(w, http.StatusBadRequest, "realm selection was removed: a NextSQL deployment serves exactly one database")
+		return
+	}
+	base.Realm = ""
 
 	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 	defer cancel()
@@ -67,7 +74,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	sess, err := s.sessions.create(conn, req.User, base.Database, base.Realm)
+	sess, err := s.sessions.create(conn, req.User, base.Database, "")
 	if err != nil {
 		_ = conn.Close()
 		if nerr.HasCode(err, nerr.Exhausted) {
@@ -205,8 +212,8 @@ func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request, sess *se
 }
 
 // handleDatabases is the M2 Databases & Storage read-model. system.databases
-// and system.realms are empty on a non-hosted deployment — that is reported,
-// not an error.
+// holds exactly one row — the database this deployment serves — and is empty
+// on a deployment with no registry; that is reported, not an error.
 func (s *Server) handleDatabases(w http.ResponseWriter, r *http.Request, sess *session) {
 	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 	defer cancel()
@@ -214,7 +221,6 @@ func (s *Server) handleDatabases(w http.ResponseWriter, r *http.Request, sess *s
 	b, err := runBundle(ctx, sess, []querySpec{
 		{key: "storage", sql: "SELECT * FROM system.storage", required: true},
 		{key: "databases", sql: "SELECT * FROM system.databases"},
-		{key: "realms", sql: "SELECT * FROM system.realms"},
 		{key: "tables", sql: "SELECT * FROM system.tables"},
 		{key: "table_stats", sql: "SELECT * FROM system.table_stats"},
 	})
@@ -226,7 +232,6 @@ func (s *Server) handleDatabases(w http.ResponseWriter, r *http.Request, sess *s
 		"generated_at": b.GeneratedAt,
 		"storage":      b.Tables["storage"],
 		"databases":    b.Tables["databases"],
-		"realms":       b.Tables["realms"],
 		"tables":       b.Tables["tables"],
 		"table_stats":  b.Tables["table_stats"],
 		"hosted":       len(b.Tables["databases"].Rows) > 0,

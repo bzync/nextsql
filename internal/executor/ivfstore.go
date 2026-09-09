@@ -3,6 +3,7 @@ package executor
 import (
 	"bytes"
 	"encoding/binary"
+	"sort"
 	"sync"
 
 	"github.com/bzync/nextsql/internal/catalog"
@@ -545,6 +546,349 @@ func (s *Session) nearestIVFIndex(n planner.Nearest, q []float32, metric nsvec.M
 			return nil, err
 		}
 		row, err := s.fetchPKRow(htx, tab, h.PK)
+		if err != nil {
+			return nil, err
+		}
+		if row == nil {
+			continue
+		}
+		ok, err := s.match(n.Residual, tab, row)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			continue
+		}
+		out = append(out, row)
+		if n.K > 0 && int64(len(out)) >= n.K {
+			break
+		}
+	}
+	return out, nil
+}
+
+// ivfStoreOfPartition binds the IVF store for one partition-local vector index.
+func (s *Session) ivfStoreOfPartition(tab *catalog.Table, part catalog.Partition, idx catalog.Index) (*sqlIVF, error) {
+	if len(idx.Columns) != 1 {
+		return nil, nerr.New(nerr.Internal, "executor.ivfStoreOfPartition", "VECTOR INDEX column count")
+	}
+	ix, err := s.partitionIndex(tab, part.ID, idx)
+	if err != nil {
+		return nil, err
+	}
+	vs, err := s.partitionVec(tab, part.ID)
+	if err != nil {
+		return nil, err
+	}
+	st := &sqlIVF{itx: s.x.use(ix), vtx: s.x.use(vs), col: uint16(idx.Columns[0])}
+	if snap, ok, err := s.fkWriteSnap(); err != nil {
+		return nil, err
+	} else if ok {
+		st.snap = snap
+		st.useSnap = true
+	}
+	return st, nil
+}
+
+// ivfSearchStorePartition returns a searchable partition-local IVF store, preferring
+// the process-local committed mem copy keyed by partitionIndexKey.
+func (s *Session) ivfSearchStorePartition(tab *catalog.Table, part catalog.Partition, idx catalog.Index) (nsvec.IVFStore, error) {
+	if s.dirtyIVF {
+		return s.ivfStoreOfPartition(tab, part, idx)
+	}
+	key := partitionIndexKey(tab.Name, part.ID, idx.Name)
+	gen := uint64(0)
+	if s.db != nil {
+		gen = s.db.hnswGeneration()
+		if m := s.db.getIVF(key); m != nil && m.gen == gen {
+			return m, nil
+		}
+	}
+	st, err := s.ivfStoreOfPartition(tab, part, idx)
+	if err != nil {
+		return nil, err
+	}
+	mem, err := nsvec.LoadIVFMem(st)
+	if err != nil {
+		if nerr.HasCode(err, nerr.NotFound) {
+			return st, nil
+		}
+		return nil, err
+	}
+	locked := &lockedIVF{mem: mem, gen: gen}
+	if s.db != nil {
+		s.db.setIVF(key, locked)
+	}
+	return locked, nil
+}
+
+// buildPartitionIVFIndex trains a coarse quantiser over one partition heap and
+// writes the centroids, posting lists, and header into the detached partition index tree.
+func (s *Session) buildPartitionIVFIndex(tab *catalog.Table, idx catalog.Index, part catalog.Partition, htx *btree.Txn, progress *rebuildProgress) error {
+	if len(idx.Columns) != 1 {
+		return nerr.New(nerr.InvalidArgument, "executor.buildPartitionIVFIndex", "VECTOR INDEX column count")
+	}
+	col := idx.Columns[0]
+	dim := tab.Columns[col].Type.Precision
+	metric := graphMetric(tab.Columns[col].Type)
+
+	type row struct {
+		pk  []byte
+		vec []float32
+	}
+	var rows []row
+	if err := htx.Range(nil, nil, func(_, val []byte) error {
+		if err := s.budget().Check(); err != nil {
+			return err
+		}
+		r, err := s.decodeHeapRow(tab, val)
+		if err != nil {
+			return err
+		}
+		v := r[col]
+		if v.Null {
+			if progress != nil {
+				progress.add(1, 0)
+			}
+			return nil
+		}
+		pk, err := types.EncodeKey(tab.PKValues(r))
+		if err != nil {
+			return err
+		}
+		rows = append(rows, row{pk: pk, vec: append([]float32(nil), v.Vec...)})
+		if progress != nil {
+			progress.add(1, 1)
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+
+	st, err := s.ivfStoreOfPartition(tab, part, idx)
+	if err != nil {
+		return err
+	}
+
+	nlist := idx.IVFLists
+	meta := nsvec.DefaultIVFMeta(dim, metric, nlist)
+	if idx.IVFProbes > 0 {
+		meta.NProbe = idx.IVFProbes
+		if meta.NProbe > meta.NList {
+			meta.NProbe = meta.NList
+		}
+	}
+
+	if len(rows) == 0 {
+		meta.NList = 1
+		meta.NProbe = 1
+		meta.Trained = true
+		meta.Count = 0
+		if err := st.SaveCentroids([][]float32{make([]float32, int(dim))}); err != nil {
+			return err
+		}
+		return st.SaveIVFMeta(meta)
+	}
+
+	const maxTrainSample = 50000
+	var sample [][]float32
+	if len(rows) <= maxTrainSample {
+		sample = make([][]float32, len(rows))
+		for i, r := range rows {
+			sample[i] = r.vec
+		}
+	} else {
+		stride := len(rows) / maxTrainSample
+		if stride < 1 {
+			stride = 1
+		}
+		for i := 0; i < len(rows) && len(sample) < maxTrainSample; i += stride {
+			sample = append(sample, rows[i].vec)
+		}
+	}
+	mem, err := nsvec.TrainIVF(meta, sample)
+	if err != nil {
+		return err
+	}
+	for _, r := range rows {
+		if err := s.budget().Check(); err != nil {
+			return err
+		}
+		mem.PutVec(r.pk, r.vec)
+		if err := nsvec.AddIVF(mem, r.pk, r.vec); err != nil {
+			return err
+		}
+	}
+
+	if err := st.SaveCentroids(mem.Centroids); err != nil {
+		return err
+	}
+	for l, list := range mem.Lists {
+		if len(list) == 0 {
+			continue
+		}
+		if err := st.writeList(l, list); err != nil {
+			return err
+		}
+	}
+	if err := st.SaveIVFMeta(mem.Meta); err != nil {
+		return err
+	}
+	if s.pendingIVF == nil {
+		s.pendingIVF = make(map[string]*lockedIVF)
+	}
+	s.pendingIVF[partitionIndexKey(tab.Name, part.ID, idx.Name)] = &lockedIVF{mem: mem}
+	return nil
+}
+
+// initPartitionIVFIndex persists an empty IVF quantiser for a freshly added partition.
+func (s *Session) initPartitionIVFIndex(tab *catalog.Table, idx catalog.Index, part catalog.Partition) error {
+	if len(idx.Columns) != 1 {
+		return nerr.New(nerr.InvalidArgument, "executor.initPartitionIVFIndex", "VECTOR INDEX column count")
+	}
+	s.dirtyIVF = true
+	col := idx.Columns[0]
+	dim := tab.Columns[col].Type.Precision
+	metric := graphMetric(tab.Columns[col].Type)
+	meta := nsvec.DefaultIVFMeta(dim, metric, 1)
+	meta.NProbe = 1
+	meta.Trained = true
+	meta.Count = 0
+
+	st, err := s.ivfStoreOfPartition(tab, part, idx)
+	if err != nil {
+		return err
+	}
+	if err := st.SaveCentroids([][]float32{make([]float32, int(dim))}); err != nil {
+		return err
+	}
+	if err := st.SaveIVFMeta(meta); err != nil {
+		return err
+	}
+	if s.pendingIVF == nil {
+		s.pendingIVF = make(map[string]*lockedIVF)
+	}
+	s.pendingIVF[partitionIndexKey(tab.Name, part.ID, idx.Name)] = &lockedIVF{
+		mem: &nsvec.IVFMem{
+			Meta:      meta,
+			Centroids: [][]float32{make([]float32, int(dim))},
+			Lists:     make([][][]byte, 1),
+			Vecs:      make(map[string][]float32),
+		},
+	}
+	return nil
+}
+
+// maintainPartitionIVFIndex applies one row change to a partition-local IVF index.
+func (s *Session) maintainPartitionIVFIndex(tab *catalog.Table, idx catalog.Index, part catalog.Partition, old, neu []types.Value) error {
+	s.dirtyIVF = true
+	st, err := s.ivfStoreOfPartition(tab, part, idx)
+	if err != nil {
+		return err
+	}
+	if old != nil {
+		pk, err := types.EncodeKey(tab.PKValues(old))
+		if err != nil {
+			return err
+		}
+		if _, err := nsvec.RemoveIVF(st, pk); err != nil {
+			return err
+		}
+	}
+	if neu != nil {
+		col := idx.Columns[0]
+		if col >= len(neu) || neu[col].Null {
+			return nil
+		}
+		pk, err := types.EncodeKey(tab.PKValues(neu))
+		if err != nil {
+			return err
+		}
+		return nsvec.AddIVF(st, pk, neu[col].Vec)
+	}
+	return nil
+}
+
+// nearestIVFIndexPartitioned searches every surviving partition-local IVF store and
+// merges results by distance.
+func (s *Session) nearestIVFIndexPartitioned(n planner.Nearest, q []float32, metric nsvec.Metric, tab *catalog.Table, idx catalog.Index) ([][]types.Value, error) {
+	type pstore struct {
+		part catalog.Partition
+		st   nsvec.IVFStore
+	}
+	var stores []pstore
+	var total uint64
+	for _, part := range partitionSelection(tab, n.Partitions) {
+		st, err := s.ivfSearchStorePartition(tab, part, idx)
+		if err != nil {
+			return nil, err
+		}
+		meta, err := st.LoadIVFMeta()
+		if err != nil {
+			if nerr.HasCode(err, nerr.NotFound) {
+				continue
+			}
+			return nil, err
+		}
+		if n.Metric != "" && meta.Metric != metric {
+			return s.nearestFlat(n, q, metric)
+		}
+		if !meta.Trained || meta.Count == 0 {
+			continue
+		}
+		total += meta.Count
+		stores = append(stores, pstore{part: part, st: st})
+	}
+	if len(stores) == 0 || total == 0 {
+		return nil, nil
+	}
+	k := int(n.K)
+	if k < 1 {
+		k = int(total)
+	}
+	if k < 1 {
+		return nil, nil
+	}
+	if n.Residual != nil && uint64(k) < total {
+		over := k * 4
+		if over < k {
+			over = k
+		}
+		if uint64(over) > total {
+			over = int(total)
+		}
+		k = over
+	}
+	type mergedHit struct {
+		hit nsvec.Hit
+		si  int
+	}
+	var all []mergedHit
+	for si := range stores {
+		hits, err := nsvec.SearchIVF(stores[si].st, q, k, int(idx.IVFProbes), s.workers())
+		if err != nil {
+			return nil, err
+		}
+		for _, h := range hits {
+			all = append(all, mergedHit{hit: h, si: si})
+		}
+	}
+	sort.Slice(all, func(i, j int) bool { return nsvec.LessHit(all[i].hit, all[j].hit) })
+	htxs := make([]*btree.Txn, len(stores))
+	var out [][]types.Value
+	for _, m := range all {
+		if err := s.budget().Check(); err != nil {
+			return nil, err
+		}
+		ps := stores[m.si]
+		if htxs[m.si] == nil {
+			heap, err := s.partitionHeap(tab, ps.part.ID)
+			if err != nil {
+				return nil, err
+			}
+			htxs[m.si] = s.x.use(heap)
+		}
+		row, err := s.fetchPKRow(htxs[m.si], tab, m.hit.PK)
 		if err != nil {
 			return nil, err
 		}

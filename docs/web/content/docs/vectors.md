@@ -57,7 +57,7 @@ round-trips exactly.
 There is no implicit conversion between element types; a `NEAREST` query vector
 stays full precision.
 
-## BITVECTOR&lt;N&gt;
+## `BITVECTOR<N>`
 
 `BITVECTOR<N>` is a distinct top-level type that stores `N` single-bit elements
 as `ceil(N/8)` packed bytes — one thirty-second of `VECTOR<F32,N>`. Every element
@@ -133,7 +133,9 @@ the index — so a query does not reload the index tree each time. This is the s
 generation-tracked cache the HNSW graph uses.
 
 IVF is real-valued only (`COSINE` / `L2` / `INNER_PRODUCT`) and is not available
-on partitioned tables or `BITVECTOR` columns.
+on `BITVECTOR` columns. On a partitioned table, each partition owns a trained
+encrypted IVF tree and `NEAREST` merges candidates across the selected
+partitions.
 
 ## IVF-PQ
 
@@ -152,8 +154,9 @@ only.
 
 - `SUBSPACES` (the subspace count `M`) is required and must divide the vector
   dimension (≤ 128). `LISTS` is required; `PROBES` defaults to ≈ 10 % of `LISTS`.
-- Not available on partitioned tables or `BITVECTOR` columns; `WITH
-  (QUANTIZATION = …)` is not an IVFPQ option.
+- Not available on `BITVECTOR` columns; `WITH (QUANTIZATION = …)` is not an
+  IVFPQ option. On a partitioned table each partition owns its own trained
+  IVFPQ tree and `NEAREST` merges candidates across selected partitions.
 - Its own detached, encrypted index tree (coarse centroids, a chunked codebook,
   one front-coded posting list per centroid); `INSERT` / `UPDATE` / `DELETE`
   maintain it incrementally and `REBUILD INDEX` retrains it. No process-local
@@ -177,8 +180,9 @@ SELECT id FROM docs NEAREST emb TO (1, 0, 0.5, 0, 0, 0, 0, 0) LIMIT 10;
 per dimension, `NSSP`) and ranks with exact inner-product accumulation,
 optional `COSINE` re-rank. SQL `N` is 1…65535; the portable core allows ambient
 dimension up to `2^24` with ≤ `2^16` non-zeros. Dense literals such as
-`(1, 0, 0.5, 0)` are coerced by dropping zeros. Not available on partitioned
-tables or dense/`BITVECTOR` columns. `nextsql-bench --vecquant` includes a
+`(1, 0, 0.5, 0)` are coerced by dropping zeros. Not available on dense/
+`BITVECTOR` columns. Partitioned tables maintain one sparse inverted index per
+partition and merge selected-partition candidates. `nextsql-bench --vecquant` includes a
 `SPARSE` size/latency/recall row on a high-dimension, low-nnz corpus.
 
 A second `NEAREST` clause fuses a dense `VECTOR` column with a `SPARSEVECTOR`
@@ -191,6 +195,6 @@ each retriever and reciprocal-rank fuses them (`EXPLAIN`:
 - Dimension `1…8192` (dense / bit vectors); `SPARSEVECTOR<N>` SQL `N` is 1…65535 (portable core allows 2^24 with ≤ 2^16 non-zeros)
 - Elements must be finite (`NaN` / `Inf` fail closed); `F16` magnitude ≤ 65504
 - Query dimension must match the column
-- IVF / IVF-PQ `LISTS` ≤ 65 536, IVF-PQ `SUBSPACES` ≤ 128; IVF / IVF-PQ / SPARSE are not available on partitioned tables
+- IVF / IVF-PQ `LISTS` ≤ 65 536, IVF-PQ `SUBSPACES` ≤ 128
 
 Engine note: [`docs/vector.md`](https://github.com/bzync/nextsql/blob/main/docs/vector.md).

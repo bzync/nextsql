@@ -328,6 +328,8 @@ func mapIdents(e ast.Expr, fn func(string) string) ast.Expr {
 		return ast.MapCtor{Keys: ks, Vals: vs}
 	case ast.FieldAccess:
 		return ast.FieldAccess{Base: mapIdents(x.Base, fn), Field: x.Field}
+	case ast.Subscript:
+		return ast.Subscript{Coll: mapIdents(x.Coll, fn), Index: mapIdents(x.Index, fn)}
 	default:
 		return e
 	}
@@ -442,6 +444,9 @@ func walkIdents(e ast.Expr, fn func(string)) {
 		}
 	case ast.FieldAccess:
 		walkIdents(x.Base, fn)
+	case ast.Subscript:
+		walkIdents(x.Coll, fn)
+		walkIdents(x.Index, fn)
 	}
 }
 
@@ -493,6 +498,8 @@ func tableOf(p planner.Logical) *catalog.Table {
 	case planner.CTEScan:
 		return n.Schema
 	case planner.Scan:
+		return n.Table
+	case planner.UnnestScan:
 		return n.Table
 	case planner.SeqScan:
 		return n.Table
@@ -609,6 +616,15 @@ func namesOf(p planner.Logical) []string {
 		}
 		return out
 	case planner.SeqScan:
+		if n.Table == nil {
+			return nil
+		}
+		out := make([]string, len(n.Table.Columns))
+		for i, c := range n.Table.Columns {
+			out[i] = c.Name
+		}
+		return out
+	case planner.UnnestScan:
 		if n.Table == nil {
 			return nil
 		}

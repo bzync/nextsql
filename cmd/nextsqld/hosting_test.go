@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/bzync/nextsql/internal/cli"
@@ -105,18 +106,16 @@ func TestOpenHostedDefaultAndValidateDatabase(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// A registry cap flows through to the open database's data-file growth cap.
+	// A registry cap recorded by an earlier release still flows through to
+	// the open database's data-file growth cap; only the ability to set one
+	// through the CLI went away with hosting.
 	if openedDB.StorageCapBytes() != 0 {
 		t.Fatalf("unexpected default cap: %d", openedDB.StorageCapBytes())
 	}
-	if err := openedRegistry.SetRealmStorageCap(realm.ID, 200<<20); err != nil {
-		t.Fatal(err)
-	}
-	if err := openedRegistry.SetDatabaseStorageCap(realm.ID, hosted.ID, 64<<20); err != nil {
-		t.Fatal(err)
-	}
-	updatedRealm := openedRegistry.Manifest().Realms[0]
-	applyHostedStorageCap(openedDB, updatedRealm, updatedRealm.Databases[0])
+	capped := openedRegistry.Manifest().Realms[0]
+	capped.StorageCapBytes = 200 << 20
+	capped.Databases[0].StorageCapBytes = 64 << 20
+	applyHostedStorageCap(openedDB, capped, capped.Databases[0])
 	if got := openedDB.StorageCapBytes(); got == 0 || got > 64<<20 {
 		t.Fatalf("effective cap not applied: %d", got)
 	}
@@ -164,58 +163,6 @@ func TestOpenHostedDefaultRejectsProvisioning(t *testing.T) {
 	}
 }
 
-// TestOpenHostedDefaultAcceptsManagedLayoutDefault covers a
-// manifest-bootstrapped deployment: RegistryManifest marks every database
-// LayoutManaged, including the default. openHostedDefault must accept it
-// (nextsqld then serves it lazily through dbmanager, with no eager primary
-// handle) instead of the pre-2026-09-03 "single-database runtime" refusal.
-func TestOpenHostedDefaultAcceptsManagedLayoutDefault(t *testing.T) {
-	dir := t.TempDir()
-	secrets := t.TempDir()
-	instanceKey := filepath.Join(secrets, "instance.key")
-	instanceRoot := createTestKey(t, instanceKey)
-	createTestKey(t, filepath.Join(secrets, "main.key")).Zero()
-	instanceRoot.Zero()
-
-	manifest := filepath.Join(t.TempDir(), "hosting.yaml")
-	if err := os.WriteFile(manifest, []byte(`version: 1
-default: {realm: only, database: main}
-realms:
-  - name: only
-    databases:
-      - {name: main, key_file: `+filepath.Join(secrets, "main.key")+`}
-`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	bootstrap, err := hosting.LoadDeploymentBootstrap(manifest)
-	if err != nil {
-		t.Fatal(err)
-	}
-	root, err := crypto.ReadKeyFile(instanceKey)
-	if err != nil {
-		t.Fatal(err)
-	}
-	reg, _, err := hosting.EnsureManifest(hosting.Path(dir), root, func(dep hosting.ID) (hosting.Manifest, error) {
-		return bootstrap.RegistryManifest(dep, hosting.StateActive)
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	_ = reg.Close()
-
-	cfg := config.Default()
-	cfg.DataDir = dir
-	cfg.InstanceKeyFile = instanceKey
-	openedReg, realm, db, err := openHostedDefault(cfg)
-	if err != nil {
-		t.Fatalf("openHostedDefault rejected a managed-layout default: %v", err)
-	}
-	defer openedReg.Close()
-	if realm.Name != "only" || db.Name != "main" || db.Layout != hosting.LayoutManaged {
-		t.Fatalf("realm=%+v db=%+v", realm, db)
-	}
-}
-
 func createTestKey(t *testing.T, path string) *crypto.DEK {
 	t.Helper()
 	root, err := crypto.CreateKeyFile(path, 1)
@@ -223,4 +170,150 @@ func createTestKey(t *testing.T, path string) *crypto.DEK {
 		t.Fatal(err)
 	}
 	return root
+}
+
+// TestRequireSingleDatabaseDeploymentFailsClosed proves nextsqld refuses to
+// serve a registry written by a release that could hold more than one
+// database, instead of starting up healthy with the operator's other
+// databases silently unreachable. The registry format is unchanged, so such a
+// deployment is still readable by the release that made it.
+func TestRequireSingleDatabaseDeploymentFailsClosed(t *testing.T) {
+	newRegistry := func(t *testing.T, dir string, layout hosting.Layout) *hosting.Registry {
+		t.Helper()
+		instanceRoot := createTestKey(t, filepath.Join(t.TempDir(), "instance.key"))
+		identity, err := format.NewIdentity()
+		if err != nil {
+			t.Fatal(err)
+		}
+		reg, _, err := hosting.EnsureBootstrap(hosting.Path(dir), instanceRoot, hosting.Bootstrap{
+			RealmName:        "default",
+			DatabaseName:     "default",
+			DatabaseIdentity: identity,
+			DatabaseState:    hosting.StateActive,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return reg
+	}
+
+	t.Run("one database is accepted", func(t *testing.T) {
+		reg := newRegistry(t, t.TempDir(), hosting.LayoutLegacyDefault)
+		defer reg.Close()
+		realm, database, err := reg.Default()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := requireSingleDatabaseDeployment(reg, realm, database); err != nil {
+			t.Fatalf("a single-database deployment must start: %v", err)
+		}
+	})
+
+	// The manifest that produced these shapes is gone, so they are built by
+	// hand here — which is exactly how they reach this build: on disk, from
+	// an earlier release.
+	t.Run("a second database is refused", func(t *testing.T) {
+		reg := newRegistry(t, t.TempDir(), hosting.LayoutLegacyDefault)
+		defer reg.Close()
+		realm, database, err := reg.Default()
+		if err != nil {
+			t.Fatal(err)
+		}
+		second := database
+		second.Name = "other"
+		realm.Databases = append(append([]hosting.Database(nil), realm.Databases...), second)
+		if err := requireSingleDatabaseDeploymentManifest(hosting.Manifest{Realms: []hosting.Realm{realm}}, realm, database); err == nil {
+			t.Fatal("a registry with two databases must fail closed")
+		} else if !nerr.HasCode(err, nerr.Unavailable) {
+			t.Fatalf("wrong code: %v", err)
+		}
+	})
+
+	t.Run("a managed-layout database is refused", func(t *testing.T) {
+		reg := newRegistry(t, t.TempDir(), hosting.LayoutLegacyDefault)
+		defer reg.Close()
+		realm, database, err := reg.Default()
+		if err != nil {
+			t.Fatal(err)
+		}
+		database.Layout = hosting.LayoutManaged
+		realm.Databases = []hosting.Database{database}
+		if err := requireSingleDatabaseDeploymentManifest(hosting.Manifest{Realms: []hosting.Realm{realm}}, realm, database); err == nil {
+			t.Fatal("a managed-layout database must fail closed")
+		} else if !nerr.HasCode(err, nerr.Unavailable) {
+			t.Fatalf("wrong code: %v", err)
+		}
+	})
+
+	t.Run("a second realm is refused", func(t *testing.T) {
+		reg := newRegistry(t, t.TempDir(), hosting.LayoutLegacyDefault)
+		defer reg.Close()
+		realm, database, err := reg.Default()
+		if err != nil {
+			t.Fatal(err)
+		}
+		m := hosting.Manifest{Realms: []hosting.Realm{realm, realm}}
+		if err := requireSingleDatabaseDeploymentManifest(m, realm, database); err == nil {
+			t.Fatal("a registry with two realms must fail closed")
+		} else if !nerr.HasCode(err, nerr.Unavailable) {
+			t.Fatalf("wrong code: %v", err)
+		}
+	})
+}
+
+// A deployment initialized without `--database` has keys and an
+// administrator but nothing to serve. nextsqld must say that, and say how to
+// fix it, instead of surfacing a missing-file error from inside the storage
+// layer — and it must still distinguish that from a registry whose database
+// has gone missing, which is damage.
+func TestRequireInitializedDatabase(t *testing.T) {
+	t.Run("a database is served", func(t *testing.T) {
+		dir := t.TempDir()
+		dbPath := filepath.Join(dir, "nextsql.db")
+		if err := os.WriteFile(dbPath, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		cfg := config.Default()
+		cfg.DataDir = dir
+		if err := requireInitializedDatabase(cfg, dbPath, nil); err != nil {
+			t.Fatalf("an existing database must be served: %v", err)
+		}
+	})
+
+	t.Run("no database yet names the command that creates one", func(t *testing.T) {
+		dir := t.TempDir()
+		cfg := config.Default()
+		cfg.DataDir = dir
+		cfg.KeyFile = "/etc/nextsql/root.key"
+		err := requireInitializedDatabase(cfg, filepath.Join(dir, "nextsql.db"), nil)
+		if !nerr.HasCode(err, nerr.Unavailable) {
+			t.Fatalf("want unavailable, got %v", err)
+		}
+		if !strings.Contains(err.Error(), "--database NAME") || !strings.Contains(err.Error(), cfg.KeyFile) {
+			t.Fatalf("the error must name the command to run: %v", err)
+		}
+	})
+
+	t.Run("a registry without its database is corruption", func(t *testing.T) {
+		dir := t.TempDir()
+		instanceKey := filepath.Join(t.TempDir(), "instance.key")
+		instanceRoot := createTestKey(t, instanceKey)
+		identity, err := format.NewIdentity()
+		if err != nil {
+			t.Fatal(err)
+		}
+		reg, _, err := hosting.EnsureBootstrap(hosting.Path(dir), instanceRoot, hosting.Bootstrap{
+			RealmName: "default", DatabaseName: "default",
+			DatabaseIdentity: identity, DatabaseState: hosting.StateActive,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer reg.Close()
+		cfg := config.Default()
+		cfg.DataDir = dir
+		if err := requireInitializedDatabase(cfg, filepath.Join(dir, "nextsql.db"), reg); !nerr.HasCode(err, nerr.Corruption) {
+			t.Fatalf("want corruption, got %v", err)
+		}
+	})
 }

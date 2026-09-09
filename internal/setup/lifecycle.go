@@ -21,6 +21,13 @@ const (
 	// been initialized (no nextsql.db). `nextsql setup --skip-init` leaves
 	// this state; a full `nextsql setup` completes it.
 	InstallConfigOnly InstallStatus = "config-only"
+	// InstallDeploymentOnly: a deployment exists — its authentication store,
+	// and so any administrator it was given — but it holds no database, which
+	// is what `nextsql init` (or `nextsql setup`) without `--database`
+	// leaves. `nextsqld` fails closed on it; `nextsql init --database NAME`
+	// completes it. Distinct from InstallConfigOnly, which has nothing on
+	// disk but a config file.
+	InstallDeploymentOnly InstallStatus = "deployment-only"
 	// InstallInitialized: an initialized database is present and no NextSQL
 	// process is holding the deployment lock.
 	InstallInitialized InstallStatus = "initialized"
@@ -34,18 +41,26 @@ type DetectInput struct {
 	ConfigPresent   bool
 	DataFilePresent bool
 	KeystorePresent bool
-	LockHeld        bool
+	// AuthPresent is the deployment-level authentication store
+	// (nextsql.users). It exists independently of any database, so it is what
+	// distinguishes a provisioned deployment from an empty directory.
+	AuthPresent bool
+	LockHeld    bool
 }
 
 // ClassifyInstall reduces the observations to a single status. A held
 // deployment lock always wins; otherwise an initialized database (data file
-// plus keystore) outranks a lone config file.
+// plus keystore) outranks a provisioned deployment, which outranks a lone
+// config file. The order matters: each state is a strict superset of the one
+// after it, so reporting the weaker one would understate what is on disk.
 func ClassifyInstall(in DetectInput) InstallStatus {
 	switch {
 	case in.LockHeld:
 		return InstallRunning
 	case in.DataFilePresent && in.KeystorePresent:
 		return InstallInitialized
+	case in.AuthPresent:
+		return InstallDeploymentOnly
 	case in.ConfigPresent:
 		return InstallConfigOnly
 	default:

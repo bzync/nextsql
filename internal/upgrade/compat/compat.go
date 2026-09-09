@@ -32,6 +32,7 @@ const (
 	FamilyProtocol Family = "protocol"
 	FamilyRepl     Family = "replication"
 	FamilyIsolated Family = "isolated"
+	FamilyKeystore Family = "keystore"
 )
 
 // Spec is one family's compatibility window for this binary.
@@ -55,12 +56,17 @@ func Catalog() []Spec {
 		{Family: FamilyWALCtrl, Magic: "NSWC", Current: 1, MinReadable: 1, MaxReadable: 1, Notes: "WAL control file"},
 		{Family: FamilyUNDO, Magic: "NSUD", Current: 1, MinReadable: 1, MaxReadable: 1, Notes: "encrypted UNDO records"},
 		{Family: FamilyUNDOCtrl, Magic: "NSUC", Current: 1, MinReadable: 1, MaxReadable: 1, Notes: "UNDO control file"},
-		{Family: FamilyCatalog, Magic: "NSCT", Current: 12, MinReadable: 1, MaxReadable: 12, Notes: "table descriptors; v1 empty FKs, v2 foreign keys, v3 CDC image policy, v4 partition metadata, v5 stable partition identity allocator, v6 per-index HNSW traversal quantisation, v7 per-index vector ANN method + IVF list/probe counts, v8 per-index IVF-PQ subspace count, v9 per-index full-text analyzer id+revision, v10 per-column ENCRYPTED CLIENT logical type, v11 per-column ENUM label list, v12 per-column recursive STRUCT/ARRAY/MAP descriptor"},
+		{Family: FamilyCatalog, Magic: "NSCT", Current: 13, MinReadable: 1, MaxReadable: 13, Notes: "table descriptors; v1 empty FKs, v2 foreign keys, v3 CDC image policy, v4 partition metadata, v5 stable partition identity allocator, v6 per-index HNSW traversal quantisation, v7 per-index vector ANN method + IVF list/probe counts, v8 per-index IVF-PQ subspace count, v9 per-index full-text analyzer id+revision, v10 per-column ENCRYPTED CLIENT logical type, v11 per-column ENUM label list, v12 per-column recursive STRUCT/ARRAY/MAP descriptor, v13 per-column client-encryption mode"},
 		{Family: FamilyBackup, Magic: "NSBK", Current: 1, MinReadable: 1, MaxReadable: 1, Notes: "physical backup header"},
 		{Family: FamilyExport, Magic: "NSXP", Current: 1, MinReadable: 1, MaxReadable: 1, Notes: "logical export header"},
 		{Family: FamilyProtocol, Magic: "NSQL", Current: 1, MinReadable: 1, MaxReadable: 1, Notes: "native wire protocol"},
 		{Family: FamilyRepl, Magic: "NSRL", Current: 1, MinReadable: 1, MaxReadable: 1, Notes: "encrypted Raft command batch"},
 		{Family: FamilyIsolated, Magic: "NSQI", Current: 1, MinReadable: 1, MaxReadable: 1, Notes: "isolated-page quarantine sidecar"},
+		// Current is 1, not MaxReadable: a keystore is written as v2 only
+		// once an operator configures a recovery key, so the version this
+		// binary produces by default is still v1 and a database that never
+		// opted in stays readable by releases that predate v2.
+		{Family: FamilyKeystore, Magic: "NSKS", Current: 1, MinReadable: 1, MaxReadable: 2, Notes: "wrapped key sidecar; v2 adds the optional recovery-key wrap of the KEK"},
 	}
 }
 

@@ -9,11 +9,13 @@ A live install uses `nextsql setup --profile production` (Setup-mode GUI default
 | Limit | Value |
 |---|---|
 | Logical page | 16 KiB |
-| Packet / SQL text | 1 MiB |
-| Parameters | 256 |
+| Packet / SQL text | 64 MiB / 16 MiB (configurable within these ceilings) |
+| Parameters | 65,535 (configurable ceiling) |
+| Prepared statements / session | 64 default; 4,096 ceiling |
 | JSON depth / size | 32 / 1 MiB |
 | Vector dimension | 8192 dense / bit; 65535 `SPARSEVECTOR<N>` (finite elements) |
 | LINESTRING / POLYGON vertices | 256 |
+| GEOMETRY / GEOGRAPHY vertices / nesting / parts | 65,536 / 8 / 4,096 |
 | Collection nesting | 8; `ARRAY` elements `2²⁰` |
 | JOIN tables | 8 (`FROM` + up to seven `JOIN`s) |
 | Foreign keys per table | 16 |
@@ -28,16 +30,10 @@ A live install uses `nextsql setup --profile production` (Setup-mode GUI default
 
 ## Not in this version
 
-- Outer `JOIN` together with `SEARCH` or `NEAREST` (inner join is allowed when the rank column is on the `FROM` table)
-- IVF / IVF-PQ / `SPARSE` indexes on partitioned tables (partition-local HNSW is implemented)
-- Partial, expression, and JSON-path `UNIQUE` on partitioned tables; partitioned-table foreign keys
-- Searchable or deterministic field-level `ENCRYPTED CLIENT` (randomized `NSCE1.` plus Go/JS/PHP helpers, PITR, and HA coverage exist and stay labeled experimental)
-- `ARRAY_AGG` / `MAP_AGG` / `UNNEST` and collection subscript sugar
-- OIDC opaque-token introspection, JIT principal provisioning, and OCSP (the required broker, short-lived credential, mTLS, live-rotation, and X.509 CRL paths are implemented)
-- Multi-primary writes
-- Hosted HA, independently addressed backup/PITR/import/export per hosted database, hosted key rotation / crypto-shred, and registry disaster recovery / Raft (selectable routing, caps, suspend/resume, rename, and offline drop are implemented; `hosting_isolation` stays experimental)
+- General searchable field-level encryption (randomized `NSCE1.` and HKDF-separated RFC 5297 AES-SIV deterministic-equality `NSCE2.` are implemented across Go, JS/TS, Bun, and PHP drivers with key rotation, fuzz, PITR, and HA coverage)
+- Multi-primary writes (deployments strictly adhere to single-leader Raft consensus)
 
-Windows/macOS packaged Admin execution and a recovery-key Setup flow remain environment-blocked. Linux `.tar.gz` / `.run` / `.deb` / `.rpm` and silent/offline/upgrade/repair paths are live-verified.
+Windows/macOS packaged Admin execution remains environment-blocked. Linux `.tar.gz` / `.run` / `.deb` / `.rpm` and silent/offline/upgrade/repair paths are live-verified.
 
 ## Known measurement notes (0.0.1)
 

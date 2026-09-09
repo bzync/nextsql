@@ -16,7 +16,6 @@ require "nextsql"
 
 conn = NextSQL.connect(NextSQL::Config.new(
   address: "127.0.0.1:7210",
-  realm: "default",
   database: "default",
   user: "app",
   password: "s3cret",
@@ -39,6 +38,23 @@ conn = NextSQL.connect(NextSQL::Config.new(
 
 For `--require-client-key`, pass `key: client_root_32_bytes` (a binary
 `String`). Never put keys or passwords in a URL.
+
+## Native wire protocol
+
+The Ruby driver speaks NSQL v1 directly over a blocking `TCPSocket` wrapped by
+TLS 1.3 off loopback. It sends length-bounded Hello/Auth/Unlock frames, typed
+Query/Prepare/Execute parameters, streaming RowDesc/DataBatch results with
+FlowAck backpressure, Cancel on a separate authenticated connection,
+IdempotentQuery, SetReadConsistency, and NodeStatus. Server Error is always
+followed by Ready; the driver drains that Ready before raising
+`NextSQL::Error`, so a handled statement error does not desynchronize the next
+request. Frames, SQL text, parameters, prepared statements, and batches obey
+the limits documented in [Wire protocol](/docs/protocol).
+
+The driver does not emulate PostgreSQL or MySQL and exposes no compatibility
+protocol. `database` names the deployment database; `realm` is reserved and
+must remain empty. Field-encryption helpers are not yet present in Ruby, so an
+application must not bind plaintext to an `ENCRYPTED CLIENT` column.
 
 ## Types
 

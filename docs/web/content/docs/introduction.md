@@ -28,7 +28,7 @@ The write path for that row is the same WAL, MVCC, encryption, and crash recover
 
 | Binary | Role |
 |---|---|
-| `nextsql` | CLI: init, setup, lifecycle, exec, migrate, backup, restore, verify, export, import, diagnose, status, cluster, hosting, realm, database, audit, token, login |
+| `nextsql` | CLI: init, setup, lifecycle, exec, migrate, backup, restore, verify, export, import, diagnose, status, cluster, hosting, audit, token, login |
 | `nextsqld` | Server. Speaks NSQL v1 on `--listen` (default `127.0.0.1:7210`) |
 | `nextsql-bench` | Official measurements. Encryption, WAL, and fsync stay on |
 | `nextsql-auth-broker` | Optional OIDC token-exchange broker. `nextsqld` never talks to an IdP |
@@ -52,6 +52,6 @@ Correctness, durability, security, integrity, availability, predictable latency,
 
 1. [Install](/docs/install), [Docker](/docs/docker), and the [quick start](/docs/quick-start) get a local instance running.
 2. The SQL chapters cover the dialect, each data model, workflows, and transactions.
-3. Operate covers users, CLI, migrations, TLS, backup, export, HA, hosting, Admin, and benches.
+3. Operate covers users, CLI, migrations, TLS, backup, export, HA, Admin, and benches.
 4. Drivers speak NSQL v1 from Go, Node, Bun, PHP, Python, and Ruby.
 5. Internals document architecture, the wire protocol, and current limits.

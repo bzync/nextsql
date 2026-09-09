@@ -87,8 +87,8 @@ func TestValidateAndConvertQueryParams(t *testing.T) {
 func TestValidateReconnectRequest(t *testing.T) {
 	ok := []ReconnectRequest{
 		{Password: "pw"},
-		{Realm: "acme", Database: "prod", Password: "pw"},
-		{Realm: "r-1_2", Database: "d-1_2", Password: "pw"},
+		{Database: "prod", Password: "pw"},
+		{Database: "d-1_2", Password: "pw"},
 	}
 	for _, r := range ok {
 		if err := r.Validate(); err != nil {
@@ -96,8 +96,9 @@ func TestValidateReconnectRequest(t *testing.T) {
 		}
 	}
 	bad := []ReconnectRequest{
-		{Realm: "acme", Database: "prod"},                                   // no password
-		{Realm: "bad name", Password: "pw"},                                 // space
+		{Database: "prod"},                                                  // no password
+		{Realm: "acme", Password: "pw"},                                     // realm selection was removed
+		{Realm: "default", Password: "pw"},                                  // including the one realm that exists
 		{Database: "bad/name", Password: "pw"},                              // slash
 		{Realm: strings.Repeat("a", MaxConnNameBytes+1), Password: "pw"},    // over cap
 		{Database: strings.Repeat("a", MaxConnNameBytes+1), Password: "pw"}, // over cap

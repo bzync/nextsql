@@ -72,7 +72,7 @@ export function SiteFooter() {
       </div>
       <div className="border-t border-line">
         <div className="mx-auto flex max-w-6xl flex-col gap-1 px-5 py-4 font-mono text-[11px] text-faint sm:flex-row sm:justify-between">
-          <p>Not PostgreSQL · not a vector-store wrapper · NSQL v1</p>
+          <p>NSQL v1 · Built with Go.</p>
           <p>{site.module}</p>
         </div>
       </div>

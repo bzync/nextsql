@@ -15,6 +15,7 @@ export function ThemeToggle({ className = "" }: { className?: string }) {
     <RuiThemeToggle
       lightIcon={<SunIcon />}
       darkIcon={<MoonIcon />}
+      showLabel={false}
       lightLabel="Toggle theme"
       darkLabel="Toggle theme"
       className={`h-10 w-10 rounded-md border-transparent bg-transparent px-0 text-muted shadow-none hover:border-transparent hover:bg-bg-hover hover:text-foreground sm:h-9 sm:w-9 ${className}`}

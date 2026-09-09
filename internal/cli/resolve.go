@@ -30,9 +30,8 @@ const (
 	envDataDir          = "NEXTSQL_DATA_DIR"
 	envKeyFile          = "NEXTSQL_KEY_FILE"
 	envInstanceKey      = "NEXTSQL_INSTANCE_KEY_FILE"
-	envRealmName        = "NEXTSQL_REALM_NAME"
 	envBufferPages      = "NEXTSQL_BUFFER_PAGES"
-	envHostingConfirm   = "NEXTSQL_HOSTING_CONFIRM"
+	envRegistryConfirm  = "NEXTSQL_REGISTRY_CONFIRM"
 	envHostingManifest  = "NEXTSQL_HOSTING_MANIFEST_FILE"
 
 	defaultMigrationsDir = "./migrations"
@@ -59,10 +58,9 @@ type Settings struct {
 	DataDir         string
 	KeyFile         string
 	InstanceKeyFile string
-	Realm           string
 	BufferPages     int
-	HostingConfirm  bool
-	HostingManifest string
+	RegistryConfirm bool
+	HostingManifest string // legacy NEXTSQL_HOSTING_MANIFEST_FILE; resolved only so `nextsql init` can refuse it
 
 	NoEnv    bool
 	EnvFile  string
@@ -130,7 +128,6 @@ func Resolve(fs *flag.FlagSet, args []string) (Settings, error) {
 	s.DataDir = pickString(s.Explicit, fs, "data-dir", envDataDir, files, s.DataDir)
 	s.KeyFile = pickString(s.Explicit, fs, "key-file", envKeyFile, files, s.KeyFile)
 	s.InstanceKeyFile = pickString(s.Explicit, fs, "instance-key-file", envInstanceKey, files, s.InstanceKeyFile)
-	s.Realm = pickString(s.Explicit, fs, "realm", envRealmName, files, s.Realm)
 	s.Password = pickSecret(envDatabasePass, files)
 	if s.Password != "" {
 		s.inlinePasswordEnv = envDatabasePass
@@ -147,11 +144,11 @@ func Resolve(fs *flag.FlagSet, args []string) (Settings, error) {
 	}
 	s.BufferPages = pages
 
-	hostingConfirm, err := pickBool(s.Explicit, fs, "confirm", envHostingConfirm, files, s.HostingConfirm)
+	registryConfirm, err := pickBool(s.Explicit, fs, "confirm", envRegistryConfirm, files, s.RegistryConfirm)
 	if err != nil {
 		return Settings{}, err
 	}
-	s.HostingConfirm = hostingConfirm
+	s.RegistryConfirm = registryConfirm
 	s.HostingManifest = pickString(s.Explicit, fs, "hosting-manifest", envHostingManifest, files, s.HostingManifest)
 	for _, field := range []struct {
 		flagName string
@@ -159,9 +156,9 @@ func Resolve(fs *flag.FlagSet, args []string) (Settings, error) {
 	}{
 		{"addr", envAddr}, {"user", envDatabaseUser}, {"password-file", envDatabasePassFile},
 		{"server-user", envServerUser}, {"server-pass", envServerPass}, {"server-password-file", envServerPassFile},
-		{"database", envDatabase}, {"realm", envRealmName}, {"data-dir", envDataDir},
+		{"database", envDatabase}, {"data-dir", envDataDir},
 		{"key-file", envKeyFile}, {"instance-key-file", envInstanceKey},
-		{"buffer-pages", envBufferPages}, {"confirm", envHostingConfirm}, {"hosting-manifest", envHostingManifest},
+		{"buffer-pages", envBufferPages}, {"confirm", envRegistryConfirm}, {"hosting-manifest", envHostingManifest},
 	} {
 		s.Supplied[field.flagName] = supplied(s.Explicit, field.flagName, field.envKey, files)
 	}

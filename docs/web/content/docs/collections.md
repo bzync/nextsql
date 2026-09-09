@@ -57,8 +57,21 @@ FROM settings
 WHERE MAP_CONTAINS_KEY(flags, 'dark');
 ```
 
-## Not in this version
+## Aggregation, subscripts, and row expansion
 
-Implicit subscript sugar (`arr[1]`, `map['k']`), `ARRAY_AGG` / `MAP_AGG`, and `UNNEST` are deferred.
+`arr[i]` and `map[key]` are 1-based subscript sugar for `ELEMENT_AT`; chained
+subscripts are supported. `ARRAY_AGG(expr)` collects non-NULL values into an
+`ARRAY<T>`, and `MAP_AGG(key, value)` collects canonical key/value pairs.
+Empty aggregate groups return `NULL`; `MAP_AGG` rejects NULL or duplicate keys.
+
+`UNNEST(expr)` is a table-valued `FROM` source: an array produces one `value`
+column per element, while a map produces `key` and `value` columns. It supports
+an alias, explicit output-column names, and `WITH OFFSET`.
+
+```sql
+SELECT ARRAY_AGG(tag) FROM tags;
+SELECT key, value FROM UNNEST(MAP('dark', TRUE)) AS f(key, value);
+SELECT tags[1] FROM docs;
+```
 
 Engine note: [`docs/design-collections.md`](https://github.com/bzync/nextsql/blob/main/docs/design-collections.md).

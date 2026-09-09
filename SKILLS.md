@@ -76,6 +76,8 @@ A change is complete only when applicable items are satisfied:
 - tests pass;
 - race tests pass;
 - fuzz tests exist for new untrusted decoders/parsers;
+- a new durable I/O path is driven through the fault seam (`diskio.SetFaultForTest`, `tests/fault`): disk-full, short write, failed `fsync` and EIO, and it fails closed;
+- a change to a persistent format, catalog encoding, or recovery path keeps `make test-upgrade` green against every retained release fixture, and does not push an on-disk family past what a shipped release can read without an explicit, documented rollback break (`docs/storage-format.md`, "Retained release fixtures"). Never regenerate a committed fixture archive with current code to make it pass; if the rollback check fails because a family exists on disk but predates its own catalog entry, record it in `tests/upgrade`'s `preCatalogFamilies` with the window that release's *own source* enforced (cite it, e.g. `git show <tag>:path`) — never by widening the check to tolerate unknown families;
 - benchmarks exist when performance is part of the contract;
 - documentation is updated;
 - failure behavior is explicit and fail-closed;

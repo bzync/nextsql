@@ -301,3 +301,292 @@ func TestPartitionPruningAwareHybridCandidates(t *testing.T) {
 		t.Fatalf("unpruned hybrid should span all partitions: %+v", got.Rows)
 	}
 }
+
+func TestPartitionLocalIVFVectorIndex(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "nextsql.db")
+	keys := testKeys(t)
+	db, err := Create(path, keys, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := db.Session()
+	execOK(t, s, `CREATE TABLE pivf (
+		region STRING NOT NULL,
+		id STRING NOT NULL,
+		name STRING NOT NULL,
+		emb VECTOR<F32,3> NOT NULL,
+		PRIMARY KEY (region, id)
+	) PARTITION BY LIST (region) (
+		PARTITION americas VALUES IN ('us'),
+		PARTITION europe VALUES IN ('eu')
+	)`)
+	execOK(t, s, `INSERT INTO pivf (region, id, name, emb) VALUES
+		('us', '1', 'x', (1, 0, 0)),
+		('us', '2', 'y', (0, 1, 0)),
+		('eu', '3', 'z', (0, 0, 1)),
+		('eu', '4', 'w', (0.9, 0.1, 0))`)
+	execOK(t, s, `CREATE VECTOR INDEX ix_ivf ON pivf (emb) USING IVF WITH (LISTS = 2, PROBES = 2)`)
+
+	tab, ok := db.Cat.Get("pivf")
+	if !ok || len(tab.Indexes) != 1 || !tab.Indexes[0].Vector || tab.Indexes[0].Meta != 0 {
+		t.Fatalf("logical vector index metadata: %+v", tab)
+	}
+	for _, part := range tab.Partitioning.Partitions {
+		if len(part.Indexes) != 1 || part.Indexes[0].Meta == 0 {
+			t.Fatalf("partition-local IVF root missing: %+v", part)
+		}
+	}
+
+	// Search top-2 across partitions.
+	got := execOK(t, s, `SELECT region, id FROM pivf NEAREST emb TO (1, 0, 0) LIMIT 2`)
+	if len(got.Rows) != 2 ||
+		got.Rows[0][0].Str != "us" || got.Rows[0][1].Str != "1" ||
+		got.Rows[1][0].Str != "eu" || got.Rows[1][1].Str != "4" {
+		t.Fatalf("cross-partition IVF NEAREST top-2: %+v", got.Rows)
+	}
+
+	// Insert maintains the partition-local IVF store.
+	execOK(t, s, `INSERT INTO pivf (region, id, name, emb) VALUES ('eu', '5', 'q', (0.98, 0.02, 0))`)
+	got = execOK(t, s, `SELECT region, id FROM pivf NEAREST emb TO (0.97, 0.03, 0) LIMIT 1`)
+	if len(got.Rows) != 1 || got.Rows[0][0].Str != "eu" || got.Rows[0][1].Str != "5" {
+		t.Fatalf("insert IVF maintenance: %+v", got.Rows)
+	}
+
+	// Cross-partition move.
+	execOK(t, s, `UPDATE pivf SET region = 'eu' WHERE region = 'us' AND id = '2'`)
+	got = execOK(t, s, `SELECT region, id FROM pivf NEAREST emb TO (0, 1, 0) LIMIT 1`)
+	if len(got.Rows) != 1 || got.Rows[0][0].Str != "eu" || got.Rows[0][1].Str != "2" {
+		t.Fatalf("cross-partition IVF move: %+v", got.Rows)
+	}
+
+	// Delete.
+	execOK(t, s, `DELETE FROM pivf WHERE region = 'eu' AND id = '3'`)
+	got = execOK(t, s, `SELECT region, id FROM pivf NEAREST emb TO (0, 0, 1) LIMIT 1`)
+	if len(got.Rows) != 1 || (got.Rows[0][0].Str == "eu" && got.Rows[0][1].Str == "3") {
+		t.Fatalf("delete IVF maintenance: %+v", got.Rows)
+	}
+
+	// ADD PARTITION then insert and search.
+	execOK(t, s, `ALTER TABLE pivf ADD PARTITION asia VALUES IN ('ap')`)
+	execOK(t, s, `INSERT INTO pivf (region, id, name, emb) VALUES ('ap', '6', 'c', (0.5, 0.5, 0.5))`)
+	got = execOK(t, s, `SELECT region, id FROM pivf NEAREST emb TO (0.5, 0.5, 0.5) LIMIT 1`)
+	if len(got.Rows) != 1 || got.Rows[0][0].Str != "ap" || got.Rows[0][1].Str != "6" {
+		t.Fatalf("IVF index on added partition: %+v", got.Rows)
+	}
+
+	// Rebuild index.
+	execOK(t, s, `REBUILD INDEX ix_ivf`)
+	got = execOK(t, s, `SELECT region, id FROM pivf NEAREST emb TO (1, 0, 0) LIMIT 1`)
+	if len(got.Rows) != 1 || got.Rows[0][0].Str != "us" || got.Rows[0][1].Str != "1" {
+		t.Fatalf("rebuilt partition IVF index: %+v", got.Rows)
+	}
+
+	// Restart.
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err = Open(path, keys, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	s = db.Session()
+	got = execOK(t, s, `SELECT region, id FROM pivf NEAREST emb TO (0.5, 0.5, 0.5) LIMIT 1`)
+	if len(got.Rows) != 1 || got.Rows[0][0].Str != "ap" || got.Rows[0][1].Str != "6" {
+		t.Fatalf("reopened partition IVF search: %+v", got.Rows)
+	}
+}
+
+func TestPartitionLocalIVFPQVectorIndex(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "nextsql.db")
+	keys := testKeys(t)
+	db, err := Create(path, keys, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := db.Session()
+	execOK(t, s, `CREATE TABLE pipq (
+		region STRING NOT NULL,
+		id STRING NOT NULL,
+		name STRING NOT NULL,
+		emb VECTOR<F32,4> NOT NULL,
+		PRIMARY KEY (region, id)
+	) PARTITION BY LIST (region) (
+		PARTITION americas VALUES IN ('us'),
+		PARTITION europe VALUES IN ('eu')
+	)`)
+	execOK(t, s, `INSERT INTO pipq (region, id, name, emb) VALUES
+		('us', '1', 'x', (1, 0, 0, 0)),
+		('us', '2', 'y', (0, 1, 0, 0)),
+		('eu', '3', 'z', (0, 0, 1, 0)),
+		('eu', '4', 'w', (0.9, 0.1, 0, 0))`)
+	execOK(t, s, `CREATE VECTOR INDEX ix_ipq ON pipq (emb) USING IVFPQ WITH (LISTS = 2, PROBES = 2, SUBSPACES = 2)`)
+
+	tab, ok := db.Cat.Get("pipq")
+	if !ok || len(tab.Indexes) != 1 || !tab.Indexes[0].Vector || tab.Indexes[0].Meta != 0 {
+		t.Fatalf("logical vector index metadata: %+v", tab)
+	}
+	for _, part := range tab.Partitioning.Partitions {
+		if len(part.Indexes) != 1 || part.Indexes[0].Meta == 0 {
+			t.Fatalf("partition-local IVFPQ root missing: %+v", part)
+		}
+	}
+
+	// Search top-2 across partitions.
+	got := execOK(t, s, `SELECT region, id FROM pipq NEAREST emb TO (1, 0, 0, 0) LIMIT 2`)
+	if len(got.Rows) != 2 ||
+		got.Rows[0][0].Str != "us" || got.Rows[0][1].Str != "1" ||
+		got.Rows[1][0].Str != "eu" || got.Rows[1][1].Str != "4" {
+		t.Fatalf("cross-partition IVFPQ NEAREST top-2: %+v", got.Rows)
+	}
+
+	// Insert maintains the partition-local IVFPQ store.
+	execOK(t, s, `INSERT INTO pipq (region, id, name, emb) VALUES ('eu', '5', 'q', (0.98, 0.02, 0, 0))`)
+	got = execOK(t, s, `SELECT region, id FROM pipq NEAREST emb TO (0.97, 0.03, 0, 0) LIMIT 1`)
+	if len(got.Rows) != 1 || got.Rows[0][0].Str != "eu" || got.Rows[0][1].Str != "5" {
+		t.Fatalf("insert IVFPQ maintenance: %+v", got.Rows)
+	}
+
+	// Cross-partition move.
+	execOK(t, s, `UPDATE pipq SET region = 'eu' WHERE region = 'us' AND id = '2'`)
+	got = execOK(t, s, `SELECT region, id FROM pipq NEAREST emb TO (0, 1, 0, 0) LIMIT 1`)
+	if len(got.Rows) != 1 || got.Rows[0][0].Str != "eu" || got.Rows[0][1].Str != "2" {
+		t.Fatalf("cross-partition IVFPQ move: %+v", got.Rows)
+	}
+
+	// Delete.
+	execOK(t, s, `DELETE FROM pipq WHERE region = 'eu' AND id = '3'`)
+	got = execOK(t, s, `SELECT region, id FROM pipq NEAREST emb TO (0, 0, 1, 0) LIMIT 1`)
+	if len(got.Rows) != 1 || (got.Rows[0][0].Str == "eu" && got.Rows[0][1].Str == "3") {
+		t.Fatalf("delete IVFPQ maintenance: %+v", got.Rows)
+	}
+
+	// ADD PARTITION then insert and search.
+	execOK(t, s, `ALTER TABLE pipq ADD PARTITION asia VALUES IN ('ap')`)
+	execOK(t, s, `INSERT INTO pipq (region, id, name, emb) VALUES ('ap', '6', 'c', (0.5, 0.5, 0.5, 0.5))`)
+	got = execOK(t, s, `SELECT region, id FROM pipq NEAREST emb TO (0.5, 0.5, 0.5, 0.5) LIMIT 1`)
+	if len(got.Rows) != 1 || got.Rows[0][0].Str != "ap" || got.Rows[0][1].Str != "6" {
+		t.Fatalf("IVFPQ index on added partition: %+v", got.Rows)
+	}
+
+	// Rebuild index.
+	execOK(t, s, `REBUILD INDEX ix_ipq`)
+	got = execOK(t, s, `SELECT region, id FROM pipq NEAREST emb TO (1, 0, 0, 0) LIMIT 1`)
+	if len(got.Rows) != 1 || got.Rows[0][0].Str != "us" || got.Rows[0][1].Str != "1" {
+		t.Fatalf("rebuilt partition IVFPQ index: %+v", got.Rows)
+	}
+
+	// Restart.
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err = Open(path, keys, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	s = db.Session()
+	got = execOK(t, s, `SELECT region, id FROM pipq NEAREST emb TO (0.5, 0.5, 0.5, 0.5) LIMIT 1`)
+	if len(got.Rows) != 1 || got.Rows[0][0].Str != "ap" || got.Rows[0][1].Str != "6" {
+		t.Fatalf("reopened partition IVFPQ search: %+v", got.Rows)
+	}
+}
+
+func TestPartitionLocalSparseVectorIndex(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "nextsql.db")
+	keys := testKeys(t)
+	db, err := Create(path, keys, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := db.Session()
+	execOK(t, s, `CREATE TABLE psp (
+		region STRING NOT NULL,
+		id STRING NOT NULL,
+		name STRING NOT NULL,
+		emb SPARSEVECTOR<8> NOT NULL,
+		PRIMARY KEY (region, id)
+	) PARTITION BY LIST (region) (
+		PARTITION americas VALUES IN ('us'),
+		PARTITION europe VALUES IN ('eu')
+	)`)
+	execOK(t, s, `INSERT INTO psp (region, id, name, emb) VALUES
+		('us', '1', 'x', (1, 0, 0, 0, 0, 0, 0, 0)),
+		('us', '2', 'y', (0, 1, 0, 0, 0, 0, 0, 0)),
+		('eu', '3', 'z', (0, 0, 1, 0, 0, 0, 0, 0)),
+		('eu', '4', 'w', (0.9, 0.1, 0, 0, 0, 0, 0, 0))`)
+	execOK(t, s, `CREATE VECTOR INDEX ix_sp ON psp (emb) USING SPARSE`)
+
+	tab, ok := db.Cat.Get("psp")
+	if !ok || len(tab.Indexes) != 1 || !tab.Indexes[0].Vector || tab.Indexes[0].Meta != 0 {
+		t.Fatalf("logical vector index metadata: %+v", tab)
+	}
+	for _, part := range tab.Partitioning.Partitions {
+		if len(part.Indexes) != 1 || part.Indexes[0].Meta == 0 {
+			t.Fatalf("partition-local SPARSE root missing: %+v", part)
+		}
+	}
+
+	// Search top-2 across partitions.
+	got := execOK(t, s, `SELECT region, id FROM psp NEAREST emb TO (1, 0, 0, 0, 0, 0, 0, 0) LIMIT 2`)
+	if len(got.Rows) != 2 ||
+		got.Rows[0][0].Str != "us" || got.Rows[0][1].Str != "1" ||
+		got.Rows[1][0].Str != "eu" || got.Rows[1][1].Str != "4" {
+		t.Fatalf("cross-partition SPARSE NEAREST top-2: %+v", got.Rows)
+	}
+
+	// Insert maintains the partition-local SPARSE store.
+	execOK(t, s, `INSERT INTO psp (region, id, name, emb) VALUES ('eu', '5', 'q', (0.98, 0.02, 0, 0, 0, 0, 0, 0))`)
+	got = execOK(t, s, `SELECT region, id FROM psp NEAREST emb TO (0.97, 0.03, 0, 0, 0, 0, 0, 0) LIMIT 1`)
+	if len(got.Rows) != 1 || got.Rows[0][0].Str != "eu" || got.Rows[0][1].Str != "5" {
+		t.Fatalf("insert SPARSE maintenance: %+v", got.Rows)
+	}
+
+	// Cross-partition move.
+	execOK(t, s, `UPDATE psp SET region = 'eu' WHERE region = 'us' AND id = '2'`)
+	got = execOK(t, s, `SELECT region, id FROM psp NEAREST emb TO (0, 1, 0, 0, 0, 0, 0, 0) LIMIT 1`)
+	if len(got.Rows) != 1 || got.Rows[0][0].Str != "eu" || got.Rows[0][1].Str != "2" {
+		t.Fatalf("cross-partition SPARSE move: %+v", got.Rows)
+	}
+
+	// Delete.
+	execOK(t, s, `DELETE FROM psp WHERE region = 'eu' AND id = '3'`)
+	got = execOK(t, s, `SELECT region, id FROM psp NEAREST emb TO (0, 0, 1, 0, 0, 0, 0, 0) LIMIT 1`)
+	if len(got.Rows) > 0 && got.Rows[0][0].Str == "eu" && got.Rows[0][1].Str == "3" {
+		t.Fatalf("delete SPARSE maintenance still returned deleted row: %+v", got.Rows)
+	}
+
+	// ADD PARTITION then insert and search.
+	execOK(t, s, `ALTER TABLE psp ADD PARTITION asia VALUES IN ('ap')`)
+	execOK(t, s, `INSERT INTO psp (region, id, name, emb) VALUES ('ap', '6', 'c', (0, 0, 0, 0, 0, 1, 0, 0))`)
+	got = execOK(t, s, `SELECT region, id FROM psp NEAREST emb TO (0, 0, 0, 0, 0, 1, 0, 0) LIMIT 1`)
+	if len(got.Rows) != 1 || got.Rows[0][0].Str != "ap" || got.Rows[0][1].Str != "6" {
+		t.Fatalf("SPARSE index on added partition: %+v", got.Rows)
+	}
+
+	// Rebuild index.
+	execOK(t, s, `REBUILD INDEX ix_sp`)
+	got = execOK(t, s, `SELECT region, id FROM psp NEAREST emb TO (1, 0, 0, 0, 0, 0, 0, 0) LIMIT 1`)
+	if len(got.Rows) != 1 || got.Rows[0][0].Str != "us" || got.Rows[0][1].Str != "1" {
+		t.Fatalf("rebuilt partition SPARSE index: %+v", got.Rows)
+	}
+
+	// Restart.
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err = Open(path, keys, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	s = db.Session()
+	got = execOK(t, s, `SELECT region, id FROM psp NEAREST emb TO (0, 0, 0, 0, 0, 1, 0, 0) LIMIT 1`)
+	if len(got.Rows) != 1 || got.Rows[0][0].Str != "ap" || got.Rows[0][1].Str != "6" {
+		t.Fatalf("reopened partition SPARSE search: %+v", got.Rows)
+	}
+}
+

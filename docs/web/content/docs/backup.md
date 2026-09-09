@@ -2,7 +2,7 @@
 
 A successful write is not a valid backup. `nextsql backup` publishes the destination only after hash checks **and** a restore-test open.
 
-`nextsql backup` / `restore` take `--data-dir`, not `--realm` / `--database`. `BACKUP DATABASE` on a running server is wired only for the legacy/non-hosted engine (`backup_dir` in `nextsql.conf`); a connection that opened a hosted managed database does not get that callback. Independently addressed backup/PITR of a named hosted database is not implemented. See [Hosting](/docs/hosting).
+`nextsql backup` / `restore` take `--data-dir`: a deployment holds exactly one database, so there is nothing else to address. `BACKUP DATABASE` on a running server uses `backup_dir` in `nextsql.conf`.
 
 ```bash
 # physical backup (pages, WAL, UNDO, users, ACL — still ciphertext)

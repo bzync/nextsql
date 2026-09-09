@@ -1,0 +1,60 @@
+name: Production evidence gate
+
+# The release profile intentionally runs on a hosted Linux disk, never tmpfs.
+# It emits a retained log which includes the scratch filesystem type, so a
+# green check is usable durability evidence rather than an opaque CI result.
+on:
+  pull_request: {}
+  push:
+    branches: [master]
+    tags: ["v*"]
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  production-evidence:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      NEXTSQL_REQUIRE_DURABLE_FS: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Select evidence profile
+        id: profile
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "name=pr" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event_name }}" = "schedule" ]; then
+            echo "name=nightly" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=production" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run ${{ steps.profile.outputs.name }} evidence profile
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p artifacts
+          make "test-${{ steps.profile.outputs.name }}" 2>&1 | tee artifacts/test-${{ steps.profile.outputs.name }}.log
+
+      - name: Retain evidence log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nextsql-${{ steps.profile.outputs.name }}-evidence-${{ github.run_id }}
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 30

@@ -108,7 +108,7 @@ A data directory is **not** a single file. After `nextsql init` and the first se
 
 DATA-DIR/
 
-  nextsql.instance      encrypted deployment/default realm/database registry
+  nextsql.instance      encrypted deployment registry (its one database)
 
   nextsql.instance.keys wrapped registry keys — never the registry root
 
@@ -186,13 +186,25 @@ printf 'secret\n' > /tmp/nextsql.pw && chmod 600 /tmp/nextsql.pw
 
 nextsql init --data-dir /var/lib/nextsql --key-file /etc/nextsql/root.key \\
 
-  --user app --password-file /tmp/nextsql.pw
+  --database production --user app --password-file /tmp/nextsql.pw
 
 sudo systemctl enable --now nextsql          # Linux
 
 # Windows: Start-Service NextSQL
 
 ```
+
+**`--database` is optional, and it decides whether a database exists.**
+Omitted, `nextsql init` provisions the deployment only — the root unlock key
+and any administrator — creating no `nextsql.db`, no keystore and no
+deployment registry; nothing is invented on your behalf, so a database named
+`default` appears only if you ask for that name. Naming one on a later run of
+the same command completes the deployment, and the administrator created
+beforehand carries over. `nextsqld` refuses to start in between and names that
+command; `nextsql lifecycle detect` reports the state as `deployment-only`.
+`nextsql setup` follows the same rule, and both its production profile and
+`--recovery-key-out` require `--database` (a deployment with no database
+cannot serve, and a recovery key has no keystore to seal).
 
 Layout, silent flags, and user-local Linux installs: [`packaging/README.md`](packaging/README.md).
 
@@ -1192,16 +1204,16 @@ non-`ADMIN` access to a legacy table containing the old `tenant_id` marker
 fails closed so an administrator can migrate each former tenant into a separate
 hosted database. See [`docs/security.md`](docs/security.md).
 
-`nextsql hosting migrate-tenant` is the offline path that copies one historical
+`nextsql registry migrate-tenant` is the offline path that copies one historical
 tenant out of a legacy `tenant_id` / `PARTITION BY TENANT` database into a freshly
 provisioned isolated deployment:
 
 ```text
-nextsql hosting migrate-tenant
+nextsql registry migrate-tenant
     --source-data-dir DIR --source-key-file FILE
     --tenant VALUE
     --data-dir DIR --key-file FILE [--instance-key-file FILE]
-    [--realm NAME] [--database NAME] [--batch-rows N] [--buffer-pages N]
+    [--database NAME] [--batch-rows N] [--buffer-pages N]
     --confirm
 ```
 
@@ -1215,72 +1227,23 @@ re-verifies without touching data. The legacy tenant column is renamed to
 partitioning, foreign keys to unmigrated tables, and a pre-existing
 `legacy_tenant_id` column all fail closed.
 
-### Storage caps
+### Storage cap
 
-The deployment/hosting administrator records durable storage caps in the
-encrypted registry:
+The deployment's data-file growth cap is `storage_cap_bytes` in
+`nextsql.conf` — a deployment serves exactly one database, so there is no
+realm or per-database cap command. A cap recorded in the registry by an
+earlier release is still honored at open.
 
-```bash
-# realm-wide cap (sum of every database in the realm)
-nextsql hosting set-realm-cap --data-dir DIR --key-file FILE \
-    --realm customer-a --cap-bytes 53687091200 --confirm
+**Enforcement.** Once the data file reaches the ceiling, any statement that
+needs a new page (`INSERT`, a row-splitting `UPDATE`, index growth) fails with
+`storage cap exceeded`; `DELETE`, `ROLLBACK`, and in-place `UPDATE` keep
+working, and freeing space (then dead-version cleanup) lets inserts resume. The
+cap covers the data file only, not WAL/UNDO. It is applied at open, so a change
+takes effect on restart.
 
-# per-database cap
-nextsql hosting set-database-cap --data-dir DIR --key-file FILE \
-    --realm customer-a --database production --cap-bytes 10737418240 --confirm
-
-# inspect
-nextsql hosting show --data-dir DIR --key-file FILE
-```
-
-`--cap-bytes 0` clears a cap (no limit). Setting a cap **overwrites** the
-previous value; setting the same value is a no-op. A per-database cap may not
-exceed a non-zero realm cap, and a realm cap may not be lowered below a
-per-database cap already set in the realm. The registry root key is
-`KEY-FILE.instance` unless `--instance-key-file` overrides it.
-
-**Enforcement.** `nextsqld` applies the smaller non-zero of the realm and
-database cap to the data file at start. Once the file reaches the ceiling, any
-statement that needs a new page (`INSERT`, a row-splitting `UPDATE`, index
-growth) fails with `storage cap exceeded`; `DELETE`, `ROLLBACK`, and in-place
-`UPDATE` keep working, and freeing space (then dead-version cleanup) lets
-inserts resume. The cap covers the data file only, not WAL/UNDO.
-
-**Updating a cap requires a restart.** `set-realm-cap` / `set-database-cap` /
-`set-realm-root` take the exclusive data-directory lock, so a running `nextsqld`
-blocks them (`unavailable`). Stop the server, run the command, start it again —
-the new ceiling is applied at open. Live cap changes without a restart are a
-follow-on.
-
-#### Realm-root delegation
-
-The administrator can delegate **per-database** cap management for one realm to a
-realm-root secret holder. The realm root can then adjust its own databases' caps
-(bounded by the realm cap) but has no path to the realm cap or any other realm.
-
-```bash
-# admin: delegate realm-root cap management (secret file >= 16 bytes)
-nextsql hosting set-realm-root --data-dir DIR --key-file FILE \
-    --realm customer-a --secret-file /run/keys/customer-a.realmroot --confirm
-
-# realm root: set one of its databases' caps, authorising with the secret
-nextsql hosting set-database-cap --data-dir DIR --key-file FILE \
-    --realm customer-a --database production \
-    --realm-secret-file /run/keys/customer-a.realmroot \
-    --cap-bytes 8589934592 --confirm
-
-# admin: revoke the delegation
-nextsql hosting set-realm-root --data-dir DIR --key-file FILE \
-    --realm customer-a --clear --confirm
-```
-
-The secret is stored only as a SHA-256 hash in the registry. Offline the CLI
-still opens the registry with the deployment root; the realm-root secret is the
-authorisation seam a future server/reseller control path uses to let a realm
-owner manage its own quotas without deployment-level access. Reseller tiers:
-**Daemon** = a whole standalone `nextsqld`; **Realm** = one `nextsql hosting`
-realm (many databases, a realm-root secret, no registry root); **Nano** = a
-single database, connection only (its own SQL users, no realm/registry access).
+**Daemon** = a whole standalone `nextsqld` (one deployment, one database);
+**Nano** = connection-only access to that database (its own SQL users, no
+registry access).
 
 ---
 
@@ -1290,47 +1253,31 @@ single database, connection only (its own SQL users, no realm/registry access).
 
 nextsql init     --data-dir DIR --key-file FILE [--instance-key-file FILE]
 
-                 [--realm NAME --database NAME] [--user NAME --password-file FILE]
+                 [--database NAME] [--user NAME --password-file FILE]
 
                  [--buffer-pages N]
 
                  [--env-file PATH | --no-env]
 
-nextsql hosting  adopt --data-dir DIR --key-file FILE [--instance-key-file FILE]
+nextsql registry adopt --data-dir DIR --key-file FILE [--instance-key-file FILE]
 
-                 [--realm NAME --database NAME] --confirm
+                 [--database NAME] --confirm
 
                  [--env-file PATH | --no-env]
 
-nextsql hosting  migrate-tenant --source-data-dir DIR --source-key-file FILE
+nextsql registry migrate-tenant --source-data-dir DIR --source-key-file FILE
 
                  --tenant VALUE --data-dir DIR --key-file FILE
 
-                 [--instance-key-file FILE] [--realm NAME] [--database NAME]
+                 [--instance-key-file FILE] [--database NAME]
 
                  [--batch-rows N] [--buffer-pages N] --confirm
 
-nextsql hosting  set-realm-cap --data-dir DIR --key-file FILE
-
-                 [--instance-key-file FILE] --realm NAME --cap-bytes N --confirm
-
-nextsql hosting  set-realm-root --data-dir DIR --key-file FILE
-
-                 [--instance-key-file FILE] --realm NAME
-
-                 (--secret-file FILE | --clear) --confirm
-
-nextsql hosting  set-database-cap --data-dir DIR --key-file FILE
-
-                 [--instance-key-file FILE] --realm NAME --database NAME
-
-                 [--realm-secret-file FILE] --cap-bytes N --confirm
-
-nextsql hosting  show --data-dir DIR --key-file FILE [--instance-key-file FILE]
+nextsql registry show --data-dir DIR [--instance-key-file FILE]
 
 nextsql login    --idp NAME [--addr HOST:PORT] [--idp-config FILE]
 
-                 [--database NAME] [--realm NAME] [--no-browser] [--timeout DURATION]
+                 [--database NAME] [--no-browser] [--timeout DURATION]
 
 nextsql logout   (--idp NAME --addr HOST:PORT | --all)
 
@@ -1388,6 +1335,20 @@ nextsql cluster drain [--timeout-ms N] [--addr HOST:PORT] [--user NAME] [--passw
 
                  [--database NAME] [--tls-ca FILE | --insecure] [--env-file PATH | --no-env]
 
+nextsql key      status --data-dir DIR [--json]
+
+                 add-recovery --data-dir DIR --key-file FILE --recovery-key-out FILE
+                      [--keystore database|instance] [--replace]
+
+                 verify-recovery --data-dir DIR --recovery-key FILE
+                      [--keystore database|instance]
+
+                 remove-recovery --data-dir DIR --key-file FILE --confirm
+                      [--keystore database|instance]
+
+                 recover --data-dir DIR --recovery-key FILE --key-file-out FILE --confirm
+                      [--keystore database|instance]
+
 nextsql token    keygen --keyset FILE
 
                  rotate --keyset FILE | retire --keyset FILE --key-id N
@@ -1396,7 +1357,7 @@ nextsql token    keygen --keyset FILE
 
                  mint --keyset FILE --principal NAME [--audience S] [--database S]
 
-                      [--realm S] [--role NAME ...] [--ttl DUR] [--not-before RFC3339]
+                      [--role NAME ...] [--ttl DUR] [--not-before RFC3339]
 
                  revoke --revocations FILE (--token-id HEX | --principal NAME [--before RFC3339])
 
@@ -1541,7 +1502,7 @@ empty result is denied. Optional JIT provisioning remains off and unimplemented.
 
 ### Hosting dotenv configuration
 
-`nextsql init`, `nextsql hosting adopt`, and `nextsqld` support process env,
+`nextsql init`, `nextsql registry adopt`, and `nextsqld` support process env,
 `.env.local`, `.env`, `--env-file PATH`, and `--no-env`. Priority is explicit
 flags > non-empty process env > `.env.local` > `.env`; for `nextsqld`, those
 sources also override `--config` field values.
@@ -1556,7 +1517,6 @@ sources also override `--config` field values.
 
 | `NEXTSQL_INSTANCE_KEY_FILE` | Deployment registry root **file path**, never key bytes |
 
-| `NEXTSQL_REALM_NAME` | Realm name created/adopted by local hosting commands |
 
 | `NEXTSQL_DATABASE` | Logical name created/adopted and client Hello database |
 
@@ -1568,7 +1528,7 @@ sources also override `--config` field values.
 
 | `NEXTSQL_SERVER_PASS` | Inline server/bootstrap password; automation fallback only |
 
-| `NEXTSQL_HOSTING_CONFIRM` | `true` for non-interactive explicit adoption |
+| `NEXTSQL_REGISTRY_CONFIRM` | `true` for non-interactive explicit adoption |
 
 | `NEXTSQL_ADDR` | Client address; also the `nextsqld` listen address |
 
@@ -1609,9 +1569,8 @@ Priority, highest wins: explicit flags (including empty strings) > non-empty pro
 
 | `NEXTSQL_IDP_CONFIG` | OIDC client profile file | user config dir `nextsql/config.toml` |
 
-| `NEXTSQL_REALM_NAME` | Hello realm for hosted routing | empty (server default) |
 
-| `NEXTSQL_DATABASE` | Hello database; routed within the selected/default realm | empty (server default) |
+| `NEXTSQL_DATABASE` | Hello database name; a deployment serves exactly one | empty (server default) |
 
 | `NEXTSQL_TLS_CA` | PEM CA / server cert | none |
 
@@ -2014,6 +1973,8 @@ nextsqld --data-dir DIR --key-file FILE [--instance-key-file FILE]
 
          [--node-id ID --raft-bind ADDR --raft-join id=addr,... [--raft-bootstrap]]
 
+         [--raft-heartbeat-ms N] [--raft-election-ms N] [--raft-leader-lease-ms N] [--raft-commit-timeout-ms N]
+
 ```
 
 `--data-dir` is required (flag or config). `--key-file` is required unless `--require-client-key` is set.
@@ -2084,6 +2045,19 @@ raft_join=
 
 raft_bootstrap=false
 
+# Raft intervals in ms; 0 (the default) leaves the built-in value.
+# raft_leader_lease_ms must not exceed raft_heartbeat_ms, and
+# raft_election_ms must be at least raft_heartbeat_ms. Raising
+# raft_heartbeat_ms also widens the follower-read freshness window,
+# which is five heartbeats. See docs/ha.md.
+raft_heartbeat_ms=0
+
+raft_election_ms=0
+
+raft_leader_lease_ms=0
+
+raft_commit_timeout_ms=0
+
 ```
 
 Command-line flags override the file.
@@ -2096,7 +2070,7 @@ Defaults: 32 in-flight, 128 queued, 5 s wait.
 
 Per-query budgets (defaults): 64 MiB memory, 256 MiB spill, 1 GiB I/O, 30 s, 1 000 000 result rows / 64 MiB result bytes. Exceeding a budget fails with `exhausted`. Worker goroutines are bounded (`min(GOMAXPROCS, 8)` per query through a process pool).
 
-Wire defaults: 1 MiB packet, 1 MiB SQL, 256 parameters, 64 prepared statements per session, 128 concurrent sessions, 60 s idle. `max_connections` and `idle_timeout_ms` override the session cap and idle deadline; `max_connections_per_user` (0 = unlimited) additionally caps concurrent authenticated connections per user name, rejecting an over-limit connection after authentication with `exhausted`. All three are node-local, not cluster-synchronized.
+Wire defaults: 64 MiB frame, 16 MiB SQL text, 65,535 parameters, 64 prepared statements per session, 64 MiB result bytes, 128 concurrent sessions, and 60 s idle. `max_frame_bytes`, `max_statement_bytes`, `max_parameters`, `max_prepared_statements`, and `max_result_bytes` are independently configurable within absolute ceilings. SQL text may not exceed its enclosing frame; result limits fail with `exhausted`, never silent truncation. `max_connections` and `idle_timeout_ms` override the session cap and idle deadline; `max_connections_per_user` (0 = unlimited) additionally caps concurrent authenticated connections per user name, rejecting an over-limit connection after authentication with `exhausted`. All three are node-local, not cluster-synchronized. See `docs/limits.md` for the complete catalog.
 
 ### Graceful shutdown
 
@@ -2492,11 +2466,12 @@ Drivers:
 
 - PHP: `'key' => $clientRoot` (32-byte string).
 
-Field-level `ENCRYPTED CLIENT` columns are **experimental**. The randomized
-`NSCE1.` SQL/catalog/server path, helpers for Go, Node.js/TypeScript, Bun,
-and PHP, PITR, replication/failover, and durable key-rotation/revocation
-(`FileFieldKeyring`) are all implemented and tested; formal production gating
-awaits the phase-wide P25 exit gate. See
+Field-level `ENCRYPTED CLIENT` is production-gated. Randomized `NSCE1.` and
+explicit deterministic-equality `NSCE2.` SQL/catalog/server paths, helpers for
+Go, Node.js/TypeScript, Bun, and PHP, fuzz, PITR, replication/failover, and
+durable key-rotation/revocation (`FileFieldKeyring`) are implemented and
+tested. Deterministic mode leaks equality and frequency; general searchable
+encryption is not supported. See
 [`docs/client-encryption.md`](docs/client-encryption.md).
 
 ### Tamper-evident audit chain
@@ -2878,9 +2853,11 @@ go test ./tests/integration ./tests/crash ./tests/ha
 
 | Logical page | 16 KiB |
 
-| Packet / SQL text | 1 MiB |
+| Packet / SQL text | 64 MiB / 16 MiB (configurable within these ceilings) |
 
-| Parameters | 256 |
+| Parameters | 65,535 (configurable ceiling) |
+
+| Prepared statements / session | 64 default; 4,096 ceiling |
 
 | JSON depth / size | 32 / 1 MiB |
 
@@ -2889,6 +2866,8 @@ go test ./tests/integration ./tests/crash ./tests/ha
 | Collection nesting / length | depth 8 / 1,048,576 elements |
 
 | LINESTRING / POLYGON vertices | 256 |
+
+| GEOMETRY / GEOGRAPHY vertices / nesting / parts | 65,536 / 8 / 4,096 |
 
 | JOIN tables | 8 (`FROM` + up to seven `JOIN`s) |
 
@@ -3000,8 +2979,8 @@ the database; some tables layer RBAC filtering on top.
 Catalog/storage tables (always visible, or filtered to tables you can
 `SELECT`): `capabilities`, `tables`, `columns`, `indexes`, `table_stats`,
 `index_stats`, `partitions`, `storage`, `replication` (alias `raft`),
-`replica_health`, `workflows`, `tasks`, `resource_groups`, `realms`,
-`databases`, and `quotas`.
+`replica_health`, `workflows`, `tasks`, `resource_groups`, `databases`, and
+`quotas`.
 
 Live, node-local, in-memory tables — cleared on restart, not replicated, one
 per `nextsqld` process; a non-admin sees only their own rows:
@@ -3029,7 +3008,7 @@ for filtering, ordering, or pagination. Full reference:
 Additional admin-only operational tables back the completed Manager MVP:
 `system.users`, `roles`, `grants`, `tls`, `key_versions`, `audit_verify`,
 `audit_log`, `config`, `metrics`, `server_log`, and `backups`. The current
-column-contract capability is `system_schema_v3`. Process-level sources such
+column-contract capability is `system_schema_v4`. Process-level sources such
 as TLS/config/log/metrics/backups are still attached only to the primary DB in
 multi-database hosting mode; a secondary manager-opened database may therefore
 return an empty/not-attached view for those process-wide sources.

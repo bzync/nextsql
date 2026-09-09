@@ -45,17 +45,31 @@ Only **one** node bootstraps. The other two use the same `--raft-join` list with
 # has_leader true
 ```
 
+## Raft timings
+
+The four Raft intervals are tunable, for an operator on a slower link or a
+contended node. Each defaults to the value shown when left unset:
+
+| Setting | Flag | Default |
+|---|---|---|
+| `raft_heartbeat_ms` | `--raft-heartbeat-ms` | 250 ms |
+| `raft_election_ms` | `--raft-election-ms` | 250 ms |
+| `raft_leader_lease_ms` | `--raft-leader-lease-ms` | 200 ms |
+| `raft_commit_timeout_ms` | `--raft-commit-timeout-ms` | 50 ms |
+
+`raft_leader_lease_ms` must not exceed `raft_heartbeat_ms`, and `raft_election_ms` must be at least `raft_heartbeat_ms`; both are consensus-protocol requirements and both are checked at configuration time, not at the next restart. Raising `raft_heartbeat_ms` also widens the follower-read freshness window — it is five heartbeats, and therefore the default `MAX STALENESS` of a `BOUNDED` read. Lowering these below what the network can carry makes a cluster re-campaign instead of converging, which is slower than the timeout it was trying to beat.
+
 ## Read consistency
 
 Every read runs in one mode (session default `STRONG`):
 
 - **`STRONG`** — linearizable: observes every write acknowledged before it began, cluster-wide. Served only on the leader, behind a Raft read barrier (`VerifyLeader` quorum round trip), so a partitioned former leader cannot answer one. Read-your-writes survives a leader failover.
-- **`BOUNDED`** — served from a member within `MAX STALENESS` of the leader, or rejected. Cheap (no quorum round trip); no cross-node read-your-writes.
+- **`BOUNDED`** — served from a member within `MAX STALENESS` of the leader, or rejected. With no explicit bound it uses the cluster's healthy-contact window, five times its configured `raft_heartbeat_ms`. Cheap (no quorum round trip); no cross-node read-your-writes.
 - **`STALE`** — served from any member's applied state, unbounded lag. Always a consistent committed prefix, never relabelled `STRONG`.
 
 Every official driver ships a cluster routing client (`OpenCluster` / `connectCluster` / `NextSQL\Cluster::connect`) that sends eligible reads to a healthy follower and everything else to the leader. `nextsql-bench --readscale` measures the barrier cost and leader read-offload. Full argument: [`docs/ha.md`](https://github.com/bzync/nextsql/blob/main/docs/ha.md) "Consistency model and sign-off".
 
-Replica repair has two proven paths: a lagging follower that reconnects, and a wiped replica restored with `nextsql backup` / `restore` (same identity and keys) then rejoined with `AddVoter`. Raft logs are ciphertext (replication DEK). HA is not a substitute for backups. Hosted multi-database HA (one Raft group per hosted database, or a shared cluster spanning the registry) is not implemented.
+Replica repair has two proven paths: a lagging follower that reconnects, and a wiped replica restored with `nextsql backup` / `restore` (same identity and keys) then rejoined with `AddVoter`. Raft logs are ciphertext (replication DEK). HA is not a substitute for backups.
 
 On Raft, connect migrators and writers to the **leader**.
 

@@ -11,7 +11,12 @@ func TestCatalogCoversKnownFamilies(t *testing.T) {
 	seen := map[Family]bool{}
 	for _, s := range Catalog() {
 		if s.Family == FamilyCatalog {
-			if s.Current != 12 || s.MinReadable != 1 || s.MaxReadable != 12 {
+			if s.Current != 13 || s.MinReadable != 1 || s.MaxReadable != 13 {
+				t.Fatalf("%s: %+v", s.Family, s)
+			}
+		} else if s.Family == FamilyKeystore {
+			// v2 is readable but written only on opt-in, so Current stays 1.
+			if s.Current != 1 || s.MinReadable != 1 || s.MaxReadable != 2 {
 				t.Fatalf("%s: %+v", s.Family, s)
 			}
 		} else if s.Current != 1 || s.MinReadable != 1 || s.MaxReadable != 1 {
@@ -26,6 +31,7 @@ func TestCatalogCoversKnownFamilies(t *testing.T) {
 		FamilyPage, FamilyEnvelope, FamilyWAL, FamilyWALCtrl,
 		FamilyUNDO, FamilyUNDOCtrl, FamilyCatalog, FamilyBackup,
 		FamilyExport, FamilyProtocol, FamilyRepl, FamilyIsolated,
+		FamilyKeystore,
 	} {
 		if !seen[f] {
 			t.Fatalf("missing %s", f)
@@ -70,8 +76,11 @@ func TestCatalogFamilyWindow(t *testing.T) {
 	if err := Check(FamilyCatalog, 12); err != nil {
 		t.Fatalf("v12: %v", err)
 	}
-	if err := Check(FamilyCatalog, 13); !nerr.HasCode(err, nerr.InvalidFormat) {
+	if err := Check(FamilyCatalog, 13); err != nil {
 		t.Fatalf("v13: %v", err)
+	}
+	if err := Check(FamilyCatalog, 14); !nerr.HasCode(err, nerr.InvalidFormat) {
+		t.Fatalf("v14: %v", err)
 	}
 }
 

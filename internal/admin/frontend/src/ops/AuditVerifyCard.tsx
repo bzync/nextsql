@@ -57,7 +57,7 @@ export function AuditVerifyCard({ auditVerify }: { auditVerify: ResultSet }) {
             </Text>
           )}
           {problem ? (
-            <Text size="sm" variant="danger">
+            <Text size="sm" className="nsa-audit-verify-problem">
               {lines > 0 ? `Line ${get("first_bad_line")}: ` : ""}{problem}
             </Text>
           ) : null}

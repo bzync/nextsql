@@ -66,6 +66,8 @@ func accessOp(p planner.Logical) string {
 		return "Filter"
 	case planner.Limit:
 		return "Limit"
+	case planner.UnnestScan:
+		return "UnnestScan"
 	default:
 		return "Scan"
 	}
@@ -204,9 +206,37 @@ func (s *Session) forEachRowInner(p planner.Logical, fn func([]types.Value) erro
 		}
 		return nil
 	case planner.Project:
-		return s.forEachRowInner(n.Input, fn)
+		if !n.PreAgg {
+			return s.forEachRowInner(n.Input, fn)
+		}
+		// The pre-aggregation projection has to be evaluated: the aggregate
+		// above addresses its computed columns by ordinal, and they do not
+		// exist in the input row.
+		tab := tableOf(n.Input)
+		return s.forEachRowInner(n.Input, func(row []types.Value) error {
+			dst := make([]types.Value, len(n.Exprs))
+			for i, ex := range n.Exprs {
+				v, err := s.eval(ex, tab, row)
+				if err != nil {
+					return err
+				}
+				dst[i] = v
+			}
+			return fn(dst)
+		})
 	case planner.Window, planner.Sort, planner.Aggregate, planner.Facet:
 		rows, err := s.collectPlan(n)
+		if err != nil {
+			return err
+		}
+		for _, row := range rows {
+			if err := fn(row); err != nil {
+				return err
+			}
+		}
+		return nil
+	case planner.UnnestScan:
+		rows, err := s.execUnnestScan(n)
 		if err != nil {
 			return err
 		}

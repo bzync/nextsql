@@ -36,10 +36,24 @@ module NextSQL
 
     def test_hello_ok_round_trip
       raw = Protocol.u16le(1) + Protocol::AUTH_PASSWORD.chr + ("S" * 8)
-      version, auth_method, secret = Protocol.decode_hello_ok(raw)
+      version, auth_method, secret, flags = Protocol.decode_hello_ok(raw)
       assert_equal 1, version
       assert_equal Protocol::AUTH_PASSWORD, auth_method
       assert_equal "S" * 8, secret
+      assert_equal 0, flags
+    end
+
+    def test_hello_ok_carries_accepted_capabilities
+      raw = Protocol.u16le(1) + Protocol::AUTH_PASSWORD.chr + ("S" * 8) +
+            Protocol.u16le(Protocol::FLAG_PUBLIC_ERROR_CODES)
+      _version, _auth_method, _secret, flags = Protocol.decode_hello_ok(raw)
+      assert_equal Protocol::FLAG_PUBLIC_ERROR_CODES, flags
+    end
+
+    def test_hello_ok_rejects_present_but_empty_flags
+      # A present-but-zero field is a second encoding of the v1 hello-ok.
+      raw = Protocol.u16le(1) + Protocol::AUTH_PASSWORD.chr + ("S" * 8) + Protocol.u16le(0)
+      assert_raises(Error) { Protocol.decode_hello_ok(raw) }
     end
 
     def test_hello_ok_rejects_bad_length
@@ -51,6 +65,22 @@ module NextSQL
       err = Protocol.decode_error(raw)
       assert_equal "unavailable", err.error_code
       assert_equal "no reachable leader", err.message
+      # An older server ignores the request bit and sends the v1 shape.
+      assert_equal "", err.public_code
+    end
+
+    def test_error_carries_public_code_when_negotiated
+      raw = Protocol.u16str("serialization") + Protocol.u16str("retry me") +
+            Protocol.u16str("ERR_SERIALIZATION")
+      err = Protocol.decode_error(raw)
+      # The legacy class is unchanged, so existing retry checks still work.
+      assert_equal "serialization", err.error_code
+      assert_equal "ERR_SERIALIZATION", err.public_code
+    end
+
+    def test_error_rejects_present_but_empty_public_code
+      raw = Protocol.u16str("conflict") + Protocol.u16str("nope") + Protocol.u16str("")
+      assert_raises(Error) { Protocol.decode_error(raw) }
     end
   end
 
@@ -487,9 +517,13 @@ module NextSQL
 
     def test_is_loopback
       assert Connection.loopback?("127.0.0.1:7210")
+      assert Connection.loopback?("127.0.0.254:7210")
       assert Connection.loopback?("localhost:7210")
       assert Connection.loopback?("[::1]:7210")
+      assert Connection.loopback?("[0:0:0:0:0:0:0:1]:7210")
       refute Connection.loopback?("db.example.com:7210")
+      refute Connection.loopback?("10.0.0.1:7210")
+      refute Connection.loopback?("192.168.1.1:7210")
     end
   end
 end

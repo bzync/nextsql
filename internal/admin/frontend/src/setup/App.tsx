@@ -51,6 +51,7 @@ export function App() {
         dataDir: res.defaults.dataDir,
         keyFile: res.defaults.keyFile,
         configOut: res.defaults.configOut || "",
+        recoveryKeyOut: res.defaults.recoveryKeyOut || "",
       }));
     }).catch((err) => setHelloError(errMessage(err)));
 

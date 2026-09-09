@@ -117,7 +117,7 @@ func chooseAt(p planner.Logical, stats StatsFunc, underJoin bool) (planner.Logic
 			rows = kid.EstRows
 			cost = kid.EstCost + rows*cpuProject
 		}
-		plan := planner.Project{Input: in, Cols: n.Cols, Exprs: n.Exprs, Names: n.Names, Distinct: n.Distinct, DistinctIndex: n.DistinctIndex}
+		plan := planner.Project{Input: in, Cols: n.Cols, Exprs: n.Exprs, Names: n.Names, Distinct: n.Distinct, DistinctIndex: n.DistinctIndex, PreAgg: n.PreAgg}
 		project := &Node{Op: "Project", Detail: joinNames(n.Names), EstRows: rows, EstCost: cost, Kids: kids(kid)}
 		if n.DistinctIndex != "" {
 			return plan, &Node{Op: "IndexDistinct", Detail: n.DistinctIndex, EstRows: rows, EstCost: cost, Kids: kids(project)}
@@ -233,7 +233,7 @@ func chooseAt(p planner.Logical, stats StatsFunc, underJoin bool) (planner.Logic
 			}
 			cost = kid.EstCost + kid.EstRows*cpuTuple
 		}
-		plan := planner.Aggregate{Input: in, Groups: n.Groups, Specs: n.Specs, Exprs: n.Exprs, Names: n.Names, Schema: n.Schema, Distinct: n.Distinct, Having: n.Having}
+		plan := planner.Aggregate{Input: in, Groups: n.Groups, Specs: n.Specs, Exprs: n.Exprs, Names: n.Names, Schema: n.Schema, Distinct: n.Distinct, Having: n.Having, Slots: n.Slots}
 		aggDetail := joinNames(n.Names)
 		if sc, ok := in.(planner.SeqScan); ok && sc.Table != nil && sc.Table.Partitioning != nil {
 			aggDetail = strings.TrimSpace(aggDetail + " partition-wise")
@@ -286,6 +286,8 @@ func chooseAt(p planner.Logical, stats StatsFunc, underJoin bool) (planner.Logic
 		return n, &Node{Op: "Rerank", Detail: rerankDetail(n), EstRows: rows, EstCost: cost + rows*cpuRerank, Kids: extraKids}
 	case planner.Candidates:
 		return chooseCandidates(n, stats)
+	case planner.UnnestScan:
+		return n, &Node{Op: "UnnestScan", EstRows: 1, EstCost: 1}
 	case planner.Filter, planner.Scan, planner.SeqScan, planner.IndexScan:
 		return chooseAccess(p, stats)
 	default:
@@ -326,6 +328,9 @@ func finishJoin(n planner.Join, l planner.Logical, lk *Node, r planner.Logical, 
 	if n.Kind == ast.JoinLeft && lr > out {
 		out = lr
 	}
+	if n.Kind == ast.JoinRight && rr > out {
+		out = rr
+	}
 	if n.Kind == ast.JoinFull {
 		if lr > out {
 			out = lr
@@ -338,6 +343,7 @@ func finishJoin(n planner.Join, l planner.Logical, lk *Node, r planner.Logical, 
 	method := "hash"
 	op := "HashJoin"
 	left := n.Kind == ast.JoinLeft
+	right := n.Kind == ast.JoinRight
 	full := n.Kind == ast.JoinFull
 	semi := n.Kind == ast.JoinSemi
 	anti := n.Kind == ast.JoinAnti
@@ -360,6 +366,9 @@ func finishJoin(n planner.Join, l planner.Logical, lk *Node, r planner.Logical, 
 	} else if full {
 		op = "FullJoin"
 		method = "hash"
+	} else if right {
+		op = "RightJoin"
+		method = "hash"
 	} else if left {
 		op = "LeftJoin"
 		if mergeSorted(l, r, lkys, rkys) {
@@ -379,7 +388,7 @@ func finishJoin(n planner.Join, l planner.Logical, lk *Node, r planner.Logical, 
 			detail = strings.TrimSpace(detail + " partition-wise")
 		}
 	}
-	return planner.Join{Left: l, Right: r, Pred: n.Pred, Kind: n.Kind, Cross: n.Cross && !left && !full && !semi && !anti, Method: method, LeftKeys: lkys, RightKeys: rkys, Schema: schema},
+	return planner.Join{Left: l, Right: r, Pred: n.Pred, Kind: n.Kind, Cross: n.Cross && !left && !right && !full && !semi && !anti, Method: method, LeftKeys: lkys, RightKeys: rkys, Schema: schema},
 		&Node{Op: op, Detail: detail, EstRows: out, EstCost: cost, Kids: []*Node{lk, rk}}
 }
 

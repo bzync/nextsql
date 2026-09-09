@@ -2,6 +2,7 @@ package storage
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"sync"
@@ -11,6 +12,7 @@ import (
 	"github.com/bzync/nextsql/internal/nerr"
 	"github.com/bzync/nextsql/internal/storage/buffer"
 	"github.com/bzync/nextsql/internal/storage/format"
+	diskio "github.com/bzync/nextsql/internal/storage/io"
 )
 
 func testKeys(t *testing.T) *crypto.MemoryKeyProvider {
@@ -561,5 +563,88 @@ func TestCreateExistingFails(t *testing.T) {
 	}
 	if _, err := Create(path, keys, 2); !nerr.HasCode(err, nerr.AlreadyExists) {
 		t.Fatalf("expected exists, got %v", err)
+	}
+}
+
+// A failing durability device must not acknowledge a commit, and once the WAL
+// itself has failed a barrier the engine must refuse every later commit even
+// though the platform reports a writeback error only once. Page and allocator
+// syncs are re-derivable by REDO, so only the WAL barrier latches; data
+// committed before the fault must survive a restart either way.
+func TestCommitFailsClosedAfterDurabilityFault(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "nextsql.db")
+	keys := testKeys(t)
+	e, err := Create(path, keys, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	commit := func(payload string) (format.PageID, uint16, error) {
+		if err := e.BeginWrite(); err != nil {
+			return 0, 0, err
+		}
+		h, err := e.NewSlotted()
+		if err != nil {
+			return 0, 0, err
+		}
+		id := h.ID()
+		slot, err := h.Page().Insert([]byte(payload))
+		if err != nil {
+			return 0, 0, err
+		}
+		if err := h.Release(true); err != nil {
+			return 0, 0, err
+		}
+		return id, slot, e.Commit()
+	}
+
+	id, slot, err := commit("before-fault")
+	if err != nil {
+		t.Fatalf("healthy commit: %v", err)
+	}
+
+	failing := true
+	restore := diskio.SetFaultForTest(func(f diskio.Fault) error {
+		if failing && (f.Op == "sync" || f.Op == "datasync") {
+			return errors.New("EIO")
+		}
+		return nil
+	})
+	defer restore()
+
+	if _, _, err := commit("during-fault"); err == nil {
+		t.Fatal("commit acknowledged despite a failing durability device")
+	}
+
+	// Drive the WAL's own barrier into failure, then let the platform stop
+	// reporting the error the way a Linux writeback error is cleared once
+	// it has been delivered to a single fsync.
+	if err := e.WAL.Flush(e.WAL.NextLSN() - 1); err == nil {
+		t.Fatal("WAL barrier reported success under an injected fault")
+	}
+	failing = false
+
+	if _, _, err := commit("after-fault"); err == nil {
+		t.Fatal("commit acknowledged after an unrecovered WAL durability failure")
+	}
+
+	_ = e.Close()
+
+	e, err = Open(path, keys, 8)
+	if err != nil {
+		t.Fatalf("reopen after durability fault: %v", err)
+	}
+	defer e.Close()
+	h, err := e.Pin(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Release(false)
+	got, err := h.Page().Get(slot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "before-fault" {
+		t.Fatalf("pre-fault commit lost: got %q", got)
 	}
 }

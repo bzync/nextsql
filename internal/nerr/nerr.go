@@ -37,6 +37,14 @@ type Error struct {
 	Op      string
 	Message string
 	Err     error
+	// Public is the stable ERR_* name the server sent for this error
+	// (docs/error-codes.md). It is populated only on an error received over
+	// a connection that negotiated the public error taxonomy, and stays
+	// empty for a locally constructed error or an older server. Code is
+	// always set and keeps its legacy spelling, so nothing should branch on
+	// Public being present. It exists so a client can report a class this
+	// build does not know about without inventing a name for it.
+	Public string
 }
 
 func New(code Code, op, message string) *Error {

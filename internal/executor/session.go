@@ -139,7 +139,8 @@ type Session struct {
 	// readConsistency selects how non-mutating statements observe replicated
 	// state. The zero value is ReadStrong.
 	readConsistency ReadConsistency
-	// readStaleness bounds a BOUNDED read. Zero selects DefaultMaxStaleness.
+	// readStaleness bounds a BOUNDED read. Zero selects the gate's own
+	// default window (see boundedStaleness).
 	readStaleness time.Duration
 
 	// id/connectedAt are set once by DB.RegisterSession, at network-connect
@@ -262,7 +263,8 @@ func (s *Session) SetReadConsistency(mode ReadConsistency) error {
 func (s *Session) ReadConsistency() ReadConsistency { return s.readConsistency }
 
 // SetMaxStaleness sets the freshness bound for BOUNDED reads. Zero (the
-// default) selects DefaultMaxStaleness. A negative value is clamped to zero.
+// default) selects the attached cluster's healthy-contact window, falling back
+// to DefaultMaxStaleness. A negative value is clamped to zero.
 // It has no effect in STRONG or STALE mode.
 func (s *Session) SetMaxStaleness(d time.Duration) {
 	if d < 0 {
@@ -274,9 +276,18 @@ func (s *Session) SetMaxStaleness(d time.Duration) {
 // MaxStaleness reports the configured BOUNDED-read freshness bound (0 = default).
 func (s *Session) MaxStaleness() time.Duration { return s.readStaleness }
 
-func (s *Session) boundedStaleness() time.Duration {
+// boundedStaleness is the freshness bound this session's BOUNDED reads carry.
+// An explicit MAX STALENESS wins; otherwise the gate names its own default
+// (an attached cluster answers with its configured healthy-contact window),
+// and only a gate that cannot falls back to the package default.
+func (s *Session) boundedStaleness(gate FollowerReadGate) time.Duration {
 	if s.readStaleness > 0 {
 		return s.readStaleness
+	}
+	if d, ok := gate.(StalenessDefaulter); ok {
+		if w := d.DefaultMaxStaleness(); w > 0 {
+			return w
+		}
 	}
 	return DefaultMaxStaleness
 }
@@ -838,19 +849,6 @@ func (s *Session) execAdmitted(ctx context.Context, sql string, params []Param) 
 		}
 		return s.execSecurity(stmt)
 	}
-	if st, ok := stmt.(ast.CreateDatabase); ok {
-		if err := s.authorize(st); err != nil {
-			s.auditRecord(security.ActionDDL, st.Name, err)
-			return nil, err
-		}
-		if s.InTxn() {
-			return nil, nerr.New(nerr.InvalidArgument, "executor.CreateDatabase", "CREATE DATABASE cannot run inside a transaction")
-		}
-		if err := s.requireLeader(true); err != nil {
-			return nil, err
-		}
-		return s.execCreateDatabase(planner.CreateDatabase{Name: st.Name, IfNotExists: st.IfNotExists})
-	}
 	stmt, err = s.guardLegacyTenancy(stmt)
 	if err != nil {
 		return nil, err
@@ -929,6 +927,9 @@ func (s *Session) execAdmitted(ctx context.Context, sql string, params []Param) 
 	}
 	bound, err := binder.BindAutomation(stmt, s.lookup, s.lookupWorkflow, s.listWorkflows, s.lookupTrigger, s.listTriggers, s.lookupSchedule, s.listSchedules, s.lookupResourceGroup, nextID, owner)
 	if err != nil {
+		return nil, err
+	}
+	if err := s.validateClientEncryptedPredicateParams(bound); err != nil {
 		return nil, err
 	}
 	plan, err := planner.Plan(bound)
@@ -1041,7 +1042,7 @@ func (s *Session) requireReadConsistency() error {
 		if !ok {
 			return nil
 		}
-		return fg.FollowerReadHealthy(s.boundedStaleness())
+		return fg.FollowerReadHealthy(s.boundedStaleness(fg))
 	default:
 		rg, ok := s.db.gate.(ReadGate)
 		if !ok {
@@ -1064,7 +1065,7 @@ func isReadStmt(stmt ast.Stmt) bool {
 
 func isMutating(plan planner.Logical) bool {
 	switch plan.(type) {
-	case planner.CreateTable, planner.CreateDatabase, planner.CreateWorkflow, planner.AlterWorkflow, planner.DropWorkflow, planner.RunWorkflow, planner.CreateTrigger, planner.AlterTrigger, planner.DropTrigger, planner.CreateSchedule, planner.AlterSchedule, planner.DropSchedule, planner.CreateResourceGroup, planner.AlterResourceGroup, planner.DropResourceGroup, planner.CancelTask, planner.DropTable, planner.DropIndex, planner.RebuildIndex, planner.AlterTable, planner.CreateIndex, planner.Insert, planner.Upsert, planner.Update, planner.Delete, planner.Begin, planner.Commit, planner.Rollback:
+	case planner.CreateTable, planner.CreateWorkflow, planner.AlterWorkflow, planner.DropWorkflow, planner.RunWorkflow, planner.CreateTrigger, planner.AlterTrigger, planner.DropTrigger, planner.CreateSchedule, planner.AlterSchedule, planner.DropSchedule, planner.CreateResourceGroup, planner.AlterResourceGroup, planner.DropResourceGroup, planner.CancelTask, planner.DropTable, planner.DropIndex, planner.RebuildIndex, planner.AlterTable, planner.CreateIndex, planner.Insert, planner.Upsert, planner.Update, planner.Delete, planner.Begin, planner.Commit, planner.Rollback:
 		return true
 	default:
 		return false

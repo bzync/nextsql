@@ -191,7 +191,7 @@ func Optimize(req Request) (Outcome, error) {
 		return Outcome{Plan: req.Plan, Trace: &Node{Op: "Analyze"}}, nil
 	}
 	switch req.Plan.(type) {
-	case planner.Begin, planner.Commit, planner.Rollback, planner.Subscribe, planner.CreateTable, planner.CreateDatabase, planner.DropTable, planner.DropIndex, planner.RebuildIndex, planner.AlterTable, planner.CreateIndex, planner.Insert, planner.Upsert:
+	case planner.Begin, planner.Commit, planner.Rollback, planner.Subscribe, planner.CreateTable, planner.DropTable, planner.DropIndex, planner.RebuildIndex, planner.AlterTable, planner.CreateIndex, planner.Insert, planner.Upsert:
 		return Outcome{Plan: req.Plan, Trace: leafTrace(req.Plan)}, nil
 	}
 	key := req.SQL
@@ -213,8 +213,6 @@ func leafTrace(p planner.Logical) *Node {
 	switch p.(type) {
 	case planner.CreateTable:
 		return &Node{Op: "CreateTable"}
-	case planner.CreateDatabase:
-		return &Node{Op: "CreateDatabase"}
 	case planner.DropTable:
 		return &Node{Op: "DropTable"}
 	case planner.DropIndex:
@@ -237,6 +235,8 @@ func leafTrace(p planner.Logical) *Node {
 		return &Node{Op: "Rollback"}
 	case planner.Subscribe:
 		return &Node{Op: "Subscribe"}
+	case planner.UnnestScan:
+		return &Node{Op: "UnnestScan"}
 	default:
 		return &Node{Op: "Plan"}
 	}

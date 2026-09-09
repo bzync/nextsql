@@ -83,6 +83,17 @@ document-length, and statistics records use the same eligibility and cleanup pat
 1. REDO committed `PageImage` / tree / allocator records (Phase 3).
 2. Apply UNDO for transactions that began and never committed or aborted.
 
+### UNDO durability
+
+`undo.Log.Flush` writes its buffer without an `fsync` of its own, and that is
+deliberate, not an omission: the WAL is the durability authority, and undo
+state for any transaction that matters at recovery time is re-derivable from
+redo plus the undo records the log rewrites on the paths that *do* carry a
+barrier — `Vacuum` and the control file, both of which `fsync` through
+`diskio.Sync` and fail closed. A commit is never acknowledged on the strength
+of an undo write. The asymmetry with the WAL is intentional; see
+`docs/wal.md`.
+
 In-process rollback applies the transaction's undo chain, then restores pages that only that transaction dirtied.
 
 ## API

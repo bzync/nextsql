@@ -72,20 +72,40 @@ body {
   outline-offset: 2px;
 }
 
-/* Shared theme selector (shared/ThemeSelect.tsx). */
-.nsa-theme-select {
-  width: 156px;
-  min-width: 156px;
+/* Shared icon-only theme picker (shared/ThemeSelect.tsx). */
+.nsa-theme-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--nsa-radius);
+  background: var(--color-surface-muted, var(--color-surface));
 }
-.nsa-theme-trigger {
-  width: 100% !important;
-  min-height: 32px;
-  font-size: 13px;
-  white-space: nowrap !important;
+.nsa-theme-button {
+  display: inline-flex;
+  width: 32px;
+  height: 32px;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid transparent;
+  border-radius: calc(var(--nsa-radius) - 2px);
+  background: transparent;
+  color: var(--color-muted-foreground, var(--color-foreground-muted));
+  cursor: pointer;
 }
-.nsa-theme-trigger span {
-  white-space: nowrap !important;
-  overflow: visible !important;
+.nsa-theme-button:hover {
+  background: var(--color-surface-raised, var(--color-surface));
+  color: var(--color-foreground);
+}
+.nsa-theme-button[aria-pressed="true"] {
+  border-color: var(--color-accent-500);
+  background: var(--color-accent-100);
+  color: var(--color-accent-700);
+}
+.dark .nsa-theme-button[aria-pressed="true"] {
+  background: color-mix(in srgb, var(--color-accent-500) 22%, transparent);
+  color: var(--color-accent-300);
 }
 
 .nsa-identity {
@@ -146,6 +166,21 @@ span.text-xs.font-mono.text-slate-400 {
   color: var(--color-foreground);
 }
 
+/* RUI 0.0.9's danger text token (#e7000b) misses AA against this shell's dark
+   surfaces — 3.44:1 on the raised audit-failure card, 4.09:1 on the page
+   ground used by inline field errors (`p.text-destructive`, which rui renders
+   for every Input `error=`). Keep the conventional destructive red in light
+   mode and use this AA-contrast red in dark mode, everywhere the token is
+   used for text. Every such message is also announced or paired with an
+   explicit label, so state never rests on color alone. */
+.nsa-audit-verify-problem {
+  color: var(--color-danger);
+}
+.dark .nsa-audit-verify-problem,
+.dark .text-destructive {
+  color: #ff8990;
+}
+
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after {
     scroll-behavior: auto !important;
@@ -156,13 +191,13 @@ span.text-xs.font-mono.text-slate-400 {
 }
 
 @media (prefers-contrast: more) {
-  .nsa-theme-trigger {
+  .nsa-theme-toggle {
     border-width: 2px;
   }
 }
 
 @media (forced-colors: active) {
-  .nsa-skip:focus, .nsa-theme-trigger:focus-visible {
+  .nsa-skip:focus, .nsa-theme-button:focus-visible {
     outline-color: Highlight;
   }
 }
@@ -189,3 +224,17 @@ span.text-xs.font-mono.text-slate-400 {
   flex-shrink: 0;
 }
 
+/* rui 0.0.9's CodeBlock puts its content in an `overflow-x: auto` region
+   that contains nothing focusable, so a keyboard-only operator cannot
+   reach whatever scrolled out of view (WCAG 2.1.1; axe
+   scrollable-region-focusable). Setup shows file paths and a start command
+   there — content that wraps perfectly well — so wrap it rather than
+   scroll it, and no unreachable region exists. */
+.nsi-code [class~="overflow-x-auto"] {
+  overflow-x: visible;
+}
+.nsi-code pre,
+.nsi-code code {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}

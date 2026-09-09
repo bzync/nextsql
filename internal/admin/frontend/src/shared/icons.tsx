@@ -53,6 +53,7 @@ export type IconName =
   | "sparkles"
   | "info"
   | "pulse"
+  | "device"
   | "sun"
   | "moon"
   | "user-check"
@@ -339,6 +340,13 @@ const GLYPHS: Record<IconName, ReactNode> = {
     </>
   ),
   pulse: <polyline points="22 12 18 12 15 21 9 3 6 12 2 12" />,
+  device: (
+    <>
+      <rect x="3" y="4" width="18" height="13" rx="2" />
+      <path d="M8 21h8" />
+      <path d="M12 17v4" />
+    </>
+  ),
   sun: (
     <>
       <circle cx="12" cy="12" r="5" />

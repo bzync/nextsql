@@ -81,7 +81,11 @@ func (s *Session) searchNearestSparse(n planner.Nearest, colType types.Type) ([]
 		if !idx.Vector {
 			return nil, nerr.New(nerr.NotFound, "executor.searchNearestSparse", "unknown vector index")
 		}
-		rows, err = s.nearestSparseIndex(n, q, metric, n.Table, idx)
+		if n.Table.Partitioning != nil {
+			rows, err = s.nearestSparseIndexPartitioned(n, q, metric, n.Table, idx)
+		} else {
+			rows, err = s.nearestSparseIndex(n, q, metric, n.Table, idx)
+		}
 	} else {
 		rows, err = s.nearestSparseFlat(n, q, metric)
 	}
@@ -133,15 +137,24 @@ func (s *Session) nearestIndex(n planner.Nearest, q []float32, metric nsvec.Metr
 		return nil, nerr.New(nerr.NotFound, "executor.nearestIndex", "unknown vector index")
 	}
 	if idx.VecMethod == catalog.VecMethodIVF {
+		if tab.Partitioning != nil {
+			return s.nearestIVFIndexPartitioned(n, q, metric, tab, idx)
+		}
 		return s.nearestIVFIndex(n, q, metric, tab, idx)
 	}
 	if idx.VecMethod == catalog.VecMethodIVFPQ {
+		if tab.Partitioning != nil {
+			return s.nearestIVFPQIndexPartitioned(n, q, metric, tab, idx)
+		}
 		return s.nearestIVFPQIndex(n, q, metric, tab, idx)
 	}
 	if idx.VecMethod == catalog.VecMethodSPARSE {
 		sv, err := valueSparse(types.VectorValue(q, types.Type{Kind: types.KindVector, Precision: uint16(len(q)), VecElem: types.VecF32}), uint32(len(q)))
 		if err != nil {
 			return nil, err
+		}
+		if tab.Partitioning != nil {
+			return s.nearestSparseIndexPartitioned(n, sv, metric, tab, idx)
 		}
 		return s.nearestSparseIndex(n, sv, metric, tab, idx)
 	}

@@ -42,14 +42,53 @@ class TestFraming(unittest.TestCase):
 
     def test_hello_ok_round_trip(self) -> None:
         raw = p.u16le(1) + bytes([p.AUTH_PASSWORD]) + (b"S" * 8)
-        version, auth_method, secret = p.decode_hello_ok(raw)
+        version, auth_method, secret, flags = p.decode_hello_ok(raw)
         self.assertEqual(version, 1)
         self.assertEqual(auth_method, p.AUTH_PASSWORD)
         self.assertEqual(secret, b"S" * 8)
+        self.assertEqual(flags, 0)
+
+    def test_hello_ok_carries_accepted_capabilities(self) -> None:
+        raw = (
+            p.u16le(1)
+            + bytes([p.AUTH_PASSWORD])
+            + (b"S" * 8)
+            + p.u16le(p.FLAG_PUBLIC_ERROR_CODES)
+        )
+        _version, _auth_method, _secret, flags = p.decode_hello_ok(raw)
+        self.assertEqual(flags, p.FLAG_PUBLIC_ERROR_CODES)
+
+    def test_hello_ok_rejects_present_but_empty_flags(self) -> None:
+        # A present-but-zero field is a second encoding of the v1 hello-ok.
+        raw = p.u16le(1) + bytes([p.AUTH_PASSWORD]) + (b"S" * 8) + p.u16le(0)
+        with self.assertRaises(NextSQLError):
+            p.decode_hello_ok(raw)
 
     def test_hello_ok_rejects_bad_length(self) -> None:
         with self.assertRaises(NextSQLError):
             p.decode_hello_ok(b"short")
+
+    def test_error_carries_public_code_when_negotiated(self) -> None:
+        raw = (
+            p.u16str("serialization")
+            + p.u16str("retry me")
+            + p.u16str("ERR_SERIALIZATION")
+        )
+        err = p.decode_error(raw)
+        # The legacy class is unchanged, so existing retry checks still work.
+        self.assertEqual(err.error_code, "serialization")
+        self.assertEqual(err.public_code, "ERR_SERIALIZATION")
+
+    def test_error_without_public_code_is_still_accepted(self) -> None:
+        # An older server ignores the request bit and sends the v1 shape.
+        err = p.decode_error(p.u16str("conflict") + p.u16str("nope"))
+        self.assertEqual(err.error_code, "conflict")
+        self.assertEqual(err.public_code, "")
+
+    def test_error_rejects_present_but_empty_public_code(self) -> None:
+        raw = p.u16str("conflict") + p.u16str("nope") + p.u16str("")
+        with self.assertRaises(NextSQLError):
+            p.decode_error(raw)
 
     def test_error_round_trip(self) -> None:
         raw = p.u16str("unavailable") + p.u16str("no reachable leader")

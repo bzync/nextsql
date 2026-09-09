@@ -48,7 +48,7 @@ Clients / CLI / NextSQL Admin (Setup, Operations, Studio modes)
             │
          TLS/Auth
             │
-   RBAC/Realm/Database
+   RBAC
             │
           Parser
             │
@@ -442,12 +442,13 @@ reads remain leader-only behind a Raft quorum barrier; every official driver
 has a bounded cluster-routing client, but the server independently enforces the
 mode.
 
-The separate hosting track layers a versioned encrypted deployment registry
-and `internal/dbmanager` over the per-database engine. M2 routes connections to
-multiple realms/databases within one process with realm-scoped auth, bounded
-open handles/eviction, a shared buffer budget, and centralized task scheduling.
-Managed databases are still single-node: independently addressed backup/PITR,
-key lifecycle, registry DR/Raft, and hosted HA remain open.
+A deployment serves exactly one database. The versioned encrypted deployment
+registry (`nextsql.instance`, its own root key) records that database's
+identity and state; it no longer routes anything. Multi-realm/multi-database
+hosting — realms, `nextsql realm` / `nextsql database`, `CREATE DATABASE`,
+per-connection routing, and `internal/dbmanager` — was removed, so isolation
+between databases is always a whole deployment: separate process, files, WAL,
+UNDO, keys, users and ACL.
 
 ---
 

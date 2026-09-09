@@ -30,6 +30,10 @@ type Options struct {
 	Fetcher oidc.Fetcher
 	// RoleMembership, when set, enables the no-escalation RBAC intersection.
 	RoleMembership RoleMembershipFunc
+	// UserProvisioner, when set and JIT provisioning is enabled, creates native principals.
+	UserProvisioner UserProvisionerFunc
+	// HTTPClient allows injecting custom HTTP transport/client (e.g. for testing).
+	HTTPClient *http.Client
 	// Logger receives structured audit and operational records. Required.
 	Logger *slog.Logger
 	// Now overrides the clock (tests only).
@@ -39,11 +43,13 @@ type Options struct {
 // Broker is the running authentication broker. Its zero value is not usable;
 // build it with New.
 type Broker struct {
-	cfg     Config
-	fetcher oidc.Fetcher
-	members RoleMembershipFunc
-	log     *slog.Logger
-	now     func() time.Time
+	cfg         Config
+	fetcher     oidc.Fetcher
+	members     RoleMembershipFunc
+	provisioner UserProvisionerFunc
+	httpClient  *http.Client
+	log         *slog.Logger
+	now         func() time.Time
 
 	mu        sync.RWMutex
 	policy    *auth.IdentityPolicy
@@ -53,9 +59,10 @@ type Broker struct {
 }
 
 type profileVerifier struct {
-	profile IdPProfile
-	idtoken *oidc.IDTokenVerifier
-	access  *oidc.AccessTokenVerifier
+	profile    IdPProfile
+	idtoken    *oidc.IDTokenVerifier
+	access     *oidc.AccessTokenVerifier
+	introspect *Introspector
 }
 
 type brokerSnapshot struct {
@@ -83,12 +90,14 @@ func New(cfg Config, opts Options) (*Broker, error) {
 		now = time.Now
 	}
 	b := &Broker{
-		cfg:     cfg,
-		fetcher: fetcher,
-		members: opts.RoleMembership,
-		log:     opts.Logger,
-		now:     now,
-		replay:  oidc.NewReplayGuard(now),
+		cfg:         cfg,
+		fetcher:     fetcher,
+		members:     opts.RoleMembership,
+		provisioner: opts.UserProvisioner,
+		httpClient:  opts.HTTPClient,
+		log:         opts.Logger,
+		now:         now,
+		replay:      oidc.NewReplayGuard(now),
 	}
 	if err := b.load(nil); err != nil {
 		return nil, err
@@ -157,7 +166,32 @@ func (b *Broker) prepare(validateKeyset func(*auth.TokenKeyset) error) (*brokerS
 				return nil, err
 			}
 		}
-		verifiers[p.Name] = &profileVerifier{profile: p, idtoken: iv, access: av}
+		var introspect *Introspector
+		if p.IntrospectionURI != "" {
+			var secret string
+			if p.ClientSecretFile != "" {
+				s, err := ReadClientSecretFile(p.ClientSecretFile)
+				if err != nil {
+					return nil, err
+				}
+				secret = s
+			}
+			introspect, err = NewIntrospector(IntrospectorConfig{
+				Endpoint:     p.IntrospectionURI,
+				ClientID:     p.ClientID,
+				ClientSecret: secret,
+				Issuer:       p.Issuer,
+				Audience:     p.AccessTokenAudience,
+				CacheTTL:     p.IntrospectionTTL,
+				Skew:         p.Skew,
+				Now:          b.now,
+				HTTPClient:   b.httpClient,
+			})
+			if err != nil {
+				return nil, err
+			}
+		}
+		verifiers[p.Name] = &profileVerifier{profile: p, idtoken: iv, access: av, introspect: introspect}
 	}
 	return &brokerSnapshot{policy: policy, keyset: keyset, verifiers: verifiers}, nil
 }

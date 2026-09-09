@@ -68,7 +68,7 @@ func TestSystemCapabilities(t *testing.T) {
 	for _, r := range res.Rows {
 		caps[r[0].Str] = r
 	}
-	for _, name := range []string{"partitions_range", "partitions_hash", "partitions_list", "system_schema_v3", "system_show_aliases"} {
+	for _, name := range []string{"partitions_range", "partitions_hash", "partitions_list", "system_schema_v4", "system_show_aliases"} {
 		row, ok := caps[name]
 		if !ok || row[1].Str != "supported" {
 			t.Fatalf("capability %q = %v, want supported", name, row)
@@ -80,7 +80,7 @@ func TestSystemCapabilities(t *testing.T) {
 	if row := caps["resource_groups"]; len(row) != 4 || row[1].Str != "supported" || contains(row[2].Str, "not yet wired") {
 		t.Fatalf("stale resource_groups capability: %v", row)
 	}
-	if row := caps["field_encryption_client"]; len(row) != 4 || !contains(row[2].Str, "Node.js") || !contains(row[2].Str, "PHP") {
+	if row := caps["field_encryption_client"]; len(row) != 4 || row[1].Str != "supported" || !contains(row[2].Str, "NSCE2") || !contains(row[2].Str, "Node.js") || !contains(row[2].Str, "PHP") {
 		t.Fatalf("stale field_encryption_client capability: %v", row)
 	}
 	// P26 exit-gate audit: the capability registry must be authoritative for
@@ -242,7 +242,6 @@ func TestSystemShowAliases(t *testing.T) {
 		columns   []string
 	}{
 		{`SHOW DATABASES`, `SELECT * FROM system.storage`, []string{"database"}},
-		{`SHOW REALMS`, `SELECT * FROM system.realms`, []string{"realm_id", "name", "state", "database_count", "storage_cap_bytes", "realm_root_delegated"}},
 		{`SHOW TABLES`, `SELECT * FROM system.tables`, []string{"name", "id", "column_count", "pk", "legacy_tenant_column"}},
 		{`SHOW INDEXES`, `SELECT * FROM system.indexes`, []string{"table_name", "index_name", "kind", "is_unique", "columns", "include_columns", "predicate", "status"}},
 		{`SHOW CONNECTIONS`, `SELECT * FROM system.sessions`, []string{"session_id", "user", "remote", "state"}},
@@ -1362,6 +1361,7 @@ func TestSystemTLS(t *testing.T) {
 			MTLSRequired:        true,
 			ClientCAConfigured:  true,
 			ClientCRLConfigured: true,
+			OCSPMode:            "enforce",
 		}, true
 	})
 
@@ -1392,6 +1392,9 @@ func TestSystemTLS(t *testing.T) {
 	}
 	if !row[7].Bool || !row[8].Bool || !row[9].Bool {
 		t.Fatalf("mtls_required/client_ca_configured/client_crl_configured not all true: %v", row)
+	}
+	if row[10].Str != "enforce" {
+		t.Fatalf("ocsp_mode = %q, want 'enforce'", row[10].Str)
 	}
 
 	// Never an error even for a plaintext deployment; a non-admin still

@@ -17,7 +17,7 @@ export type SearchItem = {
 const WORKSPACES: { id: string; label: string; description: string; icon: IconName; keywords: string }[] = [
   { id: "overview", label: "Overview", description: "System health, node status, and cluster metrics", icon: "overview", keywords: "home dashboard metrics nodes status health" },
   { id: "studio", label: "Studio", description: "Interactive SQL query editor, table inspector, and results grid", icon: "studio", keywords: "sql query editor console run explain select tables ide" },
-  { id: "databases", label: "Databases", description: "Storage breakdown, databases, realms, and table catalogs", icon: "database", keywords: "tables schemas storage size realms metadata" },
+  { id: "databases", label: "Databases", description: "Storage breakdown, the deployment's database, and its table catalog", icon: "database", keywords: "tables schemas storage size realms metadata" },
   { id: "activity", label: "Activity", description: "Active queries, live transactions, lock waits, and sessions", icon: "activity", keywords: "queries locks transactions sessions blocking deadlocks" },
   { id: "security", label: "Security", description: "Users, roles, privileges, RBAC grants, and audit log", icon: "shield", keywords: "users roles rbac grants privileges passwords audit" },
   { id: "cluster", label: "Cluster", description: "Raft consensus, replica nodes, partitions, and membership", icon: "cluster", keywords: "raft nodes consensus replicas leadership quorum" },
@@ -149,9 +149,9 @@ export function AdminSearchModal({
       id: "act-switch-connection",
       category: "Actions",
       label: "Switch Connection…",
-      description: "Switch to another database or realm on this server",
+      description: "Reconnect this session to the server",
       icon: "plug",
-      keywords: "switch connection database realm reconnect server",
+      keywords: "switch connection database reconnect server",
       badge: "Action",
       run: () => {
         onClose();

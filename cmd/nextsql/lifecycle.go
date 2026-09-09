@@ -136,6 +136,7 @@ type detectResult struct {
 	ConfigParseErr  string `json:"config_parse_error,omitempty"`
 	DataFilePresent bool   `json:"data_file_present"`
 	KeystorePresent bool   `json:"keystore_present"`
+	AuthPresent     bool   `json:"auth_present"`
 
 	ResolvedDataDir    string `json:"resolved_data_dir,omitempty"`
 	ResolvedKeyFile    string `json:"resolved_key_file,omitempty"`
@@ -220,10 +221,14 @@ func lifecycleDetect(args []string) error {
 		}
 	}
 
+	if _, err := os.Stat(filepath.Join(*dataDir, config.AuthFileName)); err == nil {
+		r.AuthPresent = true
+	}
 	r.Status = setup.ClassifyInstall(setup.DetectInput{
 		ConfigPresent:   r.ConfigPresent,
 		DataFilePresent: r.DataFilePresent,
 		KeystorePresent: r.KeystorePresent,
+		AuthPresent:     r.AuthPresent,
 		LockHeld:        r.ServerRunning,
 	})
 	r.Summary = detectSummary(r)
@@ -249,6 +254,8 @@ func lifecycleDetect(args []string) error {
 	} else {
 		fmt.Fprintf(w, "  present        no\n")
 	}
+	fmt.Fprintf(w, "\ndeployment\n")
+	fmt.Fprintf(w, "  auth store     %s\n", presentWord(r.AuthPresent))
 	fmt.Fprintf(w, "\ndatabase\n")
 	fmt.Fprintf(w, "  data file      %s\n", presentWord(r.DataFilePresent))
 	fmt.Fprintf(w, "  keystore       %s\n", presentWord(r.KeystorePresent))
@@ -288,6 +295,8 @@ func detectSummary(r detectResult) string {
 		return "no NextSQL installation found here"
 	case setup.InstallConfigOnly:
 		return "a config file is present but the database has not been initialized"
+	case setup.InstallDeploymentOnly:
+		return "a deployment is provisioned here but holds no database; create one with `nextsql init --database NAME`"
 	case setup.InstallInitialized:
 		if r.DataFilePresent && !r.HeadersCompatible {
 			return "an initialized database is present but its headers are not compatible with this binary"

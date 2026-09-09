@@ -1048,6 +1048,23 @@ func TestRandomizedLargeInvariants(t *testing.T) {
 	if space < 1 {
 		space = 1
 	}
+	// The production soak enables a bounded heartbeat so an operator can see
+	// forward progress before the intentionally rare full invariant walks.
+	// Keep ordinary unit-test output quiet unless explicitly requested.
+	progressEvery := 0
+	if os.Getenv("NEXTSQL_BTREE_PROGRESS") != "" {
+		progressEvery = ops / 1000 // no more than 1,000 progress records
+		if progressEvery < 1 {
+			progressEvery = 1
+		}
+		if v := os.Getenv("NEXTSQL_BTREE_PROGRESS_EVERY"); v != "" {
+			n, err := strconv.Atoi(v)
+			if err != nil || n < 1 {
+				t.Fatalf("NEXTSQL_BTREE_PROGRESS_EVERY=%q", v)
+			}
+			progressEvery = n
+		}
+	}
 	present := make([]bool, space)
 	value := make([]int32, space) // op index fits int32; half the RAM of []int
 	live := 0
@@ -1068,6 +1085,7 @@ func TestRandomizedLargeInvariants(t *testing.T) {
 	if ops >= 1_000_000 {
 		flushEvery = 1_000_000
 	}
+	started := time.Now()
 	// checkEvery is the expensive, rare full structural invariant walk plus a
 	// scan count. Its map/slice transients are freed to the OS afterwards.
 	checkEvery := 1000
@@ -1155,6 +1173,12 @@ func TestRandomizedLargeInvariants(t *testing.T) {
 			// RAM-constrained soak host does not drift toward the OOM killer.
 			runtime.GC()
 			debug.FreeOSMemory()
+		}
+		if progressEvery > 0 && (i+1)%progressEvery == 0 {
+			elapsed := time.Since(started)
+			rate := float64(i+1) / elapsed.Seconds()
+			remaining := time.Duration(float64(ops-(i+1))/rate) * time.Second
+			t.Logf("progress op=%d/%d pct=%.1f live=%d elapsed=%s rate=%.0f_ops_per_sec eta=%s", i+1, ops, float64(i+1)*100/float64(ops), live, elapsed.Round(time.Second), rate, remaining.Round(time.Second))
 		}
 	}
 	commit(ops - 1)

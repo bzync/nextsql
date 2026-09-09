@@ -12,14 +12,37 @@ SELECT * FROM system.capabilities WHERE status = 'supported';
 SELECT name, remote FROM system.sessions WHERE state = 'active';
 ```
 
-`system.*` tables support `WHERE`, `ORDER BY`, `LIMIT`, `DISTINCT`, and typed
-parameters, evaluated over the generated rows — the same as any other SELECT
-— but not `JOIN`, subqueries in the `FROM` clause, or `GROUP BY`/`HAVING`.
+`system.*` tables support `WHERE`, `ORDER BY`, `LIMIT`, `DISTINCT`, typed
+parameters, and scalar aggregates, evaluated over the generated rows — the same
+as any other SELECT — but not `JOIN`, subqueries in the `FROM` clause, or
+`GROUP BY`/`HAVING`.
 Every session needs at least `CONNECT` on the database to query any
 `system.*` table; individual tables layer additional filtering on top (below).
 
+An aggregate select list (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `ARRAY_AGG`,
+`MAP_AGG`) collapses the filtered rows to one result row:
+
+```sql
+SELECT COUNT(*) FROM system.tables;
+SELECT COUNT(*) FROM system.columns WHERE table_name = 'orders';
+```
+
+The accumulators are the ones the user-table path uses, so `COUNT(*)` counts
+rows while `COUNT(col)` skips NULLs, and `COUNT(*)` over a catalog with no
+matching rows is `0` — one row, not zero rows. `LIMIT`/`OFFSET` bound that
+result rather than the rows the aggregate reads. Because there is no `GROUP BY`
+here, a bare column beside an aggregate has no single value to report and is
+rejected, exactly as it is for a user table.
+
+An aggregate may sit inside a larger expression, as on a user table:
+
+```sql
+SELECT COUNT(*) + 1 FROM system.tables;
+SELECT CASE WHEN COUNT(*) > 100 THEN 'large' ELSE 'small' END FROM system.columns;
+```
+
 `system.capabilities` carries the current `internal/system.SchemaVersion`
-(currently 3) as the supported capability name `system_schema_v3`, so machine
+(currently 4) as the supported capability name `system_schema_v4`, so machine
 consumers can detect column-contract changes without parsing prose. The
 `system_show_aliases` row advertises the convenience syntax separately. Bump
 `SchemaVersion` only when a `system.*` table's columns change shape.
@@ -131,9 +154,8 @@ administration tables. See `docs/design-multidatabase-dbaas.md`.
 
 | Table | Columns | Notes |
 |---|---|---|
-| `system.realms` | `realm_id, name, state, database_count, storage_cap_bytes, realm_root_delegated` | One row per registered realm. `storage_cap_bytes` is `0` for no realm-level cap; `realm_root_delegated` is true when a realm-root delegation secret hash is set (§10.1). |
-| `system.databases` | `realm_id, realm_name, database_id, name, state, layout, storage_cap_bytes` | One row per registered database across every realm. `layout` is `legacy_default` or `managed`. |
-| `system.quotas` | `scope, realm_name, database_name, state, cap_bytes, effective_cap_bytes, usage_known, used_bytes, pct_of_cap, over_cap` | Advisory surfacing of the storage caps (§10.1). One row per realm (`scope='realm'`, empty `database_name`) and per database (`scope='database'`). `cap_bytes` is that scope's own configured cap; `effective_cap_bytes` is `EffectiveStorageCapBytes(realmCap, dbCap)` for a database row, the realm cap for a realm row (`0` = uncapped). The usage columns (`used_bytes`, `pct_of_cap` as an integer percent, `over_cap`) are populated **only for the row matching the session's own connected realm+database** — `usage_known` flags which one — because no other database's engine is reachable from one connection. `used_bytes` is the data-file logical high-water, the quantity the cap is enforced against. Never a hard limit: the authoritative over-cap signal is the write-path `nerr.Exhausted` rejection. `system.capabilities` row `quotas_view`. |
+| `system.databases` | `database_id, name, state, storage_cap_bytes` | Exactly one row: the database this deployment serves. Empty when no deployment registry is attached. (`system.realms` was removed with multi-realm hosting in schema v4.) |
+| `system.quotas` | `database_name, state, cap_bytes, effective_cap_bytes, usage_known, used_bytes, pct_of_cap, over_cap` | Advisory surfacing of the deployment's storage cap. One row, matching `system.databases`. `cap_bytes` is the configured cap; `effective_cap_bytes` folds in a realm-level cap recorded by an earlier release (`0` = uncapped). The usage columns (`used_bytes`, `pct_of_cap` as an integer percent, `over_cap`) are populated when the row is the session's own connected database — `usage_known` flags that. `used_bytes` is the data-file logical high-water, the quantity the cap is enforced against. Never a hard limit: the authoritative over-cap signal is the write-path `nerr.Exhausted` rejection. `system.capabilities` row `quotas_view`. |
 
 ## Design notes
 

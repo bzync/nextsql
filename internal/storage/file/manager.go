@@ -67,7 +67,12 @@ func Create(path string, id format.Identity, keys crypto.KeyProvider) (*Manager,
 		return nil, err
 	}
 	if err := diskio.SyncDir(filepath.Dir(path)); err != nil && filepath.Dir(path) != "." {
+		// The directory entry is not durable, so this file does not reliably
+		// exist. Remove it, as the failure paths above do: leaving it behind
+		// makes every later Create at this path fail with AlreadyExists even
+		// though no usable database was ever produced.
 		_ = f.Close()
+		_ = os.Remove(path)
 		return nil, err
 	}
 	return m, nil

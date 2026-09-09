@@ -19,7 +19,6 @@ export function Login({ onSignedIn }: { onSignedIn: (who: Whoami) => void }) {
         user: String(fd.get("user") ?? ""),
         password: String(fd.get("password") ?? ""),
         database: String(fd.get("database") ?? ""),
-        realm: String(fd.get("realm") ?? ""),
       });
       onSignedIn(who);
     } catch (err) {
@@ -57,8 +56,8 @@ export function Login({ onSignedIn }: { onSignedIn: (who: Whoami) => void }) {
                 <ThemeSelect />
               </div>
               <Text variant="muted">
-                Sign in with NextSQL credentials. Database and realm are optional
-                when the server has defaults.
+                Sign in with NextSQL credentials. The database is optional when
+                the server has a default.
               </Text>
               {error ? <Alert variant="error" title="Sign-in failed">{error}</Alert> : null}
               <form onSubmit={submit} autoComplete="off" aria-busy={busy || undefined}>
@@ -66,7 +65,6 @@ export function Login({ onSignedIn }: { onSignedIn: (who: Whoami) => void }) {
                   <Input id="f-user" name="user" label="User" required autoComplete="username" />
                   <Input id="f-pw" name="password" label="Password" type="password" required autoComplete="current-password" />
                   <Input id="f-db" name="database" label="Database" hint="Optional" />
-                  <Input id="f-realm" name="realm" label="Realm" hint="Optional" />
                   <Button type="submit" disabled={busy} icon={<Icon name="lock" size={14} />}>
                     {busy ? "Signing in…" : "Sign in"}
                   </Button>

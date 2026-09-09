@@ -242,7 +242,8 @@ with `PROBES` and reaches 1.0 when every list is probed (`PROBES = LISTS`).
   directly from the index tree instead. This is the same generation-tracked cache
   the HNSW graph uses.
 - `nextsql-bench --vecquant` includes an IVF row (see "Size / recall comparison"
-  above). IVF is not yet supported on partitioned tables.
+  above). On a partitioned table, every partition owns a trained IVF tree and
+  `NEAREST` merges candidates from the selected partitions.
 
 The portable core (`TrainIVF`, `AddIVF`, `RemoveIVF`, `SearchIVF`, the `IVFStore`
 interface, the `NSIV` / `NSIC` / `NSIL` encodings) lives in `internal/vector`.
@@ -275,7 +276,9 @@ tracks an unquantised IVF; without them the ADC ranking stands.
 - The residual formulation is Euclidean, so IVF-PQ supports `COSINE` (unit-
   normalised first) and `L2`; `INNER_PRODUCT` is rejected. `WITH (QUANTIZATION =
   …)` is not a valid IVFPQ option, and IVF-PQ is rejected on a `BITVECTOR` column
-  and on partitioned tables (as plain IVF is).
+  and on a `BITVECTOR` column. On a partitioned table, every partition owns a
+  trained IVF-PQ tree and `NEAREST` merges candidates from the selected
+  partitions.
 - Encodings: `NSPQ` meta (dimension, metric, `LISTS`, `PROBES`, `M`, count),
   `NSPC` codebook (contiguous `f32` sub-centroids), and `NSPL` posting lists (the
   same front-coded primary-key scheme as `NSIL`, with the `M` code bytes appended
@@ -586,9 +589,9 @@ compatibility / durability argument. It is a review, not a proof of zero defects
 | `BITVECTOR<N>` + `HAMMING` | Bit-packed payload (`ceil(N/8)` bytes). Elements are exactly 0/1 (rejected, never rounded). Hamming is the default and only metric. HNSW builds a Hamming graph. |
 | Quantised HNSW | `USING HNSW WITH (QUANTIZATION = 'F16' \| 'I8')` traverses on a compact copy and re-ranks against full-precision payloads, so recall tracks an unquantised graph. `NONE` is the default. |
 | Compressed neighbour lists | HNSW node format v2 front-codes each layer. Lossless: v1 records still decode; recall and neighbour sets are unchanged. |
-| IVF | `USING IVF WITH (LISTS = n [, PROBES = m])`. Encrypted detached index tree, process-local quantiser cache, not on partitioned tables. |
-| IVF-PQ | `USING IVFPQ WITH (LISTS = n, SUBSPACES = M [, PROBES = m])`. ADC + exact re-rank. Encrypted detached index tree. Not on partitioned tables. No process-local cache yet (follow-on). |
-| `SPARSEVECTOR<N>` + `USING SPARSE` | Inverted-index exact inner product, optional COSINE re-rank. Encrypted detached index tree. Not on partitioned tables. |
+| IVF | `USING IVF WITH (LISTS = n [, PROBES = m])`. Encrypted detached index tree and process-local quantiser cache; partitioned tables own one tree per partition. |
+| IVF-PQ | `USING IVFPQ WITH (LISTS = n, SUBSPACES = M [, PROBES = m])`. ADC + exact re-rank. Encrypted detached index tree; partitioned tables own one tree per partition. No process-local cache yet (follow-on). |
+| `SPARSEVECTOR<N>` + `USING SPARSE` | Inverted-index exact inner product, optional COSINE re-rank. Encrypted detached index tree; partitioned tables own one tree per partition. |
 | Dense + sparse + BM25 fusion | A second `NEAREST` unions candidates and reciprocal-rank fuses them. |
 
 Every new representation uses a versioned encoding. Every ANN structure is
@@ -663,7 +666,6 @@ comparison** above for the 2026-08-31 reference run.
 - a `BITVECTOR` / Hamming row in `nextsql-bench --vecquant`;
 - a process-local IVF-PQ quantiser cache (plain IVF already has one);
 - a re-rank-free quantised HNSW mode that drops the full payload;
-- IVF / IVF-PQ / `USING SPARSE` on partitioned tables;
 - SIMD / `unsafe` acceleration, only after profiling, isolation, tests, fuzzing,
   and a measured win.
 

@@ -112,6 +112,13 @@ func (s *Session) eval(e ast.Expr, tab *catalog.Table, row []types.Value) (types
 			if dv, ok, err := evalVecFn(x.Name, args); err != nil || ok {
 				return dv, err
 			}
+			// An aggregate reaching per-row evaluation is a real function that
+			// simply has no meaning against a single row. Saying "unknown
+			// function" would send the reader looking for a typo instead of at
+			// where the aggregate was written.
+			if systemAggFuncs(x.Name) {
+				return types.Value{}, nerr.New(nerr.InvalidArgument, "executor.eval", x.Name+" is an aggregate and cannot be evaluated per row here")
+			}
 			return types.Value{}, nerr.New(nerr.InvalidArgument, "executor.eval", "unknown function")
 		}
 	case ast.ArrayCtor:
@@ -303,6 +310,26 @@ func (s *Session) eval(e ast.Expr, tab *catalog.Table, row []types.Value) (types
 			return types.Value{}, nerr.New(nerr.InvalidArgument, "executor.eval", "path extract requires a JSON or STRUCT column")
 		}
 		return types.ExtractJSON(v.JSON, x.Parts[1:])
+	case ast.Subscript:
+		coll, err := s.eval(x.Coll, tab, row)
+		if err != nil {
+			return types.Value{}, err
+		}
+		idx, err := s.eval(x.Index, tab, row)
+		if err != nil {
+			return types.Value{}, err
+		}
+		if coll.Null {
+			return types.Null(elemType(coll.Typ)), nil
+		}
+		val, ok, err := evalCollectionFn("element_at", []types.Value{coll, idx})
+		if err != nil {
+			return types.Value{}, err
+		}
+		if !ok {
+			return types.Value{}, nerr.New(nerr.InvalidArgument, "executor.eval", "subscript not supported on "+coll.Typ.String())
+		}
+		return val, nil
 	default:
 		return types.Value{}, nerr.New(nerr.InvalidArgument, "executor.eval", "unsupported expression")
 	}
@@ -349,6 +376,9 @@ func (s *Session) evalSubqueryAnyColumns(id uint64, query ast.Stmt, outer *catal
 	}
 	bound, err := binder.Bind(stmt, s.lookup, s.db.Cat.PeekNext())
 	if err != nil {
+		return nil, err
+	}
+	if err := s.validateClientEncryptedPredicateParams(bound); err != nil {
 		return nil, err
 	}
 	plan, err := planner.Plan(bound)

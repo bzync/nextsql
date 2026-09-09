@@ -2,6 +2,7 @@ package binder
 
 import (
 	"reflect"
+	"strconv"
 	"strings"
 
 	"github.com/bzync/nextsql/internal/catalog"
@@ -20,10 +21,6 @@ type Bound interface{ bound() }
 type (
 	CreateTable struct {
 		Table *catalog.Table
-	}
-	CreateDatabase struct {
-		Name        string
-		IfNotExists bool
 	}
 	ShowTasks struct {
 		After string
@@ -175,8 +172,17 @@ type (
 	Agg struct {
 		Fun  string
 		Arg  ast.Expr
+		Arg2 ast.Expr
 		Col  int
+		Col2 int
 		Star bool
+	}
+	Unnest struct {
+		Table  *catalog.Table
+		Expr   ast.Expr
+		Alias  string
+		Column string
+		Offset bool
 	}
 	BoundWindow struct {
 		Fun       string
@@ -223,30 +229,30 @@ type (
 	}
 )
 
-func (CreateTable) bound()    {}
-func (CreateDatabase) bound() {}
-func (ShowTasks) bound()      {}
-func (CancelTask) bound()     {}
-func (Subscribe) bound()      {}
-func (DropTable) bound()      {}
-func (DropIndex) bound()      {}
-func (RebuildIndex) bound()   {}
-func (AlterTable) bound()     {}
-func (CreateIndex) bound()    {}
-func (Insert) bound()         {}
-func (Upsert) bound()         {}
-func (Select) bound()         {}
-func (SetOperation) bound()   {}
-func (With) bound()           {}
-func (CTERef) bound()         {}
-func (Update) bound()         {}
-func (Delete) bound()         {}
-func (Begin) bound()          {}
-func (Commit) bound()         {}
-func (Rollback) bound()       {}
-func (Explain) bound()        {}
-func (Analyze) bound()        {}
-func (Maintain) bound()       {}
+func (CreateTable) bound()  {}
+func (ShowTasks) bound()    {}
+func (CancelTask) bound()   {}
+func (Subscribe) bound()    {}
+func (DropTable) bound()    {}
+func (DropIndex) bound()    {}
+func (RebuildIndex) bound() {}
+func (AlterTable) bound()   {}
+func (CreateIndex) bound()  {}
+func (Insert) bound()       {}
+func (Upsert) bound()       {}
+func (Select) bound()       {}
+func (Unnest) bound()       {}
+func (SetOperation) bound() {}
+func (With) bound()         {}
+func (CTERef) bound()       {}
+func (Update) bound()       {}
+func (Delete) bound()       {}
+func (Begin) bound()        {}
+func (Commit) bound()       {}
+func (Rollback) bound()     {}
+func (Explain) bound()      {}
+func (Analyze) bound()      {}
+func (Maintain) bound()     {}
 
 func Bind(stmt ast.Stmt, lookup Lookup, nextID uint32) (Bound, error) {
 	return bind(stmt, lookup, nextID, nil)
@@ -306,22 +312,10 @@ func bind(stmt ast.Stmt, lookup Lookup, nextID uint32, ctes map[string]*CTE) (Bo
 					return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "primary key must include every partition column")
 				}
 			}
-			// Cross-partition FKs are not yet supported transactionally.
-			if len(t.ForeignKeys) > 0 {
-				return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "partitioned tables cannot have foreign keys in this slice")
-			}
 			// Partition key must be NOT NULL or PRIMARY? Enforce NOT NULL for RANGE/TENANT.
 			// Tenant partitioning must be on tenant_id.
 		}
 		return CreateTable{Table: t}, nil
-	case ast.CreateDatabase:
-		if s.Name == "" {
-			return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "empty database name")
-		}
-		if catalog.ReservedName(s.Name) {
-			return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "database name prefix nsql_ is reserved")
-		}
-		return CreateDatabase{Name: s.Name, IfNotExists: s.IfNotExists}, nil
 	case ast.Subscribe:
 		tab, err := mustTable(lookup, s.Table)
 		if err != nil {
@@ -450,7 +444,7 @@ func bind(stmt ast.Stmt, lookup Lookup, nextID uint32, ctes map[string]*CTE) (Bo
 		if err := checkExpr(s.Where, tab, types.Bool(), true); err != nil {
 			return nil, err
 		}
-		if err := rejectClientEncryptedExpr(s.Where, tab, "WHERE"); err != nil {
+		if err := rejectClientEncryptedWhere(s.Where, tab); err != nil {
 			return nil, err
 		}
 		if err := rejectSearchHL(s.Where); err != nil {
@@ -477,7 +471,7 @@ func bind(stmt ast.Stmt, lookup Lookup, nextID uint32, ctes map[string]*CTE) (Bo
 		if err := checkExpr(s.Where, tab, types.Bool(), true); err != nil {
 			return nil, err
 		}
-		if err := rejectClientEncryptedExpr(s.Where, tab, "WHERE"); err != nil {
+		if err := rejectClientEncryptedWhere(s.Where, tab); err != nil {
 			return nil, err
 		}
 		if err := rejectSearchHL(s.Where); err != nil {
@@ -555,6 +549,11 @@ func boundNames(b Bound) ([]string, bool) {
 			names[i] = c.Name
 		}
 		return names, true
+	case Unnest:
+		if x.Offset {
+			return []string{x.Column, "offset"}, true
+		}
+		return []string{x.Column}, true
 	default:
 		return nil, false
 	}
@@ -675,6 +674,11 @@ func checkExpr(e ast.Expr, tab *catalog.Table, hint types.Type, allowNil bool) e
 		return nil
 	case ast.FieldAccess:
 		return checkExpr(x.Base, tab, types.Type{}, false)
+	case ast.Subscript:
+		if err := checkExpr(x.Coll, tab, types.Type{}, false); err != nil {
+			return err
+		}
+		return checkExpr(x.Index, tab, types.Type{}, false)
 	case ast.Call:
 		switch x.Name {
 		case "uuid", "now", "ai":
@@ -695,6 +699,25 @@ func checkExpr(e ast.Expr, tab *catalog.Table, hint types.Type, allowNil bool) e
 				return nerr.New(nerr.InvalidArgument, "sql.binder", x.Name+" takes one argument")
 			}
 			return checkExpr(x.Args[0], tab, types.Type{}, false)
+		case "array_agg":
+			if x.Star {
+				return nerr.New(nerr.InvalidArgument, "sql.binder", "array_agg does not accept *")
+			}
+			if len(x.Args) != 1 {
+				return nerr.New(nerr.InvalidArgument, "sql.binder", "array_agg takes one argument")
+			}
+			return checkExpr(x.Args[0], tab, types.Type{}, false)
+		case "map_agg":
+			if x.Star {
+				return nerr.New(nerr.InvalidArgument, "sql.binder", "map_agg does not accept *")
+			}
+			if len(x.Args) != 2 {
+				return nerr.New(nerr.InvalidArgument, "sql.binder", "map_agg takes two arguments")
+			}
+			if err := checkExpr(x.Args[0], tab, types.Type{}, false); err != nil {
+				return err
+			}
+			return checkExpr(x.Args[1], tab, types.Type{}, false)
 		case "lower", "upper", "length", "trim", "ltrim", "rtrim":
 			if x.Star || len(x.Args) != 1 {
 				return nerr.New(nerr.InvalidArgument, "sql.binder", x.Name+" takes one argument")
@@ -901,7 +924,54 @@ func bindSelect(s ast.Select, lookup Lookup, ctes map[string]*CTE) (Bound, error
 	}
 	var left *catalog.Table
 	var input Bound
-	if s.FromQuery != nil {
+	if s.Unnest != nil {
+		if len(s.Joins) > 0 {
+			return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "joins from UNNEST are not yet supported")
+		}
+		if err := checkExpr(s.Unnest.Expr, nil, types.Type{}, false); err != nil {
+			return nil, err
+		}
+		collTy := exprType(s.Unnest.Expr, nil)
+		var cols []catalog.Column
+		if collTy.Kind == types.KindMap || len(s.Unnest.Columns) >= 2 {
+			kName := "key"
+			vName := "value"
+			if len(s.Unnest.Columns) >= 1 && s.Unnest.Columns[0] != "" {
+				kName = s.Unnest.Columns[0]
+			}
+			if len(s.Unnest.Columns) >= 2 && s.Unnest.Columns[1] != "" {
+				vName = s.Unnest.Columns[1]
+			}
+			kTy, vTy := types.String(), types.String()
+			if len(collTy.Key) > 0 {
+				kTy = collTy.Key[0]
+			}
+			if len(collTy.Elem) > 0 {
+				vTy = collTy.Elem[0]
+			}
+			cols = append(cols, catalog.Column{Name: kName, Type: kTy})
+			cols = append(cols, catalog.Column{Name: vName, Type: vTy})
+		} else {
+			cName := s.Unnest.Column
+			if cName == "" {
+				cName = "value"
+			}
+			eTy := types.Type{Kind: types.KindInvalid}
+			if collTy.Kind == types.KindArray && len(collTy.Elem) > 0 {
+				eTy = collTy.Elem[0]
+			}
+			cols = append(cols, catalog.Column{Name: cName, Type: eTy})
+		}
+		if s.Unnest.Offset != "" {
+			cols = append(cols, catalog.Column{Name: s.Unnest.Offset, Type: types.Int64()})
+		}
+		tblName := s.Unnest.Alias
+		if tblName == "" {
+			tblName = "unnest"
+		}
+		left = &catalog.Table{Name: tblName, Columns: cols}
+		input = Unnest{Table: left, Expr: s.Unnest.Expr, Alias: tblName, Column: s.Unnest.Column, Offset: s.Unnest.Offset != ""}
+	} else if s.FromQuery != nil {
 		if len(s.Joins) > 0 {
 			return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "joins from a derived table are not yet supported")
 		}
@@ -986,13 +1056,6 @@ func bindSelect(s ast.Select, lookup Lookup, ctes map[string]*CTE) (Bound, error
 		}
 		joins = append(joins, BoundJoin{Table: right, On: joinOn, Kind: js.Kind, Input: jInput})
 	}
-	if (len(s.SearchCols) > 0 || s.NearestCol != "" || s.Nearest2Col != "") && len(s.Joins) > 0 {
-		for _, js := range s.Joins {
-			if js.Kind == ast.JoinLeft || js.Kind == ast.JoinRight || js.Kind == ast.JoinFull {
-				return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "SEARCH/NEAREST does not support outer JOIN")
-			}
-		}
-	}
 	where := rewriteQual(s.Where, schema)
 	if containsWindow(where) {
 		return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "window functions are not allowed in WHERE")
@@ -1000,7 +1063,7 @@ func bindSelect(s ast.Select, lookup Lookup, ctes map[string]*CTE) (Bound, error
 	if err := checkExpr(where, schema, types.Bool(), true); err != nil {
 		return nil, err
 	}
-	if err := rejectClientEncryptedExpr(where, schema, "WHERE"); err != nil {
+	if err := rejectClientEncryptedWhere(where, schema); err != nil {
 		return nil, err
 	}
 	if err := rejectSearchHL(where); err != nil {
@@ -1156,11 +1219,34 @@ func bindSelect(s ast.Select, lookup Lookup, ctes map[string]*CTE) (Bound, error
 		if err := rejectSearchHL(s.Group[i]); err != nil {
 			return nil, err
 		}
+		// A grouping item is either a column of the input or an expression the
+		// planner materialises into one before aggregating. What it must never
+		// be is silently dropped: dropping a group does not disable grouping,
+		// it collapses every row into one group and reports a value from it.
+		if id, isIdent := s.Group[i].(ast.Ident); isIdent {
+			if _, found := schema.ColIndex(id.Name); !found {
+				return nil, nerr.New(nerr.NotFound, "sql.binder", "unknown column in GROUP BY")
+			}
+		}
+		// GROUP BY 1 means the first select item in standard SQL. Now that a
+		// computed grouping expression is materialised, a bare integer would
+		// otherwise be taken literally and quietly produce a single constant
+		// group — a different answer under the same spelling. Positional
+		// grouping is not implemented, so say so.
+		if _, isOrdinal := orderOrdinal(s.Group[i]); isOrdinal {
+			return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "positional GROUP BY is not supported; name the column or repeat the expression")
+		}
 		out.Groups = append(out.Groups, s.Group[i])
 	}
 	var hasAgg, hasBare bool
+	// HAVING is matched against the select list as the user wrote it. Aggregate
+	// calls in OutExprs are rewritten to their reserved intermediate columns
+	// below, so the rewritten form would never match a HAVING that names the
+	// aggregate; keep the pre-rewrite expressions for that comparison.
+	var selected []ast.Expr
 	for _, item := range s.List {
 		ex := rewriteQual(item.Expr, schema)
+		selected = append(selected, ex)
 		if err := checkExpr(ex, schema, types.Type{}, false); err != nil {
 			return nil, err
 		}
@@ -1188,27 +1274,36 @@ func bindSelect(s ast.Select, lookup Lookup, ctes map[string]*CTE) (Bound, error
 			}
 		} else if call, ok := ex.(ast.Call); ok && isAgg(call.Name) {
 			hasAgg = true
-			col := -1
-			var arg ast.Expr
-			if !call.Star && len(call.Args) == 1 {
-				arg = call.Args[0]
-				if id, ok := arg.(ast.Ident); ok {
-					if i, found := schema.ColIndex(id.Name); found {
-						col = i
-					}
-				}
-			}
 			if name == "" {
 				name = call.Name
 			}
-			out.Aggs = append(out.Aggs, Agg{Fun: call.Name, Arg: arg, Col: col, Star: call.Star})
+			// A bare aggregate is rewritten to its reserved intermediate
+			// column exactly like a nested one. Keeping the call here instead
+			// would leave the projection matching output items to aggregate
+			// slots by position, and a rewritten neighbour consumes a slot
+			// without advancing that position — SELECT MAX(a) + 1, COUNT(*)
+			// would read the max into the count. One representation, no
+			// counters.
+			if _, err := bindAgg(call, schema, &out); err != nil {
+				return nil, err
+			}
 		} else {
 			if containsGroupingAgg(ex) {
+				// An aggregate inside a larger expression is evaluated after
+				// aggregation, against the aggregated row. Each aggregate call
+				// is registered as its own spec and replaced by the reserved
+				// intermediate column that will hold its value, so the
+				// surrounding expression no longer references the input rows
+				// the aggregate consumed. A window function is left alone by
+				// the rewrite: it has its own path.
 				hasAgg = true
+				if _, err := rewriteNestedAggs(ex, schema, &out); err != nil {
+					return nil, err
+				}
 			} else if !containsWindow(ex) {
 				hasBare = true
-				if len(s.Group) > 0 && !grouped(ex, s.Group) {
-					return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "select item must be an aggregate or GROUP BY expression")
+				if len(s.Group) > 0 && !groupCovered(ex, s.Group) {
+					return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "select item must be an aggregate, or read only grouping columns")
 				}
 			}
 		}
@@ -1243,7 +1338,7 @@ func bindSelect(s ast.Select, lookup Lookup, ctes map[string]*CTE) (Bound, error
 		if !out.HasAgg {
 			return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "HAVING requires GROUP BY or an aggregate")
 		}
-		having, err := bindHaving(s.Having, out)
+		having, err := bindHaving(s.Having, out, schema, selected)
 		if err != nil {
 			return nil, err
 		}
@@ -1255,14 +1350,85 @@ func bindSelect(s ast.Select, lookup Lookup, ctes map[string]*CTE) (Bound, error
 	if err := bindWindows(&out, schema); err != nil {
 		return nil, err
 	}
+	// Rewrite each aggregate call in the select list to the reserved
+	// intermediate column holding its value, so the executor can evaluate the
+	// whole select item against the aggregated row. This runs last, and only
+	// when no window function is present: a window over an aggregate has its
+	// own intermediate schema (bindWindowsAfterAgg), which recovers output
+	// names by matching the calls still standing in OutExprs and rewrites them
+	// itself. Rewriting before that would hide the calls it looks for.
+	if out.HasAgg && len(out.Windows) == 0 {
+		n := 0
+		for i, ex := range out.OutExprs {
+			out.OutExprs[i] = replaceAggsWithSlots(replaceGroupExprs(ex, out.Groups), &n)
+		}
+	}
 	return out, nil
 }
 
-func bindHaving(e ast.Expr, out Select) (ast.Expr, error) {
+// replaceAggsWithSlots substitutes each aggregate call with its reserved
+// intermediate column. It walks in the same order bindAgg registered the
+// aggregates, so the n-th call it meets is the n-th spec.
+func replaceAggsWithSlots(e ast.Expr, n *int) ast.Expr {
+	if e == nil {
+		return nil
+	}
+	switch x := e.(type) {
+	case ast.Window:
+		return x
+	case ast.Call:
+		if isAgg(x.Name) {
+			slot := ast.Ident{Name: aggSlotName(*n)}
+			*n++
+			return slot
+		}
+		args := make([]ast.Expr, len(x.Args))
+		for i := range x.Args {
+			args[i] = replaceAggsWithSlots(x.Args[i], n)
+		}
+		return ast.Call{Name: x.Name, Args: args, Star: x.Star}
+	case ast.Unary:
+		return ast.Unary{Op: x.Op, Right: replaceAggsWithSlots(x.Right, n)}
+	case ast.Binary:
+		return ast.Binary{Op: x.Op, Left: replaceAggsWithSlots(x.Left, n), Right: replaceAggsWithSlots(x.Right, n)}
+	case ast.Between:
+		return ast.Between{Expr: replaceAggsWithSlots(x.Expr, n), Low: replaceAggsWithSlots(x.Low, n), High: replaceAggsWithSlots(x.High, n), Not: x.Not}
+	case ast.IsNull:
+		return ast.IsNull{Expr: replaceAggsWithSlots(x.Expr, n), Not: x.Not}
+	case ast.Case:
+		whens := make([]ast.CaseWhen, len(x.Whens))
+		for i, arm := range x.Whens {
+			whens[i] = ast.CaseWhen{When: replaceAggsWithSlots(arm.When, n), Then: replaceAggsWithSlots(arm.Then, n)}
+		}
+		return ast.Case{Operand: replaceAggsWithSlots(x.Operand, n), Whens: whens, Else: replaceAggsWithSlots(x.Else, n)}
+	case ast.ArrayCtor:
+		elems := make([]ast.Expr, len(x.Elems))
+		for i := range x.Elems {
+			elems[i] = replaceAggsWithSlots(x.Elems[i], n)
+		}
+		return ast.ArrayCtor{Elems: elems}
+	case ast.FieldAccess:
+		return ast.FieldAccess{Base: replaceAggsWithSlots(x.Base, n), Field: x.Field}
+	case ast.Subscript:
+		return ast.Subscript{Coll: replaceAggsWithSlots(x.Coll, n), Index: replaceAggsWithSlots(x.Index, n)}
+	}
+	return e
+}
+
+func bindHaving(e ast.Expr, out Select, schema *catalog.Table, selected []ast.Expr) (ast.Expr, error) {
+	// Normalise the HAVING expression the same way the select list was
+	// normalised before comparing the two. Select items are stored after
+	// rewriteQual, which rebuilds every ast.Call with a freshly made Args
+	// slice; for a star aggregate that slice is empty but non-nil, while the
+	// parser leaves Args nil. reflect.DeepEqual separates those, so an
+	// un-normalised HAVING COUNT(*) could never match the selected COUNT(*)
+	// and fell through to per-row evaluation. Normalising both sides also
+	// lets HAVING use a qualified reference, as the select list can.
+	e = rewriteQual(e, schema)
 	var rewrite func(ast.Expr) ast.Expr
 	rewrite = func(e ast.Expr) ast.Expr {
-		for i, selected := range out.OutExprs {
-			if reflect.DeepEqual(e, selected) {
+		for i, sel := range selected {
+			if i < len(out.OutNames) && reflect.DeepEqual(e, sel) {
 				return ast.Ident{Name: out.OutNames[i]}
 			}
 		}
@@ -1409,7 +1575,7 @@ func orderOrdinal(e ast.Expr) (int, bool) {
 
 func isAgg(name string) bool {
 	switch name {
-	case "count", "sum", "avg", "min", "max":
+	case "count", "sum", "avg", "min", "max", "array_agg", "map_agg":
 		return true
 	}
 	return false
@@ -1417,6 +1583,13 @@ func isAgg(name string) bool {
 
 func grouped(e ast.Expr, groups []ast.Expr) bool {
 	es := exprKey(e)
+	// exprKey yields "" for any form it cannot identify. Comparing those for
+	// equality would make two *different* unidentifiable expressions look like
+	// the same one, so an ungrouped select item could pass as grouped. An
+	// expression whose identity is unknown is not provably grouped.
+	if es == "" {
+		return false
+	}
 	for _, g := range groups {
 		if exprKey(g) == es {
 			return true
@@ -1438,6 +1611,8 @@ func exprKey(e ast.Expr) string {
 		return "i:" + x.Name
 	case ast.Literal:
 		return "l:" + x.Value.String()
+	case ast.Subscript:
+		return "s:" + exprKey(x.Coll) + "[" + exprKey(x.Index) + "]"
 	case ast.Path:
 		s := "p:"
 		for i, p := range x.Parts {
@@ -1708,6 +1883,8 @@ func rewriteQual(e ast.Expr, schema *catalog.Table) ast.Expr {
 			whens[i] = ast.CaseWhen{When: rewriteQual(arm.When, schema), Then: rewriteQual(arm.Then, schema)}
 		}
 		return ast.Case{Operand: rewriteQual(x.Operand, schema), Whens: whens, Else: rewriteQual(x.Else, schema)}
+	case ast.Subscript:
+		return ast.Subscript{Coll: rewriteQual(x.Coll, schema), Index: rewriteQual(x.Index, schema)}
 	default:
 		return e
 	}
@@ -2345,4 +2522,268 @@ func remapIndexOrds(idx catalog.Index, dropped int) catalog.Index {
 	idx.Columns = remapOrds(idx.Columns, dropped)
 	idx.Include = remapOrds(idx.Include, dropped)
 	return idx
+}
+
+// aggSlotName is the reserved name of the intermediate column holding the i-th
+// aggregate's value. `#` cannot appear in an identifier the lexer produces, so
+// a rewritten expression can never collide with a real column.
+func aggSlotName(i int) string { return "agg#" + strconv.Itoa(i) }
+
+// AggSlotName exposes the reserved intermediate name to the executor, which
+// builds the row these rewritten expressions are evaluated against.
+func AggSlotName(i int) string { return aggSlotName(i) }
+
+// grpSlotName is the reserved name of the column holding the i-th grouping
+// expression when that expression is computed rather than a plain column. Like
+// aggSlotName it uses `#`, which no identifier from the lexer contains.
+func grpSlotName(i int) string { return "grp#" + strconv.Itoa(i) }
+
+// GrpSlotName exposes that name to the planner, which materialises the
+// expression into a column of that name, and to the executor, which reads it.
+func GrpSlotName(i int) string { return grpSlotName(i) }
+
+// replaceGroupExprs substitutes any sub-expression written exactly like a
+// computed grouping expression with the reserved column that will hold it. A
+// grouping column needs no substitution: it keeps its own name in the
+// aggregated row.
+func replaceGroupExprs(e ast.Expr, groups []ast.Expr) ast.Expr {
+	if e == nil {
+		return nil
+	}
+	// Every grouping item — a plain column as much as a computed expression —
+	// is addressed in the aggregated row by its reserved slot, so the executor
+	// never has to know which of the two it was.
+	for i, g := range groups {
+		if reflect.DeepEqual(e, g) {
+			return ast.Ident{Name: grpSlotName(i)}
+		}
+	}
+	switch x := e.(type) {
+	case ast.Window:
+		return x
+	case ast.Call:
+		args := make([]ast.Expr, len(x.Args))
+		for i := range x.Args {
+			args[i] = replaceGroupExprs(x.Args[i], groups)
+		}
+		return ast.Call{Name: x.Name, Args: args, Star: x.Star}
+	case ast.Unary:
+		return ast.Unary{Op: x.Op, Right: replaceGroupExprs(x.Right, groups)}
+	case ast.Binary:
+		return ast.Binary{Op: x.Op, Left: replaceGroupExprs(x.Left, groups), Right: replaceGroupExprs(x.Right, groups)}
+	case ast.Between:
+		return ast.Between{Expr: replaceGroupExprs(x.Expr, groups), Low: replaceGroupExprs(x.Low, groups), High: replaceGroupExprs(x.High, groups), Not: x.Not}
+	case ast.IsNull:
+		return ast.IsNull{Expr: replaceGroupExprs(x.Expr, groups), Not: x.Not}
+	case ast.Case:
+		whens := make([]ast.CaseWhen, len(x.Whens))
+		for i, arm := range x.Whens {
+			whens[i] = ast.CaseWhen{When: replaceGroupExprs(arm.When, groups), Then: replaceGroupExprs(arm.Then, groups)}
+		}
+		return ast.Case{Operand: replaceGroupExprs(x.Operand, groups), Whens: whens, Else: replaceGroupExprs(x.Else, groups)}
+	case ast.ArrayCtor:
+		elems := make([]ast.Expr, len(x.Elems))
+		for i := range x.Elems {
+			elems[i] = replaceGroupExprs(x.Elems[i], groups)
+		}
+		return ast.ArrayCtor{Elems: elems}
+	case ast.FieldAccess:
+		return ast.FieldAccess{Base: replaceGroupExprs(x.Base, groups), Field: x.Field}
+	case ast.Subscript:
+		return ast.Subscript{Coll: replaceGroupExprs(x.Coll, groups), Index: replaceGroupExprs(x.Index, groups)}
+	}
+	return e
+}
+
+// bindAgg validates one aggregate call and appends it to out.Aggs, returning
+// the reserved intermediate column that will hold its value. Argument checking
+// is shared with the bare-aggregate path so a nested aggregate cannot accept
+// something the same aggregate would refuse on its own.
+func bindAgg(call ast.Call, schema *catalog.Table, out *Select) (ast.Expr, error) {
+	col, col2 := -1, -1
+	var arg, arg2 ast.Expr
+	// An argument is either a column of the input, or an expression the planner
+	// materialises into one before aggregating. Col stays -1 for the latter and
+	// the planner fills it in; it must not reach the executor that way, because
+	// -1 already means COUNT(*).
+	if !call.Star && len(call.Args) >= 1 {
+		arg = call.Args[0]
+		if id, isIdent := arg.(ast.Ident); isIdent {
+			var found bool
+			if col, found = schema.ColIndex(id.Name); !found {
+				return nil, nerr.New(nerr.NotFound, "sql.binder", "unknown column in "+call.Name)
+			}
+		} else if err := checkExpr(arg, schema, types.Type{}, false); err != nil {
+			return nil, err
+		}
+	}
+	if !call.Star && len(call.Args) == 2 {
+		arg2 = call.Args[1]
+		if id, isIdent := arg2.(ast.Ident); isIdent {
+			var found bool
+			if col2, found = schema.ColIndex(id.Name); !found {
+				return nil, nerr.New(nerr.NotFound, "sql.binder", "unknown column in "+call.Name)
+			}
+		} else if err := checkExpr(arg2, schema, types.Type{}, false); err != nil {
+			return nil, err
+		}
+	}
+	slot := aggSlotName(len(out.Aggs))
+	out.Aggs = append(out.Aggs, Agg{Fun: call.Name, Arg: arg, Arg2: arg2, Col: col, Col2: col2, Star: call.Star})
+	return ast.Ident{Name: slot}, nil
+}
+
+// rewriteNestedAggs replaces every aggregate call inside e with the reserved
+// intermediate column that will hold its value, so the surrounding expression
+// can be evaluated against the aggregated row rather than the input rows it was
+// computed from. A window function is left alone: it is evaluated on its own
+// path and must not be turned into an aggregate slot.
+func rewriteNestedAggs(e ast.Expr, schema *catalog.Table, out *Select) (ast.Expr, error) {
+	if e == nil {
+		return nil, nil
+	}
+	var err error
+	rw := func(x ast.Expr) ast.Expr {
+		if err != nil {
+			return x
+		}
+		var r ast.Expr
+		r, err = rewriteNestedAggs(x, schema, out)
+		return r
+	}
+	switch x := e.(type) {
+	case ast.Window:
+		return x, nil
+	case ast.Call:
+		if isAgg(x.Name) {
+			return bindAgg(x, schema, out)
+		}
+		args := make([]ast.Expr, len(x.Args))
+		for i := range x.Args {
+			args[i] = rw(x.Args[i])
+		}
+		if err != nil {
+			return nil, err
+		}
+		return ast.Call{Name: x.Name, Args: args, Star: x.Star}, nil
+	case ast.Unary:
+		return ast.Unary{Op: x.Op, Right: rw(x.Right)}, err
+	case ast.Binary:
+		return ast.Binary{Op: x.Op, Left: rw(x.Left), Right: rw(x.Right)}, err
+	case ast.Between:
+		return ast.Between{Expr: rw(x.Expr), Low: rw(x.Low), High: rw(x.High), Not: x.Not}, err
+	case ast.IsNull:
+		return ast.IsNull{Expr: rw(x.Expr), Not: x.Not}, err
+	case ast.Case:
+		whens := make([]ast.CaseWhen, len(x.Whens))
+		for i, arm := range x.Whens {
+			whens[i] = ast.CaseWhen{When: rw(arm.When), Then: rw(arm.Then)}
+		}
+		return ast.Case{Operand: rw(x.Operand), Whens: whens, Else: rw(x.Else)}, err
+	case ast.ArrayCtor:
+		elems := make([]ast.Expr, len(x.Elems))
+		for i := range x.Elems {
+			elems[i] = rw(x.Elems[i])
+		}
+		return ast.ArrayCtor{Elems: elems}, err
+	case ast.FieldAccess:
+		return ast.FieldAccess{Base: rw(x.Base), Field: x.Field}, err
+	case ast.Subscript:
+		return ast.Subscript{Coll: rw(x.Coll), Index: rw(x.Index)}, err
+	}
+	return e, nil
+}
+
+// collectIdents gathers every column name an expression reads. A JSON path
+// contributes its base column. Window bodies are included: a window over an
+// ungrouped column is still reading that column.
+func collectIdents(e ast.Expr, into map[string]struct{}) {
+	if e == nil {
+		return
+	}
+	switch x := e.(type) {
+	case ast.Ident:
+		into[x.Name] = struct{}{}
+	case ast.Path:
+		if len(x.Parts) > 0 {
+			into[x.Parts[0]] = struct{}{}
+		}
+	case ast.Unary:
+		collectIdents(x.Right, into)
+	case ast.Binary:
+		collectIdents(x.Left, into)
+		collectIdents(x.Right, into)
+	case ast.Between:
+		collectIdents(x.Expr, into)
+		collectIdents(x.Low, into)
+		collectIdents(x.High, into)
+	case ast.IsNull:
+		collectIdents(x.Expr, into)
+	case ast.Call:
+		for _, a := range x.Args {
+			collectIdents(a, into)
+		}
+	case ast.Case:
+		collectIdents(x.Operand, into)
+		collectIdents(x.Else, into)
+		for _, arm := range x.Whens {
+			collectIdents(arm.When, into)
+			collectIdents(arm.Then, into)
+		}
+	case ast.ArrayCtor:
+		for _, el := range x.Elems {
+			collectIdents(el, into)
+		}
+	case ast.StructCtor:
+		for _, el := range x.Elems {
+			collectIdents(el, into)
+		}
+	case ast.MapCtor:
+		for _, el := range x.Keys {
+			collectIdents(el, into)
+		}
+		for _, el := range x.Vals {
+			collectIdents(el, into)
+		}
+	case ast.FieldAccess:
+		collectIdents(x.Base, into)
+	case ast.Subscript:
+		collectIdents(x.Coll, into)
+		collectIdents(x.Index, into)
+	case ast.Window:
+		collectIdents(x.Fn, into)
+		for _, p := range x.Partition {
+			collectIdents(p, into)
+		}
+		for _, o := range x.Order {
+			collectIdents(o.Expr, into)
+		}
+	}
+}
+
+// groupCovered reports whether every column a select item reads is a grouping
+// column. That is the condition under which the item has one value per group
+// and can be evaluated against the aggregated row — which is what the executor
+// does, since grouping columns are present there under their own names. An item
+// reading nothing (a constant) is covered vacuously.
+//
+// This replaces matching the item against the GROUP BY list as a whole, which
+// only recognised an item spelled exactly like a grouping expression and so
+// rejected the legal SELECT a + 1 … GROUP BY a.
+func groupCovered(e ast.Expr, groups []ast.Expr) bool {
+	// Substituting first is what lets SELECT a + b + 1 … GROUP BY a + b pass:
+	// the grouped part becomes a single covered name, even though a and b are
+	// not grouping columns on their own.
+	grouped := make(map[string]struct{}, len(groups))
+	for i := range groups {
+		grouped[grpSlotName(i)] = struct{}{}
+	}
+	used := map[string]struct{}{}
+	collectIdents(replaceGroupExprs(e, groups), used)
+	for name := range used {
+		if _, ok := grouped[name]; !ok {
+			return false
+		}
+	}
+	return true
 }

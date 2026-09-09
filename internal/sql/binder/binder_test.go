@@ -1151,7 +1151,7 @@ func TestBindLeftJoinNullableSchema(t *testing.T) {
 	}
 }
 
-func TestBindSearchAndNearestRejectOuterJoin(t *testing.T) {
+func TestBindSearchAndNearestLeftJoin(t *testing.T) {
 	st, err := parser.Parse(`CREATE TABLE t (id UUID PRIMARY KEY, body TEXT, emb VECTOR<F32,3>, k STRING)`)
 	if err != nil {
 		t.Fatal(err)
@@ -1179,12 +1179,19 @@ func TestBindSearchAndNearestRejectOuterJoin(t *testing.T) {
 		}
 		return nil, false
 	}
-	sel, err := parser.Parse(`SELECT t.id FROM t LEFT JOIN u ON t.k = u.k SEARCH body FOR 'x'`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := Bind(sel, lookup, 1); err == nil {
-		t.Fatal("expected SEARCH+LEFT JOIN error")
+	for _, sql := range []string{
+		`SELECT t.id FROM t LEFT JOIN u ON t.k = u.k SEARCH body FOR 'x'`,
+		`SELECT t.id FROM t LEFT JOIN u ON t.k = u.k NEAREST emb TO (1, 0, 0)`,
+		`SELECT t.id FROM t RIGHT JOIN u ON t.k = u.k SEARCH body FOR 'x'`,
+		`SELECT t.id FROM t FULL JOIN u ON t.k = u.k NEAREST emb TO (1, 0, 0)`,
+	} {
+		sel, err := parser.Parse(sql)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Bind(sel, lookup, 1); err != nil {
+			t.Fatalf("outer join must bind with rank: %v", err)
+		}
 	}
 }
 
@@ -1479,17 +1486,6 @@ func TestBindOrderByAndDDL(t *testing.T) {
 		t.Fatalf("%+v", ba.(AlterTable).Result.Columns)
 	}
 
-	cdb, err := parser.Parse(`CREATE DATABASE app`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	bc, err := Bind(cdb, lookup, 1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if bc.(CreateDatabase).Name != "app" {
-		t.Fatalf("%+v", bc)
-	}
 }
 
 func TestBindUpsertAndReturning(t *testing.T) {

@@ -10,6 +10,13 @@ import (
 	"github.com/bzync/nextsql/internal/sql/types"
 )
 
+func TestDefaultLimitsSeparateFrameStatementAndParameters(t *testing.T) {
+	lim := DefaultLimits()
+	if lim.MaxPacket != 64<<20 || lim.MaxSQL != 16<<20 || lim.MaxParams != 65535 {
+		t.Fatalf("unexpected defaults: %+v", lim)
+	}
+}
+
 // TestHelloRealmRoundTrip proves the new M2-2 trailing field round-trips.
 func TestHelloRealmRoundTrip(t *testing.T) {
 	lim := DefaultLimits()

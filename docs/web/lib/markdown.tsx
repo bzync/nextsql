@@ -14,6 +14,12 @@ type Block =
 
 export type Heading = { id: string; text: string; level: number };
 
+export type SearchSection = {
+  id?: string;
+  heading?: string;
+  content: string;
+};
+
 export function slugify(text: string): string {
   return text
     .toLowerCase()
@@ -268,4 +274,49 @@ export function Markdown({ source }: { source: string }) {
 
 export function extractHeadings(source: string): Heading[] {
   return parseMarkdown(source).headings.filter((h) => h.level > 1);
+}
+
+export function extractSearchSections(source: string): SearchSection[] {
+  const { blocks } = parseMarkdown(source);
+  const sections: SearchSection[] = [];
+  let current: { id?: string; heading?: string; parts: string[] } = { parts: [] };
+
+  const flush = () => {
+    const content = current.parts.join(" ").replace(/\s+/g, " ").trim();
+    if (content) {
+      sections.push({ id: current.id, heading: current.heading, content });
+    }
+  };
+
+  for (const block of blocks) {
+    if (block.type === "heading") {
+      if (block.level === 1) continue;
+      flush();
+      const heading = stripInline(block.text);
+      current = { id: block.id, heading, parts: [heading] };
+      continue;
+    }
+
+    switch (block.type) {
+      case "paragraph":
+      case "quote":
+        current.parts.push(stripInline(block.text));
+        break;
+      case "list":
+        current.parts.push(...block.items.map(stripInline));
+        break;
+      case "code":
+        current.parts.push(block.code);
+        break;
+      case "table":
+        current.parts.push(...block.headers.map(stripInline));
+        for (const row of block.rows) current.parts.push(...row.map(stripInline));
+        break;
+      case "hr":
+        break;
+    }
+  }
+
+  flush();
+  return sections;
 }

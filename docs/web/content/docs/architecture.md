@@ -3,7 +3,7 @@
 NextSQL is **one engine**, not four loosely connected stores. Catalog mutations, secondary indexes, HNSW graphs, inverted postings, nested collections, workflows, and CDC all go through the same WAL and transaction.
 
 ```text
-Native wire protocol → TLS 1.3 → authn → RBAC / realm
+Native wire protocol → TLS 1.3 → authn → RBAC
         → SQL parser → binder / catalog
         → logical planner → cost optimizer
         → vectorized executor

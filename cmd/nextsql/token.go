@@ -159,7 +159,11 @@ func tokenMint(args []string) error {
 	ttl := fs.Duration("ttl", 15*time.Minute, "credential lifetime, e.g. 15m, 1h (max 720h)")
 	audience := fs.String("audience", "", "deployment audience the credential is bound to")
 	database := fs.String("database", "", "database scope (empty = any the principal may reach)")
-	realm := fs.String("realm", "", "realm scope (empty = any)")
+	// Kept as an explicit, empty-by-default scope: multi-realm hosting was
+	// removed, so a token is scoped to the deployment, not to a realm within
+	// it. Minting one with a realm scope would produce a credential nothing
+	// can present.
+	realm := ""
 	var roles rolesFlag
 	fs.Var(&roles, "role", "restrict to a role the principal holds (repeatable, or comma-separated)")
 	notBefore := fs.String("not-before", "", "RFC3339 time the credential becomes valid (default now)")
@@ -173,7 +177,7 @@ func tokenMint(args []string) error {
 		Principal: *principal,
 		Audience:  *audience,
 		Database:  *database,
-		Realm:     *realm,
+		Realm:     realm,
 		Roles:     roles,
 		TTL:       *ttl,
 	}

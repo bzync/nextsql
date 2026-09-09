@@ -21,7 +21,15 @@ to a script.
 ./scripts/build-windows-installer.sh --arch amd64
 ```
 
-Artifacts land in `installers/`. Checksums: `installers/SHA256SUMS.linux`, `installers/SHA256SUMS.windows`, and `installers/SHA256SUMS` after the combined script.
+Artifacts land in the gitignored `installers/` directory. They are disposable
+build output: do not commit them. Checksums are
+`installers/SHA256SUMS.linux`, `installers/SHA256SUMS.windows`, and
+`installers/SHA256SUMS` after the combined script.
+
+For a release, push a version tag only after the gates in `RELEASING.md` are
+green. `.github/workflows/release-installers.yml` builds into runner-temporary
+storage, verifies the payload, and uploads it to the corresponding GitHub
+Release. GitHub Releases—not this repository—is the binary distribution store.
 
 To detached-sign the checksums file with GPG, pass `--gpg-key ID` (or set
 `NEXTSQL_RELEASE_GPG_KEY`) — no signing key exists in this repo/CI yet, so

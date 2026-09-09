@@ -2,11 +2,14 @@ package config
 
 import (
 	"bytes"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/bzync/nextsql/internal/limits"
 )
 
 func TestLoadAndValidate(t *testing.T) {
@@ -71,6 +74,38 @@ func TestLoadAdmissionKeys(t *testing.T) {
 	}
 	if cfg.MaxInflight != 4 || cfg.MaxQueryQueue != 8 || cfg.QueueWaitMS != 250 || cfg.MaxResultRows != 100 {
 		t.Fatalf("%+v", cfg)
+	}
+}
+
+func TestLoadWireLimits(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "wire.conf")
+	if err := os.WriteFile(path, []byte("max_frame_bytes=16777216\nmax_statement_bytes=8388608\nmax_parameters=65535\nmax_prepared_statements=64\nmax_result_bytes=67108864\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.MaxFrameBytes != 16777216 || c.MaxStatementBytes != 8388608 || c.MaxParameters != 65535 || c.MaxPrepared != 64 || c.MaxResultBytes != 67108864 {
+		t.Fatalf("%+v", c)
+	}
+}
+
+func TestLoadRejectsStatementLargerThanFrame(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "bad-wire.conf")
+	if err := os.WriteFile(path, []byte("max_frame_bytes=64\nmax_statement_bytes=65\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil {
+		t.Fatal("expected frame/statement validation error")
+	}
+}
+
+func TestValidateRejectsUnsafeProgrammaticWireLimits(t *testing.T) {
+	c := Default()
+	c.MaxFrameBytes, c.MaxStatementBytes = 64, 65
+	if err := c.Validate(); err == nil {
+		t.Fatal("expected frame/statement validation error")
 	}
 }
 
@@ -298,6 +333,33 @@ func TestLoadWALRetentionMSRejectsNegative(t *testing.T) {
 	}
 	if _, err := Load(path); err == nil {
 		t.Fatal("expected error")
+	}
+}
+
+func TestCheckpointIntervalConfig(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "checkpoint.conf")
+	if err := os.WriteFile(path, []byte("checkpoint_interval_ms=45000\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.CheckpointIntervalMS != 45000 {
+		t.Fatalf("CheckpointIntervalMS=%d, want 45000", cfg.CheckpointIntervalMS)
+	}
+	if got := Default().CheckpointIntervalMS; got != DefaultCheckpointIntervalMS {
+		t.Fatalf("default CheckpointIntervalMS=%d, want %d", got, DefaultCheckpointIntervalMS)
+	}
+	if _, err := cfg.WithSetting("checkpoint_interval_ms", "0", false); err != nil {
+		t.Fatalf("disable checkpoint interval: %v", err)
+	}
+	badPath := filepath.Join(t.TempDir(), "checkpoint-bad.conf")
+	if err := os.WriteFile(badPath, []byte("checkpoint_interval_ms=-1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(badPath); err == nil {
+		t.Fatal("negative checkpoint interval accepted")
 	}
 }
 
@@ -819,4 +881,172 @@ func TestPreallocAheadPagesRoundTrip(t *testing.T) {
 			t.Fatalf("prealloc_ahead_pages = %s must be refused", bad)
 		}
 	}
+}
+
+// TestEveryLimitIsWired pins the catalog to this package. A limit that appears
+// in internal/limits but no configuration key parses, or that Validate cannot
+// read back off a Config, is a ceiling that looks enforced and is not.
+func TestEveryLimitIsWired(t *testing.T) {
+	for _, s := range limits.Catalog() {
+		if _, ok := Default().limitValue(s.Key); !ok {
+			t.Fatalf("limit %q has no Config field: Validate cannot enforce it", s.Key)
+		}
+		// The key must be accepted by the file parser at its own minimum.
+		path := filepath.Join(t.TempDir(), "one.conf")
+		if err := os.WriteFile(path, []byte(fmt.Sprintf("%s=%d\n", s.Key, s.Min)), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Load(path); err != nil {
+			t.Fatalf("limit %q is in the catalog but %s=%d is not accepted: %v", s.Key, s.Key, s.Min, err)
+		}
+	}
+}
+
+// TestLoadRejectsEveryLimitAboveItsCeiling is the negative half: a ceiling that
+// no configuration path enforces would leave the catalog decorative.
+func TestLoadRejectsEveryLimitAboveItsCeiling(t *testing.T) {
+	for _, s := range limits.Catalog() {
+		path := filepath.Join(t.TempDir(), "over.conf")
+		if err := os.WriteFile(path, []byte(fmt.Sprintf("%s=%d\n", s.Key, s.Max+1)), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Load(path); err == nil {
+			t.Fatalf("%s=%d was accepted; its ceiling is %d", s.Key, s.Max+1, s.Max)
+		}
+		neg := filepath.Join(t.TempDir(), "neg.conf")
+		if err := os.WriteFile(neg, []byte(fmt.Sprintf("%s=-1\n", s.Key)), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Load(neg); err == nil {
+			t.Fatalf("%s=-1 was accepted", s.Key)
+		}
+	}
+}
+
+// TestValidateEnforcesEveryCeiling covers the programmatic path, which used to
+// disagree with the file parser about several of these bounds.
+func TestValidateEnforcesEveryCeiling(t *testing.T) {
+	for _, s := range limits.Catalog() {
+		c := Default()
+		if !setLimitForTest(&c, s.Key, s.Max+1) {
+			t.Fatalf("limit %q cannot be set on a Config", s.Key)
+		}
+		if err := c.Validate(); err == nil {
+			t.Fatalf("Validate accepted %s = %d, above its ceiling %d", s.Key, s.Max+1, s.Max)
+		}
+	}
+}
+
+// TestValidateTreatsZeroAsUnset guards the convention every caller that builds
+// a Config by hand relies on: an unset numeric field means "leave the owning
+// subsystem's default", not "zero".
+func TestValidateTreatsZeroAsUnset(t *testing.T) {
+	c := Default()
+	for _, s := range limits.Catalog() {
+		if s.Key == "buffer_pages" {
+			continue // always set; 0 pages is not a pool
+		}
+		setLimitForTest(&c, s.Key, 0)
+	}
+	if err := c.Validate(); err != nil {
+		t.Fatalf("a Config with every optional limit unset must validate: %v", err)
+	}
+}
+
+// TestMarshalRoundTripsEveryLimit keeps Marshal in step with the catalog: a
+// limit that is parsed but never written back would be silently dropped by
+// every path that rewrites a configuration file.
+func TestMarshalRoundTripsEveryLimit(t *testing.T) {
+	c := Default()
+	for _, s := range limits.Catalog() {
+		setLimitForTest(&c, s.Key, s.Min)
+	}
+	path := filepath.Join(t.TempDir(), "round.conf")
+	if err := os.WriteFile(path, c.Marshal(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	back, err := Load(path)
+	if err != nil {
+		t.Fatalf("Marshal produced a file Load rejects: %v", err)
+	}
+	for _, s := range limits.Catalog() {
+		got, _ := back.limitValue(s.Key)
+		if got != s.Min {
+			t.Fatalf("%s did not survive Marshal/Load: got %d, want %d", s.Key, got, s.Min)
+		}
+	}
+}
+
+func setLimitForTest(c *Config, key string, v int) bool {
+	switch key {
+	case "buffer_pages":
+		c.BufferPages = v
+	case "checkpoint_interval_ms":
+		c.CheckpointIntervalMS = v
+	case "disk_watermark_check_ms":
+		c.DiskWatermarkCheckMS = v
+	case "idle_timeout_ms":
+		c.IdleTimeoutMS = v
+	case "idle_transaction_timeout_ms":
+		c.IdleTransactionTimeoutMS = v
+	case "lock_timeout_ms":
+		c.LockTimeoutMS = v
+	case "max_connections":
+		c.MaxConnections = v
+	case "max_connections_per_database":
+		c.MaxConnectionsPerDatabase = v
+	case "max_connections_per_realm":
+		c.MaxConnectionsPerRealm = v
+	case "max_connections_per_user":
+		c.MaxConnectionsPerUser = v
+	case "max_frame_bytes":
+		c.MaxFrameBytes = v
+	case "max_inflight_queries":
+		c.MaxInflight = v
+	case "max_open_databases":
+		c.MaxOpenDatabases = v
+	case "max_parameters":
+		c.MaxParameters = v
+	case "max_prepared_statements":
+		c.MaxPrepared = v
+	case "max_query_queue":
+		c.MaxQueryQueue = v
+	case "max_result_bytes":
+		c.MaxResultBytes = v
+	case "max_result_rows":
+		c.MaxResultRows = v
+	case "max_statement_bytes":
+		c.MaxStatementBytes = v
+	case "max_total_buffer_pages":
+		c.MaxTotalBufferPages = v
+	case "prealloc_ahead_pages":
+		c.PreallocAheadPages = v
+	case "query_queue_wait_ms":
+		c.QueueWaitMS = v
+	case "raft_commit_timeout_ms":
+		c.RaftCommitTimeoutMS = v
+	case "raft_election_ms":
+		c.RaftElectionMS = v
+	case "raft_heartbeat_ms":
+		c.RaftHeartbeatMS = v
+	case "raft_leader_lease_ms":
+		c.RaftLeaderLeaseMS = v
+	case "replica_lag_check_ms":
+		c.ReplicaLagCheckMS = v
+	case "replica_lag_warn_entries":
+		c.ReplicaLagWarnEntries = v
+	case "shutdown_drain_ms":
+		c.DrainTimeoutMS = v
+	case "statement_timeout_ms":
+		c.StatementTimeoutMS = v
+	case "task_workers":
+		c.TaskWorkers = v
+	case "transaction_timeout_ms":
+		c.TransactionTimeoutMS = v
+	case "wal_retention_ms":
+		c.WalRetentionMS = v
+	default:
+		return false
+	}
+	return true
 }

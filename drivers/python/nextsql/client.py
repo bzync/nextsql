@@ -40,9 +40,10 @@ class Config:
     address: str = ""
     nodes: list[str] = field(default_factory=list)
     database: str = ""
-    # Selects which hosted realm this connection targets (M2-2). Optional:
-    # an unset realm sends the exact pre-realm Hello and connects to the
-    # server's configured default.
+    # Reserved; must stay empty. Multi-realm hosting was removed — a
+    # deployment serves exactly one database, and a server rejects a Hello
+    # naming any other realm. The field remains only because the wire
+    # frame's trailing realm slot does.
     realm: str = ""
     user: str = ""
     password: str = ""
@@ -299,6 +300,7 @@ class Connection:
         self._cfg = cfg
         self._sock = _dial(cfg)
         self._secret = b""
+        self.public_error_codes = False
         self._busy = False
         try:
             self._handshake()
@@ -442,13 +444,23 @@ class Connection:
         cfg = self._cfg
         self._write_frame(
             p.TYPE_HELLO,
-            p.encode_hello(p.VERSION, 0, b"\x00" * 8, cfg.database, cfg.user, cfg.realm),
+            p.encode_hello(
+                p.VERSION,
+                p.FLAG_PUBLIC_ERROR_CODES,
+                b"\x00" * 8,
+                cfg.database,
+                cfg.user,
+                cfg.realm,
+            ),
         )
         typ, payload = self._read_frame()
         if typ != p.TYPE_HELLO_OK:
             raise self._unexpected(typ, payload)
-        _version, auth_method, secret = p.decode_hello_ok(payload)
+        _version, auth_method, secret, flags = p.decode_hello_ok(payload)
         self._secret = secret
+        # Diagnostic only: decode_error reads the field whenever it is present,
+        # so nothing depends on this having been echoed.
+        self.public_error_codes = bool(flags & p.FLAG_PUBLIC_ERROR_CODES)
         self._write_frame(p.TYPE_AUTH, p.u16str(cfg.password))
         typ, payload = self._read_frame()
         if typ != p.TYPE_AUTH_OK:

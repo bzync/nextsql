@@ -50,7 +50,6 @@ func loginCmd(args []string) error {
 	fs.String("idp", "", "identity provider profile name from the client config")
 	fs.String("idp-config", "", "client identity-provider config file (default ~/.config/nextsql/config.toml)")
 	fs.String("database", "", "restrict the minted credential to this database")
-	fs.String("realm", "", "realm scope for hosted routing")
 	clientCredentials := fs.Bool("client-credentials", false, "use the non-interactive OAuth2 client_credentials grant")
 	clientSecretFile := fs.String("client-secret-file", "", "mode-0600 OAuth2 client secret file (overrides the profile)")
 	noBrowser := fs.Bool("no-browser", false, "print the sign-in URL instead of opening a browser")
@@ -75,14 +74,13 @@ func loginCmd(args []string) error {
 	var ts oidcclient.TokenSet
 	if *clientCredentials {
 		res, ts, err = oidcclient.ClientCredentials(context.Background(), oidcclient.ClientCredentialsOptions{
-			Profile: ip, Database: strings.TrimSpace(s.Database), Realm: strings.TrimSpace(s.Realm),
+			Profile: ip, Database: strings.TrimSpace(s.Database),
 		})
 	} else {
 		opts := oidcclient.LoginOptions{
 			Profile:  ip,
 			Progress: os.Stderr,
 			Database: strings.TrimSpace(s.Database),
-			Realm:    strings.TrimSpace(s.Realm),
 			Timeout:  *timeout,
 		}
 		if !*noBrowser {
@@ -97,9 +95,13 @@ func loginCmd(args []string) error {
 	if err != nil {
 		return err
 	}
-	cred := oidcclient.NewCredential(ip, addr, strings.TrimSpace(s.Database), strings.TrimSpace(s.Realm), res, ts, time.Now())
+	// Realm is empty for every new credential: multi-realm hosting was
+	// removed, and the broker/server treat an empty realm claim as "the
+	// deployment's own". The parameter stays so credentials minted by an
+	// earlier release keep validating.
+	cred := oidcclient.NewCredential(ip, addr, strings.TrimSpace(s.Database), "", res, ts, time.Now())
 	if *clientCredentials {
-		cred = oidcclient.NewClientCredential(ip, addr, strings.TrimSpace(s.Database), strings.TrimSpace(s.Realm), res, time.Now())
+		cred = oidcclient.NewClientCredential(ip, addr, strings.TrimSpace(s.Database), "", res, time.Now())
 	}
 	if err := store.Save(cred); err != nil {
 		return err

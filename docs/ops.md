@@ -25,8 +25,8 @@ nextsqld --config DIR/nextsql.conf
 `nextsqld --production` forces the same profile for a process that was
 initialized as developer. Either path fail-closes if the unlock key sits
 on the data volume or if disk-watermark / drain / statement / idle
-timeouts are unset. Experimental capabilities (`field_encryption_client`,
-`hosting_isolation`) stay labeled experimental in `system.capabilities`
+timeouts are unset. Experimental capabilities such as `hosting_isolation`
+stay labeled experimental in `system.capabilities`
 and are not implied by the production profile.
 
 Setup-mode GUI defaults to Production. The CLI default remains `developer`
@@ -44,8 +44,8 @@ table decoder (`catalog.DecodeTable`) enforce this same catalog directly
 match what actually opens — not a separately maintained number that could
 drift. The error names the actual and required version numbers.
 
-Most families are **v1**; the catalog descriptor (`NSCT`) is at **v12**
-(readable 1..12). Opening a data directory this binary can read is the
+Most families are **v1**; the catalog descriptor (`NSCT`) is at **v13**
+(readable 1..13). Opening a data directory this binary can read is the
 supported path. A future format bump must either widen
 `MaxReadable` or add an explicit rewrite increment — not an in-place
 guess. See `docs/storage-format.md` "Format and catalog migration

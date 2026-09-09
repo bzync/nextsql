@@ -139,11 +139,6 @@ export const docsNav: NavGroup[] = [
         description: "Three-node Raft, quorum commits, follower reads, and failover.",
       },
       {
-        title: "Hosting",
-        slug: "hosting",
-        description: "Realms, selectable databases, storage caps, suspend, and drop.",
-      },
-      {
         title: "Admin",
         slug: "admin",
         description: "nextsql-admin Setup, Operations, and Studio modes.",

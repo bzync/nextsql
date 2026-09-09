@@ -2,6 +2,7 @@ package executor
 
 import (
 	"strconv"
+	"strings"
 
 	"github.com/bzync/nextsql/internal/catalog"
 	"github.com/bzync/nextsql/internal/executor/aggregate"
@@ -11,6 +12,7 @@ import (
 	"github.com/bzync/nextsql/internal/executor/window"
 	"github.com/bzync/nextsql/internal/nerr"
 	"github.com/bzync/nextsql/internal/sql/ast"
+	"github.com/bzync/nextsql/internal/sql/binder"
 	"github.com/bzync/nextsql/internal/sql/optimizer"
 	"github.com/bzync/nextsql/internal/sql/planner"
 	"github.com/bzync/nextsql/internal/sql/types"
@@ -68,8 +70,10 @@ func (s *Session) execSelect(plan planner.Logical) (*Result, error) {
 			cur = n.Input
 		case planner.Project:
 			// Keep inner Projects (RIGHT→LEFT column reorder, derived tables)
-			// for collectPlan.
-			if peeledProject {
+			// for collectPlan. The pre-aggregation projection is different
+			// again: it is the aggregate's input, and peeling it would hand
+			// the aggregate the raw scan without the columns it addresses.
+			if peeledProject || (agg != nil && n.PreAgg) {
 				goto done
 			}
 			peeledProject = true
@@ -356,12 +360,12 @@ func (s *Session) execAggregate(a *planner.Aggregate, input planner.Logical) ([]
 		if n, ok, err := s.tryCountScan(input); err != nil {
 			return nil, err
 		} else if ok {
-			return countStarResult(a, n), nil
+			return s.countStarResult(a, n)
 		}
 		if n, ok, err := s.tryCountJoin(input); err != nil {
 			return nil, err
 		} else if ok {
-			return countStarResult(a, n), nil
+			return s.countStarResult(a, n)
 		}
 	}
 	if rows, err, ok := s.tryStreamHeapAggregate(a, input); ok {
@@ -398,14 +402,14 @@ func countStarOnly(a *planner.Aggregate) bool {
 	return true
 }
 
-func countStarResult(a *planner.Aggregate, n int64) [][]types.Value {
+func (s *Session) countStarResult(a *planner.Aggregate, n int64) ([][]types.Value, error) {
 	d, _ := types.ParseDecimal(strconv.FormatInt(n, 10))
 	v := types.DecimalValue(d, types.Type{Kind: types.KindDecimal})
 	raw := make([]types.Value, len(a.Specs))
 	for i := range raw {
 		raw[i] = v
 	}
-	return orderAgg([][]types.Value{raw}, a)
+	return s.orderAgg([][]types.Value{raw}, a)
 }
 
 func (s *Session) tryCountScan(input planner.Logical) (int64, bool, error) {
@@ -843,7 +847,7 @@ func (s *Session) streamHeapAggregate(a *planner.Aggregate, tab *catalog.Table) 
 	if err != nil {
 		return nil, err
 	}
-	return orderAgg(raw, a), nil
+	return s.orderAgg(raw, a)
 }
 
 func (s *Session) parallelHeapAggregate(a *planner.Aggregate, tab *catalog.Table, htx *btree.Txn, specs []aggregate.Spec, outTy []types.Type, splits [][]byte) ([][]types.Value, error) {
@@ -898,7 +902,7 @@ func (s *Session) parallelHeapAggregate(a *planner.Aggregate, tab *catalog.Table
 	if err != nil {
 		return nil, err
 	}
-	return orderAgg(raw, a), nil
+	return s.orderAgg(raw, a)
 }
 
 // partitionWiseHeapAggregate aggregates a partitioned table by running one
@@ -1004,7 +1008,7 @@ func (s *Session) partitionWiseHeapAggregate(a *planner.Aggregate, n planner.Seq
 	if err != nil {
 		return nil, err
 	}
-	return orderAgg(raw, a), nil
+	return s.orderAgg(raw, a)
 }
 
 func (s *Session) streamAggregate(a *planner.Aggregate, input planner.Logical) ([][]types.Value, error) {
@@ -1020,7 +1024,7 @@ func (s *Session) streamAggregate(a *planner.Aggregate, input planner.Logical) (
 	if err != nil {
 		return nil, err
 	}
-	return orderAgg(raw, a), nil
+	return s.orderAgg(raw, a)
 }
 
 func aggSpecs(a *planner.Aggregate) ([]aggregate.Spec, []types.Type) {
@@ -1030,23 +1034,82 @@ func aggSpecs(a *planner.Aggregate) ([]aggregate.Spec, []types.Type) {
 		if sp.Star {
 			col = -1
 		}
-		specs[i] = aggregate.Spec{Fun: sp.Fun, Col: col}
+		var outType types.Type
+		switch sp.Fun {
+		case "count", "sum", "avg":
+			outType = types.Type{Kind: types.KindDecimal}
+		case "min", "max":
+			if a.Schema != nil && col >= 0 && col < len(a.Schema.Columns) {
+				outType = a.Schema.Columns[col].Type
+			}
+		case "array_agg":
+			elemType := types.String()
+			if a.Schema != nil && col >= 0 && col < len(a.Schema.Columns) {
+				elemType = a.Schema.Columns[col].Type
+			}
+			if at, err := types.ArrayType(elemType); err == nil {
+				outType = at
+			}
+		case "map_agg":
+			kType, vType := types.String(), types.String()
+			if a.Schema != nil {
+				if col >= 0 && col < len(a.Schema.Columns) {
+					kType = a.Schema.Columns[col].Type
+				}
+				if sp.Col2 >= 0 && sp.Col2 < len(a.Schema.Columns) {
+					vType = a.Schema.Columns[sp.Col2].Type
+				}
+			}
+			if mt, err := types.MapType(kType, vType); err == nil {
+				outType = mt
+			}
+		}
+		specs[i] = aggregate.Spec{Fun: sp.Fun, Col: col, Col2: sp.Col2, OutType: outType}
 	}
 	outTy := make([]types.Type, len(a.Names))
 	for i := range outTy {
 		outTy[i] = types.Type{Kind: types.KindDecimal}
 	}
-	if a.Schema != nil {
-		gi := 0
-		for i, ex := range a.Exprs {
-			if id, ok := ex.(ast.Ident); ok {
-				if ord, found := a.Schema.ColIndex(id.Name); found && i < len(outTy) {
-					outTy[i] = a.Schema.Columns[ord].Type
-					if gi < len(a.Groups) {
-						gi++
+	ai := 0
+	for i, ex := range a.Exprs {
+		if i >= len(outTy) {
+			continue
+		}
+		if _, ok := ex.(ast.Call); ok {
+			if ai < len(specs) && specs[ai].OutType.Kind != types.KindInvalid {
+				outTy[i] = specs[ai].OutType
+			}
+			ai++
+		} else if id, ok := ex.(ast.Ident); ok {
+			// A select item is a reserved slot once the binder has rewritten
+			// it: agg#N carries that aggregate's output type, grp#N the type
+			// of the column it groups on. Falling through to the decimal
+			// default instead typed a grouped STRING column as a number, and
+			// HAVING then compared it as one — the group value read back as 0.
+			if n, ok := slotIndex(id.Name, binder.AggSlotName); ok {
+				if n < len(specs) && specs[n].OutType.Kind != types.KindInvalid {
+					outTy[i] = specs[n].OutType
+				}
+				continue
+			}
+			if n, ok := slotIndex(id.Name, binder.GrpSlotName); ok {
+				if a.Schema != nil && n < len(a.Groups) {
+					if ord := a.Groups[n]; ord >= 0 && ord < len(a.Schema.Columns) {
+						outTy[i] = a.Schema.Columns[ord].Type
 					}
 				}
+				continue
 			}
+			if a.Schema != nil {
+				if ord, found := a.Schema.ColIndex(id.Name); found {
+					outTy[i] = a.Schema.Columns[ord].Type
+				}
+			}
+		} else if a.Slots {
+			// An expression over slots has no declared type to claim. Leaving
+			// the decimal default would coerce a non-numeric result the same
+			// way; an unset type lets the value keep the type it has.
+			outTy[i] = types.Type{}
 		}
 	}
 	return specs, outTy
@@ -1074,34 +1137,64 @@ func (s *Session) runAggregate(a *planner.Aggregate, rows [][]types.Value) ([][]
 	if err != nil {
 		return nil, err
 	}
-	return orderAgg(raw, a), nil
+	return s.orderAgg(raw, a)
 }
 
-func orderAgg(raw [][]types.Value, a *planner.Aggregate) [][]types.Value {
-	if len(a.Exprs) == 0 || len(raw) == 0 {
-		return raw
+// aggRowTable describes the row aggregate.Hash emits: the grouping columns in
+// GROUP BY order, then one column per aggregate spec under the reserved name
+// the binder rewrote that aggregate to. Select items are evaluated against this
+// row, which is what lets an aggregate appear inside a larger expression —
+// COUNT(*) + 1 is Ident{agg#0} + 1 by the time it reaches here.
+func aggRowTable(a *planner.Aggregate) *catalog.Table {
+	tab := &catalog.Table{Name: "aggregate_row", Columns: make([]catalog.Column, 0, len(a.Groups)+len(a.Specs))}
+	for i, ord := range a.Groups {
+		// Named by grouping position, not by the input column it came from:
+		// the binder rewrites every grouped reference in the select list to
+		// this same reserved name, so a grouping expression that was computed
+		// rather than selected from the input needs no special case here.
+		col := catalog.Column{Name: binder.GrpSlotName(i)}
+		if a.Schema != nil && ord >= 0 && ord < len(a.Schema.Columns) {
+			col.Type = a.Schema.Columns[ord].Type
+		}
+		tab.Columns = append(tab.Columns, col)
 	}
+	specs, _ := aggSpecs(a)
+	for i := range a.Specs {
+		ty := types.Type{Kind: types.KindDecimal}
+		if i < len(specs) && specs[i].OutType.Kind != types.KindInvalid {
+			ty = specs[i].OutType
+		}
+		tab.Columns = append(tab.Columns, catalog.Column{Name: binder.AggSlotName(i), Type: ty})
+	}
+	return tab
+}
+
+// orderAgg projects the emitted aggregate rows into select-list order. Every
+// select item is an expression over aggRowTable — a grouped column, a reserved
+// aggregate slot, or any expression built from them — so this is one evaluation
+// per output rather than a positional mapping that only ever understood a bare
+// aggregate call or a grouped column.
+func (s *Session) orderAgg(raw [][]types.Value, a *planner.Aggregate) ([][]types.Value, error) {
+	// The window-over-aggregate path supplies its own intermediate schema as
+	// Exprs, already matching the emitted row position for position; only the
+	// slot-rewritten select list needs projecting.
+	if !a.Slots || len(a.Exprs) == 0 || len(raw) == 0 {
+		return raw, nil
+	}
+	tab := aggRowTable(a)
 	out := make([][]types.Value, len(raw))
 	for i, row := range raw {
 		dst := make([]types.Value, len(a.Exprs))
-		gi, ai := 0, 0
 		for j, ex := range a.Exprs {
-			if _, ok := ex.(ast.Call); ok {
-				idx := len(a.Groups) + ai
-				if idx < len(row) {
-					dst[j] = row[idx]
-				}
-				ai++
-			} else {
-				if gi < len(row) {
-					dst[j] = row[gi]
-				}
-				gi++
+			v, err := s.eval(ex, tab, row)
+			if err != nil {
+				return nil, err
 			}
+			dst[j] = v
 		}
 		out[i] = dst
 	}
-	return out
+	return out, nil
 }
 
 func splitRows(rows [][]types.Value, n int) [][][]types.Value {
@@ -1217,6 +1310,8 @@ func (s *Session) collectPlan(p planner.Logical) ([][]types.Value, error) {
 		}
 		tab := tableOf(n.Input)
 		return s.applyFilter(rows, tab, n.Pred, "Filter")
+	case planner.UnnestScan:
+		return s.execUnnestScan(n)
 	case planner.Scan:
 		return s.scanHeapBatch(n.Table, nil, nil, true, true, "SeqScan")
 	case planner.SeqScan:
@@ -1394,16 +1489,16 @@ func (s *Session) execJoin(n planner.Join) ([][]types.Value, error) {
 	lTypes := joinLeftTypes(n, left)
 	rTypes := joinRightTypes(n, right)
 	var out [][]types.Value
-	if n.Kind == ast.JoinFull {
-		// v1 FULL is hash-only and memory-capped (no spill, no merge).
-		if s.workers() > 1 && len(left)+len(right) >= 64 {
+	if n.Kind == ast.JoinFull || n.Kind == ast.JoinRight {
+		// v1 FULL and rank-preserving RIGHT are hash-only and memory-capped (no spill, no merge).
+		if !planner.RankPreserving(n.Left) && s.workers() > 1 && len(left)+len(right) >= 64 {
 			out, err = join.ParallelHash(s.pool(), s.budget(), left, right, n.LeftKeys, n.RightKeys, n.Kind, lTypes, rTypes, pred)
 		} else {
 			out, err = join.HashJoin(left, right, n.LeftKeys, n.RightKeys, n.Kind, lTypes, rTypes, pred, s.budget())
 		}
 	} else if n.Method == "merge" && join.Sorted(left, n.LeftKeys) && join.Sorted(right, n.RightKeys) {
 		out, err = join.MergeJoin(left, right, n.LeftKeys, n.RightKeys, n.Kind, rTypes, pred, s.budget())
-	} else if !rankPreserving(n.Left) && s.workers() > 1 && len(left)+len(right) >= 64 {
+	} else if !planner.RankPreserving(n.Left) && s.workers() > 1 && len(left)+len(right) >= 64 {
 		out, err = join.ParallelHash(s.pool(), s.budget(), left, right, n.LeftKeys, n.RightKeys, n.Kind, lTypes, rTypes, pred)
 	} else {
 		out, err = join.HashJoin(left, right, n.LeftKeys, n.RightKeys, n.Kind, lTypes, rTypes, pred, s.budget())
@@ -1415,6 +1510,8 @@ func (s *Session) execJoin(n planner.Join) ([][]types.Value, error) {
 		op := "HashJoin"
 		if n.Kind == ast.JoinFull {
 			op = "FullJoin"
+		} else if n.Kind == ast.JoinRight {
+			op = "RightJoin"
 		} else if n.Kind == ast.JoinLeft {
 			op = "LeftJoin"
 		} else if n.Method == "merge" {
@@ -1519,18 +1616,7 @@ func joinRightTypes(n planner.Join, right [][]types.Value) []types.Type {
 }
 
 func rankPreserving(p planner.Logical) bool {
-	switch n := p.(type) {
-	case planner.Search, planner.Nearest, planner.Rerank, planner.Candidates:
-		return true
-	case planner.Filter:
-		return rankPreserving(n.Input)
-	case planner.Limit:
-		return rankPreserving(n.Input)
-	case planner.Join:
-		return rankPreserving(n.Left)
-	default:
-		return false
-	}
+	return planner.RankPreserving(p)
 }
 
 func (s *Session) scanHeapBatch(tab *catalog.Table, low, high []types.Value, lowIncl, highIncl bool, op string) ([][]types.Value, error) {
@@ -1721,4 +1807,62 @@ func compareBytes(a, b []byte) int {
 	default:
 		return 0
 	}
+}
+
+func (s *Session) execUnnestScan(n planner.UnnestScan) ([][]types.Value, error) {
+	val, err := s.eval(n.Expr, nil, nil)
+	if err != nil {
+		return nil, err
+	}
+	if val.Null {
+		return nil, nil
+	}
+	var out [][]types.Value
+	switch val.Typ.Kind {
+	case types.KindArray:
+		out = make([][]types.Value, len(val.Coll))
+		for i, elem := range val.Coll {
+			if n.Offset {
+				out[i] = []types.Value{elem, types.IntValue(types.KindInt64, int64(i+1))}
+			} else {
+				out[i] = []types.Value{elem}
+			}
+		}
+	case types.KindMap:
+		out = make([][]types.Value, len(val.Coll))
+		for i := range val.Coll {
+			k := val.CollKeys[i]
+			v := val.Coll[i]
+			if n.Offset {
+				out[i] = []types.Value{k, v, types.IntValue(types.KindInt64, int64(i+1))}
+			} else {
+				out[i] = []types.Value{k, v}
+			}
+		}
+	default:
+		return nil, nerr.New(nerr.InvalidArgument, "executor.execUnnestScan", "UNNEST requires an ARRAY or MAP, got "+val.Typ.String())
+	}
+	if err := s.budget().ChargeMem(int64(len(out) * 32)); err != nil {
+		return nil, err
+	}
+	if s.trace != nil {
+		if node := optimizer.Find(s.trace, "UnnestScan"); node != nil {
+			node.ActRows = int64(len(out))
+			node.Workers = 1
+		}
+	}
+	return out, nil
+}
+
+// slotIndex reports the ordinal encoded in a reserved slot name, if name is one.
+func slotIndex(name string, mk func(int) string) (int, bool) {
+	i := strings.IndexByte(name, '#')
+	if i < 0 {
+		return 0, false
+	}
+	n, err := strconv.Atoi(name[i+1:])
+	if err != nil || n < 0 || mk(n) != name {
+		return 0, false
+	}
+	return n, true
 }

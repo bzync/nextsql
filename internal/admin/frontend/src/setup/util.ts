@@ -88,10 +88,28 @@ const SETUP_ERROR_RULES: setupErrorRule[] = [
       "A configuration file is already present at this path. Choose a different config location, or remove the existing file yourself if you meant to replace it, then run setup again.",
   },
   {
+    match: (m) => m.includes("recovery key file") && m.includes("already exists"),
+    title: "A recovery key file already exists",
+    action:
+      "A file already exists at the chosen recovery key export path. Setup will not overwrite key material. Choose a fresh filename, or manage the existing key with `nextsql key verify-recovery`.",
+  },
+  {
+    match: (m) => m.includes("recovery-key-out cannot be used with --skip-init") || m.includes("recoverykeyout cannot be used with skipinit"),
+    title: "Recovery key cannot be generated when skipping database creation",
+    action:
+      "A recovery key seals an initialized database. Either initialize the database now, or export a recovery key later with `nextsql key add-recovery`.",
+  },
+  {
+    match: (m) => m.includes("instance-recovery-key-out requires --recovery-key-out") || m.includes("instancerecoverykeyout requires recoverykeyout"),
+    title: "Both keystores must have recovery keys configured together",
+    action:
+      "A NextSQL deployment uses two keystores (database and registry). Recovery keys must be configured for both keystores together or neither.",
+  },
+  {
     match: (m) => m.includes("already contains an initialized database") || (m.includes("data directory already") && m.includes("database")) || m.includes("database already exists"),
     title: "This data directory already has a database",
     action:
-      "NextSQL is already initialized in this folder. Pick an empty data directory for a fresh install, or use `nextsql hosting` to upgrade or repair the existing one.",
+      "NextSQL is already initialized in this folder. Pick an empty data directory for a fresh install, or use `nextsql registry` to upgrade or repair the existing one.",
   },
   {
     match: (m) => m.includes("production profile requires --user") || m.includes("production profile requires an administrator") || m.includes("production profile requires --user and --password-file"),

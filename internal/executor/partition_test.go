@@ -1221,9 +1221,11 @@ func TestPartitionCrossPartitionUnique(t *testing.T) {
 	)`)
 	execOK(t, s, `INSERT INTO accounts (shard, id, email) VALUES ('w', '1', 'a@x'), ('e', '2', 'a@x')`)
 
-	// Non-plain UNIQUE indexes stay rejected on partitioned tables.
-	expectErrContains(t, s, `CREATE UNIQUE INDEX ux_bad ON accounts (email) WHERE id > '0'`, "not supported in this slice")
-	expectErrContains(t, s, `CREATE UNIQUE INDEX ux_bad ON accounts (LOWER(email))`, "not supported in this slice")
+	// Non-plain UNIQUE indexes now supported: cross-partition duplicates fail closed.
+	expectErrContains(t, s, `CREATE UNIQUE INDEX ux_bad_partial ON accounts (email) WHERE id > '0'`, "across partitions")
+	expectErrContains(t, s, `CREATE UNIQUE INDEX ux_bad_expr ON accounts (LOWER(email))`, "across partitions")
+	execOK(t, s, `CREATE UNIQUE INDEX ux_partial_ok ON accounts (email) WHERE id = '1'`)
+	execOK(t, s, `DROP INDEX ux_partial_ok`)
 
 	// PK-target UPSERT routes to the proposed row's partition heap.
 	execOK(t, s, `UPSERT INTO accounts (shard, id, email) VALUES ('w', '1', 'z@x') ON UNIQUE (shard, id) SET email = excluded.email`)
@@ -1811,3 +1813,147 @@ func TestPartitionCrossPartitionUniqueSustainedConcurrentWrites(t *testing.T) {
 		}
 	}
 }
+
+func TestPartitionUniqueIndexesExtended(t *testing.T) {
+	db := testDB(t)
+	defer db.Close()
+	s := db.Session()
+
+	execOK(t, s, `CREATE TABLE part_unique_ext (
+		shard STRING NOT NULL,
+		id INT64 NOT NULL,
+		email STRING NOT NULL,
+		payload JSON NOT NULL,
+		status STRING NOT NULL,
+		PRIMARY KEY (shard, id)
+	) PARTITION BY LIST (shard) (
+		PARTITION s1 VALUES IN ('s1'),
+		PARTITION s2 VALUES IN ('s2')
+	)`)
+
+	execOK(t, s, `INSERT INTO part_unique_ext (shard, id, email, payload, status) VALUES
+		('s1', 1, 'alice@example.com', '{"profile":{"code":10}}', 'active'),
+		('s2', 2, 'bob@example.com', '{"profile":{"code":20}}', 'active')`)
+
+	// 1. Partial UNIQUE index on partitioned table.
+	execOK(t, s, `CREATE UNIQUE INDEX ux_part_status ON part_unique_ext (email) WHERE status = 'active'`)
+	// Cross-partition duplicate with matching status fails.
+	expectErrContains(t, s, `INSERT INTO part_unique_ext (shard, id, email, payload, status) VALUES ('s2', 3, 'alice@example.com', '{"profile":{"code":30}}', 'active')`, "across partitions")
+	// Non-matching status succeeds.
+	execOK(t, s, `INSERT INTO part_unique_ext (shard, id, email, payload, status) VALUES ('s2', 3, 'alice@example.com', '{"profile":{"code":30}}', 'inactive')`)
+
+	// 2. Expression UNIQUE index on partitioned table.
+	// Build-time check catches duplicate lowercase email across partitions ('s1' has alice, 's2' has alice).
+	expectErrContains(t, s, `CREATE UNIQUE INDEX ux_part_lower ON part_unique_ext (LOWER(email))`, "across partitions")
+	// Remove duplicate inactive row so creation succeeds.
+	execOK(t, s, `DELETE FROM part_unique_ext WHERE shard = 's2' AND id = 3`)
+	execOK(t, s, `CREATE UNIQUE INDEX ux_part_lower ON part_unique_ext (LOWER(email))`)
+	// Casing duplicate across partitions fails.
+	expectErrContains(t, s, `INSERT INTO part_unique_ext (shard, id, email, payload, status) VALUES ('s1', 4, 'BOB@EXAMPLE.COM', '{"profile":{"code":40}}', 'pending')`, "across partitions")
+	// Distinct value succeeds.
+	execOK(t, s, `INSERT INTO part_unique_ext (shard, id, email, payload, status) VALUES ('s1', 4, 'charlie@example.com', '{"profile":{"code":40}}', 'pending')`)
+
+	// 3. JSON-path UNIQUE index on partitioned table.
+	execOK(t, s, `CREATE UNIQUE INDEX ux_part_json ON part_unique_ext (payload.profile.code)`)
+	// Duplicate JSON code across partitions fails.
+	expectErrContains(t, s, `INSERT INTO part_unique_ext (shard, id, email, payload, status) VALUES ('s2', 5, 'david@example.com', '{"profile":{"code":10}}', 'pending')`, "across partitions")
+	// Distinct code succeeds.
+	execOK(t, s, `INSERT INTO part_unique_ext (shard, id, email, payload, status) VALUES ('s2', 5, 'david@example.com', '{"profile":{"code":50}}', 'pending')`)
+}
+
+func TestPartitionForeignKeys(t *testing.T) {
+	db := testDB(t)
+	defer db.Close()
+	s := db.Session()
+
+	// 1. Partitioned child referencing unpartitioned parent.
+	execOK(t, s, `CREATE TABLE fk_parent_unpart (
+		id INT64 NOT NULL PRIMARY KEY,
+		name STRING NOT NULL
+	)`)
+	execOK(t, s, `CREATE TABLE fk_child_part (
+		region STRING NOT NULL,
+		child_id INT64 NOT NULL,
+		parent_id INT64 NOT NULL,
+		PRIMARY KEY (region, child_id),
+		FOREIGN KEY (parent_id) REFERENCES fk_parent_unpart (id) ON DELETE CASCADE ON UPDATE CASCADE
+	) PARTITION BY LIST (region) (
+		PARTITION north VALUES IN ('north'),
+		PARTITION south VALUES IN ('south')
+	)`)
+
+	execOK(t, s, `INSERT INTO fk_parent_unpart (id, name) VALUES (1, 'p1'), (2, 'p2')`)
+	execOK(t, s, `INSERT INTO fk_child_part (region, child_id, parent_id) VALUES ('north', 10, 1), ('south', 20, 1), ('north', 30, 2)`)
+	// Invalid parent foreign key rejected.
+	expectErrContains(t, s, `INSERT INTO fk_child_part (region, child_id, parent_id) VALUES ('south', 40, 999)`, "foreign key")
+
+	// Parent UPDATE cascades to child rows across both partitions.
+	execOK(t, s, `UPDATE fk_parent_unpart SET id = 100 WHERE id = 1`)
+	got := execOK(t, s, `SELECT parent_id FROM fk_child_part WHERE child_id = 10 OR child_id = 20 ORDER BY child_id`)
+	if len(got.Rows) != 2 || got.Rows[0][0].Int != 100 || got.Rows[1][0].Int != 100 {
+		t.Fatalf("child parent_id cascade update failed: %+v", got.Rows)
+	}
+
+	// Parent DELETE cascades to child rows across both partitions.
+	execOK(t, s, `DELETE FROM fk_parent_unpart WHERE id = 100`)
+	got = execOK(t, s, `SELECT child_id FROM fk_child_part ORDER BY child_id`)
+	if len(got.Rows) != 1 || got.Rows[0][0].Int != 30 {
+		t.Fatalf("child cascade delete failed: %+v", got.Rows)
+	}
+
+	// 2. Unpartitioned child referencing partitioned parent.
+	execOK(t, s, `CREATE TABLE fk_parent_part (
+		region STRING NOT NULL,
+		id INT64 NOT NULL,
+		name STRING NOT NULL,
+		PRIMARY KEY (region, id)
+	) PARTITION BY LIST (region) (
+		PARTITION us VALUES IN ('us'),
+		PARTITION eu VALUES IN ('eu')
+	)`)
+	execOK(t, s, `CREATE TABLE fk_child_unpart (
+		cid INT64 NOT NULL PRIMARY KEY,
+		pref_region STRING NOT NULL,
+		pref_id INT64 NOT NULL,
+		FOREIGN KEY (pref_region, pref_id) REFERENCES fk_parent_part (region, id) ON DELETE CASCADE
+	)`)
+
+	execOK(t, s, `INSERT INTO fk_parent_part (region, id, name) VALUES ('us', 1, 'u1'), ('eu', 2, 'e1')`)
+	execOK(t, s, `INSERT INTO fk_child_unpart (cid, pref_region, pref_id) VALUES (101, 'us', 1), (102, 'eu', 2)`)
+	expectErrContains(t, s, `INSERT INTO fk_child_unpart (cid, pref_region, pref_id) VALUES (103, 'eu', 99)`, "foreign key")
+
+	// Delete partitioned parent row cascades to child.
+	execOK(t, s, `DELETE FROM fk_parent_part WHERE region = 'us' AND id = 1`)
+	got = execOK(t, s, `SELECT cid FROM fk_child_unpart`)
+	if len(got.Rows) != 1 || got.Rows[0][0].Int != 102 {
+		t.Fatalf("unpartitioned child cascade delete failed: %+v", got.Rows)
+	}
+
+	// 3. Partitioned child referencing partitioned parent.
+	execOK(t, s, `CREATE TABLE fk_both_parent (
+		cat STRING NOT NULL,
+		pid INT64 NOT NULL,
+		PRIMARY KEY (cat, pid)
+	) PARTITION BY LIST (cat) (
+		PARTITION c1 VALUES IN ('electronics'),
+		PARTITION c2 VALUES IN ('books')
+	)`)
+	execOK(t, s, `CREATE TABLE fk_both_child (
+		shard STRING NOT NULL,
+		cid INT64 NOT NULL,
+		p_cat STRING NOT NULL,
+		p_id INT64 NOT NULL,
+		PRIMARY KEY (shard, cid),
+		FOREIGN KEY (p_cat, p_id) REFERENCES fk_both_parent (cat, pid) ON DELETE RESTRICT
+	) PARTITION BY LIST (shard) (
+		PARTITION s1 VALUES IN ('east'),
+		PARTITION s2 VALUES IN ('west')
+	)`)
+
+	execOK(t, s, `INSERT INTO fk_both_parent (cat, pid) VALUES ('electronics', 1), ('books', 2)`)
+	execOK(t, s, `INSERT INTO fk_both_child (shard, cid, p_cat, p_id) VALUES ('west', 1, 'electronics', 1)`)
+	expectErrContains(t, s, `DELETE FROM fk_both_parent WHERE cat = 'electronics' AND pid = 1`, "foreign key")
+	execOK(t, s, `DELETE FROM fk_both_child WHERE shard = 'west' AND cid = 1`)
+	execOK(t, s, `DELETE FROM fk_both_parent WHERE cat = 'electronics' AND pid = 1`)
+}
+

@@ -31,23 +31,42 @@ type ServerTLSReloader struct {
 	keyFile       string
 	clientCAFile  string
 	clientCRLFile string
+	ocspConfig    OCSPConfig
 
 	mu      sync.RWMutex
 	current *tls.Config
 	config  *tls.Config
 }
 
+// ReloaderOption configures optional ServerTLSReloader behavior.
+type ReloaderOption func(*ServerTLSReloader)
+
+// WithOCSP configures certificate status checking via OCSP.
+func WithOCSP(cfg OCSPConfig) ReloaderOption {
+	return func(r *ServerTLSReloader) {
+		r.ocspConfig = cfg
+	}
+}
+
 // NewServerTLSReloader loads a server key pair and, when clientCAFile is set,
 // an mTLS trust bundle plus an optional PEM CRL bundle. Call Reload after
 // atomically replacing any of the files to rotate credentials without
 // restarting the listener.
-func NewServerTLSReloader(certFile, keyFile, clientCAFile, clientCRLFile string) (*ServerTLSReloader, error) {
+func NewServerTLSReloader(certFile, keyFile, clientCAFile, clientCRLFile string, opts ...ReloaderOption) (*ServerTLSReloader, error) {
 	if strings.TrimSpace(clientCRLFile) != "" && strings.TrimSpace(clientCAFile) == "" {
 		return nil, nerr.New(nerr.InvalidArgument, "security.NewServerTLSReloader", "client CRL requires a client CA bundle")
 	}
 	r := &ServerTLSReloader{
 		certFile: certFile, keyFile: keyFile,
 		clientCAFile: clientCAFile, clientCRLFile: clientCRLFile,
+	}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(r)
+		}
+	}
+	if r.ocspConfig.Mode != "" && r.ocspConfig.Mode != OCSPModeDisabled && strings.TrimSpace(clientCAFile) == "" {
+		return nil, nerr.New(nerr.InvalidArgument, "security.NewServerTLSReloader", "client OCSP verification requires a client CA bundle")
 	}
 	if err := r.Reload(); err != nil {
 		return nil, err
@@ -81,7 +100,7 @@ func (r *ServerTLSReloader) Reload() error {
 	if r == nil {
 		return nerr.New(nerr.InvalidArgument, "security.ServerTLSReloader.Reload", "nil reloader")
 	}
-	cfg, err := loadServerTLS(r.certFile, r.keyFile, r.clientCAFile, r.clientCRLFile)
+	cfg, err := loadServerTLS(r.certFile, r.keyFile, r.clientCAFile, r.clientCRLFile, r.ocspConfig)
 	if err != nil {
 		return err
 	}
@@ -110,6 +129,7 @@ type TLSStatus struct {
 	MTLSRequired        bool
 	ClientCAConfigured  bool
 	ClientCRLConfigured bool
+	OCSPMode            string
 }
 
 // Status returns the currently active leaf certificate's redacted status.
@@ -127,6 +147,10 @@ func (r *ServerTLSReloader) Status() (TLSStatus, bool) {
 		return TLSStatus{}, false
 	}
 	leaf := cfg.Certificates[0].Leaf
+	ocspMode := string(r.ocspConfig.Mode)
+	if ocspMode == "" {
+		ocspMode = string(OCSPModeDisabled)
+	}
 	return TLSStatus{
 		Enabled:             true,
 		Subject:             leaf.Subject.String(),
@@ -137,12 +161,13 @@ func (r *ServerTLSReloader) Status() (TLSStatus, bool) {
 		MTLSRequired:        cfg.ClientAuth == tls.RequireAndVerifyClientCert,
 		ClientCAConfigured:  r.MTLS(),
 		ClientCRLConfigured: strings.TrimSpace(r.clientCRLFile) != "",
+		OCSPMode:            ocspMode,
 	}, true
 }
 
 // ServerTLS loads a certificate and requires TLS 1.3.
 func ServerTLS(certFile, keyFile string) (*tls.Config, error) {
-	return loadServerTLS(certFile, keyFile, "", "")
+	return loadServerTLS(certFile, keyFile, "", "", OCSPConfig{})
 }
 
 // ServerMTLS loads the server key pair and a client trust bundle. Every TLS
@@ -150,10 +175,10 @@ func ServerTLS(certFile, keyFile string) (*tls.Config, error) {
 // protocol separately binds the certificate's NextSQL service URI to the
 // requested database principal.
 func ServerMTLS(certFile, keyFile, clientCAFile string) (*tls.Config, error) {
-	return loadServerTLS(certFile, keyFile, clientCAFile, "")
+	return loadServerTLS(certFile, keyFile, clientCAFile, "", OCSPConfig{})
 }
 
-func loadServerTLS(certFile, keyFile, clientCAFile, clientCRLFile string) (*tls.Config, error) {
+func loadServerTLS(certFile, keyFile, clientCAFile, clientCRLFile string, ocspCfg OCSPConfig) (*tls.Config, error) {
 	const op = "security.loadServerTLS"
 	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
 	if err != nil {
@@ -176,6 +201,9 @@ func loadServerTLS(certFile, keyFile, clientCAFile, clientCRLFile string) (*tls.
 		if strings.TrimSpace(clientCRLFile) != "" {
 			return nil, nerr.New(nerr.InvalidArgument, op, "client CRL requires a client CA bundle")
 		}
+		if ocspCfg.Mode != "" && ocspCfg.Mode != OCSPModeDisabled {
+			return nil, nerr.New(nerr.InvalidArgument, op, "client OCSP verification requires a client CA bundle")
+		}
 		return cfg, nil
 	}
 	pool, authorities, err := certPoolAndCertificatesFromFile(op, clientCAFile)
@@ -184,12 +212,47 @@ func loadServerTLS(certFile, keyFile, clientCAFile, clientCRLFile string) (*tls.
 	}
 	cfg.ClientAuth = tls.RequireAndVerifyClientCert
 	cfg.ClientCAs = pool
+
+	var verifyFuncs []func(state tls.ConnectionState) error
 	if strings.TrimSpace(clientCRLFile) != "" {
 		revocations, err := revocationListsFromFile(op, clientCRLFile, authorities, now)
 		if err != nil {
 			return nil, err
 		}
-		cfg.VerifyConnection = revocations.verifyConnection
+		verifyFuncs = append(verifyFuncs, revocations.verifyConnection)
+	}
+	if ocspCfg.Mode != "" && ocspCfg.Mode != OCSPModeDisabled {
+		verifyFuncs = append(verifyFuncs, func(state tls.ConnectionState) error {
+			if len(state.VerifiedChains) == 0 {
+				return nerr.New(nerr.Unauthorized, "security.verifyClientOCSP", "verified client certificate required")
+			}
+			var lastErr error
+			for _, chain := range state.VerifiedChains {
+				if len(chain) < 2 {
+					lastErr = nerr.New(nerr.Unauthorized, "security.verifyClientOCSP", "client certificate chain has no issuer")
+					continue
+				}
+				if err := VerifyOCSP(chain[0], chain[1], state.OCSPResponse, ocspCfg); err == nil {
+					return nil
+				} else {
+					lastErr = err
+				}
+			}
+			if lastErr != nil {
+				return lastErr
+			}
+			return nerr.New(nerr.Unauthorized, "security.verifyClientOCSP", "client certificate OCSP verification failed")
+		})
+	}
+	if len(verifyFuncs) > 0 {
+		cfg.VerifyConnection = func(state tls.ConnectionState) error {
+			for _, fn := range verifyFuncs {
+				if err := fn(state); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
 	}
 	return cfg, nil
 }

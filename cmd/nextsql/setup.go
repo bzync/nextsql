@@ -47,8 +47,7 @@ func setupCmd(args []string) error {
 	tlsKey := fs.String("tls-key", "", "TLS 1.3 private key (PEM) for a remote listen address")
 	user := fs.String("user", "", "bootstrap administrator user (recommended)")
 	passwordFile := fs.String("password-file", "", "password file for --user (never a URL)")
-	realmName := fs.String("realm", "default", "bootstrap subscription realm name")
-	databaseName := fs.String("database", "default", "bootstrap logical database name")
+	databaseName := fs.String("database", "", "name the deployment's database and create it; unset initializes the deployment only (keys and administrator), with no database")
 	configIn := fs.String("config-in", "", "load defaults from this key=value config file before applying flags")
 	configOut := fs.String("config-out", "", "where to write the generated config (default DATA-DIR/nextsql.conf)")
 	jsonOut := fs.Bool("json", false, "emit a single machine-readable JSON object instead of text")
@@ -56,6 +55,8 @@ func setupCmd(args []string) error {
 	force := fs.Bool("force", false, "overwrite an existing config file")
 	skipInit := fs.Bool("skip-init", false, "generate the config only; do not initialize the database")
 	keepFailed := fs.Bool("keep-failed", false, "on failure, leave a partial install in place instead of rolling it back")
+	recoveryKeyOut := fs.String("recovery-key-out", "", "also generate a recovery key (a second, independent unlock key for the same database) and write it here; must not exist")
+	instanceRecoveryKeyOut := fs.String("instance-recovery-key-out", "", "recovery key for the deployment-registry keystore (default RECOVERY-KEY-OUT.instance)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -65,6 +66,14 @@ func setupCmd(args []string) error {
 	}
 	if (*user == "") != (*passwordFile == "") {
 		return nerr.New(nerr.InvalidArgument, "nextsql setup", "--user and --password-file must be given together")
+	}
+	// A deployment has two independently sealed keystores and losing either
+	// root is fatal on its own (see `nextsql key --keystore`), so recovery is
+	// requested for both or neither: --instance-recovery-key-out only
+	// relocates the second file, it never selects one keystore alone.
+	if *instanceRecoveryKeyOut != "" && *recoveryKeyOut == "" {
+		return cli.Validation("nextsql setup",
+			"--instance-recovery-key-out requires --recovery-key-out: a deployment's two keystores get recovery keys together or not at all")
 	}
 
 	presetVal, err := setup.ParsePreset(*preset)
@@ -77,6 +86,23 @@ func setupCmd(args []string) error {
 	}
 	if profileVal == config.ProfileProduction && *skipInit {
 		return cli.Validation("nextsql setup", "production profile cannot use --skip-init: initialize the database with --user/--password-file")
+	}
+	if *recoveryKeyOut != "" && *skipInit {
+		return cli.Validation("nextsql setup",
+			"--recovery-key-out cannot be used with --skip-init: no keystore is created for a recovery key to seal, so run `nextsql key add-recovery` after the database exists")
+	}
+	// A deployment can be initialized without a database (`nextsql init`'s
+	// own rule: no --database, no database). Two things then have nothing to
+	// act on, and both say so rather than half-working: a recovery key has no
+	// keystore to seal, and a production install would write a configuration
+	// for a server that refuses to start.
+	if *recoveryKeyOut != "" && !*skipInit && *databaseName == "" {
+		return cli.Validation("nextsql setup",
+			"--recovery-key-out requires --database: without one no database (and so no keystore) is created for a recovery key to seal")
+	}
+	if profileVal == config.ProfileProduction && *databaseName == "" {
+		return cli.Validation("nextsql setup",
+			"production profile requires --database: a deployment with no database cannot serve, and nextsqld fails closed on one")
 	}
 
 	base := config.Default()
@@ -132,23 +158,36 @@ func setupCmd(args []string) error {
 	keyFileExists := statExists(*keyFile)
 	instanceKeyExists := statExists(plan.InstanceKeyFile)
 
+	// Resolved before anything is written, so --dry-run refuses exactly what
+	// a real run would: the GUI treats the dry run as the authoritative
+	// validator, and an install that fails only after creating a database
+	// would leave the operator with a rollback instead of an answer.
+	recoveryExports, err := planRecoveryExports(*recoveryKeyOut, *instanceRecoveryKeyOut, plan)
+	if err != nil {
+		return err
+	}
+
 	result := setupResult{
-		NextSQLVersion:    version.String,
-		Phase:             version.Phase,
-		Hardware:          plan.Info,
-		Recommendation:    plan.Recommendation,
-		ConfigPath:        plan.ConfigPath,
-		ListenAddr:        plan.ListenAddr,
-		TLS:               plan.TLS,
-		DataDir:           plan.DataDir,
-		KeyFile:           plan.KeyFile,
-		KeyFileExists:     keyFileExists,
-		InstanceKey:       plan.InstanceKeyFile,
-		InstanceKeyExists: instanceKeyExists,
-		AdminUser:         plan.AdminUser,
-		Profile:           plan.Profile,
-		Warnings:          append(append([]string{}, plan.Warnings...), keyFileAdvisories(*keyFile, keyFileExists, plan.InstanceKeyFile, instanceKeyExists)...),
-		DryRun:            *dryRun,
+		NextSQLVersion:          version.String,
+		Phase:                   version.Phase,
+		Hardware:                plan.Info,
+		Recommendation:          plan.Recommendation,
+		ConfigPath:              plan.ConfigPath,
+		ListenAddr:              plan.ListenAddr,
+		TLS:                     plan.TLS,
+		DataDir:                 plan.DataDir,
+		KeyFile:                 plan.KeyFile,
+		KeyFileExists:           keyFileExists,
+		InstanceKey:             plan.InstanceKeyFile,
+		InstanceKeyExists:       instanceKeyExists,
+		AdminUser:               plan.AdminUser,
+		Profile:                 plan.Profile,
+		RecoveryKeyFile:         exportPathFor(recoveryExports, keystoreDatabase),
+		InstanceRecoveryKeyFile: exportPathFor(recoveryExports, keystoreInstance),
+		Warnings: append(append(append([]string{}, plan.Warnings...),
+			keyFileAdvisories(*keyFile, keyFileExists, plan.InstanceKeyFile, instanceKeyExists)...),
+			recoveryKeyAdvisories(recoveryExports, plan.RunInit)...),
+		DryRun: *dryRun,
 	}
 
 	if !*dryRun && profileVal == config.ProfileProduction && *user == "" {
@@ -179,6 +218,9 @@ func setupCmd(args []string) error {
 	// never a pre-existing data directory or an operator-supplied key.
 	rb := setup.NewInstallRollback()
 	rollbackPaths := installArtifactPaths(*dataDir, *keyFile, plan.InstanceKeyFile)
+	for _, ex := range recoveryExports {
+		rollbackPaths = append(rollbackPaths, ex.Out)
+	}
 	for _, p := range append(rollbackPaths, *dataDir, confPath) {
 		_, statErr := os.Stat(p)
 		rb.Observe(p, statErr == nil)
@@ -201,7 +243,7 @@ func setupCmd(args []string) error {
 		if _, err := os.Stat(filepath.Join(*dataDir, config.DataFileName)); err == nil {
 			return nerr.New(nerr.AlreadyExists, "nextsql setup",
 				"data directory already contains an initialized database; pass --skip-init to only regenerate the config, "+
-					"or use `nextsql hosting` for upgrade/repair")
+					"or use `nextsql registry` for upgrade/repair")
 		} else if !os.IsNotExist(err) {
 			return nerr.Wrap(nerr.IO, "nextsql setup", "stat database", err)
 		}
@@ -211,8 +253,9 @@ func setupCmd(args []string) error {
 			"--data-dir", *dataDir,
 			"--key-file", *keyFile,
 			"--buffer-pages", strconv.Itoa(plan.Config.BufferPages),
-			"--realm", *realmName,
-			"--database", *databaseName,
+		}
+		if *databaseName != "" {
+			initArgs = append(initArgs, "--database", *databaseName)
 		}
 		if plan.InstanceKeyFile != "" {
 			initArgs = append(initArgs, "--instance-key-file", plan.InstanceKeyFile)
@@ -232,7 +275,27 @@ func setupCmd(args []string) error {
 			return failed(initErr)
 		}
 		result.InitOutput = strings.TrimSpace(out)
-		result.Initialized = true
+		// Initialized means "a database exists now". A deployment-only run
+		// initialized the deployment, not a database, and must not claim
+		// otherwise — the Setup wizard and `nextsql lifecycle detect` both
+		// read this field.
+		result.Initialized = *databaseName != ""
+		result.DatabaseName = *databaseName
+	}
+
+	// Sealing a recovery key needs the keystores `nextsql init` just made, so
+	// this runs after init and before the config is written: a failure here
+	// rolls the whole install back rather than handing over a database the
+	// operator believes is recoverable and is not.
+	if len(recoveryExports) > 0 {
+		for _, ex := range recoveryExports {
+			rb.Track(ex.Out) // tracked before the write, so a partial file is cleaned up too
+			if err := exportRecoveryKey(ex); err != nil {
+				return failed(err)
+			}
+			warnIfUnderDataDir("nextsql setup", ex.Out, *dataDir)
+		}
+		result.RecoveryKeysCreated = true
 	}
 
 	if err := writeConfigFile(confPath, plan.Config); err != nil {
@@ -241,7 +304,10 @@ func setupCmd(args []string) error {
 	rb.Track(confPath)
 	result.ConfigWritten = true
 
-	if plan.RunInit {
+	// A deployment-only install (no --database) creates nothing to open, so
+	// there is no health to check; reporting a health result for it would be
+	// an assertion about a database that does not exist.
+	if plan.RunInit && *databaseName != "" {
 		health, err := verifySetupHealth(*dataDir, *keyFile, plan.Config.BufferPages)
 		if err != nil {
 			return failed(err)
@@ -335,19 +401,31 @@ type setupResult struct {
 	// means a new root unlock key will be generated there. Never flips a
 	// generate into an overwrite either way — this is disclosure, not a
 	// switch; see keyFileAdvisories.
-	KeyFileExists     bool         `json:"key_file_exists"`
-	InstanceKey       string       `json:"instance_key_file"`
-	InstanceKeyExists bool         `json:"instance_key_exists"`
-	AdminUser         string       `json:"admin_user,omitempty"`
-	Profile           string       `json:"profile"`
-	Initialized       bool         `json:"initialized"`
-	InitOutput        string       `json:"init_output,omitempty"`
-	Health            *setupHealth `json:"health,omitempty"`
-	Warnings          []string     `json:"warnings"`
-	DryRun            bool         `json:"dry_run"`
-	Plan              string       `json:"plan,omitempty"`
-	RolledBack        []string     `json:"rolled_back,omitempty"`
-	RollbackKept      []string     `json:"rollback_kept,omitempty"`
+	KeyFileExists     bool   `json:"key_file_exists"`
+	InstanceKey       string `json:"instance_key_file"`
+	InstanceKeyExists bool   `json:"instance_key_exists"`
+	// RecoveryKeyFile/InstanceRecoveryKeyFile are where this run will write
+	// (or, after a successful run, did write) a recovery key for each of the
+	// deployment's two keystores. Empty means none was requested — the
+	// pre-existing behavior, where the root unlock key is the only way in.
+	// RecoveryKeysCreated is true only once both files exist and each has
+	// been verified to actually unlock its keystore from disk.
+	RecoveryKeyFile         string `json:"recovery_key_file,omitempty"`
+	InstanceRecoveryKeyFile string `json:"instance_recovery_key_file,omitempty"`
+	RecoveryKeysCreated     bool   `json:"recovery_keys_created"`
+	AdminUser               string `json:"admin_user,omitempty"`
+	Profile                 string `json:"profile"`
+	Initialized             bool   `json:"initialized"`
+	// DatabaseName is the deployment's database, empty when this run made a
+	// deployment with no database (no --database).
+	DatabaseName string       `json:"database_name,omitempty"`
+	InitOutput   string       `json:"init_output,omitempty"`
+	Health       *setupHealth `json:"health,omitempty"`
+	Warnings     []string     `json:"warnings"`
+	DryRun       bool         `json:"dry_run"`
+	Plan         string       `json:"plan,omitempty"`
+	RolledBack   []string     `json:"rolled_back,omitempty"`
+	RollbackKept []string     `json:"rollback_kept,omitempty"`
 }
 
 // statExists reports whether path names an existing filesystem entry. It
@@ -385,6 +463,159 @@ func keyFileAdvisories(keyFile string, keyExists bool, instanceKeyFile string, i
 		}
 	}
 	return w
+}
+
+// recoveryExport is one keystore's recovery-key export, fully resolved
+// before the run touches the filesystem: which keystore, the root unlock key
+// that must open it, the keystore file itself, and where the exported key
+// goes.
+type recoveryExport struct {
+	Keystore     string
+	KeyFile      string
+	KeystorePath string
+	Out          string
+}
+
+// planRecoveryExports resolves --recovery-key-out into one export per
+// keystore, or nothing at all when the flag was not given. A deployment's
+// database and registry keystores are sealed under separate roots and losing
+// either is fatal alone, so both get a recovery key — the instance path
+// defaults beside the first exactly as --instance-key-file defaults beside
+// --key-file.
+//
+// It refuses up front rather than after `nextsql init`: an output path that
+// already exists, or any two of the four key paths naming the same file
+// (which would either clobber a key or seal a "recovery" key that is the
+// root key, and SetRecoveryKey rejects the latter outright).
+func planRecoveryExports(out, instanceOut string, plan setup.Plan) ([]recoveryExport, error) {
+	if out == "" {
+		return nil, nil
+	}
+	if instanceOut == "" {
+		instanceOut = out + ".instance"
+	}
+	dbPath := filepath.Join(plan.DataDir, config.DataFileName)
+	exports := []recoveryExport{
+		{
+			Keystore:     keystoreDatabase,
+			KeyFile:      plan.KeyFile,
+			KeystorePath: crypto.KeystorePath(dbPath),
+			Out:          out,
+		},
+		{
+			Keystore:     keystoreInstance,
+			KeyFile:      plan.InstanceKeyFile,
+			KeystorePath: hosting.KeyStorePath(hosting.Path(plan.DataDir)),
+			Out:          instanceOut,
+		},
+	}
+	seen := map[string]string{}
+	for _, pair := range []struct{ label, path string }{
+		{"--key-file", plan.KeyFile},
+		{"--instance-key-file", plan.InstanceKeyFile},
+		{"--recovery-key-out", out},
+		{"--instance-recovery-key-out", instanceOut},
+	} {
+		if pair.path == "" {
+			continue
+		}
+		abs, err := filepath.Abs(pair.path)
+		if err != nil {
+			abs = pair.path
+		}
+		if prior, dup := seen[abs]; dup {
+			return nil, cli.Validation("nextsql setup",
+				prior+" and "+pair.label+" name the same file ("+pair.path+"); each key must be its own file")
+		}
+		seen[abs] = pair.label
+	}
+	for _, ex := range exports {
+		if statExists(ex.Out) {
+			return nil, nerr.New(nerr.AlreadyExists, "nextsql setup",
+				"recovery key file "+ex.Out+" already exists; setup never overwrites key material — choose another path, "+
+					"or manage the existing key with `nextsql key verify-recovery`")
+		}
+	}
+	return exports, nil
+}
+
+func exportPathFor(exports []recoveryExport, keystore string) string {
+	for _, ex := range exports {
+		if ex.Keystore == keystore {
+			return ex.Out
+		}
+	}
+	return ""
+}
+
+// recoveryKeyAdvisories states, before the operator confirms, either what
+// recovery keys this run will write or that the root unlock key will be the
+// only way in. The second half is the more important one: it is the default,
+// and it is silent otherwise.
+func recoveryKeyAdvisories(exports []recoveryExport, runInit bool) []string {
+	if len(exports) == 0 {
+		if !runInit {
+			return nil
+		}
+		return []string{"no --recovery-key-out given: the root unlock key will be the only way to open this deployment — losing it means total, unrecoverable data loss. Add a second unlock path later with `nextsql key add-recovery`"}
+	}
+	var w []string
+	for _, ex := range exports {
+		w = append(w, "a recovery key for the "+ex.Keystore+" keystore will be generated at "+ex.Out+
+			" and verified against that keystore; store it offline, separately from "+ex.KeyFile)
+	}
+	return w
+}
+
+// exportRecoveryKey seals a freshly generated recovery key into one keystore
+// and then proves the exported file opens it, in the same order and with the
+// same write-before-install ordering as `nextsql key add-recovery`.
+//
+// Verification is deliberately done twice and the second time from disk: the
+// live envelope check catches a wrap that does not unwrap, while reopening
+// the keystore file with the bytes that were actually written is the same
+// operation the operator will perform in a disaster. An exported recovery
+// key that has never opened its keystore is a backup nobody has restored.
+func exportRecoveryKey(ex recoveryExport) error {
+	root, err := crypto.ReadKeyFile(ex.KeyFile)
+	if err != nil {
+		return err
+	}
+	env, err := crypto.OpenEnvelope(ex.KeystorePath, root)
+	if err != nil {
+		return err
+	}
+	if env.HasRecoveryKey() {
+		_ = env.Close()
+		return nerr.New(nerr.AlreadyExists, "nextsql setup",
+			"the "+ex.Keystore+" keystore already has a recovery key configured; supersede it deliberately with `nextsql key add-recovery --replace`")
+	}
+	rec, err := crypto.CreateRecoveryKeyFile(ex.Out, env.NextRecoveryKeyVersion())
+	if err != nil {
+		_ = env.Close()
+		return err
+	}
+	if err := env.SetRecoveryKey(rec); err != nil {
+		_ = os.Remove(ex.Out)
+		_ = env.Close()
+		return err
+	}
+	if err := env.VerifyRecoveryKey(rec); err != nil {
+		_ = env.Close()
+		return err
+	}
+	_ = env.Close()
+
+	reread, err := crypto.ReadRecoveryKeyFile(ex.Out)
+	if err != nil {
+		return nerr.Wrap(nerr.IO, "nextsql setup", "re-read the exported recovery key for "+ex.Keystore, err)
+	}
+	verified, err := crypto.OpenEnvelopeWithRecovery(ex.KeystorePath, reread)
+	if err != nil {
+		return nerr.Wrap(nerr.Crypto, "nextsql setup",
+			"the exported recovery key for "+ex.Keystore+" did not open its keystore", err)
+	}
+	return verified.Close()
 }
 
 type setupHealth struct {
@@ -469,6 +700,20 @@ func writeConfigFile(path string, c config.Config) error {
 	return nil
 }
 
+// recoveryKeyVerb distinguishes a planned export from a completed, verified
+// one. It never says "created" before the file has actually been written and
+// proven to open its keystore.
+func recoveryKeyVerb(created, dryRun bool) string {
+	switch {
+	case created:
+		return "created and verified"
+	case dryRun:
+		return "would be created"
+	default:
+		return "not created"
+	}
+}
+
 func keyFileVerb(exists bool) string {
 	if exists {
 		return "existing, will be imported"
@@ -506,6 +751,10 @@ func emitSetup(r setupResult, jsonOut bool) error {
 	fmt.Fprintf(w, "  listen        %s%s\n", r.ListenAddr, tlsSuffix(r.TLS))
 	fmt.Fprintf(w, "  data-dir      %s\n", r.DataDir)
 	fmt.Fprintf(w, "  key-file      %s (%s)\n", r.KeyFile, keyFileVerb(r.KeyFileExists))
+	if r.RecoveryKeyFile != "" {
+		fmt.Fprintf(w, "  recovery key  %s (%s)\n", r.RecoveryKeyFile, recoveryKeyVerb(r.RecoveryKeysCreated, r.DryRun))
+		fmt.Fprintf(w, "  registry rec. %s\n", r.InstanceRecoveryKeyFile)
+	}
 	fmt.Fprintf(w, "  config        %s\n", r.ConfigPath)
 	if r.AdminUser != "" {
 		fmt.Fprintf(w, "  admin user    %s\n", r.AdminUser)
@@ -523,6 +772,13 @@ func emitSetup(r setupResult, jsonOut bool) error {
 	}
 	if r.Initialized {
 		fmt.Fprintf(w, "database initialized\n")
+	}
+	if r.RecoveryKeysCreated {
+		fmt.Fprintf(w, "recovery keys written and verified:\n")
+		fmt.Fprintf(w, "  %s  (database keystore)\n", r.RecoveryKeyFile)
+		fmt.Fprintf(w, "  %s  (deployment registry keystore)\n", r.InstanceRecoveryKeyFile)
+		fmt.Fprintf(w, "Move both off this host now. They are the only copies, and either one\n")
+		fmt.Fprintf(w, "kept beside the root unlock key it backs up is not a backup.\n")
 	}
 	if r.ConfigWritten {
 		fmt.Fprintf(w, "config written to %s\n", r.ConfigPath)

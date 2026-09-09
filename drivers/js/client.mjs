@@ -4,6 +4,7 @@
 import {
   AuthPasswordKey,
   FlagCancel,
+  FlagPublicErrorCodes,
   HEADER,
   NextSQLError,
   ReadConsistency,
@@ -26,7 +27,12 @@ import {
   toBytes,
   u32,
 } from './protocol.mjs';
-import { decryptField, encryptField } from './client-encryption.mjs';
+import {
+  decryptField,
+  decryptFieldDeterministic,
+  encryptField,
+  encryptFieldDeterministic,
+} from './client-encryption.mjs';
 
 export { ReadConsistency };
 
@@ -295,11 +301,13 @@ export class Conn {
     this.dial = dial;
     this.secret = 0n;
     this.busy = false;
+    this.publicErrorCodes = false;
   }
 
   async handshake() {
     await this.wire.writeFrame(Type.Hello, encodeHello({
       version: VERSION,
+      flags: FlagPublicErrorCodes,
       database: this.cfg.database || '',
       user: this.cfg.user,
       realm: this.cfg.realm || '',
@@ -309,6 +317,9 @@ export class Conn {
       throw await this.unexpected(msg);
     }
     const ok = decodeHelloOK(msg.payload);
+    // Diagnostic only: decodeError reads the field whenever it is present,
+    // so nothing depends on this having been echoed.
+    this.publicErrorCodes = (ok.flags & FlagPublicErrorCodes) !== 0;
     this.secret = ok.secret;
     await this.wire.writeFrame(Type.Auth, encodeAuth(this.cfg.password || ''));
     msg = await this.wire.readFrame();
@@ -461,6 +472,14 @@ export class Conn {
   // returning its logical value.
   async decryptField(table, column, type, ciphertext) {
     return decryptField(this.cfg.fieldKeys, this.cfg.database || '', table, column, type, ciphertext);
+  }
+
+  async encryptFieldDeterministic(table, column, type, value) {
+    return encryptFieldDeterministic(this.cfg.fieldKeys, this.cfg.database || '', table, column, type, value);
+  }
+
+  async decryptFieldDeterministic(table, column, type, ciphertext) {
+    return decryptFieldDeterministic(this.cfg.fieldKeys, this.cfg.database || '', table, column, type, ciphertext);
   }
 
   async prepare(sql) {

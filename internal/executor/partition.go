@@ -654,7 +654,12 @@ func (s *Session) checkCrossPartitionUnique(tab *catalog.Table, idx catalog.Inde
 	if tab.Partitioning == nil || row == nil {
 		return nil
 	}
-	if !idx.Unique || idx.Fulltext || idx.Vector || idx.Spatial || idx.Predicate != nil || idx.HasExpr() || len(idx.Path) > 0 {
+	if !idx.Unique || idx.Fulltext || idx.Vector || idx.Spatial {
+		return nil
+	}
+	if ok, err := s.indexRowMatches(tab, idx, row); err != nil {
+		return err
+	} else if !ok {
 		return nil
 	}
 	part, err := s.partitionForRow(tab, row)

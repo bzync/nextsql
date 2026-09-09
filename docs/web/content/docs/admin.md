@@ -24,13 +24,14 @@ Keep Admin on loopback. It is not a remote management plane.
 
 ## Setup mode
 
-Covers welcome, paths and dry-run validation, resource preset, administrator, summary, install, and completion. The GUI defaults to **Production** (`--profile production`): skip-init is disabled and an administrator is required. The CLI default remains `developer` so `--skip-init` scripts keep working. Linux `.tar.gz` / `.run` / `.deb` / `.rpm` and silent/offline/upgrade/repair paths are live-verified. Recovery-key capability and Windows/macOS packaged execution remain environment-blocked.
+Covers welcome, paths and dry-run validation, resource preset, administrator, summary, install, and completion. The GUI defaults to **Production** (`--profile production`): skip-init is disabled and an administrator is required. The CLI default remains `developer` so `--skip-init` scripts keep working. On a first install, recovery-key export is enabled by default for both keystores; Finish remains disabled until the operator confirms both exported files were copied offline. The wizard passes paths to `nextsql setup` and never handles key material itself. Linux `.tar.gz` / `.run` / `.deb` / `.rpm` and silent/offline/upgrade/repair paths are live-verified. Windows/macOS packaged execution remains environment-blocked.
 
 The same work can be done without the GUI:
 
 ```bash
 nextsql setup --data-dir /var/lib/nextsql --key-file /etc/nextsql/root.key \
-  --profile production --preset balanced --user app --password-file /tmp/nextsql.pw
+  --profile production --preset balanced --user app --password-file /tmp/nextsql.pw \
+  --recovery-key-out /etc/nextsql/recovery.key
 nextsql lifecycle detect --data-dir /var/lib/nextsql --json
 nextsql lifecycle upgrade --data-dir /var/lib/nextsql --key-file /etc/nextsql/root.key
 ```
@@ -39,7 +40,7 @@ See [Install](/docs/install) and [Command line](/docs/cli).
 
 ## Operations mode
 
-It talks to `nextsqld` over NSQL with the operator's credentials. Server-enforced RBAC still applies: a user without `ADMIN` does not get a security dashboard by visiting Admin. Surfaces include overview, storage, connections and activity, cluster, backup, configuration, and audit — all from `system.*` and the official CLI, never by opening data-directory files.
+It talks to `nextsqld` over NSQL with the operator's credentials. Server-enforced RBAC still applies: a user without `ADMIN` does not get a security dashboard by visiting Admin. Surfaces include overview, storage, connections and activity, cluster, backup, configuration, and audit — all from `system.*` and the official CLI, never by opening data-directory files. The Databases view expands the deployment's database into its tables. Backup and verification controls keep their in-flight state visible and disable conflicting actions; a request in flight keeps an Operations session from expiring by idleness, while its absolute lifetime remains enforced.
 
 ## Studio mode
 

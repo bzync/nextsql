@@ -56,6 +56,12 @@ READ_STALE = 2
 AUTH_PASSWORD = 1
 AUTH_PASSWORD_KEY = 2
 FLAG_CANCEL = 1
+# FLAG_PUBLIC_ERROR_CODES asks the server for the stable ERR_* error taxonomy
+# (docs/error-codes.md). A server that does not implement it ignores the bit and
+# keeps the NSQL v1 error shape, which decode_error still reads, so setting it is
+# safe against any server version. The server echoes it in the hello-ok flags
+# when it was accepted.
+FLAG_PUBLIC_ERROR_CODES = 2
 FLAG_NULL = 0x01
 
 KIND_UUID = 1
@@ -730,13 +736,20 @@ def encode_hello(version: int, flags: int, secret: bytes, database: str, user: s
     return out
 
 
-def decode_hello_ok(b: bytes) -> tuple[int, int, bytes]:
-    if len(b) != 11:
+def decode_hello_ok(b: bytes) -> tuple[int, int, bytes, int]:
+    if len(b) not in (11, 13):
         raise ProtocolError("bad hello-ok length")
     version = u16(b, 0)
     auth_method = b[2]
     secret = b[3:11]
-    return version, auth_method, secret
+    flags = 0
+    if len(b) == 13:
+        flags = u16(b, 11)
+        # The server omits the field when it accepted no capability, so a
+        # present-but-zero field is a second encoding of the v1 hello-ok.
+        if flags == 0:
+            raise ProtocolError("empty hello-ok flags")
+    return version, auth_method, secret, flags
 
 
 def encode_query(sql: str, params: list[Any]) -> bytes:
@@ -1044,8 +1057,16 @@ def decode_command_complete(b: bytes) -> int:
 
 def decode_error(b: bytes) -> NextSQLError:
     code, off = read_u16_string(b, 0, MAX_NAME)
-    msg, _ = read_u16_string(b, off, MAX_NAME)
-    return NextSQLError(code, msg)
+    msg, off = read_u16_string(b, off, MAX_NAME)
+    # Optional trailing field, present only from a server that accepted
+    # FLAG_PUBLIC_ERROR_CODES. Its absence is normal -- an older server ignores
+    # the request bit -- so this must never be required.
+    public = ""
+    if off < len(b):
+        public, off = read_u16_string(b, off, MAX_NAME)
+        if public == "":
+            raise ProtocolError("empty public error code")
+    return NextSQLError(code, msg, public)
 
 
 def encode_set_read_consistency(mode: int, max_staleness_ms: int) -> bytes:

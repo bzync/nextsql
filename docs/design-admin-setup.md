@@ -120,7 +120,7 @@ script, `X-Frame-Options: DENY`).
 | Slice | Scope | Status |
 |---|---|---|
 | M1 | Serving backbone + token auth + one working flow: Welcome → data dir/key file (live capacity/permission feedback via dry-run) → resource preset → administrator account → summary → install → completion | **complete (2026-09-04; targeted tests and live API-to-database verification green)** |
-| M2 | Encryption setup wizard detail: generate-vs-import root key choice, recovery-key export/verification UX, "never upload root key" messaging surfaced explicitly (not just enforced by design) | **generate-vs-import disclosure landed (2026-09-04)**; recovery-key export/verification still open |
+| M2 | Encryption setup wizard detail: generate-vs-import root key choice, recovery-key export/verification UX, "never upload root key" messaging surfaced explicitly (not just enforced by design) | **complete (2026-09-09)** — generate-vs-import disclosure (2026-09-04); recovery-key capability + `nextsql key` CLI (log #242); `nextsql setup --recovery-key-out` plus the wizard's default-on export, both-keystore paths, and saved-offline gate before Finish (log #243) |
 | M3 | Advanced/component selection (skip-init config-only mode, TLS certificate assistant for a remote listen address, custom buffer-pages) | **complete (2026-09-04)** — all three pieces landed: skip-init (M1, log #136), custom buffer-pages (M1, log #135), remote listen + TLS (log #138) |
 | M4 | Packaging integration: bundle `nextsql-admin` into the `.tar.gz`/`.run`/`.deb`/`.rpm`/`.msi`/`.pkg` artifacts as the default interactive entry point (`scripts/build-*-installer.sh`), auto-exit-on-completion instead of requiring Ctrl+C | **Linux (`.tar.gz`/`.run`/`.deb`/`.rpm`) complete (2026-09-05, `.rpm` added log #143)** — see below; Windows/macOS packaging out of scope (no build host in this environment) |
 | M5 | Accessibility pass (keyboard-only walkthrough, screen-reader labels audit, prefers-reduced-motion, high-contrast) + light/dark/system theming | **complete (2026-09-05, log #141)** — deterministic real-Chrome Installer + Manager keyboard flows and axe WCAG 2.2 A/AA audits green; explicit three-state theme selection, transition focus/live announcements, semantic progress, associated errors, reduced motion, and increased/forced contrast landed |
@@ -128,6 +128,17 @@ script, `X-Frame-Options: DENY`).
 
 Each slice is its own scoped increment, logged in `TODO.md` under Phase 28
 "Installer UX", same discipline as the Manager MVP's M1–M9.
+
+### Lifecycle inspection (read-only)
+
+When the selected location may already contain a deployment, the Location
+step offers **Inspect existing installation**. It calls the same CLI contract
+as `nextsql lifecycle detect --json` through the Setup subprocess boundary
+and displays the returned lifecycle status/summary. The action is token
+authenticated, path-length bounded, and read-only: it does not open the
+engine for mutation, start a service, or replace configuration. Upgrade,
+repair, and uninstall deliberately remain explicit CLI workflows until their
+separate destructive-confirmation UX is designed.
 
 ### M2 progress: generate-vs-import disclosure (2026-09-04)
 
@@ -510,9 +521,24 @@ Summary screen is guaranteed to describe exactly what Install will do.
   reversible follow-up once the flow is proven. **Landed for Linux
   (`.tar.gz`/`.run`/`.deb`), 2026-09-05** — see above; Windows/macOS
   packaging remain out of scope (no build host in this environment).
-- No recovery-key export UI yet (M2) — `nextsql setup` does not generate a
-  separate recovery key today (single root unlock key), so this waits on
-  that capability existing.
+- Two `@bzync/rui` 0.0.9 accessibility defects are worked around rather than
+  fixed upstream (same treatment as the earlier Stepper/danger-token contrast
+  findings): `CodeBlock` renders its content in an `overflow-x: auto` region
+  with nothing focusable inside it, so Setup's code blocks carry
+  `className="nsi-code"` and wrap instead of scrolling; and `Autocomplete`'s
+  "no matches" empty row is a bare `<li>` under `role=listbox` styled
+  `text-slate-600`, which fails contrast in dark mode — reachable from any
+  path field whose directory lists nothing, not currently worked around.
+
+- Recovery-key export landed (M2, log #243): the Location step offers it by
+  default at the server-suggested path, names both keystores' export files,
+  blocks Continue on an enabled-but-empty path, withdraws the export when
+  "configuration only" is chosen on the Resources step (`nextsql setup`
+  refuses `--recovery-key-out` with `--skip-init`), and the completion screen
+  holds Finish until the operator confirms both files were copied offline.
+  The wizard never handles key material itself — it passes paths to
+  `nextsql setup`, which generates, seals and verifies (`docs/security.md`
+  "Recovery keys").
 - No TLS certificate assistant in M1 — the installer defaulted to the
   loopback, TLS-optional path `nextsql setup` already supports; a remote,
   TLS-required listen address was left to the CLI/config file. **Landed as

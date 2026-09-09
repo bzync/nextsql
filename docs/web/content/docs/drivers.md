@@ -23,7 +23,7 @@ When `nextsqld` is started with `--require-client-key`, the first authenticated 
 
 Every official driver also ships a cluster client (`OpenCluster` / `connectCluster` / `connect_cluster` / `NextSQL\Cluster::connect`) that sends eligible reads to a healthy follower under `STRONG` / `BOUNDED` / `STALE`. See [High availability](/docs/ha).
 
-`realm` / `database` on the connect config select the hosted target on Hello. An empty database name selects the registered default. See [Hosting](/docs/hosting).
+`database` on the connect config names the deployment's database on Hello; an empty name accepts whatever the deployment serves. `realm` is reserved and must stay empty — multi-realm hosting was removed.
 
 All six drivers encode the scalar type expansion (`BLOB`, integers, floats, `DATE`/`TIME`/`TIMESTAMP`/`INTERVAL`, `CHAR`/`VARCHAR`, `ENUM`) and collections (`STRUCT`/`ARRAY`/`MAP`). Field-encryption helpers exist in Go/Node/Bun/PHP only.
 

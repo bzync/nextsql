@@ -12,6 +12,9 @@ func TestClassifyInstall(t *testing.T) {
 		{"config only", DetectInput{ConfigPresent: true}, InstallConfigOnly},
 		{"data without keystore is not initialized", DetectInput{DataFilePresent: true}, InstallNone},
 		{"initialized", DetectInput{ConfigPresent: true, DataFilePresent: true, KeystorePresent: true}, InstallInitialized},
+		{"deployment provisioned, no database", DetectInput{AuthPresent: true}, InstallDeploymentOnly},
+		{"deployment with a config, still no database", DetectInput{ConfigPresent: true, AuthPresent: true}, InstallDeploymentOnly},
+		{"a database outranks the deployment that holds it", DetectInput{AuthPresent: true, DataFilePresent: true, KeystorePresent: true}, InstallInitialized},
 		{"lock wins over everything", DetectInput{DataFilePresent: true, KeystorePresent: true, LockHeld: true}, InstallRunning},
 		{"lock wins even with nothing else", DetectInput{LockHeld: true}, InstallRunning},
 	}

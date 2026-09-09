@@ -76,6 +76,19 @@ else
       end
     end
 
+    def test_public_error_taxonomy
+      # docs/error-codes.md: a real server error carries the stable ERR_* name
+      # alongside the unchanged legacy class.
+      conn = NextSQL.connect(cfg)
+      begin
+        err = assert_raises(NextSQL::Error) { conn.exec("SELECT * FROM no_such_table") }
+        refute_empty err.error_code
+        assert_equal "ERR_#{err.error_code.upcase}", err.public_code
+      ensure
+        conn.close
+      end
+    end
+
     def test_cluster_routes_to_standalone
       cl = NextSQL.connect_cluster(cfg)
       begin

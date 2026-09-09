@@ -53,34 +53,14 @@ async function withServer(handler, run) {
   }
 }
 
-// The theme control (shared/ThemeSelect.tsx) is @bzync/rui's Select, which
-// renders as a button[role=combobox] + li[role=option] listbox, not a
-// native <select> — id="nsa-color-theme" is the stable hook (a <label for>
-// supplies the accessible name; there's no aria-label on the button).
-const THEME_TRIGGER = "document.getElementById('nsa-color-theme')";
-
-// Matches shared/ThemeSelect.tsx's THEME_OPTIONS order (system, light, dark)
-// -> the listbox's opt-0/opt-1/opt-2 ids.
-const THEME_OPTION_INDEX = { system: 0, light: 1, dark: 2 };
+const THEME_BUTTON = (theme) => `document.querySelector('.nsa-theme-button[aria-label="Use ${theme} theme"]')`;
 
 async function themeCheck(browser, label) {
-  assert.equal(await browser.evaluate(`${THEME_TRIGGER}?.getAttribute("role")`), "combobox");
-  await browser.evaluate(`${THEME_TRIGGER}.click()`);
-  assert.equal(await browser.evaluate("document.querySelectorAll('[role=option]').length"), 3);
-  await browser.evaluate(`${THEME_TRIGGER}.click()`);
-  await browser.waitFor(`${THEME_TRIGGER}?.getAttribute("aria-expanded") === "false"`, `${label} theme menu closed`);
-  // End back on "system" (not "dark"/"light") so a later axe check in this
-  // same session isn't run against a manually-forced dark theme — rui's
-  // --color-accent-500 token is known not to meet AA against a dark
-  // background (tracked separately; out of scope for this merge).
+  assert.equal(await browser.evaluate("document.querySelector('.nsa-theme-toggle')?.getAttribute('role')"), "group");
+  assert.equal(await browser.evaluate("document.querySelectorAll('.nsa-theme-button').length"), 3);
   for (const theme of ["dark", "light", "system"]) {
-    await browser.evaluate(`${THEME_TRIGGER}.click()`);
-    await browser.waitFor(`${THEME_TRIGGER}?.getAttribute("aria-expanded") === "true"`, `${label} theme menu open`);
-    await browser.evaluate(`document.getElementById("nsa-color-theme-list-opt-${THEME_OPTION_INDEX[theme]}")?.click()`);
-    await browser.waitFor(
-      `${THEME_TRIGGER}?.getAttribute("aria-expanded") === "false"`,
-      `${label} theme menu closed after choosing ${theme}`,
-    );
+    await browser.evaluate(`${THEME_BUTTON(theme)}.click()`);
+    await browser.waitFor(`${THEME_BUTTON(theme)}?.getAttribute("aria-pressed") === "true"`, `${label} ${theme} theme selected`);
   }
 }
 
@@ -91,7 +71,7 @@ async function contrastAndMotionCheck(browser, label) {
   ]);
   assert.equal(await browser.evaluate("matchMedia('(prefers-reduced-motion: reduce)').matches"), true);
   assert.equal(await browser.evaluate("matchMedia('(prefers-contrast: more)').matches"), true);
-  await browser.waitFor("getComputedStyle(document.querySelector('.nsa-theme-trigger')).borderTopWidth === '2px'", `${label} increased-contrast styles`);
+  await browser.waitFor("getComputedStyle(document.querySelector('.nsa-theme-toggle')).borderTopWidth === '2px'", `${label} increased-contrast styles`);
   assert.equal(await browser.evaluate("parseFloat(getComputedStyle(document.querySelector('button')).transitionDuration) <= 0.001"), true);
   await runAxe(browser, axe.source, `${label} (increased contrast/reduced motion)`);
   await browser.emulateMedia([]);
@@ -139,7 +119,7 @@ async function testSetupMode() {
       return json(response, 200, {
         nextsql_version: "test",
         phase: 28,
-        defaults: { dataDir: "/var/lib/nextsql", keyFile: "/etc/nextsql/root.key", configOut: "/etc/nextsql/nextsql.conf", elevated: false, os: "linux" },
+        defaults: { dataDir: "/var/lib/nextsql", keyFile: "/etc/nextsql/root.key", configOut: "/etc/nextsql/nextsql.conf", recoveryKeyOut: "/etc/nextsql/recovery.key", elevated: false, os: "linux" },
       });
     }
     if (url.pathname === "/api/v1/service") {
@@ -156,6 +136,242 @@ async function testSetupMode() {
     await contrastAndMotionCheck(browser, "Setup");
     await highDensityCheck(browser, "Setup welcome", "getComputedStyle(document.querySelector('.nsi-shell')).flexDirection === 'column'");
     console.log("setup-mode accessibility audit passed (welcome view + axe WCAG 2.2 AA tags)");
+  });
+}
+
+// --- Phase 1b: Setup mode, recovery-key export flow (P28 M2) ---
+//
+// A recovery key is the deployment's second, independent unlock path
+// (docs/security.md "Recovery keys"). The wizard is where most operators
+// ever get one, so the choice, the two exported paths, and the
+// "I saved them" gate are driven here against the real bundle, with
+// `nextsql setup`'s own contract mocked: an export is refused together with
+// --skip-init, and both keystores are exported together or not at all.
+async function testSetupRecoveryKeyFlow() {
+  const defaultRecovery = "/etc/nextsql/recovery.key";
+  const planBodies = [];
+  const installBodies = [];
+  const readBody = (request) => new Promise((resolveBody) => {
+    let raw = "";
+    request.on("data", (chunk) => { raw += chunk; });
+    request.on("end", () => resolveBody(raw ? JSON.parse(raw) : {}));
+  });
+  await withServer(async (request, response) => {
+    const url = new URL(request.url, "http://127.0.0.1");
+    if (serveAssets(request, response)) return;
+    if (url.pathname === "/api/v1/mode") return json(response, 200, { mode: "setup" });
+    if (url.pathname === "/api/v1/hello") {
+      return json(response, 200, {
+        nextsql_version: "test",
+        phase: 28,
+        defaults: { dataDir: "/var/lib/nextsql", keyFile: "/etc/nextsql/root.key", configOut: "/etc/nextsql/nextsql.conf", recoveryKeyOut: defaultRecovery, elevated: false, os: "linux" },
+      });
+    }
+    if (url.pathname === "/api/v1/service") {
+      return json(response, 200, { supported: false, scope: "", unitFound: false, configPath: "", enabled: false, active: false });
+    }
+    // A real listing, because an empty one puts @bzync/rui's Autocomplete
+    // into its "no matches" empty row, whose own markup fails axe (a
+    // `text-slate-600` row that never lightens in dark mode, inside a bare
+    // <li> under role=listbox). That defect is rui's, is reachable from any
+    // path field in the wizard, and is recorded in docs/design-admin-setup.md
+    // next to the earlier rui contrast finding — it is not what this audit
+    // is checking, so the fixture behaves like a directory that exists.
+    if (url.pathname === "/api/v1/browse") {
+      return json(response, 200, {
+        dir: "/etc/nextsql",
+        parent: "/etc",
+        entries: [
+          { name: "root.key", path: "/etc/nextsql/root.key", isDir: false },
+          { name: "nextsql.conf", path: "/etc/nextsql/nextsql.conf", isDir: false },
+        ],
+      });
+    }
+    if (url.pathname === "/api/v1/plan") {
+      const body = await readBody(request);
+      planBodies.push(body);
+      return json(response, 200, {
+        ok: true,
+        result: {
+          nextsql_version: "test", phase: 28,
+          config_path: "/etc/nextsql/nextsql.conf", config_written: false,
+          listen_addr: "127.0.0.1:7210", tls: false,
+          data_dir: body.dataDir, key_file: body.keyFile, key_file_exists: false,
+          instance_key_file: body.keyFile + ".instance", instance_key_exists: false,
+          recovery_key_file: body.recoveryKeyOut || "",
+          instance_recovery_key_file: body.instanceRecoveryKeyOut || "",
+          recovery_keys_created: false,
+          initialized: false, dry_run: true,
+          hardware: { goos: "linux", goarch: "amd64", num_cpu: 8, gomaxprocs: 8, ram_bytes: 8 * 1024 ** 3, measured_path: body.dataDir, disk_total_bytes: 100 * 1024 ** 3, disk_free_bytes: 50 * 1024 ** 3, filesystem: "ext4" },
+          recommendation: { preset: "balanced", buffer_pages: 8192, buffer_bytes: 8192 * 16384, ram_fraction: 0.25, rationale: "fixture" },
+        },
+      });
+    }
+    if (url.pathname === "/api/v1/install") {
+      const body = await readBody(request);
+      installBodies.push(body);
+      return json(response, 200, {
+        ok: true,
+        result: {
+          nextsql_version: "test", phase: 28,
+          config_path: "/etc/nextsql/nextsql.conf", config_written: true,
+          listen_addr: "127.0.0.1:7210", tls: false,
+          data_dir: body.dataDir, key_file: body.keyFile, key_file_exists: true,
+          instance_key_file: body.keyFile + ".instance", instance_key_exists: true,
+          recovery_key_file: body.recoveryKeyOut,
+          instance_recovery_key_file: body.instanceRecoveryKeyOut,
+          recovery_keys_created: true,
+          initialized: true, dry_run: false,
+          health: { ok: true, format_compatible: true, tables: 0, durable_lsn: 1 },
+        },
+      });
+    }
+    if (url.pathname === "/api/v1/finish") return json(response, 200, { ok: true });
+    json(response, 404, { error: "not found" });
+  }, async (browser) => {
+    const clickButton = (label) => browser.evaluate(`(() => {
+      const button = [...document.querySelectorAll("button")].find((item) => item.textContent.trim() === ${JSON.stringify(label)});
+      button?.click();
+      return Boolean(button);
+    })()`);
+    const setPath = (id, value) => browser.evaluate(`(() => {
+      const el = document.getElementById(${JSON.stringify(id)});
+      const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+      setter.call(el, ${JSON.stringify(value)});
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+    })()`);
+    const checkboxState = (id) => browser.evaluate(`(() => {
+      const el = document.getElementById(${JSON.stringify(id)});
+      return el ? { checked: el.checked, disabled: el.disabled } : null;
+    })()`);
+    const buttonDisabled = (label) => browser.evaluate(`(() => {
+      const button = [...document.querySelectorAll("button")].find((item) => item.textContent.trim() === ${JSON.stringify(label)});
+      return button ? button.disabled : null;
+    })()`);
+
+    await browser.waitFor("document.getElementById('installer-step-title')?.textContent === 'NextSQL Setup'", "the Setup welcome view");
+    assert.equal(await clickButton("Get started"), true, "the welcome step should offer Get started");
+    await browser.waitFor("document.getElementById('installer-step-title')?.textContent === 'Data directory & unlock key'", "the location step");
+
+    // Recovery export is on by default, at the server's suggested path, and
+    // names both keystores' files — a deployment seals two keystores and
+    // losing either root is fatal on its own.
+    await browser.waitFor(`document.getElementById('recoveryKeyOut')?.value === ${JSON.stringify(defaultRecovery)}`, "the default recovery key path");
+    assert.deepEqual(await checkboxState("enableRecoveryKey"), { checked: true, disabled: false }, "recovery keys should be offered by default");
+    assert.equal(
+      await browser.evaluate(`document.body.textContent.includes(${JSON.stringify(defaultRecovery + ".instance")})`),
+      true,
+      "the registry keystore's own export path should be stated, not left implicit",
+    );
+    await runAxe(browser, axe.source, "Setup location (recovery key export)");
+
+    // Emptying the field to retype it must not tear the field down, and an
+    // enabled-but-empty export must not silently install with no recovery
+    // key at all — the opposite of what the operator just asked for.
+    await setPath("recoveryKeyOut", "");
+    await browser.waitFor("document.body.textContent.includes('Enter a path for the recovery key export')", "the empty-path error");
+    assert.deepEqual(await checkboxState("enableRecoveryKey"), { checked: true, disabled: false }, "clearing the path must not silently disable the export");
+    assert.equal(await browser.evaluate("Boolean(document.getElementById('recoveryKeyOut'))"), true, "the path field must stay mounted while it is empty");
+    assert.equal(await buttonDisabled("Continue"), true, "Continue must be blocked while the export path is empty");
+    assert.equal(await buttonDisabled("Check"), true, "the dry run must be blocked while the export path is empty");
+    await runAxe(browser, axe.source, "Setup location (recovery key path missing)");
+
+    await setPath("recoveryKeyOut", "/srv/keys/recovery.key");
+    await browser.waitFor("document.body.textContent.includes('/srv/keys/recovery.key.instance')", "the derived registry export path");
+    assert.equal(await buttonDisabled("Continue"), false, "Continue should return once a path is given");
+
+    // Unchecking keeps the typed path for a re-check rather than losing it,
+    // and states the consequence of installing without one.
+    await browser.evaluate("document.getElementById('enableRecoveryKey').click()");
+    await browser.waitFor("document.body.textContent.includes('single point of failure')", "the no-recovery-key warning");
+    assert.equal(await browser.evaluate("Boolean(document.getElementById('recoveryKeyOut'))"), false, "the export path field should be hidden when the export is off");
+    await browser.evaluate("document.getElementById('enableRecoveryKey').click()");
+    await browser.waitFor("document.getElementById('recoveryKeyOut')?.value === '/srv/keys/recovery.key'", "the previously typed path to be restored");
+
+    assert.equal(await clickButton("Continue"), true, "the location step should continue");
+    await browser.waitFor("document.getElementById('installer-step-title')?.textContent === 'Deployment profile'", "the resources step");
+
+    // A database is created only when it is named — the wizard never
+    // substitutes one — and the production profile requires it, because a
+    // deployment with no database cannot serve.
+    await browser.waitFor("document.getElementById('databaseName')?.value === ''", "an empty database name by default");
+    assert.equal(await buttonDisabled("Continue"), true, "production must block Continue until the database is named");
+    await browser.waitFor(
+      "document.body.textContent.includes('Enter a database name, or choose the Developer profile')",
+      "the required-database error",
+    );
+    await runAxe(browser, axe.source, "Setup profile (database name required)");
+    await setPath("databaseName", "analytics");
+    assert.equal(await buttonDisabled("Continue"), false, "naming the database unblocks Continue");
+
+    // `nextsql setup` refuses --recovery-key-out with --skip-init (there is
+    // no keystore yet for one to seal), so choosing "configuration only"
+    // withdraws the export here instead of failing the install.
+    await browser.evaluate(`(() => {
+      const radio = [...document.querySelectorAll('input[type=radio]')]
+        .find((input) => input.closest('label')?.textContent.trim().startsWith('Developer'));
+      radio?.click();
+    })()`);
+    await browser.waitFor("document.getElementById('skipInit')?.disabled === false", "skip-init to become available off the production profile");
+    await browser.evaluate("document.getElementById('skipInit').click()");
+    assert.equal(await clickButton("Back"), true, "the resources step should go back");
+    await browser.waitFor("document.getElementById('installer-step-title')?.textContent === 'Data directory & unlock key'", "the location step again");
+    assert.deepEqual(await checkboxState("enableRecoveryKey"), { checked: false, disabled: false }, "a configuration-only install must withdraw the recovery export");
+
+    assert.equal(await clickButton("Continue"), true, "back to resources");
+    await browser.waitFor("document.getElementById('installer-step-title')?.textContent === 'Deployment profile'", "the resources step again");
+    await browser.evaluate("document.getElementById('skipInit').click()");
+    assert.equal(await clickButton("Back"), true, "the resources step should go back again");
+    await browser.waitFor("document.getElementById('installer-step-title')?.textContent === 'Data directory & unlock key'", "the location step once more");
+    await browser.evaluate("document.getElementById('enableRecoveryKey').click()");
+    // Re-enabling after that detour proposes a path derived from the root
+    // key file rather than an empty field — the step was re-entered, so the
+    // earlier typed value is gone with it.
+    await browser.waitFor("document.getElementById('recoveryKeyOut')?.value === '/etc/nextsql/recovery.key'", "the export to be re-enabled at a suggested path");
+    await setPath("recoveryKeyOut", "/srv/keys/recovery.key");
+    await browser.waitFor("document.body.textContent.includes('/srv/keys/recovery.key.instance')", "the registry export path for the final run");
+
+    // Through the rest of the wizard on the developer profile (no
+    // administrator required) to the review and the install itself.
+    assert.equal(await clickButton("Continue"), true, "location → resources");
+    await browser.waitFor("document.getElementById('installer-step-title')?.textContent === 'Deployment profile'", "resources before review");
+    assert.equal(await clickButton("Continue"), true, "resources → administrator");
+    await browser.waitFor("document.getElementById('installer-step-title')?.textContent === 'Administrator account'", "the administrator step");
+    assert.equal(await clickButton("Continue"), true, "administrator → review");
+    await browser.waitFor("document.getElementById('installer-step-title')?.textContent === 'Review'", "the review step");
+    await browser.waitFor(
+      "document.body.textContent.includes('/srv/keys/recovery.key and /srv/keys/recovery.key.instance')",
+      "the review to name both exports before anything is written",
+    );
+    await runAxe(browser, axe.source, "Setup review (recovery keys planned)");
+
+    assert.equal(await clickButton("Install"), true, "the review step should install");
+    await browser.waitFor("document.getElementById('installer-step-title')?.textContent === 'NextSQL is ready'", "the completion step");
+    assert.equal(installBodies.length, 1, "exactly one install call");
+    assert.equal(installBodies[0].recoveryKeyOut, "/srv/keys/recovery.key", "the install must carry the database export path");
+    assert.equal(installBodies[0].instanceRecoveryKeyOut, "/srv/keys/recovery.key.instance", "the install must carry the registry export path");
+    assert.equal(
+      planBodies.every((body) => body.recoveryKeyOut === "" || body.instanceRecoveryKeyOut === body.recoveryKeyOut + ".instance"),
+      true,
+      "every dry run must request both keystores' exports together or neither",
+    );
+
+    // The exported files are the only copies, so Finish stays blocked until
+    // the operator says they moved them off this host.
+    await browser.waitFor("document.body.textContent.includes('Action required: Save recovery keys offline')", "the save-your-keys instruction");
+    assert.equal(
+      await browser.evaluate("document.body.textContent.includes('/srv/keys/recovery.key.instance')"),
+      true,
+      "both exported paths should be shown on the completion screen",
+    );
+    assert.equal(await buttonDisabled("Finish"), true, "Finish must wait for the saved-offline confirmation");
+    await runAxe(browser, axe.source, "Setup completion (recovery keys exported)");
+    await browser.evaluate("document.getElementById('confirmRecoverySaved').click()");
+    await browser.waitFor("[...document.querySelectorAll('button')].find((b) => b.textContent.trim() === 'Finish')?.disabled === false", "Finish to unlock after confirming");
+    assert.equal(await clickButton("Finish"), true, "Finish should be clickable once confirmed");
+    await browser.waitFor("document.getElementById('installer-step-title')?.textContent === 'Setup finished'", "the finished view");
+
+    console.log("setup-mode recovery-key export flow passed (default-on, both keystores, saved-offline gate)");
   });
 }
 
@@ -373,24 +589,16 @@ async function testOperateMode() {
       });
     }
     if (url.pathname === "/api/v1/databases") {
-      // Two realms, one of them named only by system.databases (the caller
-      // cannot see it in system.realms), so the tree's orphan grouping is
-      // exercised; "default" is the realm/database this session is on.
+      // system.databases holds exactly one row now — the database this
+      // deployment serves — and the tree hangs the connected database's
+      // tables under it.
       return json(response, 200, {
         generated_at: new Date(0).toISOString(),
         hosted: true,
         storage: result,
-        realms: {
-          columns: ["realm_id", "name", "state", "database_count", "storage_cap_bytes", "realm_root_delegated"],
-          rows: [["r-1", "default", "active", "2", "10737418240", "false"]],
-        },
         databases: {
-          columns: ["realm_id", "realm_name", "database_id", "name", "state", "layout", "storage_cap_bytes"],
-          rows: [
-            ["r-1", "default", "db-1", "default", "active", "managed", "1073741824"],
-            ["r-1", "default", "db-2", "reports", "active", "managed", "0"],
-            ["r-9", "archive", "db-3", "cold", "suspended", "legacy_default", "0"],
-          ],
+          columns: ["database_id", "name", "state", "storage_cap_bytes"],
+          rows: [["db-1", "default", "active", "1073741824"]],
         },
         tables: {
           columns: ["name", "id", "column_count", "pk", "legacy_tenant_column"],
@@ -706,9 +914,10 @@ async function testOperateMode() {
       "getComputedStyle(document.querySelector('.nsm-sidebar')).display === 'none' && getComputedStyle(document.querySelector('.nsm-mobile-nav')).display !== 'none'",
     );
 
-    // Databases: the catalog tree (realm -> database -> tables). The old flat
-    // Tables/Realms tabs are gone, so the tree is the only way to reach a
-    // table list, and only the connected database can produce one.
+    // Databases: the catalog tree (database -> tables). The old flat
+    // Tables/Realms tabs are gone — and so are realms — so the tree is the
+    // only way to reach a table list, under the one database this deployment
+    // serves.
     const openView = (label) => `(() => {
       const item = [...document.querySelectorAll(".nsm-sidebar nav button.nsm-nav-item")]
         .find((b) => b.textContent.trim().startsWith(${JSON.stringify(label)}));
@@ -722,23 +931,16 @@ async function testOperateMode() {
     assert.equal(
       databaseTabs.some((t) => t.startsWith("Tables") || t.startsWith("Realms")),
       false,
-      "Tables and Realms are rows in the tree now, not tabs",
+      "Tables are rows in the tree now, and realms no longer exist",
     );
-    const realmRows = await browser.evaluate(`[...document.querySelectorAll('.nsm-tree > .nsm-tree-list > .nsm-tree-node > .nsm-tree-row')].map((r) => ({
+    const rootRows = await browser.evaluate(`[...document.querySelectorAll('.nsm-tree > .nsm-tree-list > .nsm-tree-node > .nsm-tree-row')].map((r) => ({
       text: r.textContent.replace(/\\s+/g, " ").trim(),
       expanded: r.getAttribute("aria-expanded"),
     }))`);
-    assert.equal(realmRows.length, 2, "one row per realm, including a realm only system.databases names");
-    assert.equal(realmRows[0].expanded, "true", "the connected realm starts expanded");
-    assert.equal(realmRows[0].text.includes("connected"), true);
-    // The connected database lists its tables; a sibling explains why it cannot.
-    await browser.evaluate(`[...document.querySelectorAll('.nsm-tree-body .nsm-tree-row')].find((r) => r.textContent.includes("default"))?.click()`);
+    assert.equal(rootRows.length, 1, "a deployment serves exactly one database, so the tree has one root");
+    assert.equal(rootRows[0].text.includes("connected"), true, "that database is the connected one");
+    await browser.evaluate(`[...document.querySelectorAll('.nsm-tree-row')].find((r) => r.textContent.includes("default"))?.click()`);
     await browser.waitFor("document.body.textContent.includes('articles')", "the connected database's tables");
-    await browser.evaluate(`[...document.querySelectorAll('.nsm-tree-body .nsm-tree-row')].find((r) => r.textContent.includes("reports"))?.click()`);
-    await browser.waitFor(
-      "document.body.textContent.includes('Sign in with reports selected')",
-      "the explanation for a database this session is not connected to",
-    );
     await runAxe(browser, axe.source, "Operations databases tree");
 
     // Backups: a create/verify runs a server-side restore test, so the button
@@ -1107,17 +1309,23 @@ async function testOperateMode() {
       })()`);
       assert.equal(opened, true, `More Studio tools should be available for ${label}`);
       await browser.waitFor(
-        `[...document.querySelectorAll('[role=dialog][aria-label="More Studio tools"] button')].some((item) => item.textContent.trim() === ${JSON.stringify(label)})`,
-        `the More menu item ${label}`,
+        'document.querySelector(\'[role=dialog][aria-label="More Studio tools"] button\') !== null',
+        "the More menu items to mount",
       );
+      const buttons = await browser.evaluate(
+        '[...document.querySelectorAll(\'[role=dialog][aria-label="More Studio tools"] button\')].map((el) => el.textContent.trim())',
+      );
+      const index = buttons.indexOf(label);
+      if (index === -1) return false;
       const clicked = await browser.evaluate(`(() => {
-        const item = [...document.querySelectorAll('[role=dialog][aria-label="More Studio tools"] button')].find((el) => el.textContent.trim() === ${JSON.stringify(label)});
+        const items = document.querySelectorAll('[role=dialog][aria-label="More Studio tools"] button');
+        const item = items[${index}];
         item?.click();
         return Boolean(item);
       })()`);
       if (clicked) {
         await browser.waitFor(
-          `document.querySelector('[role=dialog][aria-label="More Studio tools"]') === null`,
+          'document.querySelector(\'[role=dialog][aria-label="More Studio tools"]\') === null',
           "the More menu to close after choosing " + label,
         );
       }
@@ -1892,6 +2100,11 @@ async function testOperateMode() {
     await browser.waitFor("document.querySelector('[role=dialog]')?.textContent.includes('Chain verification FAILED')", "a newly detected audit-chain failure to render");
     assert.equal(await browser.evaluate("document.querySelector('[role=dialog]')?.textContent.includes('Line 7: hash chain mismatch')"), true, "the first bad line and verification problem should render");
     assert.equal(await browser.evaluate("document.querySelector('[role=dialog]')?.textContent.includes('articles')"), true, "the suspect audit record must remain visible after verification fails");
+    assert.equal(
+      await browser.evaluate("getComputedStyle(document.querySelector('.nsa-audit-verify-problem')).color"),
+      "rgb(255, 137, 144)",
+      "audit-chain failure text must keep its AA dark-surface contrast override",
+    );
     await runAxe(browser, axe.source, "Studio Audit viewer chain failure");
     assert.equal(await clickDialogButton("Close"), true, "Close should dismiss the Audit viewer");
     await browser.waitFor("document.querySelector('[role=dialog]') === null", "the Audit viewer to close");
@@ -2551,5 +2764,6 @@ async function testOperateMode() {
 }
 
 await testSetupMode();
+await testSetupRecoveryKeyFlow();
 await testOperateMode();
 console.log("nextsql-admin accessibility audit passed");

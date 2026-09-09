@@ -99,10 +99,10 @@ Drivers:
 - Python: `key=` 32-byte `bytes`.
 - Ruby: `key:` 32-byte binary `String`.
 
-Field-level `ENCRYPTED CLIENT` columns stay **experimental**: the randomized
-`NSCE1.` SQL/catalog/server path, Go/JS/PHP helpers, PITR, HA/failover, and
-durable `FileFieldKeyring` rotation/revocation are implemented and tested.
-Python and Ruby have no field-encryption helpers. No searchable or
-deterministic mode ships. mTLS service certificates, live rotation, X.509 CRL
-revocation, signed short-lived credentials, and the OIDC broker are
-implemented; OCSP, opaque-token introspection, and JIT provisioning are not.
+Field-level `ENCRYPTED CLIENT` is production-gated: randomized `NSCE1.` and
+opt-in deterministic-equality `NSCE2.` SQL/catalog/server paths, Go/JS/PHP
+helpers, PITR, HA/failover, fuzz, and durable `FileFieldKeyring` rotation/
+revocation are implemented and tested. Python and Ruby have no field-encryption
+helpers. General searchable encryption is not implemented. mTLS service
+certificates, live rotation, X.509 CRL revocation, signed short-lived
+credentials, and the OIDC broker are implemented.

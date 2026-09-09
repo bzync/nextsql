@@ -399,6 +399,8 @@ func FormatExpr(e ast.Expr) string {
 			s += " ELSE " + FormatExpr(x.Else)
 		}
 		return s + " END"
+	case ast.Subscript:
+		return FormatExpr(x.Coll) + "[" + FormatExpr(x.Index) + "]"
 	default:
 		return "?"
 	}
@@ -409,6 +411,9 @@ func ExprEqual(a, b ast.Expr) bool {
 		return a == nil && b == nil
 	}
 	switch x := a.(type) {
+	case ast.Subscript:
+		y, ok := b.(ast.Subscript)
+		return ok && ExprEqual(x.Coll, y.Coll) && ExprEqual(x.Index, y.Index)
 	case ast.Literal:
 		y, ok := b.(ast.Literal)
 		if !ok {
@@ -501,6 +506,8 @@ func ExprUsesIdent(e ast.Expr, name string) bool {
 				return true
 			}
 		}
+	case ast.Subscript:
+		return ExprUsesIdent(x.Coll, name) || ExprUsesIdent(x.Index, name)
 	}
 	return false
 }
@@ -542,6 +549,8 @@ func RewriteIdent(e ast.Expr, old, neu string) ast.Expr {
 			whens[i] = ast.CaseWhen{When: RewriteIdent(arm.When, old, neu), Then: RewriteIdent(arm.Then, old, neu)}
 		}
 		return ast.Case{Operand: RewriteIdent(x.Operand, old, neu), Whens: whens, Else: RewriteIdent(x.Else, old, neu)}
+	case ast.Subscript:
+		return ast.Subscript{Coll: RewriteIdent(x.Coll, old, neu), Index: RewriteIdent(x.Index, old, neu)}
 	default:
 		return e
 	}
@@ -606,6 +615,8 @@ func ExprVolatile(e ast.Expr) bool {
 		}
 	case ast.FieldAccess:
 		return ExprVolatile(x.Base)
+	case ast.Subscript:
+		return ExprVolatile(x.Coll) || ExprVolatile(x.Index)
 	}
 	return false
 }
@@ -665,6 +676,8 @@ func ExprHasSubquery(e ast.Expr) bool {
 		}
 	case ast.FieldAccess:
 		return ExprHasSubquery(x.Base)
+	case ast.Subscript:
+		return ExprHasSubquery(x.Coll) || ExprHasSubquery(x.Index)
 	}
 	return false
 }

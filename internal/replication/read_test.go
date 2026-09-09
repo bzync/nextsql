@@ -46,7 +46,7 @@ func TestStrongReadBarrierRejectsIsolatedLeader(t *testing.T) {
 	trans[1].Disconnect(addrs[0])
 	trans[2].Disconnect(addrs[0])
 
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(raftConverge)
 	var maj *Cluster
 	for time.Now().Before(deadline) {
 		n := 0

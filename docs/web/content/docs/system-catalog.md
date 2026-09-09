@@ -13,7 +13,7 @@ SELECT sql FROM system.active_queries;
 `JOIN` and `GROUP BY` are not. Every session needs `CONNECT` on the database;
 some tables layer RBAC filtering on top.
 
-Capability consumers can query the supported `system_schema_v3` row in
+Capability consumers can query the supported `system_schema_v4` row in
 `system.capabilities` to identify the current stable system-column contract.
 `system_show_aliases` advertises the convenience syntax.
 
@@ -33,8 +33,7 @@ renders canonical `CREATE TABLE` / `CREATE INDEX`. `system.triggers` and
 |---|---|
 | `follower_reads` | `supported` |
 | `resource_groups` | `supported` |
-| `field_encryption_client` | `experimental` (no searchable/deterministic mode, by design) |
-| `hosting_isolation` | `experimental` (selectable routing is usable; hosted HA / registry DR remain open) |
+| `field_encryption_client` | `supported` (randomized `NSCE1` plus opt-in deterministic-equality `NSCE2`) |
 
 `system.storage.database` is the configured logical database name (`default`
 for unnamed embedded use), never the engine's filesystem path.
@@ -78,13 +77,11 @@ Operations tables (admin-only unless noted): `config` (running vs file
 settings; network addresses redacted), `metrics`, `server_log` (in-memory
 tail, not a durable store), `backups` (verified backups in `backup_dir`;
 needs `BACKUP` or `ADMIN`). `tls`, `config`, `metrics`, `server_log`, and
-`backups` are wired on the legacy/non-hosted engine that `nextsqld` opened
-at start. A session that routed to a hosted managed database sees those
-tables empty / “not attached”.
+`backups` are wired to the deployment database opened by `nextsqld` at start.
 
-Hosted-deployment tables (admin-only; empty on a legacy/non-hosted
-deployment): `realms`, `databases`, `quotas`. `quotas` is advisory — the
-write path still fail-closes at the storage cap.
+Deployment tables (admin-only; empty when no deployment registry is
+attached): `databases` (exactly one row) and `quotas`. `quotas` is advisory —
+the write path still fail-closes at the storage cap.
 
 Workload governance (admin-only): `resource_groups` — one row per
 `CREATE RESOURCE GROUP` descriptor (`name, owner, max_concurrency,

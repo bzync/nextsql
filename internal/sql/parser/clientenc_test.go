@@ -23,3 +23,14 @@ func TestParseEncryptedClientColumn(t *testing.T) {
 		t.Fatal("accepted duplicate ENCRYPTED CLIENT")
 	}
 }
+
+func TestParseEncryptedClientDeterministicColumn(t *testing.T) {
+	stmt, err := Parse(`CREATE TABLE accounts (id UUID PRIMARY KEY, email STRING ENCRYPTED CLIENT DETERMINISTIC)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	col := stmt.(ast.CreateTable).Columns[1]
+	if !col.EncryptedClient || !col.EncryptedClientDeterministic {
+		t.Fatalf("column = %+v", col)
+	}
+}

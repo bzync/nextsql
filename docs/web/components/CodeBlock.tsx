@@ -20,8 +20,8 @@ export function CodeBlock({
         </span>
         <CopyButton
           value={code}
-          label="Copy"
-          className="border-transparent bg-transparent text-slate-400 hover:bg-white/10 hover:text-white"
+          label="copy"
+          className="border-transparent bg-transparent lowercase text-slate-400 hover:bg-white/10 hover:text-white"
         />
       </div>
       <pre className="overflow-x-auto overscroll-x-contain p-4 text-[12.5px] leading-6 text-code-fg [-webkit-overflow-scrolling:touch] sm:px-5 sm:text-[13px]">

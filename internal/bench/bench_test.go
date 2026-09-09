@@ -404,3 +404,26 @@ func TestUnknownWorkload(t *testing.T) {
 		t.Fatal("expected unknown workload")
 	}
 }
+
+func TestCheckProductionWorkload(t *testing.T) {
+	// 1. Not in production: always allowed
+	if err := CheckProductionWorkload(false, false, true, "destructive operation"); err != nil {
+		t.Fatalf("expected nil when not in production, got: %v", err)
+	}
+
+	// 2. In production, but lightweight / non-destructive: allowed
+	if err := CheckProductionWorkload(true, false, false, ""); err != nil {
+		t.Fatalf("expected nil for non-heavy non-destructive in production, got: %v", err)
+	}
+
+	// 3. In production, heavy / destructive, without override: rejected
+	if err := CheckProductionWorkload(true, false, true, "bulk delete"); err == nil {
+		t.Fatal("expected error for heavy/destructive in production without override")
+	}
+
+	// 4. In production, heavy / destructive, with override: allowed
+	if err := CheckProductionWorkload(true, true, true, "bulk delete"); err != nil {
+		t.Fatalf("expected nil when override provided, got: %v", err)
+	}
+}
+

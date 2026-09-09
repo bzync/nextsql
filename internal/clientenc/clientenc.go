@@ -8,23 +8,37 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
+	"io"
 	"strings"
 
 	"github.com/bzync/nextsql/internal/nerr"
 	"github.com/bzync/nextsql/internal/sql/types"
+	"golang.org/x/crypto/hkdf"
 )
 
 const (
-	Prefix        = "NSCE1."
-	Version       = 1
-	KeySize       = 32
-	MaxKeyIDBytes = 64
-	MaxPlaintext  = 1 << 20
-	nonceSize     = 12
-	headerFixed   = 3 + 6 + nonceSize // version, suite, key length, logical type, nonce
-	suiteAESGCM   = 1
+	Prefix               = "NSCE1."
+	DeterministicPrefix  = "NSCE2."
+	Version              = 1
+	DeterministicVersion = 2
+	KeySize              = 32
+	MaxKeyIDBytes        = 64
+	MaxPlaintext         = 1 << 20
+	nonceSize            = 12
+	headerFixed          = 3 + 6 + nonceSize // version, suite, key length, logical type, nonce
+	suiteAESGCM          = 1
+	suiteAESSIV          = 2
+	deterministicKeyInfo = "NextSQL NSCE2 AES-SIV v2"
+)
+
+type Mode uint8
+
+const (
+	ModeRandomized Mode = iota
+	ModeDeterministic
 )
 
 // Key is one AES-256 field key. ID is public envelope metadata; Material must
@@ -45,6 +59,7 @@ type KeyProvider interface {
 type Header struct {
 	KeyID       string
 	LogicalType types.Type
+	Mode        Mode
 }
 
 // Encrypt seals one non-NULL SQL value with randomized AES-256-GCM and binds
@@ -99,6 +114,52 @@ func Encrypt(ctx context.Context, provider KeyProvider, database, table, column 
 	return Prefix + base64.RawURLEncoding.EncodeToString(body), nil
 }
 
+// EncryptDeterministic seals a value with RFC 5297 AES-SIV. Equal plaintexts
+// under the same key and exact database/table/column context produce equal
+// ciphertexts; callers must treat that equality/frequency leakage as public.
+func EncryptDeterministic(ctx context.Context, provider KeyProvider, database, table, column string, value types.Value) (string, error) {
+	if provider == nil || value.Null || !SupportedType(value.Typ) {
+		return "", nerr.New(nerr.InvalidArgument, "clientenc.EncryptDeterministic", "provider and a supported non-NULL value are required")
+	}
+	if value.Typ.Kind == types.KindDecimal {
+		coerced, err := types.Coerce(value, value.Typ)
+		if err != nil {
+			return "", err
+		}
+		value = coerced
+	}
+	plain, err := types.EncodeScalar(value)
+	if err != nil {
+		return "", err
+	}
+	if len(plain) > MaxPlaintext {
+		return "", nerr.New(nerr.Exhausted, "clientenc.EncryptDeterministic", "plaintext exceeds field limit")
+	}
+	key, err := provider.CurrentFieldKey(ctx, database, table, column)
+	if err != nil {
+		return "", nerr.Wrap(nerr.Crypto, "clientenc.EncryptDeterministic", "field key unavailable", err)
+	}
+	if err := validateKey(key); err != nil {
+		return "", err
+	}
+	header := makeHeader(key.ID, value.Typ)[:headerFixed+len(key.ID)-nonceSize]
+	header[0], header[1] = DeterministicVersion, suiteAESSIV
+	aad, err := associatedDataWithPrefix(DeterministicPrefix, database, table, column, header)
+	if err != nil {
+		return "", err
+	}
+	derived, err := deterministicKey(key.Material)
+	if err != nil {
+		return "", err
+	}
+	siv, err := NewAESSIV(derived[:])
+	if err != nil {
+		return "", err
+	}
+	body := append(header, siv.Seal(plain, aad)...)
+	return DeterministicPrefix + base64.RawURLEncoding.EncodeToString(body), nil
+}
+
 // Decrypt authenticates and decodes one client ciphertext. Wrong context,
 // wrong/revoked keys, and any tampering fail closed with no partial plaintext.
 func Decrypt(ctx context.Context, provider KeyProvider, database, table, column, ciphertext string) (types.Value, error) {
@@ -108,6 +169,9 @@ func Decrypt(ctx context.Context, provider KeyProvider, database, table, column,
 	body, hdr, headerLen, err := parse(ciphertext)
 	if err != nil {
 		return types.Value{}, err
+	}
+	if hdr.Mode != ModeRandomized {
+		return types.Value{}, nerr.New(nerr.InvalidFormat, "clientenc.Decrypt", "deterministic ciphertext requires DecryptDeterministic")
 	}
 	key, err := provider.FieldKey(ctx, database, table, column, hdr.KeyID)
 	if err != nil {
@@ -139,6 +203,48 @@ func Decrypt(ctx context.Context, provider KeyProvider, database, table, column,
 	return v, nil
 }
 
+// DecryptDeterministic authenticates and decodes an NSCE2 value.
+func DecryptDeterministic(ctx context.Context, provider KeyProvider, database, table, column, ciphertext string) (types.Value, error) {
+	if provider == nil {
+		return types.Value{}, nerr.New(nerr.InvalidArgument, "clientenc.DecryptDeterministic", "field key provider is required")
+	}
+	body, hdr, headerLen, err := parse(ciphertext)
+	if err != nil {
+		return types.Value{}, err
+	}
+	if hdr.Mode != ModeDeterministic {
+		return types.Value{}, nerr.New(nerr.InvalidFormat, "clientenc.DecryptDeterministic", "randomized ciphertext requires Decrypt")
+	}
+	key, err := provider.FieldKey(ctx, database, table, column, hdr.KeyID)
+	if err != nil || validateKey(key) != nil || key.ID != hdr.KeyID {
+		return types.Value{}, nerr.New(nerr.Crypto, "clientenc.DecryptDeterministic", "field key unavailable or revoked")
+	}
+	aad, err := associatedDataWithPrefix(DeterministicPrefix, database, table, column, body[:headerLen])
+	if err != nil {
+		return types.Value{}, err
+	}
+	derived, err := deterministicKey(key.Material)
+	if err != nil {
+		return types.Value{}, err
+	}
+	siv, err := NewAESSIV(derived[:])
+	if err != nil {
+		return types.Value{}, err
+	}
+	plain, err := siv.Open(body[headerLen:], aad)
+	if err != nil {
+		return types.Value{}, nerr.New(nerr.Crypto, "clientenc.DecryptDeterministic", "ciphertext authentication failed")
+	}
+	if len(plain) > MaxPlaintext {
+		return types.Value{}, nerr.New(nerr.InvalidFormat, "clientenc.DecryptDeterministic", "plaintext exceeds field limit")
+	}
+	v, next, err := types.DecodeScalar(plain, 0, hdr.LogicalType)
+	if err != nil || next != len(plain) {
+		return types.Value{}, nerr.New(nerr.InvalidFormat, "clientenc.DecryptDeterministic", "invalid encrypted value")
+	}
+	return v, nil
+}
+
 // Inspect validates the bounded, versioned envelope structure without a key.
 // It does not authenticate the ciphertext and must not be treated as decrypt.
 func Inspect(ciphertext string) (Header, error) {
@@ -149,6 +255,10 @@ func Inspect(ciphertext string) (Header, error) {
 // ValidateForColumn is the server-side structural gate used before a value is
 // persisted. Authentication remains exclusively client-side.
 func ValidateForColumn(ciphertext string, logical types.Type) error {
+	return ValidateForColumnMode(ciphertext, logical, ModeRandomized)
+}
+
+func ValidateForColumnMode(ciphertext string, logical types.Type, mode Mode) error {
 	h, err := Inspect(ciphertext)
 	if err != nil {
 		return err
@@ -156,10 +266,13 @@ func ValidateForColumn(ciphertext string, logical types.Type) error {
 	if !h.LogicalType.Equals(logical) {
 		return nerr.New(nerr.InvalidArgument, "clientenc.ValidateForColumn", "ciphertext logical type does not match column")
 	}
+	if h.Mode != mode {
+		return nerr.New(nerr.InvalidArgument, "clientenc.ValidateForColumn", "ciphertext mode does not match column")
+	}
 	return nil
 }
 
-// SupportedType is the deliberately small v1 logical-type surface. Vector and
+// SupportedType is the deliberately small client-encryption logical-type surface. Vector and
 // geospatial values remain out because their large/specialized server storage
 // paths would violate the opaque-scalar contract.
 func SupportedType(t types.Type) bool {
@@ -177,28 +290,31 @@ func SupportedType(t types.Type) bool {
 }
 
 func parse(ciphertext string) ([]byte, Header, int, error) {
-	if !strings.HasPrefix(ciphertext, Prefix) {
+	prefix, version, suite, mode, fixed := Prefix, byte(Version), byte(suiteAESGCM), ModeRandomized, headerFixed
+	if strings.HasPrefix(ciphertext, DeterministicPrefix) {
+		prefix, version, suite, mode, fixed = DeterministicPrefix, DeterministicVersion, suiteAESSIV, ModeDeterministic, headerFixed-nonceSize
+	} else if !strings.HasPrefix(ciphertext, Prefix) {
 		return nil, Header{}, 0, nerr.New(nerr.InvalidFormat, "clientenc.Inspect", "invalid client ciphertext prefix")
 	}
-	enc := strings.TrimPrefix(ciphertext, Prefix)
-	if len(enc) == 0 || len(enc) > base64.RawURLEncoding.EncodedLen(MaxPlaintext+headerFixed+MaxKeyIDBytes+32) {
+	enc := strings.TrimPrefix(ciphertext, prefix)
+	if len(enc) == 0 || len(enc) > base64.RawURLEncoding.EncodedLen(MaxPlaintext+fixed+MaxKeyIDBytes+32) {
 		return nil, Header{}, 0, nerr.New(nerr.InvalidFormat, "clientenc.Inspect", "client ciphertext length out of range")
 	}
 	body, err := base64.RawURLEncoding.DecodeString(enc)
 	if err != nil {
 		return nil, Header{}, 0, nerr.New(nerr.InvalidFormat, "clientenc.Inspect", "invalid client ciphertext encoding")
 	}
-	if len(body) < headerFixed+1+16 { // non-empty key id and GCM tag
+	if len(body) < fixed+1+16 {
 		return nil, Header{}, 0, nerr.New(nerr.InvalidFormat, "clientenc.Inspect", "truncated client ciphertext")
 	}
-	if body[0] != Version || body[1] != suiteAESGCM {
+	if body[0] != version || body[1] != suite {
 		return nil, Header{}, 0, nerr.New(nerr.InvalidFormat, "clientenc.Inspect", "unsupported client ciphertext version or suite")
 	}
 	n := int(body[2])
 	if n < 1 || n > MaxKeyIDBytes {
 		return nil, Header{}, 0, nerr.New(nerr.InvalidFormat, "clientenc.Inspect", "invalid field key id length")
 	}
-	headerLen := headerFixed + n
+	headerLen := fixed + n
 	if len(body) < headerLen+16 {
 		return nil, Header{}, 0, nerr.New(nerr.InvalidFormat, "clientenc.Inspect", "truncated client ciphertext body")
 	}
@@ -216,7 +332,7 @@ func parse(ciphertext string) ([]byte, Header, int, error) {
 	if !SupportedType(typ) {
 		return nil, Header{}, 0, nerr.New(nerr.InvalidFormat, "clientenc.Inspect", "unsupported encrypted logical type")
 	}
-	return body, Header{KeyID: keyID, LogicalType: typ}, headerLen, nil
+	return body, Header{KeyID: keyID, LogicalType: typ, Mode: mode}, headerLen, nil
 }
 
 func makeHeader(keyID string, typ types.Type) []byte {
@@ -232,8 +348,12 @@ func makeHeader(keyID string, typ types.Type) []byte {
 }
 
 func associatedData(database, table, column string, header []byte) ([]byte, error) {
+	return associatedDataWithPrefix(Prefix, database, table, column, header)
+}
+
+func associatedDataWithPrefix(prefix, database, table, column string, header []byte) ([]byte, error) {
 	parts := []string{database, table, column}
-	n := len(Prefix) + len(header) + 6
+	n := len(prefix) + len(header) + 6
 	for _, part := range parts {
 		if len(part) == 0 || len(part) > 0xffff {
 			return nil, nerr.New(nerr.InvalidArgument, "clientenc", "database, table, and column are required and bounded")
@@ -241,7 +361,7 @@ func associatedData(database, table, column string, header []byte) ([]byte, erro
 		n += len(part)
 	}
 	aad := make([]byte, 0, n)
-	aad = append(aad, Prefix...)
+	aad = append(aad, prefix...)
 	for _, part := range parts {
 		var size [2]byte
 		binary.LittleEndian.PutUint16(size[:], uint16(len(part)))
@@ -289,4 +409,14 @@ func newGCM(key [KeySize]byte) (cipher.AEAD, error) {
 		return nil, nerr.Wrap(nerr.Crypto, "clientenc", "AES-GCM", err)
 	}
 	return gcm, nil
+}
+
+// deterministicKey domain-separates the AES-SIV key from the NSCE1
+// AES-256-GCM key even when an application deliberately reuses a field-key id.
+func deterministicKey(material [KeySize]byte) ([KeySize]byte, error) {
+	var out [KeySize]byte
+	if _, err := io.ReadFull(hkdf.New(sha256.New, material[:], nil, []byte(deterministicKeyInfo)), out[:]); err != nil {
+		return out, nerr.Wrap(nerr.Crypto, "clientenc", "derive deterministic field key", err)
+	}
+	return out, nil
 }

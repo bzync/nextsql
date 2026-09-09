@@ -9,10 +9,12 @@ import (
 
 	"github.com/bzync/nextsql/internal/catalog"
 	"github.com/bzync/nextsql/internal/catalog/ddl"
+	"github.com/bzync/nextsql/internal/executor/aggregate"
 	"github.com/bzync/nextsql/internal/hosting"
 	"github.com/bzync/nextsql/internal/nerr"
 	"github.com/bzync/nextsql/internal/security"
 	"github.com/bzync/nextsql/internal/sql/ast"
+	"github.com/bzync/nextsql/internal/sql/binder"
 	"github.com/bzync/nextsql/internal/sql/types"
 	"github.com/bzync/nextsql/internal/storage/format"
 	"github.com/bzync/nextsql/internal/system"
@@ -77,6 +79,14 @@ func (s *Session) execSystemSelect(sel ast.Select) (*Result, error) {
 		// For system.tables etc, they are not tenant-specific; skip.
 		// For system.tasks etc, rows include tenant string column check would have been done in generation.
 		filtered = append(filtered, row)
+	}
+
+	// A select list containing an aggregate collapses every filtered row to a
+	// single result row, so it cannot share the row-at-a-time projection path
+	// below: ORDER BY has nothing to order, and LIMIT/OFFSET must bound the
+	// result rather than the input the aggregate reads.
+	if hasSystemAgg(sel) {
+		return s.execSystemAggregate(sel, schema, filtered)
 	}
 
 	// Handle DISTINCT, ORDER BY, LIMIT via generic helpers after projection?
@@ -269,6 +279,293 @@ func encodeRowKey(row []types.Value) (string, error) {
 	return b.String(), nil
 }
 
+// systemAggFuncs are the aggregate names the system-catalog evaluator answers.
+// It is deliberately the same set the binder recognises (binder.isAgg), so a
+// query does not silently mean one thing over a user table and another over a
+// system table.
+func systemAggFuncs(name string) bool {
+	switch name {
+	case "count", "sum", "avg", "min", "max", "array_agg", "map_agg":
+		return true
+	}
+	return false
+}
+
+// hasSystemAgg reports whether the select list contains an aggregate anywhere —
+// on its own or inside a larger expression, which is answered the same way a
+// user table answers it.
+func hasSystemAgg(sel ast.Select) bool {
+	if sel.Star {
+		return false
+	}
+	for _, item := range sel.List {
+		if containsSystemAgg(item.Expr) {
+			return true
+		}
+	}
+	return false
+}
+
+// containsSystemAgg reports whether e contains an aggregate call. A window
+// function is not one: it is rejected separately on system tables.
+func containsSystemAgg(e ast.Expr) bool {
+	found := false
+	walkSystemExpr(e, func(c ast.Call) ast.Expr {
+		if systemAggFuncs(c.Name) {
+			found = true
+		}
+		return nil
+	})
+	return found
+}
+
+// walkSystemExpr rebuilds e, offering every call to fn. A non-nil result from
+// fn replaces that call; nil leaves it in place with its arguments walked.
+func walkSystemExpr(e ast.Expr, fn func(ast.Call) ast.Expr) ast.Expr {
+	if e == nil {
+		return nil
+	}
+	switch x := e.(type) {
+	case ast.Window:
+		return x
+	case ast.Call:
+		if rep := fn(x); rep != nil {
+			return rep
+		}
+		args := make([]ast.Expr, len(x.Args))
+		for i := range x.Args {
+			args[i] = walkSystemExpr(x.Args[i], fn)
+		}
+		return ast.Call{Name: x.Name, Args: args, Star: x.Star}
+	case ast.Unary:
+		return ast.Unary{Op: x.Op, Right: walkSystemExpr(x.Right, fn)}
+	case ast.Binary:
+		return ast.Binary{Op: x.Op, Left: walkSystemExpr(x.Left, fn), Right: walkSystemExpr(x.Right, fn)}
+	case ast.Between:
+		return ast.Between{Expr: walkSystemExpr(x.Expr, fn), Low: walkSystemExpr(x.Low, fn), High: walkSystemExpr(x.High, fn), Not: x.Not}
+	case ast.IsNull:
+		return ast.IsNull{Expr: walkSystemExpr(x.Expr, fn), Not: x.Not}
+	case ast.Case:
+		whens := make([]ast.CaseWhen, len(x.Whens))
+		for i, arm := range x.Whens {
+			whens[i] = ast.CaseWhen{When: walkSystemExpr(arm.When, fn), Then: walkSystemExpr(arm.Then, fn)}
+		}
+		return ast.Case{Operand: walkSystemExpr(x.Operand, fn), Whens: whens, Else: walkSystemExpr(x.Else, fn)}
+	case ast.ArrayCtor:
+		elems := make([]ast.Expr, len(x.Elems))
+		for i := range x.Elems {
+			elems[i] = walkSystemExpr(x.Elems[i], fn)
+		}
+		return ast.ArrayCtor{Elems: elems}
+	case ast.FieldAccess:
+		return ast.FieldAccess{Base: walkSystemExpr(x.Base, fn), Field: x.Field}
+	case ast.Subscript:
+		return ast.Subscript{Coll: walkSystemExpr(x.Coll, fn), Index: walkSystemExpr(x.Index, fn)}
+	}
+	return e
+}
+
+// execSystemAggregate answers a scalar aggregate over a system table. It reuses
+// aggregate.Hash with no grouping columns so the accumulator semantics — NULL
+// handling, the AVG denominator, COUNT(*) versus COUNT(col), and the empty
+// input that must still produce one row — are exactly the ones a user table
+// gets, rather than a second implementation that could drift from them.
+//
+// GROUP BY and HAVING stay unsupported and are rejected below, with the same
+// message the row-at-a-time path uses, so the reason does not depend on which
+// path a query happened to take.
+func (s *Session) execSystemAggregate(sel ast.Select, schema *catalog.Table, filtered [][]types.Value) (*Result, error) {
+	if len(sel.Group) > 0 || sel.Having != nil {
+		return nil, nerr.New(nerr.InvalidArgument, "executor.system", "GROUP BY not supported on system tables")
+	}
+	if len(sel.SearchCols) > 0 || sel.NearestCol != "" || sel.Nearest2Col != "" || len(sel.Joins) > 0 {
+		return nil, nerr.New(nerr.InvalidArgument, "executor.system", "unsupported clause on system table")
+	}
+
+	// Each aggregate argument is evaluated into its own slot of a synthetic
+	// input row, so an argument that is any expression — not just a bare
+	// column — is supported without teaching aggregate.Spec about expressions.
+	// Each aggregate call is then replaced by the reserved column that will
+	// hold its value, so a select item may be an expression *around* the
+	// aggregate, exactly as on a user table.
+	outCols := make([]string, len(sel.List))
+	outExprs := make([]ast.Expr, len(sel.List))
+	specs := make([]aggregate.Spec, 0, len(sel.List))
+	outTy := make([]types.Type, 0, len(sel.List))
+	argExprs := make([]ast.Expr, 0, 2*len(sel.List))
+
+	addArg := func(e ast.Expr) int {
+		argExprs = append(argExprs, e)
+		return len(argExprs) - 1
+	}
+
+	var bindErr error
+	for i, item := range sel.List {
+		rewritten := walkSystemExpr(item.Expr, func(call ast.Call) ast.Expr {
+			if bindErr != nil || !systemAggFuncs(call.Name) {
+				return nil
+			}
+			switch call.Name {
+			case "count":
+				if !call.Star && len(call.Args) != 1 {
+					bindErr = nerr.New(nerr.InvalidArgument, "executor.system", call.Name+" argument count")
+					return nil
+				}
+			case "map_agg":
+				if call.Star || len(call.Args) != 2 {
+					bindErr = nerr.New(nerr.InvalidArgument, "executor.system", call.Name+" argument count")
+					return nil
+				}
+			default:
+				if call.Star || len(call.Args) != 1 {
+					bindErr = nerr.New(nerr.InvalidArgument, "executor.system", call.Name+" argument count")
+					return nil
+				}
+			}
+			col, col2 := -1, -1
+			if !call.Star && len(call.Args) >= 1 {
+				col = addArg(call.Args[0])
+			}
+			if call.Name == "map_agg" {
+				col2 = addArg(call.Args[1])
+			}
+			var ot types.Type
+			switch call.Name {
+			case "count", "sum", "avg":
+				ot = types.Type{Kind: types.KindDecimal}
+			case "min", "max":
+				ot = systemArgType(call.Args[0], schema)
+			case "array_agg":
+				if at, err := types.ArrayType(systemArgTypeOr(call.Args[0], schema, types.String())); err == nil {
+					ot = at
+				}
+			case "map_agg":
+				kt := systemArgTypeOr(call.Args[0], schema, types.String())
+				vt := systemArgTypeOr(call.Args[1], schema, types.String())
+				if mt, err := types.MapType(kt, vt); err == nil {
+					ot = mt
+				}
+			}
+			slot := ast.Ident{Name: binder.AggSlotName(len(specs))}
+			specs = append(specs, aggregate.Spec{Fun: call.Name, Col: col, Col2: col2, OutType: ot})
+			outTy = append(outTy, ot)
+			return slot
+		})
+		if bindErr != nil {
+			return nil, bindErr
+		}
+		outExprs[i] = rewritten
+		switch {
+		case item.Alias != "":
+			outCols[i] = item.Alias
+		default:
+			outCols[i] = "?"
+			if call, ok := item.Expr.(ast.Call); ok {
+				outCols[i] = call.Name
+			} else if id, ok := item.Expr.(ast.Ident); ok {
+				outCols[i] = id.Name
+			}
+		}
+	}
+	// A select item reading a column of the table has no single value once the
+	// rows are collapsed, and there is no GROUP BY here to give it one.
+	for _, ex := range outExprs {
+		used := map[string]struct{}{}
+		collectSystemIdents(ex, used)
+		for name := range used {
+			if _, isSlot := slotIndex(name, binder.AggSlotName); isSlot {
+				continue
+			}
+			return nil, nerr.New(nerr.InvalidArgument, "executor.system", "select item must be an aggregate when the list contains one")
+		}
+	}
+
+	h := aggregate.New(nil, specs, outTy, s.budget())
+	defer h.Close()
+	for _, row := range filtered {
+		in := make([]types.Value, len(argExprs))
+		for j, e := range argExprs {
+			v, err := s.eval(e, schema, row)
+			if err != nil {
+				return nil, err
+			}
+			in[j] = v
+		}
+		if err := h.Add(in); err != nil {
+			return nil, err
+		}
+	}
+	// With no grouping columns Finish always yields exactly one row, including
+	// over zero input rows — COUNT(*) of nothing is 0, not no row at all.
+	raw, err := h.Finish()
+	if err != nil {
+		return nil, err
+	}
+	// Project the select list over the emitted row, whose columns are the
+	// reserved aggregate slots. This is what lets an aggregate sit inside a
+	// larger expression here as it does on a user table.
+	aggTab := &catalog.Table{Name: "aggregate_row", Columns: make([]catalog.Column, len(specs))}
+	for i, sp := range specs {
+		ty := sp.OutType
+		if ty.Kind == types.KindInvalid {
+			ty = types.Type{Kind: types.KindDecimal}
+		}
+		aggTab.Columns[i] = catalog.Column{Name: binder.AggSlotName(i), Type: ty}
+	}
+	outRows := make([][]types.Value, 0, len(raw))
+	for _, row := range raw {
+		dst := make([]types.Value, len(outExprs))
+		for i, ex := range outExprs {
+			v, err := s.eval(ex, aggTab, row)
+			if err != nil {
+				return nil, err
+			}
+			dst[i] = v
+		}
+		outRows = append(outRows, dst)
+	}
+
+	// LIMIT/OFFSET bound the aggregate result, not the rows it read.
+	if sel.Offset != nil {
+		if *sel.Offset < 0 {
+			return nil, nerr.New(nerr.InvalidArgument, "executor.system", "OFFSET must be >=0")
+		}
+		if *sel.Offset >= int64(len(outRows)) {
+			outRows = [][]types.Value{}
+		} else {
+			outRows = outRows[*sel.Offset:]
+		}
+	}
+	if sel.Limit != nil {
+		if *sel.Limit < 0 {
+			return nil, nerr.New(nerr.InvalidArgument, "executor.system", "LIMIT must be >=0")
+		}
+		if lim := int(*sel.Limit); lim < len(outRows) {
+			outRows = outRows[:lim]
+		}
+	}
+	return &Result{Columns: outCols, Rows: outRows}, nil
+}
+
+// systemArgType reports the declared type of an aggregate argument that is a
+// plain column of this system table, and the zero Type otherwise, matching what
+// aggSpecs does with a non-column argument on the user-table path.
+func systemArgType(e ast.Expr, schema *catalog.Table) types.Type {
+	if id, ok := e.(ast.Ident); ok && schema != nil {
+		if i, found := schema.ColIndex(id.Name); found {
+			return schema.Columns[i].Type
+		}
+	}
+	return types.Type{}
+}
+
+func systemArgTypeOr(e ast.Expr, schema *catalog.Table, fallback types.Type) types.Type {
+	if t := systemArgType(e, schema); t.Kind != types.KindInvalid {
+		return t
+	}
+	return fallback
+}
+
 func (s *Session) systemRows(name string, schema *catalog.Table) ([][]types.Value, error) {
 	switch name {
 	case "system.capabilities":
@@ -321,8 +618,6 @@ func (s *Session) systemRows(name string, schema *catalog.Table) ([][]types.Valu
 		return s.systemGrantsRows()
 	case "system.resource_groups":
 		return s.systemResourceGroupsRows()
-	case "system.realms":
-		return s.systemRealmsRows()
 	case "system.databases":
 		return s.systemDatabasesRows()
 	case "system.quotas":
@@ -398,6 +693,9 @@ func (s *Session) systemColumnsRows() ([][]types.Value, error) {
 			}
 			if col.ClientEncrypted() {
 				typStr += " ENCRYPTED CLIENT"
+				if col.ClientEncryptionMode == catalog.ClientEncryptionDeterministic {
+					typStr += " DETERMINISTIC"
+				}
 			}
 			defaultStr := ""
 			if col.Default.Kind != catalog.DefNone {
@@ -918,36 +1216,13 @@ func hostingLayoutName(l hosting.Layout) string {
 	}
 }
 
-// systemRealmsRows and systemDatabasesRows (M2-4a) expose the hosted
-// deployment registry (internal/hosting.Registry.Manifest) read-only.
-// Admin-only, like system.resource_groups: deployment structure across
-// realms is not tenant-visible data. Empty (not an error) on a
-// legacy/non-hosted deployment (s.hostingRegistry is nil, e.g. Databases
-// was never configured) or for a non-admin caller.
-func (s *Session) systemRealmsRows() ([][]types.Value, error) {
-	if s.hostingRegistry == nil {
-		return [][]types.Value{}, nil
-	}
-	if !(s.acl == nil || s.isAdmin()) {
-		return [][]types.Value{}, nil
-	}
-	m := s.hostingRegistry.Manifest()
-	out := make([][]types.Value, 0, len(m.Realms))
-	for _, r := range m.Realms {
-		var zero [32]byte
-		out = append(out, []types.Value{
-			types.StringValue(r.ID.String()),
-			types.StringValue(r.Name),
-			types.StringValue(hostingStateName(r.State)),
-			sysDec(int64(len(r.Databases)), 10),
-			sysDec(int64(r.StorageCapBytes), 20),
-			types.BoolValue(r.RealmRootAuthHash != zero),
-		})
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i][1].Str < out[j][1].Str })
-	return out, nil
-}
-
+// systemDatabasesRows exposes the deployment registry
+// (internal/hosting.Registry.Manifest) read-only: one row, the single
+// database this deployment serves. Admin-only, like
+// system.resource_groups — deployment structure is not tenant-visible data.
+// Empty (not an error) on a deployment with no registry attached
+// (s.hostingRegistry is nil) or for a non-admin caller. system.realms was
+// removed with multi-realm hosting (system schema v4).
 func (s *Session) systemDatabasesRows() ([][]types.Value, error) {
 	if s.hostingRegistry == nil {
 		return [][]types.Value{}, nil
@@ -960,22 +1235,14 @@ func (s *Session) systemDatabasesRows() ([][]types.Value, error) {
 	for _, r := range m.Realms {
 		for _, d := range r.Databases {
 			out = append(out, []types.Value{
-				types.StringValue(r.ID.String()),
-				types.StringValue(r.Name),
 				types.StringValue(d.ID.String()),
 				types.StringValue(d.Name),
 				types.StringValue(hostingStateName(d.State)),
-				types.StringValue(hostingLayoutName(d.Layout)),
 				sysDec(int64(d.StorageCapBytes), 20),
 			})
 		}
 	}
-	sort.Slice(out, func(i, j int) bool {
-		if out[i][1].Str != out[j][1].Str {
-			return out[i][1].Str < out[j][1].Str
-		}
-		return out[i][3].Str < out[j][3].Str
-	})
+	sort.Slice(out, func(i, j int) bool { return out[i][1].Str < out[j][1].Str })
 	return out, nil
 }
 
@@ -998,41 +1265,22 @@ func (s *Session) systemQuotasRows() ([][]types.Value, error) {
 	}
 	m := s.hostingRegistry.Manifest()
 
-	// Usage is only knowable for the database this session is connected to.
-	var connRealm, connDB string
+	// Usage is only knowable for the database this session is connected to —
+	// which, since a deployment serves exactly one, is the only row here.
+	var connDB string
 	var connUsedBytes int64
 	var connUsageKnown bool
 	if s.db != nil && s.db.Eng != nil && s.db.Eng.Alloc != nil {
 		connDB = s.db.DatabaseName()
-		for _, r := range m.Realms {
-			if r.ID == s.realmID {
-				connRealm = r.Name
-				break
-			}
-		}
-		if connRealm != "" {
-			connUsedBytes = int64(uint64(s.db.Eng.Alloc.Next()) * uint64(format.PhysicalPageSize))
-			connUsageKnown = true
-		}
+		connUsedBytes = int64(uint64(s.db.Eng.Alloc.Next()) * uint64(format.PhysicalPageSize))
+		connUsageKnown = true
 	}
 
 	var out [][]types.Value
 	for _, r := range m.Realms {
-		out = append(out, []types.Value{
-			types.StringValue("realm"),
-			types.StringValue(r.Name),
-			types.StringValue(""),
-			types.StringValue(hostingStateName(r.State)),
-			sysDec(int64(r.StorageCapBytes), 20),
-			sysDec(int64(r.StorageCapBytes), 20),
-			types.BoolValue(false),
-			sysDec(0, 20),
-			sysDec(0, 5),
-			types.BoolValue(false),
-		})
 		for _, d := range r.Databases {
 			effCap := hosting.EffectiveStorageCapBytes(r.StorageCapBytes, d.StorageCapBytes)
-			known := connUsageKnown && r.Name == connRealm && d.Name == connDB
+			known := connUsageKnown && d.Name == connDB
 			var used, pct int64
 			over := false
 			if known {
@@ -1043,8 +1291,6 @@ func (s *Session) systemQuotasRows() ([][]types.Value, error) {
 				}
 			}
 			out = append(out, []types.Value{
-				types.StringValue("database"),
-				types.StringValue(r.Name),
 				types.StringValue(d.Name),
 				types.StringValue(hostingStateName(d.State)),
 				sysDec(int64(d.StorageCapBytes), 20),
@@ -1056,15 +1302,7 @@ func (s *Session) systemQuotasRows() ([][]types.Value, error) {
 			})
 		}
 	}
-	sort.Slice(out, func(i, j int) bool {
-		if out[i][1].Str != out[j][1].Str {
-			return out[i][1].Str < out[j][1].Str
-		}
-		if out[i][0].Str != out[j][0].Str {
-			return out[i][0].Str > out[j][0].Str // "realm" row before its "database" rows
-		}
-		return out[i][2].Str < out[j][2].Str
-	})
+	sort.Slice(out, func(i, j int) bool { return out[i][0].Str < out[j][0].Str })
 	return out, nil
 }
 
@@ -1547,6 +1785,7 @@ func (s *Session) systemTLSRows() ([][]types.Value, error) {
 		types.BoolValue(st.MTLSRequired),
 		types.BoolValue(st.ClientCAConfigured),
 		types.BoolValue(st.ClientCRLConfigured),
+		types.StringValue(st.OCSPMode),
 	}
 	return [][]types.Value{row}, nil
 }
@@ -1965,5 +2204,57 @@ func partitionKindString(k catalog.PartitionKind) string {
 		return "legacy_tenant"
 	default:
 		return "none"
+	}
+}
+
+// collectSystemIdents gathers every column name a rewritten select item reads.
+func collectSystemIdents(e ast.Expr, into map[string]struct{}) {
+	if e == nil {
+		return
+	}
+	if id, ok := e.(ast.Ident); ok {
+		into[id.Name] = struct{}{}
+		return
+	}
+	if p, ok := e.(ast.Path); ok {
+		if len(p.Parts) > 0 {
+			into[p.Parts[0]] = struct{}{}
+		}
+		return
+	}
+	walkSystemExpr(e, func(c ast.Call) ast.Expr {
+		for _, a := range c.Args {
+			collectSystemIdents(a, into)
+		}
+		return nil
+	})
+	switch x := e.(type) {
+	case ast.Unary:
+		collectSystemIdents(x.Right, into)
+	case ast.Binary:
+		collectSystemIdents(x.Left, into)
+		collectSystemIdents(x.Right, into)
+	case ast.Between:
+		collectSystemIdents(x.Expr, into)
+		collectSystemIdents(x.Low, into)
+		collectSystemIdents(x.High, into)
+	case ast.IsNull:
+		collectSystemIdents(x.Expr, into)
+	case ast.Case:
+		collectSystemIdents(x.Operand, into)
+		collectSystemIdents(x.Else, into)
+		for _, arm := range x.Whens {
+			collectSystemIdents(arm.When, into)
+			collectSystemIdents(arm.Then, into)
+		}
+	case ast.ArrayCtor:
+		for _, el := range x.Elems {
+			collectSystemIdents(el, into)
+		}
+	case ast.FieldAccess:
+		collectSystemIdents(x.Base, into)
+	case ast.Subscript:
+		collectSystemIdents(x.Coll, into)
+		collectSystemIdents(x.Index, into)
 	}
 }

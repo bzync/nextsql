@@ -66,6 +66,9 @@ func CreateTableSQLWithParents(t *catalog.Table, parents map[string]*catalog.Tab
 		b.WriteString(SQLType(c.LogicalType()))
 		if c.ClientEncrypted() {
 			b.WriteString(" ENCRYPTED CLIENT")
+			if c.ClientEncryptionMode == catalog.ClientEncryptionDeterministic {
+				b.WriteString(" DETERMINISTIC")
+			}
 		}
 		singlePK := len(t.PK) == 1 && t.PK[0] == i
 		if singlePK {

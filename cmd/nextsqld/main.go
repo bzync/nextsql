@@ -2,12 +2,16 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -19,7 +23,6 @@ import (
 	"github.com/bzync/nextsql/internal/cli"
 	"github.com/bzync/nextsql/internal/config"
 	"github.com/bzync/nextsql/internal/crypto"
-	"github.com/bzync/nextsql/internal/dbmanager"
 	"github.com/bzync/nextsql/internal/diskspace"
 	"github.com/bzync/nextsql/internal/executor"
 	"github.com/bzync/nextsql/internal/hosting"
@@ -84,6 +87,8 @@ func run() error {
 	tlsKey := fs.String("tls-key", "", "TLS private key (PEM)")
 	tlsClientCA := fs.String("tls-client-ca", "", "PEM CA for required mTLS client certificates")
 	tlsClientCRL := fs.String("tls-client-crl", "", "PEM CRL bundle for required fail-closed mTLS revocation checks")
+	tlsOCSPMode := fs.String("tls-ocsp-mode", "", "disabled|optional|enforce OCSP certificate status checking")
+	tlsOCSPResponder := fs.String("tls-ocsp-responder", "", "override OCSP responder URL")
 	authBrokerConfig := fs.String("auth-broker-config", "", "embedded OIDC broker config (default: DATA-DIR/nextsql-auth-broker.conf)")
 	authBrokerListen := fs.String("auth-broker-listen", "", "host the OIDC broker on this separate HTTP(S) listener (single-node only)")
 	user := fs.String("user", "", "bootstrap or update this user")
@@ -96,6 +101,10 @@ func run() error {
 	raftBind := fs.String("raft-bind", "", "Raft bind address (enables HA)")
 	raftJoin := fs.String("raft-join", "", "Raft peers as id=addr,id=addr (min 3 voters)")
 	raftBootstrap := fs.Bool("raft-bootstrap", false, "bootstrap this node with --raft-join")
+	raftHeartbeatMS := fs.Int("raft-heartbeat-ms", 0, "Raft leader-contact interval in ms (0 = built-in default; also sets the follower-read freshness window)")
+	raftElectionMS := fs.Int("raft-election-ms", 0, "Raft election timeout in ms (0 = built-in default; must be >= --raft-heartbeat-ms)")
+	raftLeaderLeaseMS := fs.Int("raft-leader-lease-ms", 0, "Raft leader lease in ms (0 = built-in default; must be <= --raft-heartbeat-ms)")
+	raftCommitTimeoutMS := fs.Int("raft-commit-timeout-ms", 0, "Raft commit batching timeout in ms (0 = built-in default)")
 	production := fs.Bool("production", false, "force the production deployment profile and refuse to start unless the live-production preflight passes")
 	fs.String("env-file", "", "load only this dotenv file")
 	fs.Bool("no-env", false, "do not load .env files")
@@ -152,6 +161,12 @@ func run() error {
 	if set["tls-client-crl"] {
 		cfg.TLSClientCRL = *tlsClientCRL
 	}
+	if set["tls-ocsp-mode"] {
+		cfg.TLSOCSPMode = *tlsOCSPMode
+	}
+	if set["tls-ocsp-responder"] {
+		cfg.TLSOCSPResponder = *tlsOCSPResponder
+	}
 	if set["auth-broker-config"] {
 		cfg.AuthBrokerConfig = *authBrokerConfig
 	}
@@ -181,6 +196,18 @@ func run() error {
 	}
 	if set["raft-bootstrap"] {
 		cfg.RaftBootstrap = *raftBootstrap
+	}
+	if set["raft-heartbeat-ms"] {
+		cfg.RaftHeartbeatMS = *raftHeartbeatMS
+	}
+	if set["raft-election-ms"] {
+		cfg.RaftElectionMS = *raftElectionMS
+	}
+	if set["raft-leader-lease-ms"] {
+		cfg.RaftLeaderLeaseMS = *raftLeaderLeaseMS
+	}
+	if set["raft-commit-timeout-ms"] {
+		cfg.RaftCommitTimeoutMS = *raftCommitTimeoutMS
 	}
 	if *production {
 		cfg.ApplyProductionDefaults()
@@ -245,19 +272,15 @@ func run() error {
 		hostingRegistry *hosting.Registry
 		hostedRealm     hosting.Realm
 		hostedDatabase  hosting.Database
-		dbMgr           *dbmanager.Manager
-		secondaryMu     sync.Mutex
-		secondaryEnvs   []*crypto.Envelope
+		backgroundWait  func()
 	)
 	defer func() {
-		if dbMgr != nil {
-			_ = dbMgr.Close()
+		// serveContext has been canceled by its later-registered defer before
+		// this cleanup runs. Wait for every primary-database maintenance loop
+		// to observe it before closing the handle it uses.
+		if backgroundWait != nil {
+			backgroundWait()
 		}
-		secondaryMu.Lock()
-		for _, e := range secondaryEnvs {
-			_ = e.Close()
-		}
-		secondaryMu.Unlock()
 		if db != nil {
 			_ = db.Close()
 		}
@@ -272,21 +295,22 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	// The primary database is eager-opened at DATA-DIR/nextsql.db only for a
-	// legacy single-database deployment (no registry) or a registry whose
-	// default is LayoutLegacyDefault. A manifest-bootstrapped deployment whose
-	// default is LayoutManaged starts with no primary handle: dbMgr (set up
-	// below, since hostingRegistry != nil) opens and serves it lazily on the
-	// first connection, exactly as it already does every non-default managed
-	// database. RequireClientKey keeps its own deferred-open path regardless.
-	eagerPrimary := hostingRegistry == nil || hostedDatabase.Layout == hosting.LayoutLegacyDefault
-	if cfg.RequireClientKey && !eagerPrimary {
-		return nerr.New(nerr.InvalidArgument, "nextsqld", "require_client_key is not supported with a manifest-bootstrapped (managed-layout default) deployment")
+	// A deployment initialized without `--database` has keys and an
+	// administrator but no database yet, and there is nothing to serve.
+	// Answer with the command that creates one instead of the bare
+	// "no such file or directory" the open would produce three frames later.
+	if err := requireInitializedDatabase(cfg, dbPath, hostingRegistry); err != nil {
+		return err
 	}
-	if !cfg.RequireClientKey && eagerPrimary && cfg.KeyFile == "" {
-		return nerr.New(nerr.InvalidArgument, "nextsqld", "--key-file is required for this deployment (its default database is a legacy DATA-DIR/nextsql.db)")
+	// The deployment's one database always lives at DATA-DIR/nextsql.db and
+	// is opened eagerly here. (Multi-database hosting once deferred that open
+	// for a managed-layout default and served it lazily; openHostedDefault
+	// now refuses such a deployment outright rather than half-serving it.)
+	// RequireClientKey keeps its own deferred-open path regardless.
+	if !cfg.RequireClientKey && cfg.KeyFile == "" {
+		return nerr.New(nerr.InvalidArgument, "nextsqld", "--key-file is required to open DATA-DIR/nextsql.db")
 	}
-	if !cfg.RequireClientKey && eagerPrimary {
+	if !cfg.RequireClientKey {
 		var opened *crypto.Envelope
 		keys, opened, err = openKeys(cfg.KeyFile, ksPath)
 		if err != nil {
@@ -403,10 +427,29 @@ func run() error {
 			db.SetDatabaseName(hostedDatabase.Name)
 		}
 	}
-	if cfg.MaxResultRows > 0 || cfg.MaxConnections > 0 || cfg.MaxConnectionsPerUser > 0 || cfg.MaxConnectionsPerDatabase > 0 || cfg.MaxConnectionsPerRealm > 0 || cfg.IdleTimeoutMS > 0 || cfg.StatementTimeoutMS > 0 || cfg.TransactionTimeoutMS > 0 || cfg.IdleTransactionTimeoutMS > 0 {
+	if cfg.MaxResultRows > 0 || cfg.MaxFrameBytes > 0 || cfg.MaxStatementBytes > 0 || cfg.MaxParameters > 0 || cfg.MaxPrepared > 0 || cfg.MaxResultBytes > 0 || cfg.MaxConnections > 0 || cfg.MaxConnectionsPerUser > 0 || cfg.MaxConnectionsPerDatabase > 0 || cfg.MaxConnectionsPerRealm > 0 || cfg.IdleTimeoutMS > 0 || cfg.StatementTimeoutMS > 0 || cfg.TransactionTimeoutMS > 0 || cfg.IdleTransactionTimeoutMS > 0 {
 		lim := srv.Limits
 		if cfg.MaxResultRows > 0 {
 			lim.Query.ResultRows = cfg.MaxResultRows
+		}
+		if cfg.MaxFrameBytes > 0 {
+			lim.MaxPacket = cfg.MaxFrameBytes
+		}
+		if cfg.MaxStatementBytes > 0 {
+			lim.MaxSQL = cfg.MaxStatementBytes
+		}
+		if cfg.MaxParameters > 0 {
+			lim.MaxParams = cfg.MaxParameters
+		}
+		if cfg.MaxPrepared > 0 {
+			lim.MaxPrepared = cfg.MaxPrepared
+		}
+		if cfg.MaxResultBytes > 0 {
+			lim.MaxResultBytes = int64(cfg.MaxResultBytes)
+			lim.Query.ResultBytes = int64(cfg.MaxResultBytes)
+		}
+		if lim.MaxSQL > lim.MaxPacket {
+			return nerr.New(nerr.InvalidArgument, "nextsqld", "max_statement_bytes cannot exceed max_frame_bytes")
 		}
 		if cfg.MaxConnections > 0 {
 			lim.MaxSessions = cfg.MaxConnections
@@ -550,14 +593,7 @@ func run() error {
 	ctx, stop := serveContext()
 	defer stop()
 	if db != nil {
-		startWALRetentionUpdater(ctx, db, cfg.WalArchive, cfg.WalRetentionMS, log)
-		if cfg.DiskWatermarkCheckMS > 0 {
-			warn, reject := cfg.DiskWatermarkThresholds()
-			startDiskWatermarkMonitor(ctx, db, cfg.DataDir, cfg.DiskWatermarkCheckMS, warn, reject, log)
-		}
-		if cfg.ReplicaLagCheckMS > 0 {
-			startReplicaLagMonitor(ctx, db, cfg.ReplicaLagCheckMS, cfg.ReplicaLagWarnThreshold(), log)
-		}
+		backgroundWait = startDatabaseBackground(ctx, db, cfg, log)
 	}
 	if auditSigningKeys != nil {
 		auditReload := make(chan os.Signal, 1)
@@ -597,134 +633,15 @@ func run() error {
 		}
 		return runtime, nil
 	}
-	if db != nil && hostingRegistry == nil {
-		// Only when there is no hosting registry at all: once one exists,
-		// the primary is scheduled by the single CentralScheduler set up
-		// below instead (M2-3b-3b), the same as every dbmanager-opened
-		// secondary — not its own dedicated TaskRuntime.
+	if db != nil {
+		// One deployment, one database, one task runtime. (Multi-database
+		// hosting once routed several databases through a single
+		// CentralScheduler here; that feature was removed.)
 		runtime, err := newTaskRuntime(db)
 		if err != nil {
 			return err
 		}
 		srv.SetTaskRuntime(runtime)
-	}
-	// dbMgr (M2-3a) lets a connection's Hello.Realm/Hello.Database route to
-	// a database other than the primary one, bounded to a small fixed
-	// number of distinct open databases with no eviction (M2-3b territory).
-	// Only meaningful with a hosting registry to look additional databases
-	// up in; a legacy/non-hosted deployment leaves srv.Databases nil, so
-	// every connection uses the pre-M2-3a DatabaseHandle() path unchanged.
-	if hostingRegistry != nil {
-		opener := func(realm hosting.Realm, database hosting.Database) (*executor.DB, func() error, error) {
-			if database.Layout != hosting.LayoutManaged {
-				return nil, nil, nerr.New(nerr.Unavailable, "nextsqld", "only managed-layout databases can be opened on demand")
-			}
-			if realm.State != hosting.StateActive || database.State != hosting.StateActive {
-				return nil, nil, nerr.New(nerr.Unavailable, "nextsqld", "realm or database is not active")
-			}
-			// database.KeyRef is the standalone root key file for this managed
-			// database (nextsql database create's own --database-key-file),
-			// distinct from the deployment's --key-file. Mirrors the primary
-			// database's own open path (openKeys): the root key does not
-			// encrypt the database file directly, it unlocks an envelope
-			// keystore (crypto.KeystorePath) placed next to the database
-			// file, which activateManagedDatabase/createOrResumeDatabase
-			// already created at provisioning time.
-			secRoot, err := crypto.ReadKeyFile(database.KeyRef)
-			if err != nil {
-				return nil, nil, err
-			}
-			secPath := hosting.ManagedDatabasePath(cfg.DataDir, realm.ID, database.ID)
-			secEnv, err := crypto.OpenEnvelope(crypto.KeystorePath(secPath), secRoot)
-			if err != nil {
-				return nil, nil, err
-			}
-			secDB, err := executor.OpenWith(secPath, secEnv, cfg.BufferPages, storage.OpenOptions{Budget: bufBudget})
-			if err != nil {
-				_ = secEnv.Close()
-				return nil, nil, err
-			}
-			if err := validateHostedDatabase(hostingRegistry, database, secDB); err != nil {
-				_ = secDB.Close()
-				_ = secEnv.Close()
-				return nil, nil, err
-			}
-			secDB.SetDatabaseName(database.Name)
-			applyHostedStorageCap(secDB, realm, database)
-			applyOps(secDB, cfg)
-			// No installArchiver, no startCluster: secondary databases are
-			// single-node only in M2-3a (no PITR archiving, no Raft — running
-			// multiple independent Raft groups in one process is out of
-			// scope). Not a regression: nextsqld opened nothing beyond the
-			// primary at all before M2-3a.
-			startWALRetentionUpdater(ctx, secDB, cfg.WalArchive, cfg.WalRetentionMS, log)
-			if cfg.DiskWatermarkCheckMS > 0 {
-				warn, reject := cfg.DiskWatermarkThresholds()
-				startDiskWatermarkMonitor(ctx, secDB, cfg.DataDir, cfg.DiskWatermarkCheckMS, warn, reject, log)
-			}
-			if cfg.ReplicaLagCheckMS > 0 {
-				startReplicaLagMonitor(ctx, secDB, cfg.ReplicaLagCheckMS, cfg.ReplicaLagWarnThreshold(), log)
-			}
-			secondaryMu.Lock()
-			secondaryEnvs = append(secondaryEnvs, secEnv)
-			secondaryMu.Unlock()
-			// No task runtime to close here any more (M2-3b-3b): the single
-			// CentralScheduler set up below covers every dbmanager-open
-			// database, primary and secondary alike, and its own Close
-			// (deferred right after it's started, below) already
-			// guarantees no claim it submitted against secDB is still
-			// in flight by the time Manager.release calls this cleanup —
-			// see CentralScheduler.Close's doc comment. The envelope closes
-			// last, since the database's own final checkpoint/flush needs
-			// its key material still available.
-			cleanup := func() error {
-				dbErr := secDB.Close()
-				_ = secEnv.Close()
-				return dbErr
-			}
-			return secDB, cleanup, nil
-		}
-		dbMgr = dbmanager.New(cfg.MaxOpenDatabases, hostingRegistry.Lookup, opener)
-		if db != nil {
-			if err := dbMgr.Preload(hostedRealm, hostedDatabase, db); err != nil {
-				return err
-			}
-		}
-		srv.SetDatabaseManager(dbMgr)
-		// CentralScheduler (M2-3b-3b) is the single poll loop covering every
-		// database dbMgr currently has open — primary and every secondary —
-		// instead of each getting its own TaskRuntime. dbMgr.Snapshot's
-		// ref-holding is what makes this safe against M2-3b-1 eviction: a
-		// database with a claim still in flight can't be evicted mid-tick
-		// (see Snapshot's own doc comment), so the Opener's cleanup above
-		// needs no task-runtime-specific ordering of its own any more.
-		// Deliberately scoped out: the REQUIRE CLIENT KEY lazy-open path's
-		// own primary-only TaskRuntime (below, in srv.Unlock) is untouched —
-		// combining REQUIRE CLIENT KEY with hosting is a narrow, rare
-		// deployment shape, and once that primary is later Preloaded into
-		// dbMgr there, it becomes redundantly (but not incorrectly — claims
-		// are transactionally exclusive) polled by both. Not attempted here;
-		// flagged rather than silently left.
-		centralSched, err := executor.StartCentralScheduler(ctx, taskPool, func() []executor.DBRef {
-			handles := dbMgr.Snapshot()
-			refs := make([]executor.DBRef, len(handles))
-			for i, h := range handles {
-				refs[i] = executor.DBRef{DB: h.DB, Release: h.Release}
-			}
-			return refs
-		}, executor.TaskRuntimeConfig{
-			ACL: acl, Audit: audit, Limits: srv.Limits.Query,
-			OnError: func(err error) { log.Error("task scheduler", "error", err) },
-		})
-		if err != nil {
-			return err
-		}
-		// Registered here — after dbMgr exists but before the earlier master
-		// dbMgr/secondary-cleanup defer runs (defers are LIFO: this one,
-		// registered later, runs first) — so CentralScheduler always closes,
-		// draining every in-flight claim, before dbMgr force-closes any
-		// database out from under it during final shutdown.
-		defer func() { _ = centralSched.Close() }()
 	}
 	if env != nil {
 		env.OnRevoke(func(crypto.RevokeEvent) {
@@ -760,9 +677,11 @@ func run() error {
 			}
 			applyHostedStorageCap(openedDB, hostedRealm, hostedDatabase)
 			var (
-				openedCluster *replication.Cluster
-				openedTasks   *executor.TaskRuntime
-				published     bool
+				openedCluster  *replication.Cluster
+				openedTasks    *executor.TaskRuntime
+				waitBackground func()
+				stopBackground context.CancelFunc
+				published      bool
 			)
 			defer func() {
 				if published {
@@ -774,6 +693,10 @@ func run() error {
 				if openedCluster != nil {
 					_ = openedCluster.Shutdown()
 				}
+				if stopBackground != nil {
+					stopBackground()
+					waitBackground()
+				}
 				_ = openedDB.Close()
 				_ = opened.Close()
 			}()
@@ -783,27 +706,19 @@ func run() error {
 				log.Info("sessions terminated after key revocation", "count", n)
 			})
 			applyOps(openedDB, cfg)
+			backgroundCtx, cancelBackground := context.WithCancel(ctx)
+			stopBackground = cancelBackground
 			if err := installArchiver(openedDB, opened, cfg.WalArchive); err != nil {
 				return err
-			}
-			startWALRetentionUpdater(ctx, openedDB, cfg.WalArchive, cfg.WalRetentionMS, log)
-			if cfg.DiskWatermarkCheckMS > 0 {
-				warn, reject := cfg.DiskWatermarkThresholds()
-				startDiskWatermarkMonitor(ctx, openedDB, cfg.DataDir, cfg.DiskWatermarkCheckMS, warn, reject, log)
 			}
 			openedCluster, err = startCluster(openedDB, opened, cfg, audit)
 			if err != nil {
 				return err
 			}
-			// Started only after startCluster returns, unlike the WAL
-			// retention/disk watermark monitors above: this one reads
-			// DB.ClusterHealth (DB.gate), which AttachCluster sets with no
-			// synchronization of its own — starting it any earlier would
-			// race that write from this goroutine against the monitor's own
-			// background goroutine.
-			if cfg.ReplicaLagCheckMS > 0 {
-				startReplicaLagMonitor(ctx, openedDB, cfg.ReplicaLagCheckMS, cfg.ReplicaLagWarnThreshold(), log)
-			}
+			// AttachCluster writes DB cluster state without its own monitor
+			// synchronization, so start the complete database background only
+			// after that write is complete.
+			waitBackground = startDatabaseBackground(backgroundCtx, openedDB, cfg, log)
 			openedTasks, err = newTaskRuntime(openedDB)
 			if err != nil {
 				return err
@@ -811,20 +726,23 @@ func run() error {
 			env = opened
 			db = openedDB
 			cluster = openedCluster
+			backgroundWait = waitBackground
 			srv.SetTaskRuntime(openedTasks)
 			srv.SetDatabase(openedDB)
-			if dbMgr != nil {
-				if err := dbMgr.Preload(hostedRealm, hostedDatabase, openedDB); err != nil {
-					return err
-				}
-			}
 			published = true
 			return nil
 		}
 	}
 	var tlsReloader *security.ServerTLSReloader
 	if cfg.TLSCert != "" {
-		tlsReloader, err = security.NewServerTLSReloader(cfg.TLSCert, cfg.TLSKey, cfg.TLSClientCA, cfg.TLSClientCRL)
+		var reloaderOpts []security.ReloaderOption
+		if cfg.TLSOCSPMode != "" && cfg.TLSOCSPMode != "disabled" {
+			reloaderOpts = append(reloaderOpts, security.WithOCSP(security.OCSPConfig{
+				Mode:         security.OCSPMode(cfg.TLSOCSPMode),
+				ResponderURL: cfg.TLSOCSPResponder,
+			}))
+		}
+		tlsReloader, err = security.NewServerTLSReloader(cfg.TLSCert, cfg.TLSKey, cfg.TLSClientCA, cfg.TLSClientCRL, reloaderOpts...)
 		if err != nil {
 			return err
 		}
@@ -1059,6 +977,43 @@ func startEmbeddedAuthBroker(cfg config.Config, users *auth.Store, acl *security
 		}
 		return acl.RolesForInRealm(realmID, principal), nil
 	}
+	if brokerCfg.JITProvisioning {
+		maxUsers := brokerCfg.MaxPrincipals
+		if maxUsers <= 0 {
+			maxUsers = 1000
+		}
+		opts.UserProvisioner = func(realmName, principal string, roles []string) error {
+			var realmID hosting.ID
+			if hostingRegistry != nil && realmName != "" {
+				realm, err := hostingRegistry.LookupRealm(realmName)
+				if err != nil {
+					return err
+				}
+				realmID = realm.ID
+			}
+			existing := users.SnapshotInRealm(realmID)
+			if len(existing) >= maxUsers {
+				return nerr.New(nerr.Exhausted, "nextsqld.jit", "maximum principal limit reached")
+			}
+			var randPass [32]byte
+			if _, err := io.ReadFull(rand.Reader, randPass[:]); err != nil {
+				return nerr.Wrap(nerr.Internal, "nextsqld.jit", "generate salt", err)
+			}
+			passHex := hex.EncodeToString(randPass[:])
+			if err := users.UpsertInRealm(realmID, principal, passHex); err != nil {
+				return err
+			}
+			if err := acl.AddUserInRealm(realmID, principal); err != nil {
+				return err
+			}
+			for _, r := range roles {
+				if err := acl.GrantRoleInRealm(realmID, r, principal); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+	}
 	broker, err := authbroker.New(brokerCfg, opts)
 	if err != nil {
 		return nil, nil, err
@@ -1160,14 +1115,77 @@ func openHostedDefault(cfg config.Config) (*hosting.Registry, hosting.Realm, hos
 		_ = registry.Close()
 		return nil, hosting.Realm{}, hosting.Database{}, nerr.New(nerr.Unavailable, "nextsqld", "default realm/database is not active")
 	}
-	// A LayoutLegacyDefault default is eager-opened below (DATA-DIR/nextsql.db
-	// under --key-file). A LayoutManaged default — produced by a declarative
-	// manifest bootstrap, where every database including the default has its
-	// own key file — is served lazily through dbmanager exactly like every
-	// other managed database (M2-5), so the eager open is skipped and the
-	// process starts with no primary DB handle at all. Both are valid; the
-	// registry decode already rejected any other layout value.
+	// Multi-realm/multi-database hosting was removed: a deployment serves
+	// exactly the one database at DATA-DIR/nextsql.db. A registry written by
+	// a release that could hold more than that is refused here rather than
+	// served with its other databases silently unreachable — the data is
+	// still on disk, and 0.0.1 can still read it to export.
+	if err := requireSingleDatabaseDeployment(registry, realm, database); err != nil {
+		_ = registry.Close()
+		return nil, hosting.Realm{}, hosting.Database{}, err
+	}
 	return registry, realm, database, nil
+}
+
+// requireInitializedDatabase reports whether this data directory holds a
+// database at all. `nextsql init` without `--database` provisions the
+// deployment only — root key, and the administrator in the deployment auth
+// store — so the data directory legitimately exists, and is legitimately
+// unservable, until a database is named. Distinguishing that from "wrong
+// --data-dir" is the whole point: both would otherwise surface as a missing
+// file deep inside the storage layer.
+func requireInitializedDatabase(cfg config.Config, dbPath string, registry *hosting.Registry) error {
+	if _, err := os.Stat(dbPath); err == nil {
+		return nil
+	} else if !os.IsNotExist(err) {
+		return nerr.Wrap(nerr.IO, "nextsqld", "stat database", err)
+	}
+	if registry != nil {
+		// A registry without its database is damage, not a pending install:
+		// the registry is only ever written once the database exists.
+		return nerr.New(nerr.Corruption, "nextsqld",
+			"deployment registry exists but "+dbPath+" is missing; restore the data directory or recover from a backup")
+	}
+	keyFile := cfg.KeyFile
+	if keyFile == "" {
+		keyFile = "KEY-FILE"
+	}
+	return nerr.New(nerr.Unavailable, "nextsqld",
+		"this deployment has no database yet (no "+dbPath+"): create one with `nextsql init --data-dir "+
+			cfg.DataDir+" --key-file "+keyFile+" --database NAME`")
+}
+
+// requireSingleDatabaseDeployment fails closed on a registry that describes
+// anything this build can no longer serve: more than one realm, more than one
+// database in that realm, or a default database that does not live at
+// DATA-DIR/nextsql.db (the managed layout a declarative multi-realm bootstrap
+// used to produce). Refusing to start is deliberate — the alternative is a
+// server that comes up looking healthy while some of the operator's databases
+// have quietly become unreachable.
+func requireSingleDatabaseDeployment(registry *hosting.Registry, realm hosting.Realm, database hosting.Database) error {
+	return requireSingleDatabaseDeploymentManifest(registry.Manifest(), realm, database)
+}
+
+// requireSingleDatabaseDeploymentManifest is the decision itself, split out
+// so it can be exercised against manifests this build can no longer write.
+func requireSingleDatabaseDeploymentManifest(m hosting.Manifest, realm hosting.Realm, database hosting.Database) error {
+	const op = "nextsqld"
+	const remedy = " Multi-realm/multi-database hosting was removed; run one deployment per database, " +
+		"and use NextSQL 0.0.1 to export anything this deployment still holds."
+	if len(m.Realms) != 1 {
+		return nerr.New(nerr.Unavailable, op,
+			"deployment registry describes "+strconv.Itoa(len(m.Realms))+" realms."+remedy)
+	}
+	if len(m.Realms[0].Databases) != 1 {
+		return nerr.New(nerr.Unavailable, op,
+			"deployment registry describes "+strconv.Itoa(len(m.Realms[0].Databases))+" databases in realm "+
+				realm.Name+"."+remedy)
+	}
+	if database.Layout != hosting.LayoutLegacyDefault {
+		return nerr.New(nerr.Unavailable, op,
+			"deployment registry's database "+database.Name+" is not the deployment's own DATA-DIR/nextsql.db."+remedy)
+	}
+	return nil
 }
 
 // applyHostedStorageCap applies the realm/database data-file growth cap from the
@@ -1194,6 +1212,15 @@ func validateHostedDatabase(registry *hosting.Registry, expected hosting.Databas
 	return nil
 }
 
+// msDuration converts a configured millisecond value to a duration, leaving a
+// zero as zero so replication.Timings resolves it to its built-in default.
+func msDuration(ms int) time.Duration {
+	if ms <= 0 {
+		return 0
+	}
+	return time.Duration(ms) * time.Millisecond
+}
+
 func startCluster(db *executor.DB, keys crypto.KeyProvider, cfg config.Config, audit *security.Log) (*replication.Cluster, error) {
 	if cfg.RaftBind == "" {
 		return nil, nil
@@ -1215,6 +1242,12 @@ func startCluster(db *executor.DB, keys crypto.KeyProvider, cfg config.Config, a
 		Peers:     peers,
 		Bootstrap: cfg.RaftBootstrap,
 		Keys:      replication.ReplKeys(keys),
+		Timings: replication.Timings{
+			Heartbeat:     msDuration(cfg.RaftHeartbeatMS),
+			Election:      msDuration(cfg.RaftElectionMS),
+			LeaderLease:   msDuration(cfg.RaftLeaderLeaseMS),
+			CommitTimeout: msDuration(cfg.RaftCommitTimeoutMS),
+		},
 	}, db)
 	if err != nil {
 		return nil, err
@@ -1254,6 +1287,67 @@ func installArchiver(db *executor.DB, keys crypto.KeyProvider, dir string) error
 	return nil
 }
 
+// startDatabaseBackground starts all per-database periodic work and returns
+// a wait function. Call it after canceling ctx and before closing db: a
+// canceled context alone cannot prevent a ticker callback already in progress
+// from using a handle that is about to be closed.
+func startDatabaseBackground(ctx context.Context, db *executor.DB, cfg config.Config, log *slog.Logger) func() {
+	waits := []func(){
+		startCheckpointController(ctx, db, cfg.CheckpointIntervalMS, log),
+		startWALRetentionUpdater(ctx, db, cfg.WalArchive, cfg.WalRetentionMS, log),
+	}
+	if cfg.DiskWatermarkCheckMS > 0 {
+		warn, reject := cfg.DiskWatermarkThresholds()
+		waits = append(waits, startDiskWatermarkMonitor(ctx, db, cfg.DataDir, cfg.DiskWatermarkCheckMS, warn, reject, log))
+	}
+	if cfg.ReplicaLagCheckMS > 0 {
+		waits = append(waits, startReplicaLagMonitor(ctx, db, cfg.ReplicaLagCheckMS, cfg.ReplicaLagWarnThreshold(), log))
+	}
+	return func() {
+		for _, wait := range waits {
+			wait()
+		}
+	}
+}
+
+// startCheckpointController periodically installs a durable recovery
+// boundary for one open database. Checkpoint itself flushes committed pages,
+// writes the checkpoint record/control file, and preserves WAL history for
+// PITR and page repair; this controller never prunes WAL. It intentionally
+// does not checkpoint immediately after open: recovery has already made the
+// database consistent, and an idle open should not create housekeeping WAL.
+//
+// A ticker invokes tick serially, so one database has at most one scheduled
+// checkpoint in flight. Shutdown cancels the loop before DB.Close performs
+// its final checkpoint, avoiding a close/checkpoint race.
+func startCheckpointController(ctx context.Context, db *executor.DB, intervalMS int, log *slog.Logger) func() {
+	if db == nil || intervalMS <= 0 {
+		return func() {}
+	}
+	interval := time.Duration(intervalMS) * time.Millisecond
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		t := time.NewTicker(interval)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				if err := db.Eng.Checkpoint(); err != nil {
+					// Do not turn a checkpoint failure into an unsafe success or
+					// stop serving a database that remains durable through WAL.
+					// The next bounded tick retries, while the error remains
+					// operator-visible.
+					log.Warn("checkpoint failed; WAL recovery window remains unbounded until a later checkpoint succeeds", "error", err)
+				}
+			}
+		}
+	}()
+	return func() { <-done }
+}
+
 // walRetentionTick advances db's WAL pruning horizon to the newest archived
 // segment's LSN at or before now-retention, so a later MAINTAIN DATABASE can
 // prune local WAL history the policy no longer requires. It never prunes
@@ -1283,9 +1377,9 @@ func walRetentionTick(db *executor.DB, archiveDir string, retention time.Duratio
 // [1m, 1h]) so a short test-oriented retention window still gets
 // reasonably fine-grained updates without a long real-world window ticking
 // needlessly often.
-func startWALRetentionUpdater(ctx context.Context, db *executor.DB, archiveDir string, retentionMS int, log *slog.Logger) {
+func startWALRetentionUpdater(ctx context.Context, db *executor.DB, archiveDir string, retentionMS int, log *slog.Logger) func() {
 	if db == nil || archiveDir == "" || retentionMS <= 0 {
-		return
+		return func() {}
 	}
 	retention := time.Duration(retentionMS) * time.Millisecond
 	interval := retention / 24
@@ -1300,7 +1394,9 @@ func startWALRetentionUpdater(ctx context.Context, db *executor.DB, archiveDir s
 			log.Warn("wal retention: horizon update failed", "error", err)
 		}
 	}
+	done := make(chan struct{})
 	go func() {
+		defer close(done)
 		tick() // apply once immediately rather than waiting a full interval
 		t := time.NewTicker(interval)
 		defer t.Stop()
@@ -1313,6 +1409,7 @@ func startWALRetentionUpdater(ctx context.Context, db *executor.DB, archiveDir s
 			}
 		}
 	}()
+	return func() { <-done }
 }
 
 // diskWatermarkTick reads free space on the volume holding dataDir and
@@ -1349,9 +1446,9 @@ func diskWatermarkTick(db *executor.DB, dataDir string, warnPercent, rejectPerce
 
 // startDiskWatermarkMonitor periodically calls diskWatermarkTick until ctx is
 // canceled. A no-op unless checkMS > 0 (the feature defaults off).
-func startDiskWatermarkMonitor(ctx context.Context, db *executor.DB, dataDir string, checkMS int, warnPercent, rejectPercent float64, log *slog.Logger) {
+func startDiskWatermarkMonitor(ctx context.Context, db *executor.DB, dataDir string, checkMS int, warnPercent, rejectPercent float64, log *slog.Logger) func() {
 	if db == nil || dataDir == "" || checkMS <= 0 {
-		return
+		return func() {}
 	}
 	interval := time.Duration(checkMS) * time.Millisecond
 	tick := func() {
@@ -1359,7 +1456,9 @@ func startDiskWatermarkMonitor(ctx context.Context, db *executor.DB, dataDir str
 			log.Warn("disk watermark: check failed", "error", err)
 		}
 	}
+	done := make(chan struct{})
 	go func() {
+		defer close(done)
 		tick() // apply once immediately rather than waiting a full interval
 		t := time.NewTicker(interval)
 		defer t.Stop()
@@ -1372,6 +1471,7 @@ func startDiskWatermarkMonitor(ctx context.Context, db *executor.DB, dataDir str
 			}
 		}
 	}()
+	return func() { <-done }
 }
 
 // replicaLagTick reads this node's current replication apply backlog
@@ -1415,9 +1515,9 @@ func replicaLagEdge(wasWarned bool, backlog, warnEntries uint64) (nowWarned, log
 // warnEntries, and a recovery line when it drops back below. A no-op
 // unless checkMS > 0 (the feature defaults off); also effectively idle on
 // a single-node deployment, where replicaLagTick reports attached=false.
-func startReplicaLagMonitor(ctx context.Context, db *executor.DB, checkMS int, warnEntries uint64, log *slog.Logger) {
+func startReplicaLagMonitor(ctx context.Context, db *executor.DB, checkMS int, warnEntries uint64, log *slog.Logger) func() {
 	if db == nil || checkMS <= 0 {
-		return
+		return func() {}
 	}
 	interval := time.Duration(checkMS) * time.Millisecond
 	warned := false
@@ -1436,7 +1536,9 @@ func startReplicaLagMonitor(ctx context.Context, db *executor.DB, checkMS int, w
 			log.Info("replica lag: apply backlog recovered below warn threshold", "apply_backlog", backlog, "warn_entries", warnEntries)
 		}
 	}
+	done := make(chan struct{})
 	go func() {
+		defer close(done)
 		tick() // apply once immediately rather than waiting a full interval
 		t := time.NewTicker(interval)
 		defer t.Stop()
@@ -1449,6 +1551,7 @@ func startReplicaLagMonitor(ctx context.Context, db *executor.DB, checkMS int, w
 			}
 		}
 	}()
+	return func() { <-done }
 }
 
 func openKeys(keyFile, keystore string) (crypto.KeyProvider, *crypto.Envelope, error) {

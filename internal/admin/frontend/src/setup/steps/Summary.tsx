@@ -29,6 +29,16 @@ export function Summary({
             <DescriptionDetails>{params.keyFile} ({keyFileAction})</DescriptionDetails>
           </DescriptionItem>
           <DescriptionItem>
+            <DescriptionTerm>Recovery keys</DescriptionTerm>
+            <DescriptionDetails>
+              {params.recoveryKeyOut
+                ? `Will be exported to ${params.recoveryKeyOut} and ${params.instanceRecoveryKeyOut || params.recoveryKeyOut + ".instance"} — save offline immediately`
+                : params.skipInit
+                  ? "Not now — no keystore exists until the database is initialized; export one then with `nextsql key add-recovery`"
+                  : "None (single unlock path; root unlock key is a single point of failure)"}
+            </DescriptionDetails>
+          </DescriptionItem>
+          <DescriptionItem>
             <DescriptionTerm>Configuration file</DescriptionTerm>
             <DescriptionDetails>{params.configOut || "(default: inside the data directory)"}</DescriptionDetails>
           </DescriptionItem>
@@ -52,8 +62,12 @@ export function Summary({
                 <DescriptionDetails>{params.adminUser || "(none — add one later with `nextsql init`'s user tools)"}</DescriptionDetails>
               </DescriptionItem>
               <DescriptionItem>
-                <DescriptionTerm>Realm / database</DescriptionTerm>
-                <DescriptionDetails>{params.realm} / {params.database}</DescriptionDetails>
+                <DescriptionTerm>Database</DescriptionTerm>
+                <DescriptionDetails>
+                  {params.database
+                    ? `Will be created as "${params.database}"`
+                    : "None — the deployment is initialized without one; create it later with `nextsql init --database NAME`"}
+                </DescriptionDetails>
               </DescriptionItem>
             </>
           )}
@@ -69,8 +83,9 @@ export function Summary({
           ) : null}
         </DescriptionList>
         <Alert variant="warning" style={{ marginTop: 20 }}>
-          Write down the unlock key file path above. It is required every time the server starts
-          and is never uploaded or recoverable by NextSQL if lost.
+          {params.recoveryKeyOut
+            ? "Write down the unlock key path and save both recovery key files offline immediately after installation. Losing both keys means total, unrecoverable data loss."
+            : "Write down the unlock key file path above. Without recovery keys, it is the only way to unlock this database and is never uploaded or recoverable if lost."}
         </Alert>
         <div className="nsi-actions">
           <Button variant="outline" onClick={onBack}>Back</Button>

@@ -17,6 +17,7 @@ package authbroker
 import (
 	"bufio"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -42,19 +43,25 @@ type IdPProfile struct {
 	JWKSHardTTL         time.Duration
 	GroupClaim          string // informational; the NSIP policy owns the real group claim
 	Skew                time.Duration
+	IntrospectionURI    string        // RFC 7662 introspection endpoint (must be https://)
+	ClientSecretFile    string        // path to mode 0600 file holding client secret
+	IntrospectionTTL    time.Duration // cache TTL for introspection results
 }
 
 // Config is the parsed broker configuration.
 type Config struct {
-	Listen             string
-	TLSCert            string
-	TLSKey             string
-	IdentityPolicy     string
-	IssuingKeyset      string
-	DeploymentAudience string
-	CredentialTTL      time.Duration
-	LogLevel           string
-	Profiles           []IdPProfile
+	Listen              string
+	TLSCert             string
+	TLSKey              string
+	IdentityPolicy      string
+	IssuingKeyset       string
+	DeploymentAudience  string
+	CredentialTTL       time.Duration
+	LogLevel            string
+	JITProvisioning     bool
+	AllowedRoleBoundary []string
+	MaxPrincipals       int
+	Profiles            []IdPProfile
 }
 
 // Default returns a config with only the non-file defaults populated.
@@ -63,6 +70,7 @@ func Default() Config {
 		Listen:        "127.0.0.1:8645",
 		CredentialTTL: DefaultCredentialTTL,
 		LogLevel:      "info",
+		MaxPrincipals: 1000,
 	}
 }
 
@@ -163,6 +171,28 @@ func applyGlobal(cfg *Config, k, v string) error {
 			return nerr.New(nerr.InvalidArgument, "authbroker.LoadConfig", "oidc_credential_ttl must be a positive duration")
 		}
 		cfg.CredentialTTL = d
+	case "jit_provisioning":
+		switch strings.ToLower(v) {
+		case "1", "true", "yes", "on":
+			cfg.JITProvisioning = true
+		case "0", "false", "no", "off":
+			cfg.JITProvisioning = false
+		default:
+			return nerr.New(nerr.InvalidArgument, "authbroker.LoadConfig", "jit_provisioning must be boolean")
+		}
+	case "allowed_role_boundary":
+		cfg.AllowedRoleBoundary = nil
+		for _, r := range strings.Split(v, ",") {
+			if r = strings.TrimSpace(r); r != "" {
+				cfg.AllowedRoleBoundary = append(cfg.AllowedRoleBoundary, r)
+			}
+		}
+	case "max_principals":
+		n, err := strconv.Atoi(v)
+		if err != nil || n <= 0 {
+			return nerr.New(nerr.InvalidArgument, "authbroker.LoadConfig", "max_principals must be a positive integer")
+		}
+		cfg.MaxPrincipals = n
 	default:
 		return nerr.New(nerr.InvalidArgument, "authbroker.LoadConfig", "unknown global key")
 	}
@@ -206,6 +236,16 @@ func applyProfile(p *IdPProfile, k, v string) error {
 			return nerr.New(nerr.InvalidArgument, "authbroker.LoadConfig", "skew must be a positive duration")
 		}
 		p.Skew = d
+	case "introspection_uri", "introspection_endpoint":
+		p.IntrospectionURI = v
+	case "client_secret_file":
+		p.ClientSecretFile = v
+	case "introspection_ttl":
+		d, err := time.ParseDuration(v)
+		if err != nil || d <= 0 {
+			return nerr.New(nerr.InvalidArgument, "authbroker.LoadConfig", "introspection_ttl must be a positive duration")
+		}
+		p.IntrospectionTTL = d
 	default:
 		return nerr.New(nerr.InvalidArgument, "authbroker.LoadConfig", "unknown idp key")
 	}
@@ -235,6 +275,9 @@ func (c Config) Validate() error {
 	if c.CredentialTTL <= 0 || c.CredentialTTL > MaxCredentialTTL {
 		return bad("oidc_credential_ttl must be within (0, 12h]")
 	}
+	if c.MaxPrincipals < 0 {
+		return bad("max_principals cannot be negative")
+	}
 	switch strings.ToLower(c.LogLevel) {
 	case "", "debug", "info", "warn", "error":
 	default:
@@ -255,6 +298,9 @@ func (c Config) Validate() error {
 		}
 		if p.JWKSURI != "" && !strings.HasPrefix(p.JWKSURI, "https://") {
 			return bad("idp jwks_uri must be an https URL")
+		}
+		if p.IntrospectionURI != "" && !strings.HasPrefix(p.IntrospectionURI, "https://") {
+			return bad("idp introspection_uri must be an https URL")
 		}
 		for _, a := range p.AllowedAlgs {
 			if !oidc.AlgIsAsymmetric(a) {

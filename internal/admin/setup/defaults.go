@@ -11,8 +11,8 @@ import (
 // every value is re-validated (and, for capacity/permissions, re-detected)
 // by the /api/v1/plan dry-run once the operator confirms or edits them.
 type Defaults struct {
-	DataDir  string `json:"dataDir"`
-	KeyFile  string `json:"keyFile"`
+	DataDir string `json:"dataDir"`
+	KeyFile string `json:"keyFile"`
 	// ConfigOut is the suggested `nextsql setup --config-out` path. It is
 	// deliberately *not* DataDir/nextsql.conf (nextsql setup's own default
 	// when --config-out is omitted): the tarball/.deb/.run installers keep
@@ -25,9 +25,10 @@ type Defaults struct {
 	// expects it, so "start automatically at boot" (service.go) can find a
 	// matching config and actually offer to enable it instead of refusing
 	// with "points at a different configuration" every time.
-	ConfigOut string `json:"configOut"`
-	Elevated  bool   `json:"elevated"` // running as root/Administrator
-	OS        string `json:"os"`
+	ConfigOut      string `json:"configOut"`
+	RecoveryKeyOut string `json:"recoveryKeyOut"`
+	Elevated       bool   `json:"elevated"` // running as root/Administrator
+	OS             string `json:"os"`
 }
 
 // DefaultDataDir is detectDefaults().DataDir, exported so the parent
@@ -53,12 +54,14 @@ func detectDefaults() Defaults {
 		}
 		d.DataDir = filepath.Join(base, "NextSQL", "data")
 		d.KeyFile = filepath.Join(base, "NextSQL", "root.key")
+		d.RecoveryKeyOut = filepath.Join(base, "NextSQL", "recovery.key")
 		d.ConfigOut = filepath.Join(base, "NextSQL", "nextsql.conf")
 	default:
 		if os.Geteuid() == 0 {
 			d.Elevated = true
 			d.DataDir = "/var/lib/nextsql"
 			d.KeyFile = "/etc/nextsql/root.key"
+			d.RecoveryKeyOut = "/etc/nextsql/recovery.key"
 			d.ConfigOut = "/etc/nextsql/nextsql.conf"
 			return d
 		}
@@ -73,6 +76,7 @@ func detectDefaults() Defaults {
 		}
 		d.DataDir = filepath.Join(dataHome, "nextsql")
 		d.KeyFile = filepath.Join(configHome, "nextsql", "root.key")
+		d.RecoveryKeyOut = filepath.Join(configHome, "nextsql", "recovery.key")
 		d.ConfigOut = filepath.Join(configHome, "nextsql", "nextsql.conf")
 	}
 	return d

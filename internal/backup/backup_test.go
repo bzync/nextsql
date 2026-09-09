@@ -338,7 +338,7 @@ func TestEncryptedClientPITRRestoresExactCiphertextAtTarget(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Session().Exec(`CREATE TABLE accounts (id STRING PRIMARY KEY, secret TEXT ENCRYPTED CLIENT NOT NULL)`); err != nil {
+	if _, err := db.Session().Exec(`CREATE TABLE accounts (id STRING PRIMARY KEY, secret TEXT ENCRYPTED CLIENT NOT NULL, email TEXT ENCRYPTED CLIENT DETERMINISTIC NOT NULL)`); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.Close(); err != nil {
@@ -369,7 +369,11 @@ func TestEncryptedClientPITRRestoresExactCiphertextAtTarget(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Session().ExecContext(context.Background(), `INSERT INTO accounts (id, secret) VALUES ('1', $1)`, []executor.Param{{Value: types.StringValue(atTarget)}}); err != nil {
+	deterministicAtTarget, err := clientenc.EncryptDeterministic(context.Background(), provider, "app", "accounts", "email", types.TextValue("person@example.com"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Session().ExecContext(context.Background(), `INSERT INTO accounts (id, secret, email) VALUES ('1', $1, $2)`, []executor.Param{{Value: types.StringValue(atTarget)}, {Value: types.StringValue(deterministicAtTarget)}}); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.Eng.Checkpoint(); err != nil {
@@ -384,7 +388,11 @@ func TestEncryptedClientPITRRestoresExactCiphertextAtTarget(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Session().ExecContext(context.Background(), `UPDATE accounts SET secret = $1 WHERE id = '1'`, []executor.Param{{Value: types.StringValue(afterTarget)}}); err != nil {
+	deterministicAfterTarget, err := clientenc.EncryptDeterministic(context.Background(), provider, "app", "accounts", "email", types.TextValue("later@example.com"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Session().ExecContext(context.Background(), `UPDATE accounts SET secret = $1, email = $2 WHERE id = '1'`, []executor.Param{{Value: types.StringValue(afterTarget)}, {Value: types.StringValue(deterministicAfterTarget)}}); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.Eng.Checkpoint(); err != nil {
@@ -406,20 +414,27 @@ func TestEncryptedClientPITRRestoresExactCiphertextAtTarget(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer restored.Close()
-	meta, err := restored.Session().Exec(`SELECT type FROM system.columns WHERE table_name = 'accounts' AND column_name = 'secret'`)
-	if err != nil || len(meta.Rows) != 1 || meta.Rows[0][0].Str != "TEXT ENCRYPTED CLIENT" {
+	meta, err := restored.Session().Exec(`SELECT type FROM system.columns WHERE table_name = 'accounts' AND (column_name = 'email' OR column_name = 'secret') ORDER BY column_name`)
+	if err != nil {
+		t.Fatalf("PITR client-encrypted catalog metadata: %v", err)
+	}
+	if len(meta.Rows) != 2 || meta.Rows[0][0].Str != "TEXT ENCRYPTED CLIENT DETERMINISTIC" || meta.Rows[1][0].Str != "TEXT ENCRYPTED CLIENT" {
 		t.Fatalf("PITR client-encrypted catalog metadata: rows=%+v err=%v", meta.Rows, err)
 	}
-	res, err := restored.Session().Exec(`SELECT secret FROM accounts WHERE id = '1'`)
+	res, err := restored.Session().Exec(`SELECT secret, email FROM accounts WHERE id = '1'`)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(res.Rows) != 1 || res.Rows[0][0].Str != atTarget || res.Rows[0][0].Str == afterTarget {
+	if len(res.Rows) != 1 || res.Rows[0][0].Str != atTarget || res.Rows[0][0].Str == afterTarget || res.Rows[0][1].Str != deterministicAtTarget || res.Rows[0][1].Str == deterministicAfterTarget {
 		t.Fatalf("PITR ciphertext at target: rows=%+v", res.Rows)
 	}
 	plain, err := clientenc.Decrypt(context.Background(), provider, "app", "accounts", "secret", res.Rows[0][0].Str)
 	if err != nil || plain.Typ.Kind != types.KindText || plain.Str != "secret-at-target" {
 		t.Fatalf("PITR decrypt: value=%+v err=%v", plain, err)
+	}
+	deterministicPlain, err := clientenc.DecryptDeterministic(context.Background(), provider, "app", "accounts", "email", res.Rows[0][1].Str)
+	if err != nil || deterministicPlain.Typ.Kind != types.KindText || deterministicPlain.Str != "person@example.com" {
+		t.Fatalf("PITR deterministic decrypt: value=%+v err=%v", deterministicPlain, err)
 	}
 }
 

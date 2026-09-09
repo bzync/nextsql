@@ -1,7 +1,8 @@
 # Client-encrypted fields
 
-Status: **experimental P25 increment**. The SQL/catalog/server path and helpers
-for Go, Node.js/TypeScript, Bun, and PHP are implemented. PITR and
+Status: **production-gated, explicit opt-in**. Randomized `NSCE1` and
+deterministic `NSCE2` SQL/catalog/server paths and helpers for Go,
+Node.js/TypeScript, Bun, and PHP are implemented. PITR and
 replication/failover are tested (exact-ciphertext restore-to-target-LSN; no
 lost acknowledged ciphertext across leader failover). Every official driver
 also ships a durable, atomic, file-backed keyring (`FileFieldKeyring`) so
@@ -13,7 +14,8 @@ revocation, and recovery" below.
 ```sql
 CREATE TABLE accounts (
     id UUID PRIMARY KEY,
-    ssn STRING ENCRYPTED CLIENT
+    ssn STRING ENCRYPTED CLIENT,
+    email TEXT ENCRYPTED CLIENT DETERMINISTIC
 );
 ```
 
@@ -30,17 +32,27 @@ length-prefixed shape `STRING`/`BLOB`/`DECIMAL` use), so any official driver
 can decrypt a field another driver encrypted. Plaintext is capped at 1 MiB.
 SQL `NULL` remains SQL `NULL` and is not wrapped.
 
-Only opaque storage, bare-column projection/`RETURNING`, NULL, parameters, and
-direct ciphertext copies are allowed. Client-encrypted columns cannot be used
-in predicates, joins, expressions, defaults, primary/foreign/partition keys,
-indexes or `INCLUDE`, `SEARCH`, `FACET`, grouping, ordering, `DISTINCT`, or set
-operations. Table/column rename, partition attach/detach, and legacy-tenant
-migration fail closed because they would change the authenticated context.
+Randomized columns allow only opaque storage, bare-column projection/
+`RETURNING`, NULL, parameters, and direct ciphertext copies. They cannot be
+used in predicates or indexes.
 
-There is no deterministic or searchable mode. Two encryptions of the same
-value produce different ciphertexts. NextSQL will document and separately gate
-any future searchable-encryption mode because equality or search tokens leak
-information.
+`DETERMINISTIC` is an explicit per-column mode. It permits only `=` / `<>` /
+`!=` against a client-encrypted parameter, `IS NULL`, and a direct ordinary
+B-tree or `UNIQUE` index. Plaintext literals, ranges, expressions, `INCLUDE`,
+joins, `SEARCH`, `FACET`, grouping, ordering, `DISTINCT`, set operations, and
+special/expression/path indexes fail closed. Primary, foreign, and partition
+keys remain forbidden. The parameter must be produced for the exact column:
+
+```sql
+CREATE INDEX accounts_email_eq ON accounts (email);
+SELECT id FROM accounts WHERE email = $1; -- $1 is an NSCE2 value
+```
+
+Table/column rename, partition attach/detach, and legacy-tenant migration fail
+closed because they would change the authenticated context. `NSCE2` is equality
+search, not general searchable encryption: it deliberately leaks repeated-value
+equality and frequency within one key-id and exact database/table/column
+context. It supports no substring, range, full-text, vector, or token search.
 
 ## `NSCE1` ciphertext
 
@@ -63,6 +75,28 @@ does not authenticate. The server validates only the bounded structure and
 logical type before persistence; only a client holding the key can
 authenticate it. Wrong keys, revoked key ids, context changes, truncation, and
 tampering fail closed without returning partial plaintext.
+
+## `NSCE2` deterministic ciphertext
+
+The portable value is ASCII `NSCE2.` followed by unpadded base64url of:
+
+```text
+version u8 (=2)
+suite u8 (=2, RFC 5297 AES-SIV)
+key-id length u8 (1..64)
+key id bytes ([A-Za-z0-9._-])
+logical type kind u8 + precision u16le + scale u16le + vector tag u8
+synthetic IV / authentication tag [16]byte
+CTR ciphertext
+```
+
+The 32-byte SIV key is derived from the field key with HKDF-SHA256 and info
+`NextSQL NSCE2 AES-SIV v2`, separating it from `NSCE1` AES-GCM use. RFC 5297
+S2V authenticates the length-delimited exact database/table/column context,
+the public header, and the canonical plaintext encoding before AES-CTR. A
+mode mismatch, wrong context/key, truncation, or tampering fails closed.
+Determinism applies only while all of key id, key material, context, logical
+type, and plaintext match. Rotation intentionally changes equality classes.
 
 The server can still observe ciphertext length, public key id and logical type,
 database/table/column names, row existence, NULLness, access patterns, and
@@ -98,6 +132,11 @@ _, err = conn.Exec(ctx,
 // After selecting the opaque ssn value into sealedResult:
 plain, err := conn.DecryptField(ctx, "accounts", "ssn",
     types.String(), sealedResult)
+
+emailToken, err := conn.EncryptFieldDeterministic(ctx, "accounts", "email",
+    types.TextValue("person@example.com"))
+rows, err := conn.Exec(ctx,
+    "SELECT id FROM accounts WHERE email = $1", emailToken)
 ```
 
 Do not log keys or put them in a URL. The application must back up field keys
@@ -125,6 +164,13 @@ await conn.exec('INSERT INTO accounts (id, ssn) VALUES ($1, $2)', [id, sealed]);
 
 const plain = await conn.decryptField(
   'accounts', 'ssn', FieldType.String, sealedResult,
+);
+
+const emailToken = await conn.encryptFieldDeterministic(
+  'accounts', 'email', FieldType.Text, 'person@example.com',
+);
+const match = await conn.exec(
+  'SELECT id FROM accounts WHERE email = $1', [emailToken],
 );
 ```
 
@@ -156,9 +202,17 @@ $conn->exec('INSERT INTO accounts (id, ssn) VALUES ($1, $2)', [$id, $sealed]);
 $plain = $conn->decryptField(
     'accounts', 'ssn', NextSQL\FieldType::string(), $sealedResult
 );
+
+$emailToken = $conn->encryptFieldDeterministic(
+    'accounts', 'email', NextSQL\FieldType::text(), 'person@example.com'
+);
+$match = $conn->exec(
+    'SELECT id FROM accounts WHERE email = $1', [$emailToken]
+);
 ```
 
-The PHP implementation uses OpenSSL AES-256-GCM. Cross-driver fixtures verify
+The PHP implementation uses OpenSSL AES-256-GCM and RFC 5297 AES-SIV with
+HKDF-SHA256 domain separation. Cross-driver fixtures verify
 that Go-produced ciphertext decrypts in Node.js, Bun, and PHP, and that
 Node.js-produced ciphertext decrypts in Go.
 
@@ -239,14 +293,15 @@ of) the database using the operator's normal file-backup process, since it is
 never sent to `nextsqld`. Restoring or migrating under different names
 requires client-side decrypt/re-encrypt. Physical backup/restore and logical
 export/import under the same authenticated names are covered, as are PITR
-(restore to a target LSN preserves the exact pre-target ciphertext and
+(restore to a target LSN preserves the exact pre-target `NSCE1` and `NSCE2`
+ciphertext and
 excludes later archived writes) and HA/failover (no lost acknowledged
 ciphertext across a three-voter leader failover, correct post-failover
 replication and decrypt).
 
-### Production-gating sign-off (Phase 25)
+### Production-gating sign-off
 
-**2026-09-02.** Every item-level blocker for `ENCRYPTED CLIENT` field-level
+**2026-09-02 (randomized); 2026-09-09 (deterministic extension).** Every item-level blocker for `ENCRYPTED CLIENT` field-level
 encryption is closed: the SQL/catalog/server surface, official-driver
 encrypt/decrypt helpers, server-opaque storage, wrong-key/tamper behavior,
 and backup/restore/PITR/replication/failover were already tested (see
@@ -260,7 +315,9 @@ interop are all covered by automated tests (`drivers/go/nextsql_test.go`,
 `drivers/php/tests/unit.php`). The
 phase-wide P25 exit gate (`docs/security.md` "P25 security review sign-off")
 closed the same day once password hashing and audit hardening also landed, so
-`ENCRYPTED CLIENT` is now formally production-gated — still `experimental`
-in `system.capabilities` because no searchable/deterministic mode ships (see
-"Searchable encryption" above), not because of any open correctness,
-durability, or key-lifecycle blocker.
+`ENCRYPTED CLIENT` is formally production-gated. The deterministic extension
+adds a versioned `NSCE2` envelope, explicit `DETERMINISTIC` DDL, equality-only
+binder/index rules, HKDF-separated RFC 5297 AES-SIV implementations and
+cross-driver fixtures, rotation/revocation tests, envelope fuzz coverage, and
+combined `NSCE1`/`NSCE2` PITR and three-voter failover coverage. The capability
+is `supported`; broader searchable encryption remains out of scope.

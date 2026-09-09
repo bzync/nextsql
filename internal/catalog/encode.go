@@ -14,7 +14,7 @@ import (
 
 const (
 	tableMagic      = "NSCT"
-	tableVersion    = 12
+	tableVersion    = 13
 	tableVersionV1  = 1
 	tableVersionV2  = 2
 	tableVersionV3  = 3
@@ -27,6 +27,7 @@ const (
 	tableVersionV10 = 10
 	tableVersionV11 = 11
 	tableVersionV12 = 12
+	tableVersionV13 = 13
 	// KeyTable prefixes durable table descriptors in the catalog tree.
 	KeyTable byte = 'T'
 	// KeyStats prefixes durable table statistics in the catalog tree.
@@ -191,6 +192,12 @@ func EncodeTable(t *Table) ([]byte, error) {
 		buf = append(buf, 1)
 		buf = appendTypeRec(buf, col.Type)
 	}
+	// v13: one explicit client-encryption mode per column. Zero preserves the
+	// randomized NSCE1 contract for old and new encrypted columns. A non-zero
+	// mode is valid only when the v10 client-encryption flag is present.
+	for _, col := range t.Columns {
+		buf = append(buf, col.ClientEncryptionMode)
+	}
 	return buf, nil
 }
 
@@ -330,7 +337,10 @@ func takeTypeRec(raw []byte, off, depth int) (types.Type, int, error) {
 
 func validClientColumn(c Column) bool {
 	if !c.ClientEncrypted() {
-		return c.ClientType.Equals(types.Type{})
+		return c.ClientType.Equals(types.Type{}) && c.ClientEncryptionMode == ClientEncryptionRandomized
+	}
+	if c.ClientEncryptionMode != ClientEncryptionRandomized && c.ClientEncryptionMode != ClientEncryptionDeterministic {
+		return false
 	}
 	if c.Type.Kind != types.KindString || c.Type.Precision != 0 || c.Type.Scale != 0 || c.Type.VecElem != 0 {
 		return false
@@ -365,9 +375,17 @@ func validateClientTable(t *Table) error {
 			}
 		}
 		for _, idx := range t.Indexes {
-			for _, c := range append(append([]int(nil), idx.Columns...), idx.Include...) {
+			for keyPos, c := range idx.Columns {
 				if c == ord {
-					return nerr.New(nerr.InvalidArgument, "catalog.clientenc", "ENCRYPTED CLIENT column cannot be indexed")
+					direct := keyPos >= len(idx.Exprs) || idx.Exprs[keyPos] == nil
+					if col.ClientEncryptionMode != ClientEncryptionDeterministic || !direct || idx.Spatial || idx.Fulltext || idx.Vector || len(idx.Path) != 0 {
+						return nerr.New(nerr.InvalidArgument, "catalog.clientenc", "only a plain btree key may index a deterministic ENCRYPTED CLIENT column")
+					}
+				}
+			}
+			for _, c := range idx.Include {
+				if c == ord {
+					return nerr.New(nerr.InvalidArgument, "catalog.clientenc", "ENCRYPTED CLIENT column cannot be included in an index")
 				}
 			}
 			if ExprUsesIdent(idx.Predicate, col.Name) {
@@ -711,6 +729,21 @@ func DecodeTable(raw []byte) (*Table, error) {
 			default:
 				return nil, nerr.New(nerr.InvalidFormat, "catalog.DecodeTable", "unknown collection descriptor flag")
 			}
+		}
+	}
+	if ver >= tableVersionV13 {
+		for i := range t.Columns {
+			if off >= len(raw) {
+				return nil, nerr.New(nerr.InvalidFormat, "catalog.DecodeTable", "truncated client-encryption mode")
+			}
+			t.Columns[i].ClientEncryptionMode = raw[off]
+			off++
+			if !validClientColumn(t.Columns[i]) {
+				return nil, nerr.New(nerr.InvalidFormat, "catalog.DecodeTable", "invalid client-encryption mode")
+			}
+		}
+		if err := validateClientTable(t); err != nil {
+			return nil, nerr.Wrap(nerr.InvalidFormat, "catalog.DecodeTable", "invalid ENCRYPTED CLIENT table", err)
 		}
 	}
 	if off != len(raw) {

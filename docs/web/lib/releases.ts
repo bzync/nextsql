@@ -7,8 +7,9 @@ import { type Catalog, type Release, compareVersions } from "@/lib/release-model
 export * from "@/lib/release-model";
 
 const DATA_DIR = path.join(process.cwd(), "data");
-const CATALOG_PATH = path.join(DATA_DIR, "releases.json");
-export const DOWNLOADS_DIR = path.join(process.cwd(), "public", "downloads");
+const CATALOG_PATH = process.env.NEXTSQL_RELEASE_CATALOG
+  ? path.resolve(process.cwd(), process.env.NEXTSQL_RELEASE_CATALOG)
+  : path.join(DATA_DIR, "releases.json");
 
 async function emptyCatalog(): Promise<Catalog> {
   return { releases: [] };

@@ -53,6 +53,12 @@ module NextSQL
     AUTH_PASSWORD = 1
     AUTH_PASSWORD_KEY = 2
     FLAG_CANCEL = 1
+    # FLAG_PUBLIC_ERROR_CODES asks the server for the stable ERR_* error
+    # taxonomy (docs/error-codes.md). A server that does not implement it
+    # ignores the bit and keeps the NSQL v1 error shape, which decode_error
+    # still reads, so setting it is safe against any server version. The server
+    # echoes it in the hello-ok flags when it was accepted.
+    FLAG_PUBLIC_ERROR_CODES = 2
     FLAG_NULL = 0x01
 
     KIND_UUID = 1
@@ -313,9 +319,16 @@ module NextSQL
     end
 
     def decode_hello_ok(b)
-      raise ProtocolError, "bad hello-ok length" unless b.bytesize == 11
+      raise ProtocolError, "bad hello-ok length" unless [11, 13].include?(b.bytesize)
 
-      [u16(b, 0), b.getbyte(2), b.byteslice(3, 8)]
+      flags = 0
+      if b.bytesize == 13
+        flags = u16(b, 11)
+        # The server omits the field when it accepted no capability, so a
+        # present-but-zero field is a second encoding of the v1 hello-ok.
+        raise ProtocolError, "empty hello-ok flags" if flags.zero?
+      end
+      [u16(b, 0), b.getbyte(2), b.byteslice(3, 8), flags]
     end
 
     def encode_query(sql, params)
@@ -946,8 +959,16 @@ module NextSQL
 
     def decode_error(b)
       code, off = read_u16_string(b, 0, MAX_NAME)
-      msg, = read_u16_string(b, off, MAX_NAME)
-      Error.new(code, msg)
+      msg, off = read_u16_string(b, off, MAX_NAME)
+      # Optional trailing field, present only from a server that accepted
+      # FLAG_PUBLIC_ERROR_CODES. Its absence is normal -- an older server
+      # ignores the request bit -- so this must never be required.
+      public_code = ""
+      if off < b.bytesize
+        public_code, = read_u16_string(b, off, MAX_NAME)
+        raise ProtocolError, "empty public error code" if public_code.empty?
+      end
+      Error.new(code, msg, public_code)
     end
 
     def encode_set_read_consistency(mode, max_staleness_ms)

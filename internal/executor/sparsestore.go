@@ -2,6 +2,7 @@ package executor
 
 import (
 	"bytes"
+	"sort"
 
 	"github.com/bzync/nextsql/internal/catalog"
 	"github.com/bzync/nextsql/internal/nerr"
@@ -446,15 +447,27 @@ func (s *Session) nearestSparseFlat(n planner.Nearest, q nsvec.SparseVec, metric
 				return nil
 			})
 		}
-		if tab.VecMeta == 0 {
-			return nil, nil
-		}
-		vs, err := s.vecOf(tab)
-		if err != nil {
-			return nil, err
-		}
-		if err := scan(vs); err != nil {
-			return nil, err
+		if tab.Partitioning != nil {
+			for _, part := range partitionSelection(tab, n.Partitions) {
+				vs, err := s.partitionVec(tab, part.ID)
+				if err != nil {
+					return nil, err
+				}
+				if err := scan(vs); err != nil {
+					return nil, err
+				}
+			}
+		} else {
+			if tab.VecMeta == 0 {
+				return nil, nil
+			}
+			vs, err := s.vecOf(tab)
+			if err != nil {
+				return nil, err
+			}
+			if err := scan(vs); err != nil {
+				return nil, err
+			}
 		}
 	}
 	k := int(n.K)
@@ -478,17 +491,263 @@ func (s *Session) nearestSparseFlat(n planner.Nearest, q nsvec.SparseVec, metric
 		}
 		return out, nil
 	}
-	heap, err := s.heapOf(tab)
-	if err != nil {
-		return nil, err
+	var htxs []*btree.Txn
+	if tab.Partitioning != nil {
+		for _, part := range partitionSelection(tab, n.Partitions) {
+			heap, err := s.partitionHeap(tab, part.ID)
+			if err != nil {
+				return nil, err
+			}
+			htxs = append(htxs, s.x.use(heap))
+		}
+	} else {
+		heap, err := s.heapOf(tab)
+		if err != nil {
+			return nil, err
+		}
+		htxs = append(htxs, s.x.use(heap))
 	}
-	htx := s.x.use(heap)
 	var out [][]types.Value
 	for _, h := range hits {
 		if err := s.budget().Check(); err != nil {
 			return nil, err
 		}
-		rowv, err := s.fetchPKRow(htx, tab, h.PK)
+		var rowv []types.Value
+		var err error
+		for _, htx := range htxs {
+			rowv, err = s.fetchPKRow(htx, tab, h.PK)
+			if err != nil {
+				return nil, err
+			}
+			if rowv != nil {
+				break
+			}
+		}
+		if rowv == nil {
+			continue
+		}
+		ok, err := s.match(n.Residual, tab, rowv)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			continue
+		}
+		out = append(out, rowv)
+		if n.K > 0 && int64(len(out)) >= n.K {
+			break
+		}
+	}
+	return out, nil
+}
+
+// sparseStoreOfPartition binds the SPARSE store for one partition-local vector index.
+func (s *Session) sparseStoreOfPartition(tab *catalog.Table, part catalog.Partition, idx catalog.Index) (*sqlSparse, error) {
+	if len(idx.Columns) != 1 {
+		return nil, nerr.New(nerr.Internal, "executor.sparseStoreOfPartition", "VECTOR INDEX column count")
+	}
+	ix, err := s.partitionIndex(tab, part.ID, idx)
+	if err != nil {
+		return nil, err
+	}
+	vs, err := s.partitionVec(tab, part.ID)
+	if err != nil {
+		return nil, err
+	}
+	st := &sqlSparse{itx: s.x.use(ix), vtx: s.x.use(vs), col: uint16(idx.Columns[0])}
+	if snap, ok, err := s.fkWriteSnap(); err != nil {
+		return nil, err
+	} else if ok {
+		st.snap = snap
+		st.useSnap = true
+	}
+	return st, nil
+}
+
+// buildPartitionSparseIndex writes the inverted index for one partition's SPARSEVECTOR column
+// into the detached partition index tree.
+func (s *Session) buildPartitionSparseIndex(tab *catalog.Table, idx catalog.Index, part catalog.Partition, htx *btree.Txn, progress *rebuildProgress) error {
+	if len(idx.Columns) != 1 {
+		return nerr.New(nerr.InvalidArgument, "executor.buildPartitionSparseIndex", "VECTOR INDEX column count")
+	}
+	col := idx.Columns[0]
+	dim := uint32(tab.Columns[col].Type.Precision)
+	metric := nsvec.MetricCosine
+
+	st, err := s.sparseStoreOfPartition(tab, part, idx)
+	if err != nil {
+		return err
+	}
+	meta := nsvec.DefaultSparseMeta(dim, metric)
+	if err := st.SaveSparseMeta(meta); err != nil {
+		return err
+	}
+	if err := htx.Range(nil, nil, func(_, val []byte) error {
+		if err := s.budget().Check(); err != nil {
+			return err
+		}
+		r, err := s.decodeHeapRow(tab, val)
+		if err != nil {
+			return err
+		}
+		v := r[col]
+		if v.Null {
+			if progress != nil {
+				progress.add(1, 0)
+			}
+			return nil
+		}
+		pk, err := types.EncodeKey(tab.PKValues(r))
+		if err != nil {
+			return err
+		}
+		sv, err := valueSparse(v, dim)
+		if err != nil {
+			return err
+		}
+		if err := nsvec.AddSparse(st, pk, sv); err != nil {
+			return err
+		}
+		if progress != nil {
+			progress.add(1, 1)
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	return nil
+}
+
+// initPartitionSparseIndex persists an empty SPARSE index for a freshly added partition.
+func (s *Session) initPartitionSparseIndex(tab *catalog.Table, idx catalog.Index, part catalog.Partition) error {
+	if len(idx.Columns) != 1 {
+		return nerr.New(nerr.InvalidArgument, "executor.initPartitionSparseIndex", "VECTOR INDEX column count")
+	}
+	col := idx.Columns[0]
+	dim := uint32(tab.Columns[col].Type.Precision)
+	metric := nsvec.MetricCosine
+	st, err := s.sparseStoreOfPartition(tab, part, idx)
+	if err != nil {
+		return err
+	}
+	meta := nsvec.DefaultSparseMeta(dim, metric)
+	return st.SaveSparseMeta(meta)
+}
+
+// maintainPartitionSparseIndex applies one row change to a partition-local SPARSE index.
+func (s *Session) maintainPartitionSparseIndex(tab *catalog.Table, idx catalog.Index, part catalog.Partition, old, neu []types.Value) error {
+	st, err := s.sparseStoreOfPartition(tab, part, idx)
+	if err != nil {
+		return err
+	}
+	col := idx.Columns[0]
+	dim := uint32(tab.Columns[col].Type.Precision)
+	if old != nil && col < len(old) && !old[col].Null {
+		pk, err := types.EncodeKey(tab.PKValues(old))
+		if err != nil {
+			return err
+		}
+		sv, err := valueSparse(old[col], dim)
+		if err != nil {
+			return err
+		}
+		if err := removeSparseCoords(st, pk, sv); err != nil {
+			return err
+		}
+	}
+	if neu != nil && col < len(neu) && !neu[col].Null {
+		pk, err := types.EncodeKey(tab.PKValues(neu))
+		if err != nil {
+			return err
+		}
+		sv, err := valueSparse(neu[col], dim)
+		if err != nil {
+			return err
+		}
+		return addSparseCoords(st, pk, sv)
+	}
+	return nil
+}
+
+// nearestSparseIndexPartitioned answers a NEAREST query across surviving partitions for a SPARSE index.
+func (s *Session) nearestSparseIndexPartitioned(n planner.Nearest, q nsvec.SparseVec, metric nsvec.Metric, tab *catalog.Table, idx catalog.Index) ([][]types.Value, error) {
+	type pstore struct {
+		part catalog.Partition
+		st   *sqlSparse
+	}
+	var stores []pstore
+	var total uint64
+	for _, part := range partitionSelection(tab, n.Partitions) {
+		st, err := s.sparseStoreOfPartition(tab, part, idx)
+		if err != nil {
+			return nil, err
+		}
+		meta, err := st.LoadSparseMeta()
+		if err != nil {
+			if nerr.HasCode(err, nerr.NotFound) {
+				continue
+			}
+			return nil, err
+		}
+		if n.Metric != "" && meta.Metric != metric {
+			return s.nearestSparseFlat(n, q, metric)
+		}
+		if meta.Count == 0 {
+			continue
+		}
+		total += meta.Count
+		stores = append(stores, pstore{part: part, st: st})
+	}
+	if len(stores) == 0 || total == 0 {
+		return nil, nil
+	}
+	k := int(n.K)
+	if k < 1 {
+		k = int(total)
+	}
+	if k < 1 {
+		return nil, nil
+	}
+	if n.Residual != nil && uint64(k) < total {
+		over := k * 4
+		if over < k {
+			over = k
+		}
+		if uint64(over) > total {
+			over = int(total)
+		}
+		k = over
+	}
+	type mergedHit struct {
+		hit nsvec.Hit
+		si  int
+	}
+	var all []mergedHit
+	for si := range stores {
+		hits, err := nsvec.SearchSparse(stores[si].st, q, k, 0, s.workers())
+		if err != nil {
+			return nil, err
+		}
+		for _, h := range hits {
+			all = append(all, mergedHit{hit: h, si: si})
+		}
+	}
+	sort.Slice(all, func(i, j int) bool { return nsvec.LessHit(all[i].hit, all[j].hit) })
+	htxs := make([]*btree.Txn, len(stores))
+	var out [][]types.Value
+	for _, m := range all {
+		if err := s.budget().Check(); err != nil {
+			return nil, err
+		}
+		ps := stores[m.si]
+		if htxs[m.si] == nil {
+			heap, err := s.partitionHeap(tab, ps.part.ID)
+			if err != nil {
+				return nil, err
+			}
+			htxs[m.si] = s.x.use(heap)
+		}
+		rowv, err := s.fetchPKRow(htxs[m.si], tab, m.hit.PK)
 		if err != nil {
 			return nil, err
 		}

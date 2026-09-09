@@ -203,24 +203,36 @@ var connNamePattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
 // and Studio persists no credential of its own. The password is used once to
 // open the new connection and is never stored.
 type ReconnectRequest struct {
-	Realm    string `json:"realm"`
-	Database string `json:"database"`
-	Password string `json:"password"`
+	Realm             string `json:"realm"`
+	Database          string `json:"database"`
+	Password          string `json:"password"`
+	UseStoredPassword bool   `json:"use_stored_password,omitempty"`
+	SavePassword      bool   `json:"save_password,omitempty"`
 }
 
 // Validate bounds and shape-checks a reconnect request before any network
 // I/O. It does not check that the realm/database exist or that the password
 // is correct — nextsqld remains the sole authority over that.
 func (r ReconnectRequest) Validate() error {
-	if r.Password == "" {
-		return nerr.New(nerr.InvalidArgument, "studio.ReconnectRequest", "password is required to switch connection")
+	if r.UseStoredPassword && r.Password != "" {
+		return nerr.New(nerr.InvalidArgument, "studio.ReconnectRequest", "password and use_stored_password are mutually exclusive")
+	}
+	if r.SavePassword && (r.Password == "" || r.UseStoredPassword) {
+		return nerr.New(nerr.InvalidArgument, "studio.ReconnectRequest", "save_password requires a supplied password")
+	}
+	if r.Password == "" && !r.UseStoredPassword {
+		return nerr.New(nerr.InvalidArgument, "studio.ReconnectRequest", "password or use_stored_password is required to switch connection")
 	}
 	if len(r.Realm) > MaxConnNameBytes || len(r.Database) > MaxConnNameBytes {
 		return nerr.New(nerr.InvalidArgument, "studio.ReconnectRequest",
 			fmt.Sprintf("realm and database names may be at most %d bytes", MaxConnNameBytes))
 	}
-	if r.Realm != "" && !connNamePattern.MatchString(r.Realm) {
-		return nerr.New(nerr.InvalidArgument, "studio.ReconnectRequest", "realm name is not a valid identifier")
+	// Multi-realm hosting was removed: a deployment serves exactly one
+	// database. A caller that names a realm asked for something this server
+	// will not do, so it is refused rather than quietly ignored.
+	if r.Realm != "" {
+		return nerr.New(nerr.InvalidArgument, "studio.ReconnectRequest",
+			"realm selection was removed: a NextSQL deployment serves exactly one database")
 	}
 	if r.Database != "" && !connNamePattern.MatchString(r.Database) {
 		return nerr.New(nerr.InvalidArgument, "studio.ReconnectRequest", "database name is not a valid identifier")
@@ -233,9 +245,11 @@ func (r ReconnectRequest) Validate() error {
 // and database. It carries no credential and no CSRF token — the session id
 // and its CSRF token are unchanged by a reconnect.
 type Connection struct {
-	User     string `json:"user"`
-	Realm    string `json:"realm"`
-	Database string `json:"database"`
+	User            string `json:"user"`
+	Realm           string `json:"realm"`
+	Database        string `json:"database"`
+	CredentialSaved bool   `json:"credential_saved,omitempty"`
+	Warning         string `json:"warning,omitempty"`
 }
 
 // TableDetail is the authorized server metadata for one selected table.
@@ -426,7 +440,7 @@ func isRealmScopedStmt(stmt ast.Stmt) bool {
 func isWriteStmt(stmt ast.Stmt) bool {
 	switch stmt.(type) {
 	case ast.Insert, ast.Upsert, ast.Update, ast.Delete,
-		ast.CreateTable, ast.CreateDatabase, ast.DropTable, ast.AlterTable,
+		ast.CreateTable, ast.DropTable, ast.AlterTable,
 		ast.CreateIndex, ast.DropIndex, ast.RebuildIndex,
 		ast.CreateWorkflow, ast.AlterWorkflow, ast.DropWorkflow, ast.RunWorkflow,
 		ast.CreateTrigger, ast.AlterTrigger, ast.DropTrigger,

@@ -120,6 +120,65 @@ Default size is 128 MiB. Header is 64 bytes: magic, version, segment id, start L
 
 `Engine.Kill` / `Log.CrashClose` discard the unsynced tail (truncate to the last synced offset) to simulate power loss.
 
+### Failed durability barriers latch
+
+A failed `fdatasync`/`fsync` leaves what actually reached stable storage
+indeterminate, and the platform reports the failure only once — a Linux
+writeback error is delivered to a single `fsync` call and then cleared, so the
+next `fsync`, covering only the *following* bytes, succeeds. A log that simply
+retried would therefore mark the un-synced region durable and acknowledge a
+commit sitting after a gap that a crash would expose as a torn or missing
+record, losing the acknowledged commit.
+
+The log latches instead. Once a durability barrier fails, every subsequent
+`Append`, `Flush` and `InstallCheckpoint` returns that same error, so no commit
+can be acknowledged and the redo boundary cannot advance past the indeterminate
+region (which would make a later segment discard turn the gap into permanent
+loss). `DurableLSN` stays at the last known-good value, and the control file
+keeps that value, so recovery on restart replays to a boundary the log actually
+observed as synced. Restart is the only way forward.
+
+A write that consumed **no** bytes does not latch: the buffer is intact at an
+unchanged offset, so a transient `ENOSPC` an operator clears can still make
+progress. A partial write does latch, because the segment then carries a torn
+record that a later write cannot repair in place.
+
+Page and allocator syncs do not latch — they are re-derivable by redo, and the
+WAL is the durability authority.
+
+### A missing segment fails the open closed
+
+The control file names the boundary the pages on disk are behind: `redo_lsn`,
+and the `durable_lsn` the engine already acknowledged. `wal.Open` refuses when
+the segments covering that interval are not on disk — either no segment at all
+while `durable_lsn > 0`, or an oldest segment whose `StartLSN` is past
+`redo_lsn`. Redo cannot reach the acknowledged boundary in that state, so
+opening anyway would silently present a database missing acknowledged commits,
+and the next checkpoint would install over the gap and make the loss permanent.
+The error names the LSNs involved so an operator can tell what is missing;
+the way forward is a restore, or recovery pointed at a WAL archive.
+
+A log that has never acknowledged anything (`durable_lsn == 0`) is an empty log,
+not a hole, and still opens with a fresh segment.
+
+### Driving these paths in tests
+
+Every durable read, write and barrier in the engine goes through one seam,
+`internal/storage/io` (`diskio`): `ReadFullAt`, `WriteFullAt`, `WriteAt`,
+`Write`, `Sync`, `DataSync` and `SyncDir`. A test installs a hook with
+`diskio.SetFaultForTest` and receives a `diskio.Fault` naming the operation
+(`read`, `write`, `sync`, `datasync`, `syncdir`), the file or directory, and
+the offset (`-1` for a sequential write), so one file can be failed while
+another keeps working — a full data volume beside a healthy log, say.
+Returning a `*diskio.ShortWrite` writes the prefix it names and then fails,
+reproducing a genuine torn record rather than a write that consumed nothing.
+The hook is process-global and never installed by production code.
+
+`tests/fault` is the release profile built on it (`make test-fault`, and part
+of `test-pr`, `test-production`, `test-chaos` and `test-nightly`). Each test
+there asserts that its fault actually fired, so a path that later moves off the
+seam fails the suite instead of silently passing.
+
 ## Checkpoints
 
 1. Flush committed dirty pages and `fsync` the data file.
@@ -128,6 +187,16 @@ Default size is 128 MiB. Header is 64 bytes: magic, version, segment id, start L
 4. Offer every segment, including the current one, to an optional `Archiver` (PITR hook). Segments are not deleted. The live segment may be re-archived after later appends.
 
 An interrupted checkpoint leaves the previous control file in place. Recovery still starts from the last installed redo LSN.
+
+`nextsqld` installs a checkpoint every `checkpoint_interval_ms` (default
+`300000`, five minutes). This bounds ordinary crash redo to the WAL suffix
+since that checkpoint without deleting retained WAL or changing the fsync
+commit rule. Set the value to `0` only for a controlled deployment that
+performs checkpoints explicitly; an indefinitely running production node with
+it disabled can otherwise accumulate an arbitrarily large redo suffix after an
+unclean stop. A failed scheduled checkpoint is logged and retried on the next
+interval; the database stays durable through WAL rather than acknowledging an
+unsafe checkpoint.
 
 ### Retention
 
@@ -185,6 +254,13 @@ On `Open`:
 4. Apply the latest committed `TreeMeta` and `AllocState` to the superblock.
 5. Apply UNDO for transactions that began and never committed or aborted (`docs/mvcc.md`).
 6. Resume LSNs after the last complete record.
+
+The scanner uses sealed segment boundaries to skip a retained segment whose
+successor has a valid CRC/identity-checked header and starts at or before the
+redo LSN. Such a segment cannot contribute a record to this recovery pass; it
+remains on disk unchanged for PITR and on-demand page repair. This makes
+restart work proportional to the redo suffix, rather than all retained
+historical WAL.
 
 A later live read of a smashed page that is past the redo LSN still calls `recovery.RepairPage`, which scans retained segments from LSN 1 for the latest committed image (`docs/storage-format.md`).
 

@@ -22,7 +22,6 @@ import (
 func main() {
 	conn, err := nextsql.Open(nextsql.Config{
 		Address:       "127.0.0.1:7210",
-		Realm:         "default",
 		Database:      "default",
 		User:          "app",
 		Password:      os.Getenv("NEXTSQL_DATABASE_PASS"),
@@ -95,15 +94,17 @@ For `--require-client-key`, set `Config.KeyProvider` (never a URL). Remote conne
 To authenticate with a signed short-lived credential, put the `NSSC1.` value in
 `Config.Password` — no other change. See [security](/docs/security).
 
-Experimental `ENCRYPTED CLIENT` columns use the separate `Config.FieldKeys`
+`ENCRYPTED CLIENT` columns use the separate `Config.FieldKeys`
 provider. Call `EncryptField(ctx, table, column, logicalValue)` before binding
 and `DecryptField(ctx, table, column, logicalType, resultValue)` after a bare
 projection. `MemoryFieldKeyring` is bounded convenience storage for keys already
 loaded from a secret manager; `FileFieldKeyring` is the durable rotation/
 revocation path. The field key is never sent to `nextsqld`. Equivalent helpers
 ship in Node.js/TypeScript, Bun, and PHP (not Python or Ruby). PITR and
-HA/failover are tested. The capability stays **experimental** because no
-searchable or deterministic mode ships.
+HA/failover are tested. For an explicit `ENCRYPTED CLIENT DETERMINISTIC`
+column, use `EncryptFieldDeterministic` / `DecryptFieldDeterministic`; only bind
+the resulting `NSCE2` value to equality/inequality predicates. This mode leaks
+equality and frequency. General searchable encryption is not supported.
 
 Follower-read routing uses `nextsql.OpenCluster` (`STRONG` / `BOUNDED` /
 `STALE`). See [High availability](/docs/ha).

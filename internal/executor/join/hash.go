@@ -133,10 +133,11 @@ func nullExtend(left []types.Value, rTypes []types.Type) []types.Value {
 	return out
 }
 
-func isLeft(kind ast.JoinKind) bool { return kind == ast.JoinLeft }
-func isFull(kind ast.JoinKind) bool { return kind == ast.JoinFull }
+func isLeft(kind ast.JoinKind) bool  { return kind == ast.JoinLeft }
+func isRight(kind ast.JoinKind) bool { return kind == ast.JoinRight }
+func isFull(kind ast.JoinKind) bool  { return kind == ast.JoinFull }
 func isOuter(kind ast.JoinKind) bool {
-	return kind == ast.JoinLeft || kind == ast.JoinFull
+	return kind == ast.JoinLeft || kind == ast.JoinRight || kind == ast.JoinFull
 }
 
 func nullPrefix(right []types.Value, lTypes []types.Type) []types.Value {
@@ -150,6 +151,10 @@ func nullPrefix(right []types.Value, lTypes []types.Type) []types.Value {
 
 func fullNoSpill() error {
 	return nerr.New(nerr.Exhausted, "join.HashJoin", "FULL OUTER JOIN exceeds memory")
+}
+
+func rightNoSpill() error {
+	return nerr.New(nerr.Exhausted, "join.HashJoin", "RIGHT JOIN exceeds memory")
 }
 
 // HashJoin builds a hash table on right and probes with left.
@@ -166,6 +171,9 @@ func HashJoin(left, right [][]types.Value, lKeys, rKeys []int, kind ast.JoinKind
 		if isFull(kind) {
 			return nestedFull(left, right, lTypes, rTypes, pred, b)
 		}
+		if isRight(kind) {
+			return nestedRight(left, right, lTypes, pred, b)
+		}
 		if isLeft(kind) {
 			return nestedLeft(left, right, rTypes, pred, b)
 		}
@@ -173,6 +181,9 @@ func HashJoin(left, right [][]types.Value, lKeys, rKeys []int, kind ast.JoinKind
 	}
 	if isFull(kind) {
 		return hashFull(left, right, lKeys, rKeys, lTypes, rTypes, pred, b)
+	}
+	if isRight(kind) {
+		return hashRight(left, right, lKeys, rKeys, lTypes, rTypes, pred, b)
 	}
 	ht, err := build(right, rKeys, b)
 	if err != nil {
@@ -308,6 +319,72 @@ func hashFull(left, right [][]types.Value, lKeys, rKeys []int, lTypes, rTypes []
 	return out, nil
 }
 
+func hashRight(left, right [][]types.Value, lKeys, rKeys []int, lTypes, rTypes []types.Type, pred Pred, b *scheduler.Budget) ([][]types.Value, error) {
+	idx := make(map[string][]int)
+	for i, row := range right {
+		if unmatchedKey(row, rKeys) {
+			continue
+		}
+		ks, err := keyString(row, rKeys)
+		if err != nil {
+			return nil, err
+		}
+		est := int64(64 + len(ks) + 8)
+		if err := b.ChargeMem(est); err != nil {
+			return nil, rightNoSpill()
+		}
+		idx[ks] = append(idx[ks], i)
+	}
+	if err := b.ChargeMem(int64(len(right) + 8)); err != nil {
+		return nil, rightNoSpill()
+	}
+	matched := make([]bool, len(right))
+	var out [][]types.Value
+	for _, lrow := range left {
+		if err := b.Check(); err != nil {
+			return nil, err
+		}
+		if unmatchedKey(lrow, lKeys) {
+			continue
+		}
+		ks, err := keyString(lrow, lKeys)
+		if err != nil {
+			return nil, err
+		}
+		for _, ri := range idx[ks] {
+			ok := true
+			if pred != nil {
+				ok, err = pred(lrow, right[ri])
+				if err != nil {
+					return nil, err
+				}
+			}
+			if ok {
+				row := concat(lrow, right[ri])
+				if err := b.ChargeMem(int64(16 * len(row))); err != nil {
+					return nil, rightNoSpill()
+				}
+				out = append(out, row)
+				matched[ri] = true
+			}
+		}
+	}
+	for i, rrow := range right {
+		if matched[i] {
+			continue
+		}
+		if err := b.Check(); err != nil {
+			return nil, err
+		}
+		row := nullPrefix(rrow, lTypes)
+		if err := b.ChargeMem(int64(16 * len(row))); err != nil {
+			return nil, rightNoSpill()
+		}
+		out = append(out, row)
+	}
+	return out, nil
+}
+
 func nested(left, right [][]types.Value, pred Pred, b *scheduler.Budget) ([][]types.Value, error) {
 	var out [][]types.Value
 	for _, lrow := range left {
@@ -422,8 +499,52 @@ func nestedFull(left, right [][]types.Value, lTypes, rTypes []types.Type, pred P
 	return out, nil
 }
 
+func nestedRight(left, right [][]types.Value, lTypes []types.Type, pred Pred, b *scheduler.Budget) ([][]types.Value, error) {
+	if err := b.ChargeMem(int64(len(right) + 8)); err != nil {
+		return nil, rightNoSpill()
+	}
+	matched := make([]bool, len(right))
+	var out [][]types.Value
+	for _, lrow := range left {
+		for i, rrow := range right {
+			if err := b.Check(); err != nil {
+				return nil, err
+			}
+			ok := true
+			var err error
+			if pred != nil {
+				ok, err = pred(lrow, rrow)
+				if err != nil {
+					return nil, err
+				}
+			}
+			if ok {
+				matched[i] = true
+				if err := b.ChargeMem(int64(16 * (len(lrow) + len(rrow)))); err != nil {
+					return nil, rightNoSpill()
+				}
+				out = append(out, concat(lrow, rrow))
+			}
+		}
+	}
+	for i, rrow := range right {
+		if matched[i] {
+			continue
+		}
+		if err := b.Check(); err != nil {
+			return nil, err
+		}
+		row := nullPrefix(rrow, lTypes)
+		if err := b.ChargeMem(int64(16 * len(row))); err != nil {
+			return nil, rightNoSpill()
+		}
+		out = append(out, row)
+	}
+	return out, nil
+}
+
 func hashWithSpill(left, right [][]types.Value, lKeys, rKeys []int, kind ast.JoinKind, rTypes []types.Type, pred Pred, b *scheduler.Budget) ([][]types.Value, error) {
-	if isFull(kind) {
+	if isFull(kind) || isRight(kind) {
 		return nil, fullNoSpill()
 	}
 	rTypes = inferTypes(right, rTypes)

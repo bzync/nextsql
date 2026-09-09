@@ -93,7 +93,7 @@ open piece of its exit gate. Prioritize:
 
 P25 Security 2.0 is complete (exit gate closed 2026-09-02): mTLS / service identity / certificate + trust rotation /
 X.509 CRL revocation, and signed short-lived credentials (`NSSC1.` Ed25519
-credential in place of the password; expiry + audience/database/realm/role
+credential in place of the password; expiry + audience/database/role
 scope; `NSTK` rotatable signing keyset + verify-only server copy; `NSTR`
 fail-closed revocation by token id or per-principal cutoff; `SIGHUP` reload;
 `nextsql token` CLI; `ACL.AllowedScoped` role narrowing with no escalation;

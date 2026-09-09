@@ -56,3 +56,47 @@ func TestBindClientEncryptedOpaqueOnly(t *testing.T) {
 		}
 	}
 }
+
+func TestBindDeterministicClientEncryptedEqualityOnly(t *testing.T) {
+	create, err := parser.Parse(`CREATE TABLE accounts (id STRING PRIMARY KEY, email STRING ENCRYPTED CLIENT DETERMINISTIC)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := Bind(create, func(string) (*catalog.Table, bool) { return nil, false }, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tab := b.(CreateTable).Table
+	lookup := func(name string) (*catalog.Table, bool) { return tab, name == "accounts" }
+	for _, sql := range []string{
+		`SELECT id FROM accounts WHERE email = $1`,
+		`SELECT id FROM accounts WHERE $1 <> email`,
+		`SELECT id FROM accounts WHERE email IS NULL`,
+		`UPDATE accounts SET email = $1 WHERE email = $2`,
+		`DELETE FROM accounts WHERE email = $1`,
+		`CREATE INDEX ix_email ON accounts (email)`,
+		`CREATE UNIQUE INDEX ux_email ON accounts (email)`,
+	} {
+		stmt, err := parser.Parse(sql)
+		if err != nil {
+			t.Fatalf("parse %q: %v", sql, err)
+		}
+		if _, err := Bind(stmt, lookup, 2); err != nil {
+			t.Fatalf("bind %q: %v", sql, err)
+		}
+	}
+	for _, sql := range []string{
+		`SELECT id FROM accounts WHERE email = 'plaintext'`,
+		`SELECT id FROM accounts WHERE email > $1`,
+		`SELECT id FROM accounts WHERE LENGTH(email) = 3`,
+		`CREATE INDEX ix_email_expr ON accounts (LENGTH(email))`,
+	} {
+		stmt, err := parser.Parse(sql)
+		if err != nil {
+			t.Fatalf("parse %q: %v", sql, err)
+		}
+		if _, err := Bind(stmt, lookup, 2); err == nil {
+			t.Fatalf("bound forbidden SQL %q", sql)
+		}
+	}
+}

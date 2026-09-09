@@ -388,3 +388,22 @@ func dirSize(root string) int64 {
 
 // Known lists official SQL workload names.
 func Known() []string { return append([]string(nil), defaultWorkloads()...) }
+
+// CheckProductionWorkload verifies whether the requested benchmark parameters
+// are permitted on a production deployment. Heavy or destructive workloads
+// (bulk DML, large row counts, extended durations, high concurrency) are
+// blocked by default on production unless allowProduction is true.
+func CheckProductionWorkload(isProduction, allowProduction, isHeavyOrDestructive bool, reason string) error {
+	if !isProduction {
+		return nil
+	}
+	if !isHeavyOrDestructive {
+		return nil
+	}
+	if !allowProduction {
+		return nerr.New(nerr.Forbidden, "bench.CheckProductionWorkload",
+			fmt.Sprintf("production benchmark refused: %s; pass --allow-production-benchmark to override", reason))
+	}
+	return nil
+}
+

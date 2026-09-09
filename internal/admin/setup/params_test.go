@@ -17,9 +17,11 @@ func TestParamsValidate(t *testing.T) {
 		{"bad preset", Params{DataDir: "/d", KeyFile: "/k", Preset: "turbo"}, true},
 		{"bad profile", Params{DataDir: "/d", KeyFile: "/k", Profile: "staging"}, true},
 		{"production skip-init rejected", Params{DataDir: "/d", KeyFile: "/k", Profile: "production", SkipInit: true}, true},
-		{"production ok", Params{DataDir: "/d", KeyFile: "/k", Profile: "production"}, false},
+		{"production ok", Params{DataDir: "/d", KeyFile: "/k", Profile: "production", Database: "db1"}, false},
 		{"developer skip-init ok", Params{DataDir: "/d", KeyFile: "/k", Profile: "developer", SkipInit: true}, false},
 		{"custom without buffer pages", Params{DataDir: "/d", KeyFile: "/k", Preset: "custom"}, true},
+		{"custom with negative buffer pages", Params{DataDir: "/d", KeyFile: "/k", Preset: "custom", BufferPages: -1}, true},
+		{"custom with buffer pages above ceiling", Params{DataDir: "/d", KeyFile: "/k", Preset: "custom", BufferPages: 5 << 20}, true},
 		{"custom with buffer pages ok", Params{DataDir: "/d", KeyFile: "/k", Preset: "custom", BufferPages: 64}, false},
 		{"user without password", Params{DataDir: "/d", KeyFile: "/k", AdminUser: "app"}, true},
 		{"password without user", Params{DataDir: "/d", KeyFile: "/k", AdminPassword: "secret123"}, true},
@@ -32,6 +34,14 @@ func TestParamsValidate(t *testing.T) {
 		{"tls cert and key ok", Params{DataDir: "/d", KeyFile: "/k", ListenAddr: "0.0.0.0:7210", TLSCert: "/c.pem", TLSKey: "/k.pem"}, false},
 		{"enableService ok", Params{DataDir: "/d", KeyFile: "/k", EnableService: true}, false},
 		{"enableService with skipInit rejected", Params{DataDir: "/d", KeyFile: "/k", SkipInit: true, EnableService: true}, true},
+		{"recoveryKeyOut with a database ok", Params{DataDir: "/d", KeyFile: "/k", Database: "db1", RecoveryKeyOut: "/rec.key"}, false},
+		{"recoveryKeyOut without a database rejected", Params{DataDir: "/d", KeyFile: "/k", RecoveryKeyOut: "/rec.key"}, true},
+		{"production without a database rejected", Params{DataDir: "/d", KeyFile: "/k", Profile: "production", AdminUser: "app", AdminPassword: "secret123"}, true},
+		{"production with a database ok", Params{DataDir: "/d", KeyFile: "/k", Profile: "production", Database: "db1", AdminUser: "app", AdminPassword: "secret123"}, false},
+		{"deployment-only developer install ok", Params{DataDir: "/d", KeyFile: "/k", AdminUser: "app", AdminPassword: "secret123"}, false},
+		{"recoveryKeyOut with skipInit rejected", Params{DataDir: "/d", KeyFile: "/k", RecoveryKeyOut: "/rec.key", SkipInit: true}, true},
+		{"instanceRecoveryKeyOut without recoveryKeyOut rejected", Params{DataDir: "/d", KeyFile: "/k", InstanceRecoveryKeyOut: "/rec.key.instance"}, true},
+		{"both recovery keys ok", Params{DataDir: "/d", KeyFile: "/k", Database: "db1", RecoveryKeyOut: "/rec.key", InstanceRecoveryKeyOut: "/rec.key.instance"}, false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -58,7 +68,12 @@ func TestParamsToArgsNeverContainsPassword(t *testing.T) {
 	if !strings.Contains(joined, "/tmp/pwfile") {
 		t.Fatalf("argv missing password-file path: %v", args)
 	}
-	want := []string{"--dry-run", "--data-dir", "/data", "--key-file", "/key", "--preset", "custom", "--profile", "production", "--buffer-pages", "128", "--user", "app", "--realm", "r1", "--database", "db1"}
+	want := []string{"--dry-run", "--data-dir", "/data", "--key-file", "/key", "--preset", "custom", "--profile", "production", "--buffer-pages", "128", "--user", "app", "--database", "db1"}
+	// Realm selection went away with multi-realm hosting: a payload that
+	// still carries one is accepted and ignored, never forwarded.
+	if strings.Contains(joined, "--realm") || strings.Contains(joined, "r1") {
+		t.Errorf("a realm must not reach the CLI: %v", args)
+	}
 	for _, w := range want {
 		if !strings.Contains(joined, w) {
 			t.Errorf("args missing %q: %v", w, args)
@@ -76,8 +91,10 @@ func TestParamsToArgsNoAdminUser(t *testing.T) {
 	if strings.Contains(joined, "--dry-run") {
 		t.Errorf("dryRun=false but --dry-run present: %v", args)
 	}
-	if !strings.Contains(joined, "--realm default") || !strings.Contains(joined, "--database default") {
-		t.Errorf("expected default realm/database, got: %v", args)
+	// No database name means no database. The wizard must never substitute
+	// one of its own — that would create a database nobody asked for.
+	if strings.Contains(joined, "--database") {
+		t.Errorf("a database name was invented for an install that named none: %v", args)
 	}
 }
 
@@ -138,5 +155,30 @@ func TestParamsToArgsSkipInit(t *testing.T) {
 	args = p.toArgs(false, "")
 	if strings.Contains(strings.Join(args, " "), "--skip-init") {
 		t.Errorf("did not expect --skip-init in args: %v", args)
+	}
+}
+
+func TestParamsToArgsRecoveryKeys(t *testing.T) {
+	p := Params{
+		DataDir:                "/d",
+		KeyFile:                "/k",
+		RecoveryKeyOut:         "/r.key",
+		InstanceRecoveryKeyOut: "/r.key.instance",
+	}
+	args := p.toArgs(false, "")
+	joined := strings.Join(args, " ")
+	if !strings.Contains(joined, "--recovery-key-out /r.key") {
+		t.Errorf("expected --recovery-key-out in args: %v", args)
+	}
+	if !strings.Contains(joined, "--instance-recovery-key-out /r.key.instance") {
+		t.Errorf("expected --instance-recovery-key-out in args: %v", args)
+	}
+
+	p.RecoveryKeyOut = ""
+	p.InstanceRecoveryKeyOut = ""
+	args = p.toArgs(false, "")
+	joined = strings.Join(args, " ")
+	if strings.Contains(joined, "--recovery-key-out") || strings.Contains(joined, "--instance-recovery-key-out") {
+		t.Errorf("did not expect recovery key flags when empty: %v", args)
 	}
 }

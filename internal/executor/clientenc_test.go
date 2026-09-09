@@ -101,3 +101,53 @@ func TestEncryptedClientOpaqueWriteRestartAndSQLGuards(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestEncryptedClientDeterministicEnvelopeGate(t *testing.T) {
+	db, err := Create(filepath.Join(t.TempDir(), "nextsql.db"), testKeys(t), 32)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	s := db.Session()
+	execOK(t, s, `CREATE TABLE accounts (id STRING PRIMARY KEY, email TEXT ENCRYPTED CLIENT DETERMINISTIC)`)
+	fieldKey := clientenc.Key{ID: "email-v1"}
+	for i := range fieldKey.Material {
+		fieldKey.Material[i] = 5
+	}
+	provider := executorFieldKeys{key: fieldKey}
+	deterministic, err := clientenc.EncryptDeterministic(context.Background(), provider, "app", "accounts", "email", types.TextValue("a@example.test"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	randomized, err := clientenc.Encrypt(context.Background(), provider, "app", "accounts", "email", types.TextValue("a@example.test"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ExecContext(context.Background(), `INSERT INTO accounts (id, email) VALUES ('bad', $1)`, []Param{{Value: types.StringValue(randomized)}}); err == nil {
+		t.Fatal("deterministic column accepted NSCE1")
+	}
+	if _, err := s.ExecContext(context.Background(), `INSERT INTO accounts (id, email) VALUES ('ok', $1)`, []Param{{Value: types.StringValue(deterministic)}}); err != nil {
+		t.Fatal(err)
+	}
+	execOK(t, s, `CREATE UNIQUE INDEX ix_accounts_email ON accounts (email)`)
+	match, err := s.ExecContext(context.Background(), `SELECT id FROM accounts WHERE email = $1`, []Param{{Value: types.StringValue(deterministic)}})
+	if err != nil || len(match.Rows) != 1 || match.Rows[0][0].Str != "ok" {
+		t.Fatalf("deterministic equality rows=%+v err=%v", match.Rows, err)
+	}
+	for name, value := range map[string]types.Value{
+		"plaintext":  types.StringValue("a@example.test"),
+		"randomized": types.StringValue(randomized),
+		"wrong type": types.Int64Value(1),
+	} {
+		if _, err := s.ExecContext(context.Background(), `SELECT id FROM accounts WHERE email = $1`, []Param{{Value: value}}); !nerr.HasCode(err, nerr.InvalidArgument) {
+			t.Fatalf("%s deterministic predicate parameter: %v", name, err)
+		}
+	}
+	if _, err := s.ExecContext(context.Background(), `INSERT INTO accounts (id, email) VALUES ('duplicate', $1)`, []Param{{Value: types.StringValue(deterministic)}}); !nerr.HasCode(err, nerr.AlreadyExists) {
+		t.Fatalf("deterministic UNIQUE duplicate: %v", err)
+	}
+	meta := execOK(t, s, `SELECT type FROM system.columns WHERE table_name = 'accounts' AND column_name = 'email'`)
+	if len(meta.Rows) != 1 || meta.Rows[0][0].Str != "TEXT ENCRYPTED CLIENT DETERMINISTIC" {
+		t.Fatalf("metadata: %+v", meta.Rows)
+	}
+}

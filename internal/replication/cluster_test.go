@@ -14,6 +14,17 @@ import (
 	"github.com/bzync/nextsql/internal/wal"
 )
 
+// raftConverge bounds how long a test waits for Raft to elect a leader or for
+// health to settle. Every such loop exits the moment the condition holds, so a
+// generous bound costs nothing on an idle machine and is the difference between
+// a real failure and a false one on a loaded gate: elections use randomised
+// timeouts and an isolated node keeps campaigning, so a fixed few seconds is a
+// bet on machine speed rather than a statement about correctness. The release
+// profile runs these alongside disk-saturating suites, where the old 3-5s
+// deadlines reported "majority has no leader" for a cluster that simply had not
+// finished electing one yet.
+const raftConverge = 30 * time.Second
+
 type recordApplier struct {
 	mu   sync.Mutex
 	recs []wal.Record
@@ -49,6 +60,16 @@ func testKeys(t *testing.T) crypto.KeyProvider {
 }
 
 func startRaft(t *testing.T, n int) ([]*Cluster, []*raft.InmemTransport, []raft.ServerAddress, []*recordApplier) {
+	t.Helper()
+	return startRaftTimings(t, n, Timings{})
+}
+
+// startRaftTimings brings up a cluster whose nodes all run the given Raft
+// intervals. The zero Timings means "the built-in defaults", so startRaft is
+// the same call; a test that passes non-default intervals is asserting that the
+// cluster actually elects, replicates and fails over on them, not merely that
+// Open accepted them.
+func startRaftTimings(t *testing.T, n int, tm Timings) ([]*Cluster, []*raft.InmemTransport, []raft.ServerAddress, []*recordApplier) {
 	t.Helper()
 	if n < 3 {
 		t.Fatal("need 3 voters")
@@ -87,6 +108,7 @@ func startRaft(t *testing.T, n int) ([]*Cluster, []*raft.InmemTransport, []raft.
 			Inmem:        true,
 			Transport:    trans[i],
 			ApplyTimeout: 3 * time.Second,
+			Timings:      tm,
 		}, apps[i])
 		if err != nil {
 			t.Fatal(err)
@@ -94,13 +116,13 @@ func startRaft(t *testing.T, n int) ([]*Cluster, []*raft.InmemTransport, []raft.
 		t.Cleanup(func() { _ = cl.Shutdown() })
 		cls[i] = cl
 	}
-	if _, err := cls[0].WaitForLeader(5 * time.Second); err != nil {
+	if _, err := cls[0].WaitForLeader(raftConverge); err != nil {
 		t.Fatal(err)
 	}
 	if err := cls[0].JoinPeers(peers); err != nil {
 		t.Fatal(err)
 	}
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(raftConverge)
 	for time.Now().Before(deadline) {
 		if cls[0].Voters() >= n && liveLeader(cls) != nil {
 			return cls, trans, addrs, apps
@@ -128,7 +150,7 @@ func liveLeader(cls []*Cluster) *Cluster {
 
 func raftLeader(t *testing.T, cls []*Cluster) *Cluster {
 	t.Helper()
-	deadline := time.Now().Add(3 * time.Second)
+	deadline := time.Now().Add(raftConverge)
 	for time.Now().Before(deadline) {
 		if c := liveLeader(cls); c != nil {
 			return c
@@ -149,7 +171,7 @@ func TestRaftReplicateQuorum(t *testing.T) {
 	if err := lead.Replicate(recs); err != nil {
 		t.Fatal(err)
 	}
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(raftConverge)
 	for time.Now().Before(deadline) {
 		ok := true
 		for i, c := range cls {
@@ -242,7 +264,7 @@ func TestRaftPartitionNoSplitBrainWrite(t *testing.T) {
 	trans[1].Disconnect(addrs[0])
 	trans[2].Disconnect(addrs[0])
 
-	deadline := time.Now().Add(4 * time.Second)
+	deadline := time.Now().Add(raftConverge)
 	var maj *Cluster
 	for time.Now().Before(deadline) {
 		var n int

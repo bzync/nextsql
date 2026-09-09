@@ -22,6 +22,530 @@ A roadmap item is not recorded as completed here until its implementation, tests
 
 ## [Unreleased]
 
+### Added — Raft timings are configurable, and the freshness window follows the heartbeat (2026-09-10)
+
+- `docs/ha.md` presented the Raft timeouts as defaults and warned against
+  lowering them, but they were hardcoded constants with no configuration field:
+  an operator on a slower link or a contended node could not raise them. A
+  cluster that cannot complete an election round inside its election timeout
+  re-campaigns rather than converging, which was observed twice under gate load.
+- `raft_heartbeat_ms`, `raft_election_ms`, `raft_leader_lease_ms` and
+  `raft_commit_timeout_ms` are now catalogued operational limits with matching
+  `nextsqld` flags. Each unset interval resolves to its previous built-in value,
+  so an existing deployment is unchanged.
+- **The healthy-contact window is five of the *configured* heartbeat**, not five
+  of the default one. `ReplicaHealth`, `FollowerReadHealthy` and the default
+  `MAX STALENESS` of a `BOUNDED` read all widen with a raised heartbeat instead
+  of judging every follower unhealthy between contacts. This coupling is why an
+  earlier attempt at configurable timings was reverted rather than half-landed.
+- The two consensus-protocol relationships — leader lease ≤ heartbeat ≤ election
+  — are enforced at configuration time by `limits.CheckRaftTimings`, shared by
+  `internal/config` and `internal/replication` so the rule exists once. An
+  operator learns at configuration time rather than at the next restart.
+- Covered by live election, replication, failover and partition tests running on
+  non-default intervals, a direct check of the freshness boundary, and a sweep
+  asserting every interval set the engine accepts is one `raft.ValidateConfig`
+  accepts. `internal/limits`, which no gate ran, is now in the release profile.
+
+### Fixed — The release gate did not run the query engine or the end-to-end suites (2026-09-09)
+
+- `make test-production` ran 24 packages and none of `internal/executor`,
+  `internal/sql/...`, `internal/replication`, `tests/crash`, `tests/ha` or
+  `tests/integration`. A wrong query answer, a failed failover or a broken
+  driver could not fail it. It now runs 36 packages, including a race pass over
+  the executor, for about three minutes more.
+- Replication runs before the disk-saturating suites: Raft elects on a 250 ms
+  timeout, so under load those tests measured machine speed rather than
+  correctness. Their fixed 3-5 second convergence deadlines are now one 30 s
+  bound that exits as soon as the cluster converges.
+
+### Added — Aggregate expressions over `system.*` tables (2026-09-09)
+
+- `SELECT COUNT(*) + 1 FROM system.tables` and similar now work, matching what a
+  user table does. A column beside an aggregate is still rejected, since system
+  selects have no `GROUP BY`.
+
+### Added — Computed `GROUP BY` and computed aggregate arguments (2026-09-09)
+
+- `GROUP BY a + b` and `GROUP BY UPPER(name)` now group correctly. Previously
+  such a group was dropped, which collapsed every row into one group rather than
+  disabling grouping.
+- `SUM(a + b)`, `COUNT(a + b)` and `MIN(a * 2)` now aggregate the expression.
+  `COUNT(a + b)` counts non-NULL values rather than rows. Identical expressions
+  are computed once and shared.
+- A non-aggregate select item now needs only to read grouping columns, so
+  `SELECT a + 1, COUNT(*) … GROUP BY a` and `SELECT 'x', COUNT(*) … GROUP BY a`
+  are accepted; `SELECT b … GROUP BY a` is still refused.
+- Plans for aggregates over plain columns are unchanged — the projection is
+  added only when something needs computing.
+- `GROUP BY 1` is now rejected explicitly. It means the first select item in
+  standard SQL, and would otherwise be taken literally as a constant.
+
+### Fixed — `HAVING` on a grouped non-numeric column
+
+- A grouped `STRING` column was typed as decimal in the `HAVING` row, so
+  `SELECT k, COUNT(*) AS total … GROUP BY k HAVING total >= 2` returned the
+  group value as `0`.
+
+### Added — Aggregates may appear inside larger select expressions (2026-09-09)
+
+- `SELECT COUNT(*) + 1`, `SUM(b) / 2`, `MAX(a) + MIN(a)`, `-COUNT(*)` and
+  `CASE WHEN COUNT(*) > 2 …` now evaluate, with or without `GROUP BY`. Each
+  aggregate is computed once and the surrounding expression is evaluated against
+  the aggregated row. Previously these returned an uninitialised, empty cell.
+- An aggregate's *argument* must still be a column reference: `SUM(a + b)` is
+  rejected. Computed `GROUP BY` is likewise still rejected. Both need a
+  projection below the aggregate, which is not implemented.
+- Window functions are unchanged and still compose.
+
+### Changed — installers publish from CI, not Git (2026-09-09)
+
+- Version-tag releases now build Linux amd64 and Windows amd64 packages in
+  temporary CI storage, validate the payload and checksum manifest, and publish
+  immutable assets to GitHub Releases. Existing releases are never overwritten.
+- The docs build derives published dates, preview/stable state, filenames,
+  sizes, SHA-256 digests, and download URLs from GitHub Releases. Curated titles,
+  summaries, highlights, and structured changes remain in the source catalog.
+- `installers/` is no longer tracked; local package output and the generated
+  docs release catalog are gitignored.
+
+### Fixed — Aggregates over computed arguments and inside expressions (2026-09-09)
+
+- `COUNT(a + b)` counted **every row** rather than the non-NULL values of the
+  expression, and `MIN`/`MAX` over an expression returned `NULL`. An aggregate
+  argument resolves to an input column ordinal, and the "unresolved" value `-1`
+  already means `COUNT(*)`. All aggregates now refuse a non-column argument at
+  bind time; `SUM`/`AVG`/`ARRAY_AGG`/`MAP_AGG` already failed closed later.
+- `SELECT COUNT(*) + 1` returned an uninitialised, empty cell instead of a value
+  or an error — as did `SUM(b) / 2`, `MAX(a) + MIN(a)`, `-COUNT(*)` and
+  `CASE WHEN COUNT(*) > 2 …`. There is no projection that runs after
+  aggregation, so an aggregate nested in a larger expression is now refused.
+- Window functions are unaffected and still compose: `SUM(b) OVER () * 2` and
+  `ROW_NUMBER() OVER (...) + 1` work as before.
+
+### Fixed — `GROUP BY` on an expression returned a wrong answer (2026-09-09)
+
+- The planner turned each `GROUP BY` item into an input column ordinal and
+  **silently dropped** anything that was not a resolvable column. That did not
+  disable grouping — it collapsed the whole input into one group and answered
+  from it, so `SELECT a + b, COUNT(*) FROM t GROUP BY a + b` returned a single
+  bogus row. `GROUP BY 1` behaved the same way.
+- `GROUP BY` now requires a column reference and refuses a computed or
+  positional group at bind time, with the planner failing closed behind it.
+  Grouping on a computed expression remains unimplemented.
+- A select item whose identity could not be determined could pass as "grouped"
+  because two unidentifiable expressions compared equal. It now fails closed.
+
+### Fixed — `HAVING COUNT(*)` could never match its selected aggregate
+
+- `HAVING` rewrites sub-expressions that match the select list, comparing with
+  `reflect.DeepEqual`. Select items are stored after a normalisation pass that
+  rebuilds calls with an empty **non-nil** argument slice, while the parser
+  leaves it nil — so a star aggregate never matched and `HAVING COUNT(*) > 1`
+  failed. Both sides are now normalised the same way before comparison, which
+  also lets `HAVING` use a qualified reference.
+
+### Fixed — Soak evidence recorded a wall time it never measured (2026-09-09)
+
+- Every retained B+Tree soak report recorded `elapsed_wall=mm`. The metrics
+  extractor split GNU `time -v` output on `:` and took the second field, but the
+  elapsed-time label itself contains colons (`... (h:mm:ss or m:ss):`), so the
+  "value" was part of the label. It now reads everything after the final `": "`.
+- The retained artifact filename was the hardcoded literal `btree-100m-p16`,
+  which described neither the default nor the constrained profile. It is now
+  derived from the profile and its actual operation and pool-page counts.
+
+### Fixed — Aggregates over `system.*` catalog tables (2026-09-09)
+
+- `SELECT COUNT(*) FROM system.tables` failed with `unknown function`: the
+  system-catalog evaluator projected row at a time, so an aggregate never had a
+  path. Scalar aggregates (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `ARRAY_AGG`,
+  `MAP_AGG`) now work, reusing the same accumulators as a user table — including
+  `COUNT(*)` of an empty catalog returning one row holding `0`.
+- `LIMIT`/`OFFSET` bound the aggregate result rather than the rows it reads.
+- A bare column beside an aggregate with no `GROUP BY` is rejected, matching the
+  binder's rule for user tables. `GROUP BY`/`HAVING` remain unsupported here.
+
+### Added — Python and Ruby driver suites run in CI
+
+- Both were the only official-driver live checks not driven from Go, so nothing
+  ran them and they sat failing unobserved. `tests/integration` now runs all
+  four gates, and each live gate fails if the suite skipped itself instead of
+  connecting.
+
+### Added — Stable `ERR_*` public error codes on the NSQL wire, negotiated per connection (2026-09-09)
+
+- Error frames can now carry NextSQL's stable, documented `ERR_*` public error
+  name (`docs/error-codes.md`) alongside the existing class. This is negotiated
+  through a new `Hello` capability flag rather than a protocol-version bump:
+  a client that does not request it receives byte-identical NSQL v1 frames.
+- The legacy lowercase `code` field is **never** replaced, in either direction.
+  Existing retry logic that branches on it is unaffected.
+- The server emits the public name only for a documented class, and echoes only
+  capability bits it actually implements, so an echoed bit is a guarantee.
+- All six official drivers (Go, Node, Bun, PHP, Python, Ruby) request the
+  capability and expose the name — `nerr.Error.Public`, `err.publicCode`,
+  `$e->publicCode`, `err.public_code` — empty against an older server.
+
+### Fixed — Optional trailing protocol fields are canonical
+
+- `DecodeError`, `DecodeHelloOK` and `DecodeHello` rejected nothing when an
+  optional trailing field was present but empty, so one message value had two
+  valid encodings. Found by new round-trip fuzzing; all three now reject the
+  empty form.
+
+### Added — Production mode enforcement: OIDC introspection, JIT provisioning, OCSP verification, and benchmark safeguards (2026-09-09)
+
+- **RFC 7662 Opaque Token Introspection**: OIDC authentication broker supports validating opaque tokens against operator-configured HTTPS endpoints (`internal/authbroker/introspect.go`). Supports protected mode-0600 client secret files, disables HTTP redirects, caps response bodies to 64 KiB, bounds timeouts, and caches token status via a bounded LRU cache (1024 entries, default 5m TTL).
+- **JIT Principal Provisioning**: Opt-in just-in-time user provisioning (`internal/authbroker/jit.go`) binds provisioned principals within `allowed_role_boundary` and strictly prohibits assignment of administrative roles (`admin`, `cluster_admin`, `superuser`, `operator`). Maximum provisioned principals are capped by `max_principals` to prevent auth store exhaustion.
+- **OCSP Certificate Status Checking**: TLS listener verification supports stapled OCSP responses and live AIA responder checks (`internal/security/ocsp.go`). Supports in-memory caching, 3s bounded timeout, and configurable enforcement (`--tls-ocsp-mode=disabled|optional|enforce`, `--tls-ocsp-responder`). Active posture is surfaced in `system.tls.ocsp_mode`.
+- **Production Safeguards for Benchmarks**: `nextsql-bench` detects the production profile (`--production`, `NEXTSQL_PROFILE=production`, or `deployment_profile=production`) and blocks heavy or mutating benchmarks (bulk UPDATE/DELETE operations, scale > 25,000 rows, cluster read-scaling, and mutating SQL workloads) by default unless `--allow-production-benchmark` is explicitly passed (closing `TODO.md` line 2635).
+
+### Changed — `nextsql hosting` is now `nextsql registry` (2026-09-09)
+
+**Breaking.** The command group is renamed to name what it operates on: the
+encrypted deployment registry, `nextsql.instance`. `hosting` was vocabulary
+left over from multi-realm/multi-database hosting, which no longer exists.
+
+- `nextsql hosting adopt|migrate-tenant|show` → `nextsql registry
+  adopt|migrate-tenant|show`. The verbs, flags, and behavior are unchanged.
+- `nextsql hosting` is removed outright, not aliased: it now fails as an
+  unknown command. Update any 0.0.1-era runbook or script.
+- `nextsql hosting set-realm-cap|set-realm-root|set-database-cap`, which
+  answered with the reason for their removal, are gone with the group.
+- `NEXTSQL_HOSTING_CONFIRM` → `NEXTSQL_REGISTRY_CONFIRM`. The old name is no
+  longer read, so adoption refuses to run unconfirmed rather than proceeding.
+- `NEXTSQL_HOSTING_MANIFEST_FILE` keeps its name and its refusal: it names a
+  removed `nextsql init --hosting-manifest` flag, so an old runbook still
+  fails closed instead of being silently ignored.
+- No persistent format, wire protocol, or catalog change.
+
+### Changed — a database is created only when it is named (2026-09-09)
+
+**Breaking.** `nextsql init` and `nextsql setup` no longer create a database
+called `default` when `--database` is omitted. The flag is optional and it
+decides whether a database exists at all.
+
+- Without `--database`, `nextsql init` provisions the **deployment**: the root
+  unlock key, and the administrator if one was requested. It creates no
+  `nextsql.db`, no keystore, and no deployment registry.
+- Running the same command later with `--database NAME` completes the
+  deployment in place — no separate verb — and the administrator created
+  beforehand carries over.
+- `nextsqld` fails closed on a deployment that has no database, and its error
+  names the exact command that creates one. A registry present without its
+  database is reported as corruption instead.
+- `nextsql setup --profile production` requires `--database` (a deployment
+  with no database cannot serve), and so does `--recovery-key-out` (there is
+  no keystore for a recovery key to seal).
+- `nextsql lifecycle detect` reports the new state as `deployment-only`,
+  distinct from `config-only`.
+- NextSQL Admin's Setup wizard asks for the database name on its profile step
+  — empty by default, required on the production profile — instead of
+  substituting `default` on the operator's behalf.
+- No persistent format changed. Existing deployments are unaffected; only a
+  script that relied on an unnamed `init` producing a database will notice.
+
+### Removed — multi-realm/multi-database hosting (2026-09-09)
+
+**Breaking.** A NextSQL deployment now serves exactly **one** database. Raft
+clustering and HA are unchanged — this removes multi-tenancy inside one
+process, not replication across processes. Isolation between databases is a
+whole deployment: its own process, files, WAL, UNDO, keys, users and ACL.
+
+- Gone: realms; `CREATE DATABASE` (the parser refuses it with that reason);
+  per-connection database routing and `internal/dbmanager`; `nextsql realm` and
+  `nextsql database`; `nextsql hosting set-realm-cap` / `set-realm-root` /
+  `set-database-cap`; `nextsql init --hosting-manifest` and the declarative
+  multi-realm bootstrap; `system.realms` and `SHOW REALMS`; the
+  `hosting_isolation` capability; `--realm` on every command; and
+  `NEXTSQL_REALM_NAME`.
+- **System catalog contract: `system_schema_v3` → `system_schema_v4`.**
+  `system.realms` is removed. `system.databases` is now
+  `database_id, name, state, storage_cap_bytes` and holds exactly one row.
+  `system.quotas` drops its realm scope.
+- Still here: the encrypted deployment registry (`nextsql.instance`), its
+  separate external root and recovery key, the exclusive deployment lock,
+  `nextsql registry adopt`, `nextsql registry show`, and offline legacy `TENANT`
+  migration. The deployment's storage cap is `storage_cap_bytes` in
+  `nextsql.conf`.
+- **No persistent format changed**, so a deployment written by 0.0.1 still
+  opens. One that holds more than one database makes `nextsqld` **fail closed**
+  naming what it found, rather than starting healthy with the rest silently
+  unreachable — 0.0.1 still reads it, so export each database and import it
+  into its own deployment.
+- `Hello.realm` remains on the wire as a reserved field that must stay empty;
+  a Hello naming any other realm or database is rejected, folded into the same
+  generic authentication failure so it cannot enumerate names.
+  `max_open_databases` is still accepted in `nextsql.conf` and ignored, so a
+  config written by an earlier release still loads.
+
+### Added — recovery keys are exported during a first install (2026-09-09)
+
+The recovery-key capability below is now reachable from the two paths most
+operators actually use to create a deployment, so a new install can hand over
+a second way in instead of leaving it to be discovered later.
+
+- `nextsql setup --recovery-key-out FILE` (with `--instance-recovery-key-out`,
+  defaulting to `FILE.instance`) generates, seals and verifies a recovery key
+  for **both** of a deployment's keystores. Losing either root is fatal on its
+  own, so they are exported together or not at all. Exports are resolved before
+  anything is written — `--dry-run` refuses exactly what a real run would, an
+  output path that already exists is never overwritten, and two key paths
+  naming one file is rejected — and they are sealed inside the install's
+  existing rollback boundary, so a failure removes the partial install rather
+  than handing over a database believed to be recoverable. Each export is
+  verified twice, the second time by reopening the keystore with the bytes
+  actually written. `--recovery-key-out` is rejected with `--skip-init`, and
+  an install without it now says out loud that the root key is the only way in.
+- NextSQL Admin's Setup wizard offers the export on by default, names both
+  keystores' files on the location and review screens, and keeps its Finish
+  button disabled until the operator confirms both files were copied offline.
+  The wizard passes paths only; key material is generated and sealed solely by
+  `nextsql setup`.
+- Setup's code blocks now wrap instead of scrolling: `@bzync/rui`'s `CodeBlock`
+  renders a horizontally scrollable region containing nothing focusable, so a
+  keyboard-only operator could not reach the second recovery-key path
+  (WCAG 2.1.1).
+- Verified live end to end: a production-profile install exported both keys,
+  **both root key files were then deleted**, `nextsqld` failed closed,
+  `nextsql key recover` re-opened both keystores onto fresh roots, and the
+  restarted server returned the pre-loss row and accepted a new one. A new
+  real-Chrome wizard walkthrough (`npm run test:a11y`) covers the default-on
+  export, the empty-path gate, the configuration-only withdrawal, and the
+  saved-offline confirmation, with axe WCAG 2.2 audits at each screen.
+
+### Added — recovery keys: a second, independent way to unlock a database (2026-09-09)
+
+Until now a NextSQL database was sealed under exactly one external root unlock
+key, which made that one file a single point of total, unrecoverable data
+loss. A **recovery key** is an optional second AES-256 key that seals the same
+KEK, so either key opens the database and neither is a single point of
+failure. It is generated once, exported for the operator to store offline, and
+never retained by the server — only the sealed blob reaches the keystore. It
+is not escrow and not a backdoor: losing both keys is still unrecoverable.
+
+- `internal/crypto`: keystore format `NSKS` v2 adds a recovery key version and
+  a second wrap of the KEK. It is written **only** once a recovery key is
+  configured, and reverts to v1 when one is removed, so a database that never
+  opts in stays byte-identical to what releases predating the format wrote and
+  can still read. New `Envelope` API: `SetRecoveryKey`, `RemoveRecoveryKey`,
+  `VerifyRecoveryKey`, `UnlockWithRecovery`, `OpenEnvelopeWithRecovery`,
+  `RotateKEKWithRecovery`, `HasRecoveryKey`, `HasRoot`, `Shredded`,
+  `KeystoreFormatVersion`.
+- **Fails closed where it must.** `RotateKEK` now refuses while a recovery key
+  is configured — the wrap seals the current KEK and the server never holds the
+  recovery key, so rotating would silently destroy the operator's only backup
+  unlock path; `RotateKEKWithRecovery` re-seals in the same operation instead.
+  An envelope unlocked by recovery is rootless: it reads and writes data, but
+  every operation that rewrites key material fails until `RotateRoot` adopts a
+  new root. Setting the root itself as the recovery key is rejected.
+- New `nextsql key status | add-recovery | verify-recovery | remove-recovery |
+  recover`, with `--keystore database|instance` selecting the database or the
+  deployment-registry keystore (each is sealed under its own root, so each
+  needs its own recovery key). `key status` needs no key at all — it is the
+  command for an operator who does not yet know which keys they still hold.
+- Exported key files are typed: `NSRK` for a recovery key against `NSKY` for a
+  root key, so swapping them reports which file it actually got rather than an
+  indistinguishable unlock failure.
+- `keystore` is now a family in the compatibility catalog (`Current: 1`,
+  `MaxReadable: 2`) and `nextsql diagnose` reports `keystore_version` with a
+  checksum-verified header read, so a rollback decision does not have to guess.
+- Verified live end to end, not only unit-tested: a real database was created,
+  populated and served; recovery keys were exported for both keystores; **both
+  root key files were then deleted**; `nextsql key recover` re-opened each
+  keystore and adopted fresh roots; `nextsqld` started on the recovered keys
+  with every row intact and accepted new writes.
+- The `tests/upgrade` rollback guard **caught this change** and had to be
+  answered rather than waved through: adding `keystore` to the catalog made
+  `diagnose` report a family the shipped `v0.0.1` fixtures never printed, and
+  the guard fails on any family the generating release did not know. It was
+  resolved with a source-verified entry (v0.0.1's `decodeKeystore` required
+  `version == 1` exactly, so its enforced window is [1,1]) plus a new,
+  stronger assertion that replaying a fixture must not move *any* on-disk
+  version at all. `make test-upgrade` is green; the fixtures stay v1.
+
+### Added — reproducible B+Tree soak evidence profiles (2026-09-09)
+
+`make test-soak-constrained` adds a fixed constrained-memory B+Tree invariant
+soak alongside the existing normal profile. Both now produce versioned manifest,
+raw `time -v`, and normalized metrics sidecars recording workload/resource
+inputs, source state, host/filesystem details, elapsed/CPU time, peak RSS,
+I/O, page faults, context switches, toolchain, and exit status. Soaks warn on
+RAM-backed scratch filesystems and refuse them when
+`NEXTSQL_REQUIRE_DURABLE_FS=1`.
+
+### Fixed — spatial resource limits distinguish fixed and general geometry (2026-09-08)
+
+Public documentation now distinguishes the fixed native `LINESTRING`/`POLYGON`
+256-vertex cap from general OGC `GEOMETRY`/`GEOGRAPHY`, which allows 65,536
+total vertices, nesting depth 8, and 4,096 parts. No spatial behavior changed.
+
+### Added — retained production-evidence CI profiles (2026-09-08)
+
+The GitHub Actions production-evidence gate runs the named PR, full-production,
+and nightly profiles on hosted Linux. It refuses a RAM-backed scratch filesystem
+and retains each complete stdout/stderr evidence log for 30 days, including the
+filesystem identity release approval must inspect.
+
+### Added — operational limit catalog with independent wire and session controls (2026-09-08)
+
+`internal/limits` now owns the validated defaults and absolute ceilings for
+every configurable operational control, including separate frame, SQL,
+parameter, prepared-statement, result, memory, concurrency, time, and storage
+budgets. `nextsqld` accepts independent `max_frame_bytes`,
+`max_statement_bytes`, `max_parameters`, `max_prepared_statements`, and
+`max_result_bytes` settings; a statement can no longer silently consume the
+entire frame default, and per-session prepared state is no longer a fixed
+constant. `docs/limits.md` is generated from and checked against that catalog.
+
+### Added — retained release fixtures prove an upgrade does not strand data (2026-09-08)
+
+Compatibility could not be tested by code that also wrote the file it read
+back. `tests/upgrade` replays *retained fixtures*: real data directories —
+pages, WAL, UNDO, keystore, auth and ACL sidecars — produced by the shipped
+`v0.0.1` binaries and committed under `tests/upgrade/testdata/`, together with
+the query results and the compatibility catalog that release itself printed.
+Each label retains two archives: one shut down cleanly, one `SIGKILL`ed with
+acknowledged commits still in the log, so the current recovery pass is driven
+against an older release's redo rather than only its page reader.
+
+For every fixture the current build must pass `nextsql diagnose` preflight with
+each on-disk version inside its declared window, return byte-identical results
+for every recorded query (relational, JSON path, full-text, vector, geospatial,
+partitioned), keep the fixture principal's grants exactly as the old release
+wrote them, accept writes through the structures that release created, survive a
+restart, and round-trip through `backup`/`restore`. It must also leave every
+on-disk family inside the *generating* release's readable window, so an operator
+can still roll back — checked against the catalog recorded in the archive, and,
+with `NEXTSQL_UPGRADE_OLD_BINDIR`, by running the released binaries against the
+directory the current build just wrote.
+
+`scripts/make-upgrade-fixture.sh` cuts a pair from any release's binaries;
+`RELEASING.md` now requires one per release. `make test-upgrade` runs the
+profile, which is also part of `test-pr`, `test-production` and `test-nightly`.
+
+### Fixed — a WAL whose segments no longer cover the redo boundary fails the open closed (2026-09-08)
+
+Found as a negative control for the fixture work: deleting the WAL segment from
+a retained fixture and starting the server produced an empty database that
+reported `status ok`. `wal.Open` created a fresh segment whenever the directory
+held none, regardless of the control file recording an acknowledged `durable_lsn`
+past the redo boundary the pages on disk were behind — so every acknowledged
+commit after that boundary silently disappeared, and the next checkpoint
+installed over the gap and made the loss permanent.
+
+`wal.Open` now refuses when the segments covering the redo interval are absent:
+no segment at all while anything was acknowledged, or an oldest segment starting
+past `redo_lsn`. The error names both LSNs. A log that never acknowledged
+anything is an empty log, not a hole, and still opens.
+
+### Added — disk-full, short-write, failed-fsync and EIO are a release profile (2026-09-08)
+
+Every durable read, write and barrier in the engine already went through one
+seam (`internal/storage/io`), but the seam had only ever been pointed at the
+write-ahead log. It now carries what a fault profile needs: injection on reads
+and directory fsyncs as well as writes and syncs, a descriptor naming the
+operation, file and offset (so a test can fail the data volume while the log
+keeps working), a sequential `Write` used by the backup and restore copiers,
+and `ShortWrite`, which writes the prefix it names before failing — a genuine
+torn record rather than a write that consumed nothing. The undo log's own
+barriers moved onto the seam, so no durability barrier in the engine is
+unhookable.
+
+`tests/fault` is the profile built on it — `make test-fault`, and part of
+`test-pr`, `test-production`, `test-chaos` and `test-nightly`. Eleven
+engine-level cases: a checkpoint under a failing page write and under a failing
+data fsync, an unreadable page, a torn WAL write, `ENOSPC` that later clears, a
+create whose directory entry never became durable, a failed nonce reservation,
+an unreadable log during redo, a failed undo barrier, and backup and restore on
+a full destination. Each test asserts that its fault actually fired, so a path
+that moves off the seam fails the suite instead of quietly passing.
+
+The runner now also prints the scratch filesystem on every profile, warns when
+it is RAM-backed, and refuses to run there under `NEXTSQL_REQUIRE_DURABLE_FS`:
+an unconfigured run on `tmpfs` fsyncs into RAM and is not durability evidence.
+
+### Fixed — a create that failed on a bad device poisoned the path forever (2026-09-08)
+
+Found by the new profile. `file.Create` removed the data file when the key or
+superblock write failed, but not when the directory `fsync` failed, and
+`storage.open` had no unwind for the WAL, undo, allocator, buffer or integrity
+steps that follow. A full or failing device during `nextsql init`, a hosted
+database create, or a restore's engine open therefore left a data file behind
+that no database was ever built on, and every retry — after the operator freed
+space or replaced the device — returned `already_exists`.
+
+A failed create now unwinds exactly what it made: the data file, the integrity
+sidecar, and only those WAL/undo directories that did not already exist, so a
+pre-existing directory is never deleted.
+
+
+### Fixed — a corrupt page freelist could hand out a page that is already in use (2026-09-08)
+
+A freelist that loads is trusted for the life of the handle: every page ID it
+names is handed straight back out by `Alloc`. The decoder already rejected a
+cycle, a wrong page type, a malformed record, page ID `0`, a duplicate ID and a
+count that disagreed with the superblock, but it accepted two states the
+allocator itself can never write:
+
+- An ID at or above `NextPageID`. `Free` refuses those, so such an ID was never
+  allocated; `Alloc` would return it, and a later high-water allocation would
+  return the same page a second time.
+- One of the chain's own freelist metadata pages listed as free — `Alloc` would
+  hand out a live page of the freelist.
+
+Both are now rejected as corruption at `Open` and at `Reload`, which applies the
+same validation so a file that changes underneath an open handle is re-checked
+rather than trusted. The metadata-page check runs after the chain walk, since a
+record on the first page can name a metadata page the walk has not reached yet.
+
+`internal/storage/allocator` had no tests of its own (76.1% incidental coverage
+from `internal/storage`); it now has a suite covering every corruption path, the
+multi-page freelist chain, reuse across reopen, the hosting storage cap, and a
+`FuzzOpenFreeList` target asserting that an accepted freelist can never hand out
+the superblock, a duplicate, a page beyond the high-water mark, or its own
+metadata. Dead `snapshot`/`restore` methods were removed.
+
+### Fixed — a failed WAL fsync no longer lets a later commit be acknowledged (2026-09-08)
+
+A durability barrier that fails leaves what reached stable storage
+indeterminate, and the platform reports the failure only once: a Linux
+writeback error is delivered to a single `fsync` and then cleared. The log
+retried, the next flush covered only the following bytes, succeeded, and
+advanced `DurableLSN` across the un-synced region — so a commit could be
+acknowledged while sitting after a gap that a crash would expose as a torn or
+missing record, losing that acknowledged commit.
+
+A failed barrier now latches: every subsequent `Append`, `Flush` and
+`InstallCheckpoint` returns the same error, `DurableLSN` stays at the last
+known-good value, and the redo boundary cannot advance past the indeterminate
+region (which a later segment discard would have turned into permanent loss).
+Restart, replaying to a boundary the log actually observed as synced, is the
+only way forward. A write that consumed no bytes does not latch, so a transient
+`ENOSPC` an operator clears can still make progress; a partial write does,
+because the segment then carries a torn record. Page and allocator syncs are
+unaffected — they are re-derivable by redo.
+
+The shared disk-I/O boundary gained a test-only fault seam, and the WAL segment
+write now goes through it, so disk-full/EIO behavior is covered by regression
+tests rather than argued from code reading.
+
+### Fixed — bounded WAL recovery after an unclean server stop (2026-09-08)
+
+- `nextsqld` now installs a durable checkpoint every five minutes by default (`checkpoint_interval_ms`; `0` explicitly disables the scheduler). A checkpoint advances the redo boundary but does not relax fsync, delete retained WAL, or weaken PITR/page repair.
+- Recovery now skips sealed retained WAL segments whose successor begins before the installed redo LSN. Previously it decrypted every historical segment before discarding pre-redo records, making restart CPU proportional to all retained WAL even after a checkpoint.
+- Per-database periodic maintenance now drains on cancellation before the database handle closes, including a hosted database evicted after its final connection releases it. This prevents a shutdown/eviction callback from racing a final checkpoint or other monitor against closed WAL/file handles.
+
+### Fixed — NextSQL Admin audit-chain failure text meets WCAG AA contrast (2026-09-08)
+
+- The shared Operations/Studio audit-chain failure message used RUI's standard destructive text token, which was only 3.44:1 against the dark raised surface. Its dark-mode presentation now uses a 7.23:1 red while light mode retains the standard destructive color. The failure badge remains explicit, so the state does not rely on color alone.
+- The real-Chrome axe fixture exercises a verified-to-tampered audit refresh and now asserts the resolved failure-state color before its WCAG 2.2 A/AA audit.
+
+### Added — Setup mode can inspect an existing installation (2026-09-08)
+
+- The Setup Location step now offers **Inspect existing installation** before a fresh install. It invokes the existing read-only `nextsql lifecycle detect --json` contract through the same bounded subprocess boundary as the wizard, reporting its status without opening the engine for mutation, starting a service, or changing files. Upgrade, repair, and uninstall remain explicit CLI workflows pending their own destructive-confirmation UX.
+
 ### Fixed — NextSQL Admin: a long backup logged the operator out (2026-09-08)
 
 - `Back up now` is allowed 30 minutes server-side (it copies, seals and restore-tests every file), but an Operations session went idle after 15 minutes and the idle clock was stamped only when a request *started*. Since the Backups view keeps its button disabled for the whole call and auto-refresh is off by default, the browser sent nothing in between: the sweeper evicted the session mid-backup and the operator was bounced to the login screen the moment their backup returned.

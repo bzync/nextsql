@@ -19,6 +19,8 @@ const {
   decodeValue,
   encodeHello,
   decodeHelloOK,
+  decodeError,
+  FlagPublicErrorCodes,
   encodeSetReadConsistency,
   decodeNodeStatus,
   decodeRowDesc,
@@ -30,7 +32,9 @@ const {
   MemoryFieldKeyring,
   FileFieldKeyring,
   decryptField,
+  decryptFieldDeterministic,
   encryptField,
+  encryptFieldDeterministic,
   struct,
 } = require('./nextsql');
 
@@ -51,6 +55,17 @@ test('nextsql.d.ts type surface matches the shared drivers/js source', async () 
     shared.slice(shared.indexOf(marker)),
     'drivers/node/nextsql.d.ts is out of sync with drivers/js/types.d.ts',
   );
+});
+
+test('NSCE2 deterministic encryption equality and context binding', async () => {
+  const ring = new MemoryFieldKeyring(fieldKey('v1', 1));
+  const a = await encryptFieldDeterministic(ring, 'app', 'accounts', 'email', FieldType.Text, 'portable');
+  const b = await encryptFieldDeterministic(ring, 'app', 'accounts', 'email', FieldType.Text, 'portable');
+  assert.match(a, /^NSCE2\./);
+  assert.equal(a, b);
+  assert.equal(await decryptFieldDeterministic(ring, 'app', 'accounts', 'email', FieldType.Text, a), 'portable');
+  await assert.rejects(() => decryptFieldDeterministic(ring, 'app', 'accounts', 'other', FieldType.Text, a), (err) => err.code === 'crypto');
+  await assert.rejects(() => decryptField(ring, 'app', 'accounts', 'email', FieldType.Text, a), (err) => err.code === 'invalid_format');
 });
 
 test('NSCE1 field encryption round-trip, rotation, and revocation', async () => {
@@ -522,4 +537,39 @@ test('spatial: EWKB decode / encode round-trip (Spatial track S4)', () => {
   assert.deepEqual(got.value, { type: 'Point', srid: 4326, coordinates: [1.5, 2.5] });
   const enc = encodeParam({ kind: 'geometry', wkt: 'POINT(1 2)', srid: 4326 });
   assert.equal(decodeValue(enc, 0).value, 'SRID=4326;POINT(1 2)');
+});
+
+test('public error taxonomy: negotiated and v1 error shapes both decode', () => {
+  const u16str = (s) => {
+    const b = Buffer.from(s, 'utf8');
+    const out = Buffer.alloc(2 + b.length);
+    out.writeUInt16LE(b.length, 0);
+    b.copy(out, 2);
+    return out;
+  };
+  const negotiated = decodeError(Buffer.concat([
+    u16str('serialization'), u16str('retry me'), u16str('ERR_SERIALIZATION'),
+  ]));
+  // The legacy class is unchanged, so existing retry checks still work.
+  assert.equal(negotiated.code, 'serialization');
+  assert.equal(negotiated.publicCode, 'ERR_SERIALIZATION');
+  // An older server ignores the request bit and sends the v1 shape.
+  const legacy = decodeError(Buffer.concat([u16str('conflict'), u16str('nope')]));
+  assert.equal(legacy.code, 'conflict');
+  assert.equal(legacy.publicCode, '');
+  // A present-but-empty public code is a second encoding of the v1 shape.
+  assert.throws(() => decodeError(Buffer.concat([u16str('conflict'), u16str('nope'), u16str('')])));
+});
+
+test('hello-ok capability flags are an opt-in trailing field', () => {
+  const base = Buffer.alloc(11);
+  base.writeUInt16LE(1, 0);
+  base[2] = 1;
+  base.writeBigUInt64LE(99n, 3);
+  assert.equal(decodeHelloOK(base).flags, 0);
+  const flags = Buffer.alloc(2);
+  flags.writeUInt16LE(FlagPublicErrorCodes, 0);
+  assert.equal(decodeHelloOK(Buffer.concat([base, flags])).flags, FlagPublicErrorCodes);
+  assert.throws(() => decodeHelloOK(Buffer.concat([base, Buffer.alloc(2)])));
+  assert.throws(() => decodeHelloOK(Buffer.alloc(12)));
 });

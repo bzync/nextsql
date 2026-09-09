@@ -3,9 +3,11 @@ package setup
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -121,9 +123,38 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/v1/hello", s.authed(s.handleHello))
 	s.mux.HandleFunc("GET /api/v1/service", s.authed(s.handleService))
 	s.mux.HandleFunc("GET /api/v1/browse", s.authed(s.handleBrowse))
+	s.mux.HandleFunc("POST /api/v1/lifecycle/detect", s.authed(s.handleLifecycleDetect))
 	s.mux.HandleFunc("POST /api/v1/plan", s.authed(s.handlePlan))
 	s.mux.HandleFunc("POST /api/v1/install", s.authed(s.handleInstall))
 	s.mux.HandleFunc("POST /api/v1/finish", s.authed(s.handleFinish))
+}
+
+// lifecycleDetectRequest is deliberately narrower than the CLI: Setup mode
+// only exposes the read-only inspection needed to recognize an existing
+// installation. Upgrade, repair, and uninstall retain their explicit CLI
+// confirmations until their dedicated UX is designed.
+type lifecycleDetectRequest struct {
+	DataDir string `json:"dataDir"`
+	Config  string `json:"config"`
+}
+
+func (s *Server) handleLifecycleDetect(w http.ResponseWriter, r *http.Request) {
+	var req lifecycleDetectRequest
+	if err := json.NewDecoder(io.LimitReader(r.Body, 8<<10)).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	req.DataDir = strings.TrimSpace(req.DataDir)
+	req.Config = strings.TrimSpace(req.Config)
+	if req.DataDir == "" || len(req.DataDir) > 4096 || strings.IndexByte(req.DataDir, 0) >= 0 || len(req.Config) > 4096 || strings.IndexByte(req.Config, 0) >= 0 {
+		writeError(w, http.StatusBadRequest, "dataDir and config must be valid paths")
+		return
+	}
+	args := []string{"lifecycle", "detect", "--json", "--data-dir", req.DataDir}
+	if req.Config != "" {
+		args = append(args, "--config", req.Config)
+	}
+	writeJSON(w, http.StatusOK, s.run.runArgs(r.Context(), args))
 }
 
 // withBaseMiddleware applies security headers and request logging. It never

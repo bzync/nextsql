@@ -3,29 +3,27 @@
 import { useEffect, useMemo } from "react";
 import { useRouter } from "next/navigation";
 import { CommandPalette, useCommand, type CommandItem } from "@bzync/rui";
-import { docsNav, docHref } from "@/lib/nav";
+import type { DocsSearchEntry } from "@/lib/search";
 
 /**
  * Global documentation search, backed by rui's <CommandPalette>.
  * Cmd/Ctrl+K is handled by <CommandProvider>; "/" is wired up here.
  */
-export function DocsCommandPalette() {
+export function DocsCommandPalette({ entries }: { entries: DocsSearchEntry[] }) {
   const router = useRouter();
   const { setOpen } = useCommand();
 
   const items = useMemo<CommandItem[]>(
     () =>
-      docsNav.flatMap((group) =>
-        group.items.map((item) => ({
-          id: item.slug,
-          label: item.title,
-          description: item.description,
-          group: group.title,
-          keywords: [item.slug],
-          onSelect: () => router.push(docHref(item.slug)),
-        })),
-      ),
-    [router],
+      entries.map((entry) => ({
+        id: entry.id,
+        label: entry.label,
+        description: entry.description,
+        group: entry.group,
+        keywords: entry.keywords,
+        onSelect: () => router.push(entry.href),
+      })),
+    [entries, router],
   );
 
   useEffect(() => {
@@ -50,6 +48,7 @@ export function DocsCommandPalette() {
       placeholder="Search documentation…"
       emptyText="No matching pages."
       ariaLabel="Search documentation"
+      inputClassName="docs-search-input border-0"
     />
   );
 }

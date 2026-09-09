@@ -19,7 +19,9 @@ expose data.
 
 ```text
 External / client root unlock key     (never stored in the data directory)
-        │
+        │                                          ▲
+        │                    optional recovery key ┘  (a second, independent
+        │                                             wrap of the same KEK)
         ▼
        KEK                            (wrapped under the root)
         │
@@ -39,8 +41,9 @@ External / client root unlock key     (never stored in the data directory)
 There is no single permanent key for every purpose. Domain DEKs cannot be
 unwrapped with the wrong domain AAD.
 
-The sidecar `nextsql.db.keys` (`NSKS` v1) holds wrapped keys, versions, flags,
-and a nonce high-water. It does not hold the raw root. Mode `0600`.
+The sidecar `nextsql.db.keys` (`NSKS` v1, or v2 once a recovery key is
+configured) holds wrapped keys, versions, flags, and a nonce high-water. It
+does not hold the raw root. Mode `0600`.
 
 `--key-file` (`NSKY`) is the external root unlock key. Keep it off the data
 volume. Official drivers never put keys in a URL; they use `KeyProvider`.
@@ -48,17 +51,95 @@ volume. Official drivers never put keys in a URL; they use `KeyProvider`.
 WAL and UNDO DEKs are still generated per log and wrapped under the **master**
 when an `Envelope` is in use, so rotating the page DEK does not brick recovery.
 
+### Recovery keys
+
+A database sealed under exactly one root unlock key makes that one file a
+single point of total, unrecoverable data loss. A **recovery key** is an
+optional second AES-256 key that seals the *same* KEK, so either key opens the
+database and neither one is a single point of failure.
+
+It is generated once, exported to a file the operator stores offline, and
+never retained by the server — only the sealed blob reaches the keystore.
+This is not escrow, not a password, and not a backdoor: losing both keys is
+still unrecoverable, exactly as `NO KEY = NO RECOVERY` says.
+
+```text
+nextsql key status          --data-dir DIR [--json]
+nextsql key add-recovery    --data-dir DIR --key-file FILE --recovery-key-out FILE
+nextsql key verify-recovery --data-dir DIR --recovery-key FILE
+nextsql key remove-recovery --data-dir DIR --key-file FILE --confirm
+nextsql key recover         --data-dir DIR --recovery-key FILE --key-file-out FILE --confirm
+```
+
+Each deployment has two independently sealed keystores, and losing either root
+is fatal on its own, so `--keystore database|instance` selects which one a
+command acts on (`database` is the default; `instance` is the deployment
+registry, whose root is `--instance-key-file`). `nextsql key status` reports
+both without needing any key at all — it is the command for an operator who
+does not yet know which keys they still hold.
+
+Properties that matter:
+
+- **Opt-in, and reversible.** A keystore is written as `NSKS` v1 until a
+  recovery key is configured, and returns to v1 when one is removed. A
+  database that never opted in is byte-identical to what a release predating
+  the format wrote, so configuring recovery for one database does not strand
+  any other on rollback. Opting in *is* a one-way door with respect to
+  releases that only understand v1, which is why it is an explicit action.
+- **Exported key files are typed.** A recovery key file is `NSRK`, not `NSKY`,
+  so handing one to `--key-file` (or the reverse) fails naming the file it
+  actually got rather than reporting an indistinguishable unlock failure.
+- **Recovery does not consume the recovery key.** `nextsql key recover` opens
+  the keystore with the recovery key and adopts a freshly generated root; the
+  recovery key still works afterwards, because it seals the KEK and the KEK
+  did not change. Any previous root key file stops working.
+- **A recovery-unlocked envelope is rootless.** It can read and write data,
+  but every operation that rewrites key material fails closed until a new root
+  is adopted — it cannot re-seal a root wrap it holds no root for.
+- **KEK rotation fails closed.** The recovery wrap seals the current KEK and
+  the server never holds the recovery key, so `RotateKEK` refuses while one is
+  configured rather than silently discarding the operator's only backup unlock
+  path. `RotateKEKWithRecovery` is the deliberate alternative and re-seals in
+  the same operation. Root, master and domain rotations do not touch the KEK
+  and leave the recovery path intact.
+- **Presence is visible, material is not.** `nextsql diagnose` reports
+  `keystore_version`, and `KeyStatus` reports a `recovery` row with its
+  version. Neither ever exposes the sealed blob or the key.
+
+Store the recovery key on separate, backed-up media, not beside the root key
+and not on the data volume; the CLI warns when it writes one inside the data
+directory it unlocks.
+
+**At install time.** `nextsql setup --recovery-key-out FILE` exports a recovery
+key for *both* keystores as part of a first install — the database keystore at
+`FILE` and the deployment registry's at `FILE.instance`
+(`--instance-recovery-key-out` relocates the second; it never selects one
+keystore alone, because losing either root is fatal by itself). The export is
+planned before anything is written, so `--dry-run` refuses exactly what a real
+run would (an output path that already exists, or two key paths naming one
+file), it is sealed after `nextsql init` created the keystores and before the
+config is written, and a failure rolls the whole install back rather than
+handing over a database the operator believes is recoverable. Each exported
+file is verified twice — once against the live envelope, then by reopening the
+keystore with the bytes actually written, which is the operation the operator
+will perform in a disaster. `--recovery-key-out` is rejected with
+`--skip-init`: no keystore exists yet for one to seal, so run
+`nextsql key add-recovery` once the database does. Without the flag, setup
+warns that the root unlock key is the deployment's only way in. NextSQL Admin's
+Setup mode offers the same export, on by default, and holds its Finish button
+until the operator confirms both files were copied offline.
+
 ### Deployment registry root
 
 Newly initialized deployments also generate a separate external registry root
 at `--instance-key-file` (default `--key-file.instance`). It unlocks the
 independent `nextsql.instance.keys` envelope and encrypted `nextsql.instance`
 registry; it is not a user password or a database DEK. Keep it off the data
-volume with the database root. The current M1 foundation registers and verifies
-only the default database. Realm-specific authentication and multiple routed
-database engines remain unimplemented.
+volume with the database root. The registry records the deployment's one
+database; multi-realm/multi-database hosting was removed, so there is nothing
+else for it to route to.
 
-`nextsql hosting adopt --confirm` is offline and fail-closed. It acquires the
+`nextsql registry adopt --confirm` is offline and fail-closed. It acquires the
 same exclusive data-directory lock held for the lifetime of `nextsqld`, opens
 the existing database with its current root, verifies storage/keystore
 identity, and only then creates or resumes the encrypted registry. It does not
@@ -137,27 +218,26 @@ Arbitrary server-side predicates, joins, `SEARCH`, and `NEAREST` over strongly
 client-encrypted values are incompatible with that contract. NextSQL will not
 pretend otherwise.
 
-### Field-level client encryption (experimental)
+### Field-level client encryption
 
 ```sql
 CREATE TABLE accounts (
     id UUID PRIMARY KEY,
     email STRING,
-    ssn STRING ENCRYPTED CLIENT
+    ssn STRING ENCRYPTED CLIENT,
+    lookup_email TEXT ENCRYPTED CLIENT DETERMINISTIC
 );
 ```
 
-`ENCRYPTED CLIENT` columns are opaque ciphertext to the server. Equality on a
-deterministic wrap, if ever offered, is searchable encryption and leaks
-equality. That leakage will be documented on the statement that introduces it.
-The randomized `NSCE1.` AES-256-GCM envelope, SQL/catalog/server path, and Go,
-Node.js/TypeScript, Bun, and PHP driver helpers are implemented. The
-server permits opaque storage and bare projection but rejects predicates,
-expressions, indexes, search, grouping, and ordering. PITR and replication/
-failover are now tested (exact-ciphertext restore-to-target-LSN; no lost
-acknowledged ciphertext across leader failover); durable key-rotation/
-revocation KMS lifecycle remains open, so the capability is experimental
-rather than production-gated. See
+`ENCRYPTED CLIENT` columns are opaque ciphertext to the server. Randomized
+`NSCE1.` uses AES-256-GCM and rejects predicates/indexes. Explicit
+`DETERMINISTIC` columns use `NSCE2.` RFC 5297 AES-SIV with an HKDF-SHA256
+domain-separated key and allow only equality/inequality against a
+client-encrypted parameter, NULL tests, and direct ordinary B-tree/UNIQUE
+indexes. This leaks equality and frequency within one key/context; ranges,
+joins, expressions, ordering/grouping, and all general search remain rejected.
+Go, Node.js/TypeScript, Bun, and PHP helpers, rotation/revocation, fuzz, PITR,
+and three-voter failover coverage are implemented and production-gated. See
 [`client-encryption.md`](client-encryption.md) for the format, leakage,
 rotation, revocation, backup, and context-migration contract.
 
@@ -208,18 +288,16 @@ Row-level shared tenancy has been removed. `SET TENANT`, `RESET TENANT`, and
 `tenant_id` predicate, rewrite writes, or allow a client-selected row security
 context.
 
-The supported isolation direction is an immutable connection binding to one
-hosted realm and database. Provision the realm/database with `nextsql init` (or
-explicitly adopt an existing default database with `nextsql hosting adopt`),
-and authenticate with a database user whose RBAC grants are scoped to that
-database. Realm/database routing is a security boundary only when the registry,
-authentication, authorization, and database handle all resolve the same stable
-IDs; routing alone never grants access.
+The supported isolation direction is a whole deployment: one process, one
+database, its own files, keys, users and ACL. Provision it with `nextsql init`
+(or explicitly adopt an existing database with `nextsql registry adopt`), and
+authenticate with a database user whose RBAC grants are scoped to that
+database. A Hello naming any other database or realm is rejected — there is
+nothing to route to, and rejection is folded into the same generic
+authentication failure so it cannot be used to enumerate names.
 
-The current hosting slice provides the encrypted deployment registry and a
-registered default realm/database. The server still opens only that registered
-default database, so additional live database routing must not be advertised as
-shipped yet.
+`nextsqld` refuses to start against a registry that describes more than one
+database, rather than serving one and leaving the rest silently unreachable.
 
 For safe upgrades, a `UUID`, `STRING`, or `TEXT` column named `tenant_id` is
 recognized as a legacy shared-tenant marker:
@@ -489,7 +567,7 @@ verification otherwise.
 
 Claims: signing-key id, a random 16-byte token id (for revocation), issued-at /
 not-before / expires-at (second precision), the native `principal`, and
-optional `audience`, `database`, `realm`, and role scopes.
+optional `audience`, `database`, and role scopes (a `realm` claim is reserved and unused).
 
 Verification (`internal/auth`, `TokenVerifier`) fails closed on: a bad or
 retired signing key, an invalid signature, `now` outside
@@ -602,7 +680,7 @@ introspection, and JIT principal provisioning — all remain off by default.
 | Token expiration | yes | yes | yes | yes — not-before/expires-at with skew; `TestTokenExpiry`, `TestTokenNotYetValid`, `TestTokenMaxLifetime`, `TestShortLivedCredentialExpiryClosesSession` |
 | Token audience/database scope | yes | yes | yes | yes — `token_audience` match + served-database match; `TestTokenAudienceMismatch`, `TestShortLivedCredentialAudienceMismatch` |
 | Token role scope | yes | yes | yes | yes — `ACL.AllowedScoped`, no-escalation guard; `TestACLAllowedScoped`, `TestShortLivedCredentialRoleScope` |
-| Token realm/database scope | yes | yes | yes | yes — surfaced on claims; database enforced server-side, realm carried for hosted routing |
+| Token database scope | yes | yes | yes | yes — surfaced on claims and enforced server-side; the realm claim is reserved and unused (multi-realm hosting was removting |
 | Token signing-key rotation | yes | yes | yes | yes — `NSTK` keyset, current/retired, overlap; `TestTokenKeyRotationOverlap`, `TestTokenKeysetReloadLastKnownGood` |
 | Token revocation | yes | yes | yes | yes — `NSTR` token-id + principal-cutoff, `SIGHUP` reload; `TestRevokeByTokenID`, `TestRevokePrincipalCutoff`, `TestShortLivedCredentialRevoked` |
 | Token audit | yes | yes | yes | yes — `identity_source` `token`/`mtls+token`; `token.reload` security setting event |
@@ -611,15 +689,15 @@ introspection, and JIT principal provisioning — all remain off by default.
 | IdP-to-NextSQL principal mapping | yes | yes | yes | yes — `NSIP` issuer-scoped subject rules + transforms + login-charset check, consumed by the broker; `internal/auth/identitypolicy_test.go`, `FuzzDecodeIdentityPolicy`, `FuzzMapClaims`, `TestExchangeHappyPathMintsVerifiableCredential` |
 | External auth remains behind RBAC | yes | yes | yes | yes — every server enforces `ACL.AllowedScoped`; embedded mode also checks the live native user and direct/transitive ACL membership before minting, with empty intersection denial and immediate revocation behavior (`TestExchangeRBACIntersection`, `TestEmbeddedAuthBrokerUsesLiveNativeMembership`) |
 | IdP group/role mapping | yes | yes | yes | yes — `NSIP` literal + RE2 `${n}` group→role mappings, 16-role cap, empty ⇒ deny, consumed by the broker; `TestIdentityPolicyGroupRegexCapture`, `TestIdentityPolicyRoleCapDenies`, `TestExchangeRejections` (unmapped groups/subject ⇒ deny) |
-| `ENCRYPTED CLIENT` | yes | yes | yes | yes — every item-level blocker, including durable key rotation/revocation, is closed; see `docs/client-encryption.md` "Production-gating sign-off (Phase 25)" — `NSCT` v11; parser/catalog/binder/executor tests |
+| `ENCRYPTED CLIENT` | yes | yes | yes | yes — randomized `NSCE1` plus explicit deterministic `NSCE2`; durable key rotation/revocation; see `docs/client-encryption.md` "Production-gating sign-off" — `NSCT` v13; parser/catalog/binder/executor tests |
 | Official-driver field encryption | yes | yes | yes | yes — Go, Node.js/TypeScript, Bun, and PHP provider/keyring/encrypt/decrypt helpers; Go↔non-Go portability fixtures |
-| Server-opaque client fields | yes | yes | yes | yes — server structurally validates/stores `NSCE1.` but has no field key; encrypted restart/plaintext-scan test |
-| Searchable-encryption leakage contract | yes | no search mode | yes | yes — randomized envelope; predicates/index/search/order/group/distinct/set operations fail closed; leakage documented |
+| Server-opaque client fields | yes | yes | yes | yes — server structurally validates/stores `NSCE1.`/`NSCE2.` but has no field key; encrypted restart/plaintext-scan test |
+| Deterministic-equality leakage contract | yes | yes | yes | yes — explicit opt-in only; equality/frequency leakage documented; plaintext/range/join/general-search paths fail closed |
 | Field-key rotation | yes | yes | yes | yes — `FileFieldKeyring` (Go/Node/Bun/PHP): atomic, versioned, 0600 `NSFK1` file; overlap reads after rotation persist across restart; cross-driver format interop |
 | Field-key revocation | yes | yes | yes | yes — revoked material zeroed on disk, revoked ids fail closed and can never be reused, current key cannot be revoked directly |
-| Field wrong-key/tamper behavior | yes | yes | yes | yes — GCM/context/type/revocation tests + `FuzzInspect` |
-| Field backup/restore/PITR | yes | yes | yes | yes — `TestEncryptedClientPITRRestoresExactCiphertextAtTarget`: base backup + archived WAL restored to a target LSN before a later `UPDATE` retains `TEXT ENCRYPTED CLIENT`, returns the exact pre-target ciphertext, excludes the later write, decrypts only via the client helper |
-| Field replication/failover | yes | yes | yes | yes — `TestHAEncryptedClientCiphertextSurvivesLeaderFailover`: three-voter cluster confirms identical ciphertext on every replica, no lost acknowledged ciphertext across a leader kill/failover, and correct post-failover replication + decrypt on the remaining follower |
+| Field wrong-key/tamper behavior | yes | yes | yes | yes — GCM and SIV context/type/revocation tests + `FuzzInspect` |
+| Field backup/restore/PITR | yes | yes | yes | yes — `TestEncryptedClientPITRRestoresExactCiphertextAtTarget`: base backup + archived WAL restore preserves exact pre-target `NSCE1` and `NSCE2`, excludes later writes, and retains v13 mode metadata |
+| Field replication/failover | yes | yes | yes | yes — `TestHAEncryptedClientCiphertextSurvivesLeaderFailover`: three-voter cluster confirms identical `NSCE1`/`NSCE2` on every replica, no lost acknowledged ciphertext across leader loss, and correct post-failover replication + decrypt |
 | Argon2id migration evaluation | yes | yes | yes | yes — `golang.org/x/crypto/argon2`, time 1 / memory 64 MiB / parallelism 4; every new record uses it |
 | Per-record password-hash versions | yes | yes | yes | yes — `NSAU` v2 adds a per-record algorithm byte (PBKDF2 or Argon2id); `TestNewRecordsAreArgon2idFromCreation` |
 | PBKDF2 backward compatibility | yes | yes | yes | yes — `NSAU` v1 files still decode; `Encode` always writes v2; `TestV1FormatDecodesAndVerifies` |
@@ -632,12 +710,13 @@ introspection, and JIT principal provisioning — all remain off by default.
 
 | Limit | Value |
 |---|---|
-| Packet | 1 MiB |
-| SQL text | 1 MiB |
+| Packet | 64 MiB configurable; 64 MiB ceiling |
+| SQL text | 16 MiB configurable; 64 MiB ceiling |
 | JSON depth | 32 |
 | JSON size | 1 MiB |
 | Vector dimension | 8192, finite elements |
 | LINESTRING / POLYGON vertices | 256 |
+| GEOMETRY / GEOGRAPHY vertices / nesting / parts | 65,536 / 8 / 4,096 |
 | JOIN tables | 8 (FROM + up to seven INNER / LEFT / RIGHT / FULL / CROSS JOINs) |
 | Foreign keys per table | 16 |
 | Columns per foreign key | 8 |
@@ -679,7 +758,7 @@ vulnerability.
 | Audit | JSON lines mode `0600`. `Redact` strips password / secret / token / key-like fields |
 | TLS | TLS 1.3 required for non-loopback `nextsqld` listen addresses |
 | Wire limits | Packet, SQL, name, session, and result sizes checked before allocate |
-| Realm/database isolation | Current server binds one registered default database; legacy `tenant_id` tables fail closed for non-ADMIN and are migration-only |
+| Database isolation | A deployment serves exactly one database; legacy `tenant_id` tables fail closed for non-ADMIN and are migration-only |
 | RBAC | Least privilege. `authorize` fails closed on any unlisted statement type |
 | Live host | An unlocked `nextsqld` process has keys in RAM. Documented; not claimed otherwise |
 
@@ -705,22 +784,21 @@ an external third-party audit.
 | Surface | Result |
 |---|---|
 | mTLS / service identity | `RequireAndVerifyClientCert` under TLS 1.3; the verified leaf's URI SAN must equal the native login user; native password + RBAC stay mandatory on top — mTLS narrows, never replaces, authorization |
-| Certificate rotation / revocation | Atomic `SIGHUP` last-known-good reload; a successful mTLS reload closes every accepted connection (including in-flight handshakes) to force reauthentication; X.509 CRLs are signature/time/full-chain checked and fail closed on a revoked serial. OCSP is a documented non-goal, not a silent gap |
+| Certificate rotation / revocation | Atomic `SIGHUP` last-known-good reload; a successful mTLS reload closes every accepted connection (including in-flight handshakes) to force reauthentication; X.509 CRLs and OCSP status checks (stapled and AIA responder with bounded cache and timeout) are signature/time/full-chain checked and fail closed under `--tls-ocsp-mode=enforce` |
 | Short-lived credentials | Ed25519-signed, presented in the existing password slot (no new attack surface on the wire format); bounded lifetime (60 s skew, 24 h default / 30 d ceiling max), audience/database/realm/role scope, `NSTK` rotation overlap, `NSTR` fail-closed revocation by id or principal cutoff |
-| External IdP (OIDC) | The SQL auth path never parses OIDC and makes no outbound HTTP — it only ever receives an ordinary `NSSC1.` credential from the broker. The broker verifies signatures against a bounded/rate-limited JWKS cache (alg-allowlist rejects `none` and MAC), rejects replay, and maps through `NSIP`, whose result is *intersected* with the principal's real RBAC membership — a compromised or misconfigured IdP mapping can subtract roles, never grant one the principal doesn't already hold |
-| Field-level client encryption | The server never holds a field key: it stores and structurally validates opaque `NSCE1.` ciphertext only. Predicates, joins, expressions, indexes, `SEARCH`, `GROUP BY`/`ORDER BY`/`DISTINCT`, set operations, and any context-changing rename/partition/migration on an encrypted column fail closed rather than silently degrading. No searchable/deterministic mode ships, so there is no query-observable ciphertext-equality leakage to reason about |
+| External IdP (OIDC) | The SQL auth path never parses OIDC and makes no outbound HTTP — it only ever receives an ordinary `NSSC1.` credential from the broker. The broker verifies signatures against a bounded/rate-limited JWKS cache (alg-allowlist rejects `none` and MAC), supports RFC 7662 opaque token introspection via bounded POST with 0600 secret files, rejects replay, maps through `NSIP`, and supports bounded JIT principal provisioning strictly constrained by role boundaries and admin prohibition |
+| Field-level client encryption | The server never holds a field key: it stores and structurally validates opaque `NSCE1.` (randomized AES-256-GCM) and `NSCE2.` (HKDF-separated RFC 5297 AES-SIV) ciphertexts. Randomized columns reject predicates/indexes. Deterministic columns explicitly expose equality/frequency and allow only ciphertext-parameter equality/inequality, NULL tests, and direct B-tree/UNIQUE indexes. Joins, expressions, ranges, general search, ordering/grouping, and context-changing rename/partition/migration fail closed |
 | Password hashing | Every new record is Argon2id (64 MiB / time 1 / parallelism 4); a correct legacy PBKDF2 verify transparently upgrades in place; a failed verify never rehashes, so a wrong-password guess cannot force extra server-side work beyond one Argon2id-equivalent hash |
 | Audit chain | Hash-chained by default; an operator who additionally configures a signing keyset gets records that cannot be forged without the private key. Documented and not silently overclaimed: neither the unsigned chain nor per-record signatures alone prove a valid final suffix wasn't deleted — that needs an external WORM/transparency system, which this feature does not provide |
 | Live host | Unchanged from P16: an unlocked `nextsqld` process, an active signing keyset, and a live OIDC broker all hold key material in RAM for the life of the process. Documented; not claimed otherwise |
 
-Explicit non-goals carried forward from the individual item tables, not
-tracked as gaps: OCSP; optional OIDC opaque-token introspection; JIT
-principal provisioning; searchable/deterministic client-side encryption;
+Explicit non-goals carried forward: searchable client-side encryption;
+multi-primary writes (single-leader Raft consensus preserved);
 suffix-truncation detection on a local audit file without an external
 append-only system.
 
 No critical production defect is tracked as open after this review. P25's
 implementable scope and this sign-off together close the P25 phase-wide exit
 gate; see `TODO.md` "Phase 25 exit gate" and `docs/client-encryption.md`
-"Production-gating sign-off (Phase 25)" for the `ENCRYPTED CLIENT`-specific
+"Production-gating sign-off" for the `ENCRYPTED CLIENT`-specific
 consequence of this gate closing.

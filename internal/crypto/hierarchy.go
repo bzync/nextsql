@@ -38,6 +38,13 @@ type Envelope struct {
 	nonceHigh uint64
 	shredded  bool
 	listeners []func(RevokeEvent)
+
+	// recoveryWrap is the KEK sealed under the operator's recovery key, or
+	// nil when no recovery key is configured. It is ciphertext, not key
+	// material: the recovery key itself is never held here, which is why
+	// RotateKEK cannot re-wrap it on its own (see RotateKEKWithRecovery).
+	recoveryVersion format.KeyVersion
+	recoveryWrap    []byte
 }
 
 type domainRing struct {
@@ -109,6 +116,7 @@ func OpenEnvelope(path string, root *DEK) (*Envelope, error) {
 		return nil, err
 	}
 	e := &Envelope{path: path, persist: ks, ident: ks.Identity, nonceHigh: ks.NonceHigh}
+	e.adoptRecoveryLocked(ks)
 	if err := e.unlockLocked(root); err != nil {
 		return nil, err
 	}
@@ -122,7 +130,17 @@ func OpenLocked(path string) (*Envelope, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Envelope{path: path, persist: ks, ident: ks.Identity, nonceHigh: ks.NonceHigh}, nil
+	e := &Envelope{path: path, persist: ks, ident: ks.Identity, nonceHigh: ks.NonceHigh}
+	e.adoptRecoveryLocked(ks)
+	return e, nil
+}
+
+// adoptRecoveryLocked copies the persisted recovery wrap into the live
+// envelope. Called from every constructor and from unlockLocked so a
+// rebuildPersistLocked cannot drop a configured recovery key on the floor.
+func (e *Envelope) adoptRecoveryLocked(ks keystore) {
+	e.recoveryVersion = ks.RecoveryVersion
+	e.recoveryWrap = append([]byte(nil), ks.WrappedRecovery...)
 }
 
 func (e *Envelope) Path() string { return e.path }
@@ -264,6 +282,13 @@ func (e *Envelope) unlockLocked(root *DEK) error {
 	if err != nil {
 		return nerr.New(nerr.Crypto, "crypto.Envelope.Unlock", "root does not unlock keystore")
 	}
+	return e.unlockWithKEKLocked(kek, root)
+}
+
+// unlockWithKEKLocked completes an unlock once the KEK has been recovered,
+// whether that came from the root wrap or the recovery wrap. A nil root
+// leaves the envelope readable but rootless: see rebuildPersistLocked.
+func (e *Envelope) unlockWithKEKLocked(kek, root *DEK) error {
 	master, err := UnwrapDEK(kek, e.persist.WrappedMaster, DomainMaster)
 	if err != nil {
 		return err
@@ -288,12 +313,17 @@ func (e *Envelope) unlockLocked(root *DEK) error {
 		}
 		rings[d.Domain] = r
 	}
-	e.root = root.clone()
+	if root != nil {
+		e.root = root.clone()
+	} else {
+		e.root = nil
+	}
 	e.kek = kek
 	e.master = master
 	e.rings = rings
 	e.ident = e.persist.Identity
 	e.nonceHigh = e.persist.NonceHigh
+	e.adoptRecoveryLocked(e.persist)
 	return nil
 }
 
@@ -415,6 +445,11 @@ func (e *Envelope) KeyStatus() ([]KeyStatus, error) {
 		KeyStatus{Domain: "kek", CurrentVersion: e.kek.Version, VersionCount: 1},
 		KeyStatus{Domain: "master", CurrentVersion: e.master.Version, VersionCount: 1},
 	)
+	if len(e.recoveryWrap) != 0 {
+		// Presence and version only. The recovery key itself is not held by
+		// this process and its sealed blob is never reported.
+		out = append(out, KeyStatus{Domain: "recovery", CurrentVersion: e.recoveryVersion, VersionCount: 1})
+	}
 	for _, d := range AllDomains {
 		ring, ok := e.rings[d]
 		if !ok {
@@ -439,19 +474,46 @@ func (e *Envelope) KeyStatus() ([]KeyStatus, error) {
 }
 
 // RotateKEK generates a new KEK and re-wraps the master. Domain DEKs are unchanged.
+//
+// It fails closed when a recovery key is configured: the recovery wrap seals
+// the *current* KEK, and this envelope never holds the recovery key, so it
+// cannot re-seal the new one. Silently dropping the wrap would destroy the
+// operator's only backup unlock path without saying so. Supply the recovery
+// key to RotateKEKWithRecovery, or remove it first.
 func (e *Envelope) RotateKEK() error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	if len(e.recoveryWrap) != 0 {
+		return nerr.New(nerr.InvalidArgument, "crypto.Envelope.RotateKEK",
+			"a recovery key seals the current KEK; use RotateKEKWithRecovery or RemoveRecoveryKey first")
+	}
+	return e.rotateKEKLocked(nil)
+}
+
+// rotateKEKLocked installs a fresh KEK. When rec is non-nil the new KEK is
+// re-sealed under it in the same operation, so the recovery path is never
+// left pointing at a superseded KEK.
+func (e *Envelope) rotateKEKLocked(rec *DEK) error {
 	if err := e.requireUnlockedLocked(); err != nil {
 		return err
 	}
-	next := e.kek.Version + 1
-	kek, err := GenerateDEK(next)
+	kek, err := GenerateDEK(e.kek.Version + 1)
 	if err != nil {
 		return err
 	}
-	e.kek.Zero()
+	var wrap []byte
+	if rec != nil {
+		if wrap, err = WrapDEK(rec, kek, DomainKEK); err != nil {
+			kek.Zero()
+			return err
+		}
+	}
+	old := e.kek
 	e.kek = kek
+	if rec != nil {
+		e.recoveryVersion, e.recoveryWrap = rec.Version, wrap
+	}
+	old.Zero()
 	return e.persistAndWriteLocked()
 }
 
@@ -472,7 +534,14 @@ func (e *Envelope) RotateMaster() error {
 	return e.persistAndWriteLocked()
 }
 
-// RotateRoot re-wraps the KEK under a new external root. The caller must persist the new root off the data volume.
+// RotateRoot re-wraps the KEK under a new external root. The caller must
+// persist the new root off the data volume.
+//
+// It is also how a recovery-unlocked envelope (UnlockWithRecovery, which
+// leaves no root loaded) is given a root again: that is the whole point of
+// the recovery key, so a missing prior root is not an error here. Any
+// configured recovery wrap survives untouched — it seals the KEK, which this
+// does not change.
 func (e *Envelope) RotateRoot(newRoot *DEK) error {
 	if newRoot == nil {
 		return nerr.New(nerr.InvalidArgument, "crypto.Envelope.RotateRoot", "nil root unlock key")
@@ -482,7 +551,9 @@ func (e *Envelope) RotateRoot(newRoot *DEK) error {
 	if err := e.requireUnlockedLocked(); err != nil {
 		return err
 	}
-	e.root.Zero()
+	if e.root != nil {
+		e.root.Zero()
+	}
 	e.root = newRoot.clone()
 	return e.persistAndWriteLocked()
 }
@@ -622,8 +693,16 @@ func (e *Envelope) persistAndWriteLocked() error {
 }
 
 func (e *Envelope) rebuildPersistLocked() error {
-	if e.root == nil || e.kek == nil || e.master == nil {
+	if e.kek == nil || e.master == nil {
 		return nerr.New(nerr.Internal, "crypto.Envelope", "cannot persist a locked envelope")
+	}
+	if e.root == nil {
+		// Reachable only after UnlockWithRecovery: the envelope can read and
+		// write data, but it cannot rewrite its own root wrap because it does
+		// not hold a root. Fail closed and name the fix rather than persisting
+		// a keystore whose root wrap no longer matches its contents.
+		return nerr.New(nerr.Unauthorized, "crypto.Envelope",
+			"envelope was unlocked with the recovery key; set a new root unlock key with RotateRoot before changing keys")
 	}
 	wrappedKEK, err := WrapDEK(e.root, e.kek, DomainKEK)
 	if err != nil {
@@ -640,6 +719,9 @@ func (e *Envelope) rebuildPersistLocked() error {
 		NonceHigh:     e.nonceHigh,
 		WrappedKEK:    wrappedKEK,
 		WrappedMaster: wrappedMaster,
+
+		RecoveryVersion: e.recoveryVersion,
+		WrappedRecovery: append([]byte(nil), e.recoveryWrap...),
 	}
 	for _, d := range AllDomains {
 		r := e.rings[d]

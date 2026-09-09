@@ -7,14 +7,31 @@ import (
 	"github.com/bzync/nextsql/internal/nerr"
 	"github.com/bzync/nextsql/internal/storage/checksum"
 	"github.com/bzync/nextsql/internal/storage/format"
+	"github.com/bzync/nextsql/internal/upgrade/compat"
 )
 
 const (
-	keystoreMagic   = "NSKS"
-	keystoreVersion = 1
-	shredMagic      = "NSSH"
-	maxWrapBlob     = 1 << 16
-	maxDomainKeys   = 256
+	keystoreMagic = "NSKS"
+	// keystoreV1 is the original layout: the KEK is wrapped exactly once,
+	// under the external root unlock key.
+	keystoreV1 = 1
+	// keystoreV2 adds a second, independent wrap of the same KEK under an
+	// operator-held recovery key, so losing the root key file is survivable.
+	// It is written only once a recovery key has actually been configured
+	// (see encodeKeystore), which keeps a database that never opted in
+	// byte-identical to what releases predating this format wrote and can
+	// still read. Opting in is therefore also the point of no return for
+	// rolling back to such a release.
+	keystoreV2    = 2
+	shredMagic    = "NSSH"
+	maxWrapBlob   = 1 << 16
+	maxDomainKeys = 256
+
+	// keystoreV1MinSize / keystoreV2MinSize are loose lower bounds used to
+	// reject an obviously truncated file before any field is read.
+	keystoreV1MinSize = 62
+	// v2 adds a u32 recovery key version and a u16-prefixed wrap.
+	keystoreV2MinSize = keystoreV1MinSize + 4 + 2
 )
 
 type keystore struct {
@@ -24,8 +41,13 @@ type keystore struct {
 	NonceHigh     uint64
 	WrappedKEK    []byte
 	WrappedMaster []byte
-	Domains       []persistedDomain
-	Shredded      bool
+	// RecoveryVersion and WrappedRecovery are the v2 recovery wrap: the same
+	// KEK as WrappedKEK, encrypted under the operator's recovery key instead
+	// of the root. Zero and empty when no recovery key is configured.
+	RecoveryVersion format.KeyVersion
+	WrappedRecovery []byte
+	Domains         []persistedDomain
+	Shredded        bool
 }
 
 type persistedDomain struct {
@@ -47,7 +69,20 @@ func encodeKeystore(ks keystore) ([]byte, error) {
 	if len(ks.Domains) > len(AllDomains)+2 {
 		return nil, nerr.New(nerr.InvalidFormat, "crypto.encodeKeystore", "too many domains")
 	}
+	if len(ks.WrappedRecovery) > maxWrapBlob {
+		return nil, nerr.New(nerr.InvalidFormat, "crypto.encodeKeystore", "wrapped key too large")
+	}
+	// The recovery wrap is what makes this a v2 keystore. A keystore with no
+	// recovery key configured is still written as v1, byte-for-byte what a
+	// release predating this format wrote, so opting out preserves rollback.
+	version := keystoreV1
+	if len(ks.WrappedRecovery) > 0 {
+		version = keystoreV2
+	}
 	n := 4 + 2 + 2 + 32 + 4 + 4 + 8 + 2 + len(ks.WrappedKEK) + 2 + len(ks.WrappedMaster) + 2
+	if version >= keystoreV2 {
+		n += 4 + 2 + len(ks.WrappedRecovery)
+	}
 	for _, d := range ks.Domains {
 		n += 1 + 4 + 2
 		if len(d.Keys) > maxDomainKeys {
@@ -63,7 +98,7 @@ func encodeKeystore(ks keystore) ([]byte, error) {
 	n += 4
 	buf := make([]byte, n)
 	copy(buf[0:4], keystoreMagic)
-	encoding.PutU16(buf, 4, keystoreVersion)
+	encoding.PutU16(buf, 4, uint16(version))
 	encoding.PutU16(buf, 6, 0)
 	copy(buf[8:24], ks.Identity.Database[:])
 	copy(buf[24:40], ks.Identity.File[:])
@@ -78,6 +113,14 @@ func encodeKeystore(ks keystore) ([]byte, error) {
 	off += 2
 	copy(buf[off:], ks.WrappedMaster)
 	off += len(ks.WrappedMaster)
+	if version >= keystoreV2 {
+		encoding.PutU32(buf, off, uint32(ks.RecoveryVersion))
+		off += 4
+		encoding.PutU16(buf, off, uint16(len(ks.WrappedRecovery)))
+		off += 2
+		copy(buf[off:], ks.WrappedRecovery)
+		off += len(ks.WrappedRecovery)
+	}
 	encoding.PutU16(buf, off, uint16(len(ks.Domains)))
 	off += 2
 	for _, d := range ks.Domains {
@@ -109,14 +152,21 @@ func decodeKeystore(raw []byte) (keystore, error) {
 	if len(raw) >= 4 && string(raw[0:4]) == shredMagic {
 		return keystore{Shredded: true}, nil
 	}
-	if len(raw) < 62 {
+	if len(raw) < keystoreV1MinSize {
 		return keystore{}, nerr.New(nerr.InvalidFormat, "crypto.decodeKeystore", "truncated keystore")
 	}
 	if string(raw[0:4]) != keystoreMagic {
 		return keystore{}, nerr.New(nerr.InvalidFormat, "crypto.decodeKeystore", "bad keystore magic")
 	}
-	if encoding.U16(raw, 4) != keystoreVersion {
-		return keystore{}, nerr.New(nerr.InvalidFormat, "crypto.decodeKeystore", "unsupported keystore version")
+	version := int(encoding.U16(raw, 4))
+	// The compatibility catalog is the single source of truth for which
+	// keystore versions this binary may open, and it produces the operator
+	// -facing "older/newer than this binary supports" wording.
+	if err := compat.Check(compat.FamilyKeystore, uint16(version)); err != nil {
+		return keystore{}, err
+	}
+	if version >= keystoreV2 && len(raw) < keystoreV2MinSize {
+		return keystore{}, nerr.New(nerr.InvalidFormat, "crypto.decodeKeystore", "truncated keystore")
 	}
 	if err := checksum.Verify(raw, len(raw)-4); err != nil {
 		return keystore{}, nerr.Wrap(nerr.Corruption, "crypto.decodeKeystore", "checksum", err)
@@ -154,6 +204,34 @@ func decodeKeystore(raw []byte) (keystore, error) {
 		return keystore{}, nerr.New(nerr.InvalidFormat, "crypto.decodeKeystore", "truncated master wrap")
 	}
 	off += int(mstLen)
+	if version >= keystoreV2 {
+		recVer, err := encoding.ReadU32(raw, off)
+		if err != nil {
+			return keystore{}, nerr.New(nerr.InvalidFormat, "crypto.decodeKeystore", "truncated recovery key version")
+		}
+		ks.RecoveryVersion = format.KeyVersion(recVer)
+		off += 4
+		recLen, err := encoding.ReadU16(raw, off)
+		if err != nil {
+			return keystore{}, nerr.New(nerr.InvalidFormat, "crypto.decodeKeystore", "truncated recovery wrap")
+		}
+		off += 2
+		if int(recLen) > maxWrapBlob {
+			return keystore{}, nerr.New(nerr.InvalidFormat, "crypto.decodeKeystore", "recovery wrap exceeds limit")
+		}
+		// A v2 keystore is only ever written with a recovery wrap present.
+		// An empty one means the file was truncated or hand-edited into a
+		// state the writer cannot produce; fail closed rather than silently
+		// downgrading the operator to a single unlock path.
+		if recLen == 0 {
+			return keystore{}, nerr.New(nerr.InvalidFormat, "crypto.decodeKeystore", "v2 keystore has no recovery wrap")
+		}
+		ks.WrappedRecovery, err = encoding.ReadBytes(raw, off, int(recLen))
+		if err != nil {
+			return keystore{}, nerr.New(nerr.InvalidFormat, "crypto.decodeKeystore", "truncated recovery wrap")
+		}
+		off += int(recLen)
+	}
 	nd, err := encoding.ReadU16(raw, off)
 	if err != nil {
 		return keystore{}, nerr.New(nerr.InvalidFormat, "crypto.decodeKeystore", "truncated domain count")

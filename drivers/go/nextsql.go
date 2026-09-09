@@ -40,10 +40,10 @@ const (
 type Config struct {
 	Address  string
 	Database string
-	// Realm selects which hosted realm this connection targets (M2-2).
-	// Optional: an empty Realm sends the exact same Hello a pre-realm
-	// client sends and connects to the server's configured default. Set it
-	// only when the server hosts more than one realm.
+	// Realm is reserved and must stay empty. Multi-realm hosting was
+	// removed: a deployment serves exactly one database, and a server
+	// rejects a Hello that names any other realm. The field remains only
+	// because the wire frame's trailing realm slot does.
 	Realm       string
 	User        string
 	Password    string
@@ -579,6 +579,23 @@ type Conn struct {
 	secret uint64
 	lim    protocol.Limits
 	busy   bool
+	// publicErrors records whether the server echoed FlagPublicErrorCodes,
+	// i.e. whether nerr.Error.Public will be populated on errors from this
+	// connection. Decoding never depends on it — an error arrives with or
+	// without the field regardless — so it is diagnostic only.
+	publicErrors bool
+}
+
+// PublicErrorCodes reports whether this connection negotiated the stable ERR_*
+// error taxonomy (docs/error-codes.md). When true, a server error carries
+// nerr.Error.Public alongside the unchanged legacy class.
+func (c *Conn) PublicErrorCodes() bool {
+	if c == nil {
+		return false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.publicErrors
 }
 
 type Result struct {
@@ -670,7 +687,12 @@ func validateConfig(cfg Config) error {
 
 func (c *Conn) handshake() error {
 	payload, err := protocol.EncodeHello(protocol.Hello{
-		Version:  protocol.Version,
+		Version: protocol.Version,
+		// Ask for the stable ERR_* taxonomy. A server that does not
+		// implement it ignores the bit and keeps the v1 error shape,
+		// which this driver still decodes, so the request is safe
+		// against any server version.
+		Flags:    protocol.FlagPublicErrorCodes,
 		Database: c.cfg.Database,
 		User:     c.cfg.User,
 		Realm:    c.cfg.Realm,
@@ -693,6 +715,7 @@ func (c *Conn) handshake() error {
 		return err
 	}
 	c.secret = ok.Secret
+	c.publicErrors = ok.Flags&protocol.FlagPublicErrorCodes != 0
 	authPayload, err := protocol.EncodeAuth(protocol.Auth{Password: c.cfg.Password}, c.lim)
 	if err != nil {
 		return err
@@ -824,6 +847,23 @@ func (c *Conn) EncryptField(ctx context.Context, table, column string, value typ
 	return types.StringValue(ciphertext), nil
 }
 
+// EncryptFieldDeterministic converts one logical value into an NSCE2
+// deterministic ciphertext. Equality and frequency are observable to the
+// server; use only with an explicitly DETERMINISTIC client-encrypted column.
+func (c *Conn) EncryptFieldDeterministic(ctx context.Context, table, column string, value types.Value) (types.Value, error) {
+	if c == nil {
+		return types.Value{}, nerr.New(nerr.InvalidArgument, "nextsql.EncryptFieldDeterministic", "nil connection")
+	}
+	if value.Null {
+		return types.Null(types.String()), nil
+	}
+	ciphertext, err := clientenc.EncryptDeterministic(ctx, c.cfg.FieldKeys, c.cfg.Database, table, column, value)
+	if err != nil {
+		return types.Value{}, err
+	}
+	return types.StringValue(ciphertext), nil
+}
+
 // DecryptField authenticates one opaque result value and returns its logical
 // SQL value. expected is checked against the authenticated envelope type.
 func (c *Conn) DecryptField(ctx context.Context, table, column string, expected types.Type, value types.Value) (types.Value, error) {
@@ -847,6 +887,30 @@ func (c *Conn) DecryptField(ctx context.Context, table, column string, expected 
 		return types.Value{}, nerr.New(nerr.InvalidFormat, "nextsql.DecryptField", "encrypted logical type mismatch")
 	}
 	return clientenc.Decrypt(ctx, c.cfg.FieldKeys, c.cfg.Database, table, column, value.Str)
+}
+
+// DecryptFieldDeterministic authenticates one NSCE2 result value.
+func (c *Conn) DecryptFieldDeterministic(ctx context.Context, table, column string, expected types.Type, value types.Value) (types.Value, error) {
+	if c == nil {
+		return types.Value{}, nerr.New(nerr.InvalidArgument, "nextsql.DecryptFieldDeterministic", "nil connection")
+	}
+	if !clientenc.SupportedType(expected) {
+		return types.Value{}, nerr.New(nerr.InvalidArgument, "nextsql.DecryptFieldDeterministic", "unsupported client-encrypted type")
+	}
+	if value.Null {
+		return types.Null(expected), nil
+	}
+	if value.Typ.Kind != types.KindString && value.Typ.Kind != types.KindText {
+		return types.Value{}, nerr.New(nerr.InvalidFormat, "nextsql.DecryptFieldDeterministic", "client ciphertext is not a string")
+	}
+	h, err := clientenc.Inspect(value.Str)
+	if err != nil {
+		return types.Value{}, err
+	}
+	if h.Mode != clientenc.ModeDeterministic || !h.LogicalType.Equals(expected) {
+		return types.Value{}, nerr.New(nerr.InvalidFormat, "nextsql.DecryptFieldDeterministic", "encrypted mode or logical type mismatch")
+	}
+	return clientenc.DecryptDeterministic(ctx, c.cfg.FieldKeys, c.cfg.Database, table, column, value.Str)
 }
 
 func (c *Conn) queryPayload(ctx context.Context, typ protocol.Type, payload []byte) (*Rows, error) {
@@ -1312,7 +1376,12 @@ func unexpected(typ protocol.Type, body []byte, lim protocol.Limits) error {
 		if err != nil {
 			return err
 		}
-		return nerr.New(nerr.Code(em.Code), "nextsql", em.Message)
+		e := nerr.New(nerr.Code(em.Code), "nextsql", em.Message)
+		// Empty unless the server accepted FlagPublicErrorCodes; see
+		// nerr.Error.Public. Code is unchanged either way, so retry
+		// checks that predate the taxonomy keep working.
+		e.Public = em.PublicCode
+		return e
 	}
 	return nerr.New(nerr.Protocol, "nextsql", "unexpected message type")
 }

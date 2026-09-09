@@ -143,6 +143,34 @@ func TestServerHello(t *testing.T) {
 	}
 }
 
+func TestServerLifecycleDetect(t *testing.T) {
+	s, hs := newTestHTTPServer(t, `printf '{"status":"healthy","summary":"ready","config_present":true,"data_file_present":true,"keystore_present":true,"headers_compatible":true}'`)
+	req, _ := http.NewRequest("POST", hs.URL+"/api/v1/lifecycle/detect", bytes.NewBufferString(`{"dataDir":"/data","config":"/etc/nextsql.conf"}`))
+	req.Header.Set(tokenHeader, s.Token())
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("detect: got %d, body %s", resp.StatusCode, body)
+	}
+	var got struct {
+		OK     bool `json:"ok"`
+		Result struct {
+			Status  string `json:"status"`
+			Summary string `json:"summary"`
+		} `json:"result"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatal(err)
+	}
+	if !got.OK || got.Result.Status != "healthy" || got.Result.Summary != "ready" {
+		t.Fatalf("unexpected lifecycle detect result: %+v", got)
+	}
+}
+
 func TestServerPlanAndInstall(t *testing.T) {
 	s, hs := newTestHTTPServer(t, `
 dry=0

@@ -11,7 +11,20 @@ import (
 
 const (
 	FlagCancel uint16 = 1 << 0
+	// FlagPublicErrorCodes is set by a client that understands the stable
+	// ERR_* public error taxonomy (docs/error-codes.md). It is a negotiated
+	// capability rather than a frame-version bump: ReadFrame rejects any
+	// frame whose version is not exactly Version, so bumping that number
+	// would disconnect every existing client instead of upgrading it. A
+	// server that supports the capability echoes this bit in HelloOK.Flags;
+	// a server that does not simply ignores it and keeps the v1 error shape.
+	FlagPublicErrorCodes uint16 = 1 << 1
 )
+
+// ServerFlags is the set of Hello capability bits a server can accept. A bit
+// outside this set is never echoed, so a client can trust an echoed bit to
+// mean the server really implements it.
+const ServerFlags = FlagPublicErrorCodes
 
 type Hello struct {
 	Version  uint16
@@ -29,6 +42,12 @@ type HelloOK struct {
 	Version    uint16
 	AuthMethod uint8
 	Secret     uint64
+	// Flags carries the capability bits from Hello.Flags that this server
+	// accepted. It is an optional trailing field, emitted only when
+	// non-zero, so a HelloOK for a client that requested nothing is
+	// byte-identical to the pre-capability wire shape. See
+	// EncodeHelloOK/DecodeHelloOK.
+	Flags uint16
 }
 
 type Auth struct {
@@ -105,6 +124,13 @@ type CommandComplete struct {
 type ErrorMsg struct {
 	Code    string
 	Message string
+	// PublicCode is the stable ERR_* name for this error
+	// (docs/error-codes.md). It is an optional trailing field, emitted only
+	// to a client that negotiated FlagPublicErrorCodes, so an error sent to
+	// a v1 client is byte-identical to the pre-capability wire shape. Code
+	// keeps its legacy lowercase spelling in both cases: existing clients
+	// branch their retry logic on it, so it is never replaced in place.
+	PublicCode string
 }
 
 func EncodeHello(h Hello, lim Limits) ([]byte, error) {
@@ -161,6 +187,12 @@ func DecodeHello(b []byte, lim Limits) (Hello, error) {
 		if err != nil {
 			return Hello{}, err
 		}
+		// Same canonical-encoding rule as DecodeError: EncodeHello never
+		// writes an empty realm, so an empty one is a second encoding of
+		// the no-realm Hello and is rejected rather than accepted.
+		if h.Realm == "" {
+			return Hello{}, protoErr("empty realm")
+		}
 	}
 	if off != len(b) {
 		return Hello{}, protoErr("trailing hello bytes")
@@ -169,22 +201,41 @@ func DecodeHello(b []byte, lim Limits) (Hello, error) {
 }
 
 func EncodeHelloOK(h HelloOK) []byte {
-	buf := make([]byte, 11)
+	n := 11
+	if h.Flags != 0 {
+		n = 13
+	}
+	buf := make([]byte, n)
 	encoding.PutU16(buf, 0, h.Version)
 	buf[2] = h.AuthMethod
 	encoding.PutU64(buf, 3, h.Secret)
+	// Optional trailing field (see HelloOK.Flags): absent when the server
+	// accepted no capability, which is exactly what a v1 client expects.
+	if h.Flags != 0 {
+		encoding.PutU16(buf, 11, h.Flags)
+	}
 	return buf
 }
 
 func DecodeHelloOK(b []byte) (HelloOK, error) {
-	if len(b) != 11 {
+	if len(b) != 11 && len(b) != 13 {
 		return HelloOK{}, protoErr("bad hello-ok length")
 	}
-	return HelloOK{
+	h := HelloOK{
 		Version:    encoding.U16(b, 0),
 		AuthMethod: b[2],
 		Secret:     encoding.U64(b, 3),
-	}, nil
+	}
+	if len(b) == 13 {
+		h.Flags = encoding.U16(b, 11)
+		// EncodeHelloOK omits the field when no capability was accepted,
+		// so a present-but-zero field is a second encoding of the v1
+		// hello-ok. Same canonical-encoding rule as DecodeError.
+		if h.Flags == 0 {
+			return HelloOK{}, protoErr("empty hello-ok flags")
+		}
+	}
+	return h, nil
 }
 
 func EncodeAuth(a Auth, lim Limits) ([]byte, error) {
@@ -505,7 +556,18 @@ func EncodeError(e ErrorMsg, lim Limits) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return appendU16String(buf, e.Message, lim.MaxName)
+	if buf, err = appendU16String(buf, e.Message, lim.MaxName); err != nil {
+		return nil, err
+	}
+	// Optional trailing field (see ErrorMsg.PublicCode). The server leaves
+	// it empty unless the client negotiated FlagPublicErrorCodes, so this
+	// stays off the wire for a v1 client.
+	if e.PublicCode != "" {
+		if buf, err = appendU16String(buf, e.PublicCode, lim.MaxName); err != nil {
+			return nil, err
+		}
+	}
+	return buf, nil
 }
 
 func DecodeError(b []byte, lim Limits) (ErrorMsg, error) {
@@ -518,10 +580,31 @@ func DecodeError(b []byte, lim Limits) (ErrorMsg, error) {
 	if err != nil {
 		return ErrorMsg{}, err
 	}
+	// Optional trailing field, present only from a server that accepted
+	// FlagPublicErrorCodes (see EncodeError). A client that negotiated the
+	// capability must still tolerate its absence: an older server ignores
+	// the request bit and keeps sending the two-field shape.
+	var public string
+	if off < len(b) {
+		public, off, err = readU16String(b, off, lim.MaxName)
+		if err != nil {
+			return ErrorMsg{}, err
+		}
+		// EncodeError omits the field rather than writing an empty
+		// string, so an empty one here is a second encoding of a value
+		// that already has one. Reject it: one value must have exactly
+		// one encoding, or a peer can vary the bytes of an identical
+		// message. The name itself is deliberately not validated —
+		// docs/error-codes.md requires a client to tolerate an ERR_*
+		// name a newer server defined and this build does not know.
+		if public == "" {
+			return ErrorMsg{}, protoErr("empty public error code")
+		}
+	}
 	if off != len(b) {
 		return ErrorMsg{}, protoErr("trailing error")
 	}
-	return ErrorMsg{Code: code, Message: msg}, nil
+	return ErrorMsg{Code: code, Message: msg, PublicCode: public}, nil
 }
 
 func encodeSQLParams(sql string, params []executor.Param, lim Limits) ([]byte, error) {
@@ -599,12 +682,15 @@ func decodeParams(b []byte, off int, lim Limits) ([]executor.Param, int, error) 
 	return out, off, nil
 }
 
-func errorFrom(err error) ErrorMsg {
-	code := string(nerr.Internal)
+// errorFrom shapes an error for the wire. public reports whether the peer
+// negotiated FlagPublicErrorCodes; only then is the stable ERR_* name added,
+// and only for a documented class (nerr.PublicCodeFor fails closed).
+func errorFrom(err error, public bool) ErrorMsg {
+	class := nerr.Internal
 	msg := "internal error"
 	var e *nerr.Error
 	if errors.As(err, &e) && e != nil {
-		code = string(e.Code)
+		class = e.Code
 		msg = e.Message
 		if msg == "" {
 			msg = e.Error()
@@ -615,5 +701,11 @@ func errorFrom(err error) ErrorMsg {
 	if len(msg) > DefaultMaxName {
 		msg = msg[:DefaultMaxName]
 	}
-	return ErrorMsg{Code: code, Message: msg}
+	out := ErrorMsg{Code: string(class), Message: msg}
+	if public {
+		if code, ok := nerr.PublicCodeFor(class); ok {
+			out.PublicCode = code
+		}
+	}
+	return out
 }

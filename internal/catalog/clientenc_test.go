@@ -36,15 +36,14 @@ func TestClientEncryptedColumnCatalogV10(t *testing.T) {
 	}
 	bad := append([]byte(nil), raw...)
 	// The second column's ENCRYPTED CLIENT flag is thirteen bytes from the
-	// end: flag + type(6), then v11's 2-byte-per-column ENUM label count (0)
-	// and v12's 1-byte-per-column collection flag (0) for each of the 2
-	// columns.
-	bad[len(bad)-13] = 2
+	// end: flag + type(6), then v11's 2-byte-per-column ENUM label count,
+	// v12's collection flag, and v13's encryption-mode byte for each column.
+	bad[len(bad)-15] = 2
 	if _, err := DecodeTable(bad); err == nil {
 		t.Fatal("accepted unknown ENCRYPTED CLIENT flag")
 	}
 	badType := append([]byte(nil), raw...)
-	badType[len(badType)-11] = 9 // VecElem in the six-byte catalog type.
+	badType[len(badType)-13] = 9 // VecElem in the six-byte catalog type.
 	if _, err := DecodeTable(badType); err == nil {
 		t.Fatal("accepted non-canonical ENCRYPTED CLIENT logical type")
 	}
@@ -52,7 +51,7 @@ func TestClientEncryptedColumnCatalogV10(t *testing.T) {
 	// A real v9 descriptor has no v10 flags/types (or v11 ENUM label counts).
 	// Synthesise that ending and prove it remains readable as an ordinary
 	// physical STRING column.
-	v9 := append([]byte(nil), raw[:len(raw)-8-4-2]...) // v10 (one zero flag + one flag/type), v11 (2 cols x 2 bytes), v12 (2 cols x 1 byte)
+	v9 := append([]byte(nil), raw[:len(raw)-8-4-2-2]...) // v10 flags/types, v11 labels, v12 collections, v13 modes
 	v9[4], v9[5] = byte(tableVersionV9), 0
 	legacy, err := DecodeTable(v9)
 	if err != nil {
@@ -60,6 +59,49 @@ func TestClientEncryptedColumnCatalogV10(t *testing.T) {
 	}
 	if legacy.Columns[1].ClientEncrypted() || legacy.Columns[1].Type.Kind != types.KindString {
 		t.Fatalf("v9 compatibility column = %+v", legacy.Columns[1])
+	}
+}
+
+func TestClientEncryptionModeCatalogV13(t *testing.T) {
+	tab, err := TableFromAST(8, ast.CreateTable{Name: "accounts", Columns: []ast.ColumnDef{
+		{Name: "id", Type: types.UUID(), Primary: true},
+		{Name: "email", Type: types.String(), EncryptedClient: true},
+	}, PK: []string{"id"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tab.Columns[1].ClientEncryptionMode = ClientEncryptionDeterministic
+	raw, err := EncodeTable(tab)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := DecodeTable(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Columns[1].ClientEncryptionMode != ClientEncryptionDeterministic {
+		t.Fatalf("mode = %d", got.Columns[1].ClientEncryptionMode)
+	}
+
+	v12 := append([]byte(nil), raw[:len(raw)-len(tab.Columns)]...)
+	v12[4], v12[5] = byte(tableVersionV12), 0
+	legacy, err := DecodeTable(v12)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if legacy.Columns[1].ClientEncryptionMode != ClientEncryptionRandomized {
+		t.Fatalf("v12 mode = %d, want randomized compatibility default", legacy.Columns[1].ClientEncryptionMode)
+	}
+
+	bad := append([]byte(nil), raw...)
+	bad[len(bad)-1] = 2
+	if _, err := DecodeTable(bad); err == nil {
+		t.Fatal("accepted unknown client-encryption mode")
+	}
+	bad = append([]byte(nil), raw...)
+	bad[len(bad)-2] = ClientEncryptionDeterministic
+	if _, err := DecodeTable(bad); err == nil {
+		t.Fatal("accepted encryption mode on plaintext column")
 	}
 }
 

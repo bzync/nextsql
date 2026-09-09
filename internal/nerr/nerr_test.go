@@ -2,8 +2,25 @@ package nerr
 
 import (
 	"errors"
+	"strings"
 	"testing"
 )
+
+func TestPublicCodesRoundTripAndRemainERRPrefixed(t *testing.T) {
+	for _, code := range allCodes {
+		public := PublicCode(code)
+		if !strings.HasPrefix(public, "ERR_") {
+			t.Fatalf("PublicCode(%q) = %q", code, public)
+		}
+		back, ok := ParsePublicCode(public)
+		if !ok || back != code {
+			t.Fatalf("ParsePublicCode(%q) = %q, %v; want %q, true", public, back, ok, code)
+		}
+	}
+	if _, ok := ParsePublicCode("ERR_NOT_A_NEXTSQL_CODE"); ok {
+		t.Fatal("unknown public code accepted")
+	}
+}
 
 func TestErrorIsByCode(t *testing.T) {
 	err := New(Corruption, "page.Parse", "bad magic")

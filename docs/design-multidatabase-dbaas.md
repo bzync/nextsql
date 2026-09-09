@@ -1,11 +1,23 @@
 # Proposed Multi-Database Hosting and Subscription Isolation
 
-> Status: **ACCEPTED DESIGN — M1 FOUNDATION COMPLETE, M2 COMPLETE
-> (M2-1/M2-2/M2-3a/M2-3b-1/M2-3b-2/M2-3b-3a/M2-3b-3b/M2-3b-3c/M2-4a/M2-4b-1/
-> M2-5/M2-6 LANDED), M3-1 LANDED 2026-09-04 (suspend/resume enforcement),
-> M3-2 LANDED 2026-09-06 (realm/database rename),
-> M3-3 LANDED 2026-09-04 (offline drop/tombstone physical reclamation);
-> M3-4, M3-5 NOT STARTED; NOT PRODUCTION-GATED**
+> Status: **WITHDRAWN 2026-09-09 — the feature this document designs was
+> removed from the product.** A NextSQL deployment now serves exactly one
+> database: no realms, no `CREATE DATABASE`, no per-connection routing, no
+> `internal/dbmanager`, no realm/database CLI surface. Isolation between
+> databases is a whole deployment (its own process, files, WAL, UNDO, keys,
+> users and ACL) — the strongest of the options this document weighed, chosen
+> outright instead of made selectable.
+>
+> What survives, and is still described accurately below, is the **deployment
+> registry**: the versioned encrypted `NSRE`/`NSRM` `nextsql.instance` file,
+> its separate external root, the exclusive deployment lock, `nextsql hosting
+> adopt`, and the offline legacy-`TENANT` migration path. Its on-disk format
+> is unchanged, which is why a deployment written by 0.0.1 still opens — and
+> why `nextsqld` fails closed, rather than silently half-serving, when such a
+> registry holds more than one database. Everything below about realms,
+> managed layouts, routing, per-database caps, suspend/resume/drop/rename,
+> hosted HA and registry DR is retained as design history only. See
+> `TODO.md` log #244.
 >
 > This document is a design and delivery plan. `TODO.md` remains authoritative
 > for implementation status and sequencing. Nothing in this document changes a

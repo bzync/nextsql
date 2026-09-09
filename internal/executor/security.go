@@ -154,8 +154,6 @@ func (s *Session) authorize(stmt ast.Stmt) error {
 		return s.require(security.PrivConnect, security.ScopeDatabase, "")
 	case ast.Subscribe:
 		return s.require(security.PrivCDC, security.ScopeTable, st.Table)
-	case ast.CreateDatabase:
-		return s.require(security.PrivCreate, security.ScopeDatabase, "")
 	case ast.DropTable:
 		if err := s.require(security.PrivDrop, security.ScopeTable, st.Name); err != nil {
 			return s.require(security.PrivDrop, security.ScopeDatabase, "")
@@ -501,8 +499,6 @@ func sqlObject(stmt ast.Stmt) string {
 	case ast.Subscribe:
 		return st.Table
 	case ast.CreateTable:
-		return st.Name
-	case ast.CreateDatabase:
 		return st.Name
 	case ast.DropTable:
 		return st.Name

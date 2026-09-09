@@ -68,6 +68,23 @@ class TestLive(unittest.TestCase):
         finally:
             conn.close()
 
+    def test_public_error_taxonomy(self) -> None:
+        # docs/error-codes.md: a real server error carries the stable ERR_*
+        # name alongside the unchanged legacy class.
+        conn = nextsql.connect(self._cfg())
+        try:
+            self.assertTrue(
+                conn.public_error_codes,
+                "server did not accept the public error taxonomy",
+            )
+            with self.assertRaises(nextsql.NextSQLError) as caught:
+                conn.exec("SELECT * FROM no_such_table")
+            err = caught.exception
+            self.assertNotEqual(err.error_code, "")
+            self.assertEqual(err.public_code, "ERR_" + err.error_code.upper())
+        finally:
+            conn.close()
+
     def test_cluster_routes_to_standalone(self) -> None:
         cl = nextsql.connect_cluster(self._cfg())
         try:

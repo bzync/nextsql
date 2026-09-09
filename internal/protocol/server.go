@@ -13,7 +13,6 @@ import (
 
 	"github.com/bzync/nextsql/internal/auth"
 	"github.com/bzync/nextsql/internal/crypto"
-	"github.com/bzync/nextsql/internal/dbmanager"
 	"github.com/bzync/nextsql/internal/executor"
 	"github.com/bzync/nextsql/internal/hosting"
 	"github.com/bzync/nextsql/internal/nerr"
@@ -38,24 +37,17 @@ type Server struct {
 	Limits                   Limits
 	Log                      *slog.Logger
 	Database                 string
-	// Realm is the hosted realm this Server serves, if any (M2-2). Empty
-	// means "don't care", mirroring Database's shape. When Databases is nil
-	// this is pure identity validation against a flat configured name; when
-	// Databases is set, a matching non-default Hello.Realm/Database can
-	// route to a different open database (M2-3a). Not realm-scoped auth
-	// (M2-4); do not confuse with the unrelated Registry field above
-	// (*security.Registry, RBAC/audit).
+	// Realm is the single realm name this deployment's registry records.
+	// Multi-realm/multi-database hosting was removed, so this is pure
+	// identity validation: a Hello naming anything else is rejected, never
+	// routed. Empty means "don't care", mirroring Database's shape. Do not
+	// confuse with the unrelated Registry field above (*security.Registry,
+	// RBAC/audit).
 	Realm string
 	Tasks *executor.TaskRuntime
-	// Databases resolves a Hello-selected realm/database to an open
-	// *executor.DB on demand (M2-3a), bounded to a small fixed number of
-	// distinct open databases; a database closes once idle and reopens on
-	// demand (M2-3b-1). Nil (the default) means "no manager configured":
-	// every connection uses DB, byte-for-byte the pre-M2-3a behavior.
-	Databases *dbmanager.Manager
-	// HostingRegistry backs system.realms/system.databases (M2-4a),
-	// read-only. Nil on a legacy/non-hosted deployment — those views then
-	// return zero rows, never an error.
+	// HostingRegistry backs system.databases, read-only, and supplies the
+	// realm ID that scopes authentication. Nil on a deployment with no
+	// registry — system.databases then returns zero rows, never an error.
 	HostingRegistry *hosting.Registry
 
 	RequireClientKey bool
@@ -266,27 +258,6 @@ func (s *Server) SetDatabase(db *executor.DB) {
 	s.mu.Unlock()
 }
 
-// SetDatabaseManager installs the bounded database manager (M2-3a) a
-// connection's Hello.Realm/Hello.Database routes through. Nil disables
-// routing: every connection uses DB, the pre-M2-3a behavior.
-func (s *Server) SetDatabaseManager(m *dbmanager.Manager) {
-	if s == nil {
-		return
-	}
-	s.mu.Lock()
-	s.Databases = m
-	s.mu.Unlock()
-}
-
-func (s *Server) databaseManager() *dbmanager.Manager {
-	if s == nil {
-		return nil
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.Databases
-}
-
 func (s *Server) Close() error {
 	s.mu.Lock()
 	if s.closed {
@@ -435,6 +406,23 @@ func (s *Server) SetTaskRuntime(tasks *executor.TaskRuntime) {
 	}
 }
 
+// sessionCaps is the set of Hello capability bits this server accepted for one
+// connection. It stays zero until the Hello has been decoded, so an error
+// emitted while still framing the handshake keeps the NSQL v1 shape — the only
+// shape a client that has not yet been heard from is known to understand.
+type sessionCaps uint16
+
+func (c sessionCaps) publicErrorCodes() bool {
+	return c&sessionCaps(FlagPublicErrorCodes) != 0
+}
+
+// acceptCaps narrows a client's requested capability bits to those this server
+// actually implements, so an echoed bit is a guarantee rather than a repetition
+// of the request.
+func acceptCaps(requested uint16) sessionCaps {
+	return sessionCaps(requested & ServerFlags)
+}
+
 func (s *Server) serveConn(ctx context.Context, conn net.Conn) {
 	defer func() {
 		_ = conn.Close()
@@ -444,26 +432,29 @@ func (s *Server) serveConn(ctx context.Context, conn net.Conn) {
 		s.mu.Unlock()
 	}()
 	lim := s.Limits.normalized()
+	// Zero until the Hello is decoded: see sessionCaps.
+	var caps sessionCaps
 	_ = conn.SetDeadline(time.Now().Add(lim.Idle))
 	typ, payload, err := ReadFrame(conn, lim.MaxPacket)
 	if err != nil {
 		return
 	}
 	if typ != TypeHello {
-		s.writeErr(conn, nerr.New(nerr.Protocol, "protocol", "expected hello"), lim)
+		s.writeErr(conn, nerr.New(nerr.Protocol, "protocol", "expected hello"), lim, caps)
 		return
 	}
 	hello, err := DecodeHello(payload, lim)
 	if err != nil {
-		s.writeErr(conn, err, lim)
+		s.writeErr(conn, err, lim, caps)
 		return
 	}
+	caps = acceptCaps(hello.Flags)
 	if hello.Flags&FlagCancel != 0 {
-		s.handleCancel(conn, hello.Secret, lim)
+		s.handleCancel(conn, hello.Secret, lim, caps)
 		return
 	}
 	if hello.Version != 0 && hello.Version != Version {
-		s.writeErr(conn, nerr.New(nerr.Protocol, "protocol", "unsupported protocol version"), lim)
+		s.writeErr(conn, nerr.New(nerr.Protocol, "protocol", "unsupported protocol version"), lim, caps)
 		return
 	}
 	identitySource := "native"
@@ -472,12 +463,12 @@ func (s *Server) serveConn(ctx context.Context, conn net.Conn) {
 		tlsConn, ok := conn.(*tls.Conn)
 		if !ok {
 			s.auditAuth(hello.User, false, "mtls", "connect", conn.RemoteAddr().String())
-			s.writeErr(conn, nerr.New(nerr.Unauthorized, "protocol", "verified client certificate required"), lim)
+			s.writeErr(conn, nerr.New(nerr.Unauthorized, "protocol", "verified client certificate required"), lim, caps)
 			return
 		}
 		if err := matchServiceIdentity(tlsConn.ConnectionState(), hello.User); err != nil {
 			s.auditAuth(hello.User, false, "mtls", "connect", conn.RemoteAddr().String())
-			s.writeErr(conn, nerr.New(nerr.Unauthorized, "protocol", "client certificate identity does not match requested user"), lim)
+			s.writeErr(conn, nerr.New(nerr.Unauthorized, "protocol", "client certificate identity does not match requested user"), lim, caps)
 			return
 		}
 	}
@@ -503,10 +494,14 @@ func (s *Server) serveConn(ctx context.Context, conn net.Conn) {
 	// realmID's accidental fallback to the deployment-wide (hosting.ID{})
 	// namespace.
 	identityOK := true
-	if s.HostingRegistry == nil && s.Realm != "" && hello.Realm != "" && hello.Realm != s.Realm {
+	// A deployment serves exactly one database, so a Hello naming any other
+	// realm or database is simply wrong — there is nothing left to route to.
+	// It is folded into the same generic authentication failure as a bad
+	// password (see above), never answered with a distinguishing error.
+	if s.Realm != "" && hello.Realm != "" && hello.Realm != s.Realm {
 		identityOK = false
 	}
-	if s.databaseManager() == nil && s.Database != "" && hello.Database != "" && hello.Database != s.Database {
+	if s.Database != "" && hello.Database != "" && hello.Database != s.Database {
 		identityOK = false
 	}
 	realmName := hello.Realm
@@ -537,6 +532,7 @@ func (s *Server) serveConn(ctx context.Context, conn net.Conn) {
 		Version:    Version,
 		AuthMethod: method,
 		Secret:     secret,
+		Flags:      uint16(caps),
 	}), lim.MaxPacket); err != nil {
 		return
 	}
@@ -546,16 +542,16 @@ func (s *Server) serveConn(ctx context.Context, conn net.Conn) {
 		return
 	}
 	if typ != TypeAuth {
-		s.writeErr(conn, nerr.New(nerr.Protocol, "protocol", "expected auth"), lim)
+		s.writeErr(conn, nerr.New(nerr.Protocol, "protocol", "expected auth"), lim, caps)
 		return
 	}
 	authMsg, err := DecodeAuth(payload, lim)
 	if err != nil {
-		s.writeErr(conn, err, lim)
+		s.writeErr(conn, err, lim, caps)
 		return
 	}
 	if s.Auth == nil {
-		s.writeErr(conn, nerr.New(nerr.Unavailable, "protocol", "authentication is not configured"), lim)
+		s.writeErr(conn, nerr.New(nerr.Unavailable, "protocol", "authentication is not configured"), lim, caps)
 		return
 	}
 	var tokenClaims *auth.TokenClaims
@@ -596,7 +592,7 @@ func (s *Server) serveConn(ctx context.Context, conn net.Conn) {
 	if authErr != nil {
 		s.log().Info("authentication failed", "user", hello.User)
 		s.auditAuth(hello.User, false, identitySource, "", conn.RemoteAddr().String())
-		s.writeErr(conn, authErr, lim)
+		s.writeErr(conn, authErr, lim, caps)
 		return
 	}
 	var tokenRoles []string
@@ -607,7 +603,7 @@ func (s *Server) serveConn(ctx context.Context, conn net.Conn) {
 		!s.ACL.AllowedScopedInRealm(realmID, hello.User, tokenRoles, security.PrivAdmin, security.ScopeCluster, "") {
 		s.log().Info("authentication failed", "user", hello.User)
 		s.auditAuth(hello.User, false, identitySource, "connect", conn.RemoteAddr().String())
-		s.writeErr(conn, nerr.New(nerr.Forbidden, "protocol", "permission denied"), lim)
+		s.writeErr(conn, nerr.New(nerr.Forbidden, "protocol", "permission denied"), lim, caps)
 		return
 	}
 	if lim.MaxSessionsPerUser > 0 {
@@ -618,7 +614,7 @@ func (s *Server) serveConn(ctx context.Context, conn net.Conn) {
 		if s.userConns[hello.User] >= lim.MaxSessionsPerUser {
 			s.mu.Unlock()
 			s.auditAuth(hello.User, false, identitySource, "connect", conn.RemoteAddr().String())
-			s.writeErr(conn, nerr.New(nerr.Exhausted, "protocol", "too many connections for user"), lim)
+			s.writeErr(conn, nerr.New(nerr.Exhausted, "protocol", "too many connections for user"), lim, caps)
 			return
 		}
 		s.userConns[hello.User]++
@@ -644,13 +640,13 @@ func (s *Server) serveConn(ctx context.Context, conn net.Conn) {
 		if lim.MaxSessionsPerDatabase > 0 && s.dbConns[key] >= lim.MaxSessionsPerDatabase {
 			s.mu.Unlock()
 			s.auditAuth(hello.User, false, identitySource, "connect", conn.RemoteAddr().String())
-			s.writeErr(conn, nerr.New(nerr.Exhausted, "protocol", "too many connections for database"), lim)
+			s.writeErr(conn, nerr.New(nerr.Exhausted, "protocol", "too many connections for database"), lim, caps)
 			return
 		}
 		if lim.MaxSessionsPerRealm > 0 && s.realmConns[realmName] >= lim.MaxSessionsPerRealm {
 			s.mu.Unlock()
 			s.auditAuth(hello.User, false, identitySource, "connect", conn.RemoteAddr().String())
-			s.writeErr(conn, nerr.New(nerr.Exhausted, "protocol", "too many connections for realm"), lim)
+			s.writeErr(conn, nerr.New(nerr.Exhausted, "protocol", "too many connections for realm"), lim, caps)
 			return
 		}
 		if lim.MaxSessionsPerDatabase > 0 {
@@ -688,7 +684,7 @@ func (s *Server) serveConn(ctx context.Context, conn net.Conn) {
 	}
 	if s.RequireClientKey {
 		if err := s.readUnlock(conn, lim); err != nil {
-			s.writeErr(conn, err, lim)
+			s.writeErr(conn, err, lim, caps)
 			return
 		}
 	}
@@ -699,22 +695,12 @@ func (s *Server) serveConn(ctx context.Context, conn net.Conn) {
 	// and returns success with no further reads), so any failure to
 	// resolve a database must be reported before it, not after — a client
 	// that already saw TypeReady never checks for a later error frame.
-	var db *executor.DB
-	var releaseDB func()
-	if mgr := s.databaseManager(); mgr != nil {
-		db, releaseDB, err = mgr.Acquire(realmName, dbName)
-		if err != nil {
-			s.writeErr(conn, err, lim)
-			return
-		}
-	} else {
-		db = s.DatabaseHandle()
-		if db == nil {
-			s.writeErr(conn, nerr.New(nerr.Unavailable, "protocol", "database is locked"), lim)
-			return
-		}
-		db.SetDatabaseName(s.Database)
+	db := s.DatabaseHandle()
+	if db == nil {
+		s.writeErr(conn, nerr.New(nerr.Unavailable, "protocol", "database is locked"), lim, caps)
+		return
 	}
+	db.SetDatabaseName(s.Database)
 
 	if err := WriteFrame(conn, TypeReady, nil, lim.MaxPacket); err != nil {
 		return
@@ -766,9 +752,6 @@ func (s *Server) serveConn(ctx context.Context, conn net.Conn) {
 			_ = b.sess.Abort()
 		}
 		db.UnregisterSession(sessID)
-		if releaseDB != nil {
-			releaseDB()
-		}
 		if b.unreg != nil {
 			b.unreg()
 		}
@@ -794,27 +777,27 @@ func (s *Server) serveConn(ctx context.Context, conn net.Conn) {
 		case TypeQuery:
 			q, err := DecodeQuery(payload, lim)
 			if err != nil {
-				s.writeErrReady(conn, err, lim)
+				s.writeErrReady(conn, err, lim, caps)
 				continue
 			}
-			s.runSQL(ctx, conn, b, q.SQL, q.Params, lim)
+			s.runSQL(ctx, conn, b, q.SQL, q.Params, lim, caps)
 		case TypeIdempotentQuery:
 			q, err := DecodeIdempotentQuery(payload, lim)
 			if err != nil {
-				s.writeErrReady(conn, err, lim)
+				s.writeErrReady(conn, err, lim, caps)
 				continue
 			}
-			s.runIdempotentSQL(ctx, conn, b, q, lim)
+			s.runIdempotentSQL(ctx, conn, b, q, lim, caps)
 		case TypePrepare:
 			sql, err := DecodePrepare(payload, lim)
 			if err != nil {
-				s.writeErrReady(conn, err, lim)
+				s.writeErrReady(conn, err, lim, caps)
 				continue
 			}
 			b.mu.Lock()
 			if len(b.prepared) >= lim.MaxPrepared {
 				b.mu.Unlock()
-				s.writeErrReady(conn, nerr.New(nerr.Exhausted, "protocol", "too many prepared statements"), lim)
+				s.writeErrReady(conn, nerr.New(nerr.Exhausted, "protocol", "too many prepared statements"), lim, caps)
 				continue
 			}
 			b.nextStmt++
@@ -830,21 +813,21 @@ func (s *Server) serveConn(ctx context.Context, conn net.Conn) {
 		case TypeExecute:
 			x, err := DecodeExecute(payload, lim)
 			if err != nil {
-				s.writeErrReady(conn, err, lim)
+				s.writeErrReady(conn, err, lim, caps)
 				continue
 			}
 			b.mu.Lock()
 			sql, ok := b.prepared[x.ID]
 			b.mu.Unlock()
 			if !ok {
-				s.writeErrReady(conn, nerr.New(nerr.NotFound, "protocol", "unknown prepared statement"), lim)
+				s.writeErrReady(conn, nerr.New(nerr.NotFound, "protocol", "unknown prepared statement"), lim, caps)
 				continue
 			}
-			s.runSQL(ctx, conn, b, sql, x.Params, lim)
+			s.runSQL(ctx, conn, b, sql, x.Params, lim, caps)
 		case TypeCloseStmt:
 			id, err := DecodeCloseStmt(payload)
 			if err != nil {
-				s.writeErrReady(conn, err, lim)
+				s.writeErrReady(conn, err, lim, caps)
 				continue
 			}
 			b.mu.Lock()
@@ -859,11 +842,11 @@ func (s *Server) serveConn(ctx context.Context, conn net.Conn) {
 		case TypeSetReadConsistency:
 			m, err := DecodeSetReadConsistency(payload)
 			if err != nil {
-				s.writeErrReady(conn, err, lim)
+				s.writeErrReady(conn, err, lim, caps)
 				continue
 			}
 			if err := applyReadConsistency(b.sess, m); err != nil {
-				s.writeErrReady(conn, err, lim)
+				s.writeErrReady(conn, err, lim, caps)
 				continue
 			}
 			if err := WriteFrame(conn, TypeReady, nil, lim.MaxPacket); err != nil {
@@ -872,7 +855,7 @@ func (s *Server) serveConn(ctx context.Context, conn net.Conn) {
 		case TypeNodeStatus:
 			out, err := EncodeNodeStatus(s.nodeStatus(db), lim)
 			if err != nil {
-				s.writeErrReady(conn, err, lim)
+				s.writeErrReady(conn, err, lim, caps)
 				continue
 			}
 			if err := WriteFrame(conn, TypeNodeStatusResp, out, lim.MaxPacket); err != nil {
@@ -884,7 +867,7 @@ func (s *Server) serveConn(ctx context.Context, conn net.Conn) {
 		case TypeFlowAck:
 			// stray ack; ignore
 		default:
-			s.writeErrReady(conn, nerr.New(nerr.Protocol, "protocol", "unexpected message type"), lim)
+			s.writeErrReady(conn, nerr.New(nerr.Protocol, "protocol", "unexpected message type"), lim, caps)
 		}
 	}
 }
@@ -975,7 +958,7 @@ func (s *Server) nodeStatus(db *executor.DB) NodeStatus {
 	return ns
 }
 
-func (s *Server) handleCancel(conn net.Conn, secret uint64, lim Limits) {
+func (s *Server) handleCancel(conn net.Conn, secret uint64, lim Limits, caps sessionCaps) {
 	s.mu.Lock()
 	b := s.backends[secret]
 	s.mu.Unlock()
@@ -985,9 +968,9 @@ func (s *Server) handleCancel(conn net.Conn, secret uint64, lim Limits) {
 	_ = WriteFrame(conn, TypeReady, nil, lim.MaxPacket)
 }
 
-func (s *Server) runSQL(parent context.Context, conn net.Conn, b *backend, sql string, params []executor.Param, lim Limits) {
+func (s *Server) runSQL(parent context.Context, conn net.Conn, b *backend, sql string, params []executor.Param, lim Limits, caps sessionCaps) {
 	if len(sql) > lim.MaxSQL {
-		s.writeErrReady(conn, nerr.New(nerr.Protocol, "protocol", "SQL exceeds limit"), lim)
+		s.writeErrReady(conn, nerr.New(nerr.Protocol, "protocol", "SQL exceeds limit"), lim, caps)
 		return
 	}
 	ctx, cancel := context.WithCancel(parent)
@@ -1006,19 +989,19 @@ func (s *Server) runSQL(parent context.Context, conn net.Conn, b *backend, sql s
 	res, err := b.sess.QueryContext(ctx, sql, params)
 	_ = conn.SetDeadline(time.Now().Add(lim.Idle))
 	if err != nil {
-		s.writeErrReady(conn, err, lim)
+		s.writeErrReady(conn, err, lim, caps)
 		return
 	}
 	if err := s.streamResult(conn, res, lim); err != nil {
 		_ = conn.SetDeadline(time.Now().Add(lim.Idle))
-		s.writeErrReady(conn, err, lim)
+		s.writeErrReady(conn, err, lim, caps)
 		return
 	}
 }
 
-func (s *Server) runIdempotentSQL(parent context.Context, conn net.Conn, b *backend, query IdempotentQuery, lim Limits) {
+func (s *Server) runIdempotentSQL(parent context.Context, conn net.Conn, b *backend, query IdempotentQuery, lim Limits, caps sessionCaps) {
 	if len(query.SQL) > lim.MaxSQL {
-		s.writeErrReady(conn, nerr.New(nerr.Protocol, "protocol", "SQL exceeds limit"), lim)
+		s.writeErrReady(conn, nerr.New(nerr.Protocol, "protocol", "SQL exceeds limit"), lim, caps)
 		return
 	}
 	ctx, cancel := context.WithCancel(parent)
@@ -1037,12 +1020,12 @@ func (s *Server) runIdempotentSQL(parent context.Context, conn net.Conn, b *back
 	res, err := b.sess.ExecIdempotent(ctx, query.Key, query.SQL, query.Params)
 	_ = conn.SetDeadline(time.Now().Add(lim.Idle))
 	if err != nil {
-		s.writeErrReady(conn, err, lim)
+		s.writeErrReady(conn, err, lim, caps)
 		return
 	}
 	if err := s.streamResult(conn, res, lim); err != nil {
 		_ = conn.SetDeadline(time.Now().Add(lim.Idle))
-		s.writeErrReady(conn, err, lim)
+		s.writeErrReady(conn, err, lim, caps)
 	}
 }
 
@@ -1166,16 +1149,16 @@ func (s *Server) waitFlow(conn net.Conn, lim Limits) error {
 	}
 }
 
-func (s *Server) writeErr(conn net.Conn, err error, lim Limits) {
-	payload, encErr := EncodeError(errorFrom(err), lim)
+func (s *Server) writeErr(conn net.Conn, err error, lim Limits, caps sessionCaps) {
+	payload, encErr := EncodeError(errorFrom(err, caps.publicErrorCodes()), lim)
 	if encErr != nil {
 		return
 	}
 	_ = WriteFrame(conn, TypeError, payload, lim.MaxPacket)
 }
 
-func (s *Server) writeErrReady(conn net.Conn, err error, lim Limits) {
-	s.writeErr(conn, err, lim)
+func (s *Server) writeErrReady(conn net.Conn, err error, lim Limits, caps sessionCaps) {
+	s.writeErr(conn, err, lim, caps)
 	_ = WriteFrame(conn, TypeReady, nil, lim.MaxPacket)
 }
 

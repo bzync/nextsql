@@ -333,7 +333,7 @@ func (l *Log) VacuumBudgeted(budget *maintenance.Budget) error {
 	if err := l.flushBufLocked(); err != nil {
 		return err
 	}
-	if err := l.file.Sync(); err != nil {
+	if err := diskio.Sync(l.file); err != nil {
 		return nerr.Wrap(nerr.IO, "undo.Vacuum", "sync old log", err)
 	}
 	ids := make([]uint64, 0, len(l.recs))
@@ -379,7 +379,7 @@ func (l *Log) VacuumBudgeted(budget *maintenance.Budget) error {
 			return nerr.Wrap(nerr.IO, "undo.Vacuum", "write temporary log", err)
 		}
 	}
-	if err := tmp.Sync(); err != nil {
+	if err := diskio.Sync(tmp); err != nil {
 		return nerr.Wrap(nerr.IO, "undo.Vacuum", "sync temporary log", err)
 	}
 	if err := tmp.Close(); err != nil {
@@ -492,7 +492,7 @@ func (l *Log) writeControlLocked() error {
 	if err != nil {
 		return nerr.Wrap(nerr.IO, "undo.writeControl", "open", err)
 	}
-	if err := f.Sync(); err != nil {
+	if err := diskio.Sync(f); err != nil {
 		_ = f.Close()
 		return nerr.Wrap(nerr.IO, "undo.writeControl", "sync", err)
 	}

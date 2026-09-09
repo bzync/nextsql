@@ -10,8 +10,10 @@ import (
 
 // Spec is one aggregate function over an input column.
 type Spec struct {
-	Fun string // count, sum, avg, min, max
-	Col int    // input ordinal; -1 for COUNT(*)
+	Fun     string     // count, sum, avg, min, max, array_agg, map_agg
+	Col     int        // input ordinal; -1 for COUNT(*)
+	Col2    int        // second input ordinal for MAP_AGG (value column)
+	OutType types.Type // expected aggregate output type
 }
 
 // Hash is a hash aggregation table. It spills encrypted partitions when
@@ -37,6 +39,9 @@ type aggAcc struct {
 	nval   int64         // non-null count for count(col) / avg denominator
 	val    types.Value   // running min or max
 	hasVal bool
+	coll   []types.Value // for array_agg
+	keys   []types.Value // for map_agg
+	vals   []types.Value // for map_agg
 }
 
 type state struct {
@@ -257,13 +262,37 @@ func acc(a *aggAcc, sp Spec, row []types.Value) error {
 		if c > 0 {
 			a.val = row[sp.Col].Clone()
 		}
+	case "array_agg":
+		if sp.Col < 0 || sp.Col >= len(row) {
+			return nerr.New(nerr.InvalidArgument, "aggregate.acc", "ARRAY_AGG needs a column")
+		}
+		if len(a.coll) >= types.MaxCollectionLen {
+			return nerr.New(nerr.InvalidArgument, "aggregate.acc", "ARRAY_AGG exceeds MaxCollectionLen")
+		}
+		a.coll = append(a.coll, row[sp.Col].Clone())
+		a.nval++
+	case "map_agg":
+		if sp.Col < 0 || sp.Col >= len(row) || sp.Col2 < 0 || sp.Col2 >= len(row) {
+			return nerr.New(nerr.InvalidArgument, "aggregate.acc", "MAP_AGG needs key and value columns")
+		}
+		k := row[sp.Col]
+		if k.Null {
+			return nerr.New(nerr.InvalidArgument, "aggregate.acc", "MAP_AGG key cannot be NULL")
+		}
+		if len(a.keys) >= types.MaxCollectionLen {
+			return nerr.New(nerr.InvalidArgument, "aggregate.acc", "MAP_AGG exceeds MaxCollectionLen")
+		}
+		v := row[sp.Col2]
+		a.keys = append(a.keys, k.Clone())
+		a.vals = append(a.vals, v.Clone())
+		a.nval++
 	default:
 		return nerr.New(nerr.InvalidArgument, "aggregate.acc", "unknown aggregate")
 	}
 	return nil
 }
 
-func (h *Hash) emit(st *state) []types.Value {
+func (h *Hash) emit(st *state) ([]types.Value, error) {
 	out := make([]types.Value, 0, len(h.groups)+len(h.specs))
 	out = append(out, st.key...)
 	for i, sp := range h.specs {
@@ -296,13 +325,57 @@ func (h *Hash) emit(st *state) []types.Value {
 			}
 		case "min", "max":
 			if !a.hasVal {
-				out = append(out, types.Null(types.String()))
+				outType := sp.OutType
+				if outType.Kind == types.KindInvalid {
+					outType = types.String()
+				}
+				out = append(out, types.Null(outType))
 			} else {
 				out = append(out, a.val)
 			}
+		case "array_agg":
+			arrType := sp.OutType
+			if arrType.Kind == types.KindInvalid {
+				elemType := types.String()
+				if len(a.coll) > 0 {
+					elemType = a.coll[0].Typ
+				}
+				at, err := types.ArrayType(elemType)
+				if err != nil {
+					return nil, err
+				}
+				arrType = at
+			}
+			if a.nval == 0 {
+				out = append(out, types.Null(arrType))
+			} else {
+				out = append(out, types.ArrayValue(arrType, a.coll))
+			}
+		case "map_agg":
+			mapType := sp.OutType
+			if mapType.Kind == types.KindInvalid {
+				keyType, valType := types.String(), types.String()
+				if len(a.keys) > 0 {
+					keyType, valType = a.keys[0].Typ, a.vals[0].Typ
+				}
+				mt, err := types.MapType(keyType, valType)
+				if err != nil {
+					return nil, err
+				}
+				mapType = mt
+			}
+			if a.nval == 0 {
+				out = append(out, types.Null(mapType))
+			} else {
+				ok, ov, err := types.CanonicalizeMap(a.keys, a.vals)
+				if err != nil {
+					return nil, err
+				}
+				out = append(out, types.MapValue(mapType, ok, ov))
+			}
 		}
 	}
-	return out
+	return out, nil
 }
 
 // Finish returns aggregated rows (in first-seen group order, then spilled).
@@ -310,11 +383,15 @@ func (h *Hash) emit(st *state) []types.Value {
 // An ungrouped aggregate is defined over one implicit group covering the whole
 // input, so it yields exactly one row even when no row ever arrived — COUNT is
 // 0, every other aggregate is NULL. Only a grouped aggregate collapses to zero
-// rows on empty input, because there is then no group to report.
+// rows on empty input, because there is no group to report.
 func (h *Hash) Finish() ([][]types.Value, error) {
 	var out [][]types.Value
 	for _, k := range h.order {
-		out = append(out, h.emit(h.table[k]))
+		row, err := h.emit(h.table[k])
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, row)
 	}
 	if h.spill != nil {
 		merged, err := h.readSpill()
@@ -324,7 +401,11 @@ func (h *Hash) Finish() ([][]types.Value, error) {
 		out = append(out, merged...)
 	}
 	if len(out) == 0 && len(h.groups) == 0 {
-		out = append(out, h.emit(&state{accs: make([]aggAcc, len(h.specs))}))
+		row, err := h.emit(&state{accs: make([]aggAcc, len(h.specs))})
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, row)
 	}
 	return out, nil
 }
@@ -358,6 +439,13 @@ func (h *Hash) Merge(other *Hash) error {
 			sa, ca := st.accs[i], &cur.accs[i]
 			ca.nval += sa.nval
 			ca.sum = types.AddDec(ca.sum, sa.sum)
+			if len(sa.coll) > 0 {
+				ca.coll = append(ca.coll, sa.coll...)
+			}
+			if len(sa.keys) > 0 {
+				ca.keys = append(ca.keys, sa.keys...)
+				ca.vals = append(ca.vals, sa.vals...)
+			}
 			if !sa.hasVal {
 				continue
 			}
@@ -394,7 +482,11 @@ func (h *Hash) flushAll() error {
 	}
 	var rows [][]types.Value
 	for _, k := range h.order {
-		rows = append(rows, encodeState(h.table[k], h.groups, h.specs))
+		row, err := encodeState(h.table[k], h.groups, h.specs)
+		if err != nil {
+			return err
+		}
+		rows = append(rows, row)
 	}
 	if err := h.spill.Write(0, rows); err != nil {
 		return err
@@ -408,7 +500,7 @@ func (h *Hash) flushAll() error {
 
 func (h *Hash) spillOne(string, *state) error { return h.flushAll() }
 
-func encodeState(st *state, groups []int, specs []Spec) []types.Value {
+func encodeState(st *state, groups []int, specs []Spec) ([]types.Value, error) {
 	// reused by spill: emit as a regular output row; readSpill re-aggregates
 	// by treating spilled rows as already-emitted groups. For correctness
 	// under spill we re-insert via a second Hash when reading.
@@ -496,6 +588,30 @@ func mergeEmit(a, b []types.Value, groups []int, specs []Spec) []types.Value {
 					out[off+i] = bi
 				}
 			}
+		case "array_agg":
+			if ai.Null {
+				out[off+i] = bi
+			} else if bi.Null {
+				out[off+i] = ai
+			} else {
+				combined := append(append([]types.Value(nil), ai.Coll...), bi.Coll...)
+				out[off+i] = types.ArrayValue(ai.Typ, combined)
+			}
+		case "map_agg":
+			if ai.Null {
+				out[off+i] = bi
+			} else if bi.Null {
+				out[off+i] = ai
+			} else {
+				combKeys := append(append([]types.Value(nil), ai.CollKeys...), bi.CollKeys...)
+				combVals := append(append([]types.Value(nil), ai.Coll...), bi.Coll...)
+				ok, ov, err := types.CanonicalizeMap(combKeys, combVals)
+				if err == nil {
+					out[off+i] = types.MapValue(ai.Typ, ok, ov)
+				} else {
+					out[off+i] = bi
+				}
+			}
 		}
 	}
 	return out
@@ -509,8 +625,12 @@ func spillSchema(groups []int, specs []Spec, outTy []types.Type) []types.Type {
 	for range groups {
 		out = append(out, types.String())
 	}
-	for range specs {
-		out = append(out, types.Type{Kind: types.KindDecimal})
+	for _, sp := range specs {
+		if sp.OutType.Kind != types.KindInvalid {
+			out = append(out, sp.OutType)
+		} else {
+			out = append(out, types.Type{Kind: types.KindDecimal})
+		}
 	}
 	return out
 }

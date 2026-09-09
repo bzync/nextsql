@@ -226,3 +226,81 @@ func TestGroupedEmptyInputEmitsNoRows(t *testing.T) {
 		t.Fatalf("grouped empty aggregate returned %d rows, want 0", len(rows))
 	}
 }
+
+func TestArrayAggAndMapAgg(t *testing.T) {
+	b := scheduler.NewBudget(nil, scheduler.DefaultLimits())
+	defer b.Close()
+
+	arrType, _ := types.ArrayType(types.Type{Kind: types.KindInt64})
+	mapType, _ := types.MapType(types.String(), types.Type{Kind: types.KindInt64})
+
+	specs := []Spec{
+		{Fun: "array_agg", Col: 1, OutType: arrType},
+		{Fun: "map_agg", Col: 2, Col2: 1, OutType: mapType},
+	}
+	h := New([]int{0}, specs, nil, b)
+	defer h.Close()
+
+	// rows: [dept, salary, name]
+	rows := [][]types.Value{
+		{types.StringValue("eng"), types.IntValue(types.KindInt64, 100), types.StringValue("alice")},
+		{types.StringValue("eng"), types.IntValue(types.KindInt64, 200), types.StringValue("bob")},
+		{types.StringValue("sales"), types.IntValue(types.KindInt64, 150), types.StringValue("charlie")},
+	}
+	for _, r := range rows {
+		if err := h.Add(r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	out, err := h.Finish()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out) != 2 {
+		t.Fatalf("expected 2 groups, got %d", len(out))
+	}
+	// eng group: array_agg should have [100, 200]
+	engRow := out[0]
+	if engRow[0].Str != "eng" {
+		t.Fatalf("expected eng, got %s", engRow[0].Str)
+	}
+	arrVal := engRow[1]
+	if len(arrVal.Coll) != 2 || arrVal.Coll[0].Int != 100 || arrVal.Coll[1].Int != 200 {
+		t.Fatalf("expected [100, 200], got %v", arrVal.Coll)
+	}
+	mapVal := engRow[2]
+	if len(mapVal.CollKeys) != 2 {
+		t.Fatalf("expected 2 map keys, got %d", len(mapVal.CollKeys))
+	}
+	// alice: 100, bob: 200
+	if mapVal.CollKeys[0].Str != "alice" || mapVal.Coll[0].Int != 100 {
+		t.Fatalf("expected alice:100, got %v:%v", mapVal.CollKeys[0], mapVal.Coll[0])
+	}
+	if mapVal.CollKeys[1].Str != "bob" || mapVal.Coll[1].Int != 200 {
+		t.Fatalf("expected bob:200, got %v:%v", mapVal.CollKeys[1], mapVal.Coll[1])
+	}
+
+	// Test empty ungrouped array_agg and map_agg returns NULL
+	hEmpty := New(nil, specs, nil, b)
+	defer hEmpty.Close()
+	emptyOut, err := hEmpty.Finish()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(emptyOut) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(emptyOut))
+	}
+	if !emptyOut[0][0].Null || !emptyOut[0][1].Null {
+		t.Fatalf("expected NULLs for empty array_agg and map_agg, got %v", emptyOut[0])
+	}
+
+	// Test duplicate map key rejection
+	hDup := New(nil, []Spec{{Fun: "map_agg", Col: 0, Col2: 1, OutType: mapType}}, nil, b)
+	defer hDup.Close()
+	_ = hDup.Add([]types.Value{types.StringValue("dup"), types.IntValue(types.KindInt64, 1)})
+	_ = hDup.Add([]types.Value{types.StringValue("dup"), types.IntValue(types.KindInt64, 2)})
+	if _, err := hDup.Finish(); err == nil {
+		t.Fatal("expected error for duplicate MAP key, got nil")
+	}
+}
+

@@ -23,6 +23,15 @@ const (
 	magicWALCtrl uint32 = 0x4357534E // NSWC
 	magicUNDOCtl uint32 = 0x4355534E // NSUC
 
+	// The keystore and its shredded tombstone are compared as text, matching
+	// how internal/crypto writes them.
+	magicKeystore = "NSKS"
+	magicShredded = "NSSH"
+
+	// maxKeystoreBytes bounds the whole-file read above. A keystore holds
+	// wrapped keys for at most a few hundred versions across ten domains.
+	maxKeystoreBytes = 1 << 20
+
 	sbOffVersion  = 4
 	sbOffLogical  = 40
 	sbOffPhysical = 44
@@ -52,28 +61,32 @@ type FileReport struct {
 // Report is a diagnose snapshot of a data directory. It does not need
 // the root unlock key: it only reads plaintext headers.
 type Report struct {
-	DataDir    string
-	DataFile   string
-	Identity   format.Identity
-	HasIdent   bool
-	PageSize   uint32
-	PhysSize   uint32
-	Cipher     format.CipherSuite
-	Envelope   uint16
-	NextPage   format.PageID
-	CheckLSN   format.LSN
-	RedoLSN    format.LSN
-	Created    int64
-	WALNext    format.LSN
-	WALDur     format.LSN
-	WALCheck   format.LSN
-	Keystore   bool
-	AuthFile   bool
-	ACLFile    bool
-	Isolated   int
-	HasIsolate bool
-	Files      []FileReport
-	OK         bool
+	DataDir  string
+	DataFile string
+	Identity format.Identity
+	HasIdent bool
+	PageSize uint32
+	PhysSize uint32
+	Cipher   format.CipherSuite
+	Envelope uint16
+	NextPage format.PageID
+	CheckLSN format.LSN
+	RedoLSN  format.LSN
+	Created  int64
+	WALNext  format.LSN
+	WALDur   format.LSN
+	WALCheck format.LSN
+	Keystore bool
+	// KeystoreVersion is the keystore's on-disk format version (0 when the
+	// file is absent or shredded); Shredded reports a crypto-shredded one.
+	KeystoreVersion uint16
+	Shredded        bool
+	AuthFile        bool
+	ACLFile         bool
+	Isolated        int
+	HasIsolate      bool
+	Files           []FileReport
+	OK              bool
 }
 
 // Inspect reads plaintext headers under dataDir and checks them against
@@ -98,6 +111,9 @@ func Inspect(dataDir string) (Report, error) {
 	r.Files = append(r.Files, inspectSuperblock(&r))
 	r.Files = append(r.Files, inspectWALCtrl(&r))
 	r.Files = append(r.Files, inspectUNDOCtrl(&r))
+	if fr, ok := inspectKeystore(&r); ok {
+		r.Files = append(r.Files, fr)
+	}
 	r.Keystore = fileExists(cryptoKeystore(r.DataFile))
 	r.AuthFile = fileExists(filepath.Join(dataDir, config.AuthFileName))
 	r.ACLFile = fileExists(filepath.Join(dataDir, config.ACLFileName))
@@ -117,6 +133,65 @@ func Inspect(dataDir string) (Report, error) {
 }
 
 func cryptoKeystore(dbPath string) string { return dbPath + ".keys" }
+
+// inspectKeystore reports the keystore's format version and checksum. It
+// never decodes a wrapped key: only the magic, the version field, and the
+// trailing checksum are examined. The version is what an operator planning a
+// rollback needs — v2 means a recovery key is configured, and a release that
+// only understands v1 will refuse the file.
+//
+// The keystore is optional (a flat key provider has none), so a missing file
+// yields no FileReport at all rather than one reported as absent.
+func inspectKeystore(r *Report) (FileReport, bool) {
+	path := cryptoKeystore(r.DataFile)
+	fr := FileReport{Family: compat.FamilyKeystore, Path: path}
+	st, err := os.Stat(path)
+	if err != nil {
+		return fr, false
+	}
+	fr.Present = true
+	fr.Size = st.Size()
+	// Bounded: a keystore holds wrapped keys, not data. Anything larger is
+	// not one, and is reported rather than read into memory.
+	if st.Size() > maxKeystoreBytes {
+		fr.Err = "keystore is implausibly large"
+		return fr, true
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		fr.Err = err.Error()
+		return fr, true
+	}
+	if len(raw) < 16 {
+		fr.Err = "truncated keystore"
+		return fr, true
+	}
+	switch string(raw[0:4]) {
+	case magicShredded:
+		// A crypto-shredded keystore is intact and intentional, not damage.
+		fr.MagicOK = true
+		fr.Compat = true
+		r.Shredded = true
+		if err := checksum.Verify(raw[:16], 12); err != nil {
+			fr.Err = "keystore checksum mismatch"
+		} else {
+			fr.Checksum = true
+		}
+	case magicKeystore:
+		fr.MagicOK = true
+		fr.Version = encoding.U16(raw, 4)
+		fr.Compat = compat.Compatible(compat.FamilyKeystore, fr.Version)
+		r.KeystoreVersion = fr.Version
+		if err := checksum.Verify(raw, len(raw)-4); err != nil {
+			fr.Err = "keystore checksum mismatch"
+		} else {
+			fr.Checksum = true
+		}
+	default:
+		fr.Err = "bad keystore magic"
+	}
+	return fr, true
+}
 
 func inspectSuperblock(r *Report) FileReport {
 	fr := FileReport{Family: compat.FamilyPage, Path: r.DataFile}
@@ -283,7 +358,15 @@ func WriteReport(w io.Writer, r Report) {
 	}
 	fmt.Fprintf(w, "checkpoint_lsn %d\nredo_lsn %d\nwal_next_lsn %d\nwal_durable_lsn %d\nwal_checkpoint_lsn %d\n",
 		r.CheckLSN, r.RedoLSN, r.WALNext, r.WALDur, r.WALCheck)
-	fmt.Fprintf(w, "keystore %t\nauth_file %t\nacl_file %t\nisolated_pages %d\n", r.Keystore, r.AuthFile, r.ACLFile, r.Isolated)
+	fmt.Fprintf(w, "keystore %t\n", r.Keystore)
+	if r.Keystore {
+		if r.Shredded {
+			fmt.Fprintf(w, "keystore_shredded true\n")
+		} else {
+			fmt.Fprintf(w, "keystore_version %d\n", r.KeystoreVersion)
+		}
+	}
+	fmt.Fprintf(w, "auth_file %t\nacl_file %t\nisolated_pages %d\n", r.AuthFile, r.ACLFile, r.Isolated)
 	fmt.Fprintf(w, "\ncompatibility catalog (this binary reads Min..Max):\n")
 	for _, s := range compat.Catalog() {
 		fmt.Fprintf(w, "  %-14s magic=%-4s current=%d min=%d max=%d  %s\n",

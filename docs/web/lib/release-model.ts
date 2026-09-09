@@ -11,6 +11,7 @@ export const ARTIFACT_KINDS = [
   "nextsqld",
   "nextsql-bench",
   "deb",
+  "rpm",
   "run",
   "setup",
   "archive",
@@ -46,6 +47,7 @@ export type Artifact = {
   filename: string;
   size: number;
   sha256: string;
+  url?: string;
 };
 
 export type Change = {
@@ -97,8 +99,9 @@ function parseVersion(version: string): { nums: number[]; pre: string } {
 }
 
 /** GitHub Release download URL. Binaries are not hosted on the docs site. */
-export function artifactUrl(version: string, filename: string): string {
-  return `https://github.com/bzync/nextsql/releases/download/v${encodeURIComponent(version)}/${encodeURIComponent(filename)}`;
+export function artifactUrl(version: string, artifact: Pick<Artifact, "filename" | "url">): string {
+  return artifact.url ??
+    `https://github.com/bzync/nextsql/releases/download/v${encodeURIComponent(version)}/${encodeURIComponent(artifact.filename)}`;
 }
 
 export function formatBytes(size: number): string {
@@ -149,6 +152,7 @@ export function kindLabel(kind: ArtifactKind): string {
     nextsqld: "Server (nextsqld)",
     "nextsql-bench": "Bench (nextsql-bench)",
     deb: "Debian package (.deb)",
+    rpm: "RPM package (.rpm)",
     run: "Linux installer (.run)",
     setup: "Windows setup (.exe)",
     archive: "Archive (.tar.gz / .zip)",

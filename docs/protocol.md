@@ -1,8 +1,9 @@
 # Native wire protocol (Phase 8)
 
 `ENCRYPTED CLIENT` adds no NSQL frame or wire type. Clients bind and receive
-its `NSCE1.` ciphertext through the existing `STRING` value encoding; logical
-type and encryption status are catalog metadata (`NSCT` v12).
+randomized `NSCE1.` or deterministic `NSCE2.` ciphertext through the existing
+`STRING` value encoding; logical type and encryption mode are catalog metadata
+(`NSCT` v13).
 
 `STRUCT` / `ARRAY` / `MAP` values (`docs/design-collections.md`) travel as a
 self-describing recursive type descriptor after the fixed value header
@@ -125,8 +126,8 @@ A length field larger than `max_packet` is a protocol error. The implementation 
 
 | Type | Direction | Payload |
 |---|---|---|
-| Hello | C→S | version, flags, cancel secret, database, user, realm (optional trailing field) |
-| HelloOK | S→C | version, auth method (1 = password), cancel secret |
+| Hello | C→S | version, flags, cancel secret, database, user, realm (optional trailing field; reserved, must be empty) |
+| HelloOK | S→C | version, auth method (1 = password), cancel secret, accepted capability flags (optional trailing `u16`; see Capability negotiation) |
 | Auth | C→S | password (TLS) |
 | AuthOK | S→C | empty |
 | Query | C→S | SQL (`u32` length) + typed parameters |
@@ -142,9 +143,31 @@ A length field larger than `max_packet` is a protocol error. The implementation 
 | RowDesc | S→C | column names and types |
 | DataBatch | S→C | row count + self-describing values |
 | CommandComplete | S→C | affected row count |
-| Error | S→C | code + message (never a password or key) |
+| Error | S→C | code + message (never a password or key) + stable `ERR_*` public code (optional trailing field; see Capability negotiation) |
 | Ready | S→C | empty; session can take the next command |
 | Unlock / UnlockOK | C↔S | client-held root after password auth when the server requires it |
+
+### Capability negotiation
+
+`Hello.flags` bit 1 (`0x0002`, public error codes) asks the server to include the
+stable `ERR_*` public error name (`docs/error-codes.md`) on error frames. The
+frame version is *not* bumped for this: a frame whose version is not exactly `1`
+is rejected outright, so raising it would disconnect every existing client
+rather than upgrade it. Capabilities are negotiated instead.
+
+The server masks a client's requested bits down to those it implements and
+echoes the result in `HelloOK`, so an echoed bit is a guarantee, never a repeat
+of the request. Both the accepted-flags field and the error frame's public code
+are *optional trailing fields*: they are written only when non-empty, so every
+frame sent to a client that requested nothing is byte-identical to the
+pre-capability NSQL v1 shape. A client that requests the capability must still
+accept the two-field error frame, because an older server ignores the bit.
+
+Optional trailing fields are canonical — an empty one is rejected rather than
+treated as absent, so one message value has exactly one encoding.
+
+An error frame's legacy lowercase `code` is never replaced, in either
+direction. Existing clients branch their retry logic on it.
 
 Strings used for names are `u16` length + bytes. SQL is `u32` length + bytes. Both reject a declared length above the matching limit or past the end of the payload.
 
@@ -191,26 +214,20 @@ An optional bounded `token_identity_source_hint=KEY_ID:oidc,...` changes only
 the server audit label to `oidc` / `mtls+oidc` after signature verification; it
 adds no claim and does not change NSQL or the `NSSC1.` format.
 
-For deployments containing the `nextsql.instance` registry, `nextsqld`
-resolves the optional Hello realm/database pair through the registry and
-routes the connection to that registered database via the bounded database
-manager. Empty fields select the registered defaults for compatibility. The
-legacy no-registry path remains pinned to its configured/default database.
-Unknown realm/database/user combinations are carried through the password
-verification step and collapse to the same generic `unauthorized` result,
-preventing pre-authentication existence enumeration.
+A deployment serves exactly one database, so Hello's `database` and `realm`
+fields select nothing: they are identity checks. An empty field means "whatever
+this deployment serves"; a field naming anything else is rejected. Unknown
+database/realm/user combinations are carried through the password verification
+step and collapse to the same generic `unauthorized` result, preventing
+pre-authentication existence enumeration.
 
-`Hello.Realm` is an **additive
-trailing field, not a protocol version bump** — the frame header's `Version`
-remains a hard equality gate with no negotiation. A client that never
-configures a realm emits nothing past `user`, producing the exact pre-realm
-wire shape (`DecodeHello` tail-sniffs one more length-prefixed string only
-when bytes remain past `user`, mirroring `NSCT`'s V1 field-versioning
-pattern in `internal/catalog`); a client that does select a realm requires a
-server new enough to decode the trailing field, and fails closed with a
-decode error against an older one rather than silently connecting to
-whatever that server has open. See `docs/design-multidatabase-dbaas.md` for
-the selectable-hosting design, landed M2 scope, and remaining M3/HA gaps.
+`Hello.Realm` remains an **additive trailing field, not a protocol version
+bump** — the frame header's `Version` remains a hard equality gate with no
+negotiation. It is now reserved: multi-realm hosting was removed, every
+official driver leaves it empty, and a client that emits nothing past `user`
+produces the same wire shape it always did (`DecodeHello` tail-sniffs one more
+length-prefixed string only when bytes remain past `user`, mirroring `NSCT`'s
+V1 field-versioning pattern in `internal/catalog`).
 
 ## Streaming and backpressure
 
@@ -226,20 +243,20 @@ HelloOK includes a 64-bit cancel secret. The driver opens a second connection, s
 
 | Limit | Default |
 |---|---|
-| Packet | 1 MiB |
-| SQL text | 1 MiB |
-| Parameters | 256 |
-| Prepared statements / session | 64 |
+| Packet | 64 MiB configurable; 64 MiB ceiling |
+| SQL text | 16 MiB configurable; 64 MiB ceiling |
+| Parameters | 65,535 configurable; 65,535 ceiling |
+| Prepared statements / session | 64 configurable; 4,096 ceiling |
 | Concurrent sessions | 128 |
 | Concurrent sessions per user | unlimited |
-| Result bytes on the wire | 64 MiB |
+| Result bytes on the wire | 64 MiB configurable; 64 MiB ceiling |
 | Idle | 60 s |
 | Statement (per-query wall clock) | 30 s |
 | Transaction (total open lifetime) | unbounded |
 | Lock wait (contended, non-deadlocking) | unbounded |
 | Idle-in-transaction (traffic gap while open) | no distinct bound (falls back to Idle) |
 
-These sit on top of the Phase 7 per-query worker / memory / disk / I/O / time budget — the statement row above *is* that budget's time bound (`scheduler.Limits.Time`), surfaced here because it is also configurable per node. Concurrent sessions, concurrent sessions per user, idle, statement, transaction, and idle-in-transaction are configurable per node (`max_connections`, `max_connections_per_user`, `idle_timeout_ms`, `statement_timeout_ms`, `transaction_timeout_ms`, `idle_transaction_timeout_ms` in `docs/ops.md` "Connection limits" / "Statement, transaction, lock, and idle-transaction timeouts") and are not synchronized across a cluster. Lock wait (`lock_timeout_ms`) is process-wide rather than per-connection — it bounds the shared engine-wide lock table, not one session's limits. An over-limit connection is rejected with `exhausted` after authentication, before a session is created; an over-budget statement or a timed-out lock wait each fail the statement in progress with `exhausted` instead; an over-timeout transaction force-aborts on the next statement dispatched inside it (`transaction_timeout_ms`) or, if none ever arrives, once the idle-in-transaction bound elapses and the connection's next frame read times out (`idle_transaction_timeout_ms`) — either way, and on any other path that tears down a connection with a transaction still open, the transaction is rolled back rather than left holding locks.
+These sit on top of the Phase 7 per-query worker / memory / disk / I/O / time budget — the statement row above *is* that budget's time bound (`scheduler.Limits.Time`), surfaced here because it is also configurable per node. Frame, SQL, parameter, prepared-statement, and result-byte limits are independently configurable (`max_frame_bytes`, `max_statement_bytes`, `max_parameters`, `max_prepared_statements`, `max_result_bytes`); SQL text may not exceed its enclosing frame. Concurrent sessions, concurrent sessions per user, idle, statement, transaction, and idle-in-transaction are configurable per node (`max_connections`, `max_connections_per_user`, `idle_timeout_ms`, `statement_timeout_ms`, `transaction_timeout_ms`, `idle_transaction_timeout_ms` in `docs/ops.md` "Connection limits" / "Statement, transaction, lock, and idle-transaction timeouts") and are not synchronized across a cluster. Lock wait (`lock_timeout_ms`) is process-wide rather than per-connection — it bounds the shared engine-wide lock table, not one session's limits. An over-limit connection is rejected with `exhausted` after authentication, before a session is created; an over-budget statement or a timed-out lock wait each fail the statement in progress with `exhausted` instead; an over-timeout transaction force-aborts on the next statement dispatched inside it (`transaction_timeout_ms`) or, if none ever arrives, once the idle-in-transaction bound elapses and the connection's next frame read times out (`idle_transaction_timeout_ms`) — either way, and on any other path that tears down a connection with a transaction still open, the transaction is rolled back rather than left holding locks.
 
 ## Threat model (honest)
 

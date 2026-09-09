@@ -15,6 +15,9 @@ func DataSync(f *os.File) error {
 	if f == nil {
 		return nerr.New(nerr.IO, "diskio.DataSync", "nil file")
 	}
+	if err := inject("datasync", name(f), 0); err != nil {
+		return nerr.Wrap(nerr.IO, "diskio.DataSync", "injected fdatasync", err)
+	}
 	if err := syscall.Fdatasync(int(f.Fd())); err != nil {
 		return nerr.Wrap(nerr.IO, "diskio.DataSync", "fdatasync", err)
 	}

@@ -183,7 +183,7 @@ transaction as the table definition. It records:
 
 Legacy `PartitionLegacyTenant` catalog descriptors remain decodable for recovery and
 offline migration compatibility, but SQL cannot create or extend them. This is
-not a supported authorization or hosting mechanism. `nextsql hosting
+not a supported authorization or hosting mechanism. `nextsql registry
 migrate-tenant` (see "Offline legacy TENANT migration" below) is the supported
 way to move a former tenant off such a descriptor.
 
@@ -223,9 +223,9 @@ than introducing an independently published sidecar.
   partition-key column). Duplicate tuples across partitions fail catalog
   validation, and writes with no matching tuple fail closed.
 - Every primary key must include every partition column, preventing duplicate
-  primary keys in separate heaps. Foreign keys on partitioned
-  tables are rejected in this slice (`partitioned tables cannot have foreign
-  keys`).
+  primary keys in separate heaps. Foreign keys may be declared by or reference
+  partitioned tables; parent probes and cascades traverse the affected local
+  heaps under the normal FK depth and row-count bounds.
 - Plain, covering, partial, expression, JSON-path, and spatial indexes allocate
   one physical B+Tree per partition. CREATE streams each local heap without an
   input-sized result buffer; INSERT/UPDATE/DELETE maintain the owning local
@@ -300,8 +300,6 @@ than introducing an independently published sidecar.
   generation always projects the full-text and vector columns so a covering
   primary-key projection (`SELECT pk … SEARCH … NEAREST`) still scores
   correctly.
-- A partitioned table cannot declare foreign keys in this slice
-  (`partitioned tables cannot have foreign keys`).
 - `MAINTAIN TABLE` visits the base ownership trees and every partition-local
   heap, vector store, and index root. `MAINTAIN INDEX` visits every local root
   of the named logical index without crossing into heaps or other indexes. Both
@@ -474,7 +472,7 @@ How to read it:
 
 ## Offline legacy TENANT migration
 
-`nextsql hosting migrate-tenant` copies one historical tenant out of a legacy
+`nextsql registry migrate-tenant` copies one historical tenant out of a legacy
 `tenant_id` / `PARTITION BY TENANT` database into a freshly provisioned isolated
 deployment. It is an offline `ADMIN` tool: stop `nextsqld` for the source, and
 the command exclusively locks both data directories (ordered by path, so two

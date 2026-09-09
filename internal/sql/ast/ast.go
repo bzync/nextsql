@@ -33,10 +33,6 @@ type (
 		Modulus     uint32 // HASH
 		Remainder   uint32 // HASH
 	}
-	CreateDatabase struct {
-		Name        string
-		IfNotExists bool
-	}
 	WorkflowParam struct {
 		Name string
 		Type types.Type
@@ -157,7 +153,7 @@ type (
 	VerifyBackup struct {
 		Name string
 	}
-	ShowTasks          struct {
+	ShowTasks struct {
 		After string
 		Limit int
 	}
@@ -273,6 +269,7 @@ type (
 		Table          string
 		Alias          string
 		FromQuery      Stmt
+		Unnest         *UnnestClause
 		Joins          []JoinSpec
 		Where          Expr
 		Group          []Expr
@@ -446,7 +443,6 @@ const (
 )
 
 func (CreateTable) stmt()             {}
-func (CreateDatabase) stmt()          {}
 func (CreateWorkflow) stmt()          {}
 func (RunWorkflow) stmt()             {}
 func (AlterWorkflow) stmt()           {}
@@ -574,10 +570,13 @@ type ColumnDef struct {
 	// EncryptedClient stores only randomized client ciphertext on the server.
 	// Type remains the logical plaintext type in the AST.
 	EncryptedClient bool
-	NotNull         bool
-	Primary         bool
-	Default         Expr
-	References      *ForeignKeyDef
+	// EncryptedClientDeterministic opts into equality-leaking deterministic
+	// client encryption. It is valid only with EncryptedClient.
+	EncryptedClientDeterministic bool
+	NotNull                      bool
+	Primary                      bool
+	Default                      Expr
+	References                   *ForeignKeyDef
 }
 
 // Expr is a parsed expression.
@@ -686,6 +685,19 @@ type (
 		Base  Expr
 		Field string
 	}
+	// Subscript is coll[index] — 1-based indexing for ARRAY and key lookup for MAP.
+	Subscript struct {
+		Coll  Expr
+		Index Expr
+	}
+	// UnnestClause is UNNEST(expr) [AS alias [(column, ...)]] [WITH OFFSET [AS offset]] in FROM.
+	UnnestClause struct {
+		Expr    Expr
+		Alias   string
+		Column  string
+		Columns []string
+		Offset  string
+	}
 )
 
 func (Literal) expr()        {}
@@ -707,3 +719,4 @@ func (ArrayCtor) expr()      {}
 func (StructCtor) expr()     {}
 func (MapCtor) expr()        {}
 func (FieldAccess) expr()    {}
+func (Subscript) expr()      {}

@@ -175,12 +175,12 @@ the partial install in place for inspection — clean it up afterwards with
 | `--keep-failed` | on failure, leave the partial install in place instead of rolling it back |
 | `--config-in FILE` | load defaults from an existing key=value config before applying flags |
 | `--instance-key-file` | deployment-registry key path (default `KEY-FILE.instance`) |
-| `--realm` / `--database` | bootstrap realm/database names (default `default`/`default`) |
+| `--database` | names the deployment's database and creates it; unset initializes the deployment only (no database). Required by `--profile production` and by `--recovery-key-out` |
 | `--log-level` | `debug` \| `info` (default) \| `warn` \| `error` |
 
 Re-running a full `nextsql setup` against an already-initialized data
 directory is refused (already-exists): use `--skip-init` to regenerate only
-the config, or the `nextsql hosting` subcommands for lifecycle operations.
+the config, or the `nextsql registry` subcommands for lifecycle operations.
 Idempotent re-runs are safe with `--skip-init` when the resulting config is
 unchanged.
 
@@ -388,8 +388,11 @@ already-matching systemd unit — never authors one itself)** are implemented
 and targeted-tested. **M5 is complete**: Setup and Operations modes share the
 same branded RUI shell/theme behavior, and deterministic headless-Chrome
 keyboard + axe WCAG 2.2 A/AA audits cover both,
-including increased contrast and reduced motion. Remaining work is
-recovery-key export/verification (the rest of M2), non-Linux packaging and
+including increased contrast and reduced motion. **M2 is complete**: `nextsql setup --recovery-key-out` exports and verifies a
+recovery key for both keystores during a first install, and the Setup wizard
+offers it by default and gates Finish on the operator confirming they saved
+both files (see `docs/security.md` "Recovery keys"). Remaining work is
+non-Linux packaging and
 full silent/upgrade/repair installer-path coverage, plus platform execution
 tests for `.rpm` and the Windows
 artifacts (blocked on `rpmbuild`/Wine not being available in every build

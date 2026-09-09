@@ -17,9 +17,13 @@ const (
 	AuthPassword    = 1
 	AuthPasswordKey = 2
 
-	DefaultMaxPacket              = 1 << 20
-	DefaultMaxSQL                 = 1 << 20
-	DefaultMaxParams              = 256
+	// Frame, SQL, and parameter limits are deliberately independent. A frame
+	// still bounds total decoded request bytes before allocation; a statement
+	// cannot consume the whole frame by default, and parameters retain their
+	// uint16 wire representation without a fixed ORM-hostile 256 cap.
+	DefaultMaxPacket              = 64 << 20
+	DefaultMaxSQL                 = 16 << 20
+	DefaultMaxParams              = 65535
 	DefaultMaxPrepared            = 64
 	DefaultMaxSessions            = 128
 	DefaultMaxSessionsPerUser     = 0 // 0 = unlimited

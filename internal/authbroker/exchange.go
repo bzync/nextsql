@@ -110,8 +110,10 @@ func (b *Broker) exchange(ctx context.Context, req exchangeRequest) (*exchangeRe
 	} else if strings.TrimSpace(req.Nonce) != "" {
 		aud.Outcome, aud.Reason = "denied", "nonce supplied with access token"
 		return nil, aud, denyHTTP(http.StatusBadRequest, "nonce is not valid with access_token")
+	} else if pv.introspect != nil && (pv.access == nil || strings.Count(req.AccessToken, ".") != 2) {
+		tok, err = pv.introspect.Introspect(ctx, req.AccessToken)
 	} else if pv.access == nil {
-		aud.Outcome, aud.Reason = "denied", "jwt access-token exchange is disabled for this profile"
+		aud.Outcome, aud.Reason = "denied", "access-token exchange is disabled for this profile"
 		return nil, aud, denyHTTP(http.StatusForbidden, "token exchange denied")
 	} else {
 		tok, err = pv.access.Verify(ctx, req.AccessToken)
@@ -142,10 +144,24 @@ func (b *Broker) exchange(ctx context.Context, req exchangeRequest) (*exchangeRe
 			aud.Outcome, aud.Reason = "error", "rbac membership lookup failed"
 			return nil, aud, denyHTTP(http.StatusServiceUnavailable, "token exchange temporarily unavailable")
 		}
-		effectiveRoles = auth.IntersectRoles(mapped.Roles, held)
-		if len(effectiveRoles) == 0 {
-			aud.Outcome, aud.Reason = "denied", "principal holds none of the policy-mapped roles"
-			return nil, aud, denyHTTP(http.StatusForbidden, "token exchange denied")
+		if len(held) == 0 && b.cfg.JITProvisioning && b.provisioner != nil {
+			boundedRoles := b.applyRoleBoundary(mapped.Roles)
+			if len(boundedRoles) == 0 {
+				aud.Outcome, aud.Reason = "denied", "jit provisioning denied: mapped roles outside allowed boundary"
+				return nil, aud, denyHTTP(http.StatusForbidden, "token exchange denied")
+			}
+			if err := b.provisioner(req.Realm, mapped.Principal, boundedRoles); err != nil {
+				aud.Outcome, aud.Reason = "error", "jit provisioning failed: "+errText(err)
+				return nil, aud, denyHTTP(http.StatusInternalServerError, "token exchange failed")
+			}
+			effectiveRoles = boundedRoles
+			aud.JITProvisioned = true
+		} else {
+			effectiveRoles = auth.IntersectRoles(mapped.Roles, held)
+			if len(effectiveRoles) == 0 {
+				aud.Outcome, aud.Reason = "denied", "principal holds none of the policy-mapped roles"
+				return nil, aud, denyHTTP(http.StatusForbidden, "token exchange denied")
+			}
 		}
 	}
 	aud.EffectiveRoles = effectiveRoles

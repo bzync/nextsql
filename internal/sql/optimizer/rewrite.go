@@ -122,6 +122,7 @@ func rewriteOnce(p planner.Logical) planner.Logical {
 			Schema:   n.Schema,
 			Distinct: n.Distinct,
 			Having:   n.Having,
+			Slots:    n.Slots,
 		}
 	case planner.Window:
 		in := rewriteOnce(n.Input)
@@ -161,6 +162,7 @@ func rewriteFilter(n planner.Filter) planner.Logical {
 			Names:         pr.Names,
 			Distinct:      pr.Distinct,
 			DistinctIndex: pr.DistinctIndex,
+			PreAgg:        pr.PreAgg,
 		}
 	}
 	if j, ok := in.(planner.Join); ok {
@@ -198,7 +200,7 @@ func rewriteProject(n planner.Project) planner.Logical {
 		e.Names = append([]string(nil), n.Names...)
 		return e
 	}
-	return planner.Project{Input: pruneInput(in, usedByProject(n)), Cols: n.Cols, Exprs: exprs, Names: n.Names, Distinct: n.Distinct, DistinctIndex: n.DistinctIndex}
+	return planner.Project{Input: pruneInput(in, usedByProject(n)), Cols: n.Cols, Exprs: exprs, Names: n.Names, Distinct: n.Distinct, DistinctIndex: n.DistinctIndex, PreAgg: n.PreAgg}
 }
 
 func rewriteLimit(n planner.Limit) planner.Logical {
@@ -230,6 +232,7 @@ func rewriteLimit(n planner.Limit) planner.Logical {
 			Exprs:         pr.Exprs,
 			Names:         pr.Names,
 			DistinctIndex: pr.DistinctIndex,
+			PreAgg:        pr.PreAgg,
 		}
 	}
 	if nr, ok := in.(planner.Nearest); ok {
@@ -253,20 +256,21 @@ func rewriteJoin(n planner.Join) planner.Logical {
 	left := rewriteOnce(n.Left)
 	right := rewriteOnce(n.Right)
 	pred := foldExpr(n.Pred)
-	if n.Kind == ast.JoinRight {
+	if n.Kind == ast.JoinRight && !planner.RankPreserving(left) {
 		return rewriteOnce(rewriteRightToLeft(left, right, pred, n))
 	}
 	_, leftEmpty := left.(planner.Empty)
 	_, rightEmpty := right.(planner.Empty)
 	full := n.Kind == ast.JoinFull
 	leftOuter := n.Kind == ast.JoinLeft
+	rightOuter := n.Kind == ast.JoinRight
 	semi := n.Kind == ast.JoinSemi
 	anti := n.Kind == ast.JoinAnti
-	outer := leftOuter || full
+	outer := leftOuter || full || rightOuter
 	if leftEmpty && rightEmpty {
 		return planner.Empty{Names: namesOfJoin(n, left, right)}
 	}
-	if leftEmpty && !full {
+	if leftEmpty && !full && !rightOuter {
 		return planner.Empty{Names: namesOf(left)}
 	}
 	if rightEmpty && anti {
@@ -276,6 +280,9 @@ func rewriteJoin(n planner.Join) planner.Logical {
 		if semi {
 			return planner.Empty{Names: namesOf(left)}
 		}
+		return planner.Empty{Names: namesOf(right)}
+	}
+	if rightEmpty && rightOuter {
 		return planner.Empty{Names: namesOf(right)}
 	}
 	if predIsFalse(pred) && anti {
@@ -293,7 +300,7 @@ func rewriteJoin(n planner.Join) planner.Logical {
 		}
 		pred = nil
 	}
-	// Do not turn LEFT/FULL/SEMI/ANTI into CROSS when ON folds to TRUE/nil.
+	// Do not turn LEFT/RIGHT/FULL/SEMI/ANTI into CROSS when ON folds to TRUE/nil.
 	cross := !outer && !semi && !anti && pred == nil
 	kind := n.Kind
 	if cross && kind == ast.JoinInner {
@@ -302,6 +309,10 @@ func rewriteJoin(n planner.Join) planner.Logical {
 	if leftOuter {
 		cross = false
 		kind = ast.JoinLeft
+	}
+	if rightOuter {
+		cross = false
+		kind = ast.JoinRight
 	}
 	if full {
 		cross = false
@@ -409,7 +420,8 @@ func namesOfJoin(n planner.Join, left, right planner.Logical) []string {
 func pushFilterJoin(pred ast.Expr, j planner.Join) planner.Logical {
 	full := j.Kind == ast.JoinFull
 	leftOuter := j.Kind == ast.JoinLeft
-	outer := leftOuter || full
+	rightOuter := j.Kind == ast.JoinRight
+	outer := leftOuter || full || rightOuter
 	var leftC, rightC, mid, above []ast.Expr
 	for _, c := range conjuncts(pred) {
 		names := identNames(c)
@@ -424,15 +436,15 @@ func pushFilterJoin(pred ast.Expr, j planner.Join) planner.Logical {
 		}
 		switch {
 		case lOnly && !rOnly:
-			if full {
-				// FULL: do not push either side's WHERE into the inputs.
+			if full || rightOuter {
+				// FULL/RIGHT: do not push null-extended side's WHERE into the inputs.
 				above = append(above, c)
 			} else {
 				leftC = append(leftC, c)
 			}
 		case rOnly && !lOnly:
-			if outer {
-				// WHERE on the null-extended side must stay above the join.
+			if full || leftOuter {
+				// FULL/LEFT: WHERE on the null-extended side must stay above the join.
 				above = append(above, c)
 			} else {
 				rightC = append(rightC, c)
@@ -752,8 +764,6 @@ func formatPlan(p planner.Logical) string {
 		return "RebuildIndex"
 	case planner.AlterTable:
 		return "AlterTable"
-	case planner.CreateDatabase:
-		return "CreateDatabase"
 	case planner.Join:
 		kind := "Join"
 		if n.Kind == ast.JoinSemi {

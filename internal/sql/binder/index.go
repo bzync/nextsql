@@ -187,7 +187,9 @@ func bindCreateIndex(s ast.CreateIndex, lookup Lookup) (Bound, error) {
 			return nil, nerr.New(nerr.NotFound, "sql.binder", "unknown index column")
 		}
 		if tab.Columns[col].ClientEncrypted() {
-			return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "indexes cannot use an ENCRYPTED CLIENT column")
+			if tab.Columns[col].ClientEncryptionMode != catalog.ClientEncryptionDeterministic || special || len(parts) != 1 {
+				return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "only a plain btree key may index a DETERMINISTIC ENCRYPTED CLIENT column")
+			}
 		}
 		if s.Spatial {
 			k := tab.Columns[col].Type.Kind
@@ -283,28 +285,12 @@ func bindCreateIndex(s ast.CreateIndex, lookup Lookup) (Bound, error) {
 		}
 		idx.Predicate = s.Where
 	}
-	if tab.Partitioning != nil && isIVFFamily(idx.VecMethod) {
-		return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "IVF indexes on partitioned tables are not supported in this slice")
-	}
-	if tab.Partitioning != nil && idx.VecMethod == catalog.VecMethodSPARSE {
-		return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "SPARSE indexes on partitioned tables are not supported in this slice")
-	}
 	if tab.Partitioning != nil && idx.Unique {
 		// Cross-partition UNIQUE is enforced by probing every partition-local
 		// root on every write (CREATE INDEX, INSERT, UPDATE, ATTACH PARTITION).
-		// Partial, expression, and JSON-path UNIQUE indexes, and UNIQUE on
-		// legacy TENANT tables, stay fail-closed on partitioned tables.
+		// UNIQUE on legacy TENANT tables stays fail-closed.
 		if tab.Partitioning.Kind == catalog.PartitionLegacyTenant {
 			return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "secondary UNIQUE indexes on legacy TENANT tables are not supported")
-		}
-		if idx.Predicate != nil {
-			return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "partial UNIQUE indexes on partitioned tables are not supported in this slice")
-		}
-		if hasExpr {
-			return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "expression UNIQUE indexes on partitioned tables are not supported in this slice")
-		}
-		if pathKeys > 0 {
-			return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "JSON-path UNIQUE indexes on partitioned tables are not supported in this slice")
 		}
 	}
 	return CreateIndex{Table: tab, Index: idx}, nil

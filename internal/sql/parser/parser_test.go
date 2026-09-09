@@ -301,8 +301,6 @@ func TestParseStatements(t *testing.T) {
 		{`ALTER TABLE items RENAME TO products`, ast.AlterTable{}},
 		{`ALTER TABLE orders ADD CONSTRAINT fk_orders_customer FOREIGN KEY (customer_id) REFERENCES customers (id)`, ast.AlterTable{}},
 		{`ALTER TABLE orders DROP CONSTRAINT fk_orders_customer`, ast.AlterTable{}},
-		{`CREATE DATABASE app`, ast.CreateDatabase{}},
-		{`CREATE DATABASE IF NOT EXISTS app`, ast.CreateDatabase{}},
 	}
 	for _, tc := range cases {
 		stmt, err := Parse(tc.src)
@@ -364,10 +362,6 @@ func TestParseStatements(t *testing.T) {
 			}
 		case ast.AlterTable:
 			if _, ok := stmt.(ast.AlterTable); !ok {
-				t.Fatalf("%s: %T", tc.src, stmt)
-			}
-		case ast.CreateDatabase:
-			if _, ok := stmt.(ast.CreateDatabase); !ok {
 				t.Fatalf("%s: %T", tc.src, stmt)
 			}
 		}
@@ -800,15 +794,6 @@ func TestParseAlterTableCmds(t *testing.T) {
 	add, ok := a.Cmd.(ast.AlterAddColumn)
 	if !ok || add.Column.Name != "note" || !add.Column.NotNull {
 		t.Fatalf("%T %+v", a.Cmd, a.Cmd)
-	}
-
-	stmt, err = Parse(`CREATE DATABASE IF NOT EXISTS analytics`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	cd := stmt.(ast.CreateDatabase)
-	if cd.Name != "analytics" || !cd.IfNotExists {
-		t.Fatalf("%+v", cd)
 	}
 }
 
@@ -1759,7 +1744,6 @@ func TestParseSystemShowAliases(t *testing.T) {
 		cols  []string
 	}{
 		{`SHOW DATABASES`, "system.storage", []string{"database"}},
-		{`SHOW REALMS`, "system.realms", nil},
 		{`SHOW TABLES`, "system.tables", nil},
 		{`SHOW INDEXES`, "system.indexes", nil},
 		{`SHOW CONNECTIONS`, "system.sessions", nil},
@@ -2043,5 +2027,61 @@ func TestParseDiagCleanOnSuccess(t *testing.T) {
 	}
 	if _, err := Parse("SELECT id FROM users"); err != nil {
 		t.Fatalf("Parse delegates to ParseDiag and regressed: %v", err)
+	}
+}
+
+func TestParseSubscriptAndUnnest(t *testing.T) {
+	// Subscript on column
+	stmt, err := Parse("SELECT tags[1], scores['math'], matrix[1][2] FROM t")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sel, ok := stmt.(ast.Select)
+	if !ok || len(sel.List) != 3 {
+		t.Fatalf("expected 3 items, got %+v", stmt)
+	}
+	sub1, ok := sel.List[0].Expr.(ast.Subscript)
+	if !ok || sub1.Coll.(ast.Ident).Name != "tags" {
+		t.Fatalf("item 0: %+v", sel.List[0].Expr)
+	}
+	sub2, ok := sel.List[1].Expr.(ast.Subscript)
+	if !ok || sub2.Coll.(ast.Ident).Name != "scores" {
+		t.Fatalf("item 1: %+v", sel.List[1].Expr)
+	}
+	sub3, ok := sel.List[2].Expr.(ast.Subscript)
+	if !ok {
+		t.Fatalf("item 2: %+v", sel.List[2].Expr)
+	}
+	innerSub, ok := sub3.Coll.(ast.Subscript)
+	if !ok || innerSub.Coll.(ast.Ident).Name != "matrix" {
+		t.Fatalf("item 2 inner: %+v", sub3.Coll)
+	}
+
+	// UNNEST in FROM
+	stmt, err = Parse("SELECT * FROM UNNEST(ARRAY(1, 2, 3)) AS u(x) WITH OFFSET AS off")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sel = stmt.(ast.Select)
+	if sel.Unnest == nil {
+		t.Fatal("expected Unnest clause")
+	}
+	if sel.Unnest.Alias != "u" || sel.Unnest.Column != "x" || sel.Unnest.Offset != "off" {
+		t.Fatalf("unnest parsed: %+v", sel.Unnest)
+	}
+}
+
+// CREATE DATABASE was removed with multi-database hosting: a deployment
+// serves exactly one database. The keyword still lexes, so the parser must
+// answer with the reason rather than a bare "unexpected token".
+func TestCreateDatabaseIsRejectedWithAReason(t *testing.T) {
+	for _, src := range []string{`CREATE DATABASE app`, `CREATE DATABASE IF NOT EXISTS app`} {
+		_, err := Parse(src)
+		if err == nil {
+			t.Fatalf("%s: expected an error", src)
+		}
+		if !strings.Contains(err.Error(), "exactly one database") {
+			t.Fatalf("%s: unhelpful error: %v", src, err)
+		}
 	}
 }

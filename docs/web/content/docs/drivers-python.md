@@ -17,7 +17,6 @@ import nextsql
 
 conn = nextsql.connect(nextsql.Config(
     address="127.0.0.1:7210",
-    realm="default",
     database="default",
     user="app",
     password="s3cret",

@@ -120,6 +120,13 @@ func (a *Allocator) reloadLocked() error {
 			if err := id.UserData(); err != nil {
 				return err
 			}
+			// Free refuses an id at or above the high-water mark, and
+			// persist raises the mark for every metadata page it claims, so
+			// a free id this large was never allocated. Trusting it would
+			// hand out a page that a later Alloc hands out again.
+			if id >= a.next {
+				return nerr.New(nerr.Corruption, "allocator.Open", "free page id is beyond the allocation high-water mark")
+			}
 			if _, dup := a.set[id]; dup {
 				return nerr.New(nerr.Corruption, "allocator.Open", "duplicate free page id")
 			}
@@ -127,6 +134,14 @@ func (a *Allocator) reloadLocked() error {
 			a.set[id] = struct{}{}
 		}
 		cur = format.PageID(p.TxnMeta())
+	}
+	// Checked after the walk, not during it: a record on the first page can
+	// name a metadata page the walk has not reached yet. Free rejects these,
+	// so one here means the chain claims a page it is itself using.
+	for _, id := range a.meta {
+		if _, ok := a.set[id]; ok {
+			return nerr.New(nerr.Corruption, "allocator.Open", "freelist metadata page is listed as free")
+		}
 	}
 	if uint64(len(a.free)) != count {
 		return nerr.New(nerr.Corruption, "allocator.Open", "freelist count mismatch")
@@ -232,33 +247,6 @@ func (a *Allocator) State() State {
 		Free:     append([]format.PageID(nil), a.free...),
 		Metadata: append([]format.PageID(nil), a.meta...),
 	}
-}
-
-type snapshot struct {
-	next format.PageID
-	free []format.PageID
-	set  map[format.PageID]struct{}
-	meta []format.PageID
-}
-
-func (a *Allocator) snapshot() snapshot {
-	s := snapshot{
-		next: a.next,
-		free: append([]format.PageID(nil), a.free...),
-		set:  make(map[format.PageID]struct{}, len(a.set)),
-		meta: append([]format.PageID(nil), a.meta...),
-	}
-	for id := range a.set {
-		s.set[id] = struct{}{}
-	}
-	return s
-}
-
-func (a *Allocator) restore(s snapshot) {
-	a.next = s.next
-	a.free = s.free
-	a.set = s.set
-	a.meta = s.meta
 }
 
 func (a *Allocator) persist() error {

@@ -15,6 +15,46 @@ func rejectClientEncryptedExpr(e ast.Expr, tab *catalog.Table, context string) e
 	return nil
 }
 
+// rejectClientEncryptedWhere permits only equality over an explicitly
+// deterministic column and an opaque parameter, plus NULL tests. These are
+// the only predicates the server can evaluate without field keys. Randomized
+// columns and plaintext literals remain fail-closed.
+func rejectClientEncryptedWhere(e ast.Expr, tab *catalog.Table) error {
+	if e == nil || !exprUsesClientEncrypted(e, tab) {
+		return nil
+	}
+	switch x := e.(type) {
+	case ast.Binary:
+		if x.Op == "AND" || x.Op == "OR" {
+			if err := rejectClientEncryptedWhere(x.Left, tab); err != nil {
+				return err
+			}
+			return rejectClientEncryptedWhere(x.Right, tab)
+		}
+		if x.Op == "=" || x.Op == "<>" || x.Op == "!=" {
+			if deterministicEncryptedColumn(x.Left, tab) && isClientCipherParam(x.Right) ||
+				deterministicEncryptedColumn(x.Right, tab) && isClientCipherParam(x.Left) {
+				return nil
+			}
+		}
+	case ast.IsNull:
+		if deterministicEncryptedColumn(x.Expr, tab) {
+			return nil
+		}
+	}
+	return nerr.New(nerr.InvalidArgument, "sql.binder", "ENCRYPTED CLIENT WHERE permits only a DETERMINISTIC column compared with an encrypted parameter, or IS NULL")
+}
+
+func isClientCipherParam(e ast.Expr) bool {
+	_, ok := e.(ast.Param)
+	return ok
+}
+
+func deterministicEncryptedColumn(e ast.Expr, tab *catalog.Table) bool {
+	ord, ok := encryptedColumnOrdinal(e, tab)
+	return ok && ord >= 0 && ord < len(tab.Columns) && tab.Columns[ord].ClientEncryptionMode == catalog.ClientEncryptionDeterministic
+}
+
 // checkClientEncryptedAssignment permits only an opaque parameter/NULL or a
 // direct ciphertext copy. It rejects server-side expressions over plaintext-
 // logical columns and prevents literals from accidentally being stored as if
@@ -133,6 +173,8 @@ func exprUsesClientEncrypted(e ast.Expr, tab *catalog.Table) bool {
 		}
 	case ast.InSubquery:
 		return exprUsesClientEncrypted(x.Expr, tab)
+	case ast.Subscript:
+		return exprUsesClientEncrypted(x.Coll, tab) || exprUsesClientEncrypted(x.Index, tab)
 	}
 	return false
 }

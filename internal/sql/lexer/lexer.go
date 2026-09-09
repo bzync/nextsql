@@ -187,6 +187,7 @@ const (
 	KwSubscribe
 	KwEncrypted
 	KwClient
+	KwDeterministic
 	KwTransfer
 	KwLeader
 	KwResource
@@ -196,9 +197,12 @@ const (
 	KwDisable
 	KwReconcile
 	KwConfirm
+	KwUnnest
 	// symbols
 	LParen
 	RParen
+	LBracket
+	RBracket
 	Comma
 	Dot
 	Star
@@ -223,7 +227,8 @@ func (k Kind) String() string {
 
 var kindNames = map[Kind]string{
 	EOF: "EOF", Ident: "ident", String: "string", Number: "number", Param: "param", HexLit: "hex literal",
-	LParen: "(", RParen: ")", Comma: ",", Dot: ".", Star: "*", Eq: "=", Neq: "<>",
+	KwUnnest: "UNNEST",
+	LParen:   "(", RParen: ")", LBracket: "[", RBracket: "]", Comma: ",", Dot: ".", Star: "*", Eq: "=", Neq: "<>",
 	Lt: "<", Gt: ">", Lte: "<=", Gte: ">=", Plus: "+", Minus: "-", Slash: "/", Semi: ";",
 }
 
@@ -260,6 +265,12 @@ func (l *Lexer) Next() Token {
 	case ')':
 		l.i++
 		return Token{Kind: RParen, Lit: ")", Pos: pos}
+	case '[':
+		l.i++
+		return Token{Kind: LBracket, Lit: "[", Pos: pos}
+	case ']':
+		l.i++
+		return Token{Kind: RBracket, Lit: "]", Pos: pos}
 	case ',':
 		l.i++
 		return Token{Kind: Comma, Lit: ",", Pos: pos}
@@ -538,7 +549,7 @@ var keywords = map[string]Kind{
 	"workflow": KwWorkflow, "run": KwRun, "trigger": KwTrigger,
 	"before": KwBefore, "after": KwAfter, "each": KwEach,
 	"show": KwShow, "task": KwTask, "tasks": KwTasks, "cancel": KwCancel, "subscribe": KwSubscribe,
-	"encrypted": KwEncrypted, "client": KwClient,
+	"encrypted": KwEncrypted, "client": KwClient, "deterministic": KwDeterministic,
 	"transfer": KwTransfer, "leader": KwLeader,
 	"resource":    KwResource,
 	"drain":       KwDrain,
@@ -547,4 +558,5 @@ var keywords = map[string]Kind{
 	"disable":     KwDisable,
 	"reconcile":   KwReconcile,
 	"confirm":     KwConfirm,
+	"unnest":      KwUnnest,
 }

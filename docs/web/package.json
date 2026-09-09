@@ -5,6 +5,8 @@
   "scripts": {
     "dev": "next dev",
     "build": "next build",
+    "releases:sync": "node scripts/sync-github-releases.mjs",
+    "test:releases": "node --test scripts/sync-github-releases.test.mjs",
     "start": "serve out",
     "lint": "eslint"
   },

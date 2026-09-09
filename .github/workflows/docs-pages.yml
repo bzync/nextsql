@@ -13,6 +13,9 @@ on:
       - "docs/web/**"
       - "content/docs/**"
       - ".github/workflows/docs-pages.yml"
+  release:
+    types: [published]
+  workflow_call: {}
   workflow_dispatch: {}
 
 permissions:
@@ -46,10 +49,18 @@ jobs:
         id: pages
         uses: actions/configure-pages@v6
 
+      - name: Sync published GitHub release assets
+        working-directory: docs/web
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NEXTSQL_GITHUB_REPOSITORY: bzync/nextsql
+        run: npm run releases:sync
+
       - name: Build static export
         working-directory: docs/web
         env:
           NEXTSQL_PAGES_BASE_PATH: ${{ steps.pages.outputs.base_path }}
+          NEXTSQL_RELEASE_CATALOG: data/releases.github.json
         run: npm run build
 
       - name: Upload artifact

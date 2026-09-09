@@ -1,0 +1,144 @@
+name: Publish release installers
+
+# Tag only after RELEASING.md's production evidence and compatibility gates
+# are green. Release assets are immutable: an existing tag/release is never
+# overwritten by this workflow.
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing vX.Y.Z tag to package
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: release-installers-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Validate tag and product version
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9]+([.-][A-Za-z0-9]+)*)?$ ]]; then
+            echo "invalid release tag: $RELEASE_TAG" >&2
+            exit 1
+          fi
+          product_version="$(sed -n 's/^[[:space:]]*String = "\(.*\)".*/\1/p' internal/version/version.go | head -n 1)"
+          tag_version="${RELEASE_TAG#v}"
+          if [ "$product_version" != "$tag_version" ]; then
+            echo "tag $RELEASE_TAG does not match product version $product_version" >&2
+            exit 1
+          fi
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "release $RELEASE_TAG already exists; release assets are not overwritten" >&2
+            exit 1
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build Linux and Windows installers
+        shell: bash
+        env:
+          RELEASE_DIST: ${{ runner.temp }}/nextsql-installers
+        run: |
+          set -euo pipefail
+          ./scripts/build-linux-installer.sh --arch amd64 --out "$RELEASE_DIST" --skip-rpm
+          ./scripts/build-windows-installer.sh --arch amd64 --out "$RELEASE_DIST" --skip-nsis
+          cat "$RELEASE_DIST/SHA256SUMS.linux" "$RELEASE_DIST/SHA256SUMS.windows" > "$RELEASE_DIST/SHA256SUMS"
+
+      - name: Verify release payload
+        shell: bash
+        env:
+          RELEASE_DIST: ${{ runner.temp }}/nextsql-installers
+        run: |
+          set -euo pipefail
+          cd "$RELEASE_DIST"
+          sha256sum --check SHA256SUMS
+          expected=(
+            "nextsql-${RELEASE_TAG#v}-linux-amd64.run"
+            "nextsql-${RELEASE_TAG#v}-linux-amd64.tar.gz"
+            "nextsql_${RELEASE_TAG#v}_amd64.deb"
+            "nextsql-${RELEASE_TAG#v}-windows-amd64-setup.exe"
+            "nextsql-${RELEASE_TAG#v}-windows-amd64.zip"
+            "SHA256SUMS"
+          )
+          for file in "${expected[@]}"; do
+            test -s "$file" || { echo "missing release artifact: $file" >&2; exit 1; }
+          done
+
+      - name: Retain installer build evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: nextsql-installers-${{ env.RELEASE_TAG }}
+          path: ${{ runner.temp }}/nextsql-installers/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish immutable GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_DIST: ${{ runner.temp }}/nextsql-installers
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          channel="$(VERSION="$version" node -e '
+            const fs = require("node:fs");
+            const catalog = JSON.parse(fs.readFileSync("docs/web/data/releases.json", "utf8"));
+            const release = catalog.releases.find((item) => item.version === process.env.VERSION);
+            process.stdout.write(release?.channel || "preview");
+          ')"
+          flags=(--verify-tag --generate-notes --title "NextSQL $RELEASE_TAG")
+          if [ "$channel" = "preview" ]; then
+            flags+=(--prerelease)
+          elif [ "$channel" != "stable" ]; then
+            echo "invalid release channel for $version: $channel" >&2
+            exit 1
+          fi
+          assets=(
+            "$RELEASE_DIST/nextsql-${version}-linux-amd64.run"
+            "$RELEASE_DIST/nextsql-${version}-linux-amd64.tar.gz"
+            "$RELEASE_DIST/nextsql_${version}_amd64.deb"
+            "$RELEASE_DIST/nextsql-${version}-windows-amd64-setup.exe"
+            "$RELEASE_DIST/nextsql-${version}-windows-amd64.zip"
+            "$RELEASE_DIST/SHA256SUMS"
+          )
+          gh release create "$RELEASE_TAG" "${assets[@]}" "${flags[@]}"
+
+  deploy-docs:
+    needs: publish
+    uses: ./.github/workflows/docs-pages.yml
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    secrets: inherit

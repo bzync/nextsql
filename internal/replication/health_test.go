@@ -34,7 +34,7 @@ func TestReplicaHealthSteadyState(t *testing.T) {
 		if h.Role != "follower" || !h.HasLeader {
 			t.Fatalf("follower health: %+v", h)
 		}
-		if h.LastContact < 0 || h.LastContact > HealthyContactWindow {
+		if h.LastContact < 0 || h.LastContact > c.HealthyContactWindow() {
 			t.Fatalf("follower contact age %v out of window", h.LastContact)
 		}
 		if !h.Healthy {
@@ -65,10 +65,10 @@ func TestReplicaHealthPartitionedFollower(t *testing.T) {
 		trans[i].Disconnect(addrs[2])
 	}
 
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(raftConverge)
 	for time.Now().Before(deadline) {
 		h := cls[2].ReplicaHealth()
-		if !h.Healthy && (h.LastContact > HealthyContactWindow || h.LastContact == NeverContacted || h.Role != "follower") {
+		if !h.Healthy && (h.LastContact > cls[2].HealthyContactWindow() || h.LastContact == NeverContacted || h.Role != "follower") {
 			break
 		}
 		time.Sleep(20 * time.Millisecond)
@@ -129,7 +129,7 @@ func TestStatusCarriesHealth(t *testing.T) {
 // leader at least once, i.e. its health snapshot is Healthy.
 func waitFollowersHealthy(t *testing.T, cls []*Cluster) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(raftConverge)
 	for time.Now().Before(deadline) {
 		ok := true
 		for _, c := range cls {

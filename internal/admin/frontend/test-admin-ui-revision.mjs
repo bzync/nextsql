@@ -47,7 +47,7 @@ assert.ok(appJs.includes("aria-label:\"Select all rows\"") || appJs.includes("ar
 
 // Test 7: Verify Tabs component is integrated across multi-table views
 assert.ok(appJs.includes("value:\"sessions\"") || appJs.includes("value\":\"sessions\""), "Activity must use Tabs for sessions");
-assert.ok(appJs.includes("value:\"realms\"") || appJs.includes("value\":\"realms\""), "Databases must use Tabs for realms");
+assert.ok(appJs.includes("value:\"catalog\"") || appJs.includes("value\":\"catalog\""), "Databases must use Tabs for the catalog tree");
 assert.ok(appJs.includes("value:\"grants\"") || appJs.includes("value\":\"grants\""), "Security must use Tabs for grants");
 assert.ok(appJs.includes("value:\"replication\"") || appJs.includes("value\":\"replication\""), "Overview / Cluster must use Tabs for replication");
 assert.ok(appJs.includes("value:\"table_stats\"") || appJs.includes("value\":\"table_stats\""), "Maintenance must use Tabs for table_stats");

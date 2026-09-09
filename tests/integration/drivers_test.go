@@ -1,9 +1,11 @@
 package integration
 
 import (
+	"bytes"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"testing"
 )
@@ -170,4 +172,92 @@ func writeClientCA(t *testing.T, _ string) string {
 		t.Fatal(err)
 	}
 	return path
+}
+
+// The Python and Ruby live suites were the only official-driver live checks not
+// driven from Go, so nothing ran them: they sat failing against a real server
+// (an unsupported `COUNT(*)` over a system table) with no signal. Wiring them in
+// here gives every official driver the same live gate, on the same in-process
+// TLS server the other four use.
+//
+// Each gets its own server because both suites create the same `items` table,
+// and startTLSServer builds a fresh database per call.
+
+func TestPythonDriverUnit(t *testing.T) {
+	py, err := exec.LookPath("python3")
+	if err != nil {
+		t.Skip("python3 not installed")
+	}
+	cmd := exec.Command(py, "-m", "unittest", "discover", "-s", "tests", "-q")
+	cmd.Dir = filepath.Join(repoRoot(t), "drivers", "python")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("python unit: %v\n%s", err, out)
+	}
+}
+
+func TestPythonDriverLiveTLS(t *testing.T) {
+	py, err := exec.LookPath("python3")
+	if err != nil {
+		t.Skip("python3 not installed")
+	}
+	addr, _ := startTLSServer(t)
+	caPath := writeClientCA(t, addr)
+	cmd := exec.Command(py, "-m", "unittest", "discover", "-s", "tests", "-q")
+	cmd.Dir = filepath.Join(repoRoot(t), "drivers", "python")
+	cmd.Env = append(os.Environ(),
+		"NEXTSQL_ADDR="+addr,
+		"NEXTSQL_CA="+caPath,
+		"NEXTSQL_DATABASE_USER=app",
+		"NEXTSQL_DATABASE_PASS=s3cret",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("python live: %v\n%s", err, out)
+	}
+	// The live cases skip themselves without the address, so a green run that
+	// never connected would otherwise look identical to a real pass.
+	if bytes.Contains(out, []byte("skipped")) {
+		t.Fatalf("python live suite skipped its live cases:\n%s", out)
+	}
+}
+
+func TestRubyDriverUnit(t *testing.T) {
+	ruby, err := exec.LookPath("ruby")
+	if err != nil {
+		t.Skip("ruby not installed")
+	}
+	cmd := exec.Command(ruby, "-Ilib", "-Itest", "test/test_protocol.rb")
+	cmd.Dir = filepath.Join(repoRoot(t), "drivers", "ruby")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("ruby unit: %v\n%s", err, out)
+	}
+}
+
+func TestRubyDriverLiveTLS(t *testing.T) {
+	ruby, err := exec.LookPath("ruby")
+	if err != nil {
+		t.Skip("ruby not installed")
+	}
+	addr, _ := startTLSServer(t)
+	caPath := writeClientCA(t, addr)
+	cmd := exec.Command(ruby, "-Ilib", "-Itest", "test/test_live.rb")
+	cmd.Dir = filepath.Join(repoRoot(t), "drivers", "ruby")
+	cmd.Env = append(os.Environ(),
+		"NEXTSQL_ADDR="+addr,
+		"NEXTSQL_CA="+caPath,
+		"NEXTSQL_DATABASE_USER=app",
+		"NEXTSQL_DATABASE_PASS=s3cret",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("ruby live: %v\n%s", err, out)
+	}
+	// Match the summary field, not the substring: minitest also prints an
+	// assertions-per-second rate, and "186.4040 assertions/s" contains
+	// "0 assertions". The summary reads "3 runs, 16 assertions, 0 failures".
+	if regexp.MustCompile(`\b0 assertions,`).Match(out) {
+		t.Fatalf("ruby live suite asserted nothing:\n%s", out)
+	}
 }

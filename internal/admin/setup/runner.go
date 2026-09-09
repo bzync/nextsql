@@ -87,10 +87,15 @@ func (rn *runner) run(ctx context.Context, p Params, dryRun bool) runResult {
 		}
 	}
 
+	return rn.runArgs(ctx, p.toArgs(dryRun, passwordFile))
+}
+
+// runArgs executes one bounded, JSON-speaking nextsql CLI command. Setup
+// mode uses it for its setup plan/install path and its read-only lifecycle
+// inspection path; neither path ever links the engine into the Admin process.
+func (rn *runner) runArgs(ctx context.Context, args []string) runResult {
 	cctx, cancel := context.WithTimeout(ctx, rn.timeout)
 	defer cancel()
-
-	args := p.toArgs(dryRun, passwordFile)
 	cmd := exec.CommandContext(cctx, rn.bin, args...)
 	// A minimal, explicit environment: no inherited NEXTSQL_* variables from
 	// whatever launched nextsql-admin should silently change what gets

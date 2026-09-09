@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -122,6 +123,24 @@ func TestWALRetentionTickAdvancesHorizonFromArchivedSegment(t *testing.T) {
 	}
 	if found {
 		t.Fatal("expected no archived segment to satisfy a much longer retention window")
+	}
+}
+
+func TestCheckpointControllerInstallsRecoveryBoundary(t *testing.T) {
+	db := testDB(t)
+	before := db.Eng.WAL.CheckpointLSN()
+	if _, err := db.Session().Exec(`CREATE TABLE checkpoint_tick (id STRING PRIMARY KEY)`); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	startCheckpointController(ctx, db, 5, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	deadline := time.Now().Add(2 * time.Second)
+	for db.Eng.WAL.CheckpointLSN() <= before && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := db.Eng.WAL.CheckpointLSN(); got <= before {
+		t.Fatalf("checkpoint LSN=%d, want > %d", got, before)
 	}
 }
 

@@ -1,13 +1,10 @@
 package executor
 
 import (
-	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/bzync/nextsql/internal/catalog"
-	"github.com/bzync/nextsql/internal/crypto"
 	"github.com/bzync/nextsql/internal/fulltext"
 	"github.com/bzync/nextsql/internal/nerr"
 	"github.com/bzync/nextsql/internal/sql/ast"
@@ -16,85 +13,6 @@ import (
 	"github.com/bzync/nextsql/internal/storage/btree"
 	"github.com/bzync/nextsql/internal/wal"
 )
-
-func (s *Session) execCreateDatabase(p planner.CreateDatabase) (*Result, error) {
-	if s == nil || s.db == nil {
-		return nil, nerr.New(nerr.Internal, "executor.CreateDatabase", "nil database")
-	}
-	if err := validateDBName(p.Name); err != nil {
-		return nil, err
-	}
-	// This statement creates a bare sibling file, which only means anything on
-	// an embedded deployment that has no deployment registry. On a
-	// registry-backed deployment the file would carry no realm, no registry
-	// record, and no routing entry, so nothing could ever connect to it
-	// (Hello resolves names through the registry) while it still consumed a
-	// full database's worth of disk. Fail closed instead of leaving an
-	// unreachable orphan behind; managed databases are provisioned through the
-	// registry.
-	if s.hostingRegistry != nil {
-		return nil, nerr.New(nerr.InvalidArgument, "executor.CreateDatabase",
-			"CREATE DATABASE is not supported on a registry-backed deployment: a database created this way has no registry record and cannot be connected to; provision it with \"nextsql database create\" instead")
-	}
-	dir := filepath.Dir(s.db.path)
-	if s.db.path == "" && s.db.Eng != nil {
-		dir = filepath.Dir(s.db.Eng.Path())
-	}
-	if dir == "" {
-		return nil, nerr.New(nerr.Unavailable, "executor.CreateDatabase", "database directory is unknown")
-	}
-	path := filepath.Join(dir, p.Name)
-	if _, err := os.Stat(path); err == nil {
-		if p.IfNotExists {
-			return &Result{}, nil
-		}
-		return nil, nerr.New(nerr.AlreadyExists, "executor.CreateDatabase", "database already exists")
-	} else if !os.IsNotExist(err) {
-		return nil, nerr.Wrap(nerr.IO, "executor.CreateDatabase", "stat", err)
-	}
-	keys := s.db.keys
-	if keys == nil && s.db.Eng != nil {
-		keys = s.db.Eng.Keys()
-	}
-	if keys == nil {
-		return nil, nerr.New(nerr.Unavailable, "executor.CreateDatabase", "key provider is not available")
-	}
-	// An Envelope is bound to the source file identity. Snapshot the
-	// current DEK so the new file can be created without that binding.
-	if _, ok := keys.(*crypto.Envelope); ok {
-		dek, err := keys.Current()
-		if err != nil {
-			return nil, err
-		}
-		keys, err = crypto.NewMemoryKeyProvider(dek)
-		if err != nil {
-			return nil, err
-		}
-	}
-	pages := s.db.bufferPages
-	if pages < 1 {
-		pages = 32
-	}
-	created, err := Create(path, keys, pages)
-	if err != nil {
-		return nil, err
-	}
-	_ = created.Close()
-	return &Result{}, nil
-}
-
-func validateDBName(name string) error {
-	if name == "" || name == "." || name == ".." {
-		return nerr.New(nerr.InvalidArgument, "executor.CreateDatabase", "invalid database name")
-	}
-	if strings.ContainsAny(name, `/\:`) || strings.Contains(name, "..") {
-		return nerr.New(nerr.InvalidArgument, "executor.CreateDatabase", "invalid database name")
-	}
-	if catalog.ReservedName(name) {
-		return nerr.New(nerr.InvalidArgument, "executor.CreateDatabase", "database name prefix nsql_ is reserved")
-	}
-	return nil
-}
 
 func (s *Session) execDropTable(p planner.DropTable) (*Result, error) {
 	if p.Table == nil {
@@ -430,9 +348,25 @@ func (s *Session) rebuildPartitionedIndex(tab *catalog.Table, pos int, idx catal
 		}
 		s.pending.partIdxs[partitionIndexKey(tab.Name, part.ID, idx.Name)] = local
 		if idx.Vector {
-			s.dirtyHNSW = true
-			if err := s.buildPartitionVectorIndex(tab, idx, part, s.x.use(heap), progress); err != nil {
-				return nil, err
+			switch idx.VecMethod {
+			case catalog.VecMethodIVF:
+				s.dirtyIVF = true
+				if err := s.buildPartitionIVFIndex(tab, idx, part, s.x.use(heap), progress); err != nil {
+					return nil, err
+				}
+			case catalog.VecMethodIVFPQ:
+				if err := s.buildPartitionIVFPQIndex(tab, idx, part, s.x.use(heap), progress); err != nil {
+					return nil, err
+				}
+			case catalog.VecMethodSPARSE:
+				if err := s.buildPartitionSparseIndex(tab, idx, part, s.x.use(heap), progress); err != nil {
+					return nil, err
+				}
+			default:
+				s.dirtyHNSW = true
+				if err := s.buildPartitionVectorIndex(tab, idx, part, s.x.use(heap), progress); err != nil {
+					return nil, err
+				}
 			}
 		} else if err := s.populatePartitionIndex(tab, idx, s.x.use(heap), s.x.use(local), progress); err != nil {
 			return nil, err
@@ -836,8 +770,23 @@ func (s *Session) alterAddPartition(old, neu *catalog.Table, cmd ast.AlterAddPar
 		part.Indexes[i].Meta = local.Meta()
 		s.pending.partIdxs[partitionIndexKey(old.Name, part.ID, idx.Name)] = local
 		if idx.Vector {
-			if err := s.initPartitionVectorIndex(neu, idx, *part); err != nil {
-				return err
+			switch idx.VecMethod {
+			case catalog.VecMethodIVF:
+				if err := s.initPartitionIVFIndex(neu, idx, *part); err != nil {
+					return err
+				}
+			case catalog.VecMethodIVFPQ:
+				if err := s.initPartitionIVFPQIndex(neu, idx, *part); err != nil {
+					return err
+				}
+			case catalog.VecMethodSPARSE:
+				if err := s.initPartitionSparseIndex(neu, idx, *part); err != nil {
+					return err
+				}
+			default:
+				if err := s.initPartitionVectorIndex(neu, idx, *part); err != nil {
+					return err
+				}
 			}
 		}
 	}

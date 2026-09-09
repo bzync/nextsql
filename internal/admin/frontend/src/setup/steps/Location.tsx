@@ -1,5 +1,6 @@
-import { Alert, Button, Card, CardBody, DescriptionDetails, DescriptionItem, DescriptionList, DescriptionTerm, Inline, List, ListItem, Stack, Text } from "@bzync/rui";
-import type { Params, RunResult } from "../api";
+import { useEffect, useRef, useState } from "react";
+import { Alert, Button, Card, CardBody, Checkbox, DescriptionDetails, DescriptionItem, DescriptionList, DescriptionTerm, Inline, List, ListItem, Spinner, Stack, Text } from "@bzync/rui";
+import { api, type LifecycleDetect, type Params, type RunResult } from "../api";
 import { PathField } from "../components/PathField";
 import { SetupErrorAlert } from "../components/SetupErrorAlert";
 import { StepHeader } from "../components/StepHeader";
@@ -18,6 +19,46 @@ export function Location({
 }) {
   const r = lastPlan?.result;
   const keyFileExists = r?.key_file_exists;
+  // The checkbox is its own state, not `params.recoveryKeyOut !== ""`:
+  // deriving it meant clearing the path field (to retype it) unchecked the
+  // box and hid the field mid-edit. `params` is still the authority for
+  // whether an export is configured, so an external change — the defaults
+  // arriving from /api/v1/hello, or the Resources step clearing the export
+  // when "configuration only" is chosen — is adopted here.
+  const [recoveryEnabled, setRecoveryEnabled] = useState(params.recoveryKeyOut !== "");
+  const [recPath, setRecPath] = useState(params.recoveryKeyOut || "");
+  const pushed = useRef(params.recoveryKeyOut);
+  useEffect(() => {
+    if (params.recoveryKeyOut === pushed.current) return; // our own edit, echoed back
+    pushed.current = params.recoveryKeyOut;
+    setRecoveryEnabled(params.recoveryKeyOut !== "");
+    setRecPath(params.recoveryKeyOut);
+  }, [params.recoveryKeyOut]);
+
+  function setRecovery(enabled: boolean, path: string) {
+    setRecoveryEnabled(enabled);
+    setRecPath(path);
+    const out = enabled ? path.trim() : "";
+    pushed.current = out;
+    patch({ recoveryKeyOut: out, instanceRecoveryKeyOut: out ? out + ".instance" : "" });
+  }
+
+  // Checked with no path would install with no recovery key at all, which is
+  // the opposite of what the operator just asked for, so it blocks instead.
+  const recoveryPathMissing = recoveryEnabled && recPath.trim() === "";
+  const [detect, setDetect] = useState<LifecycleDetect | null>(null);
+  const [detectError, setDetectError] = useState<string | null>(null);
+  const [detecting, setDetecting] = useState(false);
+  async function inspectExisting() {
+    setDetecting(true); setDetectError(null); setDetect(null);
+    try {
+      const response = await api.lifecycleDetect(params.dataDir, params.configOut);
+      if (!response.ok || !response.result) throw new Error(response.error || "could not inspect this location");
+      setDetect(response.result as unknown as LifecycleDetect);
+    } catch (err) {
+      setDetectError(err instanceof Error ? err.message : String(err));
+    } finally { setDetecting(false); }
+  }
 
   return (
     <Card variant="bordered">
@@ -43,6 +84,51 @@ export function Location({
             deleted or overwritten by this wizard.
           </Text>
 
+          <Stack gap="xs" style={{ marginTop: 8 }}>
+            <Checkbox
+              id="enableRecoveryKey"
+              label="Generate offline recovery keys (recommended backup unlock path)"
+              checked={recoveryEnabled}
+              onChange={(e) => {
+                if (e.target.checked) {
+                  const fallback = params.keyFile
+                    ? params.keyFile.replace(/root\.key$/, "recovery.key")
+                    : "/etc/nextsql/recovery.key";
+                  setRecovery(true, recPath || fallback);
+                } else {
+                  setRecovery(false, recPath);
+                }
+              }}
+            />
+            <Text variant="muted" size="sm">
+              A recovery key creates an independent second unlock path for both the database and deployment registry keystores, preventing total data loss if the root key is lost.
+            </Text>
+            {recoveryEnabled ? (
+              <Stack gap="xs">
+                <PathField
+                  id="recoveryKeyOut"
+                  label="Recovery key export file"
+                  mode="file"
+                  placeholder="/etc/nextsql/recovery.key"
+                  value={recPath}
+                  onChange={(v) => setRecovery(true, v)}
+                />
+                <Text variant="muted" size="sm">
+                  Exports the database recovery key and registry recovery key ({recPath.trim() ? recPath.trim() + ".instance" : "…"}). Store both offline.
+                </Text>
+                {recoveryPathMissing ? (
+                  <Alert variant="error">
+                    Enter a path for the recovery key export, or clear the checkbox to install with the root unlock key as the only way in.
+                  </Alert>
+                ) : null}
+              </Stack>
+            ) : (
+              <Alert variant="warning">
+                Without recovery keys, the root unlock key is the single point of failure: losing it means permanent, unrecoverable data loss.
+              </Alert>
+            )}
+          </Stack>
+
           {lastPlan && r ? (
             keyFileExists ? (
               <Alert variant="warning">
@@ -56,6 +142,18 @@ export function Location({
           ) : null}
 
           {planError ? <SetupErrorAlert raw={planError} /> : null}
+          <Inline gap="sm" align="center" wrap>
+            <Button variant="outline" size="sm" onClick={inspectExisting} disabled={detecting}>
+              {detecting ? <><Spinner size="sm" /> Inspecting…</> : "Inspect existing installation"}
+            </Button>
+            <Text size="sm" variant="muted">Read-only; it does not change files or start a server.</Text>
+          </Inline>
+          {detect ? (
+            <Alert variant={detect.status === "healthy" ? "success" : "warning"} title={`Existing installation: ${detect.status}`}>
+              {detect.summary} {detect.server_running ? "A server currently holds the deployment lock; lifecycle changes must wait." : ""}
+            </Alert>
+          ) : null}
+          {detectError ? <SetupErrorAlert raw={detectError} /> : null}
           {r?.hardware ? (
             <DescriptionList columns={1} density="compact">
               <DescriptionItem>
@@ -75,8 +173,8 @@ export function Location({
         <div className="nsi-actions">
           <Button variant="outline" onClick={onBack}>Back</Button>
           <Inline gap="sm">
-            <Button variant="secondary" onClick={onCheck}>Check</Button>
-            <Button variant="primary" onClick={onNext}>Continue</Button>
+            <Button variant="secondary" onClick={onCheck} disabled={recoveryPathMissing}>Check</Button>
+            <Button variant="primary" onClick={onNext} disabled={recoveryPathMissing}>Continue</Button>
           </Inline>
         </div>
       </CardBody>

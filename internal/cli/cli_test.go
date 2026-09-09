@@ -194,7 +194,6 @@ func TestResolveNextSQLDotenvSurface(t *testing.T) {
 	dotenv := strings.Join([]string{
 		"NEXTSQL_ADDR=127.0.0.1:7210",
 		"NEXTSQL_DATABASE=app_db",
-		"NEXTSQL_REALM_NAME=customer_a",
 		"NEXTSQL_INSTANCE_KEY_FILE=/run/keys/instance.key",
 		"NEXTSQL_DATABASE_USER=db_user",
 		"NEXTSQL_DATABASE_PASS=db_password",
@@ -204,7 +203,7 @@ func TestResolveNextSQLDotenvSurface(t *testing.T) {
 		"NEXTSQL_SERVER_USER=server_admin",
 		"NEXTSQL_SERVER_PASS=server_password",
 		"NEXTSQL_SERVER_PASSWORD_FILE=/run/server.pw",
-		"NEXTSQL_HOSTING_CONFIRM=true",
+		"NEXTSQL_REGISTRY_CONFIRM=true",
 		"NEXTSQL_HOSTING_MANIFEST_FILE=/etc/nextsql/hosting.yaml",
 		"",
 	}, "\n")
@@ -219,11 +218,11 @@ func TestResolveNextSQLDotenvSurface(t *testing.T) {
 	if s.Addr != "127.0.0.1:7210" || s.Database != "app_db" || s.User != "db_user" {
 		t.Fatalf("connection settings: addr=%q database=%q user=%q", s.Addr, s.Database, s.User)
 	}
-	if s.Realm != "customer_a" || s.InstanceKeyFile != "/run/keys/instance.key" || !s.HostingConfirm || s.HostingManifest != "/etc/nextsql/hosting.yaml" {
-		t.Fatalf("hosting settings: realm=%q instance_key=%q confirm=%t manifest=%q", s.Realm, s.InstanceKeyFile, s.HostingConfirm, s.HostingManifest)
+	if s.InstanceKeyFile != "/run/keys/instance.key" || !s.RegistryConfirm || s.HostingManifest != "/etc/nextsql/hosting.yaml" {
+		t.Fatalf("deployment settings: instance_key=%q confirm=%t manifest=%q", s.InstanceKeyFile, s.RegistryConfirm, s.HostingManifest)
 	}
-	if !s.Supplied["realm"] || !s.Supplied["database"] || !s.Supplied["instance-key-file"] || !s.Supplied["confirm"] || !s.Supplied["hosting-manifest"] {
-		t.Fatalf("hosting settings were not marked supplied: %+v", s.Supplied)
+	if !s.Supplied["database"] || !s.Supplied["instance-key-file"] || !s.Supplied["confirm"] || !s.Supplied["hosting-manifest"] {
+		t.Fatalf("deployment settings were not marked supplied: %+v", s.Supplied)
 	}
 	if s.Password != "db_password" || !s.Insecure {
 		t.Fatal("password or insecure setting was not resolved")
@@ -239,19 +238,23 @@ func TestResolveNextSQLDotenvSurface(t *testing.T) {
 	}
 }
 
+// Realm and tenant selection are both gone: NEXTSQL_REALM / NEXTSQL_TENANT
+// never existed as supported names, and NEXTSQL_REALM_NAME went away with
+// multi-realm hosting. None of them may resolve to anything.
 func TestRemovedRealmAndTenantEnvironmentNamesAreIgnored(t *testing.T) {
 	clearClientEnv(t)
 	dir := t.TempDir()
 	chdir(t, dir)
 	t.Setenv("NEXTSQL_REALM", "legacy-realm")
+	t.Setenv("NEXTSQL_REALM_NAME", "legacy-realm-name")
 	t.Setenv("NEXTSQL_TENANT", "legacy-tenant")
 
 	s, err := Resolve(testServerFlags(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if s.Realm != "" || s.Supplied["realm"] {
-		t.Fatalf("removed NEXTSQL_REALM was accepted: realm=%q supplied=%v", s.Realm, s.Supplied["realm"])
+	if s.Supplied["realm"] {
+		t.Fatalf("a removed realm environment name was accepted: supplied=%v", s.Supplied["realm"])
 	}
 }
 
@@ -485,23 +488,21 @@ func TestServerConfigIgnoresKeyFileFromEnv(t *testing.T) {
 	}
 }
 
-// TestServerConfigThreadsRealm proves a resolved Settings.Realm (via
-// --realm or NEXTSQL_REALM_NAME, already merged by Resolve) actually
-// reaches the driver Config — ServerConfig previously built the Config
-// literal without a Realm field at all, silently dropping it regardless of
-// how it was supplied.
-func TestServerConfigThreadsRealm(t *testing.T) {
+// TestServerConfigCarriesNoRealm proves realm selection is gone from the
+// client surface with multi-realm hosting: there is no Settings.Realm to
+// thread, and ServerConfig leaves the driver's (wire-compatibility) Realm
+// field empty, which is what a Hello for "this deployment's database" sends.
+func TestServerConfigCarriesNoRealm(t *testing.T) {
 	s := Defaults()
 	s.User = "app"
 	s.Password = "x"
 	s.Insecure = true
-	s.Realm = "acme"
 	cfg, err := ServerConfig(s)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Realm != "acme" {
-		t.Fatalf("cfg.Realm = %q, want %q", cfg.Realm, "acme")
+	if cfg.Realm != "" {
+		t.Fatalf("cfg.Realm = %q, want empty", cfg.Realm)
 	}
 }
 
@@ -603,7 +604,6 @@ func testServerFlags() *flag.FlagSet {
 	fs.String("data-dir", "", "")
 	fs.String("key-file", "", "")
 	fs.String("instance-key-file", "", "")
-	fs.String("realm", "", "")
 	fs.Int("buffer-pages", config.DefaultBufferPages, "")
 	fs.Bool("confirm", false, "")
 	fs.String("env-file", "", "")
@@ -632,7 +632,7 @@ func clearClientEnv(t *testing.T) {
 	for _, k := range []string{
 		envAddr, envDatabaseUser, envDatabasePassFile, envDatabasePass, envServerUser, envServerPass, envServerPassFile, envDatabase,
 		envTLSCA, envTLSServerName, envTLSClientCert, envTLSClientKey, envInsecure, envMigrationDir,
-		envDataDir, envKeyFile, envInstanceKey, envRealmName, envBufferPages, envHostingConfirm,
+		envDataDir, envKeyFile, envInstanceKey, envBufferPages, envRegistryConfirm,
 	} {
 		t.Setenv(k, "")
 		_ = os.Unsetenv(k)

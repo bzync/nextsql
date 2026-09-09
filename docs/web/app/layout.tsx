@@ -7,6 +7,7 @@ import { site } from "@/lib/site";
 import { SiteThemeProvider } from "@/components/SiteThemeProvider";
 import { ThemeScript } from "@/components/ThemeScript";
 import { DocsCommandPalette } from "@/components/DocsCommandPalette";
+import { searchIndex } from "@/lib/content";
 
 const geist = Geist({
   variable: "--font-geist",
@@ -51,6 +52,8 @@ export const metadata: Metadata = {
 };
 
 export default function RootLayout({ children }: LayoutProps<"/">) {
+  const docsSearchEntries = searchIndex();
+
   return (
     <html
       lang="en"
@@ -69,9 +72,9 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
           Skip to content
         </a>
         <SiteThemeProvider>
-          <CommandProvider>
+          <CommandProvider shortcut="k">
             {children}
-            <DocsCommandPalette />
+            <DocsCommandPalette entries={docsSearchEntries} />
           </CommandProvider>
         </SiteThemeProvider>
       </body>

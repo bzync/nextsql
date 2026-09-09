@@ -7,11 +7,14 @@ import { rename, stat, readFile, writeFile } from 'node:fs/promises';
 import net from 'node:net';
 import tls from 'node:tls';
 import {
+  FlagCancel,
+  FlagPublicErrorCodes,
   Kind,
   NextSQLError,
   ReadConsistency,
   Type,
   decodeDecimal,
+  decodeError,
   decodeHelloOK,
   decodeNSJB,
   decodeValue,
@@ -38,18 +41,23 @@ import {
   MemoryFieldKeyring,
   decodeFieldKeyring,
   decryptField,
+  decryptFieldDeterministic,
   encodeFieldKeyring,
   encryptField,
+  encryptFieldDeterministic,
   generateFieldKey,
   inspectField,
 } from '../js/client-encryption.mjs';
 
 export {
+  FlagCancel,
+  FlagPublicErrorCodes,
   Kind,
   NextSQLError,
   ReadConsistency,
   Type,
   decodeDecimal,
+  decodeError,
   decodeHelloOK,
   decodeNSJB,
   decodeNodeStatus,
@@ -68,7 +76,9 @@ export {
   MemoryFieldKeyring,
   FileFieldKeyring,
   decryptField,
+  decryptFieldDeterministic,
   encryptField,
+  encryptFieldDeterministic,
   generateFieldKey,
   inspectField,
 };
@@ -229,12 +239,11 @@ function connectSocket(cfg) {
       };
       if (cfg.tls.ca) {
         opts.ca = cfg.tls.ca;
-        // Bun/BoringSSL rejects a self-signed leaf used as a trust
-        // anchor. Handshake, then pin/verify the provided certificate.
-        opts.rejectUnauthorized = false;
       }
-      if (cfg.tls.rejectUnauthorized === false) {
-        opts.rejectUnauthorized = false;
+      if (cfg.tls.ca || typeof cfg.tls.rejectUnauthorized === 'boolean') {
+        // When a custom CA is pinned, Bun/BoringSSL handshakes and then
+        // NextSQL executes manual pin/verification in verifyPeer().
+        opts.rejectUnauthorized = !cfg.tls.ca && cfg.tls.rejectUnauthorized !== false;
       }
       const sock = tls.connect(opts, () => {
         try {

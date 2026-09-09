@@ -10,6 +10,8 @@ import {
   connectCluster,
   decodeDecimal,
   decodeHelloOK,
+  decodeError,
+  FlagPublicErrorCodes,
   decodeNSJB,
   decodeNodeStatus,
   decodeValue,
@@ -27,7 +29,9 @@ import {
   MemoryFieldKeyring,
   FileFieldKeyring,
   decryptField,
+  decryptFieldDeterministic,
   encryptField,
+  encryptFieldDeterministic,
 } from './nextsql.js';
 
 function fieldKey(id, fill) {
@@ -43,6 +47,15 @@ test('nextsql.d.ts type surface matches the shared drivers/js source', async () 
   expect(local.startsWith('//')).toBe(true);
   expect(local.includes("from '../js")).toBe(false);
   expect(local.slice(local.indexOf(marker))).toBe(shared.slice(shared.indexOf(marker)));
+});
+
+test('NSCE2 deterministic encryption matches Go and binds context', async () => {
+  const ring = new MemoryFieldKeyring(fieldKey('v1', 1));
+  const expected = 'NSCE2.AgICdjEDAAAAAADlFfKNZjDtO9v-sO8n1efAOo2JQ72kt938TLBP';
+  const sealed = await encryptFieldDeterministic(ring, 'app', 'accounts', 'secret', FieldType.Text, 'portable');
+  expect(sealed).toBe(expected);
+  expect(await decryptFieldDeterministic(ring, 'app', 'accounts', 'secret', FieldType.Text, sealed)).toBe('portable');
+  await expect(decryptFieldDeterministic(ring, 'app', 'accounts', 'other', FieldType.Text, sealed)).rejects.toBeInstanceOf(NextSQLError);
 });
 
 test('NSCE1 field encryption round-trip, rotation, and revocation', async () => {
@@ -393,4 +406,39 @@ test('spatial: EWKB decode / encode round-trip (Spatial track S4)', () => {
 
   const enc = encodeParam({ kind: 'geometry', wkt: 'POINT(1 2)', srid: 4326 });
   expect(decodeValue(enc, 0).value).toBe('SRID=4326;POINT(1 2)');
+});
+
+test('public error taxonomy: negotiated and v1 error shapes both decode', () => {
+  const u16str = (s) => {
+    const b = Buffer.from(s, 'utf8');
+    const out = Buffer.alloc(2 + b.length);
+    out.writeUInt16LE(b.length, 0);
+    b.copy(out, 2);
+    return out;
+  };
+  const negotiated = decodeError(Buffer.concat([
+    u16str('serialization'), u16str('retry me'), u16str('ERR_SERIALIZATION'),
+  ]));
+  // The legacy class is unchanged, so existing retry checks still work.
+  expect(negotiated.code).toBe('serialization');
+  expect(negotiated.publicCode).toBe('ERR_SERIALIZATION');
+  // An older server ignores the request bit and sends the v1 shape.
+  const legacy = decodeError(Buffer.concat([u16str('conflict'), u16str('nope')]));
+  expect(legacy.code).toBe('conflict');
+  expect(legacy.publicCode).toBe('');
+  // A present-but-empty public code is a second encoding of the v1 shape.
+  expect(() => decodeError(Buffer.concat([u16str('conflict'), u16str('nope'), u16str('')]))).toThrow();
+});
+
+test('hello-ok capability flags are an opt-in trailing field', () => {
+  const base = Buffer.alloc(11);
+  base.writeUInt16LE(1, 0);
+  base[2] = 1;
+  base.writeBigUInt64LE(99n, 3);
+  expect(decodeHelloOK(base).flags).toBe(0);
+  const flags = Buffer.alloc(2);
+  flags.writeUInt16LE(FlagPublicErrorCodes, 0);
+  expect(decodeHelloOK(Buffer.concat([base, flags])).flags).toBe(FlagPublicErrorCodes);
+  expect(() => decodeHelloOK(Buffer.concat([base, Buffer.alloc(2)]))).toThrow();
+  expect(() => decodeHelloOK(Buffer.alloc(12))).toThrow();
 });

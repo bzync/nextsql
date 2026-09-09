@@ -196,11 +196,23 @@ scalars?).
 - **Nested columnar (Arrow-style) vectorized-batch layout** — the boxed
   `[]types.Value` representation is correct; this is a perf optimization
   gated on a benchmark showing it matters.
-- **`[...]` / `[i]` subscript sugar** in the grammar — accessor functions
-  (`ELEMENT_AT`, `ARRAY_LENGTH`, …) cover the same ground with no new
-  lexer token; subscript sugar could be added later.
-- **`ARRAY_AGG` / `MAP_AGG` aggregates**, `UNNEST` in `FROM`, array/map
-  `slice`/`concat`/`sort`/`distinct` helpers — a natural next increment.
+- **`[...]` / `[i]` subscript sugar** — LANDED 2026-09-08. `arr[i]`
+  (1-based), `map['key']`, and chained `matrix[i][j]` in SELECT, WHERE,
+  and expressions. Desugars to `ELEMENT_AT` via `ast.Subscript` → eval.
+- **`ARRAY_AGG(expr)` aggregate** — LANDED 2026-09-08. Collects non-NULL
+  values into `ARRAY<T>` (element type inferred from input column).
+  Empty group yields NULL. Bounded by `MaxCollectionLen`.
+- **`MAP_AGG(key, val)` aggregate** — LANDED 2026-09-08. 2-argument
+  aggregate collecting pairs into `MAP<K,V>`. NULL keys rejected
+  (fail-closed); duplicate keys rejected via `CanonicalizeMap`. Empty
+  group yields NULL.
+- **`UNNEST(expr) [AS alias [(col, ...)]] [WITH OFFSET [AS off]]` in
+  `FROM`** — LANDED 2026-09-08. Table-valued generator for ARRAY (one
+  row per element) and MAP (one row per key/value pair, 2 column
+  aliases). Supports WHERE, ORDER BY, LIMIT, GROUP BY, and composing
+  with ARRAY_AGG/MAP_AGG.
+- Array/map `slice`/`concat`/`sort`/`distinct` helpers — a natural next
+  increment (not yet implemented).
 
 ## 5. Source of truth
 

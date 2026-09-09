@@ -101,10 +101,6 @@ function Hero() {
               Documentation
             </Link>
           </div>
-          <p className="mt-6 max-w-md font-mono text-[12px] leading-5 text-faint">
-            Not PostgreSQL, MySQL, MongoDB, or a vector-store compatibility layer.
-            Native format, dialect, protocol, and drivers.
-          </p>
         </div>
         <div className="min-w-0 max-w-full">
           <CodePanel title="hybrid.sql">{HYBRID_SQL}</CodePanel>
@@ -269,7 +265,7 @@ function Security() {
 
 function Architecture() {
   const layers = [
-    "Native wire protocol → TLS 1.3 → authn → RBAC / realm",
+    "Native wire protocol → TLS 1.3 → authn → RBAC",
     "SQL parser → binder / catalog → planner → cost optimizer",
     "Vectorized executor: relational · JSON · vector · full-text · geo · collections",
     "MVCC + row/range locks + UNDO",
@@ -422,7 +418,7 @@ function Status() {
           and Raft HA ship in{" "}
           <code className="rounded bg-bg-hover px-1 font-mono text-[12px]">nextsql</code> and{" "}
           <code className="rounded bg-bg-hover px-1 font-mono text-[12px]">nextsqld</code>.
-          NextSQL Admin covers Setup and Operations; Studio is in progress.
+          NextSQL Admin covers Setup and Operations; Studio M1–M3 is implemented and its MVP gate remains open.
           Install the binaries, initialize a data directory, and start serving NSQL.
         </p>
         <div className="mt-8 flex flex-wrap gap-2">

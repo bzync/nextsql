@@ -9,11 +9,18 @@ import (
 	"github.com/bzync/nextsql/internal/storage/format"
 )
 
-// HealthyContactWindow bounds how long a follower may go without hearing from
-// the leader before it is treated as potentially partitioned and arbitrarily
-// stale. A healthy follower is contacted every DefaultHeartbeat; this window is
-// generous enough to ride out a single election without flapping.
-const HealthyContactWindow = 5 * DefaultHeartbeat
+// DefaultHealthyContactWindow is the healthy-contact window of a cluster
+// running the default heartbeat. It is the fallback for callers that have no
+// cluster to ask — a single-node deployment, or a read gate with no
+// replication attached.
+//
+// A configured cluster does not use it: the window is five of *its* configured
+// heartbeats (Timings.HealthyContactWindow), because an operator who raised
+// raft_heartbeat_ms for a slow link has said contact is expected less often. A
+// fixed window would then report every follower unhealthy between heartbeats,
+// which is exactly why the first attempt at configurable timings was reverted
+// (TODO.md log #256).
+const DefaultHealthyContactWindow = healthyContactHeartbeats * DefaultHeartbeat
 
 // NeverContacted is the LastContact value for a follower that has not yet heard
 // from any leader since start.
@@ -44,7 +51,7 @@ type ReplicaHealth struct {
 	LastContact time.Duration
 	// Healthy reports whether this node is a safe follower-read target right
 	// now: leader, or a follower that sees a leader and was contacted within
-	// HealthyContactWindow.
+	// this cluster's HealthyContactWindow.
 	Healthy bool
 	// ReplicationSuspect reports whether this node has an unreconciled
 	// replication orphan (see Cluster.ReportReplicationOrphan) and is
@@ -85,13 +92,54 @@ func (c *Cluster) ReplicaHealth() ReplicaHealth {
 				h.LastContact = 0
 			}
 		}
-		h.Healthy = h.HasLeader && h.LastContact >= 0 && h.LastContact <= HealthyContactWindow
+		h.Healthy = healthyContact(h.HasLeader, h.LastContact, c.HealthyContactWindow())
 	default:
 		// candidate / shutdown: no stable leader contact.
 		h.LastContact = NeverContacted
 		h.Healthy = false
 	}
 	return h
+}
+
+// healthyContact decides whether a follower is a safe follower-read target from
+// its leader visibility and contact age alone. It is the whole freshness rule,
+// kept separate from the Raft plumbing so the boundary can be checked directly:
+// the window is a cluster's own (Timings.HealthyContactWindow), so a raised
+// heartbeat must widen it rather than leave healthy followers outside a fixed
+// one.
+//
+// NeverContacted (-1) fails the lower bound: a follower that has never heard
+// from a leader is arbitrarily stale, not maximally fresh.
+func healthyContact(hasLeader bool, lastContact, window time.Duration) bool {
+	return hasLeader && lastContact >= 0 && lastContact <= window
+}
+
+// Timings reports the Raft intervals this cluster resolved at Open. A nil or
+// unopened cluster reports the defaults.
+func (c *Cluster) Timings() Timings {
+	if c == nil {
+		return DefaultTimings()
+	}
+	t := c.cfg.Timings
+	if t.Heartbeat <= 0 {
+		return DefaultTimings()
+	}
+	return t
+}
+
+// HealthyContactWindow is how long this cluster's followers may go without
+// leader contact before they stop being safe follower-read targets. It is five
+// of this cluster's configured heartbeats — see Timings.HealthyContactWindow.
+func (c *Cluster) HealthyContactWindow() time.Duration {
+	return c.Timings().HealthyContactWindow()
+}
+
+// DefaultMaxStaleness is the freshness bound a BOUNDED read takes on this
+// cluster when the session sets no explicit MAX STALENESS: the healthy-contact
+// window, so the default bound and the health model agree by construction
+// rather than by two constants that must be kept equal.
+func (c *Cluster) DefaultMaxStaleness() time.Duration {
+	return c.HealthyContactWindow()
 }
 
 // FollowerReadHealthy reports whether this node may serve a follower read now.

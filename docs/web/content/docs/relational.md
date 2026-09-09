@@ -46,8 +46,17 @@ DELETE FROM scan LIMIT 8192;
 and exposes pruning in `EXPLAIN`. Keys may span one to eight columns (RANGE
 tuple bounds `VALUES LESS THAN (a, b, …)`; LIST tuple membership
 `VALUES IN ((a, b), …)`; HASH SHA-256 over the canonical tuple). This is local
-physical partitioning, not distributed sharding, and never replaces realm or
-RBAC isolation.
+physical partitioning, not distributed sharding, and never replaces RBAC
+isolation.
+
+`SEARCH` and `NEAREST` (including hybrid ranking) may rank the `FROM` table
+before an inner, `LEFT`, `RIGHT`, or `FULL OUTER JOIN`. Matched rows retain the
+ranked-table order; null-extended rows without a rank follow them unless an
+`ORDER BY` replaces rank order. The rank column must belong to the `FROM`
+table—ranking a joined table remains rejected. `LIMIT` and `OFFSET` apply to
+the joined result, so an inner join can skip an unjoined high-ranked source
+row. `FULL OUTER JOIN` remains hash-only and memory-bounded; it fails with
+`exhausted` instead of spilling beyond its budget.
 
 Non-unique B+Tree-family, covering, partial, expression, JSON-path, and spatial
 indexes have one physical root per partition. Plain-column secondary `UNIQUE`,
@@ -77,11 +86,16 @@ streaming typed validation of its matching schema, indexes, and rows; no roots
 or rows are copied. `DETACH` publishes that owned member as an unpartitioned
 table of the same name. Both are atomic WAL/catalog ownership transfers.
 
-`UPSERT` on RANGE/HASH/LIST tables hits the partition-local roots. Partial,
-expression, and JSON-path `UNIQUE`, partitioned-table foreign keys, and
-IVF / IVF-PQ / `SPARSE` on partitioned tables remain rejected.
+`UPSERT` on RANGE/HASH/LIST tables hits the partition-local roots. HNSW, IVF,
+IVF-PQ, and `SPARSE` vector indexes are built and maintained per partition;
+`NEAREST` merges the surviving partition-local candidates. Secondary `UNIQUE`
+indexes—including partial, expression, and JSON-path keys—take a shared key
+lock and probe every partition-local root, so their uniqueness contract spans
+the table. Foreign keys may reference or be declared by partitioned tables;
+parent lookup and cascading actions traverse the affected partition heaps under
+the normal FK depth, row-count, transaction, and WAL bounds.
 `PARTITION BY TENANT` is rejected; migrate leftover tenants with
-`nextsql hosting migrate-tenant`.
+`nextsql registry migrate-tenant`.
 
 `ANALYZE events` records exact stable-partition row counts plus bounded local
 column/index/vector sketches. Pruned plans use local costing only when every

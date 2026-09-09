@@ -1,6 +1,7 @@
 package wal
 
 import (
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -78,6 +79,19 @@ type Log struct {
 
 	flushing bool
 	flushErr error
+
+	// durabilityErr latches a durability barrier that failed after the log
+	// lost the ability to retry it in place: a failed fsync, or a partial
+	// write whose consumed prefix already advanced segOff. In both cases
+	// what actually reached stable storage is indeterminate, and the
+	// platform will not report the same failure twice — a Linux writeback
+	// error is delivered to one fsync and then cleared, so the next fsync
+	// of the *following* bytes succeeds and would otherwise let the log
+	// declare the un-synced region durable. Once latched, the log refuses
+	// every further append and durability barrier, so no commit can be
+	// acknowledged on top of a gap. Recovery from the last known-good
+	// durable LSN, via restart, is the only way forward.
+	durabilityErr error
 
 	segmentSize int64
 	crash       *Injector
@@ -216,11 +230,37 @@ func Open(dir string, pageKeys crypto.KeyProvider, ident format.Identity, opt Op
 	if err != nil {
 		return nil, err
 	}
+	// The control file names the boundary the pages on disk are behind. If the
+	// segments that cover it are gone, redo cannot reach the LSN the engine
+	// already acknowledged, and opening anyway would present a database
+	// missing acknowledged commits — then make the loss permanent at the next
+	// checkpoint. Fail closed instead; an operator can restore, or point
+	// recovery at an archive.
 	if len(ids) == 0 {
+		if l.durableLSN > 0 {
+			return nil, nerr.New(nerr.Corruption, "wal.Open", fmt.Sprintf(
+				"WAL directory has no segments but the control file records durable LSN %d with redo from %d",
+				l.durableLSN, l.redoLSN))
+		}
+		// Nothing was ever acknowledged, so this is an empty log, not a hole.
 		if err := l.openNewSegmentLocked(l.nextSeg, l.nextLSN); err != nil {
 			return nil, err
 		}
 		return l, nil
+	}
+	if l.durableLSN > 0 {
+		oldest, oldestHdr, _, err := openSegment(dir, ids[0], ident)
+		if err != nil {
+			return nil, err
+		}
+		if err := oldest.Close(); err != nil {
+			return nil, nerr.Wrap(nerr.IO, "wal.Open", "close oldest segment", err)
+		}
+		if oldestHdr.StartLSN > l.redoLSN {
+			return nil, nerr.New(nerr.Corruption, "wal.Open", fmt.Sprintf(
+				"oldest WAL segment %d starts at LSN %d, past the redo boundary %d: the segments covering redo are missing",
+				ids[0], oldestHdr.StartLSN, l.redoLSN))
+		}
 	}
 	last := ids[len(ids)-1]
 	f, hdr, size, err := openSegment(dir, last, ident)
@@ -508,6 +548,9 @@ func encodingPutLSN(page []byte, lsn format.LSN) {
 }
 
 func (l *Log) appendLocked(rec Record) (format.LSN, error) {
+	if l.durabilityErr != nil {
+		return 0, l.durabilityErr
+	}
 	if l.seg == nil {
 		return 0, nerr.New(nerr.Internal, "wal.Append", "log is closed")
 	}
@@ -542,6 +585,9 @@ func (l *Log) appendLocked(rec Record) (format.LSN, error) {
 func (l *Log) AppendHeld(rec Record) (format.LSN, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if l.durabilityErr != nil {
+		return 0, l.durabilityErr
+	}
 	if l.held {
 		return 0, nerr.New(nerr.Internal, "wal.AppendHeld", "a record is already held")
 	}
@@ -638,6 +684,9 @@ func (l *Log) Flush(lsn format.LSN) error {
 }
 
 func (l *Log) flushLocked() error {
+	if l.durabilityErr != nil {
+		return l.durabilityErr
+	}
 	toFlush := len(l.buf)
 	last := l.bufLast
 	if l.held {
@@ -651,19 +700,26 @@ func (l *Log) flushLocked() error {
 		return err
 	}
 	buf := l.buf[:toFlush]
-	n, err := l.seg.WriteAt(buf, l.segOff)
+	n, err := diskio.WriteAt(l.seg, buf, l.segOff)
 	if n < len(buf) && err == nil {
 		err = io.ErrShortWrite
 	}
 	if err != nil {
+		wrapped := nerr.Wrap(nerr.IO, "wal.Flush", "write", err)
 		if n > 0 {
+			// A prefix landed and segOff moves past it, so the segment now
+			// carries a torn record that a later write cannot repair in
+			// place. Latch. A write that consumed nothing left the buffer
+			// intact at an unchanged offset and stays retryable, so a
+			// transient ENOSPC an operator clears can still make progress.
 			l.segOff += int64(n)
 			l.buf = l.buf[n:]
 			if l.held {
 				l.heldOffset -= n
 			}
+			l.durabilityErr = wrapped
 		}
-		return nerr.Wrap(nerr.IO, "wal.Flush", "write", err)
+		return wrapped
 	}
 	l.segOff += int64(len(buf))
 	l.written += int64(len(buf))
@@ -675,6 +731,7 @@ func (l *Log) flushLocked() error {
 		return err
 	}
 	if err := diskio.DataSync(l.seg); err != nil {
+		l.durabilityErr = err
 		return err
 	}
 	l.syncOff = l.segOff
@@ -778,6 +835,13 @@ func (l *Log) hit(p Point) error {
 func (l *Log) InstallCheckpoint(lsn, redo format.LSN) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	// Every path that reaches here appends a checkpoint record first, so a
+	// latched log has already refused. Guard anyway: advancing the redo
+	// boundary past an indeterminate region is what lets a later segment
+	// discard turn an unsynced gap into permanent loss.
+	if l.durabilityErr != nil {
+		return l.durabilityErr
+	}
 	if err := l.hit(PointAfterCheckpointRecordBeforeControl); err != nil {
 		return err
 	}
@@ -1089,7 +1153,28 @@ func (l *Log) scanLocked(start format.LSN, maxRecords, maxBytes int) ([]Record, 
 	if start == 0 {
 		start = 1
 	}
-	for _, id := range ids {
+	for i, id := range ids {
+		// A segment's upper LSN boundary is the next segment's StartLSN. If
+		// that boundary is at or before start, this sealed segment cannot
+		// contain a record recovery requested. Do not decrypt its whole
+		// retained history merely to discard it: checkpointed segments remain
+		// on disk for PITR and on-demand page repair, so a long-lived database
+		// can otherwise spend startup CPU proportional to all retained WAL,
+		// not the redo interval. The next header is still CRC-validated and
+		// identity-checked by openSegment. The final segment has no known upper
+		// boundary and must always be scanned for a torn tail.
+		if i+1 < len(ids) {
+			next, nextHdr, _, err := openSegment(l.dir, ids[i+1], l.ident)
+			if err != nil {
+				return nil, 0, err
+			}
+			if err := next.Close(); err != nil {
+				return nil, 0, nerr.Wrap(nerr.IO, "wal.ScanFrom", "close successor segment", err)
+			}
+			if nextHdr.StartLSN <= start {
+				continue
+			}
+		}
 		f, hdr, size, err := openSegment(l.dir, id, l.ident)
 		if err != nil {
 			return nil, 0, err

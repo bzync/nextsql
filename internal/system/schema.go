@@ -21,7 +21,7 @@ import (
 // system.foreign_keys, system.table_ddl, system.triggers and
 // system.schedules (Phase 29 Studio) are new read-only views, not column
 // changes to existing ones, so they do not bump the version.
-const SchemaVersion = 3
+const SchemaVersion = 4
 
 // SchemaName is the virtual schema name.
 const SchemaName = "system"
@@ -115,26 +115,17 @@ func init() {
 		{Name: "has_leader", Type: types.Bool()},
 		{Name: "maintenance_mode", Type: types.Bool()},
 	})
-	// realms and databases (M2-4a) expose the hosted deployment registry
-	// (internal/hosting.Registry.Manifest) read-only. Admin-only, like
-	// system.resource_groups: deployment structure across realms is not
-	// tenant-visible data. Empty on a legacy/non-hosted deployment (no
-	// registry attached) or for a non-admin caller, never an error.
-	register("realms", []catalog.Column{
-		{Name: "realm_id", Type: types.String()},
-		{Name: "name", Type: types.String()},
-		{Name: "state", Type: types.String()},
-		{Name: "database_count", Type: dec(10, 0)},
-		{Name: "storage_cap_bytes", Type: dec(20, 0)},
-		{Name: "realm_root_delegated", Type: types.Bool()},
-	})
+	// databases exposes the deployment registry
+	// (internal/hosting.Registry.Manifest) read-only: exactly one row, the
+	// database this deployment serves. Admin-only, like
+	// system.resource_groups — deployment structure is not tenant-visible
+	// data. Empty on a deployment with no registry attached, or for a
+	// non-admin caller, never an error. (system.realms was removed with
+	// multi-realm hosting; schema v4.)
 	register("databases", []catalog.Column{
-		{Name: "realm_id", Type: types.String()},
-		{Name: "realm_name", Type: types.String()},
 		{Name: "database_id", Type: types.String()},
 		{Name: "name", Type: types.String()},
 		{Name: "state", Type: types.String()},
-		{Name: "layout", Type: types.String()},
 		{Name: "storage_cap_bytes", Type: dec(20, 0)},
 	})
 	register("replica_health", []catalog.Column{
@@ -168,6 +159,7 @@ func init() {
 		{Name: "mtls_required", Type: types.Bool()},
 		{Name: "client_ca_configured", Type: types.Bool()},
 		{Name: "client_crl_configured", Type: types.Bool()},
+		{Name: "ocsp_mode", Type: types.String()},
 	})
 	// key_versions (M4 remainder) exposes the attached crypto.Envelope's
 	// per-key rotation state — current version and retained/revoked/retired
@@ -374,8 +366,6 @@ func init() {
 	// other row reports the caps only. Never an error, never a hard limit —
 	// the authoritative signal is still the write-path rejection.
 	register("quotas", []catalog.Column{
-		{Name: "scope", Type: types.String()},
-		{Name: "realm_name", Type: types.String()},
 		{Name: "database_name", Type: types.String()},
 		{Name: "state", Type: types.String()},
 		{Name: "cap_bytes", Type: dec(20, 0)},
@@ -500,7 +490,7 @@ func Capabilities() [][]types.Value {
 		rowCap("covering_indexes", "supported", "INCLUDE covering indexes", "0.1.0"),
 		rowCap("distinct", "supported", "SELECT DISTINCT", "0.1.0"),
 		rowCap("encryption", "supported", "AES-256-GCM envelope", "0.1.0"),
-		rowCap("field_encryption_client", "experimental", "server-opaque randomized ENCRYPTED CLIENT fields; Go, Node.js/TypeScript, Bun, and PHP helpers", version.String),
+		rowCap("field_encryption_client", "supported", "server-opaque randomized NSCE1 and opt-in deterministic NSCE2 ENCRYPTED CLIENT fields; Go, Node.js/TypeScript, Bun, and PHP helpers", version.String),
 		rowCap("expression_indexes", "supported", "expression indexes", "0.1.0"),
 		rowCap("foreign_keys", "supported", "FOREIGN KEY constraints", "0.1.0"),
 		rowCap("fulltext", "supported", "full-text SEARCH with simple and language analyzers, prefix/fuzzy/typo matching, HIGHLIGHT/SNIPPET, multi-field indexes, per-field WEIGHT, and FACET histograms", "0.1.0"),
@@ -524,7 +514,6 @@ func Capabilities() [][]types.Value {
 		rowCap(fmt.Sprintf("system_schema_v%d", SchemaVersion), "supported", fmt.Sprintf("stable system table column contract v%d", SchemaVersion), version.String),
 		rowCap("system_show_aliases", "supported", "SHOW aliases backed by canonical system views", version.String),
 		rowCap("tasks", "supported", "durable TASK execution", "0.1.0"),
-		rowCap("hosting_isolation", "experimental", "realm/database registry foundation; selectable multi-engine routing is production-usable, hosted HA/registry DR remain open", version.String),
 		rowCap("transactions", "supported", "BEGIN/COMMIT/ROLLBACK", "0.1.0"),
 		rowCap("triggers", "supported", "TRIGGER RUN WORKFLOW", "0.1.0"),
 		rowCap("upsert", "supported", "UPSERT with RETURNING", "0.1.0"),

@@ -18,6 +18,7 @@ import (
 	"time"
 
 	nextsql "github.com/bzync/nextsql/drivers/go"
+	"github.com/bzync/nextsql/internal/admin/credential"
 	"github.com/bzync/nextsql/internal/nerr"
 	"github.com/bzync/nextsql/internal/security"
 )
@@ -56,6 +57,10 @@ type Config struct {
 	TLS bool
 
 	LogLevel string
+
+	// CredentialStore is the OS-backed store used only when a Studio operator
+	// explicitly asks to save a reconnect password. It has no file fallback.
+	CredentialStore credential.Store
 }
 
 // withDefaults returns c with zero-valued fields filled in.
@@ -74,6 +79,9 @@ func (c Config) withDefaults() Config {
 	}
 	if c.LogLevel == "" {
 		c.LogLevel = "info"
+	}
+	if c.CredentialStore == nil {
+		c.CredentialStore = credential.OSStore{}
 	}
 	return c
 }

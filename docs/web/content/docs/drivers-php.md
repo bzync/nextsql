@@ -16,7 +16,6 @@ require 'vendor/autoload.php'; // or 'drivers/php/autoload.php' when vendored
 
 $conn = NextSQL\Client::connect([
     'address' => '127.0.0.1:7210',
-    'realm' => 'default',
     'database' => 'default',
     'user' => 'app',
     'password' => getenv('NEXTSQL_DATABASE_PASS'),
@@ -42,4 +41,14 @@ $conn = NextSQL\Client::connect([
 
 For `--require-client-key`, pass `'key' => $clientRoot` as a 32-byte string. Never put keys or passwords in a URL.
 
-Follower-read routing uses `NextSQL\Cluster::connect`. See [High availability](/docs/ha). Hosted connections take `'realm'` and `'database'`.
+Follower-read routing uses `NextSQL\Cluster::connect`. See [High availability](/docs/ha). `database` may name the deployment database; `realm` is reserved and must remain empty.
+
+## Client-encrypted fields
+
+Pass a `FieldKeyProvider` as `fieldKeys`. Use `encryptField` / `decryptField`
+for randomized `NSCE1` columns. Explicit `ENCRYPTED CLIENT DETERMINISTIC`
+columns use `encryptFieldDeterministic` / `decryptFieldDeterministic`; bind the
+produced `NSCE2` value only to equality/inequality predicates for that exact
+column. Deterministic mode leaks equality and frequency. `FileFieldKeyring`
+provides versioned durable rotation/revocation; general searchable encryption
+is not supported.

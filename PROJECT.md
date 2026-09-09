@@ -264,7 +264,11 @@ single Raft leader for writes
 + native local partitioning
 ```
 
-**Automatic distributed sharding and multi-primary writes are not part of the core product contract.**
+Automatic distributed sharding is not part of the core product contract.
+Multi-primary writes are an explicitly requested future extension, but remain
+disabled until their versioned replicated conflict model, recovery semantics,
+and independent failure gates are implemented. The current production write
+path remains single-leader Raft.
 
 ---
 
@@ -2913,7 +2917,6 @@ The following are **not** required to consider the product family complete:
 
 ## Deferred
 
-- multi-primary writes
 - automatic distributed sharding
 - autonomous cross-node shard placement/rebalancing
 

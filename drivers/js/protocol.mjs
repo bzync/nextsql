@@ -53,6 +53,12 @@ export const ReadConsistency = {
 export const AuthPassword = 1;
 export const AuthPasswordKey = 2;
 export const FlagCancel = 1;
+// FlagPublicErrorCodes asks the server for the stable ERR_* error taxonomy
+// (docs/error-codes.md). A server that does not implement it ignores the bit
+// and keeps the NSQL v1 error shape, which decodeError still reads, so setting
+// it is safe against any server version. The server echoes it in HelloOK.flags
+// when it was accepted.
+export const FlagPublicErrorCodes = 2;
 export const FlagNull = 0x01;
 
 export const Kind = {
@@ -101,10 +107,16 @@ const MAX_STRUCT_FIELDS = 128;
 const MAX_COLLECTION_LEN = 1 << 20;
 
 export class NextSQLError extends Error {
-  constructor(code, message) {
+  constructor(code, message, publicCode) {
     super(message || code);
     this.name = 'NextSQLError';
     this.code = code;
+    // publicCode is the stable ERR_* name the server sent, present only on
+    // an error received over a connection that negotiated the taxonomy and
+    // empty otherwise. code always carries the legacy class, so existing
+    // retry checks keep working and nothing should branch on publicCode
+    // being present.
+    this.publicCode = publicCode || '';
   }
 }
 
@@ -1392,10 +1404,19 @@ export function encodeHello(h) {
 }
 
 export function decodeHelloOK(b) {
-  if (b.length !== 11) {
+  if (b.length !== 11 && b.length !== 13) {
     throw new NextSQLError('protocol', 'bad hello-ok length');
   }
-  return { version: u16(b, 0), authMethod: b[2], secret: u64(b, 3) };
+  let flags = 0;
+  if (b.length === 13) {
+    flags = u16(b, 11);
+    // The server omits the field when it accepted no capability, so a
+    // present-but-zero field is a second encoding of the v1 hello-ok.
+    if (flags === 0) {
+      throw new NextSQLError('protocol', 'empty hello-ok flags');
+    }
+  }
+  return { version: u16(b, 0), authMethod: b[2], secret: u64(b, 3), flags };
 }
 
 export function encodeAuth(password) {
@@ -1487,7 +1508,18 @@ export function decodeDataBatch(b) {
 export function decodeError(b) {
   const code = readU16String(b, 0, MAX_NAME);
   const msg = readU16String(b, code.next, MAX_NAME);
-  return new NextSQLError(code.value, msg.value);
+  // Optional trailing field, present only from a server that accepted
+  // FlagPublicErrorCodes. Its absence is normal — an older server ignores the
+  // request bit — so this must never be required.
+  let publicCode = '';
+  if (msg.next < b.length) {
+    const p = readU16String(b, msg.next, MAX_NAME);
+    if (p.value === '') {
+      throw new NextSQLError('protocol', 'empty public error code');
+    }
+    publicCode = p.value;
+  }
+  return new NextSQLError(code.value, msg.value, publicCode);
 }
 
 export function decodeCommandComplete(b) {

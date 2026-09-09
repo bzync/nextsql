@@ -6,6 +6,7 @@
 
 require "socket"
 require "openssl"
+require "ipaddr"
 
 require_relative "protocol"
 require_relative "errors"
@@ -40,7 +41,6 @@ module NextSQL
   # from multiple threads/fibers — open one Connection per worker, or use
   # +Cluster+ which pools one connection per node.
   class Connection
-    LOOPBACK_RE = /\A127\.\d{1,3}\.\d{1,3}\.\d{1,3}\z/.freeze
     CONNECT_TIMEOUT = 10.0
 
     class << self
@@ -73,9 +73,12 @@ module NextSQL
         host, = split_host_port(addr, allow_bare: true)
         host = host.strip.downcase
         return true if host == "localhost"
-        return true if %w[::1 0:0:0:0:0:0:0:1].include?(host)
 
-        LOOPBACK_RE.match?(host)
+        begin
+          IPAddr.new(host).loopback?
+        rescue IPAddr::Error
+          false
+        end
       end
 
       def validate_config!(cfg)
@@ -369,12 +372,17 @@ module NextSQL
 
     def handshake
       cfg = @cfg
-      write_frame(Protocol::TYPE_HELLO, Protocol.encode_hello(Protocol::VERSION, 0, "\x00" * 8, cfg.database, cfg.user, cfg.realm))
+      write_frame(Protocol::TYPE_HELLO,
+                  Protocol.encode_hello(Protocol::VERSION, Protocol::FLAG_PUBLIC_ERROR_CODES, "\x00" * 8,
+                                        cfg.database, cfg.user, cfg.realm))
       typ, payload = read_frame
       raise unexpected(typ, payload) if typ != Protocol::TYPE_HELLO_OK
 
-      _version, auth_method, secret = Protocol.decode_hello_ok(payload)
+      _version, auth_method, secret, flags = Protocol.decode_hello_ok(payload)
       @secret = secret
+      # Diagnostic only: decode_error reads the field whenever it is present,
+      # so nothing depends on this having been echoed.
+      @public_error_codes = (flags & Protocol::FLAG_PUBLIC_ERROR_CODES) != 0
       write_frame(Protocol::TYPE_AUTH, Protocol.u16str(cfg.password))
       typ, payload = read_frame
       raise unexpected(typ, payload) if typ != Protocol::TYPE_AUTH_OK

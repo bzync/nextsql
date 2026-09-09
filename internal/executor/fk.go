@@ -467,6 +467,66 @@ func (s *Session) checkOutboundFK(child *catalog.Table, fk catalog.ForeignKey, r
 }
 
 func (s *Session) lookupParentAt(parent *catalog.Table, fk catalog.ForeignKey, refKey []byte, probe txn.Snapshot) (bool, []types.Value, error) {
+	if parent.Partitioning != nil {
+		if refsPK(parent, fk.RefColumns) {
+			for _, part := range parent.Partitioning.Partitions {
+				heap, err := s.partitionHeap(parent, part.ID)
+				if err != nil {
+					return false, nil, err
+				}
+				htx := s.x.use(heap)
+				raw, err := htx.LookupAt(refKey, probe)
+				if err != nil {
+					if nerr.HasCode(err, nerr.NotFound) {
+						continue
+					}
+					return false, nil, err
+				}
+				row, err := s.decodeHeapRow(parent, raw)
+				if err != nil {
+					return false, nil, err
+				}
+				return true, row, nil
+			}
+			return false, nil, nil
+		}
+		idx, ok := uniqueIndexOn(parent, fk.RefColumns)
+		if !ok {
+			return false, nil, nerr.New(nerr.Internal, "executor.fk", "referenced key is not PRIMARY KEY or UNIQUE")
+		}
+		for _, part := range parent.Partitioning.Partitions {
+			ix, err := s.partitionIndex(parent, part.ID, idx)
+			if err != nil {
+				return false, nil, err
+			}
+			itx := s.x.use(ix)
+			pkRaw, err := itx.LookupAt(refKey, probe)
+			if err != nil {
+				if nerr.HasCode(err, nerr.NotFound) {
+					continue
+				}
+				return false, nil, err
+			}
+			heap, err := s.partitionHeap(parent, part.ID)
+			if err != nil {
+				return false, nil, err
+			}
+			htx := s.x.use(heap)
+			raw, err := htx.LookupAt(pkRaw, probe)
+			if err != nil {
+				if nerr.HasCode(err, nerr.NotFound) {
+					continue
+				}
+				return false, nil, err
+			}
+			row, err := s.decodeHeapRow(parent, raw)
+			if err != nil {
+				return false, nil, err
+			}
+			return true, row, nil
+		}
+		return false, nil, nil
+	}
 	heap, err := s.heapOf(parent)
 	if err != nil {
 		return false, nil, err
@@ -605,11 +665,14 @@ func (s *Session) applyInboundWork(parent *catalog.Table, work []fkChildWork, ol
 }
 
 func (s *Session) applyOneChild(w fkChildWork, src, oldParent, newParent []types.Value, deleting bool) error {
-	heap, err := s.heapOf(w.child)
-	if err != nil {
-		return err
+	var htx *btree.Txn
+	if w.child.Partitioning == nil {
+		heap, err := s.heapOf(w.child)
+		if err != nil {
+			return err
+		}
+		htx = s.x.use(heap)
 	}
-	htx := s.x.use(heap)
 	switch w.act {
 	case catalog.FKCascade:
 		if deleting {
@@ -704,17 +767,83 @@ func (s *Session) collectChildrenAt(child *catalog.Table, fk catalog.ForeignKey,
 }
 
 func (s *Session) collectChildIndex(child *catalog.Table, idx catalog.Index, fk catalog.ForeignKey, parentRow []types.Value, probe txn.Snapshot) ([][]types.Value, error) {
-	ix, err := s.indexOf(child, idx)
-	if err != nil {
-		return nil, err
-	}
-	itx := s.x.use(ix)
 	vals := parentValsForChild(parentRow, fk, idx.Columns)
 	prefix, err := types.EncodeKey(vals)
 	if err != nil {
 		return nil, err
 	}
 	var out [][]types.Value
+	if child.Partitioning != nil {
+		for _, part := range child.Partitioning.Partitions {
+			ix, err := s.partitionIndex(child, part.ID, idx)
+			if err != nil {
+				return nil, err
+			}
+			itx := s.x.use(ix)
+			if idx.Unique {
+				if err := s.chargeFKProbe(); err != nil {
+					return nil, err
+				}
+				pkRaw, err := itx.LookupAt(prefix, probe)
+				if err != nil {
+					if nerr.HasCode(err, nerr.NotFound) {
+						continue
+					}
+					return nil, err
+				}
+				row, err := s.childRowAt(child, pkRaw, probe)
+				if err != nil {
+					return nil, err
+				}
+				if row == nil {
+					continue
+				}
+				ok, err := fkRowMatches(row, fk, parentRow)
+				if err != nil {
+					return nil, err
+				}
+				if !ok {
+					continue
+				}
+				if err := s.chargeFKTouched(); err != nil {
+					return nil, err
+				}
+				out = append(out, row)
+				continue
+			}
+			end := types.PrefixEnd(prefix)
+			err = itx.RangeAt(prefix, end, probe, func(_, pkRaw []byte) error {
+				if err := s.chargeFKProbe(); err != nil {
+					return err
+				}
+				row, err := s.childRowAt(child, pkRaw, probe)
+				if err != nil {
+					return err
+				}
+				if row == nil {
+					return nil
+				}
+				ok, err := fkRowMatches(row, fk, parentRow)
+				if err != nil || !ok {
+					return err
+				}
+				if err := s.chargeFKTouched(); err != nil {
+					return err
+				}
+				out = append(out, row)
+				return nil
+			})
+			if err != nil {
+				return nil, err
+			}
+		}
+		return out, nil
+	}
+	ix, err := s.indexOf(child, idx)
+	if err != nil {
+		return nil, err
+	}
+	itx := s.x.use(ix)
 	if idx.Unique {
 		if err := s.chargeFKProbe(); err != nil {
 			return nil, err
@@ -765,12 +894,43 @@ func (s *Session) collectChildIndex(child *catalog.Table, idx catalog.Index, fk 
 }
 
 func (s *Session) collectChildHeap(child *catalog.Table, fk catalog.ForeignKey, parentRow []types.Value, probe txn.Snapshot) ([][]types.Value, error) {
+	var out [][]types.Value
+	if child.Partitioning != nil {
+		for _, part := range child.Partitioning.Partitions {
+			heap, err := s.partitionHeap(child, part.ID)
+			if err != nil {
+				return nil, err
+			}
+			htx := s.x.use(heap)
+			err = htx.RangeAt(nil, nil, probe, func(_, raw []byte) error {
+				if err := s.chargeFKProbe(); err != nil {
+					return err
+				}
+				row, err := s.decodeHeapRow(child, raw)
+				if err != nil {
+					return err
+				}
+				ok, err := fkRowMatches(row, fk, parentRow)
+				if err != nil || !ok {
+					return err
+				}
+				if err := s.chargeFKTouched(); err != nil {
+					return err
+				}
+				out = append(out, cloneRow(row))
+				return nil
+			})
+			if err != nil {
+				return nil, err
+			}
+		}
+		return out, nil
+	}
 	heap, err := s.heapOf(child)
 	if err != nil {
 		return nil, err
 	}
 	htx := s.x.use(heap)
-	var out [][]types.Value
 	err = htx.RangeAt(nil, nil, probe, func(_, raw []byte) error {
 		if err := s.chargeFKProbe(); err != nil {
 			return err
@@ -793,6 +953,28 @@ func (s *Session) collectChildHeap(child *catalog.Table, fk catalog.ForeignKey, 
 }
 
 func (s *Session) childRowAt(child *catalog.Table, pkRaw []byte, probe txn.Snapshot) ([]types.Value, error) {
+	if child.Partitioning != nil {
+		for _, part := range child.Partitioning.Partitions {
+			heap, err := s.partitionHeap(child, part.ID)
+			if err != nil {
+				return nil, err
+			}
+			htx := s.x.use(heap)
+			raw, err := htx.LookupAt(pkRaw, probe)
+			if err != nil {
+				if nerr.HasCode(err, nerr.NotFound) {
+					continue
+				}
+				return nil, err
+			}
+			row, err := s.decodeHeapRow(child, raw)
+			if err != nil {
+				return nil, err
+			}
+			return cloneRow(row), nil
+		}
+		return nil, nil
+	}
 	heap, err := s.heapOf(child)
 	if err != nil {
 		return nil, err
@@ -813,16 +995,65 @@ func (s *Session) childRowAt(child *catalog.Table, pkRaw []byte, probe txn.Snaps
 }
 
 func (s *Session) probeChildIndex(child *catalog.Table, idx catalog.Index, fk catalog.ForeignKey, parentRow []types.Value, probe txn.Snapshot) (bool, error) {
-	ix, err := s.indexOf(child, idx)
-	if err != nil {
-		return false, err
-	}
-	itx := s.x.use(ix)
 	vals := parentValsForChild(parentRow, fk, idx.Columns)
 	prefix, err := types.EncodeKey(vals)
 	if err != nil {
 		return false, err
 	}
+	if child.Partitioning != nil {
+		for _, part := range child.Partitioning.Partitions {
+			ix, err := s.partitionIndex(child, part.ID, idx)
+			if err != nil {
+				return false, err
+			}
+			itx := s.x.use(ix)
+			if idx.Unique {
+				if err := s.chargeFKProbe(); err != nil {
+					return false, err
+				}
+				pkRaw, err := itx.LookupAt(prefix, probe)
+				if err != nil {
+					if nerr.HasCode(err, nerr.NotFound) {
+						continue
+					}
+					return false, err
+				}
+				ok, err := s.childRowExists(child, pkRaw, probe)
+				if err != nil || ok {
+					return ok, err
+				}
+				continue
+			}
+			end := types.PrefixEnd(prefix)
+			var found bool
+			err = itx.RangeAt(prefix, end, probe, func(_, pkRaw []byte) error {
+				if err := s.chargeFKProbe(); err != nil {
+					return err
+				}
+				ok, err := s.childRowExists(child, pkRaw, probe)
+				if err != nil || ok {
+					found = ok
+					if err == nil && ok {
+						return errStop
+					}
+					return err
+				}
+				return nil
+			})
+			if err == errStop {
+				err = nil
+			}
+			if err != nil || found {
+				return found, err
+			}
+		}
+		return false, nil
+	}
+	ix, err := s.indexOf(child, idx)
+	if err != nil {
+		return false, err
+	}
+	itx := s.x.use(ix)
 	if idx.Unique {
 		if err := s.chargeFKProbe(); err != nil {
 			return false, err
@@ -859,6 +1090,41 @@ func (s *Session) probeChildIndex(child *catalog.Table, idx catalog.Index, fk ca
 }
 
 func (s *Session) probeChildHeap(child *catalog.Table, fk catalog.ForeignKey, parentRow []types.Value, probe txn.Snapshot) (bool, error) {
+	if child.Partitioning != nil {
+		for _, part := range child.Partitioning.Partitions {
+			heap, err := s.partitionHeap(child, part.ID)
+			if err != nil {
+				return false, err
+			}
+			htx := s.x.use(heap)
+			var found bool
+			err = htx.RangeAt(nil, nil, probe, func(_, raw []byte) error {
+				if err := s.chargeFKProbe(); err != nil {
+					return err
+				}
+				row, err := s.decodeHeapRow(child, raw)
+				if err != nil {
+					return err
+				}
+				_ = s.legacyTenantVisible(child, row)
+				ok, err := fkRowMatches(row, fk, parentRow)
+				if err != nil || !ok {
+					return err
+				}
+				// RESTRICT counts a matching child even when the session tenant
+				// cannot see it (global parent referenced by another tenant).
+				found = true
+				return errStop
+			})
+			if err == errStop {
+				err = nil
+			}
+			if err != nil || found {
+				return found, err
+			}
+		}
+		return false, nil
+	}
 	heap, err := s.heapOf(child)
 	if err != nil {
 		return false, err
@@ -890,6 +1156,29 @@ func (s *Session) probeChildHeap(child *catalog.Table, fk catalog.ForeignKey, pa
 }
 
 func (s *Session) childRowExists(child *catalog.Table, pkRaw []byte, probe txn.Snapshot) (bool, error) {
+	if child.Partitioning != nil {
+		for _, part := range child.Partitioning.Partitions {
+			heap, err := s.partitionHeap(child, part.ID)
+			if err != nil {
+				return false, err
+			}
+			htx := s.x.use(heap)
+			raw, err := htx.LookupAt(pkRaw, probe)
+			if err != nil {
+				if nerr.HasCode(err, nerr.NotFound) {
+					continue
+				}
+				return false, err
+			}
+			row, err := s.decodeHeapRow(child, raw)
+			if err != nil {
+				return false, err
+			}
+			_ = s.legacyTenantVisible(child, row)
+			return true, nil
+		}
+		return false, nil
+	}
 	heap, err := s.heapOf(child)
 	if err != nil {
 		return false, err

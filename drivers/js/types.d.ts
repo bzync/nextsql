@@ -30,9 +30,10 @@ export interface Config {
   /** Single-node entry point. Required for connect(); optional when nodes is set. */
   address?: string;
   database?: string;
-  /** Selects which hosted realm this connection targets (M2-2). Optional:
-   * an unset realm sends the exact pre-realm Hello and connects to the
-   * server's configured default. */
+  /** Reserved; must stay empty. Multi-realm hosting was removed — a
+   * deployment serves exactly one database, and a server rejects a Hello
+   * naming any other realm. The field remains only because the wire
+   * frame's trailing realm slot does. */
   realm?: string;
   user: string;
   password?: string;
@@ -211,6 +212,8 @@ export interface Conn {
   encryptField(table: string, column: string, type: FieldTypeDescriptor, value: unknown): Promise<string | null>;
   /** Authenticate and decode an opaque NSCE1 STRING; null passes through. */
   decryptField(table: string, column: string, type: FieldTypeDescriptor, ciphertext: string | null): Promise<unknown>;
+  encryptFieldDeterministic(table: string, column: string, type: FieldTypeDescriptor, value: unknown): Promise<string | null>;
+  decryptFieldDeterministic(table: string, column: string, type: FieldTypeDescriptor, ciphertext: string | null): Promise<unknown>;
 }
 
 /** Routing client over every node of a NextSQL HA cluster. */
@@ -235,6 +238,8 @@ export interface HelloOK {
   version: number;
   authMethod: number;
   secret: bigint;
+  /** Capability bits the server accepted from Hello.flags; 0 when none. */
+  flags: number;
 }
 
 export interface DecodeValue {
@@ -245,7 +250,14 @@ export interface DecodeValue {
 
 export declare class NextSQLError extends Error {
   readonly code: string;
-  constructor(code: string, message?: string);
+  /**
+   * Stable ERR_* name from docs/error-codes.md, present only on an error
+   * received over a connection that negotiated the public taxonomy and empty
+   * otherwise. `code` always carries the legacy class, so retry logic should
+   * keep reading that.
+   */
+  readonly publicCode: string;
+  constructor(code: string, message?: string, publicCode?: string);
 }
 
 export declare const Kind: {
@@ -321,11 +333,17 @@ export declare function generateFieldKey(id: string): FieldKey;
 export declare function inspectField(ciphertext: string): { keyID: string; type: FieldTypeDescriptor };
 export declare function encryptField(provider: FieldKeyProvider, database: string, table: string, column: string, type: FieldTypeDescriptor, value: unknown): Promise<string | null>;
 export declare function decryptField(provider: FieldKeyProvider, database: string, table: string, column: string, type: FieldTypeDescriptor, ciphertext: string | null): Promise<unknown>;
+export declare function encryptFieldDeterministic(provider: FieldKeyProvider, database: string, table: string, column: string, type: FieldTypeDescriptor, value: unknown): Promise<string | null>;
+export declare function decryptFieldDeterministic(provider: FieldKeyProvider, database: string, table: string, column: string, type: FieldTypeDescriptor, ciphertext: string | null): Promise<unknown>;
 export declare function validateConfig(cfg: Config): void;
 export declare function isLoopback(addr: string): boolean;
 export declare function encodeParam(v: Param): Uint8Array;
 export declare function struct(fields: Array<[string, unknown]>): { __struct: Array<[string, unknown]> };
 export declare function decodeValue(buf: Uint8Array, off: number): DecodeValue;
+/** Hello.flags bit requesting cancellation instead of a session. */
+export declare const FlagCancel: number;
+/** Hello.flags bit requesting the stable ERR_* error taxonomy. */
+export declare const FlagPublicErrorCodes: number;
 export declare function encodeHello(h: Hello): Uint8Array;
 export declare function decodeHelloOK(b: Uint8Array): HelloOK;
 export declare function encodeDecimalString(s: string): Uint8Array;

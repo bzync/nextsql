@@ -359,7 +359,7 @@ func TestHALeaderTransferSQL(t *testing.T) {
 func TestHAEncryptedClientCiphertextSurvivesLeaderFailover(t *testing.T) {
 	nodes := cluster3(t)
 	lead := leader(t, nodes)
-	if _, err := lead.db.Session().Exec(`CREATE TABLE accounts (id STRING PRIMARY KEY, secret TEXT ENCRYPTED CLIENT NOT NULL)`); err != nil {
+	if _, err := lead.db.Session().Exec(`CREATE TABLE accounts (id STRING PRIMARY KEY, secret TEXT ENCRYPTED CLIENT NOT NULL, email TEXT ENCRYPTED CLIENT DETERMINISTIC NOT NULL)`); err != nil {
 		t.Fatal(err)
 	}
 	fieldKey := clientenc.Key{ID: "ha-v1"}
@@ -371,14 +371,18 @@ func TestHAEncryptedClientCiphertextSurvivesLeaderFailover(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := lead.db.Session().ExecContext(context.Background(), `INSERT INTO accounts (id, secret) VALUES ('1', $1)`, []executor.Param{{Value: types.StringValue(beforeFailover)}}); err != nil {
+	deterministicBeforeFailover, err := clientenc.EncryptDeterministic(context.Background(), provider, "app", "accounts", "email", types.TextValue("person@example.com"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := lead.db.Session().ExecContext(context.Background(), `INSERT INTO accounts (id, secret, email) VALUES ('1', $1, $2)`, []executor.Param{{Value: types.StringValue(beforeFailover)}, {Value: types.StringValue(deterministicBeforeFailover)}}); err != nil {
 		t.Fatal(err)
 	}
 	writtenLSN := uint64(lead.cluster.AppliedLSN())
 	waitAll(t, nodes, writtenLSN)
 	for _, n := range nodes {
-		res, err := staleSession(t, n).Exec(`SELECT secret FROM accounts WHERE id = '1'`)
-		if err != nil || len(res.Rows) != 1 || res.Rows[0][0].Str != beforeFailover {
+		res, err := staleSession(t, n).Exec(`SELECT secret, email FROM accounts WHERE id = '1'`)
+		if err != nil || len(res.Rows) != 1 || res.Rows[0][0].Str != beforeFailover || res.Rows[0][1].Str != deterministicBeforeFailover {
 			t.Fatalf("replica %s before failover: rows=%+v err=%v", n.id, res.Rows, err)
 		}
 	}
@@ -398,31 +402,43 @@ func TestHAEncryptedClientCiphertextSurvivesLeaderFailover(t *testing.T) {
 		t.Fatal(err)
 	}
 	newLeader := leader(t, remaining)
-	res, err := newLeader.db.Session().Exec(`SELECT secret FROM accounts WHERE id = '1'`)
-	if err != nil || len(res.Rows) != 1 || res.Rows[0][0].Str != beforeFailover {
+	res, err := newLeader.db.Session().Exec(`SELECT secret, email FROM accounts WHERE id = '1'`)
+	if err != nil || len(res.Rows) != 1 || res.Rows[0][0].Str != beforeFailover || res.Rows[0][1].Str != deterministicBeforeFailover {
 		t.Fatalf("new leader lost acknowledged client ciphertext: rows=%+v err=%v", res.Rows, err)
 	}
 	plain, err := clientenc.Decrypt(context.Background(), provider, "app", "accounts", "secret", res.Rows[0][0].Str)
 	if err != nil || plain.Typ.Kind != types.KindText || plain.Str != "secret-before-failover" {
 		t.Fatalf("new-leader decrypt: value=%+v err=%v", plain, err)
 	}
+	deterministicPlain, err := clientenc.DecryptDeterministic(context.Background(), provider, "app", "accounts", "email", res.Rows[0][1].Str)
+	if err != nil || deterministicPlain.Str != "person@example.com" {
+		t.Fatalf("new-leader deterministic decrypt: value=%+v err=%v", deterministicPlain, err)
+	}
 
 	afterFailover, err := clientenc.Encrypt(context.Background(), provider, "app", "accounts", "secret", types.TextValue("secret-after-failover"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := newLeader.db.Session().ExecContext(context.Background(), `UPDATE accounts SET secret = $1 WHERE id = '1'`, []executor.Param{{Value: types.StringValue(afterFailover)}}); err != nil {
+	deterministicAfterFailover, err := clientenc.EncryptDeterministic(context.Background(), provider, "app", "accounts", "email", types.TextValue("later@example.com"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := newLeader.db.Session().ExecContext(context.Background(), `UPDATE accounts SET secret = $1, email = $2 WHERE id = '1'`, []executor.Param{{Value: types.StringValue(afterFailover)}, {Value: types.StringValue(deterministicAfterFailover)}}); err != nil {
 		t.Fatal(err)
 	}
 	waitAll(t, remaining, uint64(newLeader.cluster.AppliedLSN()))
 	for _, n := range remaining {
-		res, err := staleSession(t, n).Exec(`SELECT secret FROM accounts WHERE id = '1'`)
-		if err != nil || len(res.Rows) != 1 || res.Rows[0][0].Str != afterFailover {
+		res, err := staleSession(t, n).Exec(`SELECT secret, email FROM accounts WHERE id = '1'`)
+		if err != nil || len(res.Rows) != 1 || res.Rows[0][0].Str != afterFailover || res.Rows[0][1].Str != deterministicAfterFailover {
 			t.Fatalf("replica %s after failover: rows=%+v err=%v", n.id, res.Rows, err)
 		}
 		plain, err := clientenc.Decrypt(context.Background(), provider, "app", "accounts", "secret", res.Rows[0][0].Str)
 		if err != nil || plain.Str != "secret-after-failover" {
 			t.Fatalf("replica %s post-failover decrypt: value=%+v err=%v", n.id, plain, err)
+		}
+		deterministicPlain, err := clientenc.DecryptDeterministic(context.Background(), provider, "app", "accounts", "email", res.Rows[0][1].Str)
+		if err != nil || deterministicPlain.Str != "later@example.com" {
+			t.Fatalf("replica %s post-failover deterministic decrypt: value=%+v err=%v", n.id, deterministicPlain, err)
 		}
 	}
 }

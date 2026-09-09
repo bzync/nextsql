@@ -1429,6 +1429,7 @@ func TestSearchNearestJoinFromTable(t *testing.T) {
 	execOK(t, s, `INSERT INTO articles (k, title, body, emb) VALUES
 		('one', 'one', 'the cat sat', (1, 0, 0)),
 		('two', 'two', 'the cat sat on the mat', (0.7, 0.7, 0)),
+		('solo', 'solo', 'the cat without an author', (0.2, 0.8, 0)),
 		('four', 'four', 'database performance tuning', (0, 1, 0))`)
 	execOK(t, s, `INSERT INTO authors (k, name, note, vec) VALUES
 		('one', 'ann', 'alpha notes', (1, 0, 0)),
@@ -1446,6 +1447,23 @@ func TestSearchNearestJoinFromTable(t *testing.T) {
 		t.Fatalf("1:N rank order %v", got.Rows)
 	}
 
+	got = execOK(t, s, `SELECT articles.title, authors.name FROM articles LEFT JOIN authors ON articles.k = authors.k SEARCH body FOR 'cat'`)
+	if len(got.Rows) != 4 {
+		t.Fatalf("outer search join %d rows %v", len(got.Rows), got.Rows)
+	}
+	var sawSolo bool
+	for _, row := range got.Rows {
+		if row[0].Str == "solo" {
+			sawSolo = true
+			if !row[1].Null {
+				t.Fatalf("outer search join must null-extend unmatched rank row: %v", row)
+			}
+		}
+	}
+	if !sawSolo {
+		t.Fatalf("outer search join omitted unmatched rank row: %v", got.Rows)
+	}
+
 	got = execOK(t, s, `SELECT articles.title FROM articles JOIN authors ON articles.k = authors.k WHERE articles.title = 'two' SEARCH body FOR 'cat'`)
 	if len(got.Rows) != 1 || got.Rows[0][0].Str != "two" {
 		t.Fatalf("from-table residual %v", titles(got))
@@ -1457,6 +1475,22 @@ func TestSearchNearestJoinFromTable(t *testing.T) {
 	}
 	if got.Rows[0][0].Str != "one" {
 		t.Fatalf("nearest top %v", got.Rows)
+	}
+	got = execOK(t, s, `SELECT articles.title, authors.name FROM articles LEFT JOIN authors ON articles.k = authors.k NEAREST emb TO (1, 0, 0)`)
+	if len(got.Rows) != 5 {
+		t.Fatalf("outer nearest join %d rows %v", len(got.Rows), got.Rows)
+	}
+	sawSolo = false
+	for _, row := range got.Rows {
+		if row[0].Str == "solo" {
+			sawSolo = true
+			if !row[1].Null {
+				t.Fatalf("outer nearest join must null-extend unmatched rank row: %v", row)
+			}
+		}
+	}
+	if !sawSolo {
+		t.Fatalf("outer nearest join omitted unmatched rank row: %v", got.Rows)
 	}
 
 	got = execOK(t, s, `SELECT articles.title, authors.name FROM articles JOIN authors ON articles.k = authors.k
@@ -1472,6 +1506,74 @@ func TestSearchNearestJoinFromTable(t *testing.T) {
 	ops := strings.Join(explainOps(plan), " ")
 	if !strings.Contains(ops, "Search") || (!strings.Contains(ops, "Join") && !strings.Contains(ops, "HashJoin")) {
 		t.Fatalf("explain missing Search/Join: %s", ops)
+	}
+
+	execOK(t, s, `INSERT INTO authors (k, name, note, vec) VALUES ('ghost', 'dan', 'unmatched', (0, 0, 0))`)
+
+	// RIGHT JOIN with SEARCH: matched rows in rank order, then unmatched authors with NULL title.
+	got = execOK(t, s, `SELECT articles.title, authors.name FROM articles RIGHT JOIN authors ON articles.k = authors.k SEARCH body FOR 'cat'`)
+	if len(got.Rows) != 5 {
+		t.Fatalf("right search join rows=%d want 5: %+v", len(got.Rows), got.Rows)
+	}
+	if got.Rows[0][0].Str != "one" || got.Rows[1][0].Str != "one" || got.Rows[2][0].Str != "two" {
+		t.Fatalf("right search join rank order %+v", got.Rows[:3])
+	}
+	for i := 3; i < 5; i++ {
+		if !got.Rows[i][0].Null {
+			t.Fatalf("unmatched right row %d must have NULL title: %+v", i, got.Rows[i])
+		}
+	}
+
+	// FULL OUTER JOIN with SEARCH: matched rows in rank order, unmatched left row (solo), then unmatched right authors (cam, dan).
+	got = execOK(t, s, `SELECT articles.title, authors.name FROM articles FULL OUTER JOIN authors ON articles.k = authors.k SEARCH body FOR 'cat'`)
+	if len(got.Rows) != 6 {
+		t.Fatalf("full search join rows=%d want 6: %+v", len(got.Rows), got.Rows)
+	}
+	if got.Rows[0][0].Str != "one" || got.Rows[1][0].Str != "one" || got.Rows[2][0].Str != "solo" || got.Rows[3][0].Str != "two" {
+		t.Fatalf("full search join rank order %+v", got.Rows[:4])
+	}
+	var sawSoloLeft bool
+	var unmatchedRightCount int
+	for _, row := range got.Rows {
+		if row[0].Str == "solo" && row[1].Null {
+			sawSoloLeft = true
+		}
+		if row[0].Null {
+			unmatchedRightCount++
+		}
+	}
+	if !sawSoloLeft || unmatchedRightCount != 2 {
+		t.Fatalf("full search join unmatched left/right: sawSolo=%v unmatchedRight=%d rows=%+v", sawSoloLeft, unmatchedRightCount, got.Rows)
+	}
+
+	// RIGHT JOIN with NEAREST
+	got = execOK(t, s, `SELECT articles.title, authors.name FROM articles RIGHT JOIN authors ON articles.k = authors.k NEAREST emb TO (1, 0, 0)`)
+	if len(got.Rows) != 5 {
+		t.Fatalf("right nearest join rows=%d want 5: %+v", len(got.Rows), got.Rows)
+	}
+	if got.Rows[0][0].Str != "one" {
+		t.Fatalf("right nearest join top row want 'one': %+v", got.Rows[0])
+	}
+	if !got.Rows[4][0].Null || got.Rows[4][1].Str != "dan" {
+		t.Fatalf("right nearest join last row want unmatched 'dan': %+v", got.Rows[4])
+	}
+
+	// FULL OUTER JOIN with NEAREST
+	got = execOK(t, s, `SELECT articles.title, authors.name FROM articles FULL OUTER JOIN authors ON articles.k = authors.k NEAREST emb TO (1, 0, 0)`)
+	if len(got.Rows) != 6 {
+		t.Fatalf("full nearest join rows=%d want 6: %+v", len(got.Rows), got.Rows)
+	}
+	if got.Rows[0][0].Str != "one" {
+		t.Fatalf("full nearest join top row want 'one': %+v", got.Rows[0])
+	}
+	if !got.Rows[5][0].Null || got.Rows[5][1].Str != "dan" {
+		t.Fatalf("full nearest join last row want unmatched 'dan': %+v", got.Rows[5])
+	}
+
+	// LIMIT on RIGHT JOIN with SEARCH
+	got = execOK(t, s, `SELECT articles.title, authors.name FROM articles RIGHT JOIN authors ON articles.k = authors.k SEARCH body FOR 'cat' LIMIT 2`)
+	if len(got.Rows) != 2 || got.Rows[0][0].Str != "one" || got.Rows[1][0].Str != "one" {
+		t.Fatalf("limit right search join rows=%+v", got.Rows)
 	}
 
 	if _, err := s.Exec(`SELECT articles.title FROM articles JOIN authors ON articles.k = authors.k SEARCH note FOR 'x'`); err == nil {

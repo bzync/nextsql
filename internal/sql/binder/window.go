@@ -378,6 +378,38 @@ func exprType(e ast.Expr, schema *catalog.Table) types.Type {
 		}
 	case ast.Literal:
 		return x.Value.Typ
+	case ast.Subscript:
+		ct := exprType(x.Coll, schema)
+		switch ct.Kind {
+		case types.KindArray, types.KindMap:
+			if len(ct.Elem) > 0 {
+				return ct.Elem[0]
+			}
+		}
+	case ast.ArrayCtor:
+		elemType := types.Type{Kind: types.KindInvalid}
+		if len(x.Elems) > 0 {
+			elemType = exprType(x.Elems[0], schema)
+		}
+		if at, err := types.ArrayType(elemType); err == nil {
+			return at
+		}
+		return types.Type{Kind: types.KindArray, Elem: []types.Type{elemType}}
+	case ast.MapCtor:
+		kType := types.String()
+		vType := types.Type{Kind: types.KindInvalid}
+		if len(x.Keys) > 0 {
+			if kt := exprType(x.Keys[0], schema); kt.Kind != types.KindInvalid {
+				kType = kt
+			}
+		}
+		if len(x.Vals) > 0 {
+			vType = exprType(x.Vals[0], schema)
+		}
+		if mt, err := types.MapType(kType, vType); err == nil {
+			return mt
+		}
+		return types.Type{Kind: types.KindMap, Key: []types.Type{kType}, Elem: []types.Type{vType}}
 	}
 	return types.Type{}
 }
@@ -415,6 +447,8 @@ func containsSearchHL(e ast.Expr) bool {
 				return true
 			}
 		}
+	case ast.Subscript:
+		return containsSearchHL(x.Coll) || containsSearchHL(x.Index)
 	}
 	return false
 }
@@ -481,6 +515,8 @@ func containsWindow(e ast.Expr) bool {
 		}
 	case ast.FieldAccess:
 		return containsWindow(x.Base)
+	case ast.Subscript:
+		return containsWindow(x.Coll) || containsWindow(x.Index)
 	}
 	return false
 }
@@ -543,6 +579,8 @@ func containsGroupingAgg(e ast.Expr) bool {
 		}
 	case ast.FieldAccess:
 		return containsGroupingAgg(x.Base)
+	case ast.Subscript:
+		return containsGroupingAgg(x.Coll) || containsGroupingAgg(x.Index)
 	}
 	return false
 }

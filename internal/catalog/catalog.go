@@ -27,13 +27,22 @@ type Column struct {
 	Name string
 	Type types.Type
 	// ClientType is the logical plaintext type for ENCRYPTED CLIENT. Type is
-	// STRING because nextsqld stores and returns only an NSCE1 ciphertext.
+	// STRING because nextsqld stores and returns only an NSCE1/NSCE2 ciphertext.
 	// KindInvalid means the column is not client-encrypted.
 	ClientType types.Type
-	NotNull    bool
-	Primary    bool
-	Default    Default
+	// ClientEncryptionMode is persisted with v13+ catalogs. Zero is the
+	// existing randomized NSCE1 contract; deterministic mode is introduced
+	// only by explicit DDL and must never be inferred from ciphertext.
+	ClientEncryptionMode uint8
+	NotNull              bool
+	Primary              bool
+	Default              Default
 }
+
+const (
+	ClientEncryptionRandomized uint8 = iota
+	ClientEncryptionDeterministic
+)
 
 func (c Column) ClientEncrypted() bool { return c.ClientType.Kind != types.KindInvalid }
 
@@ -712,6 +721,9 @@ func ColumnFromAST(c ast.ColumnDef) (Column, error) {
 	}
 	col.ClientType = c.Type
 	col.Type = types.String()
+	if c.EncryptedClientDeterministic {
+		col.ClientEncryptionMode = ClientEncryptionDeterministic
+	}
 	return col, nil
 }
 

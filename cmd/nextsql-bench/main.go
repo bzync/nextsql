@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/bzync/nextsql/internal/bench"
+	"github.com/bzync/nextsql/internal/config"
 	"github.com/bzync/nextsql/internal/crypto"
 	"github.com/bzync/nextsql/internal/storage"
 	"github.com/bzync/nextsql/internal/storage/format"
@@ -40,6 +41,9 @@ func main() {
 	duration := flag.Duration("duration", time.Second, "SQL workload duration")
 	rows := flag.Int("rows", 128, "seeded rows per table")
 	conc := flag.Int("concurrency", 1, "SQL worker sessions")
+	prod := flag.Bool("production", false, "target production environment profile")
+	allowProdBench := flag.Bool("allow-production-benchmark", false, "allow running heavy or destructive benchmarks on production")
+	cfgPath := flag.String("config", "", "path to nextsql.conf")
 	flag.Parse()
 	if *quick {
 		testing.Init()
@@ -78,6 +82,58 @@ func main() {
 		}
 		if *vecQuantSparseNNZ > 8 {
 			*vecQuantSparseNNZ = 8
+		}
+	}
+
+	isProduction := *prod || strings.EqualFold(os.Getenv("NEXTSQL_PROFILE"), "production")
+	if !isProduction && *cfgPath != "" {
+		if loaded, err := config.Load(*cfgPath); err == nil && loaded.IsProduction() {
+			isProduction = true
+		}
+	}
+
+	if isProduction {
+		var isHeavyOrDestructive bool
+		var reason string
+
+		if *slo {
+			if !*sloNoDML {
+				isHeavyOrDestructive = true
+				reason = "SLO suite includes destructive bulk UPDATE/DELETE operations"
+			} else if *sloMax > 25000 || *sloVec > 256 || !*quick {
+				isHeavyOrDestructive = true
+				reason = fmt.Sprintf("SLO suite runs heavy scan/vector workload (max_rows=%d, vecs=%d)", *sloMax, *sloVec)
+			}
+		} else if *partition {
+			if *partitionRows > 20000 || !*quick {
+				isHeavyOrDestructive = true
+				reason = fmt.Sprintf("partition benchmark runs heavy table workload (rows=%d)", *partitionRows)
+			}
+		} else if *readScale {
+			if *readScaleRows > 5000 || *readScaleReaders > 8 || !*quick {
+				isHeavyOrDestructive = true
+				reason = fmt.Sprintf("read-scaling benchmark runs heavy cluster workload (rows=%d, readers=%d)", *readScaleRows, *readScaleReaders)
+			}
+		} else if *vecQuant {
+			if *vecQuantRows > 2000 || !*quick {
+				isHeavyOrDestructive = true
+				reason = fmt.Sprintf("quantised-vector benchmark runs heavy index-building workload (rows=%d)", *vecQuantRows)
+			}
+		} else if *workload != "page" {
+			mutatingWorkloads := map[string]bool{
+				"all": true, "insert": true, "update": true, "delete": true, "txns": true,
+			}
+			if mutatingWorkloads[*workload] {
+				isHeavyOrDestructive = true
+				reason = fmt.Sprintf("SQL workload %q performs mutating/destructive operations", *workload)
+			} else if *rows > 1000 || *conc > 8 || *duration > 5*time.Second {
+				isHeavyOrDestructive = true
+				reason = fmt.Sprintf("SQL benchmark runs heavy parameters (rows=%d, concurrency=%d, duration=%s)", *rows, *conc, *duration)
+			}
+		}
+
+		if err := bench.CheckProductionWorkload(isProduction, *allowProdBench, isHeavyOrDestructive, reason); err != nil {
+			fatal(err)
 		}
 	}
 

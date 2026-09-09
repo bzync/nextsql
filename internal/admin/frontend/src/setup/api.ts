@@ -11,6 +11,7 @@ export type Defaults = {
   dataDir: string;
   keyFile: string;
   configOut: string;
+  recoveryKeyOut: string;
   elevated: boolean;
   os: string;
 };
@@ -48,6 +49,8 @@ export type Params = {
   listenAddr: string;
   tlsCert: string;
   tlsKey: string;
+  recoveryKeyOut: string;
+  instanceRecoveryKeyOut: string;
   enableService: boolean;
 };
 
@@ -61,12 +64,17 @@ export function defaultParams(): Params {
     bufferPages: 0,
     adminUser: "",
     adminPassword: "",
-    realm: "default",
-    database: "default",
+    realm: "",
+    // Empty means "no database": `nextsql setup` then initializes the
+    // deployment only. The wizard asks for the name on the Resources step
+    // rather than inventing one here.
+    database: "",
     skipInit: false,
     listenAddr: "",
     tlsCert: "",
     tlsKey: "",
+    recoveryKeyOut: "",
+    instanceRecoveryKeyOut: "",
     enableService: false,
   };
 }
@@ -104,6 +112,9 @@ export type PlanResult = {
   key_file_exists: boolean;
   instance_key_file: string;
   instance_key_exists: boolean;
+  recovery_key_file?: string;
+  instance_recovery_key_file?: string;
+  recovery_keys_created?: boolean;
   admin_user?: string;
   profile?: string;
   initialized: boolean;
@@ -144,6 +155,16 @@ export type RunResult = {
   service?: ServiceOutcome;
 };
 
+export type LifecycleDetect = {
+  status: string;
+  summary: string;
+  config_present: boolean;
+  data_file_present: boolean;
+  keystore_present: boolean;
+  server_running: boolean;
+  headers_compatible: boolean;
+};
+
 function tokenFromCookie(): string {
   const m = document.cookie.match(/(?:^|; )nsi_token=([^;]+)/);
   return m ? decodeURIComponent(m[1]) : "";
@@ -158,6 +179,8 @@ export const api = {
   service: () => request<ServiceStatus>("GET", "/api/v1/service"),
   plan: (p: Params) => request<RunResult>("POST", "/api/v1/plan", p),
   install: (p: Params) => request<RunResult>("POST", "/api/v1/install", p),
+  lifecycleDetect: (dataDir: string, config: string) =>
+    request<RunResult>("POST", "/api/v1/lifecycle/detect", { dataDir, config }),
   finish: () => request<{ ok: boolean }>("POST", "/api/v1/finish", {}),
   browse: (dir?: string) =>
     request<BrowseResult>("GET", "/api/v1/browse" + (dir ? "?dir=" + encodeURIComponent(dir) : "")),

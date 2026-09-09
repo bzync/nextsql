@@ -49,7 +49,6 @@ func ServerConfig(s Settings) (nextsql.Config, error) {
 	}
 	cfg := nextsql.Config{
 		Address:       addr,
-		Realm:         s.Realm,
 		Database:      s.Database,
 		User:          s.User,
 		Password:      pw,

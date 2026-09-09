@@ -94,6 +94,7 @@ export function Resources({
   onNext: () => void;
 }) {
   const rec = lastPlan?.result?.recommendation;
+  const databaseMissing = params.profile === "production" && !params.skipInit && params.database.trim() === "";
   const remoteLooking = looksNonLoopback(params.listenAddr);
   const hasBothTLS = !!params.tlsCert && !!params.tlsKey;
 
@@ -115,6 +116,27 @@ export function Resources({
               <Radio key={value} value={value} label={label} description={desc} />
             ))}
           </RadioGroup>
+          {/* The deployment's database is created only when it is named:
+              `nextsql setup` initializes the deployment alone otherwise, and
+              the wizard must not substitute a name of its own. Production
+              needs one, because a deployment with no database cannot serve. */}
+          {!params.skipInit ? (
+            <Stack gap="xs">
+              <Input
+                id="databaseName"
+                label="Database name"
+                placeholder="default"
+                value={params.database}
+                onChange={(e) => patch({ database: e.target.value })}
+                hint={
+                  params.profile === "production"
+                    ? "Required: a deployment with no database cannot serve."
+                    : "Optional. Leave empty to initialize the deployment (keys and administrator) with no database — create one later with `nextsql init --database NAME`."
+                }
+                error={databaseMissing ? "Enter a database name, or choose the Developer profile to install without one." : undefined}
+              />
+            </Stack>
+          ) : null}
           {params.profile === "production" ? (
             <Alert variant="success">
               Production preflight will refuse a key file inside the data directory, --skip-init,
@@ -161,13 +183,21 @@ export function Resources({
             description={
               params.profile === "production"
                 ? "Not available on the production profile — a live install must initialize the database with an administrator."
-                : (params.skipInit ? "You can initialize it later with `nextsql setup --skip-init=false` or `nextsql init` against the generated config." : undefined)
+                : (params.skipInit
+                  ? "You can initialize it later with `nextsql setup --skip-init=false` or `nextsql init` against the generated config. Recovery keys are exported then, not now — there is no keystore for one to seal yet."
+                  : undefined)
             }
             checked={params.skipInit && params.profile !== "production"}
             disabled={params.profile === "production"}
             onChange={(e) => {
               const skipInit = e.target.checked;
-              patch(skipInit ? { skipInit, adminUser: "", adminPassword: "", enableService: false } : { skipInit });
+              // A recovery key seals a keystore `nextsql init` creates, so
+              // the two are mutually exclusive and `nextsql setup` rejects
+              // the pair outright. Clear the export here rather than let a
+              // choice made on the previous step fail the install.
+              patch(skipInit
+                ? { skipInit, adminUser: "", adminPassword: "", enableService: false, recoveryKeyOut: "", instanceRecoveryKeyOut: "" }
+                : { skipInit });
             }}
           />
 
@@ -225,7 +255,7 @@ export function Resources({
           <Button variant="outline" onClick={onBack}>Back</Button>
           <Inline gap="sm">
             <Button variant="secondary" onClick={onCheck}>Check</Button>
-            <Button variant="primary" onClick={onNext}>Continue</Button>
+            <Button variant="primary" onClick={onNext} disabled={databaseMissing}>Continue</Button>
           </Inline>
         </div>
       </CardBody>

@@ -19,6 +19,7 @@ type exchangeAudit struct {
 	EffectiveRoles []string
 	TokenID        string
 	ExpiresAt      time.Time
+	JITProvisioned bool
 	Outcome        string // "granted", "denied", "error"
 	Reason         string // populated for denied / error
 }
@@ -44,6 +45,9 @@ func (b *Broker) logAudit(a exchangeAudit) {
 	}
 	if len(a.EffectiveRoles) > 0 {
 		attrs = append(attrs, slog.Any("effective_roles", a.EffectiveRoles))
+	}
+	if a.JITProvisioned {
+		attrs = append(attrs, slog.Bool("jit_provisioned", true))
 	}
 	if a.TokenID != "" {
 		attrs = append(attrs, slog.String("token_id", a.TokenID))

@@ -14,8 +14,9 @@ nextsqld --config DIR/nextsql.conf
 `nextsqld --production` forces it for a process that was initialized as
 developer. Either path fail-closes if the unlock key sits on the data volume
 or if disk-watermark / drain / statement / idle timeouts are unset.
-`field_encryption_client` and `hosting_isolation` stay labeled experimental
-in `system.capabilities` and are not implied by the profile.
+An opt-in feature's `system.capabilities` status still controls whether it is
+production-gated; the production profile does not enable application-level
+field encryption automatically.
 
 ## Diagnose and status
 
@@ -29,7 +30,7 @@ in `system.capabilities` and are not implied by the profile.
 
 `nextsql status --local` is the data-directory inspect: format-family versions plus opened table count, `durable_lsn` / `checkpoint_lsn` / `next_lsn`, isolated-page count, query/error/commit counters, admission inflight/queue, and cluster fields when Raft is running.
 
-`diagnose` checks format-family versions and plaintext headers. Most families are **v1**; the catalog descriptor (`NSCT`) is at **v12** (readable 1..12). A newer or older-than-min file fails closed — there is no silent rewrite. `diagnose` does not need a key.
+`diagnose` checks format-family versions and plaintext headers. Most families are **v1**; the catalog descriptor (`NSCT`) is at **v13** (readable 1..13). A newer or older-than-min file fails closed — there is no silent rewrite. `diagnose` does not need a key.
 
 Isolated pages are a fail-closed corruption path (`*.isolated`). NextSQL never returns a known corrupted record.
 

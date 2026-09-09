@@ -52,7 +52,6 @@ export type Databases = {
   generated_at: string;
   storage: ResultSet;
   databases: ResultSet;
-  realms: ResultSet;
   tables: ResultSet;
   table_stats: ResultSet;
   hosted: boolean;

@@ -38,12 +38,26 @@ $conn = NextSQL\Client::connect([
 ]);
 ```
 
+```ruby
+conn = NextSQL.connect(NextSQL::Config.new(
+  address: "db.example.com:7210",
+  database: "production",
+  user: "app",
+  password: ENV.fetch("NEXTSQL_DATABASE_PASS"),
+  key: client_root_32_bytes,
+  tls: NextSQL::TLSConfig.new(
+    cafile: "/etc/nextsql/ca.pem",
+    server_name: "db.example.com",
+  ),
+))
+```
+
 ## Session rules
 
 - One statement per request on the wire.
 - A connection is single-flight: a second query while rows are open returns `conflict`.
 - Default listen: `127.0.0.1:7210`.
-- Packet / SQL text cap: 1 MiB. Parameters: 256. Prepared statements per session: 64. Concurrent sessions: 128. Idle: 60 s.
+- Packet / SQL text cap: 64 MiB / 16 MiB (configurable within those ceilings). Parameters: 65,535. Prepared statements per session: 64 default, 4,096 ceiling. Concurrent sessions: 128. Idle: 60 s.
 - Retryable mutations use the additive NSQL v1 `IdempotentQuery` frame: a
   bounded key plus ordinary SQL/typed parameters. Same-key replays return the
   committed result; different-request reuse is `conflict`.
@@ -53,8 +67,8 @@ $conn = NextSQL\Client::connect([
   `connectCluster`, PHP `NextSQL\Cluster::connect`, Python and Ruby
   `connect_cluster`) that routes eligible reads to a healthy follower; the
   server enforces every barrier regardless. See [HA](/docs/ha).
-- Initialized deployments select a realm and database on Hello. An empty
-  database name selects the registered default for v1 compatibility. See
-  [Hosting](/docs/hosting).
+- Each deployment serves exactly one database. Hello may name that database;
+  an empty name accepts the deployment default, while another database or any
+  non-empty realm is rejected without disclosing deployment names.
 
 See [Drivers](/docs/drivers) for language-specific examples and [TLS](/docs/tls) for unlock-over-TLS (`TypeUnlock`).

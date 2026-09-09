@@ -140,15 +140,53 @@ Phase 1 stand-in for a `KeyProvider`. Not a connection URL. Mode `0600`. Keep it
 | 42 | 4 | CRC32C |
 
 Phase 13: `--key-file` is the external **root unlock key**. The sidecar
-`nextsql.db.keys` (`NSKS` v1) stores KEK / master / domain DEKs wrapped under
+`nextsql.db.keys` (`NSKS`) stores KEK / master / domain DEKs wrapped under
 the hierarchy in `docs/security.md`. The raw root is never in the data
 directory. Legacy databases without a keystore still treat `NSKY` as the page DEK.
+
+`NSKS` has two versions, and which one is written is a property of the
+database's configuration rather than of the binary:
+
+| Version | Layout | Written when |
+|---|---|---|
+| v1 | one wrap of the KEK, under the root unlock key | no recovery key is configured (the default) |
+| v2 | v1 plus a `u32` recovery key version and a `u16`-prefixed second wrap of the same KEK, under the recovery key | a recovery key is configured |
+
+The v2 fields sit between the master wrap and the domain count; everything
+before and after is unchanged from v1. A v2 file with an empty recovery wrap
+is rejected — the writer cannot produce one, so it means truncation or hand
+editing, and accepting it would silently downgrade the operator to a single
+unlock path.
+
+Because a keystore reverts to v1 when the recovery key is removed, and is only
+ever v2 by explicit operator action, an untouched database stays byte-readable
+by releases predating v2. The compatibility catalog records this as
+`Current: 1, MaxReadable: 2` for the `keystore` family, and `nextsql diagnose`
+prints `keystore_version` so a rollback decision does not have to guess. See
+`docs/security.md` "Recovery keys".
+
+Exported key files share one 46-byte layout but not one magic: `NSKY` is a
+root unlock key and `NSRK` an exported recovery key, so the two cannot be
+silently swapped.
 
 ## Allocator
 
 High-water `NextPageID` plus a chain of `PageTypeFreeList` pages. Each freelist page stores 8-byte page IDs as slotted records. `TxnMeta` is the next freelist page ID (`0` if none).
 Allocated freelist metadata pages remain linked even when the free-ID count
 shrinks, preventing the unused metadata tail from becoming unreachable.
+
+A freelist that loads is trusted for the life of the handle — every ID it names
+is handed straight back out by `Alloc` — so the decoder validates the whole
+chain before accepting it, and fails closed on anything the allocator itself
+could not have written: a count without a head, a head or link whose page is not
+`PageTypeFreeList`, a cycle in the chain, a record that is not 8 bytes, page ID
+`0`, an ID at or above `NextPageID` (never allocated, so a later `Alloc` would
+hand it out a second time), a duplicate ID, one of the chain's own metadata
+pages listed as free, or a chain whose ID count disagrees with the superblock.
+The metadata-page check runs after the walk, since a record on the first page
+can name a metadata page the walk has not reached yet. `Reload` applies the same
+validation, so a file that changes underneath an open handle is re-checked
+rather than trusted.
 
 `btree.Tree.OwnedPages` performs the fail-closed ownership walk used by storage
 reclamation. It returns the detached metadata page plus every internal and leaf
@@ -222,10 +260,11 @@ Table descriptors live in the primary tree (key `T` + name). Magic `NSCT`.
 | 9 | Readable. v8 payload, then per-index full-text analyzer id (`u8`) + revision (`u16`). `0/0` is simple v1; `1/1` is english stem-only; `1/2` is english stem plus stop-word dictionary v1; `1/3` is english v2 plus synonym dictionary v1 (query-time OR expansion); `2/1` french, `3/1` german, `4/1` spanish (Snowball stemmer + stop-word dictionary v1). Unknown id/revision pairs fail closed. |
 | 10 | Readable. v9 payload, then one `u8` flag per column in column order. `0` means ordinary. `1` means `ENCRYPTED CLIENT` and is followed by its logical plaintext type (`kind u8`, `vector tag u8`, `precision u16le`, `scale u16le`); the stored physical type is `STRING`. Unknown flags/types, inconsistent metadata, or leftover bytes fail closed. |
 | 11 | Readable. v10 payload, then one `u16le` label count per column in column order; a nonzero count is followed by that many length-prefixed UTF-8 `ENUM` labels. Zero for every non-`ENUM` column. A label list on a non-`ENUM` column, a count over the label limit, or leftover bytes fail closed. |
-| 12 | Current write format. v11 payload, then one `u8` flag per column in column order: `0` for a non-collection column (no further bytes), `1` for a `STRUCT`/`ARRAY`/`MAP` column followed by its full recursive type descriptor (`kind u8`, `vector tag u8`, `precision u16le`, `scale u16le`, then — for `ENUM` its label list; for `ARRAY` one nested descriptor; for `MAP` two; for `STRUCT` a `u16le` field count then each field's length-prefixed name + nested descriptor). Recursion is bounded at depth 8 and every reconstructed type is re-validated through its own constructor. A missing descriptor on a collection column, a `Kind` mismatch, over-deep nesting, or leftover bytes fail closed. |
+| 12 | Readable. v11 payload, then one `u8` flag per column in column order: `0` for a non-collection column (no further bytes), `1` for a `STRUCT`/`ARRAY`/`MAP` column followed by its full recursive type descriptor (`kind u8`, `vector tag u8`, `precision u16le`, `scale u16le`, then — for `ENUM` its label list; for `ARRAY` one nested descriptor; for `MAP` two; for `STRUCT` a `u16le` field count then each field's length-prefixed name + nested descriptor). Recursion is bounded at depth 8 and every reconstructed type is re-validated through its own constructor. A missing descriptor on a collection column, a `Kind` mismatch, over-deep nesting, or leftover bytes fail closed. |
+| 13 | Current write format. v12 payload, then one client-encryption-mode `u8` per column in column order: `0` is randomized (and is the backward-compatible default for v1..v12), `1` is deterministic. A nonzero mode on a non-`ENCRYPTED CLIENT` column or any unknown mode fails closed. |
 | other | Fail closed (`unsupported catalog version`). |
 
-Compatibility window (`internal/upgrade` `FamilyCatalog`): current 12, readable 1..12. `nextsql diagnose` prints that window. Old binaries cannot open v12 rows. Any catalog rewrite upgrades a readable older descriptor to v12 (older descriptors decode with every index unquantised, every vector index as HNSW unless a later trailer says otherwise, every full-text index as the simple analyzer, no client-encrypted columns, no `ENUM` columns, and no collection columns). v6 adds a per-index HNSW traversal-quantisation byte; v7 adds a per-index vector-ANN-method byte plus the IVF `LISTS` / `PROBES` counts; v8 adds a per-index IVF-PQ `SUBSPACES` count; v9 adds a per-index full-text analyzer id + revision; v10 adds per-column client-encryption metadata; v11 adds a per-column `ENUM` label list; v12 adds a per-column recursive `STRUCT`/`ARRAY`/`MAP` descriptor.
+Compatibility window (`internal/upgrade` `FamilyCatalog`): current 13, readable 1..13. `nextsql diagnose` prints that window. Old binaries cannot open v13 rows. Any catalog rewrite upgrades a readable older descriptor to v13 (older descriptors decode with every index unquantised, every vector index as HNSW unless a later trailer says otherwise, every full-text index as the simple analyzer, no client-encrypted columns before v10, no `ENUM` columns before v11, no collection columns before v12, and randomized client encryption before v13). v6 adds a per-index HNSW traversal-quantisation byte; v7 adds a per-index vector-ANN-method byte plus the IVF `LISTS` / `PROBES` counts; v8 adds a per-index IVF-PQ `SUBSPACES` count; v9 adds a per-index full-text analyzer id + revision; v10 adds per-column client-encryption metadata; v11 adds a per-column `ENUM` label list; v12 adds a per-column recursive `STRUCT`/`ARRAY`/`MAP` descriptor; v13 adds the per-column client-encryption mode.
 
 The v4/v5 partition section begins with a kind byte (`0` none, `1` RANGE, `2`
 HASH, `3` LIST, `4` legacy TENANT). A nonzero kind carries at most 8 column ordinals
@@ -364,7 +403,7 @@ limit violations. The decoder has a fuzz seed.
 
 Current scope is the M1 foundation: the default database uses the legacy
 `DATA-DIR/nextsql.db` layout and `nextsqld` verifies that its identity and
-ACTIVE state match the registry. `nextsql hosting adopt --confirm` explicitly
+ACTIVE state match the registry. `nextsql registry adopt --confirm` explicitly
 registers an existing default database without changing its file identity or
 discovering sibling files. Its durable `PROVISIONING` registry record is the
 restart intent and `ACTIVE` is published only after recovery-open succeeds.
@@ -461,6 +500,41 @@ good faith against the actual proposed change when a real format bump is
 next on the table, the same way each `NSCT` version above was decided on
 its own concrete merits, not designed in advance of having a version to
 add.
+
+### Retained release fixtures
+
+The strategy above is only as good as the evidence that it holds, and no
+compatibility claim can be tested by code that also writes the file it
+reads back. `tests/upgrade` therefore replays *retained fixtures*: real
+data directories — pages, WAL, UNDO, keystore, and the auth/ACL sidecars —
+produced by a shipped binary and committed under
+`tests/upgrade/testdata/<label>-{clean,dirty}.tar.gz`, together with the
+query results and the compatibility catalog that release itself printed.
+Nothing in an archive is regenerated from current code.
+
+Each release cuts a pair with `scripts/make-upgrade-fixture.sh --label
+<tag> --bindir <dir with the released nextsql/nextsqld>`, on that release's
+commit. The `clean` archive was shut down normally; the `dirty` archive was
+`SIGKILL`ed with acknowledged commits still in the log, so replaying it
+exercises the current recovery pass against an older release's redo rather
+than only its page reader — an invariant `TestDirtyFixtureCarriesUnreplayedRedo`
+asserts directly, so a generator change that stopped killing the server
+cannot leave a green suite that no longer recovers anything.
+
+For each fixture the current build must: pass `nextsql diagnose` preflight
+with every on-disk version inside its declared window; return byte-identical
+results for every recorded query; keep the fixture's least-privilege
+principal's grants exactly as the old release wrote them; accept new writes
+through the structures the old release created; survive a restart; and
+round-trip through `nextsql backup`/`restore`. It must also leave every
+on-disk family inside the *generating* release's readable window — the
+rollback direction — checked against the catalog that release recorded in
+the archive. With the released binaries available
+(`NEXTSQL_UPGRADE_OLD_BINDIR`), the old binaries are additionally run
+against the directory the current one just wrote.
+
+Run it with `make test-upgrade`; `test-pr`, `test-production` and
+`test-nightly` include it.
 
 ## What this version does not store
 

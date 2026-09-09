@@ -20,7 +20,6 @@ const { connect } = require("@bzync/nextsql"); // Bun: import from ./drivers/bun
 
 const conn = await connect({
   address: "127.0.0.1:7210",
-  realm: "default",
   database: "default",
   user: "app",
   password: process.env.NEXTSQL_DATABASE_PASS,
@@ -58,3 +57,13 @@ const conn = await connect({
 ```
 
 For `--require-client-key`, pass `key` as a 32-byte `Buffer` or `Uint8Array`.
+
+## Client-encrypted fields
+
+Provide `fieldKeys`, then use `encryptField` / `decryptField` for randomized
+`NSCE1` columns. Explicit `ENCRYPTED CLIENT DETERMINISTIC` columns use
+`encryptFieldDeterministic` / `decryptFieldDeterministic`; bind the produced
+`NSCE2` value only to equality/inequality predicates for that exact column.
+Deterministic mode leaks equality and frequency. `FileFieldKeyring` provides
+versioned durable rotation/revocation; general searchable encryption is not
+supported.

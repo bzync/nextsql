@@ -62,13 +62,13 @@ silently ignoring change history. Downgrade across the first emitted
 `RecChange` therefore requires a pre-change backup/WAL boundary or an explicit
 format-aware migration.
 
-Catalog table descriptors are `NSCT` v12 when written by this version and the
-current binary reads v1 through v12. Successive trailers cover CDC image policy
+Catalog table descriptors are `NSCT` v13 when written by this version and the
+current binary reads v1 through v13. Successive trailers cover CDC image policy
 (v3), physical partitions/stable IDs (v4/v5), vector index quantization and
 ANN method/IVF/IVF-PQ metadata (v6–v8), full-text analyzer metadata (v9),
-client-encrypted column metadata (v10), `ENUM` labels (v11), and recursive
-`STRUCT`/`ARRAY`/`MAP` descriptors (v12). Any catalog rewrite upgrades a
-readable older descriptor to v12. Older binaries must not open a data directory
+client-encrypted column metadata (v10), `ENUM` labels (v11), recursive
+`STRUCT`/`ARRAY`/`MAP` descriptors (v12), and per-column client-encryption mode
+(v13). Any catalog rewrite upgrades a readable older descriptor to v13. Older binaries must not open a data directory
 after such a rewrite; restore a pre-upgrade backup or use an explicit
 format-aware migration. See `docs/storage-format.md` for the byte-level window.
 
@@ -90,7 +90,7 @@ Breaking changes require explicit versioning.
 The wire frame version remains NSQL v1. Realm selection, read-consistency,
 node-status, CDC, and idempotent-query support are additive v1 frames or
 trailing fields and are capability-gated. The virtual `system` schema has its
-own column-contract capability, currently `system_schema_v3`.
+own column-contract capability, currently `system_schema_v4`.
 
 ---
 

@@ -51,7 +51,7 @@ func sealFile(dek *crypto.DEK, name string, srcPath, dstPath string, genBase uin
 	encoding.PutU32(hdr, 14, defaultChunk)
 	encoding.PutU64(hdr, 18, genBase)
 	h := sha256.New()
-	if _, err := out.Write(hdr); err != nil {
+	if _, err := diskio.Write(out, hdr); err != nil {
 		return 0, 0, sum, 0, nerr.Wrap(nerr.IO, "backup.sealFile", "write header", err)
 	}
 	h.Write(hdr)
@@ -84,7 +84,7 @@ func sealFile(dek *crypto.DEK, name string, srcPath, dstPath string, genBase uin
 			encoding.PutU32(rec, 0, uint32(len(ct)))
 			copy(rec[4:], nonce)
 			copy(rec[4+len(nonce):], ct)
-			if _, err := out.Write(rec); err != nil {
+			if _, err := diskio.Write(out, rec); err != nil {
 				return 0, 0, sum, 0, nerr.Wrap(nerr.IO, "backup.sealFile", "write chunk", err)
 			}
 			h.Write(rec)
@@ -196,7 +196,7 @@ func openMember(dek *crypto.DEK, name, srcPath, dstPath string) (plainSize uint6
 		if oerr != nil {
 			return 0, oerr
 		}
-		if _, err := out.Write(plain); err != nil {
+		if _, err := diskio.Write(out, plain); err != nil {
 			return 0, nerr.Wrap(nerr.IO, "backup.openMember", "write", err)
 		}
 		got += uint64(len(plain))

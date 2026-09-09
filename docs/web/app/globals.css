@@ -136,6 +136,13 @@ body {
   box-shadow: none;
 }
 
+.docs-search-input:focus,
+.docs-search-input:focus-visible {
+  border-color: transparent;
+  outline: none;
+  box-shadow: none;
+}
+
 * {
   scrollbar-width: thin;
   scrollbar-color: color-mix(in oklab, var(--ink) 18%, transparent) transparent;

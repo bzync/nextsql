@@ -80,6 +80,7 @@ export function SiteHeader({
                 onClick={onSearch}
                 className="inline-flex h-10 w-10 items-center justify-center rounded-md text-muted transition-colors hover:bg-bg-hover hover:text-foreground md:hidden"
                 aria-label="Search documentation"
+                aria-keyshortcuts="Control+K Meta+K /"
               >
                 <SearchIcon />
               </button>
@@ -87,9 +88,11 @@ export function SiteHeader({
                 type="button"
                 onClick={onSearch}
                 className="ml-1 hidden h-8 w-[12.5rem] items-center gap-2 rounded-md border border-line bg-bg-elev px-2.5 text-[12.5px] text-muted transition-colors hover:border-line-strong hover:text-foreground md:inline-flex"
+                aria-label="Search documentation"
+                aria-keyshortcuts="Control+K Meta+K /"
               >
                 <span className="flex-1 text-left">Search docs</span>
-                <Kbd keys="/" />
+                <Kbd keys={["⌘/Ctrl", "K"]} />
               </button>
             </>
           ) : null}

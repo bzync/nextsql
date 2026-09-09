@@ -67,7 +67,7 @@ type ViewMeta = {
 const VIEWS: Record<ViewId, ViewMeta> = {
   overview: { id: "overview", label: "Overview", icon: "overview", description: "Sessions, storage, and cluster posture for this node." },
   activity: { id: "activity", label: "Activity", icon: "activity", description: "Live sessions, running statements, transactions, and locks." },
-  databases: { id: "databases", label: "Databases", icon: "database", description: "Realms, databases, tables, and collected statistics." },
+  databases: { id: "databases", label: "Databases", icon: "database", description: "Databases, tables, and collected statistics." },
   studio: { id: "studio", label: "Studio", icon: "studio", description: "Query editor, schema explorer, and result inspector." },
   cluster: { id: "cluster", label: "Cluster", icon: "cluster", description: "Replication health and leader, drain, and maintenance actions." },
   backups: { id: "backups", label: "Backups", icon: "archive", description: "Verified backups and the offline restore command." },

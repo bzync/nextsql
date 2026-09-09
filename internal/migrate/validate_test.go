@@ -92,7 +92,6 @@ func TestValidateRejectsMoreSecurityAndTxn(t *testing.T) {
 func TestValidateAllowsImplementedDDL(t *testing.T) {
 	cases := []string{
 		"ALTER TABLE customers ADD name STRING",
-		"CREATE DATABASE app",
 		"DROP TABLE customers",
 		"DROP INDEX ix_customers_name",
 		"REBUILD INDEX ix_customers_name",

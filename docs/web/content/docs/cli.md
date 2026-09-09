@@ -2,47 +2,31 @@
 
 ```text
 nextsql init     --data-dir DIR --key-file FILE [--instance-key-file FILE]
-                 [--realm NAME --database NAME]
+                 [--database NAME]
                  [--user NAME --password-file FILE] [--buffer-pages N]
                  [--env-file PATH | --no-env]
 nextsql setup    --data-dir DIR --key-file FILE
                  [--profile developer|production]
                  [--preset conservative|balanced|high-performance|custom]
                  [--user NAME --password-file FILE] [--json] [--dry-run]
+                 [--recovery-key-out FILE [--instance-recovery-key-out FILE]]
 nextsql lifecycle detect|preflight|backup-config|upgrade|repair|uninstall
-nextsql hosting adopt --data-dir DIR --key-file FILE [--instance-key-file FILE]
-                 [--realm NAME --database NAME] --confirm
+nextsql registry adopt --data-dir DIR --key-file FILE [--instance-key-file FILE]
+                 [--database NAME] --confirm
                  [--env-file PATH | --no-env]
-nextsql hosting migrate-tenant --source-data-dir DIR --source-key-file FILE
+nextsql registry migrate-tenant --source-data-dir DIR --source-key-file FILE
                  --tenant VALUE --data-dir DIR --key-file FILE
-                 [--instance-key-file FILE] [--realm NAME --database NAME]
+                 [--instance-key-file FILE] [--database NAME]
                  [--batch-rows N] [--buffer-pages N] --confirm
-nextsql hosting set-realm-cap --data-dir DIR --key-file FILE
-                 [--instance-key-file FILE] --realm NAME --cap-bytes N --confirm
-nextsql hosting set-realm-root --data-dir DIR --key-file FILE
-                 [--instance-key-file FILE] --realm NAME
-                 (--secret-file FILE | --clear) --confirm
-nextsql hosting set-database-cap --data-dir DIR --key-file FILE
-                 [--instance-key-file FILE] --realm NAME --database NAME
-                 [--realm-secret-file FILE] --cap-bytes N --confirm
-nextsql hosting show --data-dir DIR --key-file FILE [--instance-key-file FILE]
-nextsql realm create --data-dir DIR --key-file FILE
-                 --realm NAME --database NAME --database-key-file FILE
-nextsql realm rename --data-dir DIR --key-file FILE
-                 --realm NAME --to NAME --confirm
-nextsql database create --data-dir DIR --key-file FILE
-                 --realm NAME --name NAME --database-key-file FILE
-nextsql database suspend|resume|drop --data-dir DIR --key-file FILE
-                 --realm NAME --database NAME --confirm
-nextsql database rename --data-dir DIR --key-file FILE
-                 --realm NAME --database NAME --to NAME --confirm
+nextsql registry show --data-dir DIR [--instance-key-file FILE]
+nextsql key status|add-recovery|verify-recovery|remove-recovery|recover
 nextsql login    --idp NAME [--addr HOST:PORT] [--idp-config FILE]
-                 [--database NAME] [--realm NAME] [--no-browser]
+                 [--database NAME] [--no-browser]
                  [--client-credentials [--client-secret-file FILE]]
 nextsql logout   (--idp NAME --addr HOST:PORT | --all)
 nextsql whoami   --idp NAME [--addr HOST:PORT] [--idp-config FILE] [--json]
 nextsql exec     [--addr HOST:PORT] [--user NAME] [--password-file FILE | --idp NAME]
-                 [--realm NAME] [--database NAME] [--tls-ca FILE | --insecure]
+                 [--database NAME] [--tls-ca FILE | --insecure]
                  [--env-file PATH | --no-env] [--json]
                  [-c SQL | SQL]
 nextsql migrate  status|pending|version|validate|create|up|down|force|repair
@@ -73,8 +57,7 @@ nextsql help
 `nextsql token` manages signed short-lived credentials (see [TLS](/docs/tls) and
 [security](/docs/security)): `keygen` / `rotate` / `retire` / `export-public`
 manage the Ed25519 signing keyset, `mint` issues a credential
-(`--principal`, `--ttl`, optional `--audience` / `--database` / `--realm` /
-`--role`), `revoke` edits the revocation file (`--token-id` or `--principal`
+(`--principal`, `--ttl`, optional `--audience` / `--database` / `--role`), `revoke` edits the revocation file (`--token-id` or `--principal`
 `--before`), and `verify` inspects a credential. Servers enable verification
 with `token_verify_keyset` / `token_revocations` / `token_audience`.
 
@@ -134,9 +117,15 @@ enforced.
 
 `nextsql init` creates an encrypted/versioned deployment registry and a
 separate external registry root. `--instance-key-file` defaults to
-`KEY-FILE.instance`; keep both roots off the data volume. `--realm` and
-`--database` default to `default`. One `nextsqld` routes Hello to the
-selected registered database; see [Hosting](/docs/hosting).
+`KEY-FILE.instance`; keep both roots off the data volume. `--database` names
+the deployment's one database and defaults to `default`. Each deployment
+serves exactly one database.
+
+`nextsql setup --recovery-key-out FILE` creates and verifies recovery exports
+for both keystores during a first install; the registry export defaults to
+`FILE.instance`. `nextsql key` reports, adds, verifies, removes, and uses
+recovery keys. See [Security](/docs/security) for the recovery procedure and
+offline-storage requirements.
 
 `nextsql audit` manages the tamper-evident `NSAC` hash chain and optional
 `NSAK` Ed25519 signatures on `nextsql.audit`. `verify` detects a tampered,
@@ -145,14 +134,14 @@ reordered, or deleted line.
 `nextsql cluster transfer-leader`, `drain`, `maintenance enable|disable`, and
 `reconcile confirm` are the operational cluster verbs; `--json` is accepted.
 
-`nextsql hosting adopt` is the explicit offline path for an existing
+`nextsql registry adopt` is the explicit offline path for an existing
 single-database `DATA-DIR/nextsql.db`. Stop `nextsqld` first. The command holds
 the deployment lock, validates and recovery-opens the existing database,
 preserves its storage identity and files, then publishes the default registry
 entry through `PROVISIONING` to `ACTIVE`. Exact reruns resume safely. It never
 discovers or adopts sibling files.
 
-`nextsql hosting migrate-tenant` copies one historical tenant out of a legacy
+`nextsql registry migrate-tenant` copies one historical tenant out of a legacy
 `tenant_id` / `PARTITION BY TENANT` database into a freshly provisioned isolated
 deployment. Stop `nextsqld` for the source first; both deployments are
 exclusively locked for the whole run. The source, destination database, and
@@ -169,28 +158,13 @@ each fail closed. A durable encrypted `nextsql.tenant-migration` intent binds
 the destination to one source identity and tenant so a changed source, tenant,
 or destination is rejected.
 
-`nextsql hosting set-realm-cap` and `nextsql hosting set-database-cap` record
-durable storage caps (bytes) in the encrypted registry; `--cap-bytes 0` clears a
-cap and any other value overwrites the previous one. A per-database cap may not
-exceed a non-zero realm cap, and a realm cap may not be lowered below a
-per-database cap already set in the realm. `nextsql hosting show` prints the
-registry with the current caps and realm-root status.
+The deployment's data-file growth cap is `storage_cap_bytes` in
+`nextsql.conf`. Once it is full, growth (`INSERT`, row-splitting `UPDATE`,
+index growth) fails with `storage cap exceeded` while `DELETE` / `ROLLBACK` /
+in-place `UPDATE` still work. `nextsql registry show` prints the registry,
+including a cap recorded by an earlier release.
 
-`nextsql hosting set-realm-root` delegates **per-database** cap management for
-one realm to a secret holder (`--secret-file`, ≥ 16 bytes; only its SHA-256 is
-stored) or revokes it (`--clear`). The realm root then passes
-`--realm-secret-file` to `nextsql hosting set-database-cap` to adjust its own
-databases' caps, bounded by the realm cap, with no path to the realm cap or any
-other realm.
-
-`nextsqld` enforces the smaller non-zero of the realm and database cap on the
-data file: once it is full, growth (`INSERT`, row-splitting `UPDATE`, index
-growth) fails with `storage cap exceeded` while `DELETE` / `ROLLBACK` /
-in-place `UPDATE` still work. The three `set-*` verbs take the exclusive
-data-directory lock, so they fail against a running server — stop it, change the
-cap, restart to apply. Live changes without a restart are a follow-on.
-
-## Hosting configuration (`init`, `hosting adopt`, and `nextsqld`)
+## Initialization configuration (`init`, `hosting adopt`, and `nextsqld`)
 
 Hosting commands use the same dotenv discovery and priority as client
 commands. For `nextsqld`, field priority is explicit flags > non-empty process
@@ -200,17 +174,17 @@ environment > `.env.local` > `.env` > `--config` > built-in defaults.
 NEXTSQL_DATA_DIR=/var/lib/nextsql
 NEXTSQL_KEY_FILE=/etc/nextsql/database.key
 NEXTSQL_INSTANCE_KEY_FILE=/etc/nextsql/instance.key
-NEXTSQL_REALM_NAME=customer-a
 NEXTSQL_DATABASE=production
 NEXTSQL_BUFFER_PAGES=1024
 NEXTSQL_SERVER_USER=admin
 NEXTSQL_SERVER_PASSWORD_FILE=/run/secrets/nextsql-admin
 ```
 
-`NEXTSQL_DATABASE` is the logical database created by `nextsql init`, adopted
-by `nextsql hosting adopt`, and selected in the client Hello. `NEXTSQL_REALM_NAME`
-is the realm for init/adoption and for Hello routing. `NEXTSQL_HOSTING_CONFIRM=true`
-may supply the explicit adoption confirmation for non-interactive provisioning.
+`NEXTSQL_DATABASE` is the logical database created by `nextsql init` and
+adopted by `nextsql registry adopt`. A client Hello may name it, but it selects
+nothing: a deployment has one database, and a Hello naming any other is
+rejected. `NEXTSQL_REGISTRY_CONFIRM=true` may supply the explicit adoption
+confirmation for non-interactive provisioning.
 `NEXTSQL_ADDR` supplies `nextsqld`'s listen address as well as the client address.
 
 Server/bootstrap credentials are deliberately distinct:

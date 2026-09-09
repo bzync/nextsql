@@ -11,6 +11,7 @@ import (
 	"time"
 
 	nextsql "github.com/bzync/nextsql/drivers/go"
+	"github.com/bzync/nextsql/internal/admin/credential"
 	"github.com/bzync/nextsql/internal/admin/studio"
 	"github.com/bzync/nextsql/internal/nerr"
 )
@@ -103,7 +104,7 @@ func (s *Server) handleStudioReconnect(w http.ResponseWriter, r *http.Request, s
 		writeError(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
-	req.Realm = strings.TrimSpace(req.Realm)
+	req.Realm = strings.TrimSpace(req.Realm) // rejected by Validate when non-empty
 	req.Database = strings.TrimSpace(req.Database)
 	if err := req.Validate(); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
@@ -117,9 +118,18 @@ func (s *Server) handleStudioReconnect(w http.ResponseWriter, r *http.Request, s
 		return
 	}
 	base.User = sess.user
-	base.Password = req.Password
+	password := req.Password
+	credentialKey := credential.Key(base.Address, sess.user, req.Realm, req.Database)
+	if req.UseStoredPassword {
+		password, err = s.cfg.CredentialStore.Get(credentialKey)
+		if err != nil || password == "" {
+			writeError(w, http.StatusUnauthorized, "saved credential is unavailable; enter a password")
+			return
+		}
+	}
+	base.Password = password
 	base.Database = req.Database
-	base.Realm = req.Realm
+	base.Realm = ""
 
 	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 	defer cancel()
@@ -136,10 +146,17 @@ func (s *Server) handleStudioReconnect(w http.ResponseWriter, r *http.Request, s
 		return
 	}
 	sess.touch()
+	response := studio.Connection{User: sess.user, Realm: req.Realm, Database: req.Database}
+	if req.SavePassword {
+		if err := s.cfg.CredentialStore.Set(credentialKey, password); err != nil {
+			response.Warning = "Connected, but the operating-system credential store could not save the password."
+			s.log.Warn("studio credential save failed", "user", sess.user, "err", err.Error())
+		} else {
+			response.CredentialSaved = true
+		}
+	}
 	s.log.Info("studio reconnect", "user", sess.user, "realm", req.Realm, "database", req.Database)
-	writeJSON(w, http.StatusOK, studio.Connection{
-		User: sess.user, Realm: req.Realm, Database: req.Database,
-	})
+	writeJSON(w, http.StatusOK, response)
 }
 
 // handleStudioTable lazy-loads the server-authorized metadata for one table.

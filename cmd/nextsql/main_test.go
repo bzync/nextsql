@@ -24,6 +24,10 @@ import (
 	"github.com/bzync/nextsql/internal/storage/format"
 )
 
+// name0 names the database of the i-th throwaway deployment: a database is
+// only created when it is named.
+func name0(i int) string { return fmt.Sprintf("db%d", i) }
+
 func TestPrintJSONResultTo(t *testing.T) {
 	res := &nextsql.Result{
 		Columns: []string{"result"},
@@ -76,13 +80,14 @@ func TestInitBootstrapsDeploymentRegistry(t *testing.T) {
 	dir := t.TempDir()
 	keyFile := filepath.Join(t.TempDir(), "database.key")
 	instanceKeyFile := filepath.Join(t.TempDir(), "instance.key")
+	passwordFile := writeTempFile(t, "secret\n")
 	args := []string{
 		"--data-dir", dir,
 		"--key-file", keyFile,
 		"--instance-key-file", instanceKeyFile,
-		"--realm", "Customer-A",
 		"--database", "Production",
 		"--buffer-pages", "8",
+		"--password-file", passwordFile,
 	}
 	if err := initDB(args); err != nil {
 		t.Fatal(err)
@@ -100,7 +105,7 @@ func TestInitBootstrapsDeploymentRegistry(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if realm.Name != "customer-a" || db.Name != "production" || db.State != hosting.StateActive {
+	if realm.Name != "default" || db.Name != "production" || db.State != hosting.StateActive {
 		t.Fatalf("unexpected bootstrap: realm=%+v database=%+v", realm, db)
 	}
 	if _, err := os.Stat(filepath.Join(dir, "nextsql.db")); err != nil {
@@ -111,121 +116,26 @@ func TestInitBootstrapsDeploymentRegistry(t *testing.T) {
 	}
 }
 
-func TestInitFromManifestBootstrapsEveryRealm(t *testing.T) {
+func TestInitDefaultsBootstrapUserToRoot(t *testing.T) {
 	dir := t.TempDir()
 	secrets := t.TempDir()
-	instanceKeyFile := filepath.Join(secrets, "instance.key")
-	// keyB pre-exists; keyA and keyC are created by init from the manifest.
-	createRootKeyFile(t, filepath.Join(secrets, "b.key"))
-	manifest := filepath.Join(t.TempDir(), "hosting.yaml")
-	if err := os.WriteFile(manifest, []byte(`version: 1
-default:
-  realm: Customer-A
-  database: Production
-realms:
-  - name: Customer-A
-    databases:
-      - {name: Production, key_file: `+filepath.Join(secrets, "a.key")+`}
-  - name: Customer-B
-    databases:
-      - {name: Analytics, key_file: `+filepath.Join(secrets, "b.key")+`}
-      - {name: Reporting, key_file: `+filepath.Join(secrets, "c.key")+`}
-`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	args := []string{
-		"--data-dir", dir,
-		"--instance-key-file", instanceKeyFile,
-		"--hosting-manifest", manifest,
-		"--user", "admin",
-		"--password-file", writeTempFile(t, "s3cret-pass"),
-		"--buffer-pages", "8",
-	}
-	if err := initDB(args); err != nil {
-		t.Fatal(err)
-	}
-
-	root, err := crypto.ReadKeyFile(instanceKeyFile)
-	if err != nil {
-		t.Fatal(err)
-	}
-	reg, err := hosting.Open(hosting.Path(dir), root)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer reg.Close()
-	m := reg.Manifest()
-	seen := map[string]hosting.State{}
-	for _, realm := range m.Realms {
-		for _, db := range realm.Databases {
-			seen[realm.Name+"/"+db.Name] = db.State
-			if db.State != hosting.StateActive {
-				t.Fatalf("%s/%s not active: %v", realm.Name, db.Name, db.State)
-			}
-			if _, err := os.Stat(hosting.ManagedDatabasePath(dir, realm.ID, db.ID)); err != nil {
-				t.Fatalf("managed database file missing for %s/%s: %v", realm.Name, db.Name, err)
-			}
-		}
-	}
-	for _, want := range []string{"customer-a/production", "customer-b/analytics", "customer-b/reporting"} {
-		if _, ok := seen[want]; !ok {
-			t.Fatalf("manifest realm/database %q not registered; got %v", want, seen)
-		}
-	}
-	dr, dd, err := reg.Default()
-	if err != nil || dr.Name != "customer-a" || dd.Name != "production" {
-		t.Fatalf("default realm/database = %s/%s err=%v", dr.Name, dd.Name, err)
-	}
-
-	// The deployment-wide bootstrap user was created.
-	store, err := auth.OpenOrCreate(filepath.Join(dir, config.AuthFileName))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := store.Verify("admin", "s3cret-pass"); err != nil {
-		t.Fatalf("bootstrap user not usable: %v", err)
-	}
-
-	// Idempotent reapply: a second run with the same manifest is a no-op.
-	if err := initDB(args); err != nil {
-		t.Fatalf("reapply: %v", err)
-	}
-}
-
-func TestInitFromManifestViaEnvVar(t *testing.T) {
-	dir := t.TempDir()
-	secrets := t.TempDir()
-	manifest := filepath.Join(t.TempDir(), "hosting.yaml")
-	if err := os.WriteFile(manifest, []byte(`version: 1
-default: {realm: only, database: main}
-realms:
-  - name: only
-    databases:
-      - {name: main, key_file: `+filepath.Join(secrets, "main.key")+`}
-`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("NEXTSQL_HOSTING_MANIFEST_FILE", manifest)
+	passwordFile := writeTempFile(t, "secret\n")
 	if err := initDB([]string{
 		"--data-dir", dir,
+		"--key-file", filepath.Join(secrets, "database.key"),
 		"--instance-key-file", filepath.Join(secrets, "instance.key"),
-		"--no-env",
+		"--database", "default",
+		"--buffer-pages", "8",
+		"--password-file", passwordFile,
 	}); err != nil {
 		t.Fatal(err)
 	}
-	root, err := crypto.ReadKeyFile(filepath.Join(secrets, "instance.key"))
+	users, err := auth.Open(filepath.Join(dir, config.AuthFileName))
 	if err != nil {
 		t.Fatal(err)
 	}
-	reg, err := hosting.Open(hosting.Path(dir), root)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer reg.Close()
-	realm, db, err := reg.Default()
-	if err != nil || realm.Name != "only" || db.Name != "main" || db.State != hosting.StateActive {
-		t.Fatalf("env-var manifest bootstrap: realm=%+v db=%+v err=%v", realm, db, err)
+	if err := users.Verify("root", "secret"); err != nil {
+		t.Fatalf("default root user did not authenticate: %v", err)
 	}
 }
 
@@ -284,7 +194,7 @@ func TestInitResolvesHostingFromDotenv(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if realm.Name != "dotenv-realm" || database.Name != "dotenv-db" || database.State != hosting.StateActive {
+	if realm.Name != "default" || database.Name != "dotenv-db" || database.State != hosting.StateActive {
 		t.Fatalf("dotenv bootstrap: realm=%+v database=%+v", realm, database)
 	}
 	users, err := auth.Open(filepath.Join(dir, config.AuthFileName))
@@ -305,7 +215,6 @@ func TestInitResumesProvisioningAfterCredentialError(t *testing.T) {
 		"--data-dir", dir,
 		"--key-file", keyFile,
 		"--instance-key-file", instanceKeyFile,
-		"--realm", "default",
 		"--database", "default",
 		"--buffer-pages", "8",
 		"--user", "admin",
@@ -380,7 +289,6 @@ func TestHostingAdoptRegistersExistingIdentityAndIsIdempotent(t *testing.T) {
 		"--data-dir", dir,
 		"--key-file", keyFile,
 		"--instance-key-file", instanceKeyFile,
-		"--realm", "Customer-A",
 		"--database", "Production",
 		"--buffer-pages", "8",
 		"--confirm",
@@ -402,7 +310,7 @@ func TestHostingAdoptRegistersExistingIdentityAndIsIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if realm.Name != "customer-a" || database.Name != "production" || database.State != hosting.StateActive || database.Identity != want {
+	if realm.Name != "default" || database.Name != "production" || database.State != hosting.StateActive || database.Identity != want {
 		t.Fatalf("unexpected adoption: realm=%+v database=%+v", realm, database)
 	}
 	if err := adoptLegacyDatabase(args); err != nil {
@@ -419,125 +327,6 @@ func TestHostingAdoptRegistersExistingIdentityAndIsIdempotent(t *testing.T) {
 	}
 	if got, err := os.ReadFile(filepath.Join(dir, "unregistered-sibling")); err != nil || string(got) != "leave me" {
 		t.Fatalf("sibling file changed: %q %v", got, err)
-	}
-}
-
-func TestHostingStorageCapsCLI(t *testing.T) {
-	dir := t.TempDir()
-	secrets := t.TempDir()
-	keyFile := filepath.Join(secrets, "database.key")
-	instanceKeyFile := filepath.Join(secrets, "instance.key")
-	createLegacyDatabase(t, dir, keyFile)
-	if err := adoptLegacyDatabase([]string{
-		"--data-dir", dir, "--key-file", keyFile, "--instance-key-file", instanceKeyFile,
-		"--realm", "Customer-A", "--database", "Production", "--buffer-pages", "8", "--confirm",
-	}); err != nil {
-		t.Fatal(err)
-	}
-
-	base := []string{"--data-dir", dir, "--key-file", keyFile, "--instance-key-file", instanceKeyFile}
-
-	// A running deployment (data-dir lock held) blocks a cap change.
-	held, err := hosting.AcquireDataDirLock(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := setRealmStorageCap(append(append([]string(nil), base...), "--realm", "customer-a", "--cap-bytes", "1000", "--confirm")); !nerr.HasCode(err, nerr.Unavailable) {
-		t.Fatalf("cap change under deployment lock: %v", err)
-	}
-	if err := held.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	// Mutating verbs require --confirm.
-	if err := setRealmStorageCap(append(append([]string(nil), base...), "--realm", "customer-a", "--cap-bytes", "1000")); !nerr.HasCode(err, nerr.InvalidArgument) {
-		t.Fatalf("missing --confirm: %v", err)
-	}
-
-	if err := setRealmStorageCap(append(append([]string(nil), base...), "--realm", "customer-a", "--cap-bytes", "1000000", "--confirm")); err != nil {
-		t.Fatal(err)
-	}
-	// A per-database cap above the realm cap is rejected.
-	if err := setDatabaseStorageCap(append(append([]string(nil), base...), "--realm", "customer-a", "--database", "production", "--cap-bytes", "2000000", "--confirm")); !nerr.HasCode(err, nerr.InvalidArgument) {
-		t.Fatalf("db cap over realm cap: %v", err)
-	}
-	if err := setDatabaseStorageCap(append(append([]string(nil), base...), "--realm", "customer-a", "--database", "production", "--cap-bytes", "500000", "--confirm")); err != nil {
-		t.Fatal(err)
-	}
-	// Lowering the realm cap below the database cap is rejected.
-	if err := setRealmStorageCap(append(append([]string(nil), base...), "--realm", "customer-a", "--cap-bytes", "100000", "--confirm")); !nerr.HasCode(err, nerr.InvalidArgument) {
-		t.Fatalf("realm cap below db cap: %v", err)
-	}
-
-	root, err := crypto.ReadKeyFile(instanceKeyFile)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer root.Zero()
-	reg, err := hosting.Open(hosting.Path(dir), root)
-	if err != nil {
-		t.Fatal(err)
-	}
-	m := reg.Manifest()
-	_ = reg.Close()
-	if m.Realms[0].StorageCapBytes != 1000000 || m.Realms[0].Databases[0].StorageCapBytes != 500000 {
-		t.Fatalf("caps not persisted: %+v", m.Realms[0])
-	}
-
-	// Clearing caps round-trips through 0.
-	if err := setDatabaseStorageCap(append(append([]string(nil), base...), "--realm", "customer-a", "--database", "production", "--cap-bytes", "0", "--confirm")); err != nil {
-		t.Fatal(err)
-	}
-	if err := showHostingRegistry(base); err != nil {
-		t.Fatal(err)
-	}
-
-	// Realm-root delegation: admin sets a secret, then a realm-root secret
-	// holder sets its own database's cap (bounded by the realm cap) but has no
-	// path to the realm cap.
-	secretFile := filepath.Join(secrets, "realm-root.secret")
-	if err := os.WriteFile(secretFile, []byte("realm-root-secret-value-123\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	rootArgs := append(append([]string(nil), base...), "--realm", "customer-a", "--database", "production", "--realm-secret-file", secretFile, "--cap-bytes", "700000", "--confirm")
-	// No delegation yet.
-	if err := setDatabaseStorageCap(rootArgs); !nerr.HasCode(err, nerr.Forbidden) {
-		t.Fatalf("realm-root before delegation: %v", err)
-	}
-	if err := setRealmRootAuth(append(append([]string(nil), base...), "--realm", "customer-a", "--secret-file", secretFile, "--confirm")); err != nil {
-		t.Fatal(err)
-	}
-	if err := setDatabaseStorageCap(rootArgs); err != nil {
-		t.Fatalf("realm-root cap set: %v", err)
-	}
-	// Above the realm cap (1000000) is rejected for the realm root too.
-	over := append(append([]string(nil), base...), "--realm", "customer-a", "--database", "production", "--realm-secret-file", secretFile, "--cap-bytes", "3000000", "--confirm")
-	if err := setDatabaseStorageCap(over); !nerr.HasCode(err, nerr.InvalidArgument) {
-		t.Fatalf("realm-root over ceiling: %v", err)
-	}
-	root2, err := crypto.ReadKeyFile(instanceKeyFile)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer root2.Zero()
-	reg2, err := hosting.Open(hosting.Path(dir), root2)
-	if err != nil {
-		t.Fatal(err)
-	}
-	m2 := reg2.Manifest()
-	_ = reg2.Close()
-	if m2.Realms[0].Databases[0].StorageCapBytes != 700000 || m2.Realms[0].StorageCapBytes != 1000000 {
-		t.Fatalf("realm-root path changed the wrong cap: %+v", m2.Realms[0])
-	}
-	if m2.Realms[0].RealmRootAuthHash == ([32]byte{}) {
-		t.Fatal("realm-root delegation not persisted")
-	}
-	// Clearing delegation revokes access.
-	if err := setRealmRootAuth(append(append([]string(nil), base...), "--realm", "customer-a", "--clear", "--confirm")); err != nil {
-		t.Fatal(err)
-	}
-	if err := setDatabaseStorageCap(rootArgs); !nerr.HasCode(err, nerr.Forbidden) {
-		t.Fatalf("realm-root after clear: %v", err)
 	}
 }
 
@@ -576,7 +365,7 @@ func TestHostingAdoptResolvesDotenvIncludingConfirmation(t *testing.T) {
 		"NEXTSQL_REALM_NAME=dotenv-realm",
 		"NEXTSQL_DATABASE=dotenv-db",
 		"NEXTSQL_BUFFER_PAGES=8",
-		"NEXTSQL_HOSTING_CONFIRM=true",
+		"NEXTSQL_REGISTRY_CONFIRM=true",
 		"",
 	}, "\n")
 	if err := os.WriteFile(envFile, []byte(body), 0o600); err != nil {
@@ -599,7 +388,7 @@ func TestHostingAdoptResolvesDotenvIncludingConfirmation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if realm.Name != "dotenv-realm" || database.Name != "dotenv-db" || database.Identity != want || database.State != hosting.StateActive {
+	if realm.Name != "default" || database.Name != "dotenv-db" || database.Identity != want || database.State != hosting.StateActive {
 		t.Fatalf("dotenv adoption: realm=%+v database=%+v", realm, database)
 	}
 }
@@ -683,7 +472,6 @@ func TestHostingMigrateTenantPublishesOnlyVerifiedIsolatedDatabase(t *testing.T)
 		"--data-dir", destDir,
 		"--key-file", destKey,
 		"--instance-key-file", instanceKey,
-		"--realm", "Customer-A",
 		"--database", "Production",
 		"--buffer-pages", "8",
 		"--batch-rows", "1",
@@ -711,7 +499,7 @@ func TestHostingMigrateTenantPublishesOnlyVerifiedIsolatedDatabase(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if realm.Name != "customer-a" || database.Name != "production" || database.State != hosting.StateActive {
+	if realm.Name != "default" || database.Name != "production" || database.State != hosting.StateActive {
 		t.Fatalf("destination published incorrectly: realm=%+v database=%+v", realm, database)
 	}
 	_ = registry.Close()
@@ -1013,7 +801,7 @@ func TestBackupListAndPruneEndToEnd(t *testing.T) {
 		ikf := kf + ".instance"
 		if err := initDB([]string{
 			"--data-dir", dataDir, "--key-file", kf, "--instance-key-file", ikf,
-			"--no-env",
+			"--database", name0(i), "--no-env",
 		}); err != nil {
 			t.Fatal(err)
 		}
@@ -1260,5 +1048,97 @@ func TestTokenCLIRoundTrip(t *testing.T) {
 	}
 	if err := run([]string{"token", "verify", "--keyset", pub, "--revocations", rev, tok}); err == nil {
 		t.Fatal("verify accepted a revoked credential")
+	}
+}
+
+// A database exists only when it is named. `nextsql init` without
+// `--database` provisions the deployment — root key, administrator — and
+// nothing database-shaped: no keystore, no nextsql.db, and no deployment
+// registry (whose own format requires the database it describes to exist).
+func TestInitWithoutDatabaseCreatesNoDatabase(t *testing.T) {
+	dataDir := t.TempDir()
+	secrets := t.TempDir()
+	keyFile := filepath.Join(secrets, "root.key")
+	passwordFile := writeTempFile(t, "adminpassword\n")
+	if err := initDB([]string{
+		"--data-dir", dataDir,
+		"--key-file", keyFile,
+		"--instance-key-file", filepath.Join(secrets, "instance.key"),
+		"--user", "admin", "--password-file", passwordFile,
+		"--buffer-pages", "8", "--no-env",
+	}); err != nil {
+		t.Fatalf("deployment-only init: %v", err)
+	}
+
+	for _, name := range []string{
+		config.DataFileName,
+		config.DataFileName + ".keys",
+		"nextsql.instance",
+		"nextsql.instance.keys",
+	} {
+		if _, err := os.Stat(filepath.Join(dataDir, name)); !os.IsNotExist(err) {
+			t.Fatalf("%s must not exist without a database: %v", name, err)
+		}
+	}
+	// The administrator is a deployment-level artifact and does exist: it is
+	// what makes the deployment usable the moment a database is added.
+	for _, name := range []string{config.AuthFileName, config.ACLFileName} {
+		if _, err := os.Stat(filepath.Join(dataDir, name)); err != nil {
+			t.Fatalf("%s must exist after a deployment-only init: %v", name, err)
+		}
+	}
+	if _, err := os.Stat(keyFile); err != nil {
+		t.Fatalf("root key file: %v", err)
+	}
+}
+
+// Naming a database on a second run of the same command completes the
+// deployment in place — no separate verb, and the administrator created
+// before the database survives it.
+func TestInitNamingADatabaseLaterCompletesTheDeployment(t *testing.T) {
+	dataDir := t.TempDir()
+	secrets := t.TempDir()
+	keyFile := filepath.Join(secrets, "root.key")
+	instanceKeyFile := filepath.Join(secrets, "instance.key")
+	passwordFile := writeTempFile(t, "adminpassword\n")
+	base := []string{
+		"--data-dir", dataDir,
+		"--key-file", keyFile,
+		"--instance-key-file", instanceKeyFile,
+		"--buffer-pages", "8", "--no-env",
+	}
+	if err := initDB(append(append([]string{}, base...), "--user", "admin", "--password-file", passwordFile)); err != nil {
+		t.Fatalf("deployment-only init: %v", err)
+	}
+	if err := initDB(append(append([]string{}, base...), "--database", "analytics")); err != nil {
+		t.Fatalf("init --database on the same deployment: %v", err)
+	}
+
+	root, err := crypto.ReadKeyFile(instanceKeyFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Zero()
+	reg, err := hosting.Open(hosting.Path(dataDir), root)
+	if err != nil {
+		t.Fatalf("open registry: %v", err)
+	}
+	defer reg.Close()
+	_, database, err := reg.Default()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if database.Name != "analytics" || database.State != hosting.StateActive {
+		t.Fatalf("registered database = %+v", database)
+	}
+	if _, err := os.Stat(filepath.Join(dataDir, config.DataFileName)); err != nil {
+		t.Fatalf("database file: %v", err)
+	}
+	store, err := auth.OpenOrCreate(filepath.Join(dataDir, config.AuthFileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Verify("admin", "adminpassword"); err != nil {
+		t.Fatalf("the administrator created before the database must still authenticate: %v", err)
 	}
 }

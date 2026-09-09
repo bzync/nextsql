@@ -67,6 +67,27 @@ async function main() {
       throw new Error('bounded read mismatch');
     }
     await conn.setReadConsistency(ReadConsistency.Strong);
+
+    // Public error taxonomy (docs/error-codes.md): a real server error carries
+    // the stable ERR_* name alongside the unchanged legacy class.
+    if (!conn.publicErrorCodes) {
+      throw new Error('server did not accept the public error taxonomy');
+    }
+    let caught = null;
+    try {
+      await conn.exec(`SELECT * FROM no_such_table`);
+    } catch (err) {
+      caught = err;
+    }
+    if (!caught) {
+      throw new Error('expected an error from an unknown table');
+    }
+    if (!caught.code) {
+      throw new Error('legacy error class missing');
+    }
+    if (caught.publicCode !== 'ERR_' + caught.code.toUpperCase()) {
+      throw new Error('public code ' + caught.publicCode + ' for class ' + caught.code);
+    }
   } finally {
     await conn.close();
   }

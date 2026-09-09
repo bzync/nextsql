@@ -82,7 +82,7 @@ catalog immediately before execution.
 
 V1 bodies may contain bounded DML (`INSERT`, `UPSERT`, `UPDATE`, and `DELETE`)
 and synchronous `RUN WORKFLOW`. Result-producing `SELECT`, DDL, `BEGIN`,
-`COMMIT`, `ROLLBACK`, `CREATE DATABASE`, maintenance statements, administrative
+`COMMIT`, `ROLLBACK`, maintenance statements, administrative
 statements, and task/schedule/trigger DDL are rejected in a body. This keeps the
 first transaction and result contract explicit.
 

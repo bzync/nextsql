@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/bzync/nextsql/internal/limits"
 	"github.com/bzync/nextsql/internal/nerr"
 )
 
@@ -21,13 +22,17 @@ const (
 	DefaultLogLevel           = "info"
 	DefaultMaxInflight        = 32
 	DefaultMaxQueue           = 128
-	// DefaultMaxOpenDatabases bounds how many distinct databases a single
-	// nextsqld process will ever open at once via dbmanager (M2-3a). An
-	// opened database is never evicted in this slice, so this is also a
-	// hard ceiling on total databases ever opened by one process lifetime.
+	// DefaultMaxOpenDatabases is retained for configuration compatibility
+	// only; see Config.MaxOpenDatabases.
 	DefaultMaxOpenDatabases = 8
 	DefaultQueueWaitMS      = 5000
 	DefaultDrainTimeoutMS   = 30000
+	// DefaultCheckpointIntervalMS bounds normal crash-recovery replay time.
+	// Checkpoints preserve retained WAL for PITR/page repair; they only advance
+	// the durable redo boundary. Five minutes avoids per-write checkpoint I/O
+	// while preventing an indefinitely-running node from replaying its entire
+	// lifetime of WAL after an unclean restart.
+	DefaultCheckpointIntervalMS = 300_000
 	// DefaultDiskWatermarkCheckMS is used when the disk-watermark feature is
 	// enabled (DiskWatermarkCheckMS > 0) but the operator didn't override
 	// the percentages — see Config.DiskWatermarkThresholds.
@@ -60,6 +65,8 @@ type Config struct {
 	TLSKey            string
 	TLSClientCA       string
 	TLSClientCRL      string
+	TLSOCSPMode       string
+	TLSOCSPResponder  string
 	TokenKeyset       string
 	TokenRevocations  string
 	TokenAudience     string
@@ -103,6 +110,11 @@ type Config struct {
 	// WalArchive: pruning without an archiver would destroy the only copy
 	// of that history, so retention is a no-op until one is configured.
 	WalRetentionMS int
+	// CheckpointIntervalMS is the periodic nextsqld checkpoint cadence. It
+	// bounds the WAL suffix a crash must redo; 0 deliberately disables the
+	// scheduler for a controlled/manual-checkpoint deployment. It does not
+	// delete or weaken retained WAL history.
+	CheckpointIntervalMS int
 	// DiskWatermarkCheckMS, when positive, makes nextsqld periodically check
 	// free disk space on the volume holding --data-dir and act on it — see
 	// DiskWatermarkWarnPercent/DiskWatermarkRejectPercent. 0 (default)
@@ -143,13 +155,14 @@ type Config struct {
 	// admission-control gate.
 	ReplicaLagWarnEntries int
 	MaxInflight           int
-	// MaxOpenDatabases bounds the dbmanager (M2-3a) open-database limit.
-	// Zero means "use DefaultMaxOpenDatabases" (see Default()); it is not
-	// itself a valid "unbounded" sentinel, since M2-3a never evicts.
+	// MaxOpenDatabases is retained for configuration compatibility only.
+	// Multi-realm/multi-database hosting was removed, so a deployment opens
+	// exactly one database and this value is accepted, validated and then
+	// ignored — dropping the key outright would make every nextsql.conf
+	// written by an earlier release fail to load.
 	MaxOpenDatabases int
-	// MaxTotalBufferPages caps, across every database this process has open
-	// at once (the primary plus every dbmanager-opened secondary, M2-3b-2),
-	// the total buffer-pool frames committed. Unlike MaxOpenDatabases, 0
+	// MaxTotalBufferPages caps the total buffer-pool frames this process
+	// commits. Unlike MaxOpenDatabases, 0
 	// here does mean unbounded — each Pool's frames are allocated in full at
 	// open, so there is nothing to gate unless an operator opts in.
 	MaxTotalBufferPages int
@@ -162,6 +175,13 @@ type Config struct {
 	MaxQueryQueue int
 	QueueWaitMS   int
 	MaxResultRows int
+	// Native-wire limits are independent operational defaults. Zero preserves
+	// protocol defaults; Load rejects values above their absolute ceilings.
+	MaxFrameBytes     int
+	MaxStatementBytes int
+	MaxParameters     int
+	MaxPrepared       int
+	MaxResultBytes    int
 	// MaxConnections and MaxConnectionsPerUser are 0 to leave the protocol
 	// package's own default (128 / unlimited) untouched. IdleTimeoutMS is 0
 	// to leave the protocol default (60s) untouched.
@@ -207,19 +227,36 @@ type Config struct {
 	RaftBind       string
 	RaftJoin       string
 	RaftBootstrap  bool
+	// RaftHeartbeatMS is the leader-contact interval. It is also the unit
+	// the follower-read freshness window is built from: the healthy-contact
+	// window, and therefore the default MAX STALENESS of a BOUNDED read, is
+	// five heartbeats. 0 leaves the built-in default (250 ms).
+	RaftHeartbeatMS int
+	// RaftElectionMS is how long a follower waits without leader contact
+	// before campaigning. It must be at least RaftHeartbeatMS. 0 leaves the
+	// built-in default (250 ms).
+	RaftElectionMS int
+	// RaftLeaderLeaseMS is how long a leader may act as leader without
+	// contacting a quorum. It must not exceed RaftHeartbeatMS. 0 leaves the
+	// built-in default (200 ms).
+	RaftLeaderLeaseMS int
+	// RaftCommitTimeoutMS is how long a leader batches log entries before
+	// flushing them to followers. 0 leaves the built-in default (50 ms).
+	RaftCommitTimeoutMS int
 }
 
 func Default() Config {
 	return Config{
-		ListenAddr:         DefaultListenAddr,
-		LogLevel:           DefaultLogLevel,
-		BufferPages:        DefaultBufferPages,
-		PreallocAheadPages: DefaultPreallocAheadPages,
-		MaxInflight:        DefaultMaxInflight,
-		MaxOpenDatabases:   DefaultMaxOpenDatabases,
-		MaxQueryQueue:      DefaultMaxQueue,
-		QueueWaitMS:        DefaultQueueWaitMS,
-		DrainTimeoutMS:     DefaultDrainTimeoutMS,
+		ListenAddr:           DefaultListenAddr,
+		LogLevel:             DefaultLogLevel,
+		BufferPages:          DefaultBufferPages,
+		PreallocAheadPages:   DefaultPreallocAheadPages,
+		MaxInflight:          DefaultMaxInflight,
+		MaxOpenDatabases:     DefaultMaxOpenDatabases,
+		MaxQueryQueue:        DefaultMaxQueue,
+		QueueWaitMS:          DefaultQueueWaitMS,
+		DrainTimeoutMS:       DefaultDrainTimeoutMS,
+		CheckpointIntervalMS: DefaultCheckpointIntervalMS,
 	}
 }
 
@@ -322,6 +359,21 @@ func Load(path string) (Config, error) {
 
 // loadFrom parses key=value lines from r onto a fresh Default(), the shared
 // body of Load and WithSetting. Every accepted key is one Marshal emits.
+// limitValue parses one operational limit and validates it against the
+// catalog in internal/limits. Every ceiling lives there, so a key that is
+// parsed here cannot end up with a bound that disagrees with what Validate
+// enforces or what docs/limits.md publishes.
+func limitValue(key, v string) (int, error) {
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return 0, nerr.New(nerr.InvalidArgument, "config.Load", fmt.Sprintf("%s must be an integer", key))
+	}
+	if err := limits.Check(key, n); err != nil {
+		return 0, nerr.New(nerr.InvalidArgument, "config.Load", err.Error())
+	}
+	return n, nil
+}
+
 func loadFrom(r io.Reader) (Config, error) {
 	cfg := Default()
 	sc := bufio.NewScanner(r)
@@ -354,15 +406,15 @@ func loadFrom(r io.Reader) (Config, error) {
 			}
 			cfg.DeploymentProfile = profile
 		case "buffer_pages":
-			n, err := strconv.Atoi(v)
-			if err != nil || n < 1 {
-				return Config{}, nerr.New(nerr.InvalidArgument, "config.Load", "buffer_pages must be a positive integer")
+			n, err := limitValue("buffer_pages", v)
+			if err != nil {
+				return Config{}, err
 			}
 			cfg.BufferPages = n
 		case "prealloc_ahead_pages":
-			n, err := strconv.Atoi(v)
-			if err != nil || n < 1 {
-				return Config{}, nerr.New(nerr.InvalidArgument, "config.Load", "prealloc_ahead_pages must be a positive integer")
+			n, err := limitValue("prealloc_ahead_pages", v)
+			if err != nil {
+				return Config{}, err
 			}
 			cfg.PreallocAheadPages = n
 		case "auth_file":
@@ -375,6 +427,10 @@ func loadFrom(r io.Reader) (Config, error) {
 			cfg.TLSClientCA = v
 		case "tls_client_crl":
 			cfg.TLSClientCRL = v
+		case "tls_ocsp_mode":
+			cfg.TLSOCSPMode = strings.ToLower(strings.TrimSpace(v))
+		case "tls_ocsp_responder":
+			cfg.TLSOCSPResponder = strings.TrimSpace(v)
 		case "token_verify_keyset":
 			cfg.TokenKeyset = v
 		case "token_revocations":
@@ -409,15 +465,21 @@ func loadFrom(r io.Reader) (Config, error) {
 		case "backup_dir":
 			cfg.BackupDir = v
 		case "wal_retention_ms":
-			n, err := strconv.Atoi(v)
-			if err != nil || n < 0 {
-				return Config{}, nerr.New(nerr.InvalidArgument, "config.Load", "wal_retention_ms must be >= 0")
+			n, err := limitValue("wal_retention_ms", v)
+			if err != nil {
+				return Config{}, err
 			}
 			cfg.WalRetentionMS = n
+		case "checkpoint_interval_ms":
+			n, err := limitValue("checkpoint_interval_ms", v)
+			if err != nil {
+				return Config{}, err
+			}
+			cfg.CheckpointIntervalMS = n
 		case "disk_watermark_check_ms":
-			n, err := strconv.Atoi(v)
-			if err != nil || n < 0 {
-				return Config{}, nerr.New(nerr.InvalidArgument, "config.Load", "disk_watermark_check_ms must be >= 0")
+			n, err := limitValue("disk_watermark_check_ms", v)
+			if err != nil {
+				return Config{}, err
 			}
 			cfg.DiskWatermarkCheckMS = n
 		case "disk_watermark_warn_percent":
@@ -433,117 +495,147 @@ func loadFrom(r io.Reader) (Config, error) {
 			}
 			cfg.DiskWatermarkRejectPercent = f
 		case "replica_lag_check_ms":
-			n, err := strconv.Atoi(v)
-			if err != nil || n < 0 {
-				return Config{}, nerr.New(nerr.InvalidArgument, "config.Load", "replica_lag_check_ms must be >= 0")
+			n, err := limitValue("replica_lag_check_ms", v)
+			if err != nil {
+				return Config{}, err
 			}
 			cfg.ReplicaLagCheckMS = n
 		case "replica_lag_warn_entries":
-			n, err := strconv.Atoi(v)
-			if err != nil || n < 0 {
-				return Config{}, nerr.New(nerr.InvalidArgument, "config.Load", "replica_lag_warn_entries must be >= 0")
+			n, err := limitValue("replica_lag_warn_entries", v)
+			if err != nil {
+				return Config{}, err
 			}
 			cfg.ReplicaLagWarnEntries = n
 		case "max_inflight_queries":
-			n, err := strconv.Atoi(v)
-			if err != nil || n < 1 {
-				return Config{}, nerr.New(nerr.InvalidArgument, "config.Load", "max_inflight_queries must be a positive integer")
+			n, err := limitValue("max_inflight_queries", v)
+			if err != nil {
+				return Config{}, err
 			}
 			cfg.MaxInflight = n
 		case "max_open_databases":
-			n, err := strconv.Atoi(v)
-			if err != nil || n < 0 {
-				return Config{}, nerr.New(nerr.InvalidArgument, "config.Load", "max_open_databases must be >= 0")
+			n, err := limitValue("max_open_databases", v)
+			if err != nil {
+				return Config{}, err
 			}
 			cfg.MaxOpenDatabases = n
 		case "max_total_buffer_pages":
-			n, err := strconv.Atoi(v)
-			if err != nil || n < 0 {
-				return Config{}, nerr.New(nerr.InvalidArgument, "config.Load", "max_total_buffer_pages must be >= 0")
+			n, err := limitValue("max_total_buffer_pages", v)
+			if err != nil {
+				return Config{}, err
 			}
 			cfg.MaxTotalBufferPages = n
 		case "task_workers":
-			n, err := strconv.Atoi(v)
-			if err != nil || n < 0 {
-				return Config{}, nerr.New(nerr.InvalidArgument, "config.Load", "task_workers must be >= 0")
+			n, err := limitValue("task_workers", v)
+			if err != nil {
+				return Config{}, err
 			}
 			cfg.TaskWorkers = n
 		case "max_query_queue":
-			n, err := strconv.Atoi(v)
-			if err != nil || n < 0 {
-				return Config{}, nerr.New(nerr.InvalidArgument, "config.Load", "max_query_queue must be >= 0")
+			n, err := limitValue("max_query_queue", v)
+			if err != nil {
+				return Config{}, err
 			}
 			cfg.MaxQueryQueue = n
 		case "query_queue_wait_ms":
-			n, err := strconv.Atoi(v)
-			if err != nil || n < 1 {
-				return Config{}, nerr.New(nerr.InvalidArgument, "config.Load", "query_queue_wait_ms must be a positive integer")
+			n, err := limitValue("query_queue_wait_ms", v)
+			if err != nil {
+				return Config{}, err
 			}
 			cfg.QueueWaitMS = n
 		case "max_result_rows":
-			n, err := strconv.Atoi(v)
-			if err != nil || n < 1 {
-				return Config{}, nerr.New(nerr.InvalidArgument, "config.Load", "max_result_rows must be a positive integer")
+			n, err := limitValue("max_result_rows", v)
+			if err != nil {
+				return Config{}, err
 			}
 			cfg.MaxResultRows = n
+		case "max_frame_bytes":
+			n, err := limitValue("max_frame_bytes", v)
+			if err != nil {
+				return Config{}, err
+			}
+			cfg.MaxFrameBytes = n
+		case "max_statement_bytes":
+			n, err := limitValue("max_statement_bytes", v)
+			if err != nil {
+				return Config{}, err
+			}
+			cfg.MaxStatementBytes = n
+		case "max_parameters":
+			n, err := limitValue("max_parameters", v)
+			if err != nil {
+				return Config{}, err
+			}
+			cfg.MaxParameters = n
+		case "max_prepared_statements":
+			n, err := limitValue("max_prepared_statements", v)
+			if err != nil {
+				return Config{}, err
+			}
+			cfg.MaxPrepared = n
+		case "max_result_bytes":
+			n, err := limitValue("max_result_bytes", v)
+			if err != nil {
+				return Config{}, err
+			}
+			cfg.MaxResultBytes = n
 		case "max_connections":
-			n, err := strconv.Atoi(v)
-			if err != nil || n < 1 {
-				return Config{}, nerr.New(nerr.InvalidArgument, "config.Load", "max_connections must be a positive integer")
+			n, err := limitValue("max_connections", v)
+			if err != nil {
+				return Config{}, err
 			}
 			cfg.MaxConnections = n
 		case "max_connections_per_user":
-			n, err := strconv.Atoi(v)
-			if err != nil || n < 0 {
-				return Config{}, nerr.New(nerr.InvalidArgument, "config.Load", "max_connections_per_user must be >= 0")
+			n, err := limitValue("max_connections_per_user", v)
+			if err != nil {
+				return Config{}, err
 			}
 			cfg.MaxConnectionsPerUser = n
 		case "max_connections_per_database":
-			n, err := strconv.Atoi(v)
-			if err != nil || n < 0 {
-				return Config{}, nerr.New(nerr.InvalidArgument, "config.Load", "max_connections_per_database must be >= 0")
+			n, err := limitValue("max_connections_per_database", v)
+			if err != nil {
+				return Config{}, err
 			}
 			cfg.MaxConnectionsPerDatabase = n
 		case "max_connections_per_realm":
-			n, err := strconv.Atoi(v)
-			if err != nil || n < 0 {
-				return Config{}, nerr.New(nerr.InvalidArgument, "config.Load", "max_connections_per_realm must be >= 0")
+			n, err := limitValue("max_connections_per_realm", v)
+			if err != nil {
+				return Config{}, err
 			}
 			cfg.MaxConnectionsPerRealm = n
 		case "idle_timeout_ms":
-			n, err := strconv.Atoi(v)
-			if err != nil || n < 1 {
-				return Config{}, nerr.New(nerr.InvalidArgument, "config.Load", "idle_timeout_ms must be a positive integer")
+			n, err := limitValue("idle_timeout_ms", v)
+			if err != nil {
+				return Config{}, err
 			}
 			cfg.IdleTimeoutMS = n
 		case "statement_timeout_ms":
-			n, err := strconv.Atoi(v)
-			if err != nil || n < 1 {
-				return Config{}, nerr.New(nerr.InvalidArgument, "config.Load", "statement_timeout_ms must be a positive integer")
+			n, err := limitValue("statement_timeout_ms", v)
+			if err != nil {
+				return Config{}, err
 			}
 			cfg.StatementTimeoutMS = n
 		case "transaction_timeout_ms":
-			n, err := strconv.Atoi(v)
-			if err != nil || n < 0 {
-				return Config{}, nerr.New(nerr.InvalidArgument, "config.Load", "transaction_timeout_ms must be >= 0")
+			n, err := limitValue("transaction_timeout_ms", v)
+			if err != nil {
+				return Config{}, err
 			}
 			cfg.TransactionTimeoutMS = n
 		case "lock_timeout_ms":
-			n, err := strconv.Atoi(v)
-			if err != nil || n < 0 {
-				return Config{}, nerr.New(nerr.InvalidArgument, "config.Load", "lock_timeout_ms must be >= 0")
+			n, err := limitValue("lock_timeout_ms", v)
+			if err != nil {
+				return Config{}, err
 			}
 			cfg.LockTimeoutMS = n
 		case "idle_transaction_timeout_ms":
-			n, err := strconv.Atoi(v)
-			if err != nil || n < 0 {
-				return Config{}, nerr.New(nerr.InvalidArgument, "config.Load", "idle_transaction_timeout_ms must be >= 0")
+			n, err := limitValue("idle_transaction_timeout_ms", v)
+			if err != nil {
+				return Config{}, err
 			}
 			cfg.IdleTransactionTimeoutMS = n
 		case "shutdown_drain_ms":
-			n, err := strconv.Atoi(v)
-			if err != nil || n < 0 {
-				return Config{}, nerr.New(nerr.InvalidArgument, "config.Load", "shutdown_drain_ms must be >= 0")
+			n, err := limitValue("shutdown_drain_ms", v)
+			if err != nil {
+				return Config{}, err
 			}
 			cfg.DrainTimeoutMS = n
 		case "node_id":
@@ -552,6 +644,30 @@ func loadFrom(r io.Reader) (Config, error) {
 			cfg.RaftBind = v
 		case "raft_join":
 			cfg.RaftJoin = v
+		case "raft_heartbeat_ms":
+			n, err := limitValue("raft_heartbeat_ms", v)
+			if err != nil {
+				return Config{}, err
+			}
+			cfg.RaftHeartbeatMS = n
+		case "raft_election_ms":
+			n, err := limitValue("raft_election_ms", v)
+			if err != nil {
+				return Config{}, err
+			}
+			cfg.RaftElectionMS = n
+		case "raft_leader_lease_ms":
+			n, err := limitValue("raft_leader_lease_ms", v)
+			if err != nil {
+				return Config{}, err
+			}
+			cfg.RaftLeaderLeaseMS = n
+		case "raft_commit_timeout_ms":
+			n, err := limitValue("raft_commit_timeout_ms", v)
+			if err != nil {
+				return Config{}, err
+			}
+			cfg.RaftCommitTimeoutMS = n
 		case "raft_bootstrap":
 			switch strings.ToLower(v) {
 			case "true", "1", "yes":
@@ -567,6 +683,9 @@ func loadFrom(r io.Reader) (Config, error) {
 	}
 	if err := sc.Err(); err != nil {
 		return Config{}, nerr.Wrap(nerr.IO, "config.Load", "read", err)
+	}
+	if cfg.MaxFrameBytes > 0 && cfg.MaxStatementBytes > cfg.MaxFrameBytes {
+		return Config{}, nerr.New(nerr.InvalidArgument, "config.Load", "max_statement_bytes cannot exceed max_frame_bytes")
 	}
 	return cfg, nil
 }
@@ -628,6 +747,8 @@ func (c Config) Marshal() []byte {
 	str("tls_key", c.TLSKey)
 	str("tls_client_ca", c.TLSClientCA)
 	str("tls_client_crl", c.TLSClientCRL)
+	str("tls_ocsp_mode", c.TLSOCSPMode)
+	str("tls_ocsp_responder", c.TLSOCSPResponder)
 	boolean("require_client_key", c.RequireClientKey)
 
 	str("token_verify_keyset", c.TokenKeyset)
@@ -654,6 +775,7 @@ func (c Config) Marshal() []byte {
 	str("wal_archive", c.WalArchive)
 	str("backup_dir", c.BackupDir)
 	num("wal_retention_ms", c.WalRetentionMS)
+	num("checkpoint_interval_ms", c.CheckpointIntervalMS)
 
 	num("disk_watermark_check_ms", c.DiskWatermarkCheckMS)
 	flt("disk_watermark_warn_percent", c.DiskWatermarkWarnPercent)
@@ -668,6 +790,11 @@ func (c Config) Marshal() []byte {
 	num("max_query_queue", c.MaxQueryQueue)
 	num("query_queue_wait_ms", c.QueueWaitMS)
 	num("max_result_rows", c.MaxResultRows)
+	num("max_frame_bytes", c.MaxFrameBytes)
+	num("max_statement_bytes", c.MaxStatementBytes)
+	num("max_parameters", c.MaxParameters)
+	num("max_prepared_statements", c.MaxPrepared)
+	num("max_result_bytes", c.MaxResultBytes)
 
 	num("max_connections", c.MaxConnections)
 	num("max_connections_per_user", c.MaxConnectionsPerUser)
@@ -685,6 +812,10 @@ func (c Config) Marshal() []byte {
 	str("raft_bind", c.RaftBind)
 	str("raft_join", c.RaftJoin)
 	boolean("raft_bootstrap", c.RaftBootstrap)
+	num("raft_heartbeat_ms", c.RaftHeartbeatMS)
+	num("raft_election_ms", c.RaftElectionMS)
+	num("raft_leader_lease_ms", c.RaftLeaderLeaseMS)
+	num("raft_commit_timeout_ms", c.RaftCommitTimeoutMS)
 
 	return []byte(b.String())
 }
@@ -748,19 +879,21 @@ var settableKeys = func() map[string]bool {
 	probe := Config{
 		DataDir: "x", KeyFile: "x", InstanceKeyFile: "x", AuthFile: "x",
 		ListenAddr: "x", LogLevel: "x", DeploymentProfile: "x", BufferPages: 1, PreallocAheadPages: 1,
-		TLSCert: "x", TLSKey: "x", TLSClientCA: "x", TLSClientCRL: "x", RequireClientKey: true,
+		TLSCert: "x", TLSKey: "x", TLSClientCA: "x", TLSClientCRL: "x", TLSOCSPMode: "x", TLSOCSPResponder: "x", RequireClientKey: true,
 		TokenKeyset: "x", TokenRevocations: "x", TokenAudience: "x",
 		TokenIdentitySourceHints: map[uint32]string{1: "x"},
 		AuthBrokerConfig:         "x", AuthBrokerListen: "x",
-		AuditFile: "x", AuditSigningKeyset: "x", WalArchive: "x", BackupDir: "x", WalRetentionMS: 1,
+		AuditFile: "x", AuditSigningKeyset: "x", WalArchive: "x", BackupDir: "x", WalRetentionMS: 1, CheckpointIntervalMS: 1,
 		DiskWatermarkCheckMS: 1, DiskWatermarkWarnPercent: 1, DiskWatermarkRejectPercent: 1,
 		ReplicaLagCheckMS: 1, ReplicaLagWarnEntries: 1,
 		MaxInflight: 1, MaxOpenDatabases: 1, MaxTotalBufferPages: 1, TaskWorkers: 1,
 		MaxQueryQueue: 1, QueueWaitMS: 1, MaxResultRows: 1,
+		MaxFrameBytes: 1, MaxStatementBytes: 1, MaxParameters: 1, MaxPrepared: 1, MaxResultBytes: 1,
 		MaxConnections: 1, MaxConnectionsPerUser: 1, MaxConnectionsPerDatabase: 1, MaxConnectionsPerRealm: 1,
 		IdleTimeoutMS: 1, StatementTimeoutMS: 1, TransactionTimeoutMS: 1, LockTimeoutMS: 1,
 		IdleTransactionTimeoutMS: 1, DrainTimeoutMS: 1,
 		NodeID: "x", RaftBind: "x", RaftJoin: "x", RaftBootstrap: true,
+		RaftHeartbeatMS: 1, RaftElectionMS: 1, RaftLeaderLeaseMS: 1, RaftCommitTimeoutMS: 1,
 	}
 	keys := map[string]bool{}
 	for _, line := range strings.Split(strings.TrimRight(string(probe.Marshal()), "\n"), "\n") {
@@ -955,59 +1088,29 @@ func DiffState(running, file Config) []EntryState {
 }
 
 func (c Config) Validate() error {
+	// Every operational limit is checked against the same catalog Load uses,
+	// so a programmatically built Config cannot carry a value a configuration
+	// file would have been rejected for. Zero is treated here as "unset —
+	// leave the owning subsystem's default", which is the convention every
+	// caller that builds a Config by hand relies on; a configuration *file*
+	// is stricter, because a key written out as 0 is a value, not an absence.
+	for _, s := range limits.Catalog() {
+		v, ok := c.limitValue(s.Key)
+		if !ok || v == 0 {
+			continue
+		}
+		if err := limits.Check(s.Key, v); err != nil {
+			return nerr.New(nerr.InvalidArgument, "config.Validate", err.Error())
+		}
+	}
 	if c.BufferPages < 1 {
 		return nerr.New(nerr.InvalidArgument, "config.Validate", "buffer_pages must be >= 1")
-	}
-	if c.MaxInflight < 0 {
-		return nerr.New(nerr.InvalidArgument, "config.Validate", "max_inflight_queries must be >= 0")
-	}
-	if c.MaxOpenDatabases < 0 {
-		return nerr.New(nerr.InvalidArgument, "config.Validate", "max_open_databases must be >= 0")
-	}
-	if c.MaxTotalBufferPages < 0 {
-		return nerr.New(nerr.InvalidArgument, "config.Validate", "max_total_buffer_pages must be >= 0")
 	}
 	if c.MaxTotalBufferPages > 0 && c.MaxTotalBufferPages < c.BufferPages {
 		return nerr.New(nerr.InvalidArgument, "config.Validate", "max_total_buffer_pages must be >= buffer_pages, or 0 for unbounded")
 	}
-	if c.TaskWorkers < 0 {
-		return nerr.New(nerr.InvalidArgument, "config.Validate", "task_workers must be >= 0")
-	}
-	if c.MaxQueryQueue < 0 {
-		return nerr.New(nerr.InvalidArgument, "config.Validate", "max_query_queue must be >= 0")
-	}
-	if c.MaxConnections < 0 {
-		return nerr.New(nerr.InvalidArgument, "config.Validate", "max_connections must be >= 0")
-	}
-	if c.MaxConnectionsPerUser < 0 {
-		return nerr.New(nerr.InvalidArgument, "config.Validate", "max_connections_per_user must be >= 0")
-	}
-	if c.MaxConnectionsPerDatabase < 0 {
-		return nerr.New(nerr.InvalidArgument, "config.Validate", "max_connections_per_database must be >= 0")
-	}
-	if c.MaxConnectionsPerRealm < 0 {
-		return nerr.New(nerr.InvalidArgument, "config.Validate", "max_connections_per_realm must be >= 0")
-	}
-	if c.IdleTimeoutMS < 0 {
-		return nerr.New(nerr.InvalidArgument, "config.Validate", "idle_timeout_ms must be >= 0")
-	}
-	if c.StatementTimeoutMS < 0 {
-		return nerr.New(nerr.InvalidArgument, "config.Validate", "statement_timeout_ms must be >= 0")
-	}
-	if c.TransactionTimeoutMS < 0 {
-		return nerr.New(nerr.InvalidArgument, "config.Validate", "transaction_timeout_ms must be >= 0")
-	}
-	if c.LockTimeoutMS < 0 {
-		return nerr.New(nerr.InvalidArgument, "config.Validate", "lock_timeout_ms must be >= 0")
-	}
-	if c.IdleTransactionTimeoutMS < 0 {
-		return nerr.New(nerr.InvalidArgument, "config.Validate", "idle_transaction_timeout_ms must be >= 0")
-	}
-	if c.WalRetentionMS < 0 {
-		return nerr.New(nerr.InvalidArgument, "config.Validate", "wal_retention_ms must be >= 0")
-	}
-	if c.DiskWatermarkCheckMS < 0 {
-		return nerr.New(nerr.InvalidArgument, "config.Validate", "disk_watermark_check_ms must be >= 0")
+	if c.MaxFrameBytes > 0 && c.MaxStatementBytes > c.MaxFrameBytes {
+		return nerr.New(nerr.InvalidArgument, "config.Validate", "max_statement_bytes cannot exceed max_frame_bytes")
 	}
 	if c.DiskWatermarkWarnPercent < 0 || c.DiskWatermarkWarnPercent > 100 {
 		return nerr.New(nerr.InvalidArgument, "config.Validate", "disk_watermark_warn_percent must be in [0, 100]")
@@ -1018,15 +1121,6 @@ func (c Config) Validate() error {
 	if warn, reject := c.DiskWatermarkThresholds(); warn >= reject {
 		return nerr.New(nerr.InvalidArgument, "config.Validate", "disk_watermark_warn_percent must be less than disk_watermark_reject_percent")
 	}
-	if c.ReplicaLagCheckMS < 0 {
-		return nerr.New(nerr.InvalidArgument, "config.Validate", "replica_lag_check_ms must be >= 0")
-	}
-	if c.ReplicaLagWarnEntries < 0 {
-		return nerr.New(nerr.InvalidArgument, "config.Validate", "replica_lag_warn_entries must be >= 0")
-	}
-	if c.DrainTimeoutMS < 0 {
-		return nerr.New(nerr.InvalidArgument, "config.Validate", "shutdown_drain_ms must be >= 0")
-	}
 	if (c.TLSCert == "") != (c.TLSKey == "") {
 		return nerr.New(nerr.InvalidArgument, "config.Validate", "tls_cert and tls_key must be set together")
 	}
@@ -1035,6 +1129,19 @@ func (c Config) Validate() error {
 	}
 	if c.TLSClientCRL != "" && c.TLSClientCA == "" {
 		return nerr.New(nerr.InvalidArgument, "config.Validate", "tls_client_crl requires tls_client_ca")
+	}
+	if c.TLSOCSPMode != "" {
+		switch c.TLSOCSPMode {
+		case "disabled", "optional", "enforce":
+		default:
+			return nerr.New(nerr.InvalidArgument, "config.Validate", "tls_ocsp_mode must be disabled, optional, or enforce")
+		}
+		if c.TLSOCSPMode != "disabled" && c.TLSClientCA == "" {
+			return nerr.New(nerr.InvalidArgument, "config.Validate", "tls_ocsp_mode requires tls_client_ca")
+		}
+	}
+	if c.TLSOCSPResponder != "" && c.TLSOCSPMode == "disabled" {
+		return nerr.New(nerr.InvalidArgument, "config.Validate", "tls_ocsp_responder cannot be set when tls_ocsp_mode is disabled")
 	}
 	if c.TokenRevocations != "" && c.TokenKeyset == "" {
 		return nerr.New(nerr.InvalidArgument, "config.Validate", "token_revocations requires token_verify_keyset")
@@ -1077,6 +1184,17 @@ func (c Config) Validate() error {
 	if (c.RaftBind != "" || c.NodeID != "") && (c.RaftBind == "" || c.NodeID == "") {
 		return nerr.New(nerr.InvalidArgument, "config.Validate", "node_id and raft_bind must be set together")
 	}
+	// The Raft intervals are related to each other, not only individually
+	// bounded, and an operator must learn that here rather than at the next
+	// restart when the cluster refuses to start. CheckRaftTimings resolves
+	// zeros to the built-in defaults first, so a partially configured set is
+	// judged as the cluster will actually run it.
+	if err := limits.CheckRaftTimings(
+		c.RaftHeartbeatMS, c.RaftElectionMS,
+		c.RaftLeaderLeaseMS, c.RaftCommitTimeoutMS,
+	); err != nil {
+		return nerr.New(nerr.InvalidArgument, "config.Validate", err.Error())
+	}
 	return nil
 }
 
@@ -1107,4 +1225,79 @@ func parseTokenIdentitySourceHints(raw string) (map[uint32]string, error) {
 		hints[id] = source
 	}
 	return hints, nil
+}
+
+// limitValue maps a catalog key onto the field that carries it. A key with no
+// field here is a catalog entry nothing enforces, which TestEveryLimitIsWired
+// rejects.
+func (c Config) limitValue(key string) (int, bool) {
+	switch key {
+	case "buffer_pages":
+		return c.BufferPages, true
+	case "checkpoint_interval_ms":
+		return c.CheckpointIntervalMS, true
+	case "disk_watermark_check_ms":
+		return c.DiskWatermarkCheckMS, true
+	case "idle_timeout_ms":
+		return c.IdleTimeoutMS, true
+	case "idle_transaction_timeout_ms":
+		return c.IdleTransactionTimeoutMS, true
+	case "lock_timeout_ms":
+		return c.LockTimeoutMS, true
+	case "max_connections":
+		return c.MaxConnections, true
+	case "max_connections_per_database":
+		return c.MaxConnectionsPerDatabase, true
+	case "max_connections_per_realm":
+		return c.MaxConnectionsPerRealm, true
+	case "max_connections_per_user":
+		return c.MaxConnectionsPerUser, true
+	case "max_frame_bytes":
+		return c.MaxFrameBytes, true
+	case "max_inflight_queries":
+		return c.MaxInflight, true
+	case "max_open_databases":
+		return c.MaxOpenDatabases, true
+	case "max_parameters":
+		return c.MaxParameters, true
+	case "max_prepared_statements":
+		return c.MaxPrepared, true
+	case "max_query_queue":
+		return c.MaxQueryQueue, true
+	case "max_result_bytes":
+		return c.MaxResultBytes, true
+	case "max_result_rows":
+		return c.MaxResultRows, true
+	case "max_statement_bytes":
+		return c.MaxStatementBytes, true
+	case "max_total_buffer_pages":
+		return c.MaxTotalBufferPages, true
+	case "prealloc_ahead_pages":
+		return c.PreallocAheadPages, true
+	case "query_queue_wait_ms":
+		return c.QueueWaitMS, true
+	case "raft_commit_timeout_ms":
+		return c.RaftCommitTimeoutMS, true
+	case "raft_election_ms":
+		return c.RaftElectionMS, true
+	case "raft_heartbeat_ms":
+		return c.RaftHeartbeatMS, true
+	case "raft_leader_lease_ms":
+		return c.RaftLeaderLeaseMS, true
+	case "replica_lag_check_ms":
+		return c.ReplicaLagCheckMS, true
+	case "replica_lag_warn_entries":
+		return c.ReplicaLagWarnEntries, true
+	case "shutdown_drain_ms":
+		return c.DrainTimeoutMS, true
+	case "statement_timeout_ms":
+		return c.StatementTimeoutMS, true
+	case "task_workers":
+		return c.TaskWorkers, true
+	case "transaction_timeout_ms":
+		return c.TransactionTimeoutMS, true
+	case "wal_retention_ms":
+		return c.WalRetentionMS, true
+	}
+	return 0, false
 }

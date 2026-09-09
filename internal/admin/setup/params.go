@@ -4,6 +4,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/bzync/nextsql/internal/limits"
 	"github.com/bzync/nextsql/internal/nerr"
 )
 
@@ -51,6 +52,9 @@ type Params struct {
 	AdminUser     string `json:"adminUser"`
 	AdminPassword string `json:"adminPassword"` // never logged, never written to argv — see toArgs
 
+	// Realm is decoded only so a payload that still carries one is answered
+	// with the reason (see Validate) rather than a bare decoder error.
+	// Multi-realm hosting was removed: a deployment serves one database.
 	Realm    string `json:"realm"`
 	Database string `json:"database"`
 
@@ -71,6 +75,13 @@ type Params struct {
 	ListenAddr string `json:"listenAddr"`
 	TLSCert    string `json:"tlsCert"`
 	TLSKey     string `json:"tlsKey"`
+
+	// RecoveryKeyOut and InstanceRecoveryKeyOut configure recovery key export
+	// (M2). When RecoveryKeyOut is given, `nextsql setup` exports a second,
+	// independent unlock key for the database and registry keystores so the
+	// root key is not a single point of failure.
+	RecoveryKeyOut         string `json:"recoveryKeyOut"`
+	InstanceRecoveryKeyOut string `json:"instanceRecoveryKeyOut"`
 
 	// EnableService requests that, after a successful (non-dry-run,
 	// non-skip-init) install, the server also runs `systemctl [--user]
@@ -103,11 +114,20 @@ func (p Params) Validate() error {
 	if !validProfiles[p.Profile] {
 		return nerr.New(nerr.InvalidArgument, "setup.Params", "profile must be one of: developer, production")
 	}
+	// Multi-realm hosting was removed. "default" is the one realm every
+	// registry records, so a payload naming it means the same thing as an
+	// empty field; anything else asked for something this build will not do.
+	if r := strings.TrimSpace(p.Realm); r != "" && r != "default" {
+		return nerr.New(nerr.InvalidArgument, "setup.Params",
+			"realm selection was removed: a NextSQL deployment serves exactly one database")
+	}
 	if p.Profile == "production" && p.SkipInit {
 		return nerr.New(nerr.InvalidArgument, "setup.Params", "production profile cannot skip initialization")
 	}
-	if p.Preset == "custom" && p.BufferPages <= 0 {
-		return nerr.New(nerr.InvalidArgument, "setup.Params", "bufferPages must be positive when preset is custom")
+	if p.Preset == "custom" {
+		if err := limits.Check("buffer_pages", p.BufferPages); err != nil {
+			return nerr.New(nerr.InvalidArgument, "setup.Params", err.Error())
+		}
 	}
 	if (p.AdminUser == "") != (p.AdminPassword == "") {
 		return nerr.New(nerr.InvalidArgument, "setup.Params", "adminUser and adminPassword must be given together")
@@ -118,8 +138,38 @@ func (p Params) Validate() error {
 	if (p.TLSCert == "") != (p.TLSKey == "") {
 		return nerr.New(nerr.InvalidArgument, "setup.Params", "tlsCert and tlsKey must be given together")
 	}
+	if p.RecoveryKeyOut != "" {
+		if strings.IndexByte(p.RecoveryKeyOut, 0) >= 0 || len(p.RecoveryKeyOut) > 4096 {
+			return nerr.New(nerr.InvalidArgument, "setup.Params", "recoveryKeyOut must be a valid path")
+		}
+		if p.SkipInit {
+			return nerr.New(nerr.InvalidArgument, "setup.Params", "recoveryKeyOut cannot be used with skipInit: no database is initialized to create a recovery key for")
+		}
+	}
+	if p.InstanceRecoveryKeyOut != "" {
+		if strings.IndexByte(p.InstanceRecoveryKeyOut, 0) >= 0 || len(p.InstanceRecoveryKeyOut) > 4096 {
+			return nerr.New(nerr.InvalidArgument, "setup.Params", "instanceRecoveryKeyOut must be a valid path")
+		}
+		if p.RecoveryKeyOut == "" {
+			return nerr.New(nerr.InvalidArgument, "setup.Params", "instanceRecoveryKeyOut requires recoveryKeyOut")
+		}
+	}
 	if p.SkipInit && p.EnableService {
 		return nerr.New(nerr.InvalidArgument, "setup.Params", "enableService has no effect with skipInit: no database is initialized to serve")
+	}
+	// Same rules the CLI enforces (cmd/nextsql/setup.go): a deployment with
+	// no database cannot serve, and a recovery key has no keystore to seal.
+	// Checked here too so the wizard reports them on its own dry run rather
+	// than only when the subprocess fails.
+	if strings.TrimSpace(p.Database) == "" && !p.SkipInit {
+		if p.Profile == "production" {
+			return nerr.New(nerr.InvalidArgument, "setup.Params",
+				"production profile requires a database name: a deployment with no database cannot serve")
+		}
+		if p.RecoveryKeyOut != "" {
+			return nerr.New(nerr.InvalidArgument, "setup.Params",
+				"recoveryKeyOut requires a database name: without one no keystore is created for a recovery key to seal")
+		}
 	}
 	return nil
 }
@@ -129,21 +179,17 @@ func (p Params) Validate() error {
 // is no admin user) — the password itself never appears in argv, which a
 // local `ps` listing can read; see runner.go for the temp-file lifecycle.
 func (p Params) toArgs(dryRun bool, passwordFile string) []string {
-	realm := p.Realm
-	if realm == "" {
-		realm = "default"
-	}
-	database := p.Database
-	if database == "" {
-		database = "default"
-	}
 	args := []string{
 		"setup",
 		"--json",
 		"--data-dir", p.DataDir,
 		"--key-file", p.KeyFile,
-		"--realm", realm,
-		"--database", database,
+	}
+	// No database name means no database: `nextsql setup` initializes the
+	// deployment only. The wizard must not substitute a name of its own —
+	// that would create a database the operator never asked for.
+	if database := strings.TrimSpace(p.Database); database != "" && !p.SkipInit {
+		args = append(args, "--database", database)
 	}
 	if p.ConfigOut != "" {
 		args = append(args, "--config-out", p.ConfigOut)
@@ -168,6 +214,12 @@ func (p Params) toArgs(dryRun bool, passwordFile string) []string {
 	}
 	if p.TLSCert != "" {
 		args = append(args, "--tls-cert", p.TLSCert, "--tls-key", p.TLSKey)
+	}
+	if p.RecoveryKeyOut != "" {
+		args = append(args, "--recovery-key-out", p.RecoveryKeyOut)
+	}
+	if p.InstanceRecoveryKeyOut != "" {
+		args = append(args, "--instance-recovery-key-out", p.InstanceRecoveryKeyOut)
 	}
 	if dryRun {
 		args = append(args, "--dry-run")

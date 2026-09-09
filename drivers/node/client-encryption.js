@@ -1,18 +1,20 @@
 'use strict';
 
-// Node-specific NSCE1 implementation. The dependency injection keeps this
+// Node-specific NSCE1/NSCE2 implementation. The dependency injection keeps this
 // module on the driver's single public NextSQLError/Kind surface.
-const { createCipheriv, createDecipheriv, randomBytes } = require('node:crypto');
+const { createCipheriv, createDecipheriv, hkdfSync, randomBytes, timingSafeEqual } = require('node:crypto');
 const fs = require('node:fs/promises');
 
 module.exports = function createClientEncryption(deps) {
   const { NextSQLError, Kind, encodeDecimalString, decodeDecimal, decodeNSJB, formatUUID, parseUUID } = deps;
   const PREFIX = 'NSCE1.';
+	const DETERMINISTIC_PREFIX = 'NSCE2.';
   const MAX_PLAINTEXT = 1 << 20;
   const MAX_KEY_ID = 64;
   const MAX_KEYS = 64;
   const NONCE_SIZE = 12;
   const TAG_SIZE = 16;
+  const DETERMINISTIC_KEY_INFO = Buffer.from('NextSQL NSCE2 AES-SIV v2', 'utf8');
 
   const FieldType = Object.freeze({
     UUID: Object.freeze({ kind: Kind.UUID, precision: 0, scale: 0, vecElem: 0 }),
@@ -334,18 +336,18 @@ module.exports = function createClientEncryption(deps) {
     return Buffer.concat([Buffer.from([tag]), u32(raw.length), raw]);
   }
 
-  function makeHeader(keyID, type, nonce) {
+  function makeHeader(keyID, type, nonce = null) {
     const id = Buffer.from(keyID, 'ascii');
-    const out = Buffer.alloc(3 + id.length + 6 + NONCE_SIZE);
-    out[0] = 1; out[1] = 1; out[2] = id.length; id.copy(out, 3);
+	const out = Buffer.alloc(3 + id.length + 6 + (nonce ? NONCE_SIZE : 0));
+	out[0] = nonce ? 1 : 2; out[1] = nonce ? 1 : 2; out[2] = id.length; id.copy(out, 3);
     const off = 3 + id.length;
     out[off] = type.kind; out.writeUInt16LE(type.precision, off + 1); out.writeUInt16LE(type.scale, off + 3); out[off + 5] = type.vecElem;
-    nonce.copy(out, off + 6);
+	if (nonce) nonce.copy(out, off + 6);
     return out;
   }
 
-  function aad(database, table, column, publicHeader) {
-    const parts = [Buffer.from(PREFIX, 'ascii')];
+  function aad(database, table, column, publicHeader, prefix = PREFIX) {
+	const parts = [Buffer.from(prefix, 'ascii')];
     for (const name of [database, table, column]) {
       const raw = validateName(name);
       parts.push(u16(raw.length), raw);
@@ -355,21 +357,64 @@ module.exports = function createClientEncryption(deps) {
   }
 
   function inspectField(ciphertext) {
-    if (typeof ciphertext !== 'string' || !ciphertext.startsWith(PREFIX)) fail('invalid_format', 'invalid client ciphertext prefix');
-    const enc = ciphertext.slice(PREFIX.length);
+	let prefix, version, suite, nonceSize, mode;
+	if (typeof ciphertext === 'string' && ciphertext.startsWith(PREFIX)) {
+	  prefix = PREFIX; version = 1; suite = 1; nonceSize = NONCE_SIZE; mode = 'randomized';
+	} else if (typeof ciphertext === 'string' && ciphertext.startsWith(DETERMINISTIC_PREFIX)) {
+	  prefix = DETERMINISTIC_PREFIX; version = 2; suite = 2; nonceSize = 0; mode = 'deterministic';
+	} else fail('invalid_format', 'invalid client ciphertext prefix');
+	const enc = ciphertext.slice(prefix.length);
     if (!enc || enc.length % 4 === 1 || !/^[A-Za-z0-9_-]+$/.test(enc) || enc.length > Math.ceil((MAX_PLAINTEXT + 101) * 4 / 3)) {
       fail('invalid_format', 'client ciphertext length out of range');
     }
     const body = Buffer.from(enc, 'base64url');
-    if (body.toString('base64url') !== enc || body.length < 38 || body[0] !== 1 || body[1] !== 1) fail('invalid_format', 'unsupported or truncated client ciphertext');
+	if (body.toString('base64url') !== enc || body.length < 3 + 1 + 6 + nonceSize + TAG_SIZE || body[0] !== version || body[1] !== suite) fail('invalid_format', 'unsupported or truncated client ciphertext');
     const n = body[2];
-    if (n < 1 || n > MAX_KEY_ID || body.length < 3 + n + 6 + NONCE_SIZE + TAG_SIZE) fail('invalid_format', 'invalid field key id length');
+	if (n < 1 || n > MAX_KEY_ID || body.length < 3 + n + 6 + nonceSize + TAG_SIZE) fail('invalid_format', 'invalid field key id length');
     const keyID = body.subarray(3, 3 + n).toString('ascii');
     if (!validKeyID(keyID)) fail('invalid_format', 'invalid field key id');
     const off = 3 + n;
     const type = normalizeType({ kind: body[off], precision: body.readUInt16LE(off + 1), scale: body.readUInt16LE(off + 3), vecElem: body[off + 5] }, 'invalid_format');
-    return { keyID, type, body, headerLength: off + 6 + NONCE_SIZE };
+	return { keyID, type, body, headerLength: off + 6 + nonceSize, mode, prefix };
   }
+
+	function aesBlock(key, block) {
+	  const cipher = createCipheriv('aes-128-ecb', key, null);
+	  cipher.setAutoPadding(false);
+	  return Buffer.concat([cipher.update(block), cipher.final()]);
+	}
+	function dbl(block) {
+	  const out = Buffer.alloc(16); let carry = 0;
+	  for (let i = 15; i >= 0; i--) { const b = block[i]; out[i] = ((b << 1) & 0xff) | carry; carry = b >>> 7; }
+	  if (carry) out[15] ^= 0x87;
+	  return out;
+	}
+	function xor16(a, b) { const out = Buffer.alloc(16); for (let i = 0; i < 16; i++) out[i] = a[i] ^ b[i]; return out; }
+	function cmac(key, msg) {
+	  const l = aesBlock(key, Buffer.alloc(16)); const k1 = dbl(l); const k2 = dbl(k1);
+	  const blocks = Math.max(1, Math.ceil(msg.length / 16)); let last = Buffer.alloc(16);
+	  if (msg.length && msg.length % 16 === 0) last = xor16(msg.subarray(msg.length - 16), k1);
+	  else { const rem = msg.length % 16; msg.copy(last, 0, msg.length - rem); last[rem] = 0x80; last = xor16(last, k2); }
+	  let y = Buffer.alloc(16);
+	  for (let i = 0; i < blocks - 1; i++) y = aesBlock(key, xor16(y, msg.subarray(i * 16, i * 16 + 16)));
+	  return aesBlock(key, xor16(y, last));
+	}
+	function s2v(key, vectors) {
+	  let d = cmac(key, Buffer.alloc(16));
+	  for (let i = 0; i < vectors.length - 1; i++) d = xor16(dbl(d), cmac(key, vectors[i]));
+	  const last = vectors[vectors.length - 1]; let t;
+	  if (last.length >= 16) { t = Buffer.from(last); const off = t.length - 16; for (let i = 0; i < 16; i++) t[off + i] ^= d[i]; }
+	  else { const padded = Buffer.alloc(16); last.copy(padded); padded[last.length] = 0x80; t = xor16(dbl(d), padded); }
+	  return cmac(key, t);
+	}
+	function sivCrypt(material, input, tag, decrypt) {
+	  const q = Buffer.from(tag); q[8] &= 0x7f; q[12] &= 0x7f;
+	  const cipher = decrypt ? createDecipheriv('aes-128-ctr', material.subarray(16), q) : createCipheriv('aes-128-ctr', material.subarray(16), q);
+	  return Buffer.concat([cipher.update(input), cipher.final()]);
+	}
+	function deterministicKey(material) {
+	  return Buffer.from(hkdfSync('sha256', material, Buffer.alloc(0), DETERMINISTIC_KEY_INFO, 32));
+	}
 
   async function encryptField(provider, database, table, column, type, value) {
     if (value === null || value === undefined) return null;
@@ -395,7 +440,8 @@ module.exports = function createClientEncryption(deps) {
     const expected = normalizeType(expectedType);
     if (ciphertext === null || ciphertext === undefined) return null;
     if (!provider || typeof provider.fieldKey !== 'function') fail('invalid_argument', 'field key provider is required');
-    const parsed = inspectField(ciphertext);
+	const parsed = inspectField(ciphertext);
+	if (parsed.mode !== 'randomized') fail('invalid_format', 'deterministic ciphertext requires decryptFieldDeterministic');
     if (!sameType(expected, parsed.type)) fail('invalid_format', 'encrypted logical type mismatch');
     let key;
     try { key = await provider.fieldKey(database, table, column, parsed.keyID); } catch { fail('crypto', 'field key unavailable or revoked'); }
@@ -414,6 +460,31 @@ module.exports = function createClientEncryption(deps) {
       fail('crypto', 'ciphertext authentication failed');
     }
   }
+
+	async function encryptFieldDeterministic(provider, database, table, column, type, value) {
+	  if (value === null || value === undefined) return null;
+	  if (!provider || typeof provider.currentFieldKey !== 'function') fail('invalid_argument', 'field key provider is required');
+	  const t = normalizeType(type); const plain = encodeScalar(t, value);
+	  if (plain.length > MAX_PLAINTEXT) fail('exhausted', 'plaintext exceeds field limit');
+	  let key; try { key = await provider.currentFieldKey(database, table, column); } catch { fail('crypto', 'field key unavailable'); }
+	  const material = deterministicKey(keyMaterial(key)); const hdr = makeHeader(key.id, t);
+	  const associated = aad(database, table, column, hdr, DETERMINISTIC_PREFIX);
+	  const tag = s2v(material.subarray(0, 16), [associated, plain]);
+	  return DETERMINISTIC_PREFIX + Buffer.concat([hdr, tag, sivCrypt(material, plain, tag, false)]).toString('base64url');
+	}
+
+	async function decryptFieldDeterministic(provider, database, table, column, expectedType, ciphertext) {
+	  const expected = normalizeType(expectedType); if (ciphertext == null) return null;
+	  if (!provider || typeof provider.fieldKey !== 'function') fail('invalid_argument', 'field key provider is required');
+	  const parsed = inspectField(ciphertext);
+	  if (parsed.mode !== 'deterministic' || !sameType(expected, parsed.type)) fail('invalid_format', 'encrypted mode or logical type mismatch');
+	  let key; try { key = await provider.fieldKey(database, table, column, parsed.keyID); } catch { fail('crypto', 'field key unavailable or revoked'); }
+	  const material = deterministicKey(keyMaterial(key, parsed.keyID)); const tag = parsed.body.subarray(parsed.headerLength, parsed.headerLength + 16);
+	  const plain = sivCrypt(material, parsed.body.subarray(parsed.headerLength + 16), tag, true);
+	  const expectedTag = s2v(material.subarray(0, 16), [aad(database, table, column, parsed.body.subarray(0, parsed.headerLength), DETERMINISTIC_PREFIX), plain]);
+	  if (!timingSafeEqual(tag, expectedTag)) fail('crypto', 'ciphertext authentication failed');
+	  return decodeScalar(expected, plain);
+	}
 
   function generateFieldKey(id) {
     if (!validKeyID(id)) fail('invalid_argument', 'invalid field key id');
@@ -630,5 +701,5 @@ module.exports = function createClientEncryption(deps) {
     }
   }
 
-  return { FieldType, MemoryFieldKeyring, FileFieldKeyring, decryptField, encryptField, generateFieldKey, inspectField };
+  return { FieldType, MemoryFieldKeyring, FileFieldKeyring, decryptField, decryptFieldDeterministic, encryptField, encryptFieldDeterministic, generateFieldKey, inspectField };
 };

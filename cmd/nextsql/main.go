@@ -19,6 +19,7 @@ import (
 	"github.com/bzync/nextsql/internal/crypto"
 	"github.com/bzync/nextsql/internal/executor"
 	"github.com/bzync/nextsql/internal/hosting"
+	"github.com/bzync/nextsql/internal/limits"
 	"github.com/bzync/nextsql/internal/migrate"
 	"github.com/bzync/nextsql/internal/nerr"
 	"github.com/bzync/nextsql/internal/replication"
@@ -57,12 +58,16 @@ func run(args []string) error {
 		return setupCmd(args[1:])
 	case "lifecycle":
 		return lifecycleCmd(args[1:])
-	case "hosting":
-		return hostingCmd(args[1:])
-	case "realm":
-		return realmCmd(args[1:])
-	case "database":
-		return databaseCmd(args[1:])
+	case "registry":
+		return registryCmd(args[1:])
+	case "realm", "database":
+		// Removed with the multi-realm/multi-database hosting feature: a
+		// deployment now serves exactly one database. Named explicitly so
+		// an operator running an old runbook gets the reason instead of
+		// "unknown command".
+		return nerr.New(nerr.InvalidArgument, "nextsql "+args[0],
+			"multi-realm/multi-database hosting was removed: a deployment serves exactly one database. "+
+				"Run one nextsqld per database, or use NextSQL 0.0.1 to export data from a deployment that has more than one")
 	case "exec":
 		return execSQL(args[1:])
 	case "backup":
@@ -87,6 +92,8 @@ func run(args []string) error {
 		return tokenCmd(args[1:])
 	case "audit":
 		return auditCmd(args[1:])
+	case "key":
+		return keyCmd(args[1:])
 	case "login":
 		return loginCmd(args[1:])
 	case "logout":
@@ -99,345 +106,31 @@ func run(args []string) error {
 	}
 }
 
-func hostingCmd(args []string) error {
+// defaultRealmName is the single realm every deployment registry records.
+// Multi-realm/multi-database hosting was removed: a deployment holds exactly
+// one database, so the realm is an on-disk compatibility detail of the
+// registry format (it keeps existing registries readable byte-for-byte),
+// never an operator-facing choice.
+const defaultRealmName = "default"
+
+func registryCmd(args []string) error {
 	if len(args) == 0 {
-		return nerr.New(nerr.InvalidArgument, "nextsql hosting", "expected adopt, migrate-tenant, set-realm-cap, set-realm-root, set-database-cap, or show")
+		return nerr.New(nerr.InvalidArgument, "nextsql registry", "expected adopt, migrate-tenant, or show")
 	}
 	switch args[0] {
 	case "adopt":
 		return adoptLegacyDatabase(args[1:])
 	case "migrate-tenant":
 		return migrateLegacyTenant(args[1:])
-	case "set-realm-cap":
-		return setRealmStorageCap(args[1:])
-	case "set-realm-root":
-		return setRealmRootAuth(args[1:])
-	case "set-database-cap":
-		return setDatabaseStorageCap(args[1:])
 	case "show":
-		return showHostingRegistry(args[1:])
+		return showDeploymentRegistry(args[1:])
 	default:
-		return nerr.New(nerr.InvalidArgument, "nextsql hosting", "unknown hosting command")
+		return nerr.New(nerr.InvalidArgument, "nextsql registry", "unknown registry command")
 	}
 }
 
-// realmCmd and databaseCmd are the M2-1 slice of the multi-database hosting
-// cross-cutting track (docs/design-multidatabase-dbaas.md §11.2): a
-// registered realm/database creation primitive, independent of the wire
-// protocol and the bounded DatabaseManager that later M2 increments add.
-// nextsqld does not yet open or serve anything created here — see the
-// design doc for the full sequence.
-func realmCmd(args []string) error {
-	if len(args) == 0 {
-		return nerr.New(nerr.InvalidArgument, "nextsql realm", "expected create or rename")
-	}
-	switch args[0] {
-	case "create":
-		return createRealm(args[1:])
-	case "rename":
-		return renameRealm(args[1:])
-	default:
-		return nerr.New(nerr.InvalidArgument, "nextsql realm", "unknown realm command")
-	}
-}
-
-func databaseCmd(args []string) error {
-	if len(args) == 0 {
-		return nerr.New(nerr.InvalidArgument, "nextsql database", "expected create, suspend, resume, drop, or rename")
-	}
-	switch args[0] {
-	case "create":
-		return createDatabase(args[1:])
-	case "suspend":
-		return setDatabaseState(args[1:], hosting.StateSuspended)
-	case "resume":
-		return setDatabaseState(args[1:], hosting.StateActive)
-	case "drop":
-		return dropDatabase(args[1:])
-	case "rename":
-		return renameDatabase(args[1:])
-	default:
-		return nerr.New(nerr.InvalidArgument, "nextsql database", "unknown database command")
-	}
-}
-
-func createRealm(args []string) error {
-	const op = "nextsql realm create"
-	fs := flag.NewFlagSet("realm create", flag.ContinueOnError)
-	fs.String("data-dir", "", "deployment data directory")
-	fs.String("key-file", "", "database root unlock key file (used to locate KEY-FILE.instance)")
-	fs.String("instance-key-file", "", "deployment registry root key file (default KEY-FILE.instance)")
-	realmName := fs.String("realm", "", "new realm name")
-	databaseName := fs.String("database", "", "new realm's first database name")
-	databaseKeyFile := fs.String("database-key-file", "", "root unlock key file for the new database (created if missing)")
-	bufferPages := fs.Int("buffer-pages", config.DefaultBufferPages, "buffer pool pages for the new database")
-	preallocAhead := fs.Int("prealloc-ahead-pages", config.DefaultPreallocAheadPages, "storage preallocation runway in 16 KiB pages (default ~256 MiB); lower it for containers or many small databases")
-	fs.String("env-file", "", "load only this dotenv file")
-	fs.Bool("no-env", false, "do not load .env files")
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
-	// Process-wide storage preallocation runway, applied before the database
-	// file is created so the new file claims only the configured amount.
-	file.SetCapacityAhead(*preallocAhead)
-	reg, ddl, settings, err := openHostingRegistryForCLI(op, fs, args, true)
-	if err != nil {
-		return err
-	}
-	defer reg.Close()
-	defer ddl.Close()
-	if settings.Supplied["realm"] {
-		*realmName = settings.Realm
-	}
-	if settings.Supplied["database"] {
-		*databaseName = settings.Database
-	}
-	if *realmName == "" || *databaseName == "" {
-		return cli.LocalMissing(op, "--realm and --database are required")
-	}
-	if *databaseKeyFile == "" {
-		return cli.LocalMissing(op, "--database-key-file is required")
-	}
-	if *bufferPages < 1 {
-		return nerr.New(nerr.InvalidArgument, op, "--buffer-pages must be positive")
-	}
-
-	m := reg.Manifest()
-	ident, alreadyActive, err := resolveManagedDatabaseIdentity(m, *realmName, *databaseName)
-	if err != nil {
-		return err
-	}
-	if alreadyActive {
-		fmt.Printf("realm %s database %s already active\n", *realmName, *databaseName)
-		return nil
-	}
-	root, err := ensureDatabaseKeyFile(*databaseKeyFile)
-	if err != nil {
-		return err
-	}
-	defer root.Zero()
-
-	realm, db, created, err := reg.CreateRealm(*realmName, *databaseName, ident, *databaseKeyFile)
-	if err != nil {
-		auditLocal(settings.DataDir, security.ActionRealmCreate, *realmName+"/"+*databaseName, err)
-		return err
-	}
-	if err := activateManagedDatabase(reg, settings.DataDir, realm.ID, db.ID, ident, root, *bufferPages); err != nil {
-		auditLocal(settings.DataDir, security.ActionRealmCreate, *realmName+"/"+*databaseName, err)
-		return err
-	}
-	auditLocal(settings.DataDir, security.ActionRealmCreate, *realmName+"/"+*databaseName, nil)
-	verb := "created"
-	if !created {
-		verb = "resumed"
-	}
-	fmt.Printf("realm %s %s database %s %s %s\n", realm.Name, realm.ID.String(), db.Name, db.ID.String(), verb)
-	return nil
-}
-
-// renameRealm is M3-2's CLI surface for a durable realm name change. The
-// stable ID and every on-disk path stay put (ManagedDatabasePath is
-// ID-based). Offline exclusive-lock pattern matches suspend/drop: fails
-// Unavailable against a running nextsqld. --confirm required. A collision
-// with another realm's name fails AlreadyExists; a no-op rename of the
-// current name succeeds without a new generation.
-func renameRealm(args []string) error {
-	const op = "nextsql realm rename"
-	fs := flag.NewFlagSet("realm rename", flag.ContinueOnError)
-	fs.String("data-dir", "", "deployment data directory")
-	fs.String("key-file", "", "database root unlock key file (used to locate KEY-FILE.instance)")
-	fs.String("instance-key-file", "", "deployment registry root key file (default KEY-FILE.instance)")
-	realm := fs.String("realm", "", "current realm name")
-	to := fs.String("to", "", "new realm name")
-	confirm := fs.Bool("confirm", false, "confirm the registry change")
-	fs.String("env-file", "", "load only this dotenv file")
-	fs.Bool("no-env", false, "do not load .env files")
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
-	reg, ddl, settings, err := openHostingRegistryForCLI(op, fs, args, true)
-	if err != nil {
-		return err
-	}
-	defer reg.Close()
-	defer ddl.Close()
-	if settings.Supplied["realm"] {
-		*realm = settings.Realm
-	}
-	if *realm == "" || *to == "" {
-		return cli.LocalMissing(op, "--realm and --to are required")
-	}
-	if !*confirm {
-		return nerr.New(nerr.InvalidArgument, op, "--confirm is required")
-	}
-	m := reg.Manifest()
-	realmID, err := resolveRealmID(m, *realm)
-	if err != nil {
-		return err
-	}
-	object := strings.ToLower(strings.TrimSpace(*realm)) + "->" + strings.ToLower(strings.TrimSpace(*to))
-	if err := reg.RenameRealm(realmID, *to); err != nil {
-		auditLocal(settings.DataDir, security.ActionRealmRename, object, err)
-		return err
-	}
-	auditLocal(settings.DataDir, security.ActionRealmRename, object, nil)
-	fmt.Printf("realm %s renamed to %s\n", strings.ToLower(strings.TrimSpace(*realm)), strings.ToLower(strings.TrimSpace(*to)))
-	return nil
-}
-
-func createDatabase(args []string) error {
-	const op = "nextsql database create"
-	fs := flag.NewFlagSet("database create", flag.ContinueOnError)
-	fs.String("data-dir", "", "deployment data directory")
-	fs.String("key-file", "", "database root unlock key file (used to locate KEY-FILE.instance)")
-	fs.String("instance-key-file", "", "deployment registry root key file (default KEY-FILE.instance)")
-	realmName := fs.String("realm", "", "existing realm name")
-	databaseName := fs.String("name", "", "new database name")
-	databaseKeyFile := fs.String("database-key-file", "", "root unlock key file for the new database (created if missing)")
-	bufferPages := fs.Int("buffer-pages", config.DefaultBufferPages, "buffer pool pages for the new database")
-	preallocAhead := fs.Int("prealloc-ahead-pages", config.DefaultPreallocAheadPages, "storage preallocation runway in 16 KiB pages (default ~256 MiB); lower it for containers or many small databases")
-	fs.String("env-file", "", "load only this dotenv file")
-	fs.Bool("no-env", false, "do not load .env files")
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
-	// Process-wide storage preallocation runway, applied before the database
-	// file is created so the new file claims only the configured amount.
-	file.SetCapacityAhead(*preallocAhead)
-	reg, ddl, settings, err := openHostingRegistryForCLI(op, fs, args, true)
-	if err != nil {
-		return err
-	}
-	defer reg.Close()
-	defer ddl.Close()
-	if settings.Supplied["realm"] {
-		*realmName = settings.Realm
-	}
-	if *realmName == "" || *databaseName == "" {
-		return cli.LocalMissing(op, "--realm and --name are required")
-	}
-	if *databaseKeyFile == "" {
-		return cli.LocalMissing(op, "--database-key-file is required")
-	}
-	if *bufferPages < 1 {
-		return nerr.New(nerr.InvalidArgument, op, "--buffer-pages must be positive")
-	}
-
-	m := reg.Manifest()
-	realmID, err := resolveRealmID(m, *realmName)
-	if err != nil {
-		return err
-	}
-	ident, alreadyActive, err := resolveManagedDatabaseIdentity(m, *realmName, *databaseName)
-	if err != nil {
-		return err
-	}
-	if alreadyActive {
-		fmt.Printf("database %s already active\n", *databaseName)
-		return nil
-	}
-	root, err := ensureDatabaseKeyFile(*databaseKeyFile)
-	if err != nil {
-		return err
-	}
-	defer root.Zero()
-
-	db, created, err := reg.CreateDatabase(realmID, *databaseName, ident, *databaseKeyFile)
-	if err != nil {
-		auditLocal(settings.DataDir, security.ActionDatabaseCreate, *realmName+"/"+*databaseName, err)
-		return err
-	}
-	if err := activateManagedDatabase(reg, settings.DataDir, realmID, db.ID, ident, root, *bufferPages); err != nil {
-		auditLocal(settings.DataDir, security.ActionDatabaseCreate, *realmName+"/"+*databaseName, err)
-		return err
-	}
-	auditLocal(settings.DataDir, security.ActionDatabaseCreate, *realmName+"/"+*databaseName, nil)
-	verb := "created"
-	if !created {
-		verb = "resumed"
-	}
-	fmt.Printf("database %s %s %s\n", db.Name, db.ID.String(), verb)
-	return nil
-}
-
-// resolveManagedDatabaseIdentity looks for realmName/databaseName already
-// registered in m. When found and StateActive, alreadyActive is true (the
-// caller should treat this as a successful no-op — createRealm/
-// createDatabase are not re-run). When found and StateProvisioning (a
-// crash-and-retry case), it returns that record's own already-durable
-// Identity rather than generating a new one, so the retried
-// Registry.CreateRealm/CreateDatabase call recognizes it as the same
-// resumable attempt instead of a name collision. When not found, it
-// generates a fresh identity for a first-time create.
-func resolveManagedDatabaseIdentity(m hosting.Manifest, realmName, databaseName string) (ident format.Identity, alreadyActive bool, err error) {
-	realmName = strings.ToLower(strings.TrimSpace(realmName))
-	databaseName = strings.ToLower(strings.TrimSpace(databaseName))
-	for _, realm := range m.Realms {
-		if realm.Name != realmName {
-			continue
-		}
-		for _, db := range realm.Databases {
-			if db.Name != databaseName {
-				continue
-			}
-			if db.State == hosting.StateActive {
-				return format.Identity{}, true, nil
-			}
-			return db.Identity, false, nil
-		}
-	}
-	ident, err = format.NewIdentity()
-	return ident, false, err
-}
-
-// ensureDatabaseKeyFile creates path (mode 0600) with a fresh root key if it
-// does not exist yet, matching nextsql init's own create-if-missing
-// convention, then reads and returns it either way.
-func ensureDatabaseKeyFile(path string) (*crypto.DEK, error) {
-	const op = "nextsql database create"
-	if _, err := os.Stat(path); os.IsNotExist(err) {
-		createdRoot, err := crypto.CreateKeyFile(path, 1)
-		if err != nil {
-			return nil, err
-		}
-		createdRoot.Zero()
-		fmt.Fprintf(os.Stderr, "created root key file %s (mode 0600); keep it off the data volume\n", path)
-	} else if err != nil {
-		return nil, nerr.Wrap(nerr.IO, op, "stat database key file", err)
-	}
-	return crypto.ReadKeyFile(path)
-}
-
-// activateManagedDatabase physically creates (or resumes creating) the
-// managed database file for realmID/databaseID at its ID-based path
-// (hosting.ManagedDatabasePath), then publishes it StateActive. Mirrors
-// the create/verify/publish sequence nextsql init already uses for the
-// single bootstrap default database (see createOrResumeDatabase),
-// generalized to any additional managed database.
-func activateManagedDatabase(reg *hosting.Registry, dataDir string, realmID, databaseID hosting.ID, ident format.Identity, root *crypto.DEK, bufferPages int) error {
-	path := hosting.ManagedDatabasePath(dataDir, realmID, databaseID)
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return nerr.Wrap(nerr.IO, "nextsql database create", "mkdir", err)
-	}
-	db, env, err := createOrResumeDatabase(path, ident, root, bufferPages)
-	if err != nil {
-		return err
-	}
-	if err := db.Close(); err != nil {
-		_ = env.Close()
-		return err
-	}
-	_ = env.Close()
-	return reg.SetDatabaseState(realmID, databaseID, hosting.StateActive)
-}
-
-// openHostingRegistryForCLI resolves the deployment registry root key and opens
-// the registry for a hosting subcommand. The instance key file defaults to
-// KEY-FILE.instance, matching "nextsql hosting adopt". When lock is true it also
-// takes the exclusive data-directory lock (a running nextsqld or another
-// offline command fails closed) and returns it for the caller to Close; a
 // registry write must never race the server that owns the same registry.
-func openHostingRegistryForCLI(op string, fs *flag.FlagSet, args []string, lock bool) (*hosting.Registry, *hosting.DataDirLock, cli.Settings, error) {
+func openRegistryForCLI(op string, fs *flag.FlagSet, args []string, lock bool) (*hosting.Registry, *hosting.DataDirLock, cli.Settings, error) {
 	settings, err := cli.Resolve(fs, args)
 	if err != nil {
 		return nil, nil, settings, err
@@ -482,7 +175,7 @@ func resolveRealmID(m hosting.Manifest, name string) (hosting.ID, error) {
 			return realm.ID, nil
 		}
 	}
-	return hosting.ID{}, nerr.New(nerr.NotFound, "nextsql hosting", "unknown realm")
+	return hosting.ID{}, nerr.New(nerr.NotFound, "nextsql registry", "unknown realm")
 }
 
 func resolveDatabaseID(m hosting.Manifest, realmID hosting.ID, name string) (hosting.ID, error) {
@@ -497,7 +190,7 @@ func resolveDatabaseID(m hosting.Manifest, realmID hosting.ID, name string) (hos
 			}
 		}
 	}
-	return hosting.ID{}, nerr.New(nerr.NotFound, "nextsql hosting", "unknown database in realm")
+	return hosting.ID{}, nerr.New(nerr.NotFound, "nextsql registry", "unknown database in realm")
 }
 
 // findManifestDatabase returns the full realm/database record for an
@@ -518,407 +211,6 @@ func findManifestDatabase(m hosting.Manifest, realmID, databaseID hosting.ID) (h
 	return hosting.Realm{}, hosting.Database{}, false
 }
 
-func setRealmStorageCap(args []string) error {
-	const op = "nextsql hosting set-realm-cap"
-	fs := flag.NewFlagSet("hosting set-realm-cap", flag.ContinueOnError)
-	fs.String("data-dir", "", "deployment data directory")
-	fs.String("key-file", "", "database root unlock key file (used to locate KEY-FILE.instance)")
-	fs.String("instance-key-file", "", "deployment registry root key file (default KEY-FILE.instance)")
-	realm := fs.String("realm", "", "realm name")
-	capBytes := fs.Uint64("cap-bytes", 0, "realm-wide storage cap in bytes (0 clears the cap)")
-	confirm := fs.Bool("confirm", false, "confirm the registry change")
-	fs.String("env-file", "", "load only this dotenv file")
-	fs.Bool("no-env", false, "do not load .env files")
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
-	reg, ddl, settings, err := openHostingRegistryForCLI(op, fs, args, true)
-	if err != nil {
-		return err
-	}
-	defer reg.Close()
-	defer ddl.Close()
-	if settings.Supplied["realm"] {
-		*realm = settings.Realm
-	}
-	if *realm == "" {
-		return cli.LocalMissing(op, "--realm is required")
-	}
-	if !*confirm {
-		return nerr.New(nerr.InvalidArgument, op, "--confirm is required")
-	}
-	realmID, err := resolveRealmID(reg.Manifest(), *realm)
-	if err != nil {
-		return err
-	}
-	if err := reg.SetRealmStorageCap(realmID, *capBytes); err != nil {
-		return err
-	}
-	fmt.Printf("realm %s cap_bytes %d\n", strings.ToLower(strings.TrimSpace(*realm)), *capBytes)
-	return nil
-}
-
-func setDatabaseStorageCap(args []string) error {
-	const op = "nextsql hosting set-database-cap"
-	fs := flag.NewFlagSet("hosting set-database-cap", flag.ContinueOnError)
-	fs.String("data-dir", "", "deployment data directory")
-	fs.String("key-file", "", "database root unlock key file (used to locate KEY-FILE.instance)")
-	fs.String("instance-key-file", "", "deployment registry root key file (default KEY-FILE.instance)")
-	realm := fs.String("realm", "", "realm name")
-	database := fs.String("database", "", "logical database name")
-	capBytes := fs.Uint64("cap-bytes", 0, "per-database storage cap in bytes (0 clears the cap)")
-	realmSecretFile := fs.String("realm-secret-file", "", "realm-root delegation secret file; authorises as realm root instead of deployment admin")
-	confirm := fs.Bool("confirm", false, "confirm the registry change")
-	fs.String("env-file", "", "load only this dotenv file")
-	fs.Bool("no-env", false, "do not load .env files")
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
-	reg, ddl, settings, err := openHostingRegistryForCLI(op, fs, args, true)
-	if err != nil {
-		return err
-	}
-	defer reg.Close()
-	defer ddl.Close()
-	if settings.Supplied["realm"] {
-		*realm = settings.Realm
-	}
-	if settings.Supplied["database"] {
-		*database = settings.Database
-	}
-	if *realm == "" || *database == "" {
-		return cli.LocalMissing(op, "--realm and --database are required")
-	}
-	if !*confirm {
-		return nerr.New(nerr.InvalidArgument, op, "--confirm is required")
-	}
-	m := reg.Manifest()
-	realmID, err := resolveRealmID(m, *realm)
-	if err != nil {
-		return err
-	}
-	databaseID, err := resolveDatabaseID(m, realmID, *database)
-	if err != nil {
-		return err
-	}
-	if *realmSecretFile != "" {
-		secret, err := readRealmRootSecret(op, *realmSecretFile)
-		if err != nil {
-			return err
-		}
-		defer wipe(secret)
-		if err := reg.SetDatabaseStorageCapAsRealmRoot(realmID, databaseID, *capBytes, secret); err != nil {
-			return err
-		}
-	} else if err := reg.SetDatabaseStorageCap(realmID, databaseID, *capBytes); err != nil {
-		return err
-	}
-	fmt.Printf("realm %s database %s cap_bytes %d\n",
-		strings.ToLower(strings.TrimSpace(*realm)), strings.ToLower(strings.TrimSpace(*database)), *capBytes)
-	return nil
-}
-
-// setDatabaseState is M3-1's CLI surface for the two lifecycle transitions
-// dbmanager's routing path (internal/hosting.Lookup) now actually enforces:
-// suspend blocks every future connection to the database until resumed,
-// resume restores it. Follows the exact same offline pattern as
-// set-realm-cap/set-database-cap (openHostingRegistryForCLI's exclusive
-// data-dir lock, so it fails Unavailable against a running nextsqld — a
-// state edit is an overwrite, applied on the next restart, same as a cap
-// edit; a live control-plane op to suspend/resume without a restart is the
-// same documented follow-on as live cap changes). Rename (M3-2) and
-// drop/tombstone (M3-3) are separate slices.
-func setDatabaseState(args []string, target hosting.State) error {
-	verb, past, action := "suspend", "suspended", security.ActionDatabaseSuspend
-	if target == hosting.StateActive {
-		verb, past, action = "resume", "resumed", security.ActionDatabaseResume
-	}
-	op := "nextsql database " + verb
-	fs := flag.NewFlagSet("database "+verb, flag.ContinueOnError)
-	fs.String("data-dir", "", "deployment data directory")
-	fs.String("key-file", "", "database root unlock key file (used to locate KEY-FILE.instance)")
-	fs.String("instance-key-file", "", "deployment registry root key file (default KEY-FILE.instance)")
-	realm := fs.String("realm", "", "realm name")
-	database := fs.String("database", "", "logical database name")
-	confirm := fs.Bool("confirm", false, "confirm the registry change")
-	fs.String("env-file", "", "load only this dotenv file")
-	fs.Bool("no-env", false, "do not load .env files")
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
-	reg, ddl, settings, err := openHostingRegistryForCLI(op, fs, args, true)
-	if err != nil {
-		return err
-	}
-	defer reg.Close()
-	defer ddl.Close()
-	if settings.Supplied["realm"] {
-		*realm = settings.Realm
-	}
-	if settings.Supplied["database"] {
-		*database = settings.Database
-	}
-	if *realm == "" || *database == "" {
-		return cli.LocalMissing(op, "--realm and --database are required")
-	}
-	if !*confirm {
-		return nerr.New(nerr.InvalidArgument, op, "--confirm is required")
-	}
-	m := reg.Manifest()
-	realmID, err := resolveRealmID(m, *realm)
-	if err != nil {
-		return err
-	}
-	databaseID, err := resolveDatabaseID(m, realmID, *database)
-	if err != nil {
-		return err
-	}
-	object := strings.ToLower(strings.TrimSpace(*realm)) + "/" + strings.ToLower(strings.TrimSpace(*database))
-	if err := reg.SetDatabaseState(realmID, databaseID, target); err != nil {
-		auditLocal(settings.DataDir, action, object, err)
-		return err
-	}
-	auditLocal(settings.DataDir, action, object, nil)
-	fmt.Printf("realm %s database %s %s\n", strings.ToLower(strings.TrimSpace(*realm)), strings.ToLower(strings.TrimSpace(*database)), past)
-	return nil
-}
-
-// dropDatabase is M3-3's CLI surface for the physical half of the delete
-// lifecycle (docs/design-multidatabase-dbaas.md §16 M3-3). The
-// StateDeleting/StateTombstoned states and Lookup's fail-closed handling of
-// both already existed (state machine landed with M0/M1; Lookup's
-// enforcement landed with M3-1, log #112) — the remaining gap was
-// exclusively that nothing ever reclaimed a tombstoned managed database's
-// on-disk files. Follows the exact same offline pattern as suspend/resume
-// (openHostingRegistryForCLI's exclusive data-dir lock, so it fails
-// Unavailable against a running nextsqld — there is no live connection to
-// evict because the server cannot be up while this runs). Scoped to
-// realm-managed (LayoutManaged) databases, never the deployment's default
-// realm/database: LayoutLegacyDefault lives directly at DATA-DIR/nextsql.db
-// with no per-ID directory to safely reclaim, and every tool that omits
-// --realm/--database assumes that path exists; a declarative-manifest
-// deployment's default database is LayoutManaged but is still rejected by
-// the explicit default-pair check for the same reason. Idempotent: a
-// database already StateTombstoned (e.g. a prior run that reclaimed the
-// files but crashed before the final state write) reports success without
-// erroring; a prior run that crashed after StateDeleting but before
-// reclaiming files resumes cleanly (os.RemoveAll is idempotent, and
-// CanTransition treats StateDeleting -> StateDeleting as a valid no-op).
-// Realm-level delete and reclaiming an *open* database's live
-// buffer/task-pool footprint remain separate, still-open items.
-func dropDatabase(args []string) error {
-	const op = "nextsql database drop"
-	fs := flag.NewFlagSet("database drop", flag.ContinueOnError)
-	fs.String("data-dir", "", "deployment data directory")
-	fs.String("key-file", "", "database root unlock key file (used to locate KEY-FILE.instance)")
-	fs.String("instance-key-file", "", "deployment registry root key file (default KEY-FILE.instance)")
-	realm := fs.String("realm", "", "realm name")
-	database := fs.String("database", "", "logical database name")
-	confirm := fs.Bool("confirm", false, "confirm the irreversible delete")
-	fs.String("env-file", "", "load only this dotenv file")
-	fs.Bool("no-env", false, "do not load .env files")
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
-	reg, ddl, settings, err := openHostingRegistryForCLI(op, fs, args, true)
-	if err != nil {
-		return err
-	}
-	defer reg.Close()
-	defer ddl.Close()
-	if settings.Supplied["realm"] {
-		*realm = settings.Realm
-	}
-	if settings.Supplied["database"] {
-		*database = settings.Database
-	}
-	if *realm == "" || *database == "" {
-		return cli.LocalMissing(op, "--realm and --database are required")
-	}
-	if !*confirm {
-		return nerr.New(nerr.InvalidArgument, op, "--confirm is required")
-	}
-	m := reg.Manifest()
-	realmID, err := resolveRealmID(m, *realm)
-	if err != nil {
-		return err
-	}
-	databaseID, err := resolveDatabaseID(m, realmID, *database)
-	if err != nil {
-		return err
-	}
-	object := strings.ToLower(strings.TrimSpace(*realm)) + "/" + strings.ToLower(strings.TrimSpace(*database))
-	if realmID == m.DefaultRealm && databaseID == m.DefaultDatabase {
-		derr := nerr.New(nerr.InvalidArgument, op, "cannot drop the deployment default database")
-		auditLocal(settings.DataDir, security.ActionDatabaseDrop, object, derr)
-		return derr
-	}
-	_, dbRec, found := findManifestDatabase(m, realmID, databaseID)
-	if !found {
-		return nerr.New(nerr.NotFound, op, "unknown database in realm")
-	}
-	if dbRec.Layout != hosting.LayoutManaged {
-		lerr := nerr.New(nerr.InvalidArgument, op, "drop is only supported for realm-managed databases; the legacy default-layout database is out of scope")
-		auditLocal(settings.DataDir, security.ActionDatabaseDrop, object, lerr)
-		return lerr
-	}
-	if dbRec.State == hosting.StateTombstoned {
-		fmt.Printf("realm %s database %s already dropped\n",
-			strings.ToLower(strings.TrimSpace(*realm)), strings.ToLower(strings.TrimSpace(*database)))
-		return nil
-	}
-	if err := reg.SetDatabaseState(realmID, databaseID, hosting.StateDeleting); err != nil {
-		auditLocal(settings.DataDir, security.ActionDatabaseDrop, object, err)
-		return err
-	}
-	dbPath := hosting.ManagedDatabasePath(settings.DataDir, realmID, databaseID)
-	dir := filepath.Dir(dbPath)
-	if _, statErr := os.Stat(dir); statErr == nil {
-		if rmErr := os.RemoveAll(dir); rmErr != nil {
-			rmErr = nerr.Wrap(nerr.IO, op, "remove managed database files", rmErr)
-			auditLocal(settings.DataDir, security.ActionDatabaseDrop, object, rmErr)
-			return rmErr
-		}
-	} else if !os.IsNotExist(statErr) {
-		statErr = nerr.Wrap(nerr.IO, op, "stat managed database directory", statErr)
-		auditLocal(settings.DataDir, security.ActionDatabaseDrop, object, statErr)
-		return statErr
-	}
-	if err := reg.SetDatabaseState(realmID, databaseID, hosting.StateTombstoned); err != nil {
-		auditLocal(settings.DataDir, security.ActionDatabaseDrop, object, err)
-		return err
-	}
-	auditLocal(settings.DataDir, security.ActionDatabaseDrop, object, nil)
-	fmt.Printf("realm %s database %s dropped\n", strings.ToLower(strings.TrimSpace(*realm)), strings.ToLower(strings.TrimSpace(*database)))
-	return nil
-}
-
-// renameDatabase is M3-2's CLI surface for a durable database name change
-// within a realm. The stable ID, layout, and on-disk path stay put.
-// Offline exclusive-lock pattern matches suspend/drop. --confirm required.
-// A collision with another database in the same realm fails AlreadyExists;
-// deleting/tombstoned databases cannot be renamed.
-func renameDatabase(args []string) error {
-	const op = "nextsql database rename"
-	fs := flag.NewFlagSet("database rename", flag.ContinueOnError)
-	fs.String("data-dir", "", "deployment data directory")
-	fs.String("key-file", "", "database root unlock key file (used to locate KEY-FILE.instance)")
-	fs.String("instance-key-file", "", "deployment registry root key file (default KEY-FILE.instance)")
-	realm := fs.String("realm", "", "realm name")
-	database := fs.String("database", "", "current logical database name")
-	to := fs.String("to", "", "new logical database name")
-	confirm := fs.Bool("confirm", false, "confirm the registry change")
-	fs.String("env-file", "", "load only this dotenv file")
-	fs.Bool("no-env", false, "do not load .env files")
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
-	reg, ddl, settings, err := openHostingRegistryForCLI(op, fs, args, true)
-	if err != nil {
-		return err
-	}
-	defer reg.Close()
-	defer ddl.Close()
-	if settings.Supplied["realm"] {
-		*realm = settings.Realm
-	}
-	if settings.Supplied["database"] {
-		*database = settings.Database
-	}
-	if *realm == "" || *database == "" || *to == "" {
-		return cli.LocalMissing(op, "--realm, --database, and --to are required")
-	}
-	if !*confirm {
-		return nerr.New(nerr.InvalidArgument, op, "--confirm is required")
-	}
-	m := reg.Manifest()
-	realmID, err := resolveRealmID(m, *realm)
-	if err != nil {
-		return err
-	}
-	databaseID, err := resolveDatabaseID(m, realmID, *database)
-	if err != nil {
-		return err
-	}
-	object := strings.ToLower(strings.TrimSpace(*realm)) + "/" + strings.ToLower(strings.TrimSpace(*database)) + "->" + strings.ToLower(strings.TrimSpace(*to))
-	if err := reg.RenameDatabase(realmID, databaseID, *to); err != nil {
-		auditLocal(settings.DataDir, security.ActionDatabaseRename, object, err)
-		return err
-	}
-	auditLocal(settings.DataDir, security.ActionDatabaseRename, object, nil)
-	fmt.Printf("realm %s database %s renamed to %s\n",
-		strings.ToLower(strings.TrimSpace(*realm)), strings.ToLower(strings.TrimSpace(*database)), strings.ToLower(strings.TrimSpace(*to)))
-	return nil
-}
-
-func setRealmRootAuth(args []string) error {
-	const op = "nextsql hosting set-realm-root"
-	fs := flag.NewFlagSet("hosting set-realm-root", flag.ContinueOnError)
-	fs.String("data-dir", "", "deployment data directory")
-	fs.String("key-file", "", "database root unlock key file (used to locate KEY-FILE.instance)")
-	fs.String("instance-key-file", "", "deployment registry root key file (default KEY-FILE.instance)")
-	realm := fs.String("realm", "", "realm name")
-	secretFile := fs.String("secret-file", "", "realm-root delegation secret file (>= 16 bytes)")
-	clear := fs.Bool("clear", false, "remove the realm-root delegation for this realm")
-	confirm := fs.Bool("confirm", false, "confirm the registry change")
-	fs.String("env-file", "", "load only this dotenv file")
-	fs.Bool("no-env", false, "do not load .env files")
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
-	reg, ddl, settings, err := openHostingRegistryForCLI(op, fs, args, true)
-	if err != nil {
-		return err
-	}
-	defer reg.Close()
-	defer ddl.Close()
-	if settings.Supplied["realm"] {
-		*realm = settings.Realm
-	}
-	if *realm == "" {
-		return cli.LocalMissing(op, "--realm is required")
-	}
-	if *clear == (*secretFile != "") {
-		return nerr.New(nerr.InvalidArgument, op, "provide exactly one of --secret-file or --clear")
-	}
-	if !*confirm {
-		return nerr.New(nerr.InvalidArgument, op, "--confirm is required")
-	}
-	realmID, err := resolveRealmID(reg.Manifest(), *realm)
-	if err != nil {
-		return err
-	}
-	var secret []byte
-	if !*clear {
-		secret, err = readRealmRootSecret(op, *secretFile)
-		if err != nil {
-			return err
-		}
-		defer wipe(secret)
-	}
-	if err := reg.SetRealmRootAuth(realmID, secret); err != nil {
-		return err
-	}
-	action := "set"
-	if *clear {
-		action = "cleared"
-	}
-	fmt.Printf("realm %s realm_root %s\n", strings.ToLower(strings.TrimSpace(*realm)), action)
-	return nil
-}
-
-func readRealmRootSecret(op, path string) ([]byte, error) {
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		return nil, nerr.Wrap(nerr.IO, op, "read realm-root secret file", err)
-	}
-	secret := bytesTrimSpace(raw)
-	if len(secret) == 0 {
-		return nil, nerr.New(nerr.InvalidArgument, op, "realm-root secret file is empty")
-	}
-	return secret, nil
-}
-
 func bytesTrimSpace(b []byte) []byte {
 	start, end := 0, len(b)
 	for start < end && (b[start] == ' ' || b[start] == '\t' || b[start] == '\n' || b[start] == '\r') {
@@ -936,9 +228,9 @@ func wipe(b []byte) {
 	}
 }
 
-func showHostingRegistry(args []string) error {
-	const op = "nextsql hosting show"
-	fs := flag.NewFlagSet("hosting show", flag.ContinueOnError)
+func showDeploymentRegistry(args []string) error {
+	const op = "nextsql registry show"
+	fs := flag.NewFlagSet("registry show", flag.ContinueOnError)
 	fs.String("data-dir", "", "deployment data directory")
 	fs.String("key-file", "", "database root unlock key file (used to locate KEY-FILE.instance)")
 	fs.String("instance-key-file", "", "deployment registry root key file (default KEY-FILE.instance)")
@@ -947,7 +239,7 @@ func showHostingRegistry(args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	reg, _, _, err := openHostingRegistryForCLI(op, fs, args, false)
+	reg, _, _, err := openRegistryForCLI(op, fs, args, false)
 	if err != nil {
 		return err
 	}
@@ -955,14 +247,8 @@ func showHostingRegistry(args []string) error {
 	m := reg.Manifest()
 	fmt.Printf("deployment %s generation %d\n", m.DeploymentID.String(), m.Generation)
 	for _, realm := range m.Realms {
-		realmRoot := "unset"
-		if realm.RealmRootAuthHash != ([32]byte{}) {
-			realmRoot = "delegated"
-		}
-		fmt.Printf("realm %s %s state %d cap_bytes %d realm_root %s\n",
-			realm.Name, realm.ID.String(), realm.State, realm.StorageCapBytes, realmRoot)
 		for _, db := range realm.Databases {
-			fmt.Printf("  database %s %s state %d layout %d cap_bytes %d\n",
+			fmt.Printf("database %s %s state %d layout %d cap_bytes %d\n",
 				db.Name, db.ID.String(), db.State, db.Layout, db.StorageCapBytes)
 		}
 	}
@@ -974,14 +260,13 @@ func showHostingRegistry(args []string) error {
 // publishes the destination ACTIVE. Both deployments are exclusively locked
 // for the entire operation.
 func migrateLegacyTenant(args []string) error {
-	fs := flag.NewFlagSet("hosting migrate-tenant", flag.ContinueOnError)
+	fs := flag.NewFlagSet("registry migrate-tenant", flag.ContinueOnError)
 	sourceDataDir := fs.String("source-data-dir", "", "offline source data directory")
 	sourceKeyFile := fs.String("source-key-file", "", "source root unlock key file")
 	tenant := fs.String("tenant", "", "exact legacy tenant UUID or string")
 	destDataDir := fs.String("data-dir", "", "new or resumable isolated destination data directory")
 	destKeyFile := fs.String("key-file", "", "independent destination root unlock key file")
 	instanceKeyFile := fs.String("instance-key-file", "", "independent destination registry root key file (default KEY-FILE.instance)")
-	realmName := fs.String("realm", "default", "destination subscription realm name")
 	databaseName := fs.String("database", "default", "destination logical database name")
 	bufferPages := fs.Int("buffer-pages", config.DefaultBufferPages, "buffer pool pages per opened database")
 	batchRows := fs.Int("batch-rows", 256, "rows per destination transaction (1-4096)")
@@ -990,19 +275,19 @@ func migrateLegacyTenant(args []string) error {
 		return err
 	}
 	if *sourceDataDir == "" || *sourceKeyFile == "" || *destDataDir == "" || *destKeyFile == "" {
-		return cli.LocalMissing("nextsql hosting migrate-tenant", "--source-data-dir, --source-key-file, --data-dir, and --key-file are required")
+		return cli.LocalMissing("nextsql registry migrate-tenant", "--source-data-dir, --source-key-file, --data-dir, and --key-file are required")
 	}
 	if *tenant == "" {
-		return nerr.New(nerr.InvalidArgument, "nextsql hosting migrate-tenant", "--tenant is required")
+		return nerr.New(nerr.InvalidArgument, "nextsql registry migrate-tenant", "--tenant is required")
 	}
 	if !*confirm {
-		return nerr.New(nerr.InvalidArgument, "nextsql hosting migrate-tenant", "--confirm is required")
+		return nerr.New(nerr.InvalidArgument, "nextsql registry migrate-tenant", "--confirm is required")
 	}
 	if *batchRows < 1 || *batchRows > 4096 {
-		return nerr.New(nerr.InvalidArgument, "nextsql hosting migrate-tenant", "--batch-rows must be between 1 and 4096")
+		return nerr.New(nerr.InvalidArgument, "nextsql registry migrate-tenant", "--batch-rows must be between 1 and 4096")
 	}
-	if *bufferPages < 1 {
-		return nerr.New(nerr.InvalidArgument, "nextsql hosting migrate-tenant", "--buffer-pages must be positive")
+	if err := limits.Check("buffer_pages", *bufferPages); err != nil {
+		return nerr.New(nerr.InvalidArgument, "nextsql registry migrate-tenant", err.Error())
 	}
 	if *instanceKeyFile == "" {
 		*instanceKeyFile = *destKeyFile + ".instance"
@@ -1011,27 +296,27 @@ func migrateLegacyTenant(args []string) error {
 	var err error
 	*sourceDataDir, err = filepath.Abs(filepath.Clean(*sourceDataDir))
 	if err != nil {
-		return nerr.Wrap(nerr.IO, "nextsql hosting migrate-tenant", "resolve source data directory", err)
+		return nerr.Wrap(nerr.IO, "nextsql registry migrate-tenant", "resolve source data directory", err)
 	}
 	*destDataDir, err = filepath.Abs(filepath.Clean(*destDataDir))
 	if err != nil {
-		return nerr.Wrap(nerr.IO, "nextsql hosting migrate-tenant", "resolve destination data directory", err)
+		return nerr.Wrap(nerr.IO, "nextsql registry migrate-tenant", "resolve destination data directory", err)
 	}
 	if deploymentPathsOverlap(*sourceDataDir, *destDataDir) {
-		return nerr.New(nerr.InvalidArgument, "nextsql hosting migrate-tenant", "source and destination data directories must be separate and non-nested")
+		return nerr.New(nerr.InvalidArgument, "nextsql registry migrate-tenant", "source and destination data directories must be separate and non-nested")
 	}
 	if samePath(*sourceKeyFile, *destKeyFile) || samePath(*sourceKeyFile, *instanceKeyFile) || samePath(*destKeyFile, *instanceKeyFile) {
-		return nerr.New(nerr.InvalidArgument, "nextsql hosting migrate-tenant", "source, destination, and registry root key files must be independent")
+		return nerr.New(nerr.InvalidArgument, "nextsql registry migrate-tenant", "source, destination, and registry root key files must be independent")
 	}
 	sourceInfo, err := os.Stat(*sourceDataDir)
 	if err != nil {
-		return nerr.Wrap(nerr.IO, "nextsql hosting migrate-tenant", "stat source data directory", err)
+		return nerr.Wrap(nerr.IO, "nextsql registry migrate-tenant", "stat source data directory", err)
 	}
 	if !sourceInfo.IsDir() {
-		return nerr.New(nerr.InvalidArgument, "nextsql hosting migrate-tenant", "source data directory is not a directory")
+		return nerr.New(nerr.InvalidArgument, "nextsql registry migrate-tenant", "source data directory is not a directory")
 	}
 	if err := os.MkdirAll(*destDataDir, 0o700); err != nil {
-		return nerr.Wrap(nerr.IO, "nextsql hosting migrate-tenant", "create destination data directory", err)
+		return nerr.Wrap(nerr.IO, "nextsql registry migrate-tenant", "create destination data directory", err)
 	}
 
 	firstPath, secondPath := *sourceDataDir, *destDataDir
@@ -1072,7 +357,7 @@ func migrateLegacyTenant(args []string) error {
 	}()
 
 	destPath := filepath.Join(*destDataDir, config.DataFileName)
-	if err := preflightHostingBootstrap(*destDataDir, destPath); err != nil {
+	if err := preflightRegistryBootstrap(*destDataDir, destPath); err != nil {
 		return err
 	}
 	registryPath := hosting.Path(*destDataDir)
@@ -1110,10 +395,10 @@ func migrateLegacyTenant(args []string) error {
 	}
 	defer instanceRoot.Zero()
 	if sourceRoot.Equal(destRoot) || sourceRoot.Equal(instanceRoot) || destRoot.Equal(instanceRoot) {
-		return nerr.New(nerr.InvalidArgument, "nextsql hosting migrate-tenant", "source, destination, and registry roots must contain independent keys")
+		return nerr.New(nerr.InvalidArgument, "nextsql registry migrate-tenant", "source, destination, and registry roots must contain independent keys")
 	}
 
-	registry, destIdentity, err := prepareHostingBootstrap(*destDataDir, destPath, destRoot, instanceRoot, *realmName, *databaseName)
+	registry, destIdentity, err := prepareRegistryBootstrap(*destDataDir, destPath, destRoot, instanceRoot, defaultRealmName, *databaseName)
 	if err != nil {
 		return err
 	}
@@ -1123,7 +408,7 @@ func migrateLegacyTenant(args []string) error {
 		return err
 	}
 	if defaultDatabase.State != hosting.StateProvisioning && defaultDatabase.State != hosting.StateActive {
-		return nerr.New(nerr.Conflict, "nextsql hosting migrate-tenant", "destination migration is not resumable from its lifecycle state")
+		return nerr.New(nerr.Conflict, "nextsql registry migrate-tenant", "destination migration is not resumable from its lifecycle state")
 	}
 	destDB, destEnvelope, err := createOrResumeDatabase(destPath, destIdentity, destRoot, *bufferPages)
 	if err != nil {
@@ -1147,7 +432,7 @@ func migrateLegacyTenant(args []string) error {
 		return err
 	}
 	if defaultDatabase.State == hosting.StateActive && currentIntent.State != hosting.TenantMigrationComplete {
-		return nerr.New(nerr.Conflict, "nextsql hosting migrate-tenant", "ACTIVE destination has an incomplete migration intent")
+		return nerr.New(nerr.Conflict, "nextsql registry migrate-tenant", "ACTIVE destination has an incomplete migration intent")
 	}
 
 	var result *xport.LegacyTenantResult
@@ -1178,8 +463,8 @@ func migrateLegacyTenant(args []string) error {
 			return err
 		}
 	}
-	fmt.Printf("migrated legacy tenant\nsource_database %s\ndestination_database %s\nrealm %s %s\ndatabase_name %s\ntables %d\nrows %d\n",
-		intent.Source.DatabaseString(), intent.Destination.DatabaseString(), defaultRealm.Name, defaultRealm.ID.String(), defaultDatabase.Name, result.Tables, result.Rows)
+	fmt.Printf("migrated legacy tenant\nsource_database %s\ndestination_database %s\ndatabase_name %s\ntables %d\nrows %d\n",
+		intent.Source.DatabaseString(), intent.Destination.DatabaseString(), defaultDatabase.Name, result.Tables, result.Rows)
 	return nil
 }
 
@@ -1192,7 +477,7 @@ func ensureMigrationRootFile(path string, partial bool, label string) error {
 		return nil
 	}
 	if partial {
-		return nerr.New(nerr.NotFound, "nextsql hosting migrate-tenant", label+" root key file is missing")
+		return nerr.New(nerr.NotFound, "nextsql registry migrate-tenant", label+" root key file is missing")
 	}
 	root, err := crypto.CreateKeyFile(path, 1)
 	if err != nil {
@@ -1224,11 +509,10 @@ func deploymentPathsOverlap(a, b string) bool {
 // deployment default. It preserves the database identity and legacy layout;
 // it never discovers or adopts sibling files.
 func adoptLegacyDatabase(args []string) error {
-	fs := flag.NewFlagSet("hosting adopt", flag.ContinueOnError)
+	fs := flag.NewFlagSet("registry adopt", flag.ContinueOnError)
 	dataDir := fs.String("data-dir", "", "existing single-database data directory")
 	keyFile := fs.String("key-file", "", "existing database root unlock key file")
 	instanceKeyFile := fs.String("instance-key-file", "", "deployment registry root key file (default KEY-FILE.instance)")
-	realmName := fs.String("realm", "default", "adopted subscription realm name")
 	databaseName := fs.String("database", "default", "adopted logical database name")
 	bufferPages := fs.Int("buffer-pages", config.DefaultBufferPages, "buffer pool pages used for recovery verification")
 	confirm := fs.Bool("confirm", false, "confirm offline deployment adoption")
@@ -1245,25 +529,22 @@ func adoptLegacyDatabase(args []string) error {
 	*keyFile = settings.KeyFile
 	*instanceKeyFile = settings.InstanceKeyFile
 	*bufferPages = settings.BufferPages
-	*confirm = settings.HostingConfirm
-	if settings.Supplied["realm"] {
-		*realmName = settings.Realm
-	}
+	*confirm = settings.RegistryConfirm
 	if settings.Supplied["database"] {
 		*databaseName = settings.Database
 	}
 	if *dataDir == "" || *keyFile == "" {
-		return cli.LocalMissing("nextsql hosting adopt", "--data-dir and --key-file are required")
+		return cli.LocalMissing("nextsql registry adopt", "--data-dir and --key-file are required")
 	}
 	if !*confirm {
-		return nerr.New(nerr.InvalidArgument, "nextsql hosting adopt", "--confirm is required")
+		return nerr.New(nerr.InvalidArgument, "nextsql registry adopt", "--confirm is required")
 	}
 	st, err := os.Stat(*dataDir)
 	if err != nil {
-		return nerr.Wrap(nerr.IO, "nextsql hosting adopt", "stat data directory", err)
+		return nerr.Wrap(nerr.IO, "nextsql registry adopt", "stat data directory", err)
 	}
 	if !st.IsDir() {
-		return nerr.New(nerr.InvalidArgument, "nextsql hosting adopt", "data directory is not a directory")
+		return nerr.New(nerr.InvalidArgument, "nextsql registry adopt", "data directory is not a directory")
 	}
 	dataDirLock, err := hosting.AcquireDataDirLock(*dataDir)
 	if err != nil {
@@ -1276,7 +557,7 @@ func adoptLegacyDatabase(args []string) error {
 		return err
 	}
 	if !report.OK || !report.HasIdent || !report.Keystore {
-		return nerr.New(nerr.Corruption, "nextsql hosting adopt", "legacy database preflight failed; run nextsql diagnose")
+		return nerr.New(nerr.Corruption, "nextsql registry adopt", "legacy database preflight failed; run nextsql diagnose")
 	}
 	dbPath := filepath.Join(*dataDir, config.DataFileName)
 	databaseRoot, err := crypto.ReadKeyFile(*keyFile)
@@ -1290,7 +571,7 @@ func adoptLegacyDatabase(args []string) error {
 	}
 	if databaseEnvelope.Identity() != report.Identity {
 		_ = databaseEnvelope.Close()
-		return nerr.New(nerr.Corruption, "nextsql hosting adopt", "database and keystore identities do not match")
+		return nerr.New(nerr.Corruption, "nextsql registry adopt", "database and keystore identities do not match")
 	}
 	db, err := executor.Open(dbPath, databaseEnvelope, *bufferPages)
 	if err != nil {
@@ -1325,7 +606,7 @@ func adoptLegacyDatabase(args []string) error {
 	}
 	if !instanceRootPresent {
 		if registryPresent {
-			return nerr.New(nerr.NotFound, "nextsql hosting adopt", "deployment registry root key file is missing")
+			return nerr.New(nerr.NotFound, "nextsql registry adopt", "deployment registry root key file is missing")
 		}
 		createdRoot, err := crypto.CreateKeyFile(*instanceKeyFile, 1)
 		if err != nil {
@@ -1340,7 +621,7 @@ func adoptLegacyDatabase(args []string) error {
 	}
 	defer instanceRoot.Zero()
 	registry, _, err := hosting.EnsureBootstrap(registryPath, instanceRoot, hosting.Bootstrap{
-		RealmName:        *realmName,
+		RealmName:        defaultRealmName,
 		DatabaseName:     *databaseName,
 		DatabaseIdentity: identity,
 		DatabaseState:    hosting.StateProvisioning,
@@ -1354,7 +635,7 @@ func adoptLegacyDatabase(args []string) error {
 		return err
 	}
 	if database.Layout != hosting.LayoutLegacyDefault {
-		return nerr.New(nerr.Conflict, "nextsql hosting adopt", "registered database is not in the legacy default layout")
+		return nerr.New(nerr.Conflict, "nextsql registry adopt", "registered database is not in the legacy default layout")
 	}
 	switch database.State {
 	case hosting.StateProvisioning:
@@ -1364,11 +645,11 @@ func adoptLegacyDatabase(args []string) error {
 	case hosting.StateActive:
 		// Exact reruns are idempotent after database recovery verification.
 	default:
-		return nerr.New(nerr.Conflict, "nextsql hosting adopt", "database adoption is not resumable from its current state")
+		return nerr.New(nerr.Conflict, "nextsql registry adopt", "database adoption is not resumable from its current state")
 	}
 	manifest := registry.Manifest()
-	fmt.Printf("adopted %s\ndeployment %s\nrealm %s %s\ndatabase_name %s\ndatabase %s\nfile %s\n",
-		dbPath, manifest.DeploymentID.String(), realm.Name, realm.ID.String(), database.Name,
+	fmt.Printf("adopted %s\ndeployment %s\ndatabase_name %s\ndatabase %s\nfile %s\n",
+		dbPath, manifest.DeploymentID.String(), database.Name,
 		identity.DatabaseString(), identity.FileString())
 	return nil
 }
@@ -1388,14 +669,12 @@ func initDB(args []string) error {
 	fs := flag.NewFlagSet("init", flag.ContinueOnError)
 	dataDir := fs.String("data-dir", "", "directory for nextsql.db")
 	keyFile := fs.String("key-file", "", "root unlock key file (created if missing; never pass a key in a URL)")
-	user := fs.String("user", "", "optional bootstrap user")
-	passwordFile := fs.String("password-file", "", "password file for --user")
+	user := fs.String("user", "", "bootstrap user (default: root when credentials are supplied)")
+	passwordFile := fs.String("password-file", "", "password file for the bootstrap user")
 	bufferPages := fs.Int("buffer-pages", config.DefaultBufferPages, "buffer pool pages")
 	preallocAhead := fs.Int("prealloc-ahead-pages", config.DefaultPreallocAheadPages, "storage preallocation runway in 16 KiB pages (default ~256 MiB); lower it for containers or many small databases")
-	realmName := fs.String("realm", "default", "bootstrap subscription realm name")
-	databaseName := fs.String("database", "default", "bootstrap logical database name")
+	databaseName := fs.String("database", "", "name the deployment's database and create it; unset initializes the deployment only (keys and administrator), with no database")
 	instanceKeyFile := fs.String("instance-key-file", "", "deployment registry root key file (default KEY-FILE.instance)")
-	fs.String("hosting-manifest", "", "declarative multi-realm bootstrap manifest (or NEXTSQL_HOSTING_MANIFEST_FILE)")
 	fs.String("env-file", "", "load only this dotenv file")
 	fs.Bool("no-env", false, "do not load .env files")
 	if err := fs.Parse(args); err != nil {
@@ -1403,6 +682,9 @@ func initDB(args []string) error {
 	}
 	// Process-wide storage preallocation runway, applied before the database
 	// file is created so the new file claims only the configured amount.
+	if err := limits.Check("prealloc_ahead_pages", *preallocAhead); err != nil {
+		return nerr.New(nerr.InvalidArgument, "nextsql init", err.Error())
+	}
 	file.SetCapacityAhead(*preallocAhead)
 	settings, err := cli.Resolve(fs, args)
 	if err != nil {
@@ -1412,6 +694,9 @@ func initDB(args []string) error {
 	*keyFile = settings.KeyFile
 	*instanceKeyFile = settings.InstanceKeyFile
 	*bufferPages = settings.BufferPages
+	if err := limits.Check("buffer_pages", *bufferPages); err != nil {
+		return nerr.New(nerr.InvalidArgument, "nextsql init", err.Error())
+	}
 	serverPass := ""
 	if settings.Explicit["user"] {
 		*user = settings.User
@@ -1426,18 +711,24 @@ func initDB(args []string) error {
 	if !settings.Explicit["password-file"] && settings.Supplied["server-pass"] {
 		serverPass = settings.ServerPass
 	}
-	if settings.Supplied["realm"] {
-		*realmName = settings.Realm
+	// Credentials without an explicit principal bootstrap the conventional root
+	// administrator. Preserve the credential-less initialization path used by
+	// developer and setup/repair workflows: no password means no account is
+	// requested, rather than creating an unusable passwordless root account.
+	if *user == "" && (*passwordFile != "" || serverPass != "") {
+		*user = "root"
 	}
 	if settings.Supplied["database"] {
 		*databaseName = settings.Database
 	}
-	manifestPath := settings.HostingManifest
-	if manifestPath != "" {
-		if *dataDir == "" || (*keyFile == "" && *instanceKeyFile == "") {
-			return cli.LocalMissing("nextsql init", "--data-dir and --key-file (or --instance-key-file) are required")
-		}
-	} else if *dataDir == "" || *keyFile == "" {
+	// A deployment holds exactly one database, so there is no declarative
+	// multi-realm bootstrap any more; a manifest supplied by an old runbook
+	// or environment is refused rather than silently ignored.
+	if settings.HostingManifest != "" {
+		return nerr.New(nerr.InvalidArgument, "nextsql init",
+			"--hosting-manifest was removed with multi-realm/multi-database hosting: initialize one deployment per database")
+	}
+	if *dataDir == "" || *keyFile == "" {
 		return cli.LocalMissing("nextsql init", "--data-dir and --key-file are required")
 	}
 	if err := os.MkdirAll(*dataDir, 0o755); err != nil {
@@ -1449,11 +740,8 @@ func initDB(args []string) error {
 	}
 	defer dataDirLock.Close()
 	dbPath := filepath.Join(*dataDir, config.DataFileName)
-	if err := preflightHostingBootstrap(*dataDir, dbPath); err != nil {
+	if err := preflightRegistryBootstrap(*dataDir, dbPath); err != nil {
 		return err
-	}
-	if manifestPath != "" {
-		return initFromManifest(manifestPath, *dataDir, *keyFile, *instanceKeyFile, *bufferPages, *user, *passwordFile, serverPass)
 	}
 	if _, err := os.Stat(*keyFile); os.IsNotExist(err) {
 		createdRoot, err := crypto.CreateKeyFile(*keyFile, 1)
@@ -1462,6 +750,24 @@ func initDB(args []string) error {
 		}
 		createdRoot.Zero()
 		fmt.Fprintf(os.Stderr, "created root key file %s (mode 0600); keep it off the data volume\n", *keyFile)
+	}
+	// No --database means: initialize the deployment, not a database. Nothing
+	// database-shaped is created — no keystore, no nextsql.db, and no
+	// deployment registry, because the registry's own format requires the
+	// database it describes to exist. The durable result is the root key file
+	// and, if one was asked for, the administrator in the deployment-level
+	// auth store and ACL. Naming a database later (`nextsql init --database
+	// NAME` on this same data directory) creates all of it in one step.
+	if *databaseName == "" {
+		if err := bootstrapDeploymentUser(*dataDir, *user, *passwordFile, serverPass); err != nil {
+			return err
+		}
+		fmt.Printf("initialized deployment %s\nkey_file %s\ndatabase none\n", *dataDir, *keyFile)
+		if *user != "" {
+			fmt.Printf("administrator %s\n", *user)
+		}
+		fmt.Printf("next: nextsql init --data-dir %s --key-file %s --database NAME\n", *dataDir, *keyFile)
+		return nil
 	}
 	root, err := crypto.ReadKeyFile(*keyFile)
 	if err != nil {
@@ -1484,7 +790,7 @@ func initDB(args []string) error {
 		return err
 	}
 	defer instanceRoot.Zero()
-	registry, ident, err := prepareHostingBootstrap(*dataDir, dbPath, root, instanceRoot, *realmName, *databaseName)
+	registry, ident, err := prepareRegistryBootstrap(*dataDir, dbPath, root, instanceRoot, defaultRealmName, *databaseName)
 	if err != nil {
 		return err
 	}
@@ -1516,9 +822,9 @@ func initDB(args []string) error {
 		return err
 	}
 	manifest := registry.Manifest()
-	fmt.Printf("initialized %s\ndatabase %s\nfile %s\ndeployment %s\nrealm %s %s\ndatabase_name %s\n",
+	fmt.Printf("initialized %s\ndatabase %s\nfile %s\ndeployment %s\ndatabase_name %s\n",
 		dbPath, ident.DatabaseString(), ident.FileString(), manifest.DeploymentID.String(),
-		defaultRealm.Name, defaultRealm.ID.String(), defaultDatabase.Name)
+		defaultDatabase.Name)
 	return nil
 }
 
@@ -1559,93 +865,7 @@ func bootstrapDeploymentUser(dataDir, user, passwordFile, serverPass string) err
 	return acl.Grant(user, security.PrivConnect, security.ScopeDatabase, "")
 }
 
-// initFromManifest is the declarative multi-realm bootstrap path: it
-// validates the whole manifest (and every referenced key file) before any
-// mutation, creates any missing per-database root key file, publishes one
-// registry generation containing every declared realm/database, then
-// physically creates and activates each managed database. Re-running with
-// an identical manifest is idempotent — already-ACTIVE databases are left
-// untouched — and a partial run resumes cleanly. The deployment registry
-// root is --instance-key-file, or KEY-FILE.instance when only --key-file is
-// given (--key-file itself is never used as a database key here; each
-// database's key comes from the manifest).
-func initFromManifest(manifestPath, dataDir, keyFile, instanceKeyFile string, bufferPages int, user, passwordFile, serverPass string) error {
-	const op = "nextsql init"
-	if instanceKeyFile == "" {
-		instanceKeyFile = keyFile + ".instance"
-	}
-	if _, err := os.Stat(instanceKeyFile); os.IsNotExist(err) {
-		createdRoot, err := crypto.CreateKeyFile(instanceKeyFile, 1)
-		if err != nil {
-			return err
-		}
-		createdRoot.Zero()
-		fmt.Fprintf(os.Stderr, "created deployment registry key file %s (mode 0600); keep it off the data volume\n", instanceKeyFile)
-	} else if err != nil {
-		return nerr.Wrap(nerr.IO, op, "stat deployment registry key", err)
-	}
-	instanceRoot, err := crypto.ReadKeyFile(instanceKeyFile)
-	if err != nil {
-		return err
-	}
-	defer instanceRoot.Zero()
-
-	createdKeys, err := hosting.EnsureBootstrapManifestKeyFiles(manifestPath)
-	if err != nil {
-		return err
-	}
-	for _, p := range createdKeys {
-		fmt.Fprintf(os.Stderr, "created database root key file %s (mode 0600); keep it off the data volume\n", p)
-	}
-	bootstrap, err := hosting.LoadDeploymentBootstrap(manifestPath)
-	if err != nil {
-		return err
-	}
-
-	reg, _, err := hosting.EnsureManifest(hosting.Path(dataDir), instanceRoot, func(deployment hosting.ID) (hosting.Manifest, error) {
-		return bootstrap.RegistryManifest(deployment, hosting.StateProvisioning)
-	})
-	if err != nil {
-		return err
-	}
-	defer reg.Close()
-
-	m := reg.Manifest()
-	for _, realm := range m.Realms {
-		for _, db := range realm.Databases {
-			if db.State == hosting.StateActive {
-				fmt.Printf("realm %s database %s already active\n", realm.Name, db.Name)
-				continue
-			}
-			if db.State != hosting.StateProvisioning {
-				return nerr.New(nerr.Conflict, op, "managed database "+realm.Name+"/"+db.Name+" is not resumable from its current state")
-			}
-			dbRoot, err := crypto.ReadKeyFile(db.KeyRef)
-			if err != nil {
-				return err
-			}
-			err = activateManagedDatabase(reg, dataDir, realm.ID, db.ID, db.Identity, dbRoot, bufferPages)
-			dbRoot.Zero()
-			if err != nil {
-				return err
-			}
-			fmt.Printf("realm %s database %s %s\n", realm.Name, db.Name, db.ID.String())
-		}
-	}
-
-	if err := bootstrapDeploymentUser(dataDir, user, passwordFile, serverPass); err != nil {
-		return err
-	}
-	defaultRealm, defaultDatabase, err := reg.Default()
-	if err != nil {
-		return err
-	}
-	fmt.Printf("initialized deployment %s\ndefault realm %s %s\ndefault database %s\n",
-		m.DeploymentID.String(), defaultRealm.Name, defaultRealm.ID.String(), defaultDatabase.Name)
-	return nil
-}
-
-func preflightHostingBootstrap(dataDir, dbPath string) error {
+func preflightRegistryBootstrap(dataDir, dbPath string) error {
 	registryPath := hosting.Path(dataDir)
 	_, registryErr := os.Stat(registryPath)
 	_, registryKeyErr := os.Stat(hosting.KeyStorePath(registryPath))
@@ -1672,7 +892,7 @@ func preflightHostingBootstrap(dataDir, dbPath string) error {
 	return nil
 }
 
-func prepareHostingBootstrap(dataDir, dbPath string, databaseRoot, instanceRoot *crypto.DEK, realmName, databaseName string) (*hosting.Registry, format.Identity, error) {
+func prepareRegistryBootstrap(dataDir, dbPath string, databaseRoot, instanceRoot *crypto.DEK, realmName, databaseName string) (*hosting.Registry, format.Identity, error) {
 	registryPath := hosting.Path(dataDir)
 	var ident format.Identity
 	if _, err := os.Stat(registryPath); err == nil {
@@ -1785,7 +1005,6 @@ func execSQL(args []string) error {
 	fs.String("password-file", "", "password file (never a URL)")
 	fs.String("idp", "", "external identity provider profile to authenticate with (see `nextsql login`)")
 	fs.String("idp-config", "", "client identity-provider config file (default ~/.config/nextsql/config.toml)")
-	fs.String("realm", "", "hosted realm name (default: the deployment's default realm)")
 	fs.String("database", "", "database name")
 	fs.String("tls-ca", "", "PEM CA / server certificate")
 	fs.String("tls-server-name", "", "TLS certificate server name (default address host)")
@@ -2015,6 +1234,9 @@ func backupDB(args []string) error {
 	if *out == "" {
 		return nerr.New(nerr.InvalidArgument, "nextsql backup", "--out is required")
 	}
+	if err := limits.Check("buffer_pages", *bufferPages); err != nil {
+		return nerr.New(nerr.InvalidArgument, "nextsql backup", err.Error())
+	}
 	keys, env, err := openEnvelope(*dataDir, *keyFile)
 	if err != nil {
 		return err
@@ -2049,6 +1271,9 @@ func restoreDB(args []string) error {
 	}
 	if *from == "" {
 		return nerr.New(nerr.InvalidArgument, "nextsql restore", "--from is required")
+	}
+	if err := limits.Check("buffer_pages", *bufferPages); err != nil {
+		return nerr.New(nerr.InvalidArgument, "nextsql restore", err.Error())
 	}
 	keys, env, err := openEnvelopeForBackup(*from, *keyFile)
 	if err != nil {
@@ -2121,6 +1346,9 @@ func exportDB(args []string) error {
 	if *out == "" {
 		return nerr.New(nerr.InvalidArgument, "nextsql export", "--out is required")
 	}
+	if err := limits.Check("buffer_pages", *bufferPages); err != nil {
+		return nerr.New(nerr.InvalidArgument, "nextsql export", err.Error())
+	}
 	root, err := crypto.ReadKeyFile(*keyFile)
 	if err != nil {
 		return err
@@ -2156,6 +1384,9 @@ func importDB(args []string) error {
 	}
 	if *from == "" {
 		return nerr.New(nerr.InvalidArgument, "nextsql import", "--from is required")
+	}
+	if err := limits.Check("buffer_pages", *bufferPages); err != nil {
+		return nerr.New(nerr.InvalidArgument, "nextsql import", err.Error())
 	}
 	root, err := crypto.ReadKeyFile(*keyFile)
 	if err != nil {
@@ -2251,6 +1482,11 @@ func statusLocal(s cli.Settings) error {
 	dataDir := s.DataDir
 	keyFile := s.KeyFile
 	bufferPages := s.BufferPages
+	if s.Explicit["buffer-pages"] {
+		if err := limits.Check("buffer_pages", bufferPages); err != nil {
+			return nerr.New(nerr.InvalidArgument, "nextsql status", err.Error())
+		}
+	}
 	if dataDir == "" || keyFile == "" {
 		return cli.LocalMissing("nextsql status", "--data-dir and --key-file are required")
 	}
@@ -2878,7 +2114,7 @@ func printUsage(w *os.File) {
 
 Usage:
   nextsql init --data-dir DIR --key-file FILE [--instance-key-file FILE]
-               [--realm NAME --database NAME] [--user NAME --password-file FILE]
+               [--database NAME] [--user NAME --password-file FILE]
                [--env-file PATH | --no-env]
   nextsql setup --data-dir DIR --key-file FILE [--preset conservative|balanced|high-performance|custom]
                [--profile developer|production] [--buffer-pages N]
@@ -2895,23 +2131,20 @@ Usage:
                [--fix-perms] [--dry-run] [--json]
   nextsql lifecycle uninstall --data-dir DIR [--config FILE] [--key-file FILE]
                [--purge-data] [--purge-keys] [--confirm] [--json]
-  nextsql hosting adopt --data-dir DIR --key-file FILE [--instance-key-file FILE]
-               [--realm NAME --database NAME] --confirm [--env-file PATH | --no-env]
-  nextsql hosting migrate-tenant --source-data-dir DIR --source-key-file FILE --tenant VALUE
+  nextsql registry adopt --data-dir DIR --key-file FILE [--instance-key-file FILE]
+               [--database NAME] --confirm [--env-file PATH | --no-env]
+  nextsql registry migrate-tenant --source-data-dir DIR --source-key-file FILE --tenant VALUE
                --data-dir DIR --key-file FILE [--instance-key-file FILE]
-               [--realm NAME --database NAME] [--batch-rows N] --confirm
-  nextsql realm create --data-dir DIR --key-file FILE [--instance-key-file FILE]
-               --realm NAME --database NAME --database-key-file FILE [--buffer-pages N]
-  nextsql realm rename --data-dir DIR --key-file FILE [--instance-key-file FILE]
-               --realm NAME --to NAME --confirm
-  nextsql database create --data-dir DIR --key-file FILE [--instance-key-file FILE]
-               --realm NAME --name NAME --database-key-file FILE [--buffer-pages N]
-  nextsql database suspend|resume --data-dir DIR --key-file FILE [--instance-key-file FILE]
-               --realm NAME --database NAME --confirm
-  nextsql database drop --data-dir DIR --key-file FILE [--instance-key-file FILE]
-               --realm NAME --database NAME --confirm
-  nextsql database rename --data-dir DIR --key-file FILE [--instance-key-file FILE]
-               --realm NAME --database NAME --to NAME --confirm
+               [--database NAME] [--batch-rows N] --confirm
+  nextsql registry show --data-dir DIR [--instance-key-file FILE] [--json]
+  nextsql key status --data-dir DIR [--json]
+  nextsql key add-recovery --data-dir DIR --key-file FILE --recovery-key-out FILE
+               [--keystore database|instance] [--replace]
+  nextsql key verify-recovery --data-dir DIR --recovery-key FILE [--keystore database|instance]
+  nextsql key remove-recovery --data-dir DIR --key-file FILE --confirm
+               [--keystore database|instance]
+  nextsql key recover --data-dir DIR --recovery-key FILE --key-file-out FILE --confirm
+               [--keystore database|instance]
   nextsql login --idp NAME [--addr HOST:PORT] [--idp-config FILE]
 	           [--database NAME] [--realm NAME] [--no-browser] [--timeout DURATION]
 	           [--client-credentials [--client-secret-file FILE]]

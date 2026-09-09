@@ -81,7 +81,7 @@ function ArtifactRow({ version, artifact }: { version: string; artifact: Artifac
         </p>
       </div>
       <Button asChild size="sm">
-        <a href={artifactUrl(version, artifact.filename)}>Download</a>
+        <a href={artifactUrl(version, artifact)}>Download</a>
       </Button>
     </li>
   );

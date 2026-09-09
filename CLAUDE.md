@@ -146,13 +146,15 @@ only after the leader's local WAL flush *and* a quorum commits the replication b
 leader means writes fail closed. SQL is not re-executed on followers (`UUID()`/`NOW()`/
 `AI()` stay deterministic — they're captured once and replicated).
 
-**Multi-database hosting** (`internal/hosting`, `internal/dbmanager`): a separate,
-in-progress cross-cutting track (`docs/design-multidatabase-dbaas.md`). M2 selectable
-multi-realm/multi-database routing is complete, with realm-scoped auth, bounded open
-handles/idle eviction, a shared buffer budget, and shared task workers/scheduling. M3
-suspend/resume and offline managed-database drop have landed; rename, independently
-addressed backup/PITR/key lifecycle, registry DR/Raft, and hosted HA remain open. Track
-its milestone state separately from the P0–P29 phase list.
+**One deployment, one database** (`internal/hosting`): multi-realm/multi-database
+hosting was **removed** (log #244) — no realms, no `CREATE DATABASE`, no per-connection
+routing, no `internal/dbmanager`, no `nextsql realm`/`nextsql database`. Isolation is a
+whole deployment. What remains is the versioned encrypted deployment registry
+(`nextsql.instance`, its own external root, exclusive deployment lock, `nextsql registry
+adopt`, offline legacy-`TENANT` migration). Its on-disk format is unchanged, and
+`nextsqld` fails closed against a registry holding more than one database rather than
+silently half-serving it. `docs/design-multidatabase-dbaas.md` is withdrawn design
+history.
 
 ## Repository layout
 
@@ -169,7 +171,7 @@ cmd/nextsql-admin          NextSQL Admin: loopback web UI + JSON API, a pure nex
                             Manager, MVP complete), Studio (Phase 29, placeholder only)
 internal/                  engine: storage, wal, recovery, txn, undo, sql (lexer/parser/
                             binder), executor, catalog, crypto, security, auth, protocol,
-                            replication, hosting, dbmanager, vector, fulltext, json, cdc,
+                            replication, hosting, vector, fulltext, json, cdc,
                             scheduler, cron, backup, xport, migrate, config, metrics,
                             setup (installer lifecycle CLI backbone), admin (setup/ops/
                             studio modes — see cmd/nextsql-admin), browseropen, ...

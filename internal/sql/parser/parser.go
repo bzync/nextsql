@@ -227,8 +227,6 @@ func (p *Parser) show() (ast.Stmt, error) {
 			Table: "system.storage",
 			List:  []ast.SelectItem{{Expr: ast.Ident{Name: "database"}}},
 		}, nil
-	case "realms":
-		return p.showSystemTable("system.realms")
 	case "tables":
 		return p.showSystemTable("system.tables")
 	case "indexes":
@@ -298,7 +296,7 @@ func (p *Parser) setStmt() (ast.Stmt, error) {
 		return p.setConfigStmt()
 	}
 	if p.tok.Kind != lexer.KwResource {
-		return nil, nerr.New(nerr.Syntax, "sql.parser", "SET TENANT was removed; provision an isolated database with nextsql hosting")
+		return nil, nerr.New(nerr.Syntax, "sql.parser", "SET TENANT was removed; provision an isolated database with nextsql registry")
 	}
 	p.next()
 	if err := p.expect(lexer.KwGroup, "GROUP"); err != nil {
@@ -354,7 +352,7 @@ func (p *Parser) setConfigStmt() (ast.Stmt, error) {
 func (p *Parser) resetStmt() (ast.Stmt, error) {
 	p.next()
 	if p.tok.Kind != lexer.KwResource {
-		return nil, nerr.New(nerr.Syntax, "sql.parser", "RESET TENANT was removed; provision an isolated database with nextsql hosting")
+		return nil, nerr.New(nerr.Syntax, "sql.parser", "RESET TENANT was removed; provision an isolated database with nextsql registry")
 	}
 	p.next()
 	if err := p.expect(lexer.KwGroup, "GROUP"); err != nil {
@@ -644,7 +642,12 @@ func (p *Parser) create() (ast.Stmt, error) {
 	case lexer.KwRole:
 		return p.createRole()
 	case lexer.KwDatabase:
-		return p.createDatabase()
+		// CREATE DATABASE was removed with multi-database hosting: one
+		// deployment serves exactly one database. The keyword is still
+		// lexed (DROP/ALTER grammar and identifiers use it), so this
+		// answers with the reason rather than a bare syntax error.
+		return nil, nerr.New(nerr.Syntax, "sql.parser",
+			"CREATE DATABASE is not supported: a NextSQL deployment serves exactly one database")
 	case lexer.KwWorkflow:
 		return p.createWorkflow()
 	case lexer.KwTrigger:
@@ -1321,26 +1324,6 @@ func (p *Parser) runWorkflow() (ast.Stmt, error) {
 		return nil, err
 	}
 	return ast.RunWorkflow{Name: name, Args: args}, nil
-}
-
-func (p *Parser) createDatabase() (ast.Stmt, error) {
-	p.next()
-	ifNot := false
-	if p.tok.Kind == lexer.KwIf {
-		p.next()
-		if err := p.expect(lexer.KwNot, "NOT"); err != nil {
-			return nil, err
-		}
-		if err := p.expect(lexer.KwExists, "EXISTS"); err != nil {
-			return nil, err
-		}
-		ifNot = true
-	}
-	name, err := p.ident()
-	if err != nil {
-		return nil, err
-	}
-	return ast.CreateDatabase{Name: name, IfNotExists: ifNot}, nil
 }
 
 func (p *Parser) createUser() (ast.Stmt, error) {
@@ -2179,6 +2162,10 @@ func (p *Parser) columnDef() (ast.ColumnDef, error) {
 				return ast.ColumnDef{}, err
 			}
 			col.EncryptedClient = true
+			if p.tok.Kind == lexer.KwDeterministic {
+				p.next()
+				col.EncryptedClientDeterministic = true
+			}
 		case lexer.KwNot:
 			p.next()
 			if err := p.expect(lexer.KwNull, "NULL"); err != nil {
@@ -3218,7 +3205,77 @@ func (p *Parser) sel() (ast.Stmt, error) {
 	}
 	if p.tok.Kind == lexer.KwFrom {
 		p.next()
-		if p.tok.Kind == lexer.LParen {
+		if p.tok.Kind == lexer.KwUnnest {
+			p.next()
+			if err := p.expect(lexer.LParen, "("); err != nil {
+				return nil, err
+			}
+			uex, err := p.or()
+			if err != nil {
+				return nil, err
+			}
+			if err := p.expect(lexer.RParen, ")"); err != nil {
+				return nil, err
+			}
+			u := &ast.UnnestClause{Expr: uex, Column: "value"}
+			if p.tok.Kind == lexer.KwAs {
+				p.next()
+			}
+			if p.tok.Kind == lexer.Ident {
+				alias, err := p.ident()
+				if err != nil {
+					return nil, err
+				}
+				u.Alias = alias
+				if p.tok.Kind == lexer.LParen {
+					p.next()
+					for {
+						col, err := p.ident()
+						if err != nil {
+							return nil, err
+						}
+						u.Columns = append(u.Columns, col)
+						if p.tok.Kind == lexer.Comma {
+							p.next()
+							continue
+						}
+						break
+					}
+					if len(u.Columns) > 0 {
+						u.Column = u.Columns[0]
+					}
+					if err := p.expect(lexer.RParen, ")"); err != nil {
+						return nil, err
+					}
+				}
+			}
+			if p.tok.Kind == lexer.KwWith {
+				p.next()
+				if err := p.expect(lexer.KwOffset, "OFFSET"); err != nil {
+					return nil, err
+				}
+				offCol := "offset"
+				if p.tok.Kind == lexer.KwAs {
+					p.next()
+				}
+				if p.tok.Kind == lexer.Ident {
+					oc, err := p.ident()
+					if err != nil {
+						return nil, err
+					}
+					offCol = oc
+				}
+				u.Offset = offCol
+			}
+			s.Unnest = u
+			if u.Alias != "" {
+				s.Table = u.Alias
+				s.Alias = u.Alias
+			} else {
+				s.Table = "unnest"
+				s.Alias = "unnest"
+			}
+		} else if p.tok.Kind == lexer.LParen {
 			p.next()
 			if p.tok.Kind != lexer.KwSelect && p.tok.Kind != lexer.KwWith {
 				return nil, nerr.New(nerr.Syntax, "sql.parser", "derived table requires a SELECT query")
@@ -3915,7 +3972,26 @@ func (p *Parser) unary() (ast.Expr, error) {
 		}
 		return ast.Unary{Op: "NOT", Right: r}, nil
 	}
-	return p.primary()
+	return p.postfix()
+}
+
+func (p *Parser) postfix() (ast.Expr, error) {
+	left, err := p.primary()
+	if err != nil {
+		return nil, err
+	}
+	for p.tok.Kind == lexer.LBracket {
+		p.next()
+		idx, err := p.or()
+		if err != nil {
+			return nil, err
+		}
+		if err := p.expect(lexer.RBracket, "]"); err != nil {
+			return nil, err
+		}
+		left = ast.Subscript{Coll: left, Index: idx}
+	}
+	return left, nil
 }
 
 func (p *Parser) primary() (ast.Expr, error) {

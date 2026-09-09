@@ -2,10 +2,13 @@ package planner
 
 import (
 	"github.com/bzync/nextsql/internal/catalog"
+	"github.com/bzync/nextsql/internal/nerr"
 	"github.com/bzync/nextsql/internal/sql/ast"
 	"github.com/bzync/nextsql/internal/sql/binder"
 	"github.com/bzync/nextsql/internal/sql/types"
 	"github.com/bzync/nextsql/internal/txn"
+	"reflect"
+	"strconv"
 )
 
 // Logical is a plan node. Phase 6 rewrites and physical choice stay in this type set.
@@ -82,10 +85,6 @@ type (
 		Table     *catalog.Table
 		Operation string
 		After     uint64
-	}
-	CreateDatabase struct {
-		Name        string
-		IfNotExists bool
 	}
 	DropTable struct {
 		Name     string
@@ -248,6 +247,13 @@ type (
 		Names         []string
 		Distinct      bool
 		DistinctIndex string
+		// PreAgg marks the projection that materialises computed grouping
+		// expressions and aggregate arguments for the Aggregate above it. Row
+		// sources otherwise pass an inner Project straight through without
+		// evaluating it, which is right for the reorder-shaped ones they were
+		// written for and wrong for this one, whose whole purpose is the
+		// columns it computes.
+		PreAgg bool
 	}
 	Limit struct {
 		Input  Logical
@@ -284,11 +290,26 @@ type (
 		Schema   *catalog.Table
 		Distinct bool
 		Having   ast.Expr
+		// Slots reports that Exprs are select-list expressions written over
+		// the reserved aggregate slots (binder.AggSlotName) and the grouping
+		// columns, so the executor projects them against the emitted row. It
+		// is false for the window-over-aggregate path, where Exprs are that
+		// path's own intermediate schema and already match the emitted row
+		// position for position.
+		Slots bool
 	}
 	AggSpec struct {
 		Fun  string
 		Col  int
+		Col2 int
 		Star bool
+	}
+	UnnestScan struct {
+		Table  *catalog.Table
+		Expr   ast.Expr
+		Alias  string
+		Column string
+		Offset bool
 	}
 	Window struct {
 		Input  Logical
@@ -381,7 +402,6 @@ func (DropResourceGroup) logical()   {}
 func (ShowTasks) logical()           {}
 func (CancelTask) logical()          {}
 func (Subscribe) logical()           {}
-func (CreateDatabase) logical()      {}
 func (DropTable) logical()           {}
 func (DropIndex) logical()           {}
 func (RebuildIndex) logical()        {}
@@ -416,6 +436,7 @@ func (Analyze) logical()             {}
 func (Maintain) logical()            {}
 func (With) logical()                {}
 func (CTEScan) logical()             {}
+func (UnnestScan) logical()          {}
 
 func applySubjoins(p Logical, joins []binder.BoundSubjoin) (Logical, error) {
 	for _, j := range joins {
@@ -551,8 +572,6 @@ func Plan(b binder.Bound) (Logical, error) {
 		return CancelTask{ID: s.ID}, nil
 	case binder.Subscribe:
 		return Subscribe{Table: s.Table, Operation: s.Operation, After: s.After}, nil
-	case binder.CreateDatabase:
-		return CreateDatabase{Name: s.Name, IfNotExists: s.IfNotExists}, nil
 	case binder.DropTable:
 		return DropTable{Name: s.Name, Table: s.Table, IfExists: s.IfExists}, nil
 	case binder.DropIndex:
@@ -571,6 +590,14 @@ func Plan(b binder.Bound) (Logical, error) {
 		}, nil
 	case binder.CreateIndex:
 		return CreateIndex{Table: s.Table, Index: s.Index}, nil
+	case binder.Unnest:
+		return UnnestScan{
+			Table:  s.Table,
+			Expr:   s.Expr,
+			Alias:  s.Alias,
+			Column: s.Column,
+			Offset: s.Offset,
+		}, nil
 	case binder.Insert:
 		return Insert{Table: s.Table, Columns: s.Columns, Rows: s.Rows, Returning: s.Returning}, nil
 	case binder.Upsert:
@@ -673,24 +700,51 @@ func Plan(b binder.Bound) (Logical, error) {
 		distinctIndex, indexDistinct := uniqueDistinctKey(s)
 		orderedDistinct := s.Distinct && !indexDistinct && orderCoversOutput(s.Order, len(s.OutNames))
 		if s.HasAgg {
+			// Grouping items and aggregate arguments are input column
+			// ordinals. Anything computed has no ordinal, and must not be
+			// dropped or left at -1: dropping a group collapses every row into
+			// one group, and -1 already means COUNT(*). Materialise those
+			// expressions into real columns first, and only when there are
+			// any — an aggregate over plain columns keeps exactly the plan it
+			// had, including the scan-level fast paths.
+			pre := newPreAgg(schema)
 			var groups []int
 			for _, g := range s.Groups {
-				if id, ok := g.(ast.Ident); ok {
-					if i, found := schema.ColIndex(id.Name); found {
-						groups = append(groups, i)
-					}
+				ord, err := pre.column(g)
+				if err != nil {
+					return nil, err
 				}
+				groups = append(groups, ord)
 			}
 			specs := make([]AggSpec, len(s.Aggs))
 			for i, a := range s.Aggs {
-				specs[i] = AggSpec{Fun: a.Fun, Col: a.Col, Star: a.Star}
+				col, col2 := a.Col, a.Col2
+				if !a.Star && col < 0 && a.Arg != nil {
+					var err error
+					if col, err = pre.column(a.Arg); err != nil {
+						return nil, err
+					}
+				}
+				if !a.Star && col2 < 0 && a.Arg2 != nil {
+					var err error
+					if col2, err = pre.column(a.Arg2); err != nil {
+						return nil, err
+					}
+				}
+				specs[i] = AggSpec{Fun: a.Fun, Col: col, Col2: col2, Star: a.Star}
+			}
+			if pre.needed() {
+				p = pre.project(p)
+				schema = pre.table
 			}
 			aggExprs, aggNames, aggSchema := s.OutExprs, s.OutNames, schema
+			slots := true
 			if len(s.Windows) > 0 && len(s.AggExprs) > 0 {
 				aggExprs, aggNames, aggSchema = s.AggExprs, s.AggNames, s.AggSchema
+				slots = false
 			}
 			distinct := s.Distinct && !orderedDistinct && len(s.Windows) == 0
-			p = Aggregate{Input: p, Groups: groups, Specs: specs, Exprs: aggExprs, Names: aggNames, Schema: aggSchema, Distinct: distinct, Having: s.Having}
+			p = Aggregate{Input: p, Groups: groups, Specs: specs, Exprs: aggExprs, Names: aggNames, Schema: aggSchema, Distinct: distinct, Having: s.Having, Slots: slots}
 		} else if len(s.Windows) == 0 {
 			p = Project{Input: p, Cols: s.OutCols, Exprs: s.OutExprs, Names: s.OutNames, Distinct: s.Distinct && !orderedDistinct && !indexDistinct, DistinctIndex: distinctIndex}
 		}
@@ -989,3 +1043,97 @@ func schemaPrefix(full *catalog.Table, n int) *catalog.Table {
 	}
 	return out
 }
+
+// RankPreserving reports whether plan node p produces a ranked stream from a
+// SEARCH or NEAREST operation on the driving table.
+func RankPreserving(p Logical) bool {
+	switch n := p.(type) {
+	case Search, Nearest, Rerank, Candidates:
+		return true
+	case Filter:
+		return RankPreserving(n.Input)
+	case Limit:
+		return RankPreserving(n.Input)
+	case Join:
+		return RankPreserving(n.Left)
+	default:
+		return false
+	}
+}
+
+// preAgg materialises the grouping expressions and aggregate arguments that are
+// not already columns of the input, so the aggregate can address every one of
+// them by ordinal. Plain columns keep their existing ordinal and no projection
+// is built at all unless something genuinely needs computing — an aggregate
+// over plain columns must keep the plan, and the scan-level fast paths, it had.
+type preAgg struct {
+	base  *catalog.Table
+	table *catalog.Table
+	exprs []ast.Expr
+	extra int
+}
+
+func newPreAgg(schema *catalog.Table) *preAgg {
+	p := &preAgg{base: schema, table: schema}
+	return p
+}
+
+func (p *preAgg) needed() bool { return p.extra > 0 }
+
+// column returns the input ordinal holding e, adding a computed column when e
+// is not already one. Identical expressions share a column: SELECT SUM(a + b),
+// AVG(a + b) computes a + b once.
+func (p *preAgg) column(e ast.Expr) (int, error) {
+	if id, ok := e.(ast.Ident); ok {
+		if i, found := p.base.ColIndex(id.Name); found {
+			return i, nil
+		}
+		return 0, nerr.New(nerr.NotFound, "sql.planner", "unknown column "+id.Name)
+	}
+	for i, have := range p.exprs {
+		if exprEqual(have, e) {
+			return len(p.base.Columns) + i, nil
+		}
+	}
+	if p.extra == 0 {
+		// Copy on first use so the input's own schema is never mutated.
+		cols := make([]catalog.Column, len(p.base.Columns), len(p.base.Columns)+1)
+		copy(cols, p.base.Columns)
+		p.table = &catalog.Table{Name: p.base.Name, Columns: cols}
+	}
+	ord := len(p.base.Columns) + len(p.exprs)
+	p.exprs = append(p.exprs, e)
+	p.extra++
+	// The value's type is whatever the expression evaluates to; the accumulator
+	// falls back to the value it actually holds when a spec has no declared
+	// output type, so leaving this unset is correct rather than a guess.
+	p.table.Columns = append(p.table.Columns, catalog.Column{Name: preAggName(ord)})
+	return ord, nil
+}
+
+// project wraps the input so it emits every original column followed by the
+// computed ones, in the ordinals column() handed out.
+func (p *preAgg) project(in Logical) Logical {
+	exprs := make([]ast.Expr, 0, len(p.table.Columns))
+	names := make([]string, 0, len(p.table.Columns))
+	cols := make([]int, 0, len(p.table.Columns))
+	for i, c := range p.base.Columns {
+		exprs = append(exprs, ast.Ident{Name: c.Name})
+		names = append(names, c.Name)
+		cols = append(cols, i)
+	}
+	for i, e := range p.exprs {
+		ord := len(p.base.Columns) + i
+		exprs = append(exprs, e)
+		names = append(names, preAggName(ord))
+		cols = append(cols, ord)
+	}
+	return Project{Input: in, Cols: cols, Exprs: exprs, Names: names, PreAgg: true}
+}
+
+// preAggName names a materialised column. `#` cannot appear in an identifier
+// the lexer produces, so it cannot collide with a real column.
+func preAggName(ord int) string { return "pre#" + strconv.Itoa(ord) }
+
+// exprEqual reports structural equality of two bound expressions.
+func exprEqual(a, b ast.Expr) bool { return reflect.DeepEqual(a, b) }

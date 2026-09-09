@@ -92,6 +92,69 @@ func TestTamperAndTypeMismatchFailClosed(t *testing.T) {
 	}
 }
 
+func TestDeterministicEncryptEqualityContextAndMode(t *testing.T) {
+	p := &testProvider{current: "v1", keys: map[string]Key{"v1": key("v1", 9)}}
+	ctx := context.Background()
+	value := types.TextValue("same value")
+	c1, err := EncryptDeterministic(ctx, p, "db", "accounts", "email", value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c2, err := EncryptDeterministic(ctx, p, "db", "accounts", "email", value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c1 != c2 || !strings.HasPrefix(c1, DeterministicPrefix) {
+		t.Fatalf("deterministic ciphertext mismatch: %q %q", c1, c2)
+	}
+	h, err := Inspect(c1)
+	if err != nil || h.Mode != ModeDeterministic || h.LogicalType.Kind != types.KindText {
+		t.Fatalf("header=%+v err=%v", h, err)
+	}
+	plain, err := DecryptDeterministic(ctx, p, "db", "accounts", "email", c1)
+	if err != nil || plain.Str != value.Str {
+		t.Fatalf("decrypt=%+v err=%v", plain, err)
+	}
+	if _, err := DecryptDeterministic(ctx, p, "db", "accounts", "other", c1); !nerr.HasCode(err, nerr.Crypto) {
+		t.Fatalf("wrong context: %v", err)
+	}
+	if err := ValidateForColumnMode(c1, types.Text(), ModeDeterministic); err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateForColumn(c1, types.Text()); err == nil {
+		t.Fatal("NSCE2 accepted for randomized column")
+	}
+	random, err := Encrypt(ctx, p, "db", "accounts", "email", value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateForColumnMode(random, types.Text(), ModeDeterministic); err == nil {
+		t.Fatal("NSCE1 accepted for deterministic column")
+	}
+	tampered := []byte(c1)
+	tampered[len(tampered)-1] ^= 1
+	if _, err := DecryptDeterministic(ctx, p, "db", "accounts", "email", string(tampered)); err == nil {
+		t.Fatal("tampered deterministic ciphertext decrypted")
+	}
+
+	p.keys["v2"] = key("v2", 10)
+	p.current = "v2"
+	rotated, err := EncryptDeterministic(ctx, p, "db", "accounts", "email", types.TextValue("new value"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h, err := Inspect(rotated); err != nil || h.KeyID != "v2" {
+		t.Fatalf("rotation header: %+v %v", h, err)
+	}
+	if _, err := DecryptDeterministic(ctx, p, "db", "accounts", "email", c1); err != nil {
+		t.Fatalf("overlap key should decrypt: %v", err)
+	}
+	delete(p.keys, "v1")
+	if _, err := DecryptDeterministic(ctx, p, "db", "accounts", "email", c1); !nerr.HasCode(err, nerr.Crypto) {
+		t.Fatalf("revoked key should fail closed: %v", err)
+	}
+}
+
 func TestSupportedTypeRejectsNonCanonicalMetadata(t *testing.T) {
 	for _, typ := range []types.Type{
 		{Kind: types.KindString, Scale: 1},
@@ -153,15 +216,29 @@ func TestNodeDriverCiphertextIsPortable(t *testing.T) {
 	}
 }
 
+func TestNodeDriverDeterministicCiphertextIsPortable(t *testing.T) {
+	p := &testProvider{current: "v1", keys: map[string]Key{"v1": key("v1", 1)}}
+	const nodeCiphertext = "NSCE2.AgICdjEDAAAAAADlFfKNZjDtO9v-sO8n1efAOo2JQ72kt938TLBP"
+	got, err := EncryptDeterministic(context.Background(), p, "app", "accounts", "secret", types.TextValue("portable"))
+	if err != nil || got != nodeCiphertext {
+		t.Fatalf("Go deterministic ciphertext=%q err=%v", got, err)
+	}
+	v, err := DecryptDeterministic(context.Background(), p, "app", "accounts", "secret", nodeCiphertext)
+	if err != nil || v.Typ.Kind != types.KindText || v.Str != "portable" {
+		t.Fatalf("Node deterministic ciphertext: value=%+v err=%v", v, err)
+	}
+}
+
 func FuzzInspect(f *testing.F) {
 	f.Add("NSCE1.")
+	f.Add("NSCE2.AgICdjEDAAAAAADlFfKNZjDtO9v-sO8n1efAOo2JQ72kt938TLBP")
 	f.Add("plaintext")
 	f.Fuzz(func(t *testing.T, s string) {
 		h, err := Inspect(s)
 		if err != nil {
 			return
 		}
-		if h.KeyID == "" || !SupportedType(h.LogicalType) {
+		if h.KeyID == "" || !SupportedType(h.LogicalType) || (h.Mode != ModeRandomized && h.Mode != ModeDeterministic) {
 			t.Fatalf("accepted invalid header: %+v", h)
 		}
 	})

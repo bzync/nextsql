@@ -13,7 +13,8 @@ chmod 600 /tmp/nextsql.pw
 nextsql init \
   --data-dir /var/lib/nextsql \
   --key-file /etc/nextsql/root.key \
-  --user app --password-file /tmp/nextsql.pw
+  --database production \
+  --password-file /tmp/nextsql.pw
 ```
 
 What that does:
@@ -21,21 +22,40 @@ What that does:
 1. Creates `/etc/nextsql/root.key` if it is missing (32-byte AES root, mode `0600`).
 2. Creates a separate deployment registry root at `/etc/nextsql/root.key.instance` unless `--instance-key-file` is supplied.
 3. Creates the encrypted `nextsql.instance` registry and `/var/lib/nextsql/nextsql.db` with their wrapped-key sidecars.
-4. Bootstraps user `app` with `ADMIN` on `CLUSTER` and `CONNECT` on the default database.
+4. Bootstraps user `root` with `ADMIN` on `CLUSTER` and `CONNECT` on the database.
 
 Printed output includes the data-file path, database/file/deployment identity
-UUIDs, normalized realm name/ID, and logical default database name.
+UUIDs, and the database name.
 
-`--user` requires `--password-file`. The password file may end with a newline; it is stripped.
+**`--database` is optional, and it decides whether a database exists.** Leave
+it out and `nextsql init` provisions the deployment only — the root key and
+the administrator — creating no `nextsql.db`, no keystore and no registry.
+Nothing is invented on your behalf: a database named `default` appears only if
+you ask for that name. `nextsqld` then refuses to start, naming the command
+that completes the deployment:
+
+```bash
+nextsql init \
+  --data-dir /var/lib/nextsql \
+  --key-file /etc/nextsql/root.key \
+  --database production
+```
+
+The same rule applies to `nextsql setup`, where two things depend on the
+database existing and say so up front: the production profile requires
+`--database`, and so does `--recovery-key-out` (a recovery key needs a
+keystore to seal). `nextsql lifecycle detect` reports the intermediate state
+as `deployment-only`.
+
+When credentials are supplied without `--user`, `nextsql init` defaults the bootstrap user to `root`; pass `--user NAME` to choose another name. A password is required for an explicit user, through `--password-file`, `NEXTSQL_SERVER_PASSWORD_FILE`, or `NEXTSQL_SERVER_PASS`. The password file may end with a newline; it is stripped.
 
 All init values can come from a protected host dotenv file. In particular,
-`NEXTSQL_DATABASE=production` automatically becomes the logical database name:
+`NEXTSQL_DATABASE=production` names (and so creates) the database:
 
 ```dotenv
 NEXTSQL_DATA_DIR=/var/lib/nextsql
 NEXTSQL_KEY_FILE=/etc/nextsql/root.key
 NEXTSQL_INSTANCE_KEY_FILE=/etc/nextsql/root.key.instance
-NEXTSQL_REALM_NAME=customer-a
 NEXTSQL_DATABASE=production
 NEXTSQL_SERVER_USER=app
 NEXTSQL_SERVER_PASSWORD_FILE=/tmp/nextsql.pw
@@ -45,7 +65,7 @@ Run `nextsql init --env-file /run/nextsql/hosting.env`. Explicit flags override
 the file. Values are paths/names, never raw key bytes.
 
 Existing pre-registry deployments must not be reinitialized. Stop `nextsqld`
-and run `nextsql hosting adopt --data-dir /var/lib/nextsql --key-file
+and run `nextsql registry adopt --data-dir /var/lib/nextsql --key-file
 /etc/nextsql/root.key --confirm`. The offline command validates and
 recovery-opens the existing default database, preserves its identity/files,
 and does not discover sibling database files.

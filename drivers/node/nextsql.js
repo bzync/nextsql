@@ -57,6 +57,12 @@ const STATUS_TTL_MS = 500;
 const AuthPassword = 1;
 const AuthPasswordKey = 2;
 const FlagCancel = 1;
+// FlagPublicErrorCodes asks the server for the stable ERR_* error taxonomy
+// (docs/error-codes.md). A server that does not implement it ignores the bit
+// and keeps the NSQL v1 error shape, which decodeError still reads, so setting
+// it is safe against any server version. The server echoes it in HelloOK.flags
+// when it was accepted.
+const FlagPublicErrorCodes = 2;
 const FlagNull = 0x01;
 
 const Kind = {
@@ -104,10 +110,16 @@ const MAX_STRUCT_FIELDS = 128;
 const MAX_COLLECTION_LEN = 1 << 20;
 
 class NextSQLError extends Error {
-  constructor(code, message) {
+  constructor(code, message, publicCode) {
     super(message || code);
     this.name = 'NextSQLError';
     this.code = code;
+    // publicCode is the stable ERR_* name the server sent, present only on
+    // an error received over a connection that negotiated the taxonomy and
+    // empty otherwise. code always carries the legacy class, so existing
+    // retry checks keep working and nothing should branch on publicCode
+    // being present.
+    this.publicCode = publicCode || '';
   }
 }
 
@@ -116,7 +128,9 @@ const {
   MemoryFieldKeyring,
   FileFieldKeyring,
   decryptField,
+  decryptFieldDeterministic,
   encryptField,
+  encryptFieldDeterministic,
   generateFieldKey,
   inspectField,
 } = require('./client-encryption')({
@@ -1279,10 +1293,19 @@ function encodeHello(h) {
 }
 
 function decodeHelloOK(b) {
-  if (b.length !== 11) {
+  if (b.length !== 11 && b.length !== 13) {
     throw new NextSQLError('protocol', 'bad hello-ok length');
   }
-  return { version: u16(b, 0), authMethod: b[2], secret: u64(b, 3) };
+  let flags = 0;
+  if (b.length === 13) {
+    flags = u16(b, 11);
+    // The server omits the field when it accepted no capability, so a
+    // present-but-zero field is a second encoding of the v1 hello-ok.
+    if (flags === 0) {
+      throw new NextSQLError('protocol', 'empty hello-ok flags');
+    }
+  }
+  return { version: u16(b, 0), authMethod: b[2], secret: u64(b, 3), flags };
 }
 
 function encodeAuth(password) {
@@ -1374,7 +1397,18 @@ function decodeDataBatch(b) {
 function decodeError(b) {
   const code = readU16String(b, 0, MAX_NAME);
   const msg = readU16String(b, code.next, MAX_NAME);
-  return new NextSQLError(code.value, msg.value);
+  // Optional trailing field, present only from a server that accepted
+  // FlagPublicErrorCodes. Its absence is normal — an older server ignores the
+  // request bit — so this must never be required.
+  let publicCode = '';
+  if (msg.next < b.length) {
+    const p = readU16String(b, msg.next, MAX_NAME);
+    if (p.value === '') {
+      throw new NextSQLError('protocol', 'empty public error code');
+    }
+    publicCode = p.value;
+  }
+  return new NextSQLError(code.value, msg.value, publicCode);
 }
 
 function decodeCommandComplete(b) {
@@ -1567,8 +1601,8 @@ function connectSocket(cfg) {
       if (cfg.tls.ca) {
         opts.ca = cfg.tls.ca;
       }
-      if (cfg.tls.rejectUnauthorized === false) {
-        opts.rejectUnauthorized = false;
+      if (typeof cfg.tls.rejectUnauthorized === 'boolean') {
+        opts.rejectUnauthorized = cfg.tls.rejectUnauthorized;
       }
       const sock = tls.connect(opts, () => resolve(sock));
       sock.on('error', onErr);
@@ -1724,11 +1758,13 @@ class Conn {
     this.wire = wire;
     this.secret = 0n;
     this.busy = false;
+    this.publicErrorCodes = false;
   }
 
   async handshake() {
     await this.wire.writeFrame(Type.Hello, encodeHello({
       version: VERSION,
+      flags: FlagPublicErrorCodes,
       database: this.cfg.database || '',
       user: this.cfg.user,
       realm: this.cfg.realm || '',
@@ -1739,6 +1775,9 @@ class Conn {
     }
     const ok = decodeHelloOK(msg.payload);
     this.secret = ok.secret;
+    // Diagnostic only: decodeError reads the field whenever it is present,
+    // so nothing depends on this having been echoed.
+    this.publicErrorCodes = (ok.flags & FlagPublicErrorCodes) !== 0;
     await this.wire.writeFrame(Type.Auth, encodeAuth(this.cfg.password || ''));
     msg = await this.wire.readFrame();
     if (msg.type !== Type.AuthOK) {
@@ -1886,6 +1925,14 @@ class Conn {
 
   async decryptField(table, column, type, ciphertext) {
     return decryptField(this.cfg.fieldKeys, this.cfg.database || '', table, column, type, ciphertext);
+  }
+
+  async encryptFieldDeterministic(table, column, type, value) {
+    return encryptFieldDeterministic(this.cfg.fieldKeys, this.cfg.database || '', table, column, type, value);
+  }
+
+  async decryptFieldDeterministic(table, column, type, ciphertext) {
+    return decryptFieldDeterministic(this.cfg.fieldKeys, this.cfg.database || '', table, column, type, ciphertext);
   }
 
   async prepare(sql) {
@@ -2152,6 +2199,8 @@ async function connectCluster(cfg) {
 
 module.exports = {
   connect,
+  FlagCancel,
+  FlagPublicErrorCodes,
   connectCluster,
   Cluster,
   NextSQLError,
@@ -2181,7 +2230,9 @@ module.exports = {
   MemoryFieldKeyring,
   FileFieldKeyring,
   decryptField,
+  decryptFieldDeterministic,
   encryptField,
+  encryptFieldDeterministic,
   generateFieldKey,
   inspectField,
 };

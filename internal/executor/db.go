@@ -1037,8 +1037,24 @@ type FollowerReadGate interface {
 }
 
 // DefaultMaxStaleness is the freshness bound a BOUNDED read uses when the
-// session sets no explicit MAX STALENESS.
-const DefaultMaxStaleness = replication.HealthyContactWindow
+// session sets no explicit MAX STALENESS and the installed gate cannot name
+// one of its own (see StalenessDefaulter). It is the healthy-contact window of
+// a cluster running the default heartbeat.
+const DefaultMaxStaleness = replication.DefaultHealthyContactWindow
+
+// StalenessDefaulter reports the freshness bound a BOUNDED read should use when
+// the session sets no explicit MAX STALENESS. An attached Cluster implements it
+// and answers with its own healthy-contact window, which is derived from its
+// configured heartbeat — so raising raft_heartbeat_ms widens the default bound
+// with it instead of leaving a fixed bound rejecting every follower read
+// between heartbeats.
+//
+// It is a separate, optional interface rather than a method on FollowerReadGate
+// so that a gate which only decides freshness does not have to define the
+// default as well; such a gate gets DefaultMaxStaleness.
+type StalenessDefaulter interface {
+	DefaultMaxStaleness() time.Duration
+}
 
 // ReadConsistency selects how a read observes replicated state. See the
 // replication package for the full contract. STRONG (the zero value) is the

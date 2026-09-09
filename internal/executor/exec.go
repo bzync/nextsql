@@ -51,8 +51,6 @@ func (s *Session) execPlan(plan planner.Logical) (*Result, error) {
 		return s.execShowTasks(p)
 	case planner.CancelTask:
 		return s.execCancelTask(p)
-	case planner.CreateDatabase:
-		return s.execCreateDatabase(p)
 	case planner.DropTable:
 		return s.execDropTable(p)
 	case planner.DropIndex:
@@ -421,8 +419,23 @@ func (s *Session) buildPartitionedIndex(tab *catalog.Table, idx catalog.Index, p
 		key := partitionIndexKey(tab.Name, part.ID, idx.Name)
 		s.pending.partIdxs[key] = local
 		if idx.Vector {
-			if err := s.buildPartitionVectorIndex(tab, idx, *part, s.x.use(heap), progress); err != nil {
-				return nil, err
+			switch idx.VecMethod {
+			case catalog.VecMethodIVF:
+				if err := s.buildPartitionIVFIndex(tab, idx, *part, s.x.use(heap), progress); err != nil {
+					return nil, err
+				}
+			case catalog.VecMethodIVFPQ:
+				if err := s.buildPartitionIVFPQIndex(tab, idx, *part, s.x.use(heap), progress); err != nil {
+					return nil, err
+				}
+			case catalog.VecMethodSPARSE:
+				if err := s.buildPartitionSparseIndex(tab, idx, *part, s.x.use(heap), progress); err != nil {
+					return nil, err
+				}
+			default:
+				if err := s.buildPartitionVectorIndex(tab, idx, *part, s.x.use(heap), progress); err != nil {
+					return nil, err
+				}
 			}
 		} else if err := s.populatePartitionIndex(tab, idx, s.x.use(heap), s.x.use(local), progress); err != nil {
 			return nil, err
@@ -1160,8 +1173,32 @@ func (s *Session) maintainIndexes(tab *catalog.Table, old, neu []types.Value) er
 			// Cross-partition move: delete from old, insert into new.
 			for _, idx := range tab.Indexes {
 				if idx.Vector {
-					if err := s.maintainCrossPartitionVectorIndex(tab, idx, *oldPart, *newPart, old, neu); err != nil {
-						return err
+					switch idx.VecMethod {
+					case catalog.VecMethodIVF:
+						if err := s.maintainPartitionIVFIndex(tab, idx, *oldPart, old, nil); err != nil {
+							return err
+						}
+						if err := s.maintainPartitionIVFIndex(tab, idx, *newPart, nil, neu); err != nil {
+							return err
+						}
+					case catalog.VecMethodIVFPQ:
+						if err := s.maintainPartitionIVFPQIndex(tab, idx, *oldPart, old, nil); err != nil {
+							return err
+						}
+						if err := s.maintainPartitionIVFPQIndex(tab, idx, *newPart, nil, neu); err != nil {
+							return err
+						}
+					case catalog.VecMethodSPARSE:
+						if err := s.maintainPartitionSparseIndex(tab, idx, *oldPart, old, nil); err != nil {
+							return err
+						}
+						if err := s.maintainPartitionSparseIndex(tab, idx, *newPart, nil, neu); err != nil {
+							return err
+						}
+					default:
+						if err := s.maintainCrossPartitionVectorIndex(tab, idx, *oldPart, *newPart, old, neu); err != nil {
+							return err
+						}
 					}
 					continue
 				}
@@ -1239,8 +1276,23 @@ func (s *Session) maintainIndexes(tab *catalog.Table, old, neu []types.Value) er
 				if err != nil {
 					return err
 				}
-				if err := s.maintainPartitionVectorIndex(tab, idx, *part, old, neu); err != nil {
-					return err
+				switch idx.VecMethod {
+				case catalog.VecMethodIVF:
+					if err := s.maintainPartitionIVFIndex(tab, idx, *part, old, neu); err != nil {
+						return err
+					}
+				case catalog.VecMethodIVFPQ:
+					if err := s.maintainPartitionIVFPQIndex(tab, idx, *part, old, neu); err != nil {
+						return err
+					}
+				case catalog.VecMethodSPARSE:
+					if err := s.maintainPartitionSparseIndex(tab, idx, *part, old, neu); err != nil {
+						return err
+					}
+				default:
+					if err := s.maintainPartitionVectorIndex(tab, idx, *part, old, neu); err != nil {
+						return err
+					}
 				}
 			} else if idx.VecMethod == catalog.VecMethodIVF {
 				if err := s.maintainIVFIndex(tab, idx, old, neu); err != nil {
@@ -1764,6 +1816,8 @@ func tableOf(p planner.Logical) *catalog.Table {
 			return n.Schema
 		}
 		return tableOf(n.Input)
+	case planner.UnnestScan:
+		return n.Table
 	default:
 		return nil
 	}

@@ -218,14 +218,18 @@ func OpenWith(path string, keys crypto.KeyProvider, bufferPages int, opt OpenOpt
 	return open(path, keys, bufferPages, format.Identity{}, false, opt)
 }
 
-func open(path string, keys crypto.KeyProvider, bufferPages int, id format.Identity, create bool, opt OpenOptions) (*Engine, error) {
+func open(path string, keys crypto.KeyProvider, bufferPages int, id format.Identity, create bool, opt OpenOptions) (eng *Engine, err error) {
 	if bufferPages < 1 {
 		return nil, nerr.New(nerr.InvalidArgument, "storage.open", "buffer_pages must be >= 1")
 	}
-	var (
-		fm  *file.Manager
-		err error
-	)
+	wdir := wal.DirFor(path)
+	udir := undo.DirFor(path)
+	// Record which sidecar directories predate this call, so a failed create
+	// only removes what it made (see the cleanup below).
+	_, walAbsent := os.Stat(wdir)
+	_, undoAbsent := os.Stat(udir)
+
+	var fm *file.Manager
 	if create {
 		fm, err = file.Create(path, id, keys)
 	} else {
@@ -233,6 +237,27 @@ func open(path string, keys crypto.KeyProvider, bufferPages int, id format.Ident
 	}
 	if err != nil {
 		return nil, err
+	}
+	if create {
+		// file.Create made the data file exclusively, so a later failure here
+		// leaves a file no database was ever built on. Every subsequent
+		// create at this path would then fail with AlreadyExists — a full
+		// disk or a failing device would permanently poison the path — so
+		// unwind exactly what this call created. Pre-existing sidecar
+		// directories are left alone: they are not ours to delete.
+		defer func() {
+			if eng != nil {
+				return
+			}
+			_ = os.Remove(path)
+			_ = os.Remove(integrity.PathFor(path))
+			if walAbsent != nil {
+				_ = os.RemoveAll(wdir)
+			}
+			if undoAbsent != nil {
+				_ = os.RemoveAll(udir)
+			}
+		}()
 	}
 	ident := fm.Identity()
 	if env, ok := keys.(*crypto.Envelope); ok {
@@ -251,8 +276,6 @@ func open(path string, keys crypto.KeyProvider, bufferPages int, id format.Ident
 			return nil, err
 		}
 	}
-	wdir := wal.DirFor(path)
-	udir := undo.DirFor(path)
 	var lg *wal.Log
 	walOpt := wal.Options{Archiver: opt.Archiver}
 	if create {

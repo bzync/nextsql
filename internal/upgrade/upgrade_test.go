@@ -5,9 +5,11 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/bzync/nextsql/internal/config"
 	"github.com/bzync/nextsql/internal/crypto"
 	"github.com/bzync/nextsql/internal/nerr"
 	"github.com/bzync/nextsql/internal/storage"
+	"github.com/bzync/nextsql/internal/storage/format"
 	"github.com/bzync/nextsql/internal/upgrade/compat"
 )
 
@@ -86,5 +88,84 @@ func TestInspectBadMagic(t *testing.T) {
 	}
 	if rep.Files[0].MagicOK {
 		t.Fatal("magic should fail")
+	}
+}
+
+// A keystore's format version is what an operator planning a rollback needs,
+// so diagnose must report it — and must report v1 for a database that has no
+// recovery key, because that is what keeps the file readable by releases that
+// predate the recovery-key format.
+func TestInspectReportsKeystoreVersion(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, config.DataFileName)
+	root, err := crypto.GenerateDEK(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ident, err := format.NewIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, err := crypto.CreateEnvelope(crypto.KeystorePath(path), ident, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eng, err := storage.CreateWithIdentity(path, ident, env, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := eng.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	rep, err := Inspect(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rep.Keystore {
+		t.Fatal("keystore not reported present")
+	}
+	if rep.KeystoreVersion != 1 {
+		t.Fatalf("keystore version = %d, want 1 without a recovery key", rep.KeystoreVersion)
+	}
+	if rep.Shredded {
+		t.Fatal("healthy keystore reported as shredded")
+	}
+	if !rep.OK {
+		t.Fatalf("report not OK: %+v", rep.Files)
+	}
+
+	// Configuring a recovery key must move the reported version to 2.
+	rec, err := crypto.GenerateDEK(env.NextRecoveryKeyVersion())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := env.SetRecoveryKey(rec); err != nil {
+		t.Fatal(err)
+	}
+	if err := env.Close(); err != nil {
+		t.Fatal(err)
+	}
+	rep, err = Inspect(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.KeystoreVersion != 2 {
+		t.Fatalf("keystore version = %d, want 2 with a recovery key", rep.KeystoreVersion)
+	}
+	if !rep.OK {
+		t.Fatalf("v2 keystore reported not OK: %+v", rep.Files)
+	}
+	var saw bool
+	for _, f := range rep.Files {
+		if f.Family == compat.FamilyKeystore {
+			saw = true
+			if !f.Present || !f.MagicOK || !f.Compat || !f.Checksum || f.Err != "" {
+				t.Fatalf("keystore file report: %+v", f)
+			}
+		}
+	}
+	if !saw {
+		t.Fatal("no keystore FileReport")
 	}
 }

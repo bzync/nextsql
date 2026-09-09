@@ -25,9 +25,33 @@ The deployment registry uses a separate external root
 `nextsql.instance.keys` envelope. It is not a login password. Keep both roots
 off the data volume. `nextsql setup --profile production` and `nextsqld
 --production` fail closed if an unlock key sits inside the data directory.
-Connections select a hosted realm and database; see [Hosting](/docs/hosting).
+A deployment serves exactly one database.
 
-Online DEK rotation, key-version revocation (kills sessions), and crypto-shred of the keystore are in the production surface. Field-level `ENCRYPTED CLIENT` columns stay **experimental** because no searchable or deterministic mode ships — a deliberate scope decision. The randomized `NSCE1.` server/catalog path, helpers in Go, Node.js/TypeScript, Bun, and PHP, PITR, HA/failover, and durable `FileFieldKeyring` rotation/revocation are implemented and tested. Python and Ruby drivers do not yet expose field-encryption helpers. The server stores only opaque ciphertext and rejects predicates, indexes, and search on these fields.
+### Recovery keys
+
+A recovery key is a second, independent AES-256 key that seals the same KEK;
+it is not a copy of the root key or a password. Either key can unlock the
+keystore, but losing both remains unrecoverable. Keep recovery exports on
+separate, backed-up media, never beside the root key or in the data directory.
+
+```bash
+nextsql key status --data-dir /var/lib/nextsql
+nextsql key verify-recovery --data-dir /var/lib/nextsql \
+  --recovery-key /secure/offline/nextsql.recovery
+nextsql key recover --data-dir /var/lib/nextsql \
+  --recovery-key /secure/offline/nextsql.recovery \
+  --key-file-out /etc/nextsql/new-root.key --confirm
+```
+
+There are two independently sealed keystores in a normal deployment: the
+database and its deployment registry. During a first install,
+`nextsql setup --recovery-key-out FILE` exports verified recovery keys for
+both (`FILE` and `FILE.instance` by default); `--instance-recovery-key-out`
+may relocate the second export. Admin Setup enables this path by default and
+requires the operator to confirm both files were copied offline before Finish.
+The wizard passes only paths to `nextsql setup`; it never reads key material.
+
+Online DEK rotation, key-version revocation (kills sessions), and crypto-shred of the keystore are in the production surface. Field-level `ENCRYPTED CLIENT` is production-gated in two explicit modes: randomized `NSCE1.` AES-256-GCM, and opt-in `ENCRYPTED CLIENT DETERMINISTIC` using HKDF-separated RFC 5297 AES-SIV in `NSCE2.`. The deterministic mode allows only ciphertext-parameter equality/inequality, NULL tests, and direct B-tree/UNIQUE indexes; it leaks equality and frequency within one key/context. Ranges, joins, expressions, ordering/grouping, and general search fail closed. Go, Node.js/TypeScript, Bun, and PHP helpers, fuzz, PITR, HA/failover, and durable `FileFieldKeyring` rotation/revocation are tested. Python and Ruby drivers do not yet expose field-encryption helpers.
 
 ## Bootstrap
 
@@ -109,11 +133,11 @@ rejected with Raft, requires TLS off loopback, verifies issuer/server keyset
 compatibility before startup/reload, and intersects roles with the live native
 ACL. Opaque-token introspection and JIT provisioning remain optional and off.
 
-## Hosted isolation
+## Isolation
 
 Shared row tenancy is removed. `SET TENANT`, `RESET TENANT`, and
-`PARTITION BY TENANT` are rejected. Connections bind to a hosted realm and
-database. Non-`ADMIN` access to a legacy table containing a `tenant_id` marker
+`PARTITION BY TENANT` are rejected. Isolation is a whole deployment: one
+process, one database, its own files, keys, users and ACL. Non-`ADMIN` access to a legacy table containing a `tenant_id` marker
 fails closed; an administrator may access it only to migrate each former tenant
 into a separately provisioned database. New CDC/task/schedule records do not
 carry row-tenant authorization state.

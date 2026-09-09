@@ -18,7 +18,7 @@ P17      complete — ONLINE rebuild proven for non-partitioned B+Tree/UNIQUE/JS
 P18      implementable scope complete
 P19      complete — v1 implementation and clean repository-wide functional gate green
 P20      complete — native committed CDC streaming, images, retention, RBAC, and failover verified
-P21      complete — RANGE/HASH/LIST (1–8 col keys) DDL, routing, tuple-tight pruning, recovery, ADD/DROP plus validated ATTACH/DETACH ownership transfer, local B+Tree-family/FULLTEXT/HNSW indexes, cross-partition secondary UNIQUE, partition-aware UPSERT, stable-ID statistics + costing, bounded maintenance, backup/restore/PITR, benchmarks, randomized pruning-soundness property test, and explicit offline legacy TENANT migration (`nextsql hosting migrate-tenant`); distributed sharding is a separate future phase
+P21      complete — RANGE/HASH/LIST (1–8 col keys) DDL, routing, tuple-tight pruning, recovery, ADD/DROP plus validated ATTACH/DETACH ownership transfer, local B+Tree-family/FULLTEXT/HNSW indexes, cross-partition secondary UNIQUE, partition-aware UPSERT, stable-ID statistics + costing, bounded maintenance, backup/restore/PITR, benchmarks, randomized pruning-soundness property test, and explicit offline legacy TENANT migration (`nextsql registry migrate-tenant`); distributed sharding is a separate future phase
 P22      complete — follower reads / read scaling
 P23      complete — Vector Engine 2.0 (quantised types, quantised HNSW, IVF/IVF-PQ, sparse retrieval, dense+sparse+BM25 fusion; production-gating sign-off 2026-08-31)
 P24      complete — Full-text Search 2.0; compatibility, adversarial bounds, quality, and encrypted recovery exit gate closed 2026-08-31
@@ -130,7 +130,7 @@ pruning, and stable-ID statistics. Partition-aware bounded table/index
 maintenance and `nextsql-bench --partition` benchmarks are implemented, and
 `TestPartitionPruningSoundness` is a randomized pruning-soundness property test.
 Explicit offline migration from a legacy `tenant_id` / `PARTITION BY TENANT`
-database into an isolated hosted deployment ships as `nextsql hosting
+database into an isolated hosted deployment ships as `nextsql registry
 migrate-tenant` (bounded, point-verified, resumable). Legacy TENANT descriptors
 are recovery/offline-migration compatibility only; distributed sharding is a
 separate future phase.
@@ -396,9 +396,11 @@ Also production-gated:
 The phase-wide exit gate — a dated security review sign-off — closed
 2026-09-02 (`docs/security.md` "P25 security review sign-off"), so
 `ENCRYPTED CLIENT` and every item above is now formally production-gated.
-`ENCRYPTED CLIENT` stays labeled `experimental` in `system.capabilities` only
-because no searchable/deterministic mode ships (a deliberate scope decision,
-not an open blocker).
+The later deterministic extension adds explicit `ENCRYPTED CLIENT
+DETERMINISTIC`, HKDF-separated `NSCE2` RFC 5297 AES-SIV, equality-only
+B-tree/UNIQUE use, cross-driver fixtures, fuzz, PITR, and failover coverage.
+`field_encryption_client` is now `supported`; broader searchable encryption
+remains outside the shipped surface.
 
 ---
 

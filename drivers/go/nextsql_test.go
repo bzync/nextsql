@@ -68,6 +68,33 @@ func TestFieldEncryptionHelpersRotateAndRevoke(t *testing.T) {
 	}
 }
 
+func TestDeterministicFieldEncryptionHelpers(t *testing.T) {
+	ring, err := NewMemoryFieldKeyring(testFieldKey("v1", 3))
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := &Conn{cfg: Config{Database: "app", FieldKeys: ring}}
+	ctx := context.Background()
+	a, err := c.EncryptFieldDeterministic(ctx, "accounts", "email", types.TextValue("a@example.test"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := c.EncryptFieldDeterministic(ctx, "accounts", "email", types.TextValue("a@example.test"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.Str != b.Str {
+		t.Fatal("deterministic helper produced unequal ciphertext")
+	}
+	plain, err := c.DecryptFieldDeterministic(ctx, "accounts", "email", types.Text(), a)
+	if err != nil || plain.Str != "a@example.test" {
+		t.Fatalf("plain=%+v err=%v", plain, err)
+	}
+	if _, err := c.DecryptField(ctx, "accounts", "email", types.Text(), a); err == nil {
+		t.Fatal("randomized helper accepted deterministic ciphertext")
+	}
+}
+
 func TestFileFieldKeyringPersistsAcrossReopen(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "keyring.nsfk")
 	v1 := testFieldKey("v1", 1)

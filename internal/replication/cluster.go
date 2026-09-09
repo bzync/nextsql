@@ -22,14 +22,10 @@ import (
 )
 
 const (
-	DefaultApplyTimeout  = 2 * time.Second
-	DefaultHeartbeat     = 250 * time.Millisecond
-	DefaultElection      = 250 * time.Millisecond
-	DefaultLeaderLease   = 200 * time.Millisecond
-	DefaultCommitTimeout = 50 * time.Millisecond
-	MinVotingNodes       = 3
-	statusFileName       = "nextsql.cluster.json"
-	raftDBName           = "raft.db"
+	DefaultApplyTimeout = 2 * time.Second
+	MinVotingNodes      = 3
+	statusFileName      = "nextsql.cluster.json"
+	raftDBName          = "raft.db"
 )
 
 // Peer is one voting member.
@@ -47,6 +43,11 @@ type Config struct {
 	Bootstrap    bool
 	Keys         crypto.KeyProvider
 	ApplyTimeout time.Duration
+	// Timings are the Raft protocol intervals. Each zero field takes its
+	// built-in default (DefaultTimings); Open resolves and validates the
+	// set as a whole before starting Raft, and the resolved heartbeat is
+	// what the follower-read freshness window is derived from.
+	Timings Timings
 	// AllowMinority permits fewer than 3 voting peers (tests only).
 	AllowMinority bool
 	// Inmem uses in-process transport and stores. Tests set this and Transport.
@@ -143,16 +144,18 @@ func Open(cfg Config, applier Applier) (*Cluster, error) {
 	if cfg.ApplyTimeout <= 0 {
 		cfg.ApplyTimeout = DefaultApplyTimeout
 	}
+	timings, err := cfg.Timings.Resolve()
+	if err != nil {
+		return nil, err
+	}
+	cfg.Timings = timings
 	dek, err := cfg.Keys.Current()
 	if err != nil {
 		return nil, err
 	}
 	rc := raft.DefaultConfig()
 	rc.LocalID = raft.ServerID(cfg.NodeID)
-	rc.HeartbeatTimeout = DefaultHeartbeat
-	rc.ElectionTimeout = DefaultElection
-	rc.LeaderLeaseTimeout = DefaultLeaderLease
-	rc.CommitTimeout = DefaultCommitTimeout
+	timings.applyTo(rc)
 	rc.SnapshotInterval = 120 * time.Second
 	rc.SnapshotThreshold = 1 << 20
 	if cfg.Logger != nil {

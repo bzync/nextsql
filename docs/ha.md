@@ -88,7 +88,8 @@ or lost leader contact entirely — is rejected with `unavailable` so the caller
 routes elsewhere. The freshness gate is `Cluster.FollowerReadHealthy`.
 
 `BOUNDED` is opt-in per session (`Session.SetReadConsistency(ReadBounded)` plus
-`Session.SetMaxStaleness`; `0` selects the default window, five heartbeats). It
+`Session.SetMaxStaleness`; `0` selects the attached cluster's healthy-contact
+window, five times its configured `raft_heartbeat_ms`). It
 does **not** take a quorum round trip — it is a lag check against local Raft
 state — so it is a cheap follower-servable read with a freshness floor, unlike
 `STRONG`.
@@ -240,7 +241,7 @@ Each node exposes a key-free health snapshot through `system.replica_health`
 | `commit_index` / `applied_index` | Raft log positions |
 | `apply_backlog` | `commit_index - applied_index`: entries known committed but not yet applied locally (0 on the leader and a caught-up follower) |
 | `last_contact_ms` | age of the last leader contact — `0` on the leader, `-1` on a follower that has never heard from a leader |
-| `healthy` | leader, or a follower that sees a leader and was contacted within `HealthyContactWindow` (5 heartbeats) |
+| `healthy` | leader, or a follower that sees a leader and was contacted within this cluster's healthy-contact window (5 × `raft_heartbeat_ms`) |
 
 A follower that is partitioned from the leader stops being contacted; its
 `last_contact_ms` grows past the window and `healthy` flips to `false`.
@@ -369,9 +370,44 @@ These are engineering targets on a healthy 3-node cluster:
 | Leader election | `< 3 s` |
 | Service recovery (new leader accepts writes) | `< 5 s` |
 
-Default Raft timeouts: heartbeat / election 250 ms, lease 200 ms,
-commit 50 ms. Do not lower them to chase the target if the network
-cannot support that.
+### Raft timings
+
+The Raft intervals are configurable. Each defaults to the value below when it
+is not set, and each is bounded by the operational limit catalog
+(`docs/limits.md`):
+
+| Setting | Flag | Default | What it controls |
+|---|---|---|---|
+| `raft_heartbeat_ms` | `--raft-heartbeat-ms` | 250 ms | leader-contact interval, and the unit the follower-read freshness window is built from |
+| `raft_election_ms` | `--raft-election-ms` | 250 ms | how long a follower waits without contact before campaigning |
+| `raft_leader_lease_ms` | `--raft-leader-lease-ms` | 200 ms | how long a leader may act as leader without reaching a quorum |
+| `raft_commit_timeout_ms` | `--raft-commit-timeout-ms` | 50 ms | how long a leader batches log entries before flushing them to followers |
+
+Two relationships are enforced, at configuration time rather than at the next
+restart, because they are consensus-protocol requirements rather than
+preferences:
+
+- `raft_leader_lease_ms` must not exceed `raft_heartbeat_ms` — otherwise a
+  leader keeps acting as one past the point it can still prove it holds quorum.
+- `raft_election_ms` must be at least `raft_heartbeat_ms` — otherwise a follower
+  campaigns against a leader that is contacting it on schedule.
+
+An unset interval is resolved to its default before the relationships are
+judged, so raising only `raft_heartbeat_ms` past 250 ms is rejected until
+`raft_election_ms` is raised with it.
+
+**Raising the heartbeat widens the freshness window with it.** The
+healthy-contact window is five heartbeats *of the configured heartbeat*, so it
+is also the default `MAX STALENESS` of a `BOUNDED` read. An operator on a slow
+link who raises `raft_heartbeat_ms` has said contact is expected less often; the
+health model follows, rather than reporting every follower unhealthy between
+contacts.
+
+Do not lower these to chase the recovery targets if the network cannot support
+it: a cluster that cannot complete an election round inside its election timeout
+re-campaigns instead of converging, which is slower than the timeout it was
+trying to beat. Raising them is the safe direction, at the cost of a
+proportionally later failure detection.
 
 ## Replica repair and rolling maintenance
 

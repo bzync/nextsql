@@ -6,7 +6,7 @@ Prefer a password file. Never put the root unlock key in the application `.env`.
 
 ## Commands
 
-```text
+```bash
 nextsql migrate validate
 nextsql migrate create add_orders
 nextsql migrate status
@@ -40,7 +40,7 @@ Each up file is one transaction: `BEGIN`, dirty history insert, each statement, 
 
 `.env` is safe to commit if it contains no secrets. `.env.local` is gitignored and is the place for the password-file path.
 
-```bash
+```dotenv
 # .env  — safe to commit if it contains no secrets
 NEXTSQL_ADDR=127.0.0.1:7210
 NEXTSQL_DATABASE_USER=app
@@ -48,7 +48,7 @@ NEXTSQL_INSECURE=true
 NEXTSQL_MIGRATION_DIR=./migrations
 ```
 
-```bash
+```dotenv
 # .env.local  — gitignored
 NEXTSQL_DATABASE_PASSWORD_FILE=/home/dev/secrets/nextsql.pw
 ```
@@ -59,7 +59,7 @@ NEXTSQL_DATABASE_PASSWORD_FILE=/home/dev/secrets/nextsql.pw
 
 Load this on the migrate runner, not on the database host. The VPS `nextsqld` already has the root key; the migrator must not.
 
-```bash
+```dotenv
 # .env.production
 NEXTSQL_ADDR=db.example.com:7210
 NEXTSQL_DATABASE_USER=migrator
@@ -76,7 +76,7 @@ On Raft, connect to the **leader**. History inserts and `CREATE TABLE` replicate
 
 ## File names
 
-```text
+```files
 migrations/
   20260818120000_create_customers.up.sql
   20260818120000_create_customers.down.sql

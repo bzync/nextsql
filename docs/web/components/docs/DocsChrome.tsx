@@ -5,6 +5,7 @@ import { usePathname } from "next/navigation";
 import { useEffect, useState } from "react";
 import { useCommand } from "@bzync/rui";
 import { SiteHeader } from "@/components/SiteHeader";
+import { SearchHighlighter } from "@/components/docs/SearchHighlighter";
 import { docsNav, docHref } from "@/lib/nav";
 import { site } from "@/lib/site";
 import { cn } from "@/lib/cn";
@@ -54,6 +55,7 @@ export function DocsChrome({ children }: { children: React.ReactNode }) {
           </div>
         </div>
       </div>
+      <SearchHighlighter />
       {menu ? (
         <div className="fixed inset-0 z-[60] lg:hidden">
           <button

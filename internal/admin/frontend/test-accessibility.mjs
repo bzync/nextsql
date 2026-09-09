@@ -2100,10 +2100,20 @@ async function testOperateMode() {
     await browser.waitFor("document.querySelector('[role=dialog]')?.textContent.includes('Chain verification FAILED')", "a newly detected audit-chain failure to render");
     assert.equal(await browser.evaluate("document.querySelector('[role=dialog]')?.textContent.includes('Line 7: hash chain mismatch')"), true, "the first bad line and verification problem should render");
     assert.equal(await browser.evaluate("document.querySelector('[role=dialog]')?.textContent.includes('articles')"), true, "the suspect audit record must remain visible after verification fails");
+    // Both themes override rui's danger text token, which clears AA in
+    // neither (see src/shared/shared.css). Which one is live here depends on
+    // the theme `themeCheck` left selected — "system", i.e. whatever the
+    // headless browser reports — so the expectation is derived from the
+    // element's own position rather than hardcoded to one theme. Pinning it to
+    // the dark value went unnoticed because every run stopped at an earlier
+    // contrast violation and never reached this line.
+    const auditProblemIsDark = await browser.evaluate(
+      "document.querySelector('.nsa-audit-verify-problem').closest('.dark') !== null",
+    );
     assert.equal(
       await browser.evaluate("getComputedStyle(document.querySelector('.nsa-audit-verify-problem')).color"),
-      "rgb(255, 137, 144)",
-      "audit-chain failure text must keep its AA dark-surface contrast override",
+      auditProblemIsDark ? "rgb(255, 137, 144)" : "rgb(200, 0, 9)",
+      "audit-chain failure text must keep the AA contrast override for the active theme",
     );
     await runAxe(browser, axe.source, "Studio Audit viewer chain failure");
     assert.equal(await clickDialogButton("Close"), true, "Close should dismiss the Audit viewer");

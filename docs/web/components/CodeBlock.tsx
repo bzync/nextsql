@@ -3,11 +3,39 @@
 import { HighlightCode } from "@/lib/highlight";
 import { CopyButton } from "@bzync/rui";
 
-export function isBashLang(lang?: string, title?: string): boolean {
+export function isBashLang(lang?: string, title?: string, code?: string): boolean {
   const l = (lang || "").toLowerCase().trim();
   const t = (title || "").toLowerCase().trim();
-  const bashKeywords = /^(bash|sh|shell|terminal|zsh|console)$/i;
-  return bashKeywords.test(l) || (!l && bashKeywords.test(t));
+  const bashKeywords = /^(bash|sh|shell|terminal|zsh|console|cli|commands?)$/i;
+  if (bashKeywords.test(l) || (!l && bashKeywords.test(t))) return true;
+  if ((l === "text" || !l) && code) {
+    const trimmed = code.trim();
+    if (
+      trimmed.startsWith("nextsql ") ||
+      trimmed.startsWith("nextsqld ") ||
+      trimmed.startsWith("nextsql-") ||
+      trimmed.startsWith("curl ") ||
+      trimmed.startsWith("npm ") ||
+      trimmed.startsWith("go ")
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+export function isFilesLang(lang?: string, title?: string, code?: string): boolean {
+  const l = (lang || "").toLowerCase().trim();
+  const t = (title || "").toLowerCase().trim();
+  const filesKeywords = /^(files?|filenames?|filetree|tree|dir|dirs|directory|structure)$/i;
+  if (filesKeywords.test(l) || (!l && filesKeywords.test(t)) || t.includes("file") || t.includes("tree")) return true;
+  if ((l === "text" || !l) && code) {
+    const lines = code.trim().split("\n");
+    const hasDir = lines.some((line) => /^\s*[\w.-]+\/\s*$/.test(line) || line.includes("├──") || line.includes("└──"));
+    const hasFiles = lines.some((line) => /\.(sql|lock|conf|instance|keys|db|wal|undo|audit|txt|md|go|js|ts|json)\b/.test(line));
+    if (hasDir && hasFiles) return true;
+  }
+  return false;
 }
 
 export function isSqlLang(lang?: string, title?: string): boolean {
@@ -34,6 +62,19 @@ export function isProtoLang(lang?: string, title?: string): boolean {
     t.includes("wire") ||
     t.includes("protocol") ||
     t.includes("frame")
+  );
+}
+
+export function isEnvLang(lang?: string, title?: string): boolean {
+  const l = (lang || "").toLowerCase().trim();
+  const t = (title || "").toLowerCase().trim();
+  const envKeywords = /^(dotenv|env|\.env)$/i;
+  return (
+    envKeywords.test(l) ||
+    (!l && envKeywords.test(t)) ||
+    t.endsWith(".env") ||
+    t.includes(".env.") ||
+    t.endsWith(".env.local")
   );
 }
 
@@ -66,10 +107,12 @@ export function CodeBlock({
   lang?: string;
   title?: string;
 }) {
-  const isBash = isBashLang(lang, title);
+  const isBash = isBashLang(lang, title, code);
   const isSql = !isBash && isSqlLang(lang, title);
   const isDriver = !isBash && !isSql && isDriverLang(lang, title);
   const isProto = !isBash && !isSql && !isDriver && isProtoLang(lang, title);
+  const isEnv = !isBash && !isSql && !isDriver && !isProto && isEnvLang(lang, title);
+  const isFiles = !isBash && !isSql && !isDriver && !isProto && !isEnv && isFilesLang(lang, title, code);
 
   if (isBash) {
     return (
@@ -79,7 +122,7 @@ export function CodeBlock({
             <span className="select-none font-bold text-[var(--bash-prompt)]" aria-hidden="true">
               $
             </span>
-            {title || lang || "bash"}
+            {title || (lang === "text" || !lang ? "bash" : lang) || "bash"}
           </span>
           <CopyButton
             value={code}
@@ -176,6 +219,66 @@ export function CodeBlock({
         <pre className="overflow-x-auto overscroll-x-contain bg-transparent p-4 text-[12.5px] leading-6 text-[var(--proto-fg)] [-webkit-overflow-scrolling:touch] sm:px-5 sm:text-[13px]">
           <code>
             <HighlightCode code={code} lang={lang || "wire"} />
+          </code>
+        </pre>
+      </div>
+    );
+  }
+
+  if (isEnv) {
+    return (
+      <div className="code-block-env group relative overflow-hidden rounded-md border border-[var(--env-border)] bg-[var(--env-bg)] text-[var(--env-fg)]">
+        <div className="code-block-header flex items-center justify-between border-b border-[var(--env-header-border)] bg-[var(--env-header-bg)] px-4 py-2">
+          <span className="inline-flex items-center gap-1.5 font-mono text-[11px] text-[var(--env-header-fg)]">
+            <span
+              className="inline-flex h-4 items-center justify-center rounded px-1.5 font-mono text-[10px] font-bold uppercase tracking-wider leading-none select-none text-[#34d399] bg-[#34d399]/15"
+              aria-hidden="true"
+            >
+              env
+            </span>
+            <span className="text-[var(--env-header-fg)] opacity-90">
+              {title || (lang === "dotenv" ? ".env" : lang) || ".env"}
+            </span>
+          </span>
+          <CopyButton
+            value={code}
+            label="copy"
+            className="border-transparent bg-transparent lowercase text-[var(--env-header-fg)] opacity-75 hover:bg-white/10 hover:opacity-100 hover:text-white"
+          />
+        </div>
+        <pre className="overflow-x-auto overscroll-x-contain bg-transparent p-4 text-[12.5px] leading-6 text-[var(--env-fg)] [-webkit-overflow-scrolling:touch] sm:px-5 sm:text-[13px]">
+          <code>
+            <HighlightCode code={code} lang={lang || "dotenv"} />
+          </code>
+        </pre>
+      </div>
+    );
+  }
+
+  if (isFiles) {
+    return (
+      <div className="code-block-files group relative overflow-hidden rounded-md border border-[var(--files-border)] bg-[var(--files-bg)] text-[var(--files-fg)]">
+        <div className="code-block-header flex items-center justify-between border-b border-[var(--files-header-border)] bg-[var(--files-header-bg)] px-4 py-2">
+          <span className="inline-flex items-center gap-1.5 font-mono text-[11px] text-[var(--files-header-fg)]">
+            <span
+              className="inline-flex h-4 items-center justify-center rounded px-1.5 font-mono text-[10px] font-bold uppercase tracking-wider leading-none select-none text-[#38bdf8] bg-[#38bdf8]/15"
+              aria-hidden="true"
+            >
+              files
+            </span>
+            <span className="text-[var(--files-header-fg)] opacity-90">
+              {title || (lang === "text" ? "files" : lang) || "files"}
+            </span>
+          </span>
+          <CopyButton
+            value={code}
+            label="copy"
+            className="border-transparent bg-transparent lowercase text-[var(--files-header-fg)] opacity-75 hover:bg-white/10 hover:opacity-100 hover:text-white"
+          />
+        </div>
+        <pre className="overflow-x-auto overscroll-x-contain bg-transparent p-4 text-[12.5px] leading-6 text-[var(--files-fg)] [-webkit-overflow-scrolling:touch] sm:px-5 sm:text-[13px]">
+          <code>
+            <HighlightCode code={code} lang="files" />
           </code>
         </pre>
       </div>

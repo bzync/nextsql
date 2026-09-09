@@ -5,4 +5,5 @@ export type DocsSearchEntry = {
   group: string;
   keywords: string[];
   href: string;
+  content?: string;
 };

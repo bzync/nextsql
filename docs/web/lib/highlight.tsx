@@ -359,6 +359,20 @@ export function HighlightCode({
   ) {
     return <>{tokenizeWireProtocol(code)}</>;
   }
+  if (kind === "dotenv" || kind === "env" || kind === ".env") {
+    return <>{tokenizeDotenv(code)}</>;
+  }
+  if (
+    kind === "files" ||
+    kind === "filetree" ||
+    kind === "tree" ||
+    kind === "filenames" ||
+    kind === "dir" ||
+    kind === "dirs" ||
+    kind === "directory"
+  ) {
+    return <>{tokenizeFileTree(code)}</>;
+  }
   return <>{code}</>;
 }
 
@@ -1159,7 +1173,7 @@ function tokenizeWireProtocolLine(line: string, lineIdx: number): ReactNode[] {
 
   const nodes: ReactNode[] = [];
   const tokenRegex =
-    /(\s+|#[^\n]*|\/\/[^\n]*|'[^']*'|"[^"]*"|\((?:reserved|optional|default)[^)]*\)|0x[0-9a-fA-F]+|\b\d+(?:,\d+)*(?:\.\d+)?(?:\s*(?:MiB|KiB|GiB|ms|s|B))?\b|C[→↔<-]+S|S[→↔<-]+C|[-=]+>|<[-=]+|--+|==+|\+\+|[a-zA-Z_][a-zA-Z0-9_.-]*|[0-9]+-[0-9]+|[0-9]+\.\.[0-9]+|\.\.|[0-9]+[+-]|[^\s\w]+)/g;
+    /(\s+|#[^\n]*|\/\/[^\n]*|'[^']*'|"[^"]*"|\((?:reserved|optional|default)[^)]*\)|0x[0-9a-fA-F]+|[0-9]+-[0-9]+|[0-9]+\.\.[0-9]+|[0-9]+\.\.|\.\.|[0-9]+[+-]|\b\d+(?:,\d+)*(?:\.\d+)?(?:\s*(?:MiB|KiB|GiB|ms|s|B))?\b|C[→↔<-]+S|S[→↔<-]+C|[-=]+>|<[-=]+|--+|==+|\+\+|ERR_[A-Z0-9_*]+|[a-zA-Z_][a-zA-Z0-9_.-]*|[()[\]{},;:.=<>+\-*\\/|&!]|[^\s\w])/g;
 
   let match: RegExpExecArray | null;
   let isFirstToken = true;
@@ -1254,7 +1268,7 @@ function tokenizeWireProtocolLine(line: string, lineIdx: number): ReactNode[] {
       continue;
     }
 
-    if (PROTO_STATUS.has(lower) || /^ERR_[A-Z0-9_]+$/.test(raw)) {
+    if (PROTO_STATUS.has(lower) || /^ERR_[A-Z0-9_*]+$/i.test(raw)) {
       nodes.push(
         <span key={key} className="hl-proto-status">
           {raw}
@@ -1310,3 +1324,329 @@ function tokenizeWireProtocolLine(line: string, lineIdx: number): ReactNode[] {
 
   return nodes;
 }
+
+function tokenizeDotenv(code: string): ReactNode[] {
+  const lines = code.split("\n");
+  const nodes: ReactNode[] = [];
+
+  lines.forEach((line, lineIdx) => {
+    if (lineIdx > 0) {
+      nodes.push("\n");
+    }
+
+    if (!line) return;
+
+    if (/^\s*#/.test(line)) {
+      nodes.push(
+        <span key={`${lineIdx}-cmt`} className="hl-env-cmt">
+          {line}
+        </span>
+      );
+      return;
+    }
+
+    const kvMatch = /^(\s*)(export\s+)?([a-zA-Z_][a-zA-Z0-9_.-]*)(\s*=\s*)(.*)$/.exec(line);
+    if (kvMatch) {
+      const [, indent, exportKw, key, eq, rest] = kvMatch;
+      let tokenIdx = 0;
+
+      if (indent) {
+        nodes.push(indent);
+      }
+
+      if (exportKw) {
+        nodes.push(
+          <span key={`${lineIdx}-${tokenIdx++}`} className="hl-env-kw">
+            {exportKw}
+          </span>
+        );
+      }
+
+      nodes.push(
+        <span key={`${lineIdx}-${tokenIdx++}`} className="hl-env-key">
+          {key}
+        </span>
+      );
+
+      nodes.push(
+        <span key={`${lineIdx}-${tokenIdx++}`} className="hl-env-op">
+          {eq}
+        </span>
+      );
+
+      if (rest) {
+        const quotedMatch = /^("[^"\\]*(?:\\.[^"\\]*)*"|'[^'\\]*(?:\\.[^'\\]*)*')(.*)$/.exec(rest);
+        if (quotedMatch) {
+          const [, quotedStr, afterStr] = quotedMatch;
+          nodes.push(
+            <span key={`${lineIdx}-${tokenIdx++}`} className="hl-env-str">
+              {quotedStr}
+            </span>
+          );
+          if (afterStr) {
+            const commentMatch = /^(\s*)(#.*)$/.exec(afterStr);
+            if (commentMatch) {
+              if (commentMatch[1]) nodes.push(commentMatch[1]);
+              nodes.push(
+                <span key={`${lineIdx}-${tokenIdx++}`} className="hl-env-cmt">
+                  {commentMatch[2]}
+                </span>
+              );
+            } else {
+              nodes.push(afterStr);
+            }
+          }
+        } else {
+          const unquotedMatch = /^(.*?)(\s+#.*)$/.exec(rest);
+          let valPart = rest;
+          let commentPart = "";
+
+          if (unquotedMatch) {
+            valPart = unquotedMatch[1];
+            commentPart = unquotedMatch[2];
+          }
+
+          if (valPart) {
+            const trimmed = valPart.trim();
+            const lower = trimmed.toLowerCase();
+
+            if (
+              lower === "true" ||
+              lower === "false" ||
+              lower === "yes" ||
+              lower === "no" ||
+              lower === "on" ||
+              lower === "off" ||
+              lower === "null" ||
+              lower === "nil" ||
+              lower === "none"
+            ) {
+              nodes.push(
+                <span key={`${lineIdx}-${tokenIdx++}`} className="hl-env-bool">
+                  {valPart}
+                </span>
+              );
+            } else if (/^-?\d+(?:\.\d+)?$/.test(trimmed)) {
+              nodes.push(
+                <span key={`${lineIdx}-${tokenIdx++}`} className="hl-env-num">
+                  {valPart}
+                </span>
+              );
+            } else if (
+              trimmed.startsWith("/") ||
+              trimmed.startsWith("./") ||
+              trimmed.startsWith("../") ||
+              trimmed.startsWith("~") ||
+              trimmed.includes("/") ||
+              trimmed.includes("\\")
+            ) {
+              nodes.push(
+                <span key={`${lineIdx}-${tokenIdx++}`} className="hl-env-path">
+                  {valPart}
+                </span>
+              );
+            } else {
+              nodes.push(
+                <span key={`${lineIdx}-${tokenIdx++}`} className="hl-env-val">
+                  {valPart}
+                </span>
+              );
+            }
+          }
+
+          if (commentPart) {
+            const cmtMatch = /^(\s*)(#.*)$/.exec(commentPart);
+            if (cmtMatch) {
+              if (cmtMatch[1]) nodes.push(cmtMatch[1]);
+              nodes.push(
+                <span key={`${lineIdx}-${tokenIdx++}`} className="hl-env-cmt">
+                  {cmtMatch[2]}
+                </span>
+              );
+            } else {
+              nodes.push(
+                <span key={`${lineIdx}-${tokenIdx++}`} className="hl-env-cmt">
+                  {commentPart}
+                </span>
+              );
+            }
+          }
+        }
+      }
+      return;
+    }
+
+    const tokenRegex =
+      /(\s+|#[^\n]*|'[^']*'|"[^"]*"|[a-zA-Z_][a-zA-Z0-9_.-]*|[0-9]+(?:\.[0-9]+)?|[=:]+|[^\s\w])/g;
+    let match: RegExpExecArray | null;
+    let tokenIdx = 0;
+
+    while ((match = tokenRegex.exec(line)) !== null) {
+      const raw = match[0];
+      const key = `${lineIdx}-${tokenIdx++}`;
+
+      if (/^\s+$/.test(raw)) {
+        nodes.push(raw);
+        continue;
+      }
+      if (raw.startsWith("#")) {
+        nodes.push(
+          <span key={key} className="hl-env-cmt">
+            {raw}
+          </span>
+        );
+        continue;
+      }
+      if (
+        (raw.startsWith('"') && raw.endsWith('"')) ||
+        (raw.startsWith("'") && raw.endsWith("'"))
+      ) {
+        nodes.push(
+          <span key={key} className="hl-env-str">
+            {raw}
+          </span>
+        );
+        continue;
+      }
+      if (/^-?\d+(?:\.\d+)?$/.test(raw)) {
+        nodes.push(
+          <span key={key} className="hl-env-num">
+            {raw}
+          </span>
+        );
+        continue;
+      }
+      if (raw === "=") {
+        nodes.push(
+          <span key={key} className="hl-env-op">
+            {raw}
+          </span>
+        );
+        continue;
+      }
+      if (raw.toLowerCase() === "export") {
+        nodes.push(
+          <span key={key} className="hl-env-kw">
+            {raw}
+          </span>
+        );
+        continue;
+      }
+      nodes.push(raw);
+    }
+  });
+
+  return nodes;
+}
+
+function tokenizeFileTree(code: string): ReactNode[] {
+  const lines = code.split("\n");
+  const nodes: ReactNode[] = [];
+
+  lines.forEach((line, lineIdx) => {
+    if (lineIdx > 0) {
+      nodes.push("\n");
+    }
+
+    if (!line) return;
+
+    if (/^\s*#/.test(line)) {
+      nodes.push(
+        <span key={`${lineIdx}-cmt`} className="hl-files-desc">
+          {line}
+        </span>
+      );
+      return;
+    }
+
+    const treeMatch = /^([\s│├└─┬─]+)?(.*)$/.exec(line);
+    const treePrefix = treeMatch ? treeMatch[1] : "";
+    const content = treeMatch ? treeMatch[2] : line;
+
+    let tokenIdx = 0;
+    if (treePrefix) {
+      nodes.push(
+        <span key={`${lineIdx}-${tokenIdx++}`} className="hl-files-tree">
+          {treePrefix}
+        </span>
+      );
+    }
+
+    if (!content) return;
+
+    const fileDescMatch = /^([^\s]+)(\s{2,})(.*)$/.exec(content);
+    if (fileDescMatch) {
+      const [, filename, spacing, desc] = fileDescMatch;
+      renderFilenameToken(nodes, filename, lineIdx, tokenIdx);
+      nodes.push(spacing);
+      nodes.push(
+        <span key={`${lineIdx}-desc`} className="hl-files-desc">
+          {desc}
+        </span>
+      );
+    } else {
+      renderFilenameToken(nodes, content, lineIdx, tokenIdx);
+    }
+  });
+
+  return nodes;
+}
+
+function renderFilenameToken(nodes: ReactNode[], filename: string, lineIdx: number, tokenIdx: number) {
+  if (filename.endsWith("/")) {
+    nodes.push(
+      <span key={`${lineIdx}-${tokenIdx}`} className="hl-files-dir">
+        {filename}
+      </span>
+    );
+    return;
+  }
+
+  const tsMatch = /^(\d{14}_)(.*)$/.exec(filename);
+  if (tsMatch) {
+    const [, timestamp, rest] = tsMatch;
+    nodes.push(
+      <span key={`${lineIdx}-${tokenIdx}-ts`} className="hl-files-time">
+        {timestamp}
+      </span>
+    );
+    classifyFile(nodes, rest, lineIdx, tokenIdx + 1);
+    return;
+  }
+
+  classifyFile(nodes, filename, lineIdx, tokenIdx);
+}
+
+function classifyFile(nodes: ReactNode[], name: string, lineIdx: number, tokenIdx: number) {
+  if (name.endsWith(".sql")) {
+    nodes.push(
+      <span key={`${lineIdx}-${tokenIdx}`} className="hl-files-sql">
+        {name}
+      </span>
+    );
+  } else if (/\.(conf|lock|key|keys|instance)$/.test(name) || name === "nextsql.instance") {
+    nodes.push(
+      <span key={`${lineIdx}-${tokenIdx}`} className="hl-files-config">
+        {name}
+      </span>
+    );
+  } else if (
+    /\.(db|wal|undo|audit)$/.test(name) ||
+    name.startsWith("nextsql.db") ||
+    name.startsWith("nextsql.users") ||
+    name.startsWith("nextsql.acl")
+  ) {
+    nodes.push(
+      <span key={`${lineIdx}-${tokenIdx}`} className="hl-files-db">
+        {name}
+      </span>
+    );
+  } else {
+    nodes.push(
+      <span key={`${lineIdx}-${tokenIdx}`} className="hl-files-sql">
+        {name}
+      </span>
+    );
+  }
+}
+

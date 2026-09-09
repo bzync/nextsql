@@ -166,19 +166,116 @@ span.text-xs.font-mono.text-slate-400 {
   color: var(--color-foreground);
 }
 
-/* RUI 0.0.9's danger text token (#e7000b) misses AA against this shell's dark
-   surfaces — 3.44:1 on the raised audit-failure card, 4.09:1 on the page
-   ground used by inline field errors (`p.text-destructive`, which rui renders
-   for every Input `error=`). Keep the conventional destructive red in light
-   mode and use this AA-contrast red in dark mode, everywhere the token is
-   used for text. Every such message is also announced or paired with an
-   explicit label, so state never rests on color alone. */
-.nsa-audit-verify-problem {
-  color: var(--color-danger);
+/* RUI 0.0.9's danger text token (red-600, #e7000b) misses AA as *text* in both
+   themes, so Admin overrides it wherever the token is used for text — never as
+   a fill, since `bg-destructive` is a separate class and white-on-red only
+   improves as the red darkens.
+
+   Dark: 3.44:1 on the raised audit-failure card, 4.09:1 on the page ground
+   used by inline field errors (`p.text-destructive`, which rui renders for
+   every Input `error=`).
+
+   Light: 4.49:1 on the #f7f8fb card ground those same field errors sit on —
+   short of AA by 0.01, and lower still (4.35:1, 4.24:1) on the muted surfaces.
+   Only pure white cleared it, so "keep the conventional red in light mode"
+   left the audit red for a background Admin does not actually render it on.
+   #c80009 is the same conventional red one step darker: 6.07:1 on white,
+   5.72:1 on the failing card ground, 5.40:1 on the darkest muted surface.
+
+   Every such message is also announced or paired with an explicit label, so
+   state never rests on color alone. */
+.nsa-audit-verify-problem,
+.text-destructive {
+  color: #c80009;
 }
 .dark .nsa-audit-verify-problem,
 .dark .text-destructive {
   color: #ff8990;
+}
+
+/* The same defect in RUI 0.0.9's other status/highlight text tokens, which
+   Admin renders through `CodeBlock` (bash/SQL highlighting on the Setup
+   completion screen and throughout Studio) and in status labels. Each is the
+   -600 step of its ramp, chosen to read as a hue rather than for contrast, and
+   none of them clears AA as text on *any* light surface this shell uses —
+   measured against the code ground (#f3f5f9), the card ground (#f7f8fb) and
+   white:
+
+     amber-600   #e17100   2.93 / 3.01 / 3.20
+     emerald-600 #009966   3.35 / 3.44 / 3.65
+     sky-600     #0084d1   3.68 / 3.79 / 4.02
+     red-500     #fb2c36   3.49 / 3.59 / 3.81
+     red-600     #e7000b   4.37 / 4.49 / 4.77
+
+   Each moves to a darker step of its own ramp, so the hue and the meaning it
+   carries are unchanged. The four semantic aliases alias straight onto these
+   same four ramps (`--color-warning: amber-600`, `--color-success:
+   emerald-600`, `--color-info: sky-600`, `--color-danger: destructive`), so
+   they are corrected alongside the palette classes rather than separately.
+   Worst case across every light surface Admin renders — including rui's tinted
+   badge grounds (red-50 #fef2f2, amber-50, emerald-50, sky-50) — is now
+   5.36:1.
+
+   Dark needs the aliases too. Where rui pairs a `dark:` variant the -400 step
+   already clears AA, but the aliases are not always paired, and unpaired they
+   would keep the light -600 value on a dark ground: danger 3.29:1, info
+   3.90:1, success 4.30:1 at worst. The `.dark` rules below give them the same
+   -400 values rui's own pairs use, so paired and unpaired usages agree;
+   `.dark .text-destructive` and `.dark .text-danger` share one red so the two
+   spellings of "destructive" cannot drift apart.
+
+   Light values are unscoped so source order carries them over rui's. `text-*`
+   sets color only — `bg-destructive`, `bg-red-50` and the other fills are
+   separate classes and are untouched, and every one of these reds only darkens,
+   so white-on-fill contrast can only improve. */
+.text-amber-600,
+.text-warning {
+  color: #973c00;
+}
+.text-emerald-600,
+.text-success {
+  color: #006045;
+}
+.text-sky-600,
+.text-info {
+  color: #00598a;
+}
+.text-red-500,
+.text-red-600,
+.text-danger {
+  color: #c80009;
+}
+.dark .text-warning {
+  color: #ffb900;
+}
+.dark .text-success {
+  color: #00d492;
+}
+.dark .text-info {
+  color: #00bcff;
+}
+.dark .text-danger {
+  color: #ff8990;
+}
+
+/* RUI 0.0.9's light `--color-muted-foreground` (#64708a) does not clear AA on
+   its own `--color-muted` (#eef1f6) — 4.38:1, the pairing every muted chip,
+   secondary label and quiet button in Operations and Studio renders. It does
+   pass on the lighter surfaces (4.97:1 on white, 4.68:1 on the page ground),
+   which is why it survives most screens and fails on the muted one.
+
+   #5b6780 is the same hue two steps darker: 5.68 / 5.35 / 5.20 / 5.02 across
+   white, the page ground, the muted surface and the muted fill. The dark value
+   is restated verbatim rather than left to rui, so that this override cannot
+   depend on whether `.dark` lands on the same element as `:root` or on a
+   descendant, nor on unlayered-vs-`@layer` ordering — light comes from `:root`
+   and dark from the later, equally specific `.dark`. Dark's #97a3b4 already
+   clears AA on every dark surface (lowest 6.14:1) and is unchanged. */
+:root {
+  --color-muted-foreground: #5b6780;
+}
+.dark {
+  --color-muted-foreground: #97a3b4;
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -237,4 +334,50 @@ span.text-xs.font-mono.text-slate-400 {
 .nsi-code code {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
+}
+
+/* RUI 0.0.9's `CodeBlock` syntax-highlight theme, which Admin renders on the
+   Setup completion screen (bash) and throughout Studio and Operations (SQL).
+   Its token map picks each colour for hue, and three of the seven do not clear
+   AA as text on the block's own `bg-surface-muted` ground (#f3f5f9):
+
+     keyword  violet-500 #8e51ff  4.03:1
+     builtin  sky-500    #00a6f4  2.48:1
+     comment  slate-400  #90a1b9  2.41:1   (and dark's slate-500, 3.74:1)
+
+   Each moves along its own ramp — keyword to violet-600 (5.40:1), builtin to
+   sky-800 (6.88:1) — and the comment token, which is what "quiet text" means,
+   moves to the theme's muted-foreground in both halves (5.20:1 light, 6.78:1
+   dark). string/number are corrected by the semantic-token block above, and
+   plain (slate-800 / slate-200) already passes.
+
+   `text-violet-500` and `text-sky-500` occur nowhere else in rui or in Admin —
+   the highlight map is their only use — so they are corrected globally rather
+   than tied to markup that could change.
+
+   The slate tokens are not: `text-slate-400` is also how rui greys *disabled*
+   controls, which WCAG 1.4.3 exempts and which should keep reading as
+   disabled. Those are scoped to the highlighter's own cells instead. Note
+   `CodeBlock` renders a `<table>` — one `<tr>` per line, an optional
+   `td.select-none` line number and a `td.whitespace-pre` of token spans — not
+   a `<pre>`/`<code>`, so the scope hangs off those cells. The descendant
+   selector also outranks rui's single-class utility in light, and the `.dark`
+   form outranks its `.dark .text-*` in dark.
+
+   The line-number column (`text-slate-400 dark:text-slate-600`) is the same
+   defect one cell over — 2.41:1 light, 2.17:1 dark — and gets the same
+   muted-foreground treatment. */
+.text-violet-500 {
+  color: #7f22fe;
+}
+.text-sky-500 {
+  color: #00598a;
+}
+td.whitespace-pre .text-slate-400,
+td.select-none.text-slate-400 {
+  color: var(--color-muted-foreground);
+}
+.dark td.whitespace-pre .text-slate-500,
+.dark td.select-none.text-slate-600 {
+  color: var(--color-muted-foreground);
 }

@@ -1,6 +1,6 @@
 # Command line
 
-```text
+```bash
 nextsql init     --data-dir DIR --key-file FILE [--instance-key-file FILE]
                  [--database NAME]
                  [--user NAME --password-file FILE] [--buffer-pages N]

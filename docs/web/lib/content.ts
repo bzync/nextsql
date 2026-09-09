@@ -39,6 +39,7 @@ export function searchIndex(): DocsSearchEntry[] {
         group: group.title,
         keywords: [item.slug, item.title, item.description, introduction?.content ?? ""],
         href: docHref(item.slug),
+        content: doc ? doc.body : "",
       };
       const sectionEntries = sections
         .filter((section): section is typeof section & { id: string; heading: string } =>
@@ -51,6 +52,7 @@ export function searchIndex(): DocsSearchEntry[] {
           group: group.title,
           keywords: [section.heading, section.content],
           href: `${docHref(item.slug)}#${section.id}`,
+          content: section.content,
         }));
       return [page, ...sectionEntries];
     }),

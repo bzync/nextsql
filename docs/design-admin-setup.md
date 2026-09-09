@@ -525,14 +525,23 @@ Summary screen is guaranteed to describe exactly what Install will do.
   reversible follow-up once the flow is proven. **Landed for Linux
   (`.tar.gz`/`.run`/`.deb`), 2026-09-05** — see above; Windows/macOS
   packaging remain out of scope (no build host in this environment).
-- Two `@bzync/rui` 0.0.9 accessibility defects are worked around rather than
-  fixed upstream (same treatment as the earlier Stepper/danger-token contrast
-  findings): `CodeBlock` renders its content in an `overflow-x: auto` region
-  with nothing focusable inside it, so Setup's code blocks carry
-  `className="nsi-code"` and wrap instead of scrolling; and `Autocomplete`'s
+- Several `@bzync/rui` 0.0.9 accessibility defects are worked around rather
+  than fixed upstream (same treatment as the earlier Stepper/danger-token
+  contrast findings): `CodeBlock` renders its content in an `overflow-x: auto`
+  region with nothing focusable inside it, so Setup's code blocks carry
+  `className="nsi-code"` and wrap instead of scrolling; `Autocomplete`'s
   "no matches" empty row is a bare `<li>` under `role=listbox` styled
   `text-slate-600`, which fails contrast in dark mode — reachable from any
-  path field whose directory lists nothing, not currently worked around.
+  path field whose directory lists nothing, not currently worked around; and
+  rui's status/highlight **text** colours are chosen for hue rather than for
+  contrast and largely miss AA on this shell's light surfaces. That last one
+  is now corrected as a class in `src/shared/shared.css` (log #261) rather
+  than one token at a time: the four `-600` status ramps and their semantic
+  aliases (`--color-warning` / `--color-success` / `--color-info` /
+  `--color-danger` all alias onto them), the light `--color-muted-foreground`
+  on rui's own `--color-muted`, and `CodeBlock`'s syntax-highlight map. Only
+  text is touched — every `bg-*` fill is a separate class, and each red only
+  darkens, so white-on-fill contrast can only improve.
 
 - Recovery-key export landed (M2, log #243): the Location step offers it by
   default at the server-suggested path, names both keystores' export files,

@@ -1,6 +1,6 @@
 # Server configuration
 
-```text
+```bash
 nextsqld --data-dir DIR --key-file FILE [--instance-key-file FILE]
          [--listen 127.0.0.1:7210] [--config FILE]
          [--env-file PATH | --no-env]
@@ -31,7 +31,7 @@ bytes; use a protected host-only env file.
 
 Simple `key=value`. Comments start with `#`. Unknown keys are rejected. Command-line flags override the file.
 
-```text
+```dotenv
 data_dir=/var/lib/nextsql
 key_file=/etc/nextsql/root.key
 instance_key_file=/etc/nextsql/root.key.instance

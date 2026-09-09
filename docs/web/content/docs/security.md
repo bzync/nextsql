@@ -12,7 +12,7 @@ This is the honest contract. NextSQL is not unhackable, not “100% secure,” a
 
 ## Envelope encryption
 
-```text
+```arch
 External root unlock key     (--key-file, never in the data directory)
         → KEK → database master
               → page / WAL / UNDO / backup / vector / full-text / temp / replication DEKs

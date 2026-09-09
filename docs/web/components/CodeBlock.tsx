@@ -27,13 +27,27 @@ export function isBashLang(lang?: string, title?: string, code?: string): boolea
 export function isFilesLang(lang?: string, title?: string, code?: string): boolean {
   const l = (lang || "").toLowerCase().trim();
   const t = (title || "").toLowerCase().trim();
-  const filesKeywords = /^(files?|filenames?|filetree|tree|dir|dirs|directory|structure)$/i;
-  if (filesKeywords.test(l) || (!l && filesKeywords.test(t)) || t.includes("file") || t.includes("tree")) return true;
+  const filesKeywords = /^(files?|filenames?|filetree|tree|dir|dirs|directory|structure|repository|repo)$/i;
+  if (filesKeywords.test(l) || (!l && filesKeywords.test(t)) || t.includes("file") || t.includes("tree") || t.includes("repo")) return true;
   if ((l === "text" || !l) && code) {
     const lines = code.trim().split("\n");
-    const hasDir = lines.some((line) => /^\s*[\w.-]+\/\s*$/.test(line) || line.includes("├──") || line.includes("└──"));
-    const hasFiles = lines.some((line) => /\.(sql|lock|conf|instance|keys|db|wal|undo|audit|txt|md|go|js|ts|json)\b/.test(line));
+    const hasDir = lines.some((line) => /^\s*[\w.-]+\/\s*$/.test(line) || /^\s*[\w.-]+\/\s+/.test(line) || line.includes("├──") || line.includes("└──"));
+    const hasFiles = lines.some((line) => /\.(sql|lock|conf|instance|keys|db|wal|undo|audit|txt|md|go|js|ts|json)\b/.test(line) || /^\s*cmd\/nextsql/.test(line));
     if (hasDir && hasFiles) return true;
+  }
+  return false;
+}
+
+export function isArchLang(lang?: string, title?: string, code?: string): boolean {
+  const l = (lang || "").toLowerCase().trim();
+  const t = (title || "").toLowerCase().trim();
+  const archKeywords = /^(arch|architecture|pipeline|flow|flowchart|dag|hierarchy)$/i;
+  if (archKeywords.test(l) || (!l && archKeywords.test(t)) || t.includes("architecture") || t.includes("pipeline")) return true;
+  if ((l === "text" || !l) && code) {
+    const trimmed = code.trim();
+    if (trimmed.includes("→") || (trimmed.includes("->") && (trimmed.includes("├──") || trimmed.includes("└──")))) {
+      return true;
+    }
   }
   return false;
 }
@@ -112,7 +126,8 @@ export function CodeBlock({
   const isDriver = !isBash && !isSql && isDriverLang(lang, title);
   const isProto = !isBash && !isSql && !isDriver && isProtoLang(lang, title);
   const isEnv = !isBash && !isSql && !isDriver && !isProto && isEnvLang(lang, title);
-  const isFiles = !isBash && !isSql && !isDriver && !isProto && !isEnv && isFilesLang(lang, title, code);
+  const isArch = !isBash && !isSql && !isDriver && !isProto && !isEnv && isArchLang(lang, title, code);
+  const isFiles = !isBash && !isSql && !isDriver && !isProto && !isEnv && !isArch && isFilesLang(lang, title, code);
 
   if (isBash) {
     return (
@@ -279,6 +294,36 @@ export function CodeBlock({
         <pre className="overflow-x-auto overscroll-x-contain bg-transparent p-4 text-[12.5px] leading-6 text-[var(--files-fg)] [-webkit-overflow-scrolling:touch] sm:px-5 sm:text-[13px]">
           <code>
             <HighlightCode code={code} lang="files" />
+          </code>
+        </pre>
+      </div>
+    );
+  }
+
+  if (isArch) {
+    return (
+      <div className="code-block-arch group relative overflow-hidden rounded-md border border-[var(--arch-border)] bg-[var(--arch-bg)] text-[var(--arch-fg)]">
+        <div className="code-block-header flex items-center justify-between border-b border-[var(--arch-header-border)] bg-[var(--arch-header-bg)] px-4 py-2">
+          <span className="inline-flex items-center gap-1.5 font-mono text-[11px] text-[var(--arch-header-fg)]">
+            <span
+              className="inline-flex h-4 items-center justify-center rounded px-1.5 font-mono text-[10px] font-bold uppercase tracking-wider leading-none select-none text-[#c084fc] bg-[#c084fc]/15"
+              aria-hidden="true"
+            >
+              arch
+            </span>
+            <span className="text-[var(--arch-header-fg)] opacity-90">
+              {title || (lang === "text" ? "architecture" : lang) || "architecture"}
+            </span>
+          </span>
+          <CopyButton
+            value={code}
+            label="copy"
+            className="border-transparent bg-transparent lowercase text-[var(--arch-header-fg)] opacity-75 hover:bg-white/10 hover:opacity-100 hover:text-white"
+          />
+        </div>
+        <pre className="overflow-x-auto overscroll-x-contain bg-transparent p-4 text-[12.5px] leading-6 text-[var(--arch-fg)] [-webkit-overflow-scrolling:touch] sm:px-5 sm:text-[13px]">
+          <code>
+            <HighlightCode code={code} lang="arch" />
           </code>
         </pre>
       </div>

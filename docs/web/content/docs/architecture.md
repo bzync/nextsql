@@ -2,7 +2,7 @@
 
 NextSQL is **one engine**, not four loosely connected stores. Catalog mutations, secondary indexes, HNSW graphs, inverted postings, nested collections, workflows, and CDC all go through the same WAL and transaction.
 
-```text
+```arch
 Native wire protocol → TLS 1.3 → authn → RBAC
         → SQL parser → binder / catalog
         → logical planner → cost optimizer
@@ -40,7 +40,7 @@ Hybrid queries (structured filter + full-text + ANN in one statement) are a sing
 
 ## Repository
 
-```text
+```files
 cmd/nextsqld              server
 cmd/nextsql               CLI
 cmd/nextsql-bench         official benchmark tool

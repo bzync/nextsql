@@ -118,6 +118,29 @@
   --files-db: #f472b6;
   --files-time: #94a3b8;
   --files-desc: #78889b;
+  --files-bin: #16a34a;
+  --files-code: #7c3aed;
+  --files-doc: #4f46e5;
+  --arch-bg: #090e1d;
+  --arch-fg: #dbe4f0;
+  --arch-border: rgba(168, 85, 247, 0.22);
+  --arch-header-bg: #050814;
+  --arch-header-fg: #d8b4fe;
+  --arch-header-border: rgba(168, 85, 247, 0.14);
+  --arch-arrow: #38bdf8;
+  --arch-stage: #818cf8;
+  --arch-exec: #34d399;
+  --arch-subsystem: #c084fc;
+  --arch-branch: #a78bfa;
+  --arch-tree: #818cf8;
+  --arch-storage: #f472b6;
+  --arch-wal: #fb923c;
+  --arch-buffer: #fcd34d;
+  --arch-crypto: #2dd4bf;
+  --arch-detail: #94a3b8;
+  --arch-badge: #93c5fd;
+  --arch-op: #94a3b8;
+  --arch-note: #78889b;
   --navy-950: #040912;
   --navy-900: #060c1a;
   --navy-800: #0a1427;
@@ -245,6 +268,29 @@
   --files-db: #f472b6;
   --files-time: #94a3b8;
   --files-desc: #64748b;
+  --files-bin: #4ade80;
+  --files-code: #c084fc;
+  --files-doc: #a5b4fc;
+  --arch-bg: #060914;
+  --arch-fg: #e0e7ff;
+  --arch-border: rgba(168, 85, 247, 0.26);
+  --arch-header-bg: #03050c;
+  --arch-header-fg: #d8b4fe;
+  --arch-header-border: rgba(168, 85, 247, 0.18);
+  --arch-arrow: #38bdf8;
+  --arch-stage: #818cf8;
+  --arch-exec: #34d399;
+  --arch-subsystem: #c084fc;
+  --arch-branch: #a78bfa;
+  --arch-tree: #818cf8;
+  --arch-storage: #f472b6;
+  --arch-wal: #fb923c;
+  --arch-buffer: #fcd34d;
+  --arch-crypto: #2dd4bf;
+  --arch-detail: #cbd5e1;
+  --arch-badge: #93c5fd;
+  --arch-op: #94a3b8;
+  --arch-note: #94a3b8;
   color-scheme: dark;
 }
 
@@ -360,6 +406,29 @@
   --color-files-db: var(--files-db);
   --color-files-time: var(--files-time);
   --color-files-desc: var(--files-desc);
+  --color-files-bin: var(--files-bin);
+  --color-files-code: var(--files-code);
+  --color-files-doc: var(--files-doc);
+  --color-arch-bg: var(--arch-bg);
+  --color-arch-fg: var(--arch-fg);
+  --color-arch-border: var(--arch-border);
+  --color-arch-header-bg: var(--arch-header-bg);
+  --color-arch-header-fg: var(--arch-header-fg);
+  --color-arch-header-border: var(--arch-header-border);
+  --color-arch-arrow: var(--arch-arrow);
+  --color-arch-stage: var(--arch-stage);
+  --color-arch-exec: var(--arch-exec);
+  --color-arch-subsystem: var(--arch-subsystem);
+  --color-arch-branch: var(--arch-branch);
+  --color-arch-tree: var(--arch-tree);
+  --color-arch-storage: var(--arch-storage);
+  --color-arch-wal: var(--arch-wal);
+  --color-arch-buffer: var(--arch-buffer);
+  --color-arch-crypto: var(--arch-crypto);
+  --color-arch-detail: var(--arch-detail);
+  --color-arch-badge: var(--arch-badge);
+  --color-arch-op: var(--arch-op);
+  --color-arch-note: var(--arch-note);
   --color-navy-950: var(--navy-950);
   --color-navy-900: var(--navy-900);
   --color-navy-800: var(--navy-800);
@@ -1205,9 +1274,106 @@ body {
   opacity: 0.85;
 }
 
+.hl-files-bin {
+  color: var(--files-bin);
+  font-weight: 600;
+}
+
+.hl-files-code {
+  color: var(--files-code);
+  font-weight: 500;
+}
+
+.hl-files-doc {
+  color: var(--files-doc);
+  font-weight: 500;
+}
+
 .hl-files-desc {
   color: var(--files-desc);
   font-style: italic;
+}
+
+.code-block-arch,
+.code-block-pipeline {
+  background: var(--arch-bg);
+  color: var(--arch-fg);
+  border-color: var(--arch-border);
+}
+
+.code-block-arch .code-block-header,
+.code-block-pipeline .code-block-header {
+  background: var(--arch-header-bg);
+  border-bottom-color: var(--arch-header-border);
+}
+
+.hl-arch-arrow {
+  color: var(--arch-arrow);
+  font-weight: 700;
+}
+
+.hl-arch-stage {
+  color: var(--arch-stage);
+  font-weight: 500;
+}
+
+.hl-arch-exec {
+  color: var(--arch-exec);
+  font-weight: 700;
+}
+
+.hl-arch-subsystem {
+  color: var(--arch-subsystem);
+  font-weight: 600;
+}
+
+.hl-arch-branch {
+  color: var(--arch-branch);
+  font-weight: 600;
+}
+
+.hl-arch-tree {
+  color: var(--arch-tree);
+  opacity: 0.9;
+}
+
+.hl-arch-storage {
+  color: var(--arch-storage);
+  font-weight: 500;
+}
+
+.hl-arch-wal {
+  color: var(--arch-wal);
+  font-weight: 600;
+}
+
+.hl-arch-buffer {
+  color: var(--arch-buffer);
+  font-weight: 500;
+}
+
+.hl-arch-crypto {
+  color: var(--arch-crypto);
+  font-weight: 600;
+}
+
+.hl-arch-detail {
+  color: var(--arch-detail);
+}
+
+.hl-arch-badge {
+  color: var(--arch-badge);
+  font-weight: 600;
+}
+
+.hl-arch-op {
+  color: var(--arch-op);
+}
+
+.hl-arch-note {
+  color: var(--arch-note);
+  font-style: italic;
+  opacity: 0.85;
 }
 
 .adjacent-nav {

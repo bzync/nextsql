@@ -373,6 +373,17 @@ export function HighlightCode({
   ) {
     return <>{tokenizeFileTree(code)}</>;
   }
+  if (
+    kind === "arch" ||
+    kind === "architecture" ||
+    kind === "pipeline" ||
+    kind === "flow" ||
+    kind === "flowchart" ||
+    kind === "dag" ||
+    kind === "hierarchy"
+  ) {
+    return <>{tokenizeArchFlow(code)}</>;
+  }
   return <>{code}</>;
 }
 
@@ -1614,6 +1625,19 @@ function renderFilenameToken(nodes: ReactNode[], filename: string, lineIdx: numb
     return;
   }
 
+  const lastSlash = filename.lastIndexOf("/");
+  if (lastSlash !== -1) {
+    const dirPart = filename.slice(0, lastSlash + 1);
+    const basePart = filename.slice(lastSlash + 1);
+    nodes.push(
+      <span key={`${lineIdx}-${tokenIdx}-dir`} className="hl-files-dir">
+        {dirPart}
+      </span>
+    );
+    classifyFile(nodes, basePart, lineIdx, tokenIdx + 1);
+    return;
+  }
+
   classifyFile(nodes, filename, lineIdx, tokenIdx);
 }
 
@@ -1641,6 +1665,28 @@ function classifyFile(nodes: ReactNode[], name: string, lineIdx: number, tokenId
         {name}
       </span>
     );
+  } else if (
+    name.startsWith("nextsql") ||
+    /^(server|cli|broker|admin|bench)$/i.test(name) ||
+    /\.(sh|bin|exe)$/.test(name)
+  ) {
+    nodes.push(
+      <span key={`${lineIdx}-${tokenIdx}`} className="hl-files-bin">
+        {name}
+      </span>
+    );
+  } else if (/\.(go|ts|js|py|rb|php)$/.test(name)) {
+    nodes.push(
+      <span key={`${lineIdx}-${tokenIdx}`} className="hl-files-code">
+        {name}
+      </span>
+    );
+  } else if (/\.(md|txt|json|yaml|yml)$/.test(name)) {
+    nodes.push(
+      <span key={`${lineIdx}-${tokenIdx}`} className="hl-files-doc">
+        {name}
+      </span>
+    );
   } else {
     nodes.push(
       <span key={`${lineIdx}-${tokenIdx}`} className="hl-files-sql">
@@ -1649,4 +1695,234 @@ function classifyFile(nodes: ReactNode[], name: string, lineIdx: number, tokenId
     );
   }
 }
+
+const ARCH_BADGE_WORDS = new Set([
+  "B+Tree",
+  "RANGE",
+  "HASH",
+  "LIST",
+  "NSJB",
+  "STRUCT",
+  "ARRAY",
+  "MAP",
+  "F32",
+  "F16",
+  "I8",
+  "HNSW",
+  "IVF",
+  "IVF-PQ",
+  "BM25",
+  "WGS84",
+  "GEOMETRY",
+  "GEOGRAPHY",
+  "WAL",
+  "REDO",
+  "UNDO",
+  "DEK",
+  "DEKS",
+  "KEK",
+  "AES-256-GCM",
+  "TLS",
+  "1.3",
+  "MVCC",
+  "RBAC",
+  "SQL",
+]);
+
+const BRANCH_COLORS: Record<string, string> = {
+  relational: "#38bdf8",
+  json: "#fbbf24",
+  collections: "#c084fc",
+  vector: "#34d399",
+  "full-text": "#f472b6",
+  geo: "#2dd4bf",
+};
+
+function classifyArchStageClass(text: string): string {
+  const lower = text.toLowerCase();
+  if (/\b(wal|redo|fsync|commit)\b/.test(lower)) return "hl-arch-wal";
+  if (/\b(aes|gcm|tls|crypto|sealed|encrypt|dek|kek)\b/.test(lower)) return "hl-arch-crypto";
+  if (/\b(mvcc|locks?|undo|txn|transaction)\b/.test(lower)) return "hl-arch-storage";
+  if (/\b(buffer|cache|pool|pages?)\b/.test(lower)) return "hl-arch-buffer";
+  if (/\b(vectorized|executor|engine)\b/.test(lower)) return "hl-arch-exec";
+  if (/\b(wire|protocol|auth|authn|rbac|client|root)\b/.test(lower)) return "hl-arch-subsystem";
+  if (/\b(parser|binder|catalog|planner|optimizer|cost|logical)\b/.test(lower)) return "hl-arch-stage";
+  return "hl-arch-stage";
+}
+
+function renderArchStageSegment(nodes: ReactNode[], segment: string, lineIdx: number, pIdx: number) {
+  const noteMatch = /^(.*?)(\s+)(\([^)]+\))$/.exec(segment);
+  let mainText = segment;
+  let noteText = "";
+  let noteSpacing = "";
+
+  if (noteMatch) {
+    mainText = noteMatch[1];
+    noteSpacing = noteMatch[2];
+    noteText = noteMatch[3];
+  }
+
+  const stageClass = classifyArchStageClass(mainText);
+
+  const subTokens = mainText.split(/(\s+[+\/]\s+)/);
+  subTokens.forEach((st, stIdx) => {
+    if (/^\s+[+\/]\s+$/.test(st)) {
+      nodes.push(
+        <span key={`${lineIdx}-${pIdx}-${stIdx}-op`} className="hl-arch-op">
+          {st}
+        </span>
+      );
+    } else {
+      nodes.push(
+        <span key={`${lineIdx}-${pIdx}-${stIdx}-stage`} className={stageClass}>
+          {st}
+        </span>
+      );
+    }
+  });
+
+  if (noteText) {
+    nodes.push(noteSpacing);
+    nodes.push(
+      <span key={`${lineIdx}-${pIdx}-note`} className="hl-arch-note">
+        {noteText}
+      </span>
+    );
+  }
+}
+
+function renderBranchDetails(nodes: ReactNode[], details: string, lineIdx: number) {
+  const tokenRegex = /(\s+|B\+Tree|[a-zA-Z0-9_\-]+(?:\s*[0-9]+)?|[,\/+]|[^\s\w]+)/g;
+  let m: RegExpExecArray | null;
+  let idx = 0;
+
+  while ((m = tokenRegex.exec(details)) !== null) {
+    const raw = m[0];
+    const key = `${lineIdx}-bd-${idx++}`;
+
+    if (/^\s+$/.test(raw)) {
+      nodes.push(raw);
+      continue;
+    }
+
+    if (raw === "," || raw === "/" || raw === "+") {
+      nodes.push(
+        <span key={key} className="hl-arch-op">
+          {raw}
+        </span>
+      );
+      continue;
+    }
+
+    const upper = raw.toUpperCase();
+    if (ARCH_BADGE_WORDS.has(raw) || ARCH_BADGE_WORDS.has(upper)) {
+      nodes.push(
+        <span key={key} className="hl-arch-badge">
+          {raw}
+        </span>
+      );
+      continue;
+    }
+
+    nodes.push(
+      <span key={key} className="hl-arch-detail">
+        {raw}
+      </span>
+    );
+  }
+}
+
+function tokenizeArchFlow(code: string): ReactNode[] {
+  const lines = code.split("\n");
+  const nodes: ReactNode[] = [];
+
+  lines.forEach((line, lineIdx) => {
+    if (lineIdx > 0) {
+      nodes.push("\n");
+    }
+
+    if (!line) return;
+
+    if (/^\s*#/.test(line)) {
+      nodes.push(
+        <span key={`${lineIdx}-cmt`} className="hl-arch-note">
+          {line}
+        </span>
+      );
+      return;
+    }
+
+    const treeMatch = /^(\s*[│├└─┬─]+\s*)(.*)$/.exec(line);
+    if (treeMatch) {
+      const [, treePrefix, rest] = treeMatch;
+      const indentMatch = /^(\s*)(.*)$/.exec(treePrefix);
+      if (indentMatch) {
+        if (indentMatch[1]) nodes.push(indentMatch[1]);
+        nodes.push(
+          <span key={`${lineIdx}-tree`} className="hl-arch-tree">
+            {indentMatch[2]}
+          </span>
+        );
+      } else {
+        nodes.push(
+          <span key={`${lineIdx}-tree`} className="hl-arch-tree">
+            {treePrefix}
+          </span>
+        );
+      }
+
+      const branchMatch = /^([^\s]+)(\s{2,})(.*)$/.exec(rest);
+      if (branchMatch) {
+        const [, branchName, spacing, details] = branchMatch;
+        const branchColor = BRANCH_COLORS[branchName.toLowerCase()];
+        nodes.push(
+          <span
+            key={`${lineIdx}-branch`}
+            className="hl-arch-branch"
+            style={branchColor ? { color: branchColor } : undefined}
+          >
+            {branchName}
+          </span>
+        );
+        nodes.push(spacing);
+        renderBranchDetails(nodes, details, lineIdx);
+      } else {
+        renderBranchDetails(nodes, rest, lineIdx);
+      }
+      return;
+    }
+
+    if (line.includes("→") || line.includes("->")) {
+      const leadMatch = /^(\s*)(.*)$/.exec(line);
+      const leadSpace = leadMatch ? leadMatch[1] : "";
+      const rest = leadMatch ? leadMatch[2] : line;
+
+      if (leadSpace) nodes.push(leadSpace);
+
+      const parts = rest.split(/(\s*(?:→|->)\s*)/);
+      parts.forEach((part, pIdx) => {
+        if (!part) return;
+        if (/^\s*(?:→|->)\s*$/.test(part)) {
+          nodes.push(
+            <span key={`${lineIdx}-${pIdx}-arr`} className="hl-arch-arrow">
+              {part}
+            </span>
+          );
+        } else {
+          renderArchStageSegment(nodes, part, lineIdx, pIdx);
+        }
+      });
+      return;
+    }
+
+    const leadMatch = /^(\s*)(.*)$/.exec(line);
+    const leadSpace = leadMatch ? leadMatch[1] : "";
+    const rest = leadMatch ? leadMatch[2] : line;
+    if (leadSpace) nodes.push(leadSpace);
+    renderArchStageSegment(nodes, rest, lineIdx, 0);
+  });
+
+  return nodes;
+}
+
 

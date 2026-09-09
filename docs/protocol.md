@@ -104,8 +104,10 @@ reload retains the last known-good snapshot. Configured CRLs are signature- and
 time-validated and require complete non-root chain coverage; revoked or
 uncovered clients fail the handshake. Successful mTLS reload terminates every
 accepted connection, including pre-authentication handshakes, so clients
-reauthenticate under the new snapshot. OCSP is not implemented. This adds no
-NSQL frame or wire-version change.
+reauthenticate under the new snapshot. Optional stapled/live OCSP status
+checking is controlled by `--tls-ocsp-mode optional|enforce`; `enforce` fails
+closed on missing, invalid, expired, or revoked status. This adds no NSQL frame
+or wire-version change.
 
 ## Frame
 

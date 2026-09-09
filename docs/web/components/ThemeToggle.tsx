@@ -1,11 +1,12 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useSyncExternalStore } from "react";
 import { ThemeToggle as RuiThemeToggle } from "@bzync/rui";
 
+const subscribeHydration = () => () => {};
+
 export function ThemeToggle({ className = "" }: { className?: string }) {
-  const [mounted, setMounted] = useState(false);
-  useEffect(() => setMounted(true), []);
+  const mounted = useSyncExternalStore(subscribeHydration, () => true, () => false);
 
   if (!mounted) {
     return <span className="inline-flex h-10 w-10 sm:h-9 sm:w-9" aria-hidden="true" />;

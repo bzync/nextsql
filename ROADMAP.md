@@ -380,12 +380,15 @@ Also production-gated:
   audience + client binding at the broker, and non-interactive renewal. The
   embedded single-node mode is implemented on a separate bounded listener with
   issuer/verifier compatibility checks and a live native-user/ACL membership
-  feed. Optional opaque-token introspection and JIT provisioning remain off;
-- field-level client encryption — experimental SQL/catalog/server slice plus
-  portable randomized `NSCE1.` helpers for Go, Node.js/TypeScript, Bun,
-  and PHP, PITR (exact-ciphertext restore-to-target-LSN), replication/failover
+  feed. Optional RFC 7662 opaque-token introspection and bounded JIT
+  provisioning are implemented as fail-closed controls and remain off by
+  default;
+- field-level client encryption — production-gated randomized `NSCE1.` and
+  explicit deterministic-equality `NSCE2.` SQL/catalog/server paths plus
+  helpers for Go, Node.js/TypeScript, Bun, and PHP, PITR
+  (exact-ciphertext restore-to-target-LSN), replication/failover
   (no lost acknowledged ciphertext across a three-voter leader failover), and
-  durable key-rotation/revocation (`FileFieldKeyring` in every official
+  durable key-rotation/revocation (`FileFieldKeyring` in every helper-bearing
   driver) all landed and tested;
 - password-hash evolution — Argon2id migration, versioned records, PBKDF2
   compatibility, transparent rehash, DoS benchmarks;

@@ -55,7 +55,9 @@ authority, and cover every non-root certificate in the verified chain; missing
 coverage and revoked serials fail closed. Successful mTLS reloads disconnect
 all accepted connections, including in-progress handshakes, so they reconnect
 under the new snapshot. Use an old+new CA overlap bundle while rotating trust.
-OCSP is not implemented.
+Optional stapled/live OCSP status checking is controlled by
+`--tls-ocsp-mode optional|enforce`; `enforce` fails closed on missing, invalid,
+expired, or revoked status. OCSP is disabled by default.
 
 `--insecure` against a remote host is rejected. `--tls-ca` is a PEM CA / server certificate; SNI defaults to the host in `--addr` and can be overridden by `--tls-server-name` / `NEXTSQL_TLS_SERVER_NAME`.
 

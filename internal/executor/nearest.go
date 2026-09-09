@@ -176,10 +176,7 @@ func (s *Session) nearestIndex(n planner.Nearest, q []float32, metric nsvec.Metr
 		// Query asked for a different metric than the graph; exact flat.
 		return s.nearestFlat(n, q, metric)
 	}
-	k := int(n.K)
-	if k < 1 {
-		k = int(meta.Count)
-	}
+	k := annK(n.K, meta.Count)
 	if k < 1 {
 		return nil, nil
 	}
@@ -280,10 +277,7 @@ func (s *Session) nearestIndexPartitioned(n planner.Nearest, q []float32, metric
 	if len(graphs) == 0 || total == 0 {
 		return nil, nil
 	}
-	k := int(n.K)
-	if k < 1 {
-		k = int(total)
-	}
+	k := annK(n.K, total)
 	if k < 1 {
 		return nil, nil
 	}
@@ -484,10 +478,7 @@ func (s *Session) nearestFlat(n planner.Nearest, q []float32, metric nsvec.Metri
 			}
 		}
 	}
-	k := int(n.K)
-	if k < 1 {
-		k = len(cands)
-	}
+	k := annK(n.K, uint64(len(cands)))
 	hits, err := nsvec.FlatSearch(q, metric, cands, k, s.workers())
 	if err != nil {
 		return nil, err
@@ -552,4 +543,23 @@ func (s *Session) nearestFlat(n planner.Nearest, q []float32, metric nsvec.Metri
 		out = append(out, row)
 	}
 	return out, nil
+}
+
+// maxInt is the largest value an int holds on this build.
+const maxInt = int64(^uint(0) >> 1)
+
+// annK narrows a plan's top-K to an int, clamped to the number of candidates
+// available. K carries the query's LIMIT through the planner unchanged, so it
+// is unbounded, and a bare int(n.K) conversion wraps it negative on a 32-bit
+// build. A K at or above the candidate count already means "every candidate",
+// so clamping there preserves the answer while keeping the conversion in range.
+func annK(k int64, avail uint64) int {
+	lim := int64(avail)
+	if avail > uint64(maxInt) {
+		lim = maxInt
+	}
+	if k < 1 || k > lim {
+		return int(lim)
+	}
+	return int(k)
 }

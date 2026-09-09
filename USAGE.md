@@ -2403,7 +2403,10 @@ certificate in the verified chain must have current issuer coverage. Replace
 all configured TLS files, then send `SIGHUP`; a failed reload retains the last
 known-good snapshot, while a successful mTLS reload disconnects all accepted
 connections, including in-progress handshakes, so clients reauthenticate. Use
-an old+new CA overlap bundle during trust rotation. OCSP is not implemented.
+an old+new CA overlap bundle during trust rotation. Optional OCSP status
+checking uses `--tls-ocsp-mode optional|enforce` and, when needed,
+`--tls-ocsp-responder URL`; `enforce` fails the handshake on missing, invalid,
+expired, or revoked status. OCSP is disabled by default.
 
 ### Short-lived credentials
 

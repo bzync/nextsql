@@ -415,11 +415,11 @@ func (p *Parser) clusterStmt() (ast.Stmt, error) {
 			if err := p.expect(lexer.Eq, "="); err != nil {
 				return nil, err
 			}
-			n, err := p.uint64Lit()
+			n, err := p.int64Lit("TIMEOUT_MS")
 			if err != nil {
 				return nil, err
 			}
-			timeoutMS = int64(n)
+			timeoutMS = n
 			if err := p.expect(lexer.RParen, ")"); err != nil {
 				return nil, err
 			}
@@ -751,13 +751,13 @@ func scheduleLiteral(expr ast.Expr) bool {
 // applies given options over zero defaults; ALTER applies given options
 // over the group's current stored values, leaving the rest untouched.
 type resourceGroupOptions struct {
-	maxConcurrency    uint64
+	maxConcurrency    int
 	hasMaxConcurrency bool
-	memoryBytes       uint64
+	memoryBytes       int64
 	hasMemoryBytes    bool
-	workers           uint64
+	workers           int
 	hasWorkers        bool
-	priority          uint64
+	priority          int
 	hasPriority       bool
 }
 
@@ -781,7 +781,7 @@ func (p *Parser) resourceGroupWith() (resourceGroupOptions, error) {
 			if err := p.expect(lexer.Eq, "="); err != nil {
 				return opt, err
 			}
-			n, err := p.uintLit()
+			n, err := p.intLit("MAX_CONCURRENCY")
 			if err != nil {
 				return opt, err
 			}
@@ -794,7 +794,7 @@ func (p *Parser) resourceGroupWith() (resourceGroupOptions, error) {
 			if err := p.expect(lexer.Eq, "="); err != nil {
 				return opt, err
 			}
-			n, err := p.uint64Lit()
+			n, err := p.int64Lit("MEMORY")
 			if err != nil {
 				return opt, err
 			}
@@ -807,7 +807,7 @@ func (p *Parser) resourceGroupWith() (resourceGroupOptions, error) {
 			if err := p.expect(lexer.Eq, "="); err != nil {
 				return opt, err
 			}
-			n, err := p.uintLit()
+			n, err := p.intLit("WORKERS")
 			if err != nil {
 				return opt, err
 			}
@@ -820,7 +820,7 @@ func (p *Parser) resourceGroupWith() (resourceGroupOptions, error) {
 			if err := p.expect(lexer.Eq, "="); err != nil {
 				return opt, err
 			}
-			n, err := p.uintLit()
+			n, err := p.intLit("PRIORITY")
 			if err != nil {
 				return opt, err
 			}
@@ -867,10 +867,10 @@ func (p *Parser) createResourceGroup() (ast.Stmt, error) {
 		if err != nil {
 			return nil, err
 		}
-		out.MaxConcurrency = int(opt.maxConcurrency)
-		out.MemoryBytes = int64(opt.memoryBytes)
-		out.Workers = int(opt.workers)
-		out.Priority = int(opt.priority)
+		out.MaxConcurrency = opt.maxConcurrency
+		out.MemoryBytes = opt.memoryBytes
+		out.Workers = opt.workers
+		out.Priority = opt.priority
 	}
 	return out, nil
 }
@@ -896,13 +896,13 @@ func (p *Parser) alterResourceGroup() (ast.Stmt, error) {
 	}
 	return ast.AlterResourceGroup{
 		Name:              name,
-		MaxConcurrency:    int(opt.maxConcurrency),
+		MaxConcurrency:    opt.maxConcurrency,
 		HasMaxConcurrency: opt.hasMaxConcurrency,
-		MemoryBytes:       int64(opt.memoryBytes),
+		MemoryBytes:       opt.memoryBytes,
 		HasMemoryBytes:    opt.hasMemoryBytes,
-		Workers:           int(opt.workers),
+		Workers:           opt.workers,
 		HasWorkers:        opt.hasWorkers,
-		Priority:          int(opt.priority),
+		Priority:          opt.priority,
 		HasPriority:       opt.hasPriority,
 	}, nil
 }
@@ -2533,21 +2533,21 @@ func (p *Parser) colTypeD(depth int) (types.Type, error) {
 		if err := p.expect(lexer.LParen, "("); err != nil {
 			return types.Type{}, err
 		}
-		prec, err := p.uintLit()
+		prec, err := p.u16Lit("DECIMAL precision")
 		if err != nil {
 			return types.Type{}, err
 		}
 		if err := p.expect(lexer.Comma, ","); err != nil {
 			return types.Type{}, err
 		}
-		scale, err := p.uintLit()
+		scale, err := p.u16Lit("DECIMAL scale")
 		if err != nil {
 			return types.Type{}, err
 		}
 		if err := p.expect(lexer.RParen, ")"); err != nil {
 			return types.Type{}, err
 		}
-		return types.DecimalType(uint16(prec), uint16(scale))
+		return types.DecimalType(prec, scale)
 	case lexer.KwPoint, lexer.KwLocation:
 		p.next()
 		return types.Point(), nil
@@ -2576,14 +2576,14 @@ func (p *Parser) colTypeD(depth int) (types.Type, error) {
 		if err := p.expect(lexer.Lt, "<"); err != nil {
 			return types.Type{}, err
 		}
-		n, err := p.uintLit()
+		n, err := p.u16Lit("BITVECTOR dimension")
 		if err != nil {
 			return types.Type{}, err
 		}
 		if err := p.expect(lexer.Gt, ">"); err != nil {
 			return types.Type{}, err
 		}
-		return types.VectorBit(uint16(n))
+		return types.VectorBit(n)
 	case lexer.KwSparsevector:
 		p.next()
 		if err := p.expect(lexer.Lt, "<"); err != nil {
@@ -2613,7 +2613,7 @@ func (p *Parser) colTypeD(depth int) (types.Type, error) {
 		if err := p.expect(lexer.Comma, ","); err != nil {
 			return types.Type{}, err
 		}
-		n, err := p.uintLit()
+		n, err := p.u16Lit("VECTOR dimension")
 		if err != nil {
 			return types.Type{}, err
 		}
@@ -2622,11 +2622,11 @@ func (p *Parser) colTypeD(depth int) (types.Type, error) {
 		}
 		switch elem {
 		case lexer.KwF16:
-			return types.VectorF16(uint16(n))
+			return types.VectorF16(n)
 		case lexer.KwI8:
-			return types.VectorI8(uint16(n))
+			return types.VectorI8(n)
 		}
-		return types.VectorF32(uint16(n))
+		return types.VectorF32(n)
 	default:
 		return types.Type{}, nerr.New(nerr.Syntax, "sql.parser", "expected a type")
 	}
@@ -2833,31 +2833,31 @@ func (p *Parser) createIndex(unique, spatial, fulltext, vector bool) (ast.Stmt, 
 						if err := p.expect(lexer.Eq, "="); err != nil {
 							return nil, err
 						}
-						n, err := p.uintLit()
+						n, err := p.intLit("LISTS")
 						if err != nil {
 							return nil, err
 						}
-						ivfLists = int(n)
+						ivfLists = n
 					case p.identIs("probes"):
 						p.next()
 						if err := p.expect(lexer.Eq, "="); err != nil {
 							return nil, err
 						}
-						n, err := p.uintLit()
+						n, err := p.intLit("PROBES")
 						if err != nil {
 							return nil, err
 						}
-						ivfProbes = int(n)
+						ivfProbes = n
 					case p.identIs("subspaces"):
 						p.next()
 						if err := p.expect(lexer.Eq, "="); err != nil {
 							return nil, err
 						}
-						n, err := p.uintLit()
+						n, err := p.intLit("SUBSPACES")
 						if err != nil {
 							return nil, err
 						}
-						ivfSubspaces = int(n)
+						ivfSubspaces = n
 					default:
 						return nil, nerr.New(nerr.Syntax, "sql.parser", "expected LISTS, PROBES, or SUBSPACES")
 					}
@@ -4555,6 +4555,52 @@ func (p *Parser) uintLit() (uint64, error) {
 	}
 	p.next()
 	return n, nil
+}
+
+// intLit parses an unsigned integer option that is stored in an int field.
+// uintLit caps at 32 bits, but int is only 32 bits wide on a 32-bit build, so
+// the value is bounded here instead of wrapping negative there.
+func (p *Parser) intLit(what string) (int, error) {
+	n, err := p.uintLit()
+	if err != nil {
+		return 0, err
+	}
+	if n > math.MaxInt32 {
+		return 0, nerr.New(nerr.InvalidArgument, "sql.parser", what+" out of range")
+	}
+	return int(n), nil
+}
+
+// int64Lit parses an unsigned integer option that is stored in an int64 field.
+// uint64Lit accepts the full unsigned range, and converting the top half of it
+// to int64 wraps negative -- a MEMORY limit that wrapped read as "no limit" at
+// admission time -- so it is rejected here.
+func (p *Parser) int64Lit(what string) (int64, error) {
+	n, err := p.uint64Lit()
+	if err != nil {
+		return 0, err
+	}
+	if n > math.MaxInt64 {
+		return 0, nerr.New(nerr.InvalidArgument, "sql.parser", what+" out of range")
+	}
+	return int64(n), nil
+}
+
+// u16Lit parses a type parameter that is stored in a uint16 field
+// (Type.Precision and friends). Narrowing with a bare uint16() conversion
+// wraps silently instead of failing -- DECIMAL(65537,1) became DECIMAL(1,1)
+// and VECTOR<F32,65544> became an 8-dimensional column -- so anything the
+// field cannot represent is rejected here. The semantic range (DECIMAL's 38
+// digits, MaxVectorDim, ...) stays with the type constructor.
+func (p *Parser) u16Lit(what string) (uint16, error) {
+	n, err := p.uintLit()
+	if err != nil {
+		return 0, err
+	}
+	if n > math.MaxUint16 {
+		return 0, nerr.New(nerr.InvalidArgument, "sql.parser", what+" out of range")
+	}
+	return uint16(n), nil
 }
 
 // uint64Lit is uintLit without the 32-bit ceiling, for fields such as byte

@@ -93,7 +93,15 @@ func TestBindResourceGroupRejectsOutOfRangeOptions(t *testing.T) {
 	workflows := func(string) (*catalog.Workflow, bool) { return nil, false }
 	lookupTrigger := func(string) (*catalog.Trigger, bool) { return nil, false }
 	schedules := func(string) (*catalog.Schedule, bool) { return nil, false }
-	stmt, err := parser.Parse(`CREATE RESOURCE GROUP huge WITH (MAX_CONCURRENCY = 4294967295)`)
+	// Values the int field cannot represent are rejected by the parser, before
+	// a narrowing conversion can wrap them into an in-range-looking number.
+	if _, err := parser.Parse(`CREATE RESOURCE GROUP huge WITH (MAX_CONCURRENCY = 4294967295)`); err == nil {
+		t.Fatal("expected the parser to reject an unrepresentable MAX_CONCURRENCY")
+	}
+
+	// A value the field can represent but the catalog does not allow is
+	// rejected by the binder.
+	stmt, err := parser.Parse(`CREATE RESOURCE GROUP huge WITH (MAX_CONCURRENCY = 2000000)`)
 	if err != nil {
 		t.Fatal(err)
 	}

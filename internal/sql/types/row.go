@@ -457,7 +457,40 @@ func DecodeScalar(raw []byte, off int, t Type) (Value, int, error) {
 	return decodeScalar(raw, off, t)
 }
 
+// checkIntWidth verifies that v's integer payload is representable in its
+// declared kind. Coerce enforces this for every value entering the engine
+// (types.NewInt / types.NewUint), so this is the encoders' fail-closed
+// backstop: narrowing an out-of-range payload on the way to disk wraps
+// silently, and because encodeScalar and encodeSortable wrap independently a
+// wrapped value would be stored under a key that no longer matches it.
+func checkIntWidth(v Value, op string) error {
+	var ok bool
+	switch v.Typ.Kind {
+	case KindInt8:
+		ok = v.Int >= math.MinInt8 && v.Int <= math.MaxInt8
+	case KindInt16:
+		ok = v.Int >= math.MinInt16 && v.Int <= math.MaxInt16
+	case KindInt32, KindDate:
+		ok = v.Int >= math.MinInt32 && v.Int <= math.MaxInt32
+	case KindUint8:
+		ok = v.Uint <= math.MaxUint8
+	case KindUint16:
+		ok = v.Uint <= math.MaxUint16
+	case KindUint32:
+		ok = v.Uint <= math.MaxUint32
+	default:
+		return nil
+	}
+	if !ok {
+		return nerr.New(nerr.InvalidArgument, op, v.Typ.Kind.String()+" value out of range")
+	}
+	return nil
+}
+
 func encodeScalar(v Value) ([]byte, error) {
+	if err := checkIntWidth(v, "types.encodeScalar"); err != nil {
+		return nil, err
+	}
 	switch v.Typ.Kind {
 	case KindUUID:
 		return append([]byte(nil), v.UUID[:]...), nil
@@ -1059,6 +1092,9 @@ func encodeKeyPart(v Value) ([]byte, error) {
 }
 
 func encodeSortable(v Value) ([]byte, error) {
+	if err := checkIntWidth(v, "types.encodeSortable"); err != nil {
+		return nil, err
+	}
 	switch v.Typ.Kind {
 	case KindUUID:
 		return append([]byte(nil), v.UUID[:]...), nil

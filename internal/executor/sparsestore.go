@@ -327,10 +327,7 @@ func (s *Session) nearestSparseIndex(n planner.Nearest, q nsvec.SparseVec, metri
 	if meta.Count == 0 {
 		return nil, nil
 	}
-	k := int(n.K)
-	if k < 1 {
-		k = int(meta.Count)
-	}
+	k := annK(n.K, meta.Count)
 	if k < 1 {
 		return nil, nil
 	}
@@ -470,10 +467,7 @@ func (s *Session) nearestSparseFlat(n planner.Nearest, q nsvec.SparseVec, metric
 			}
 		}
 	}
-	k := int(n.K)
-	if k < 1 {
-		k = len(cands)
-	}
+	k := annK(n.K, uint64(len(cands)))
 	hits, err := nsvec.SparseFlat(q, metric, cands, k)
 	if err != nil {
 		return nil, err
@@ -701,10 +695,7 @@ func (s *Session) nearestSparseIndexPartitioned(n planner.Nearest, q nsvec.Spars
 	if len(stores) == 0 || total == 0 {
 		return nil, nil
 	}
-	k := int(n.K)
-	if k < 1 {
-		k = int(total)
-	}
+	k := annK(n.K, total)
 	if k < 1 {
 		return nil, nil
 	}

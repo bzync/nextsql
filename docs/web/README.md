@@ -18,6 +18,7 @@ Open [http://localhost:3000](http://localhost:3000).
 
 ```bash
 npm run build   # emits static HTML into out/
+npm run test:search # verifies the rendered function page and search payload
 npm start       # serves out/ locally for a production preview
 ```
 

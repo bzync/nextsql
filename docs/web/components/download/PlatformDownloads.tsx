@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useMemo, useState, useSyncExternalStore } from "react";
 import {
   type Artifact,
   type Platform,
@@ -13,18 +13,20 @@ import {
 } from "@/lib/release-model";
 import { Button } from "@bzync/rui";
 
-export function PlatformDownloads({ release }: { release: Release }) {
-  const [platform, setPlatform] = useState<Platform>("linux-amd64");
+const subscribeBrowser = () => () => {};
 
-  useEffect(() => {
-    const detected = detectPlatform();
-    if (release.artifacts.some((artifact) => artifact.platform === detected)) {
-      setPlatform(detected);
-      return;
-    }
-    const first = release.artifacts[0]?.platform;
-    if (first) setPlatform(first);
-  }, [release.artifacts]);
+export function PlatformDownloads({ release }: { release: Release }) {
+  const fallback = release.artifacts[0]?.platform ?? "linux-amd64";
+  const detected = useSyncExternalStore(
+    subscribeBrowser,
+    () => {
+      const candidate = detectPlatform();
+      return release.artifacts.some((artifact) => artifact.platform === candidate) ? candidate : fallback;
+    },
+    () => fallback,
+  );
+  const [selectedPlatform, setSelectedPlatform] = useState<Platform | null>(null);
+  const platform = selectedPlatform ?? detected;
 
   const matching = useMemo(
     () => release.artifacts.filter((artifact) => artifact.platform === platform),
@@ -48,7 +50,7 @@ export function PlatformDownloads({ release }: { release: Release }) {
           <button
             key={item}
             type="button"
-            onClick={() => setPlatform(item)}
+            onClick={() => setSelectedPlatform(item)}
             className={
               item === platform
                 ? "rounded-md bg-bg-hover px-3 py-1.5 text-sm font-medium"

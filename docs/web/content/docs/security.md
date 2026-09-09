@@ -131,7 +131,11 @@ Embedded mode uses `--auth-broker-listen` and the standalone-format
 `--auth-broker-config` (default `DATA-DIR/nextsql-auth-broker.conf`). It is
 rejected with Raft, requires TLS off loopback, verifies issuer/server keyset
 compatibility before startup/reload, and intersects roles with the live native
-ACL. Opaque-token introspection and JIT provisioning remain optional and off.
+ACL. RFC 7662 opaque-token introspection and bounded JIT provisioning are
+implemented as fail-closed options and remain off by default. Introspection
+uses protected secret files, bounded POST responses/timeouts, no redirects, and
+an active/issuer/audience/expiry check. JIT enforces a principal ceiling and an
+allowed-role boundary; administrative roles require explicit operator opt-in.
 
 ## Isolation
 

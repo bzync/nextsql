@@ -39,7 +39,7 @@ jobs:
           ref: ${{ env.RELEASE_TAG }}
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
           cache: true
@@ -96,7 +96,7 @@ jobs:
           done
 
       - name: Retain installer build evidence
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: nextsql-installers-${{ env.RELEASE_TAG }}
           path: ${{ runner.temp }}/nextsql-installers/

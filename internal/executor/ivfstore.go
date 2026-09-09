@@ -514,10 +514,7 @@ func (s *Session) nearestIVFIndex(n planner.Nearest, q []float32, metric nsvec.M
 	if !meta.Trained || meta.Count == 0 {
 		return nil, nil
 	}
-	k := int(n.K)
-	if k < 1 {
-		k = int(meta.Count)
-	}
+	k := annK(n.K, meta.Count)
 	if k < 1 {
 		return nil, nil
 	}
@@ -842,10 +839,7 @@ func (s *Session) nearestIVFIndexPartitioned(n planner.Nearest, q []float32, met
 	if len(stores) == 0 || total == 0 {
 		return nil, nil
 	}
-	k := int(n.K)
-	if k < 1 {
-		k = int(total)
-	}
+	k := annK(n.K, total)
 	if k < 1 {
 		return nil, nil
 	}

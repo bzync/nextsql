@@ -105,13 +105,20 @@ See [Change streams](/docs/cdc).
 
 ## Functions
 
+The complete signatures, return behavior, NULL rules, and examples are in the
+[Function reference](/docs/functions).
+
 | Area | Calls |
 |---|---|
 | Defaults | `UUID()`, `NOW()`, `AI()` |
-| Aggregates | `COUNT(*)`, `COUNT(col)`, `SUM`, `AVG`, `MIN`, `MAX` |
+| Aggregates | `COUNT(*)`, `COUNT(col)`, `SUM`, `AVG`, `MIN`, `MAX`, `ARRAY_AGG`, `MAP_AGG` |
 | Windows | `ROW_NUMBER`, `RANK`, `DENSE_RANK`, `LAG`, `LEAD`, `FIRST_VALUE`, `LAST_VALUE`, and aggregate `OVER (...)` |
-| Temporal | `DATE_TRUNC`, `DATE_ADD`, `DATE_DIFF` |
-| Vector | `COSINE(a,b)`, `L2(a,b)`, `INNER_PRODUCT(a,b)`, `VECTOR_DIM`, `VECTOR_NORM`, `VECTOR_NORMALIZE` |
+| String | `LOWER`, `UPPER`, `LENGTH`, `SUBSTRING`, `TRIM`, `LTRIM`, `RTRIM`, `REPLACE`, `CONCAT`, `STARTS_WITH`, `ENDS_WITH`, `CONTAINS` |
+| Numeric | `ABS`, `ROUND`, `CEIL`, `FLOOR`, `POWER`, `SQRT`, `MOD` |
+| NULL / value | `COALESCE`, `NULLIF`, `GREATEST`, `LEAST` |
+| Temporal | `EXTRACT`, `DATE_TRUNC`, `DATE_ADD`, `DATE_DIFF` |
+| JSON | `JSON_GET`, `JSON_SET`, `JSON_REMOVE`, `JSON_CONTAINS`, `JSON_ARRAY_LENGTH`, `JSON_TYPE` |
+| Vector | `COSINE`, `COSINE_DISTANCE`, `L2`, `L1`, `INNER_PRODUCT`, `VECTOR_DIM`, `VECTOR_NORM`, `VECTOR_NORMALIZE`, `VECTOR_ADD`, `VECTOR_SUBTRACT`, `VECTOR_SCALE` |
 | Geo | `POINT`, `BOX`, `LON`/`LAT`, `DISTANCE`, `DISTANCE_SPHEROID`, `DWITHIN`, `WITHIN`, `COVERS`, `LINELENGTH` (and `ST_*` aliases) |
 | Collections | `ELEMENT_AT`, `CARDINALITY` / `ARRAY_LENGTH`, `ARRAY_CONTAINS`, `MAP_CONTAINS_KEY`, `MAP_KEYS`, `MAP_VALUES`, `MAP_SIZE` |
 | Search | `HIGHLIGHT(col [, pre, post])`, `SNIPPET(col [, width [, pre, post]])` (require `SEARCH`) |

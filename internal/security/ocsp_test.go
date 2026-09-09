@@ -189,6 +189,55 @@ func TestVerifyOCSP_LiveResponder(t *testing.T) {
 	}
 }
 
+func TestVerifyOCSP_LiveResponderRejectsInvalidTimeWindow(t *testing.T) {
+	ca, caKey := generateTestCA(t)
+	now := time.Now().UTC()
+
+	var respBytes []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/ocsp-response")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(respBytes)
+	}))
+	defer srv.Close()
+
+	leaf, _ := generateTestLeaf(t, ca, caKey, 32, srv.URL)
+	cfg := OCSPConfig{Mode: OCSPModeEnforce, Now: func() time.Time { return now }, HTTPClient: srv.Client()}
+
+	respBytes = makeOCSPResponse(t, ca, caKey, leaf.SerialNumber, ocsp.Good, now.Add(-2*time.Hour), now.Add(-time.Hour))
+	if err := VerifyOCSP(leaf, ca, nil, cfg); err == nil {
+		t.Fatal("expired live responder response accepted")
+	}
+
+	respBytes = makeOCSPResponse(t, ca, caKey, leaf.SerialNumber, ocsp.Good, now.Add(time.Hour), now.Add(2*time.Hour))
+	if err := VerifyOCSP(leaf, ca, nil, cfg); err == nil {
+		t.Fatal("not-yet-valid live responder response accepted")
+	}
+}
+
+func TestOCSPCacheOrderingRemainsBounded(t *testing.T) {
+	cache := &ocspCache{entries: make(map[string]cachedOCSPStatus)}
+	now := time.Now().UTC()
+	entry := cachedOCSPStatus{status: ocsp.Good, nextUpdate: now.Add(time.Hour)}
+
+	for i := 0; i < maxOCSPCacheEntries*3; i++ {
+		cache.put("same", entry)
+	}
+	if got := len(cache.order); got != 1 {
+		t.Fatalf("repeated refresh grew cache order to %d entries", got)
+	}
+
+	for i := 0; i < maxOCSPCacheEntries*2; i++ {
+		cache.put(big.NewInt(int64(i)).String(), entry)
+	}
+	if got := len(cache.entries); got > maxOCSPCacheEntries {
+		t.Fatalf("cache entries = %d, max %d", got, maxOCSPCacheEntries)
+	}
+	if got := len(cache.order); got > maxOCSPCacheEntries {
+		t.Fatalf("cache order = %d, max %d", got, maxOCSPCacheEntries)
+	}
+}
+
 func TestVerifyOCSP_EnforceVsOptional(t *testing.T) {
 	ca, caKey := generateTestCA(t)
 	// Leaf without responder URL and without stapled response

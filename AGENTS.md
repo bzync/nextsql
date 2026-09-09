@@ -72,8 +72,8 @@ P28      in progress — NextSQL Admin: Setup + Operations modes (2026-09-05: In
          (docs/design-admin-operations.md). Setup mode's implemented wizard,
          packaging integration, service flow, and accessibility baseline are verified;
          Linux .tar.gz/.run/.deb/.rpm and silent/offline/upgrade/repair paths are
-         live-verified. Recovery-key capability and Windows/macOS execution remain
-         capability/environment-blocked.
+         live-verified. Recovery-key export/verification is implemented for both
+         keystores; Windows/macOS execution remains environment-blocked.
 P29      in progress — Studio M1–M3, five native explorers, Users/Roles,
          Transaction/Lock, Audit, bounded per-tab plan comparison plus
          ANALYZE-only profiler, catalog-aware table/column IntelliSense
@@ -117,23 +117,24 @@ operator-mapped, successfully verified broker key ids produce `oidc` /
 are implemented with protected secret-file input, explicit broker resource
 audience + client binding, and non-interactive renewal. Embedded single-node
 mode is implemented on a separate bounded listener with issuer/verifier checks
-and a live native-user/ACL membership feed. Optional opaque introspection and
-JIT remain off. Field-level client encryption has an experimental
-SQL/catalog/server slice, helpers in the four drivers in P25 scope
-(Go/Node.js/TypeScript/Bun/PHP), tested PITR + HA/failover, and durable
-`FileFieldKeyring` rotation/revocation. The Python and Ruby drivers added later
-do not yet expose field-encryption helpers. Password hashing has migrated
+and a live native-user/ACL membership feed. Field-level client encryption has
+production-gated randomized and deterministic-equality SQL/catalog/server
+paths, helpers in the four drivers in P25 scope (Go/Node.js/TypeScript/Bun/PHP),
+tested PITR + HA/failover, and durable `FileFieldKeyring` rotation/revocation.
+RFC 7662 opaque-token introspection,
+bounded JIT principal provisioning, and OCSP are implemented as opt-in,
+fail-closed production controls and remain off by default. The Python and Ruby
+drivers added later do not yet expose field-encryption helpers. Password hashing has migrated
 to Argon2id (versioned records, PBKDF2 backward compatibility, transparent
 login rehash, DoS benchmarks). Audit hardening is implemented: `nextsql.audit`
 carries a versioned `NSAC` hash chain with optional `NSAK` Ed25519 signatures
 (rotatable keyset, fail-closed signed-transition rule), verified by the
 `nextsql audit` CLI. The phase-wide exit gate — a dated security review
 sign-off (`docs/security.md` "P25 security review sign-off") — closed
-2026-09-02, so every item above is production-gated. `ENCRYPTED CLIENT`
-stays labeled `experimental` in `system.capabilities` only because no
-searchable/deterministic mode ships (a deliberate scope decision, not an
-open blocker). OCSP, optional OIDC opaque-token introspection, and JIT
-principal provisioning remain off by design, not as open blockers.
+2026-09-02, so every item above is production-gated. `ENCRYPTED CLIENT` now
+ships randomized `NSCE1.` plus explicit deterministic-equality `NSCE2.` and is
+labeled `supported` in `system.capabilities`; broader searchable encryption
+remains out of scope.
 
 Stemming, stop-word dictionaries, versioned language analyzers, english synonym dictionary v1, prefix search, fuzzy matching, typo tolerance, highlight/snippet generation, multi-field search, field weighting, and faceting landed: `NSCT` v9 analyzer metadata, `WITH (ANALYZER = 'simple' | 'english' | 'french' | 'german' | 'spanish')`, english v3 = Porter2 + stop-word dictionary v1 + query-time synonym dictionary v1, french/german/spanish v1 = Snowball stemmer + stop list, trailing `*` prefix queries and trailing `~` fuzzy queries, automatic typo tolerance on missing unadorned tokens (fail-closed expansion caps), `HIGHLIGHT`/`SNIPPET` on SEARCH SELECT lists (bounded markers/width), `CREATE FULLTEXT INDEX` / `SEARCH` on 1–8 columns (phrases stay per-field), optional `SEARCH col WEIGHT n` (query-time BM25 tf scale, `(0, 64]`, default 1), `SELECT * … SEARCH … FACET col [, col …]` independent histograms over the full match set (per-facet `LIMIT`, 8 columns / 1024 values fail closed), default BM25/phrase behaviour preserved.
 
@@ -148,9 +149,9 @@ convenience aliases. P27 Operational maturity + workload governance closed
 2026-09-03. **P28 NextSQL Admin (Setup + Operations modes) is the current
 release gate**: Operations mode's MVP is complete; Setup mode
 (`docs/design-admin-setup.md`) has its standalone M1 flow implemented and
-targeted-tested. Packaging integration, richer encryption/advanced flows,
-accessibility validation, silent-install coverage, and remaining platform
-execution tests are open.
+targeted-tested. Packaging integration, recovery-key export/verification,
+accessibility validation, and silent/offline install coverage are implemented;
+remaining Windows/macOS execution tests are environment-blocked.
 
 Always verify the latest status in `TODO.md` before acting — its log entries
 are numbered and dated; trust the highest-numbered one over any status text

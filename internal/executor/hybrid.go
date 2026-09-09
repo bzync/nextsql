@@ -301,10 +301,7 @@ func (s *Session) execRerank(n planner.Rerank) ([][]types.Value, error) {
 		}
 		return bytes.Compare(fusedRows[i].pk, fusedRows[j].pk) < 0
 	})
-	k := int(n.K)
-	if k <= 0 || k > len(fusedRows) {
-		k = len(fusedRows)
-	}
+	k := annK(n.K, uint64(len(fusedRows)))
 	rows = make([][]types.Value, k)
 	for i := 0; i < k; i++ {
 		rows[i] = fusedRows[i].row

@@ -22,6 +22,26 @@ A roadmap item is not recorded as completed here until its implementation, tests
 
 ## [Unreleased]
 
+### Added — Deterministic client encryption and complete Ruby wire docs (2026-09-10)
+
+- `ENCRYPTED CLIENT DETERMINISTIC` is a versioned, explicit equality-only mode:
+  HKDF-separated RFC 5297 AES-SIV in `NSCE2.`, runtime ciphertext-parameter
+  validation, and direct B-tree/UNIQUE eligibility. Range, join, expression,
+  ordering/grouping, and general-search use fails closed; equality/frequency
+  leakage is documented.
+- Go, Node.js/TypeScript, Bun, and PHP helpers share cross-driver fixtures and
+  durable key rotation/revocation. Catalog compatibility, decoder/envelope
+  fuzzing, exact-ciphertext PITR, and three-voter failover coverage are green.
+- The web Ruby-driver guide now documents its direct NSQL v1 implementation,
+  TLS, bounded framing, streaming backpressure, cancellation, idempotency,
+  read-consistency/node-status frames, error draining, and the absence of both
+  compatibility protocols and Ruby field-encryption helpers.
+- The docs theme/download components now use hydration-safe external snapshots;
+  the React lint gate is clean without post-mount `setState` effects.
+- Live OCSP responses now enforce their validity window before a status is
+  accepted, cache keys include the responder, and repeated refresh/expiry can
+  no longer grow the cache-order index without bound.
+
 ### Added — Raft timings are configurable, and the freshness window follows the heartbeat (2026-09-10)
 
 - `docs/ha.md` presented the Raft timeouts as defaults and warned against

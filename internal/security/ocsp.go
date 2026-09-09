@@ -86,6 +86,20 @@ func (c *ocspCache) get(key string, now time.Time) (cachedOCSPStatus, bool) {
 func (c *ocspCache) put(key string, entry cachedOCSPStatus) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	// Keep the insertion-order index bounded too. Expired entries are removed
+	// from entries by get; repeated refreshes of one certificate must not leave
+	// duplicate/stale keys accumulating forever in order.
+	compacted := c.order[:0]
+	for _, candidate := range c.order {
+		if candidate == key {
+			continue
+		}
+		if _, live := c.entries[candidate]; live {
+			compacted = append(compacted, candidate)
+		}
+	}
+	c.order = compacted
+	delete(c.entries, key)
 	if len(c.entries) >= maxOCSPCacheEntries && len(c.order) > 0 {
 		oldest := c.order[0]
 		c.order = c.order[1:]
@@ -93,6 +107,16 @@ func (c *ocspCache) put(key string, entry cachedOCSPStatus) {
 	}
 	c.entries[key] = entry
 	c.order = append(c.order, key)
+}
+
+func ocspResponseCurrent(resp *ocsp.Response, now time.Time, maxAge time.Duration) bool {
+	if resp == nil || resp.ThisUpdate.IsZero() || now.Before(resp.ThisUpdate) {
+		return false
+	}
+	if !resp.NextUpdate.IsZero() {
+		return !now.After(resp.NextUpdate)
+	}
+	return maxAge > 0 && !now.After(resp.ThisUpdate.Add(maxAge))
 }
 
 // VerifyOCSP checks the certificate status of leaf against issuer using stapled
@@ -110,12 +134,16 @@ func VerifyOCSP(leaf, issuer *x509.Certificate, stapled []byte, cfg OCSPConfig) 
 	if cfg.Now != nil {
 		now = cfg.Now().UTC()
 	}
+	cacheTTL := cfg.CacheTTL
+	if cacheTTL <= 0 {
+		cacheTTL = defaultOCSPCacheTTL
+	}
 
 	// 1. Check stapled OCSP response if provided
 	if len(stapled) > 0 {
 		resp, err := ocsp.ParseResponseForCert(stapled, leaf, issuer)
 		if err == nil {
-			if now.Before(resp.ThisUpdate) || (!resp.NextUpdate.IsZero() && now.After(resp.NextUpdate)) {
+			if !ocspResponseCurrent(resp, now, cacheTTL) {
 				// Stapled response is expired or not yet valid
 			} else {
 				switch resp.Status {
@@ -145,8 +173,11 @@ func VerifyOCSP(leaf, issuer *x509.Certificate, stapled []byte, cfg OCSPConfig) 
 	}
 
 	// 3. Check in-memory cache
-	cacheKeyHash := sha256.Sum256(append(leaf.Raw, issuer.Raw...))
-	cacheKey := hex.EncodeToString(cacheKeyHash[:])
+	cacheKeyHasher := sha256.New()
+	_, _ = cacheKeyHasher.Write(leaf.Raw)
+	_, _ = cacheKeyHasher.Write(issuer.Raw)
+	_, _ = cacheKeyHasher.Write([]byte(responder))
+	cacheKey := hex.EncodeToString(cacheKeyHasher.Sum(nil))
 
 	if cached, ok := globalOCSPCache.get(cacheKey, now); ok {
 		switch cached.status {
@@ -227,13 +258,17 @@ func VerifyOCSP(leaf, issuer *x509.Certificate, stapled []byte, cfg OCSPConfig) 
 		}
 		return nil
 	}
-
-	cacheTTL := cfg.CacheTTL
-	if cacheTTL <= 0 {
-		cacheTTL = defaultOCSPCacheTTL
+	if !ocspResponseCurrent(parsed, now, cacheTTL) {
+		if cfg.Mode == OCSPModeEnforce {
+			return nerr.New(nerr.Unauthorized, op, "OCSP response is expired or not yet valid")
+		}
+		return nil
 	}
 	nextUp := parsed.NextUpdate
-	if nextUp.IsZero() || nextUp.After(now.Add(cacheTTL)) {
+	if nextUp.IsZero() {
+		nextUp = parsed.ThisUpdate.Add(cacheTTL)
+	}
+	if nextUp.After(now.Add(cacheTTL)) {
 		nextUp = now.Add(cacheTTL)
 	}
 

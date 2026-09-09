@@ -452,8 +452,13 @@ so none can become or remain a session under the previous snapshot. Clients
 must reconnect under the exact new trust and revocation state. This is
 intentionally availability-affecting and fail-closed.
 
-Without `tls_client_crl`, NextSQL has no CRL revocation check; operators can
-still remove a CA from the trust bundle and reload. OCSP is not implemented.
+Without `tls_client_crl`, NextSQL has no CRL-file revocation check; operators can
+still remove a CA from the trust bundle and reload. Independently,
+`tls_ocsp_mode=optional|enforce` (or `--tls-ocsp-mode`) enables stapled or live
+AIA OCSP checks with a bounded cache, 3-second default timeout, 64 KiB response
+cap, signature/time/chain validation, and an optional responder override. In
+`enforce` mode a missing, expired, invalid, or revoked status fails the
+handshake; the default is `disabled`.
 
 ## External identity providers (OIDC)
 
@@ -535,12 +540,16 @@ reload before issuer reload, and consumes live native-user/ACL membership.
 Non-loopback broker listeners require their own TLS certificate/key. The SQL
 listener still does no OIDC parsing or outbound HTTP.
 
-**Still not implemented:** optional opaque access-token introspection and
-optional just-in-time provisioning. JIT remains off and is not part of the core
-gate because pre-created native principals preserve the smaller privilege
-surface.
+Optional RFC 7662 opaque access-token introspection and just-in-time principal
+provisioning are implemented and remain off by default. Introspection uses a
+bounded POST-only client with redirects disabled, a 64 KiB response cap, a
+5-second default timeout, and credentials read only from protected mode-`0600`
+files. JIT is bounded by `max_principals` and `allowed_role_boundary`; empty role
+intersection denies, and administrative roles are prohibited unless the
+operator explicitly permits them. Both paths retain the normal NSIP mapping and
+server-side RBAC checks.
 
-The **`NSIP` identity-policy engine** that the broker will consult *is*
+The **`NSIP` identity-policy engine** that the broker consults is
 implemented and tested (`internal/auth/identitypolicy.go`): a versioned,
 corruption-validated, `SIGHUP`-last-known-good policy document (mode `0600`,
 atomic rename, like `NSTK`/`NSTR`; at-rest envelope encryption is a follow-on
@@ -663,10 +672,9 @@ connection/auth concurrency limits (Phase 27) must budget roughly
 `DESIGNED` below means the target exists in `PROJECT.md`/`TODO.md`; it is not a
 shipped-functionality claim. `TESTED` names a concrete automated boundary.
 Every implementable-scope item is now `PRODUCTION-GATED` per the dated review
-below ("Security review sign-off (Phase 25)"). A handful of sub-features are
-deliberate, explicitly documented non-goals rather than open blockers: OCSP
-(certificate revocation uses X.509 CRLs instead), optional OIDC opaque-token
-introspection, and JIT principal provisioning — all remain off by default.
+below ("Security review sign-off (Phase 25)"). OCSP, OIDC opaque-token
+introspection, and JIT principal provisioning are implemented as opt-in,
+fail-closed controls and remain off by default.
 
 | Checklist item | Designed | Implemented | Tested | Production-gated / evidence |
 |---|---:|---:|---:|---|
@@ -674,18 +682,18 @@ introspection, and JIT principal provisioning — all remain off by default.
 | Client certificate validation | yes | yes | yes | yes — system `x509`, configured CA, client EKU/validity/chain |
 | Service identity mapping | yes | yes | yes | yes — exact URI-to-Hello-user binding tests |
 | Certificate rotation | yes | yes | yes | yes — atomic `SIGHUP` reload, overlap trust rotation, last-known-good rollback test |
-| Certificate revocation handling | yes | yes | yes | yes — fail-closed X.509 CRL coverage/revocation/expiry tests; OCSP not implemented |
+| Certificate revocation handling | yes | yes | yes | yes — fail-closed X.509 CRL coverage/revocation/expiry tests plus stapled/live OCSP tests, bounded cache/timeout/body, and `enforce`-mode TLS handshake coverage |
 | Audit authentication identity source | yes | yes | yes | yes — `identity_source` redaction test |
 | Signed short-lived credential format | yes | yes | yes | yes — `NSSC1.` Ed25519 wire form; `internal/auth` decode/verify + `FuzzDecodeTokenClaims` |
 | Token expiration | yes | yes | yes | yes — not-before/expires-at with skew; `TestTokenExpiry`, `TestTokenNotYetValid`, `TestTokenMaxLifetime`, `TestShortLivedCredentialExpiryClosesSession` |
 | Token audience/database scope | yes | yes | yes | yes — `token_audience` match + served-database match; `TestTokenAudienceMismatch`, `TestShortLivedCredentialAudienceMismatch` |
 | Token role scope | yes | yes | yes | yes — `ACL.AllowedScoped`, no-escalation guard; `TestACLAllowedScoped`, `TestShortLivedCredentialRoleScope` |
-| Token database scope | yes | yes | yes | yes — surfaced on claims and enforced server-side; the realm claim is reserved and unused (multi-realm hosting was removting |
+| Token database scope | yes | yes | yes | yes — surfaced on claims and enforced server-side; the realm claim is reserved and unused (multi-realm hosting was removed) |
 | Token signing-key rotation | yes | yes | yes | yes — `NSTK` keyset, current/retired, overlap; `TestTokenKeyRotationOverlap`, `TestTokenKeysetReloadLastKnownGood` |
 | Token revocation | yes | yes | yes | yes — `NSTR` token-id + principal-cutoff, `SIGHUP` reload; `TestRevokeByTokenID`, `TestRevokePrincipalCutoff`, `TestShortLivedCredentialRevoked` |
 | Token audit | yes | yes | yes | yes — `identity_source` `token`/`mtls+token`; `token.reload` security setting event |
 | OIDC design | yes | n/a | n/a | accepted design `docs/design-oidc-external-idp.md` (brokered token exchange → `NSSC1.`; `NSIP` no-escalation mapping) |
-| OIDC implementation | yes | yes | yes | yes — standalone and embedded brokers validate ID tokens and client-credentials JWT access tokens vs a bounded cached JWKS and mint `NSSC1.`; `nextsql login` implements Authorization Code/PKCE or `--client-credentials`; key-derived server audit labels verified broker credentials. Embedded mode adds a separate bounded listener, single-node gate, issuer/verifier startup+reload compatibility, and live ACL feed. Fake-IdP→client/embedded broker→`TokenVerifier`, TLS/listener, functional/race/adversarial/config/audit tests. Optional opaque introspection/JIT remain off |
+| OIDC implementation | yes | yes | yes | yes — standalone and embedded brokers validate ID tokens, client-credentials JWTs, and optionally RFC 7662 opaque tokens before minting `NSSC1.`; opaque introspection is bounded, redirect-free, and secret-file-backed. Opt-in JIT is principal-count/role-boundary bounded and cannot silently grant administrative roles. Authorization Code/PKCE, key-derived audit labels, live ACL intersection, TLS/listener, replay, functional/race/adversarial/config/audit, introspection, and JIT tests cover the surface |
 | IdP-to-NextSQL principal mapping | yes | yes | yes | yes — `NSIP` issuer-scoped subject rules + transforms + login-charset check, consumed by the broker; `internal/auth/identitypolicy_test.go`, `FuzzDecodeIdentityPolicy`, `FuzzMapClaims`, `TestExchangeHappyPathMintsVerifiableCredential` |
 | External auth remains behind RBAC | yes | yes | yes | yes — every server enforces `ACL.AllowedScoped`; embedded mode also checks the live native user and direct/transitive ACL membership before minting, with empty intersection denial and immediate revocation behavior (`TestExchangeRBACIntersection`, `TestEmbeddedAuthBrokerUsesLiveNativeMembership`) |
 | IdP group/role mapping | yes | yes | yes | yes — `NSIP` literal + RE2 `${n}` group→role mappings, 16-role cap, empty ⇒ deny, consumed by the broker; `TestIdentityPolicyGroupRegexCapture`, `TestIdentityPolicyRoleCapDenies`, `TestExchangeRejections` (unmapped groups/subject ⇒ deny) |

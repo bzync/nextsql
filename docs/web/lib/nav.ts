@@ -44,6 +44,11 @@ export const docsNav: NavGroup[] = [
         description: "Types, statements, identifiers, parameters, and EXPLAIN.",
       },
       {
+        title: "Functions",
+        slug: "functions",
+        description: "Scalar, aggregate, window, JSON, vector, geo, and collection functions.",
+      },
+      {
         title: "Relational",
         slug: "relational",
         description: "Tables, partitioning, indexes, foreign keys, joins, aggregates, and DML.",

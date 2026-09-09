@@ -235,7 +235,10 @@ func ReadFrame(r io.Reader, max int) (Type, []byte, error) {
 		return 0, nil, nerr.New(nerr.Protocol, "protocol.ReadFrame", "invalid message type")
 	}
 	n := encoding.U32(hdr[:], 8)
-	if n > uint32(max) {
+	// Widened rather than narrowing max to uint32: max is an int, so on a
+	// 64-bit build a limit of 4 GiB or more would wrap to a much smaller
+	// number (exactly 4 GiB wraps to 0, rejecting every non-empty frame).
+	if uint64(n) > uint64(max) {
 		return 0, nil, nerr.New(nerr.Protocol, "protocol.ReadFrame", "packet exceeds limit")
 	}
 	if n == 0 {

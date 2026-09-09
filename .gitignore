@@ -27,5 +27,6 @@ __pycache__/
 .codex/
 .agents/
 .fixtures/
+.codeql-*
 /installers/
 /docs/web/data/releases.github.json

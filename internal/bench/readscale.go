@@ -364,12 +364,24 @@ func startReadScaleCluster(opt ReadScaleOptions) ([]*rsNode, error) {
 	if err := nodes[0].cluster.JoinPeers(peers); err != nil {
 		return nil, err
 	}
+	// Every node must hold the full voter set, not just the leader: the leader
+	// applies a membership change to its own configuration as soon as it
+	// appends the entry, so a leader-only check reports a formed cluster while
+	// a follower is still catching up and is not yet a read replica at all.
+	// Starting the measurement there charges a node's join to the read numbers.
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		if nodes[0].cluster.Voters() >= readScaleNodes {
+		ready := true
+		for _, n := range nodes {
+			if n.cluster.Voters() < readScaleNodes {
+				ready = false
+				break
+			}
+		}
+		if ready {
 			return nodes, nil
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	return nil, nerr.New(nerr.Unavailable, "bench.RunReadScale", "cluster did not reach 3 voters")
+	return nil, nerr.New(nerr.Unavailable, "bench.RunReadScale", "cluster did not reach 3 voters on every node")
 }

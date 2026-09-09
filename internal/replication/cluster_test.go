@@ -122,15 +122,61 @@ func startRaftTimings(t *testing.T, n int, tm Timings) ([]*Cluster, []*raft.Inme
 	if err := cls[0].JoinPeers(peers); err != nil {
 		t.Fatal(err)
 	}
+	// Wait for EVERY node to know the full voter set, not just the leader.
+	// The leader applies a membership change to its own configuration the
+	// moment it appends the entry, so cls[0].Voters() reaches n while a
+	// follower may still be several AppendEntries behind and hold the older
+	// two-voter configuration. A test that partitions or kills a node
+	// immediately after this call then strands that follower with a
+	// configuration it can never win an election under: with the leader cut
+	// off, a follower whose config is {n1,n2} needs a vote from n1 and never
+	// asks n3, while n3 asks n2 and is refused ("not in configuration"). That
+	// is a permanent deadlock, not slow convergence — no deadline reaches a
+	// leader — and it is how TestStrongReadBarrierRejectsIsolatedLeader
+	// failed roughly one run in ten.
 	deadline := time.Now().Add(raftConverge)
 	for time.Now().Before(deadline) {
-		if cls[0].Voters() >= n && liveLeader(cls) != nil {
+		if allKnowVoters(cls, n) && liveLeader(cls) != nil {
 			return cls, trans, addrs, apps
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	t.Fatalf("cluster did not reach %d voters", n)
+	votes := make([]int, len(cls))
+	for i, c := range cls {
+		votes[i] = c.Voters()
+	}
+	t.Fatalf("cluster did not reach %d voters on every node: per-node voters %v", n, votes)
 	return cls, trans, addrs, apps
+}
+
+// allKnowVoters reports whether every node's own configuration already holds
+// the full voter set. Cluster.Voters reads the node-local latest configuration
+// (committed or not), which is exactly what Raft campaigns and counts votes
+// against, so this is the condition that makes a subsequent partition behave
+// like a partition of a fully formed cluster.
+func allKnowVoters(cls []*Cluster, n int) bool {
+	for _, c := range cls {
+		if c.Voters() < n {
+			return false
+		}
+	}
+	return true
+}
+
+// A cluster the helper calls ready must leave every node — not only the
+// leader — holding the full voter set. This is the precondition every
+// partition and leader-kill test in this package depends on: a follower that
+// is still on the older two-voter configuration cannot elect with the leader
+// cut off, and cannot be elected by the peer it does not know about, so the
+// surviving majority deadlocks permanently rather than converging slowly.
+// Weaken startRaftTimings back to checking only cls[0] and this fails.
+func TestStartRaftLeavesEveryNodeKnowingTheFullVoterSet(t *testing.T) {
+	cls, _, _, _ := startRaft(t, 3)
+	for i, c := range cls {
+		if got := c.Voters(); got != 3 {
+			t.Fatalf("node %d sees %d voters, want 3: a partition here would strand it", i+1, got)
+		}
+	}
 }
 
 func liveLeader(cls []*Cluster) *Cluster {

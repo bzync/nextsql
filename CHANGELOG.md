@@ -22,6 +22,16 @@ A roadmap item is not recorded as completed here until its implementation, tests
 
 ## [Unreleased]
 
+### Fixed — Static-analysis triage: installer token cookie, and three integer-narrowing defects (2026-09-10)
+
+- **The Setup-mode installer token cookie is now `HttpOnly`.** It carries the single credential that authorises a first install on this machine, and it was deliberately script-readable so the bundled JS could echo it into `X-Installer-Token`. `checkToken` already accepted the cookie itself, so the echo was redundant: the cookie is now `HttpOnly` (still `SameSite=Strict`), the Setup client sends no token header of its own, and `jsonRequest`'s `extraHeaders` became optional. The `X-Installer-Token` path is unchanged for non-browser callers. Regression test pins both halves — the cookie's flags and that the cookie alone authorises `/api/v1` — and was verified to fail against the un-fixed code.
+- **System-catalog `LIMIT` no longer narrows before its bounds check.** `sel.Limit` is an `int64` and the parser accepts up to `MaxUint32`, so `int(*sel.Limit)` turned every limit above `MaxInt32` negative wherever `int` is 32 bits and `rows[:negative]` panicked. Both system-select paths now compare in `int64` and narrow only once the comparison proves it fits.
+- **`ST_PointN` / `ST_GeometryN` / `ST_InteriorRingN` no longer wrap an out-of-range element index.** All three bounds-checked *after* narrowing a user-supplied `INT64`, so on a 32-bit build an index past the `int` range wrapped into a valid one and answered with the wrong element instead of `NULL`. A shared `spatialIndexArg` guard reports unrepresentable indices, which each caller already treats as out of bounds.
+- **Token identity-source hint ids stay `uint32` through marshalling.** Routing them through `int` sorted and printed them as negative numbers wherever `int` is 32 bits, so a marshalled keyset did not round-trip back through `Load`.
+
+The three narrowing defects reach only builds whose `int` is 32 bits, which is not a shipped target; they are corrected rather than left as latent traps. The remaining open CodeQL findings on this surface were reviewed and are false positives — see `TODO.md` log #260 for the per-rule reasoning.
+
+
 ### Added — Deterministic client encryption and complete Ruby wire docs (2026-09-10)
 
 - `ENCRYPTED CLIENT DETERMINISTIC` is a versioned, explicit equality-only mode:

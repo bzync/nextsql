@@ -427,3 +427,57 @@ func TestSpatialSRIDArgRange(t *testing.T) {
 		}
 	}
 }
+
+// TestSpatialIndexArgOutOfIntRange pins the narrowing contract for the
+// user-supplied element index that ST_PointN, ST_GeometryN and
+// ST_InteriorRingN all take. Each bounds-checks only after narrowing an INT64
+// to an int, so on a 32-bit build a bare conversion wraps an index past the
+// int range into a valid one and answers with the wrong element instead of
+// NULL. spatialIndexArg is the guard; its contract holds at either width.
+func TestSpatialIndexArgOutOfIntRange(t *testing.T) {
+	for _, n := range []int64{minInt, 0, 1, 42, maxInt} {
+		got, ok := spatialIndexArg(n)
+		if !ok || int64(got) != n {
+			t.Errorf("spatialIndexArg(%d) = (%d, %v), want (%d, true)", n, got, ok, n)
+		}
+	}
+	// Only representable on a build whose int is wider than 32 bits; on a
+	// 32-bit build these are exactly the values that used to wrap.
+	if maxInt == math.MaxInt64 {
+		for _, n := range []int64{math.MinInt64, math.MaxInt64} {
+			if _, ok := spatialIndexArg(n); !ok {
+				t.Errorf("spatialIndexArg(%d) reported unrepresentable on a 64-bit int", n)
+			}
+		}
+	}
+}
+
+// The SQL-visible half: an element index far past any geometry's part count
+// is NULL, never a wrapped-around element.
+func TestSpatialElementIndexBeyondRangeIsNull(t *testing.T) {
+	dir := t.TempDir()
+	keys := testKeys(t)
+	db, err := Create(filepath.Join(dir, "nextsql.db"), keys, 32)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	s := db.Session()
+
+	for _, q := range []string{
+		`SELECT ST_PointN(ST_GeomFromText('LINESTRING(0 0, 1 1, 2 2)'), 4294967297)`,
+		`SELECT ST_GeometryN(ST_GeomFromText('MULTIPOINT(0 0, 1 1)'), 4294967297)`,
+		`SELECT ST_InteriorRingN(ST_GeomFromText('POLYGON((0 0, 4 0, 4 4, 0 4, 0 0))'), 4294967297)`,
+	} {
+		res, err := s.Exec(q)
+		if err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+		if len(res.Rows) != 1 {
+			t.Fatalf("%s: got %d rows, want 1", q, len(res.Rows))
+		}
+		if !res.Rows[0][0].Null {
+			t.Errorf("%s returned %v, want NULL", q, res.Rows[0][0])
+		}
+	}
+}

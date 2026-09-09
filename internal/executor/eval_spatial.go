@@ -147,7 +147,11 @@ func evalSpatialFn(name string, args []types.Value) (types.Value, bool, error) {
 		if err != nil {
 			return types.Value{}, true, err
 		}
-		part := geomPartN(args[0].Geom, int(n.Int))
+		pn, ok := spatialIndexArg(n.Int)
+		if !ok {
+			return types.Null(args[0].Typ), true, nil
+		}
+		part := geomPartN(args[0].Geom, pn)
 		if part == nil {
 			return types.Null(args[0].Typ), true, nil
 		}
@@ -331,7 +335,11 @@ func evalSpatialFn(name string, args []types.Value) (types.Value, bool, error) {
 			if err != nil {
 				return types.Value{}, true, err
 			}
-			idx = int(n.Int) - 1
+			v, ok := spatialIndexArg(n.Int)
+			if !ok {
+				return types.Null(args[0].Typ), true, nil
+			}
+			idx = v - 1
 		}
 		if idx < 0 || idx >= np {
 			return types.Null(args[0].Typ), true, nil
@@ -365,7 +373,11 @@ func evalSpatialFn(name string, args []types.Value) (types.Value, bool, error) {
 		if err != nil {
 			return types.Value{}, true, err
 		}
-		idx := int(n.Int) // 1-based, over the hole rings (ring 0 is exterior)
+		// 1-based, over the hole rings (ring 0 is exterior)
+		idx, ok := spatialIndexArg(n.Int)
+		if !ok {
+			return types.Null(args[0].Typ), true, nil
+		}
 		if idx < 1 || idx >= len(g.Rings) {
 			return types.Null(args[0].Typ), true, nil
 		}
@@ -850,4 +862,21 @@ func subtypeToken(t uint32) string {
 		return "GEOMETRY"
 	}
 	return name
+}
+
+// minInt is the smallest value an int holds on this build; maxInt (see
+// nearest.go) is the largest.
+const minInt = -maxInt - 1
+
+// spatialIndexArg narrows a user-supplied element index to an int. The
+// argument arrives as an INT64 and every caller bounds-checks it only after
+// narrowing, so a bare int(n) wraps an index past the int range into a valid
+// one wherever int is 32 bits — ST_POINTN(g, 4294967297) would answer point 1
+// instead of NULL. Reporting false for anything unrepresentable lets each
+// caller reuse the answer it already gives an out-of-bounds index.
+func spatialIndexArg(n int64) (int, bool) {
+	if n < minInt || n > maxInt {
+		return 0, false
+	}
+	return int(n), true
 }

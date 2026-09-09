@@ -96,10 +96,10 @@ func (s *Server) URLQuery() string { return tokenParam + "=" + s.token }
 // AuthenticateShellRequest enforces Setup mode's single-run token against a
 // request for the shared shell HTML: from the cookie set on a prior load, the
 // X-Installer-Token header, or (only for the very first load) the ?token=
-// query string — in which case it also sets the cookie so a reload works
-// without the query string. It returns false when none of those match; the
-// caller (the parent admin package's shell handler) is responsible for
-// writing the 403.
+// query string — in which case it also sets the cookie (HttpOnly) so both a
+// reload and the subsequent API calls work without the query string. It
+// returns false when none of those match; the caller (the parent admin
+// package's shell handler) is responsible for writing the 403.
 func (s *Server) AuthenticateShellRequest(w http.ResponseWriter, r *http.Request) bool {
 	q := r.URL.Query().Get(tokenParam)
 	authorized := s.checkToken(r) || (q != "" && tokenEqual(q, s.token))
@@ -108,10 +108,15 @@ func (s *Server) AuthenticateShellRequest(w http.ResponseWriter, r *http.Request
 	}
 	if q != "" {
 		http.SetCookie(w, &http.Cookie{
-			Name:     tokenCookie,
-			Value:    s.token,
-			Path:     "/",
-			HttpOnly: false, // the bundled JS must read it back to set the API header
+			Name:  tokenCookie,
+			Value: s.token,
+			Path:  "/",
+			// The bundled JS does not need to read this back: checkToken
+			// accepts the cookie itself, and the browser attaches it to
+			// every same-origin /api/v1 call. Keeping it script-readable
+			// only widened what an injected script could steal — this is
+			// the operator's single-run install token.
+			HttpOnly: true,
 			SameSite: http.SameSiteStrictMode,
 			Secure:   s.tls,
 		})

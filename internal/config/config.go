@@ -755,14 +755,18 @@ func (c Config) Marshal() []byte {
 	str("token_revocations", c.TokenRevocations)
 	str("token_audience", c.TokenAudience)
 	if len(c.TokenIdentitySourceHints) != 0 {
-		ids := make([]int, 0, len(c.TokenIdentitySourceHints))
+		// Key ids stay uint32 end to end. Routing them through int sorted
+		// and printed them as negative numbers on a 32-bit build for every
+		// id past MaxInt32, so a keyset marshalled there did not round-trip
+		// through parseTokenIdentitySourceHints.
+		ids := make([]uint32, 0, len(c.TokenIdentitySourceHints))
 		for id := range c.TokenIdentitySourceHints {
-			ids = append(ids, int(id))
+			ids = append(ids, id)
 		}
-		sort.Ints(ids)
+		sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
 		parts := make([]string, 0, len(ids))
 		for _, id := range ids {
-			parts = append(parts, strconv.Itoa(id)+":"+c.TokenIdentitySourceHints[uint32(id)])
+			parts = append(parts, strconv.FormatUint(uint64(id), 10)+":"+c.TokenIdentitySourceHints[id])
 		}
 		str("token_identity_source_hint", strings.Join(parts, ","))
 	}

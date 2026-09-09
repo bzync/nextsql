@@ -96,10 +96,13 @@ The installer runs once, locally, before any user/password/RBAC system
 exists — there is nothing to log in *as*. Modeled on the same trust boundary
 Jupyter's local notebook server uses: `nextsql-install` generates a random
 256-bit token at startup, prints/embeds it in the URL it opens
-(`http://127.0.0.1:PORT/?token=…`), and requires it (via cookie, set on the
-first page load, plus an `X-Installer-Token` header the bundled JS attaches
-to every `/api/*` call) for everything else. A stray localhost process
-without that token gets `403`. This is deliberately simpler than Manager's
+(`http://127.0.0.1:PORT/?token=…`), and requires it for everything else. The
+cookie set on the first page load carries it: `HttpOnly`, `SameSite=Strict`,
+`Secure` under TLS, so the browser attaches it to every same-origin `/api/*`
+call and no script can read the token back out. An `X-Installer-Token`
+header is accepted as well, for callers that are not the bundled JS — which
+sends no header of its own. A stray localhost process without that token
+gets `403`. This is deliberately simpler than Manager's
 session store (no concurrent multi-operator use case exists here) but keeps
 the same CSP / security-header posture (`default-src 'self'`, no inline
 script, `X-Frame-Options: DENY`).
@@ -289,7 +292,8 @@ cycle. Six step components (`Welcome`, `Location`, `Resources`,
 `Administrator`, `Summary`, `Completion`) plus a `Stepper`-driven progress
 bar, ported field-for-field from the vanilla version's `state` object and
 API calls (`src/api.ts` mirrors Manager's `api.ts` request-wrapper pattern,
-substituting the single-run `X-Installer-Token` header for Manager's CSRF
+substituting the single-run installer token — carried by its `HttpOnly`
+cookie, so this client attaches no header of its own — for Manager's CSRF
 token).
 
 **Two real, user-facing bugs found and fixed during the rewrite, not

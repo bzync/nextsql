@@ -1050,3 +1050,35 @@ func setLimitForTest(c *Config, key string, v int) bool {
 	}
 	return true
 }
+
+// TestMarshalTokenIdentitySourceHintsHighKeyIDs pins that a verified NSTK key
+// id above MaxInt32 survives Marshal → Load unchanged. The ids are uint32 and
+// must stay uint32 through sorting and formatting: routing them through int
+// renders them negative wherever int is 32 bits, which both misorders the
+// list and emits a hint line that Load then rejects.
+func TestMarshalTokenIdentitySourceHintsHighKeyIDs(t *testing.T) {
+	cfg := Default()
+	cfg.TokenKeyset = "/etc/nextsql/token.keyset"
+	cfg.TokenIdentitySourceHints = map[uint32]string{
+		7:          "oidc",
+		4294967295: "oidc",
+		2147483648: "oidc",
+	}
+
+	path := filepath.Join(t.TempDir(), "token.conf")
+	if err := os.WriteFile(path, cfg.Marshal(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := Load(path)
+	if err != nil {
+		t.Fatalf("marshalled config did not load back: %v", err)
+	}
+	for id, want := range cfg.TokenIdentitySourceHints {
+		if got.TokenIdentitySourceHints[id] != want {
+			t.Errorf("hint %d = %q, want %q", id, got.TokenIdentitySourceHints[id], want)
+		}
+	}
+	if n := len(got.TokenIdentitySourceHints); n != len(cfg.TokenIdentitySourceHints) {
+		t.Errorf("round-tripped %d hints, want %d", n, len(cfg.TokenIdentitySourceHints))
+	}
+}

@@ -1,8 +1,9 @@
 // Same-origin JSON client for NextSQL Admin's Setup-mode API (/api/v1). Auth
-// is the single-run installer token — read once from the cookie the server
-// sets on first load (see internal/admin/setup) and sent on every call via
-// X-Installer-Token, exactly like the cookie itself would be, so a call
-// still works even if the cookie somehow isn't attached.
+// is the single-run installer token, carried by the HttpOnly cookie the
+// server sets on first load (see internal/admin/setup). The browser attaches
+// it to every same-origin call, so this client sends no token header of its
+// own — the cookie is deliberately not script-readable, so that an injected
+// script cannot read the operator's install token back out.
 
 import { ApiError, jsonRequest } from "../shared/apiClient";
 export { ApiError };
@@ -165,13 +166,8 @@ export type LifecycleDetect = {
   headers_compatible: boolean;
 };
 
-function tokenFromCookie(): string {
-  const m = document.cookie.match(/(?:^|; )nsi_token=([^;]+)/);
-  return m ? decodeURIComponent(m[1]) : "";
-}
-
 function request<T>(method: string, path: string, body?: unknown): Promise<T> {
-  return jsonRequest<T>(method, path, body, { "X-Installer-Token": tokenFromCookie() });
+  return jsonRequest<T>(method, path, body);
 }
 
 export const api = {

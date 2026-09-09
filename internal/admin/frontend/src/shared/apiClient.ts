@@ -16,7 +16,9 @@ export async function jsonRequest<T>(
   method: string,
   path: string,
   body: unknown,
-  extraHeaders: Record<string, string>,
+  // Optional: a caller whose auth rides on an HttpOnly cookie (Setup mode)
+  // has no header of its own to attach.
+  extraHeaders: Record<string, string> = {},
 ): Promise<T> {
   const headers: Record<string, string> = { ...extraHeaders };
   if (body !== undefined) headers["Content-Type"] = "application/json";

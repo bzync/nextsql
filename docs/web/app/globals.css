@@ -24,6 +24,72 @@
   --str: #7dd3fc;
   --cmt: #7b8798;
   --num: #fbbf24;
+  --bash-bg: #0b1120;
+  --bash-fg: #dbe4f0;
+  --bash-border: rgba(56, 189, 248, 0.22);
+  --bash-header-bg: #070d18;
+  --bash-header-fg: #7dd3fc;
+  --bash-header-border: rgba(56, 189, 248, 0.14);
+  --bash-cmd: #4ade80;
+  --bash-subcmd: #38bdf8;
+  --bash-flag: #c084fc;
+  --bash-arg: #e2e8f0;
+  --bash-str: #fcd34d;
+  --bash-var: #f472b6;
+  --bash-cmt: #78889b;
+  --bash-num: #fb923c;
+  --bash-prompt: #34d399;
+  --bash-op: #94a3b8;
+  --bash-path: #67e8f9;
+  --sql-bg: #0b1220;
+  --sql-fg: #dbe4f0;
+  --sql-border: rgba(147, 197, 253, 0.2);
+  --sql-header-bg: #070e1b;
+  --sql-header-fg: #93c5fd;
+  --sql-header-border: rgba(147, 197, 253, 0.12);
+  --sql-kw: #93c5fd;
+  --sql-type: #5eead4;
+  --sql-fn: #c084fc;
+  --sql-str: #6ee7b7;
+  --sql-num: #fbbf24;
+  --sql-bool: #f97316;
+  --sql-param: #f472b6;
+  --sql-cmt: #78889b;
+  --sql-op: #7dd3fc;
+  --sql-punct: #94a3b8;
+  --sql-id: #dbe4f0;
+  --driver-bg: #0b1220;
+  --driver-fg: #dbe4f0;
+  --driver-border: rgba(99, 102, 241, 0.2);
+  --driver-header-bg: #070e1b;
+  --driver-header-fg: #a5b4fc;
+  --driver-header-border: rgba(99, 102, 241, 0.12);
+  --driver-kw: #c084fc;
+  --driver-type: #38bdf8;
+  --driver-fn: #60a5fa;
+  --driver-str: #6ee7b7;
+  --driver-var: #f472b6;
+  --driver-num: #fbbf24;
+  --driver-cmt: #78889b;
+  --driver-op: #93c5fd;
+  --driver-punct: #94a3b8;
+  --driver-prop: #7dd3fc;
+  --proto-bg: #081720;
+  --proto-fg: #dcf8f6;
+  --proto-border: rgba(45, 212, 191, 0.25);
+  --proto-header-bg: #040e14;
+  --proto-header-fg: #5eead4;
+  --proto-header-border: rgba(45, 212, 191, 0.16);
+  --proto-offset: #38bdf8;
+  --proto-field: #99f6e4;
+  --proto-type: #c084fc;
+  --proto-opcode: #2dd4bf;
+  --proto-str: #fde047;
+  --proto-num: #fb923c;
+  --proto-op: #f472b6;
+  --proto-cmt: #78889b;
+  --proto-status: #34d399;
+  --proto-punct: #94a3b8;
   --navy-950: #040912;
   --navy-900: #060c1a;
   --navy-800: #0a1427;
@@ -57,6 +123,72 @@
   --str: #7dd3fc;
   --cmt: #6b7a90;
   --num: #fbbf24;
+  --bash-bg: #05080f;
+  --bash-fg: #dbe4f0;
+  --bash-border: rgba(56, 189, 248, 0.25);
+  --bash-header-bg: #03060c;
+  --bash-header-fg: #7dd3fc;
+  --bash-header-border: rgba(56, 189, 248, 0.18);
+  --bash-cmd: #4ade80;
+  --bash-subcmd: #38bdf8;
+  --bash-flag: #c084fc;
+  --bash-arg: #e2e8f0;
+  --bash-str: #fde047;
+  --bash-var: #f472b6;
+  --bash-cmt: #64748b;
+  --bash-num: #fb923c;
+  --bash-prompt: #34d399;
+  --bash-op: #94a3b8;
+  --bash-path: #67e8f9;
+  --sql-bg: #07101c;
+  --sql-fg: #dbe4f0;
+  --sql-border: rgba(147, 197, 253, 0.22);
+  --sql-header-bg: #040913;
+  --sql-header-fg: #93c5fd;
+  --sql-header-border: rgba(147, 197, 253, 0.15);
+  --sql-kw: #93c5fd;
+  --sql-type: #5eead4;
+  --sql-fn: #c084fc;
+  --sql-str: #6ee7b7;
+  --sql-num: #fbbf24;
+  --sql-bool: #f97316;
+  --sql-param: #f472b6;
+  --sql-cmt: #6b7a90;
+  --sql-op: #7dd3fc;
+  --sql-punct: #94a3b8;
+  --sql-id: #dbe4f0;
+  --driver-bg: #07101c;
+  --driver-fg: #dbe4f0;
+  --driver-border: rgba(99, 102, 241, 0.22);
+  --driver-header-bg: #040913;
+  --driver-header-fg: #a5b4fc;
+  --driver-header-border: rgba(99, 102, 241, 0.15);
+  --driver-kw: #c084fc;
+  --driver-type: #38bdf8;
+  --driver-fn: #60a5fa;
+  --driver-str: #6ee7b7;
+  --driver-var: #f472b6;
+  --driver-num: #fbbf24;
+  --driver-cmt: #6b7a90;
+  --driver-op: #93c5fd;
+  --driver-punct: #94a3b8;
+  --driver-prop: #7dd3fc;
+  --proto-bg: #041218;
+  --proto-fg: #dcf8f6;
+  --proto-border: rgba(45, 212, 191, 0.28);
+  --proto-header-bg: #020a0e;
+  --proto-header-fg: #5eead4;
+  --proto-header-border: rgba(45, 212, 191, 0.18);
+  --proto-offset: #38bdf8;
+  --proto-field: #99f6e4;
+  --proto-type: #c084fc;
+  --proto-opcode: #2dd4bf;
+  --proto-str: #fde047;
+  --proto-num: #fb923c;
+  --proto-op: #f472b6;
+  --proto-cmt: #64748b;
+  --proto-status: #34d399;
+  --proto-punct: #94a3b8;
   color-scheme: dark;
 }
 
@@ -78,6 +210,72 @@
   --color-link: var(--link);
   --color-code-bg: var(--code-bg);
   --color-code-fg: var(--code-fg);
+  --color-bash-bg: var(--bash-bg);
+  --color-bash-fg: var(--bash-fg);
+  --color-bash-border: var(--bash-border);
+  --color-bash-header-bg: var(--bash-header-bg);
+  --color-bash-header-fg: var(--bash-header-fg);
+  --color-bash-header-border: var(--bash-header-border);
+  --color-bash-cmd: var(--bash-cmd);
+  --color-bash-subcmd: var(--bash-subcmd);
+  --color-bash-flag: var(--bash-flag);
+  --color-bash-arg: var(--bash-arg);
+  --color-bash-str: var(--bash-str);
+  --color-bash-var: var(--bash-var);
+  --color-bash-cmt: var(--bash-cmt);
+  --color-bash-num: var(--bash-num);
+  --color-bash-prompt: var(--bash-prompt);
+  --color-bash-op: var(--bash-op);
+  --color-bash-path: var(--bash-path);
+  --color-sql-bg: var(--sql-bg);
+  --color-sql-fg: var(--sql-fg);
+  --color-sql-border: var(--sql-border);
+  --color-sql-header-bg: var(--sql-header-bg);
+  --color-sql-header-fg: var(--sql-header-fg);
+  --color-sql-header-border: var(--sql-header-border);
+  --color-sql-kw: var(--sql-kw);
+  --color-sql-type: var(--sql-type);
+  --color-sql-fn: var(--sql-fn);
+  --color-sql-str: var(--sql-str);
+  --color-sql-num: var(--sql-num);
+  --color-sql-bool: var(--sql-bool);
+  --color-sql-param: var(--sql-param);
+  --color-sql-cmt: var(--sql-cmt);
+  --color-sql-op: var(--sql-op);
+  --color-sql-punct: var(--sql-punct);
+  --color-sql-id: var(--sql-id);
+  --color-driver-bg: var(--driver-bg);
+  --color-driver-fg: var(--driver-fg);
+  --color-driver-border: var(--driver-border);
+  --color-driver-header-bg: var(--driver-header-bg);
+  --color-driver-header-fg: var(--driver-header-fg);
+  --color-driver-header-border: var(--driver-header-border);
+  --color-driver-kw: var(--driver-kw);
+  --color-driver-type: var(--driver-type);
+  --color-driver-fn: var(--driver-fn);
+  --color-driver-str: var(--driver-str);
+  --color-driver-var: var(--driver-var);
+  --color-driver-num: var(--driver-num);
+  --color-driver-cmt: var(--driver-cmt);
+  --color-driver-op: var(--driver-op);
+  --color-driver-punct: var(--driver-punct);
+  --color-driver-prop: var(--driver-prop);
+  --color-proto-bg: var(--proto-bg);
+  --color-proto-fg: var(--proto-fg);
+  --color-proto-border: var(--proto-border);
+  --color-proto-header-bg: var(--proto-header-bg);
+  --color-proto-header-fg: var(--proto-header-fg);
+  --color-proto-header-border: var(--proto-header-border);
+  --color-proto-offset: var(--proto-offset);
+  --color-proto-field: var(--proto-field);
+  --color-proto-type: var(--proto-type);
+  --color-proto-opcode: var(--proto-opcode);
+  --color-proto-str: var(--proto-str);
+  --color-proto-num: var(--proto-num);
+  --color-proto-op: var(--proto-op);
+  --color-proto-cmt: var(--proto-cmt);
+  --color-proto-status: var(--proto-status);
+  --color-proto-punct: var(--proto-punct);
   --color-navy-950: var(--navy-950);
   --color-navy-900: var(--navy-900);
   --color-navy-800: var(--navy-800);
@@ -447,6 +645,9 @@ body {
 .doc-prose .code-embed pre {
   margin: 0;
   border-radius: 0;
+  background: transparent;
+  border: 0;
+  color: inherit;
 }
 
 .doc-prose pre {
@@ -550,6 +751,241 @@ body {
 .code-stage {
   background: var(--code-bg);
   color: var(--code-fg);
+}
+
+.code-block-bash {
+  background: var(--bash-bg);
+  color: var(--bash-fg);
+  border-color: var(--bash-border);
+}
+
+.code-block-bash .code-block-header {
+  background: var(--bash-header-bg);
+  border-bottom-color: var(--bash-header-border);
+}
+
+.hl-bash-cmd {
+  color: var(--bash-cmd);
+  font-weight: 600;
+}
+
+.hl-bash-subcmd {
+  color: var(--bash-subcmd);
+  font-weight: 500;
+}
+
+.hl-bash-flag {
+  color: var(--bash-flag);
+}
+
+.hl-bash-arg {
+  color: var(--bash-arg);
+}
+
+.hl-bash-str {
+  color: var(--bash-str);
+}
+
+.hl-bash-var {
+  color: var(--bash-var);
+}
+
+.hl-bash-cmt {
+  color: var(--bash-cmt);
+  font-style: italic;
+}
+
+.hl-bash-num {
+  color: var(--bash-num);
+}
+
+.hl-bash-prompt {
+  color: var(--bash-prompt);
+  user-select: none;
+  font-weight: 600;
+}
+
+.hl-bash-op {
+  color: var(--bash-op);
+}
+
+.hl-bash-path {
+  color: var(--bash-path);
+}
+
+.code-block-sql {
+  background: var(--sql-bg);
+  color: var(--sql-fg);
+  border-color: var(--sql-border);
+}
+
+.code-block-sql .code-block-header {
+  background: var(--sql-header-bg);
+  border-bottom-color: var(--sql-header-border);
+}
+
+.hl-sql-kw {
+  color: var(--sql-kw);
+  font-weight: 600;
+}
+
+.hl-sql-type {
+  color: var(--sql-type);
+  font-weight: 500;
+}
+
+.hl-sql-fn {
+  color: var(--sql-fn);
+  font-weight: 500;
+}
+
+.hl-sql-str {
+  color: var(--sql-str);
+}
+
+.hl-sql-num {
+  color: var(--sql-num);
+}
+
+.hl-sql-bool {
+  color: var(--sql-bool);
+  font-weight: 600;
+}
+
+.hl-sql-param {
+  color: var(--sql-param);
+  font-weight: 500;
+}
+
+.hl-sql-cmt {
+  color: var(--sql-cmt);
+  font-style: italic;
+}
+
+.hl-sql-op {
+  color: var(--sql-op);
+}
+
+.hl-sql-punct {
+  color: var(--sql-punct);
+}
+
+.hl-sql-id {
+  color: var(--sql-id);
+}
+
+.code-block-driver {
+  background: var(--driver-bg);
+  color: var(--driver-fg);
+  border-color: var(--driver-border);
+}
+
+.code-block-driver .code-block-header {
+  background: var(--driver-header-bg);
+  border-bottom-color: var(--driver-header-border);
+}
+
+.hl-driver-kw {
+  color: var(--driver-kw);
+  font-weight: 600;
+}
+
+.hl-driver-type {
+  color: var(--driver-type);
+  font-weight: 500;
+}
+
+.hl-driver-fn {
+  color: var(--driver-fn);
+  font-weight: 500;
+}
+
+.hl-driver-str {
+  color: var(--driver-str);
+}
+
+.hl-driver-var {
+  color: var(--driver-var);
+  font-weight: 500;
+}
+
+.hl-driver-num {
+  color: var(--driver-num);
+}
+
+.hl-driver-cmt {
+  color: var(--driver-cmt);
+  font-style: italic;
+}
+
+.hl-driver-op {
+  color: var(--driver-op);
+}
+
+.hl-driver-punct {
+  color: var(--driver-punct);
+}
+
+.hl-driver-prop {
+  color: var(--driver-prop);
+}
+
+.code-block-proto {
+  background: var(--proto-bg);
+  color: var(--proto-fg);
+  border-color: var(--proto-border);
+}
+
+.code-block-proto .code-block-header {
+  background: var(--proto-header-bg);
+  border-bottom-color: var(--proto-header-border);
+}
+
+.hl-proto-offset {
+  color: var(--proto-offset);
+  font-weight: 500;
+}
+
+.hl-proto-field {
+  color: var(--proto-field);
+  font-weight: 500;
+}
+
+.hl-proto-type {
+  color: var(--proto-type);
+  font-weight: 500;
+}
+
+.hl-proto-opcode {
+  color: var(--proto-opcode);
+  font-weight: 600;
+}
+
+.hl-proto-str {
+  color: var(--proto-str);
+}
+
+.hl-proto-num {
+  color: var(--proto-num);
+}
+
+.hl-proto-op {
+  color: var(--proto-op);
+  font-weight: 500;
+}
+
+.hl-proto-cmt {
+  color: var(--proto-cmt);
+  font-style: italic;
+}
+
+.hl-proto-status {
+  color: var(--proto-status);
+  font-weight: 600;
+}
+
+.hl-proto-punct {
+  color: var(--proto-punct);
 }
 
 .adjacent-nav {

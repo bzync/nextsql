@@ -152,9 +152,13 @@ func (s *Session) execSystemSelect(sel ast.Select) (*Result, error) {
 		if *sel.Limit < 0 {
 			return nil, nerr.New(nerr.InvalidArgument, "executor.system", "LIMIT must be >=0")
 		}
-		lim := int(*sel.Limit)
-		if lim < len(filtered) {
-			filtered = filtered[:lim]
+		// Compare in int64 before narrowing. sel.Limit is an int64 and the
+		// parser accepts up to MaxUint32 (uintLit parses with a 32-bit
+		// bound), so on a 32-bit build int(*sel.Limit) turns every limit
+		// above MaxInt32 negative and filtered[:negative] panics. Narrowing
+		// only after the comparison proves it fits.
+		if *sel.Limit < int64(len(filtered)) {
+			filtered = filtered[:int(*sel.Limit)]
 		}
 	}
 
@@ -540,8 +544,10 @@ func (s *Session) execSystemAggregate(sel ast.Select, schema *catalog.Table, fil
 		if *sel.Limit < 0 {
 			return nil, nerr.New(nerr.InvalidArgument, "executor.system", "LIMIT must be >=0")
 		}
-		if lim := int(*sel.Limit); lim < len(outRows) {
-			outRows = outRows[:lim]
+		// Narrow only after the int64 comparison proves it fits; see the
+		// matching note on the other system-select LIMIT above.
+		if *sel.Limit < int64(len(outRows)) {
+			outRows = outRows[:int(*sel.Limit)]
 		}
 	}
 	return &Result{Columns: outCols, Rows: outRows}, nil

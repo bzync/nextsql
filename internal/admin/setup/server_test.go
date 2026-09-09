@@ -352,3 +352,44 @@ func TestServerURLQueryIncludesToken(t *testing.T) {
 		t.Errorf("URLQuery() = %q, expected it to contain the token", s.URLQuery())
 	}
 }
+
+// TestTokenCookieIsHttpOnlyAndAuthenticatesAPI pins the two halves of the
+// installer token's cookie contract. The token is the single credential that
+// authorises a first install on this machine, so the cookie carrying it must
+// not be script-readable; and because the bundled JS therefore cannot echo it
+// into X-Installer-Token, the cookie alone has to authenticate an /api/v1
+// call. Losing either half silently breaks the wizard or widens what an
+// injected script can steal.
+func TestTokenCookieIsHttpOnlyAndAuthenticatesAPI(t *testing.T) {
+	s := newTestServer(t, `printf '{"ok":true}'`)
+
+	req := httptest.NewRequest("GET", "/?token="+s.Token(), nil)
+	rec := httptest.NewRecorder()
+	if !s.AuthenticateShellRequest(rec, req) {
+		t.Fatal("expected a valid ?token= load to authenticate")
+	}
+	var cookie *http.Cookie
+	for _, c := range rec.Result().Cookies() {
+		if c.Name == tokenCookie {
+			cookie = c
+		}
+	}
+	if cookie == nil {
+		t.Fatal("no token cookie was set")
+	}
+	if !cookie.HttpOnly {
+		t.Error("token cookie is script-readable; an injected script could read the install token")
+	}
+	if cookie.SameSite != http.SameSiteStrictMode {
+		t.Errorf("token cookie SameSite = %v, want Strict", cookie.SameSite)
+	}
+
+	// The cookie by itself must authorise the API, with no token header.
+	apiReq := httptest.NewRequest("GET", "/api/v1/hello", nil)
+	apiReq.AddCookie(cookie)
+	apiRec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(apiRec, apiReq)
+	if apiRec.Code != http.StatusOK {
+		t.Fatalf("cookie-only /api/v1/hello = %d, want 200 (body %q)", apiRec.Code, apiRec.Body.String())
+	}
+}

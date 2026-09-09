@@ -214,3 +214,31 @@ func TestSystemAggregateInsideExpression(t *testing.T) {
 		t.Fatalf("got %v, want an invalid_argument rejection", err)
 	}
 }
+
+// TestSystemSelectHugeLimitReturnsEveryRow pins that a LIMIT larger than any
+// row count still returns the whole result. The parser accepts LIMIT up to
+// MaxUint32 (uintLit parses with a 32-bit bound), and sel.Limit is an int64,
+// so the comparison against len(rows) has to happen before the narrowing to
+// int: narrowing first turns every limit above MaxInt32 negative wherever int
+// is 32 bits, and filtered[:negative] panics rather than returning rows.
+func TestSystemSelectHugeLimitReturnsEveryRow(t *testing.T) {
+	sess := newAggSession(t)
+	for _, ddl := range []string{
+		"CREATE TABLE a (id INT64 PRIMARY KEY)",
+		"CREATE TABLE b (id INT64 PRIMARY KEY)",
+		"CREATE TABLE c (id INT64 PRIMARY KEY)",
+	} {
+		if _, err := sess.Exec(ddl); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, limit := range []string{"2147483648", "3000000000", "4294967295"} {
+		res, err := sess.Exec("SELECT name FROM system.tables LIMIT " + limit)
+		if err != nil {
+			t.Fatalf("LIMIT %s: %v", limit, err)
+		}
+		if len(res.Rows) != 3 {
+			t.Errorf("LIMIT %s returned %d rows, want all 3", limit, len(res.Rows))
+		}
+	}
+}

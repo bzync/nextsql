@@ -10,7 +10,7 @@
 // CACHE_NAME is rewritten at build time (build.mjs) to a hash of the built
 // bundle, so a new release always gets a fresh cache and the activate
 // handler below drops every older one.
-const CACHE_NAME = "nextsql-admin-shell-678e81cf4354";
+const CACHE_NAME = "nextsql-admin-shell-ea0e326047be";
 const PRECACHE = ["/assets/app.js", "/assets/app.css"];
 
 self.addEventListener("install", (event) => {

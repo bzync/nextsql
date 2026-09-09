@@ -50,7 +50,7 @@ jobs:
       id-token: write # PyPI Trusted Publishing
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: ${{ inputs.ref || github.ref }}
 

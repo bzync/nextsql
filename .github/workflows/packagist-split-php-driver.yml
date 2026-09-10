@@ -17,7 +17,8 @@ name: Publish PHP driver to Packagist
 #   2. Submit https://github.com/bzync/nextsql-php to https://packagist.org
 #      once (it then auto-updates via the GitHub webhook Packagist installs).
 #   3. Add a PHP_SPLIT_TOKEN repository secret: a fine-grained PAT with
-#      Contents: read/write on bzync/nextsql-php.
+#      Contents: read/write on bzync/nextsql-php. The split job must check out
+#      with persist-credentials: false, or that PAT is ignored -- see below.
 
 on:
   push:
@@ -56,6 +57,12 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.ref }}
           fetch-depth: 0
+          # Without this, checkout leaves an http.https://github.com/.extraheader
+          # carrying the github-actions[bot] token. That header matches *every*
+          # github.com URL, so it overrides the PAT in the push URL below and the
+          # mirror push fails with "Permission to bzync/nextsql-php.git denied to
+          # github-actions[bot]" -- a 403 that looks like a bad PAT but is not.
+          persist-credentials: false
 
       - name: Validate composer.json
         run: |
@@ -75,6 +82,10 @@ jobs:
           VERSION: ${{ steps.v.outputs.version }}
         run: |
           set -euo pipefail
+          if [ -z "${SPLIT_TOKEN}" ]; then
+            echo "::error::PHP_SPLIT_TOKEN is empty -- a called workflow needs 'secrets: inherit'."
+            exit 1
+          fi
           git config user.name "nextsql-release"
           git config user.email "release@bzync.com"
           split_sha="$(git subtree split --prefix=drivers/php HEAD)"

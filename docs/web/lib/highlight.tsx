@@ -359,7 +359,14 @@ export function HighlightCode({
   ) {
     return <>{tokenizeWireProtocol(code)}</>;
   }
-  if (kind === "dotenv" || kind === "env" || kind === ".env") {
+  if (
+    kind === "dotenv" ||
+    kind === "env" ||
+    kind === ".env" ||
+    kind === "toml" ||
+    kind === "conf" ||
+    kind === "ini"
+  ) {
     return <>{tokenizeDotenv(code)}</>;
   }
   if (
@@ -380,7 +387,8 @@ export function HighlightCode({
     kind === "flow" ||
     kind === "flowchart" ||
     kind === "dag" ||
-    kind === "hierarchy"
+    kind === "hierarchy" ||
+    kind === "workflow"
   ) {
     return <>{tokenizeArchFlow(code)}</>;
   }
@@ -1356,6 +1364,31 @@ function tokenizeDotenv(code: string): ReactNode[] {
       return;
     }
 
+    const sectionMatch = /^(\s*)(\[+[^\]]+\]+)(.*)$/.exec(line);
+    if (sectionMatch) {
+      const [, indent, section, after] = sectionMatch;
+      if (indent) nodes.push(indent);
+      nodes.push(
+        <span key={`${lineIdx}-sec`} className="hl-env-key font-bold text-[#38bdf8]">
+          {section}
+        </span>
+      );
+      if (after) {
+        const cmtMatch = /^(\s*)(#.*)$/.exec(after);
+        if (cmtMatch) {
+          if (cmtMatch[1]) nodes.push(cmtMatch[1]);
+          nodes.push(
+            <span key={`${lineIdx}-cmt`} className="hl-env-cmt">
+              {cmtMatch[2]}
+            </span>
+          );
+        } else {
+          nodes.push(after);
+        }
+      }
+      return;
+    }
+
     const kvMatch = /^(\s*)(export\s+)?([a-zA-Z_][a-zA-Z0-9_.-]*)(\s*=\s*)(.*)$/.exec(line);
     if (kvMatch) {
       const [, indent, exportKw, key, eq, rest] = kvMatch;
@@ -1386,38 +1419,86 @@ function tokenizeDotenv(code: string): ReactNode[] {
       );
 
       if (rest) {
-        const quotedMatch = /^("[^"\\]*(?:\\.[^"\\]*)*"|'[^'\\]*(?:\\.[^'\\]*)*')(.*)$/.exec(rest);
-        if (quotedMatch) {
-          const [, quotedStr, afterStr] = quotedMatch;
+        const arrayMatch = /^(\s*\[)(.*)(\]\s*)(#.*)?$/.exec(rest);
+        if (arrayMatch) {
+          const [, openBracket, inner, closeBracket, cmt] = arrayMatch;
           nodes.push(
-            <span key={`${lineIdx}-${tokenIdx++}`} className="hl-env-str">
-              {quotedStr}
+            <span key={`${lineIdx}-${tokenIdx++}`} className="hl-env-op">
+              {openBracket}
             </span>
           );
-          if (afterStr) {
-            const commentMatch = /^(\s*)(#.*)$/.exec(afterStr);
-            if (commentMatch) {
-              if (commentMatch[1]) nodes.push(commentMatch[1]);
+          const itemRegex = /(\s+|"[^"\\]*(?:\\.[^"\\]*)*"|'[^'\\]*(?:\\.[^'\\]*)*'|[^,\s]+|,)/g;
+          let im: RegExpExecArray | null;
+          while ((im = itemRegex.exec(inner)) !== null) {
+            const raw = im[0];
+            const k = `${lineIdx}-${tokenIdx++}`;
+            if (/^\s+$/.test(raw)) {
+              nodes.push(raw);
+            } else if (raw === ",") {
               nodes.push(
-                <span key={`${lineIdx}-${tokenIdx++}`} className="hl-env-cmt">
-                  {commentMatch[2]}
+                <span key={k} className="hl-env-op">
+                  ,
+                </span>
+              );
+            } else if (raw.startsWith('"') || raw.startsWith("'")) {
+              nodes.push(
+                <span key={k} className="hl-env-str">
+                  {raw}
                 </span>
               );
             } else {
-              nodes.push(afterStr);
+              nodes.push(
+                <span key={k} className="hl-env-val">
+                  {raw}
+                </span>
+              );
             }
           }
-        } else {
-          const unquotedMatch = /^(.*?)(\s+#.*)$/.exec(rest);
-          let valPart = rest;
-          let commentPart = "";
-
-          if (unquotedMatch) {
-            valPart = unquotedMatch[1];
-            commentPart = unquotedMatch[2];
+          nodes.push(
+            <span key={`${lineIdx}-${tokenIdx++}`} className="hl-env-op">
+              {closeBracket}
+            </span>
+          );
+          if (cmt) {
+            nodes.push(
+              <span key={`${lineIdx}-${tokenIdx++}`} className="hl-env-cmt">
+                {cmt}
+              </span>
+            );
           }
+        } else {
+          const quotedMatch = /^("[^"\\]*(?:\\.[^"\\]*)*"|'[^'\\]*(?:\\.[^'\\]*)*')(.*)$/.exec(rest);
+          if (quotedMatch) {
+            const [, quotedStr, afterStr] = quotedMatch;
+            nodes.push(
+              <span key={`${lineIdx}-${tokenIdx++}`} className="hl-env-str">
+                {quotedStr}
+              </span>
+            );
+            if (afterStr) {
+              const commentMatch = /^(\s*)(#.*)$/.exec(afterStr);
+              if (commentMatch) {
+                if (commentMatch[1]) nodes.push(commentMatch[1]);
+                nodes.push(
+                  <span key={`${lineIdx}-${tokenIdx++}`} className="hl-env-cmt">
+                    {commentMatch[2]}
+                  </span>
+                );
+              } else {
+                nodes.push(afterStr);
+              }
+            }
+          } else {
+            const unquotedMatch = /^(.*?)(\s+#.*)$/.exec(rest);
+            let valPart = rest;
+            let commentPart = "";
 
-          if (valPart) {
+            if (unquotedMatch) {
+              valPart = unquotedMatch[1];
+              commentPart = unquotedMatch[2];
+            }
+
+            if (valPart) {
             const trimmed = valPart.trim();
             const lower = trimmed.toLowerCase();
 
@@ -1484,8 +1565,9 @@ function tokenizeDotenv(code: string): ReactNode[] {
           }
         }
       }
-      return;
     }
+    return;
+  }
 
     const tokenRegex =
       /(\s+|#[^\n]*|'[^']*'|"[^"]*"|[a-zA-Z_][a-zA-Z0-9_.-]*|[0-9]+(?:\.[0-9]+)?|[=:]+|[^\s\w])/g;
@@ -1727,6 +1809,12 @@ const ARCH_BADGE_WORDS = new Set([
   "MVCC",
   "RBAC",
   "SQL",
+  "RUN",
+  "WORKFLOW",
+  "TRIGGER",
+  "SCHEDULE",
+  "TASK",
+  "EXPLAIN",
 ]);
 
 const BRANCH_COLORS: Record<string, string> = {
@@ -1744,7 +1832,7 @@ function classifyArchStageClass(text: string): string {
   if (/\b(aes|gcm|tls|crypto|sealed|encrypt|dek|kek)\b/.test(lower)) return "hl-arch-crypto";
   if (/\b(mvcc|locks?|undo|txn|transaction)\b/.test(lower)) return "hl-arch-storage";
   if (/\b(buffer|cache|pool|pages?)\b/.test(lower)) return "hl-arch-buffer";
-  if (/\b(vectorized|executor|engine)\b/.test(lower)) return "hl-arch-exec";
+  if (/\b(vectorized|executor|engine|workflow|task|trigger|schedule)\b/.test(lower)) return "hl-arch-exec";
   if (/\b(wire|protocol|auth|authn|rbac|client|root)\b/.test(lower)) return "hl-arch-subsystem";
   if (/\b(parser|binder|catalog|planner|optimizer|cost|logical)\b/.test(lower)) return "hl-arch-stage";
   return "hl-arch-stage";
@@ -1892,17 +1980,17 @@ function tokenizeArchFlow(code: string): ReactNode[] {
       return;
     }
 
-    if (line.includes("→") || line.includes("->")) {
+    if (line.includes("→") || line.includes("->") || line.includes("↓")) {
       const leadMatch = /^(\s*)(.*)$/.exec(line);
       const leadSpace = leadMatch ? leadMatch[1] : "";
       const rest = leadMatch ? leadMatch[2] : line;
 
       if (leadSpace) nodes.push(leadSpace);
 
-      const parts = rest.split(/(\s*(?:→|->)\s*)/);
+      const parts = rest.split(/(\s*(?:→|->|↓)\s*)/);
       parts.forEach((part, pIdx) => {
         if (!part) return;
-        if (/^\s*(?:→|->)\s*$/.test(part)) {
+        if (/^\s*(?:→|->|↓)\s*$/.test(part)) {
           nodes.push(
             <span key={`${lineIdx}-${pIdx}-arr`} className="hl-arch-arrow">
               {part}
@@ -1919,6 +2007,20 @@ function tokenizeArchFlow(code: string): ReactNode[] {
     const leadSpace = leadMatch ? leadMatch[1] : "";
     const rest = leadMatch ? leadMatch[2] : line;
     if (leadSpace) nodes.push(leadSpace);
+
+    const colMatch = /^([A-Za-z0-9_-]+)(\s{2,})(.*)$/.exec(rest);
+    if (colMatch) {
+      const [, label, spacing, details] = colMatch;
+      nodes.push(
+        <span key={`${lineIdx}-label`} className="hl-arch-subsystem font-semibold">
+          {label}
+        </span>
+      );
+      nodes.push(spacing);
+      renderBranchDetails(nodes, details, lineIdx);
+      return;
+    }
+
     renderArchStageSegment(nodes, rest, lineIdx, 0);
   });
 

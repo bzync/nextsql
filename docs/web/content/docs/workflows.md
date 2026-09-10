@@ -2,7 +2,7 @@
 
 Triggers and schedules invoke a workflow. Only asynchronous or scheduled execution becomes a durable **TASK**.
 
-```text
+```arch
 WORKFLOW
 ├── manual RUN WORKFLOW
 ├── TRIGGER invocation

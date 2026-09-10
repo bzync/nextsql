@@ -20,7 +20,7 @@ events may not contain a committed row image.
 
 The result columns are:
 
-```text
+```sql
 operation, database_id, table_id, table, tenant, old_tenant,
 primary_key, old_primary_key, transaction_id, change_lsn,
 commit_lsn, resume_token, lag_lsn, before_image, after_image

@@ -2,7 +2,7 @@
 
 `nextsql-admin` is one binary with three modes. It is a protocol client: it never reads database files, never holds the root unlock key, and never bypasses RBAC.
 
-```text
+```arch
 Setup        install / upgrade / repair / uninstall
 Operations   server, cluster, security, backup, activity
 Studio       SQL workspace, explorers, EXPLAIN, catalog

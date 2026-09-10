@@ -41,22 +41,38 @@ export function isFilesLang(lang?: string, title?: string, code?: string): boole
 export function isArchLang(lang?: string, title?: string, code?: string): boolean {
   const l = (lang || "").toLowerCase().trim();
   const t = (title || "").toLowerCase().trim();
-  const archKeywords = /^(arch|architecture|pipeline|flow|flowchart|dag|hierarchy)$/i;
-  if (archKeywords.test(l) || (!l && archKeywords.test(t)) || t.includes("architecture") || t.includes("pipeline")) return true;
+  const archKeywords = /^(arch|architecture|pipeline|flow|flowchart|dag|hierarchy|workflow)$/i;
+  if (archKeywords.test(l) || (!l && archKeywords.test(t)) || t.includes("architecture") || t.includes("pipeline") || t.includes("workflow")) return true;
   if ((l === "text" || !l) && code) {
     const trimmed = code.trim();
-    if (trimmed.includes("→") || (trimmed.includes("->") && (trimmed.includes("├──") || trimmed.includes("└──")))) {
+    if (
+      trimmed.includes("→") ||
+      trimmed.includes("↓") ||
+      (trimmed.includes("->") && (trimmed.includes("├──") || trimmed.includes("└──"))) ||
+      (trimmed.includes("WORKFLOW") && trimmed.includes("TASK"))
+    ) {
       return true;
     }
   }
   return false;
 }
 
-export function isSqlLang(lang?: string, title?: string): boolean {
+export function isSqlLang(lang?: string, title?: string, code?: string): boolean {
   const l = (lang || "").toLowerCase().trim();
   const t = (title || "").toLowerCase().trim();
   const sqlKeywords = /^(sql|nsql|nextsql)$/i;
-  return sqlKeywords.test(l) || (!l && sqlKeywords.test(t)) || t.endsWith(".sql");
+  if (sqlKeywords.test(l) || (!l && sqlKeywords.test(t)) || t.endsWith(".sql")) return true;
+  if ((l === "text" || !l) && code) {
+    const trimmed = code.trim();
+    if (
+      /^(CREATE\s+(TABLE|DATABASE|INDEX|UNIQUE|SPATIAL|FULLTEXT|VECTOR|WORKFLOW|TRIGGER)|SELECT\s+|INSERT\s+INTO|UPDATE\s+|DELETE\s+FROM|ALTER\s+TABLE|DROP\s+(TABLE|DATABASE|INDEX)|BEGIN\b)/i.test(
+        trimmed
+      )
+    ) {
+      return true;
+    }
+  }
+  return false;
 }
 
 export function isDriverLang(lang?: string, title?: string): boolean {
@@ -82,13 +98,15 @@ export function isProtoLang(lang?: string, title?: string): boolean {
 export function isEnvLang(lang?: string, title?: string): boolean {
   const l = (lang || "").toLowerCase().trim();
   const t = (title || "").toLowerCase().trim();
-  const envKeywords = /^(dotenv|env|\.env)$/i;
+  const envKeywords = /^(dotenv|env|\.env|toml|conf|config|ini)$/i;
   return (
     envKeywords.test(l) ||
     (!l && envKeywords.test(t)) ||
     t.endsWith(".env") ||
     t.includes(".env.") ||
-    t.endsWith(".env.local")
+    t.endsWith(".toml") ||
+    t.endsWith(".conf") ||
+    t.endsWith(".ini")
   );
 }
 
@@ -122,7 +140,7 @@ export function CodeBlock({
   title?: string;
 }) {
   const isBash = isBashLang(lang, title, code);
-  const isSql = !isBash && isSqlLang(lang, title);
+  const isSql = !isBash && isSqlLang(lang, title, code);
   const isDriver = !isBash && !isSql && isDriverLang(lang, title);
   const isProto = !isBash && !isSql && !isDriver && isProtoLang(lang, title);
   const isEnv = !isBash && !isSql && !isDriver && !isProto && isEnvLang(lang, title);
@@ -241,18 +259,22 @@ export function CodeBlock({
   }
 
   if (isEnv) {
+    const isToml = (lang || "").toLowerCase() === "toml" || (title || "").toLowerCase().endsWith(".toml");
+    const badgeText = isToml ? "toml" : "env";
+    const badgeColor = isToml ? "text-[#fb923c] bg-[#fb923c]/15" : "text-[#34d399] bg-[#34d399]/15";
+    const displayTitle = title || (isToml ? "config.toml" : (lang === "dotenv" ? ".env" : lang) || ".env");
     return (
       <div className="code-block-env group relative overflow-hidden rounded-md border border-[var(--env-border)] bg-[var(--env-bg)] text-[var(--env-fg)]">
         <div className="code-block-header flex items-center justify-between border-b border-[var(--env-header-border)] bg-[var(--env-header-bg)] px-4 py-2">
           <span className="inline-flex items-center gap-1.5 font-mono text-[11px] text-[var(--env-header-fg)]">
             <span
-              className="inline-flex h-4 items-center justify-center rounded px-1.5 font-mono text-[10px] font-bold uppercase tracking-wider leading-none select-none text-[#34d399] bg-[#34d399]/15"
+              className={`inline-flex h-4 items-center justify-center rounded px-1.5 font-mono text-[10px] font-bold uppercase tracking-wider leading-none select-none ${badgeColor}`}
               aria-hidden="true"
             >
-              env
+              {badgeText}
             </span>
             <span className="text-[var(--env-header-fg)] opacity-90">
-              {title || (lang === "dotenv" ? ".env" : lang) || ".env"}
+              {displayTitle}
             </span>
           </span>
           <CopyButton
@@ -263,7 +285,7 @@ export function CodeBlock({
         </div>
         <pre className="overflow-x-auto overscroll-x-contain bg-transparent p-4 text-[12.5px] leading-6 text-[var(--env-fg)] [-webkit-overflow-scrolling:touch] sm:px-5 sm:text-[13px]">
           <code>
-            <HighlightCode code={code} lang={lang || "dotenv"} />
+            <HighlightCode code={code} lang={lang || (isToml ? "toml" : "dotenv")} />
           </code>
         </pre>
       </div>

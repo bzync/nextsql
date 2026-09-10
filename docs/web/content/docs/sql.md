@@ -47,7 +47,7 @@ A table **must** declare `PRIMARY KEY`. Secondary indexes store secondary key + 
 
 ## Statements
 
-```text
+```sql
 CREATE TABLE   [FOREIGN KEY / REFERENCES …] [PARTITION BY RANGE|HASH|LIST]
 CREATE DATABASE [IF NOT EXISTS]
 DROP TABLE [IF EXISTS]

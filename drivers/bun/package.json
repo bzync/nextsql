@@ -1,6 +1,6 @@
 {
   "name": "nextsql",
-  "version": "0.0.1",
+  "version": "0.1.1",
   "description": "Official NextSQL Bun driver. Keys never go in URLs.",
   "license": "UNLICENSED",
   "type": "module",

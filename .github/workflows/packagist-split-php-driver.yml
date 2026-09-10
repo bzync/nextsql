@@ -76,6 +76,43 @@ jobs:
           if [ -z "$version" ]; then version="${GITHUB_REF_NAME#php-v}"; fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
+      # `git push` reports only "Invalid username or token", which cannot
+      # distinguish an expired token from one the org has not approved from one
+      # merely lacking Contents: write. Ask the API first, and never print the
+      # token itself -- only the identity it resolves to.
+      - name: Verify PHP_SPLIT_TOKEN before pushing
+        env:
+          SPLIT_TOKEN: ${{ secrets.PHP_SPLIT_TOKEN }}
+        run: |
+          set -uo pipefail
+          if [ -z "${SPLIT_TOKEN}" ]; then
+            echo "::error::PHP_SPLIT_TOKEN is empty -- a called workflow needs 'secrets: inherit'."
+            exit 1
+          fi
+          code="$(curl -sS -o /tmp/whoami.json -w '%{http_code}' \
+            -H "Authorization: Bearer ${SPLIT_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/user || echo 000)"
+          if [ "$code" != "200" ]; then
+            echo "::error::PHP_SPLIT_TOKEN is not a valid GitHub token: GET /user returned $code. Reissue the secret."
+            exit 1
+          fi
+          echo "token authenticates as: $(python3 -c 'import json;print(json.load(open("/tmp/whoami.json"))["login"])')"
+          code="$(curl -sS -o /tmp/repo.json -w '%{http_code}' \
+            -H "Authorization: Bearer ${SPLIT_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/bzync/nextsql-php || echo 000)"
+          if [ "$code" != "200" ]; then
+            echo "::error::PHP_SPLIT_TOKEN cannot see bzync/nextsql-php (HTTP $code). bzync is an organization: a fine-grained PAT must be granted access to it and may need owner approval."
+            exit 1
+          fi
+          push="$(python3 -c 'import json;print(json.load(open("/tmp/repo.json")).get("permissions",{}).get("push"))')"
+          echo "push permission on bzync/nextsql-php: $push"
+          if [ "$push" != "True" ]; then
+            echo "::error::PHP_SPLIT_TOKEN lacks write access to bzync/nextsql-php. It needs Contents: read/write."
+            exit 1
+          fi
+
       - name: Split drivers/php and push to the mirror
         env:
           SPLIT_TOKEN: ${{ secrets.PHP_SPLIT_TOKEN }}

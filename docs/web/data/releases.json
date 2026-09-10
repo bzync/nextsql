@@ -6,7 +6,7 @@
       "status": "published",
       "channel": "preview",
       "latest": true,
-      "releasedAt": "2026-09-10T02:21:59Z",
+      "releasedAt": "2026-09-10T02:45:31Z",
       "summary": "Storage, WAL, MVCC, SQL, optimizer, protocol, JSON, full-text, vectors, hybrid plans, security, backup/PITR/export, and Raft HA ship in this tree.",
       "highlights": [
         "One WAL, one MVCC, and one optimizer for SQL, JSON, vectors, full-text, and geo",
@@ -81,8 +81,8 @@
           "kind": "run",
           "platform": "linux-amd64",
           "filename": "nextsql-0.0.1-linux-amd64.run",
-          "size": 21794294,
-          "sha256": "2e31237dc43897323f6ca8b71607e6609583747a107ea423c72b38d67b9406df",
+          "size": 21794189,
+          "sha256": "174a540faeffa3f34aca1e93a246978046e153ec70ec9ec2c6b29325238d0fef",
           "url": "https://github.com/bzync/nextsql/releases/download/v0.0.1/nextsql-0.0.1-linux-amd64.run"
         },
         {
@@ -90,8 +90,8 @@
           "kind": "archive",
           "platform": "linux-amd64",
           "filename": "nextsql-0.0.1-linux-amd64.tar.gz",
-          "size": 21791398,
-          "sha256": "b5399f13fca2feee8cd8143462b70da37c68d9b6a5f01b729fd4b58e005b36f2",
+          "size": 21791130,
+          "sha256": "372d1ac04e00b408d8f7daed207a9968e4d6692efefdb4ad31a7ce439193c1e5",
           "url": "https://github.com/bzync/nextsql/releases/download/v0.0.1/nextsql-0.0.1-linux-amd64.tar.gz"
         },
         {
@@ -99,8 +99,8 @@
           "kind": "setup",
           "platform": "windows-amd64",
           "filename": "nextsql-0.0.1-windows-amd64-setup.exe",
-          "size": 19893880,
-          "sha256": "ece793d750a32730880937f9ee4e756fbec7b90b45a8f7d12d39aaa74466e615",
+          "size": 19893883,
+          "sha256": "f021f97751177d4cd6b069fa2be60bfc400459c06a2593f5b90991348110d593",
           "url": "https://github.com/bzync/nextsql/releases/download/v0.0.1/nextsql-0.0.1-windows-amd64-setup.exe"
         },
         {
@@ -108,8 +108,8 @@
           "kind": "archive",
           "platform": "windows-amd64",
           "filename": "nextsql-0.0.1-windows-amd64.zip",
-          "size": 17369704,
-          "sha256": "89c4b746ddc2a2cf83983db4bd9d9c947baf5884642f6bdd74aad04b48ac59e8",
+          "size": 17369707,
+          "sha256": "a44e813779c71dd5087f871d0bfbe39c6db14f2a008d63efcecf2aedf5ab3317",
           "url": "https://github.com/bzync/nextsql/releases/download/v0.0.1/nextsql-0.0.1-windows-amd64.zip"
         },
         {
@@ -117,8 +117,8 @@
           "kind": "deb",
           "platform": "linux-amd64",
           "filename": "nextsql_0.0.1_amd64.deb",
-          "size": 18232794,
-          "sha256": "c10114c5c69e54e4216ec4be1d38c95b82d7a3e4d6c059bf657fa94331f86d30",
+          "size": 18233040,
+          "sha256": "f938b8d6b0acd0efe90019a983da48b78213b030736a6ce5e532aa9ac05bd34b",
           "url": "https://github.com/bzync/nextsql/releases/download/v0.0.1/nextsql_0.0.1_amd64.deb"
         }
       ]

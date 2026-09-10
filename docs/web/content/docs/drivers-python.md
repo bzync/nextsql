@@ -1,7 +1,7 @@
 # Python driver
 
 Python 3.10+ (stdlib only — `socket`, `ssl`, `decimal`, `json`; no external
-dependencies). MIT, versioned independently of the engine (package `0.1.0`).
+dependencies). MIT, versioned independently of the engine (package `0.0.1`).
 
 ```bash
 pip install bzync-nextsql

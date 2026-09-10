@@ -2,7 +2,7 @@
 
 Companion to `SKILL.md`. Authoritative source is `docs/sql.md` and the
 per-model docs; this is a working summary for the current release (**0.0.1**;
-driver packages are `0.1.0`).
+driver packages are `0.0.1`).
 
 ## Types
 

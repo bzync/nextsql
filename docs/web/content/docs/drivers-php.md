@@ -1,7 +1,7 @@
 # PHP driver
 
 PHP 8.1+ (requires `ext-openssl`). MIT, versioned independently of the engine
-(package `0.1.0`).
+(package `0.0.1`).
 
 ```bash
 composer require bzync/nextsql

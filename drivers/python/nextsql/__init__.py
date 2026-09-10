@@ -21,7 +21,7 @@ Published to PyPI as ``bzync-nextsql`` (``pip install bzync-nextsql``, then
 from this tree with ``drivers/python`` on ``sys.path``.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.0.1"
 
 from .client import (
     Config,

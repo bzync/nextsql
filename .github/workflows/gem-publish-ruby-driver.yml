@@ -39,12 +39,43 @@ on:
         description: "Version to publish, e.g. 0.1.0 (default: derived from a ruby-v* tag)"
         required: false
         type: string
+      yank_versions:
+        description: "If set (comma-separated), yank these gem versions instead of publishing"
+        required: false
+        type: string
 
 permissions:
   contents: read
 
 jobs:
+  yank:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.yank_versions != '' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.4"
+          rubygems: latest
+      - name: Configure RubyGems trusted publishing (OIDC)
+        uses: rubygems/configure-rubygems-credentials@dc5a8d8553e6ee01fc26761a49e99e733d17954a # v2.1.0
+      - name: Yank
+        env:
+          VERSIONS: ${{ inputs.yank_versions }}
+        run: |
+          set -euo pipefail
+          IFS=',' read -ra vers <<< "$VERSIONS"
+          for v in "${vers[@]}"; do
+            v="$(echo "$v" | tr -d '[:space:]')"
+            [ -n "$v" ] || continue
+            echo "yank bzync-nextsql $v"
+            gem yank bzync-nextsql -v "$v"
+          done
+
   publish:
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.yank_versions == '' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read

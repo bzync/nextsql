@@ -38,12 +38,79 @@ on:
         description: "Version to publish, e.g. 0.1.0 (default: derived from a python-v* tag)"
         required: false
         type: string
+      yank_versions:
+        description: "If set (comma-separated), yank these PyPI versions instead of publishing"
+        required: false
+        type: string
 
 permissions:
   contents: read
 
 jobs:
+  yank:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.yank_versions != '' }}
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Yank via trusted publishing
+        env:
+          VERSIONS: ${{ inputs.yank_versions }}
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          import base64, json, os, sys, urllib.error, urllib.request
+
+          def request(url, data=None, headers=None, method=None):
+              req = urllib.request.Request(url, data=data, headers=headers or {}, method=method)
+              try:
+                  with urllib.request.urlopen(req, timeout=60) as resp:
+                      return resp.status, resp.read()
+              except urllib.error.HTTPError as e:
+                  return e.code, e.read()
+
+          oidc_url = os.environ["ACTIONS_ID_TOKEN_REQUEST_URL"] + "&audience=pypi"
+          status, body = request(
+              oidc_url,
+              headers={"Authorization": "Bearer " + os.environ["ACTIONS_ID_TOKEN_REQUEST_TOKEN"]},
+          )
+          if status != 200:
+              sys.exit(f"github oidc token failed: {status} {body[:500]!r}")
+          github_token = json.loads(body)["value"]
+          status, body = request(
+              "https://pypi.org/_/oidc/github/mint-token",
+              data=json.dumps({"token": github_token}).encode(),
+              headers={"Content-Type": "application/json"},
+              method="POST",
+          )
+          if status != 200:
+              sys.exit(f"pypi mint-token failed: {status} {body[:800]!r}")
+          token = json.loads(body)["token"]
+          basic = base64.b64encode(("__token__:" + token).encode()).decode()
+          failed = False
+          for raw in os.environ["VERSIONS"].split(","):
+              version = raw.strip()
+              if not version:
+                  continue
+              status, body = request(
+                  f"https://pypi.org/pypi/bzync-nextsql/{version}/yank",
+                  data=b"",
+                  headers={"Authorization": "Basic " + basic},
+                  method="POST",
+              )
+              print(f"yank {version}: {status} {body[:300]!r}")
+              if status not in (200, 201, 204):
+                  failed = True
+          if failed:
+              sys.exit(1)
+          PY
+
   publish:
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.yank_versions == '' }}
     runs-on: ubuntu-latest
     environment: pypi
     permissions:

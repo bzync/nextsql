@@ -40,6 +40,10 @@ on:
         description: "Version to publish, e.g. 0.1.0 (default: derived from a node-v* tag)"
         required: false
         type: string
+      yank_versions:
+        description: "If set (comma-separated), unpublish these npm versions instead of publishing"
+        required: false
+        type: string
 
 defaults:
   run:
@@ -50,7 +54,36 @@ permissions:
   id-token: write # npm provenance + Trusted Publishing
 
 jobs:
+  yank:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.yank_versions != '' }}
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: .
+    steps:
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+      - name: Use an OIDC-capable npm
+        run: npm install -g npm@latest
+      - name: Unpublish via trusted publishing
+        env:
+          VERSIONS: ${{ inputs.yank_versions }}
+        run: |
+          set -euo pipefail
+          # Do not set NODE_AUTH_TOKEN: the granular token cannot unpublish
+          # when 2FA is required. OIDC trusted publishing is the owner.
+          IFS=',' read -ra vers <<< "$VERSIONS"
+          for v in "${vers[@]}"; do
+            v="$(echo "$v" | tr -d '[:space:]')"
+            [ -n "$v" ] || continue
+            echo "unpublish @bzync/nextsql@$v"
+            npm unpublish "@bzync/nextsql@$v" --force
+          done
+
   publish:
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.yank_versions == '' }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -87,6 +120,16 @@ jobs:
         run: node --test nextsql.test.js
 
       - name: Publish
-        run: npm publish --access public --provenance
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          version="${{ steps.v.outputs.version }}"
+          if npm publish --access public --provenance; then
+            exit 0
+          fi
+          # A lower version cannot take `latest` implicitly (npm refuses
+          # 0.0.1 while 0.1.x exists). Publish under a version tag, then
+          # move `latest` explicitly.
+          npm publish --access public --provenance --tag "v${version}"
+          npm dist-tag add "@bzync/nextsql@${version}" latest

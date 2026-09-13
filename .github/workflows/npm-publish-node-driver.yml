@@ -129,7 +129,8 @@ jobs:
             exit 0
           fi
           # A lower version cannot take `latest` implicitly (npm refuses
-          # 0.0.1 while 0.1.x exists). Publish under a version tag, then
-          # move `latest` explicitly.
-          npm publish --access public --provenance --tag "v${version}"
+          # 0.0.1 while 0.1.x exists). Publish under a non-semver tag, then
+          # move `latest` explicitly. `--tag v0.0.1` is invalid: npm treats
+          # it as a SemVer range.
+          npm publish --access public --provenance --tag rewind
           npm dist-tag add "@bzync/nextsql@${version}" latest

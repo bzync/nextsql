@@ -170,7 +170,7 @@ func (s *Server) handleSwitch(w http.ResponseWriter, r *http.Request, sess *sess
 		}
 	}
 	s.log.Info("ops switch", "from_profile", sess.profile, "from_user", sess.user,
-		"to_profile", target.ID, "user", req.User, "saved_password", req.UseSavedPassword)
+		"to_profile", target.ID, "user", req.User)
 	writeJSON(w, http.StatusOK, view)
 }
 

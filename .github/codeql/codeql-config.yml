@@ -1,0 +1,11 @@
+# The default Go suite includes go/incorrect-integer-conversion
+# (CWE-681). On this tree that query builds an intermediate result
+# set larger than CodeQL's 2 GiB cap, so `database run-queries`
+# exits 34 and the rest of the Go analysis is discarded. That is
+# an evaluator overflow, not a finding. Exclude only that query so
+# the other default Go queries still run. Revisit if GitHub ships
+# a version that finishes on this codebase.
+name: nextsql
+query-filters:
+  - exclude:
+      id: go/incorrect-integer-conversion

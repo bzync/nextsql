@@ -39,7 +39,7 @@ export const NEXTSQL_KEYWORDS: ReadonlySet<string> = new Set([
   "or", "between", "in", "is", "limit", "offset", "as", "true", "false",
   "transaction", "read", "committed", "snapshot", "serializable", "uuid",
   "string", "text", "blob", "int8", "int16", "int32", "int64", "uint8",
-  "uint16", "uint32", "uint64", "char", "varchar", "enum", "float32",
+  "uint16", "uint32", "uint64", "bool", "char", "varchar", "enum", "float32",
   "float64", "decimal", "timestamptz", "timestamp", "date", "time", "interval",
   "json", "struct", "array", "map", "vector", "bitvector", "sparsevector",
   "f32", "f16", "i8", "explain", "analyze", "maintain", "point", "box",
@@ -62,7 +62,7 @@ export const NEXTSQL_KEYWORDS: ReadonlySet<string> = new Set([
 
 const NEXTSQL_TYPE_KEYWORDS = new Set([
   "uuid", "string", "text", "blob", "int8", "int16", "int32", "int64",
-  "uint8", "uint16", "uint32", "uint64", "char", "varchar", "enum", "float32",
+  "uint8", "uint16", "uint32", "uint64", "bool", "char", "varchar", "enum", "float32",
   "float64", "decimal", "timestamptz", "timestamp", "date", "time", "interval",
   "json", "struct", "array", "map", "vector", "bitvector", "sparsevector",
   "f32", "f16", "i8", "point", "box", "location", "linestring", "polygon",

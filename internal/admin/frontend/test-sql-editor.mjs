@@ -23,13 +23,14 @@ try {
     "FROM users",
     "WHERE note = 'it''s safe' AND payload = X'CAFE'; -- comment",
     'SELECT "quoted""name" FROM users /* block */',
-    "CREATE TABLE samples (body TEXT);",
+    "CREATE TABLE samples (body TEXT, flag BOOL);",
     "SELECT café FROM samples;",
   ].join("\n");
   const tokens = editor.tokenizeSql(source);
   assert.equal(tokens.map((token) => token.value).join(""), source, "highlighting must preserve every source byte");
   assert.ok(tokens.some((token) => token.type === "keyword" && token.value === "SELECT"));
   assert.ok(tokens.some((token) => token.type === "type" && token.value === "TEXT"));
+  assert.ok(tokens.some((token) => token.type === "type" && token.value === "BOOL"));
   assert.ok(tokens.some((token) => token.type === "function" && token.value === "lower"));
   assert.ok(tokens.some((token) => token.type === "parameter" && token.value === "$1"));
   assert.ok(tokens.some((token) => token.type === "number" && token.value === "12.5"));

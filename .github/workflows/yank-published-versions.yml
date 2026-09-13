@@ -6,24 +6,28 @@ name: Remove published preview versions
 #
 # RubyGems 0.0.1 is left in place: yanked gem versions cannot be re-pushed.
 # npm never published 0.0.1; PyPI never published 0.0.1.
+#
+# Pass `-` (or `none`) for a registry to skip that job. A blank input is
+# not a skip: GitHub substitutes the default, which is how run #2 tried
+# to unpublish npm 0.1.x while only Docker Hub 0.0.1 needed deleting.
 
 on:
   workflow_dispatch:
     inputs:
       npm_versions:
-        description: "Comma-separated @bzync/nextsql versions to unpublish"
+        description: "Comma-separated @bzync/nextsql versions to unpublish, or - to skip. A blank value uses the default, it does not skip."
         required: false
         default: "0.1.1,0.1.0"
       gem_versions:
-        description: "Comma-separated bzync-nextsql gem versions to yank"
+        description: "Comma-separated bzync-nextsql gem versions to yank, or - to skip. A blank value uses the default, it does not skip."
         required: false
         default: "0.1.1,0.1.0"
       pypi_versions:
-        description: "Comma-separated bzync-nextsql PyPI versions to yank"
+        description: "Comma-separated bzync-nextsql PyPI versions to yank, or - to skip. A blank value uses the default, it does not skip."
         required: false
         default: "0.1.1,0.1.0"
       docker_tags:
-        description: "Comma-separated bzynchub/nextsql tags to delete"
+        description: "Comma-separated bzynchub/nextsql tags to delete, or - to skip. A blank value uses the default, it does not skip."
         required: false
         default: "0.0.1"
 
@@ -34,6 +38,7 @@ permissions:
 jobs:
   npm:
     name: Unpublish npm versions
+    if: inputs.npm_versions != '-' && inputs.npm_versions != 'none'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/setup-node@v7
@@ -58,6 +63,7 @@ jobs:
 
   rubygems:
     name: Yank RubyGems versions
+    if: inputs.gem_versions != '-' && inputs.gem_versions != 'none'
     runs-on: ubuntu-latest
     steps:
       - uses: ruby/setup-ruby@v1
@@ -83,6 +89,7 @@ jobs:
 
   pypi:
     name: Yank PyPI versions
+    if: inputs.pypi_versions != '-' && inputs.pypi_versions != 'none'
     runs-on: ubuntu-latest
     # Trusted publishing is bound to pypi-publish-python-driver.yml and the
     # `pypi` environment (tag python-v*), so this job is best-effort. If it
@@ -160,6 +167,7 @@ jobs:
 
   dockerhub:
     name: Delete Docker Hub tags
+    if: inputs.docker_tags != '-' && inputs.docker_tags != 'none'
     runs-on: ubuntu-latest
     steps:
       - name: Delete tags

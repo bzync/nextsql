@@ -8,7 +8,6 @@ import {
   CardHeader,
   CardTitle,
   Checkbox,
-  CodeEditor,
   ConfirmDialog,
   CopyButton,
   EmptyState,
@@ -22,6 +21,7 @@ import {
   Stack,
   Text,
 } from "@bzync/rui";
+import { SqlCodeEditor } from "./SqlCodeEditor";
 import { Icon, type IconName } from "../shared/icons";
 import {
   ApiError,
@@ -59,7 +59,6 @@ import { DMLBuilderExplorer } from "./DMLBuilderExplorer";
 import { SchemaDesignerExplorer, type SchemaDesignerMode } from "./SchemaDesignerExplorer";
 import { ObjectSearch } from "./ObjectSearch";
 import { CommandPalette, type StudioCommand } from "./CommandPalette";
-import { SwitchConnection } from "./SwitchConnection";
 import { SavedQueries } from "./SavedQueries";
 import { SchemaTree } from "./SchemaTree";
 import { ResultGrid } from "./ResultGrid";
@@ -79,6 +78,7 @@ import {
   detectEditableTable,
   editorDraftsWorthRestoring,
   environmentStorageKey,
+  connectionScope,
   extractQueryParams,
   extractReferencedTables,
   findAllMatches,
@@ -90,16 +90,11 @@ import {
   namesFromResult,
   parseStudioLayout,
   queryResultSummary,
-  realmScopeWarning,
   resetStudioLayout,
   resultColumn,
   nextMatchIndex,
   previousMatchIndex,
   parseEditorDrafts,
-  parseRecentConnections,
-  recentConnectionStorageKey,
-  recordRecentConnection,
-  serializeRecentConnections,
   parseSavedQueries,
   parseSavedQueriesExport,
   downloadSavedQueries,
@@ -133,7 +128,6 @@ import {
   type SQLSuggestion,
   type SavedQuery,
   type StudioEnvironment,
-  type RecentConnection,
   type TableColumnsCache,
   type TableJSONPathCache,
   type TableNameFix,
@@ -148,7 +142,8 @@ function columnIndex(result: StudioResultSet, name: string): number {
 
 function tableNames(bootstrap: StudioBootstrap | null): string[] {
   if (!bootstrap) return [];
-  const nameIndex = columnIndex(bootstrap.tables, "name");
+  let nameIndex = columnIndex(bootstrap.tables, "name");
+  if (nameIndex < 0) nameIndex = columnIndex(bootstrap.tables, "table_name");
   if (nameIndex < 0) return [];
   return bootstrap.tables.rows
     .map((row) => row[nameIndex])
@@ -355,7 +350,7 @@ function LayoutSplitter({
 export function StudioWorkspace({
   who,
   onUnauthorized,
-  onConnectionChanged,
+  onRequestSwitchServer,
   serverConnection,
   connectionChecking,
   onRetryConnection,
@@ -364,7 +359,10 @@ export function StudioWorkspace({
 }: {
   who: Whoami;
   onUnauthorized: () => void;
-  onConnectionChanged: (next: { realm: string; database: string }) => void;
+  // Opens the Shell's "Switch server" dialog; absent when this Admin has only
+  // one connection profile. A switch issues a new session, which remounts
+  // this workspace against the new server.
+  onRequestSwitchServer?: () => void;
   serverConnection: ServerConnection | null;
   connectionChecking: boolean;
   onRetryConnection: () => void;
@@ -372,8 +370,6 @@ export function StudioWorkspace({
   onSelectRouteTable?: (table: string) => void;
 }) {
   const [bootstrap, setBootstrap] = useState<StudioBootstrap | null>(null);
-  const [switchOpen, setSwitchOpen] = useState(false);
-  const [recentConnections, setRecentConnections] = useState<RecentConnection[]>([]);
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [readMode, setReadMode] = useState<StudioReadConsistency>("strong");
   const [stalenessSec, setStalenessSec] = useState(0);
@@ -385,7 +381,10 @@ export function StudioWorkspace({
   // Layout persistence: pane visibility/widths and the last selected table
   // name (never SQL, results, or a credential). Hydrated once from this
   // connection's localStorage slot; a missing/malformed value is the default.
-  const layoutKey = layoutStorageKey(who.realm ?? "", who.database ?? "", who.user ?? "");
+  // Every per-connection browser slot is scoped by the session's server
+  // (connection profile), database, and user — see connectionScope.
+  const scope = connectionScope(who.profile?.id);
+  const layoutKey = layoutStorageKey(scope, who.database ?? "", who.user ?? "");
   const [initialLayout] = useState(() => {
     try {
       return parseStudioLayout(window.localStorage.getItem(layoutKey));
@@ -406,7 +405,7 @@ export function StudioWorkspace({
   // Crash recovery: mirror the editor tab buffers (title + SQL only) to
   // localStorage keyed by this connection, and rehydrate them on load so a
   // crash / accidental close / reload does not lose unsaved work.
-  const draftKey = editorDraftStorageKey(who.realm ?? "", who.database ?? "", who.user ?? "");
+  const draftKey = editorDraftStorageKey(scope, who.database ?? "", who.user ?? "");
   const [restoredDrafts] = useState(() => {
     try {
       const parsed = parseEditorDrafts(window.localStorage.getItem(draftKey));
@@ -428,7 +427,7 @@ export function StudioWorkspace({
   // Saved queries: named, tag-grouped SQL the operator explicitly keeps.
   // Same per-connection localStorage scoping as the draft buffers; text only,
   // never sent anywhere.
-  const savedKey = savedQueryStorageKey(who.realm ?? "", who.database ?? "", who.user ?? "");
+  const savedKey = savedQueryStorageKey(scope, who.database ?? "", who.user ?? "");
   const [savedQueries, setSavedQueries] = useState<SavedQuery[]>(() => {
     try {
       return parseSavedQueries(window.localStorage.getItem(savedKey));
@@ -445,7 +444,7 @@ export function StudioWorkspace({
   const [checkingSQL, setCheckingSQL] = useState(false);
   const [environment, setEnvironmentState] = useState<StudioEnvironment | null>(null);
   const [readOnlyMode, setReadOnlyMode] = useState(false);
-  const [pendingRun, setPendingRun] = useState<{ analysis: StudioAnalysis; sql: string; isSelection: boolean; tabId: string; blockedReadOnly: boolean; realmScoped: boolean; params?: StudioQueryParam[] } | null>(null);
+  const [pendingRun, setPendingRun] = useState<{ analysis: StudioAnalysis; sql: string; isSelection: boolean; tabId: string; blockedReadOnly: boolean; params?: StudioQueryParam[] } | null>(null);
   const [pendingScript, setPendingScript] = useState<{ tabId: string; statements: string[]; flagged: { index: number; reasons: string[] }[] } | null>(null);
   const [splittingScript, setSplittingScript] = useState(false);
   const [hasSelection, setHasSelection] = useState(false);
@@ -1571,9 +1570,8 @@ export function StudioWorkspace({
       const analysis = await api.studioAnalyze(target);
       if (!mounted.current) return;
       const blockedReadOnly = readOnlyMode && analysis.write;
-      const realmScoped = Boolean(analysis.realm_scoped);
-      if (analysis.destructive || blockedReadOnly || realmScoped) {
-        setPendingRun({ analysis, sql: target, isSelection: Boolean(selection), tabId, blockedReadOnly, realmScoped, params });
+      if (analysis.destructive || blockedReadOnly) {
+        setPendingRun({ analysis, sql: target, isSelection: Boolean(selection), tabId, blockedReadOnly, params });
         return;
       }
     } catch (error: unknown) {
@@ -1686,12 +1684,9 @@ export function StudioWorkspace({
       if (!mounted.current) return;
       const flagged = analyses
         .map((a, index) => ({ a, index }))
-        .filter((entry) => entry.a?.destructive || entry.a?.realm_scoped || (readOnlyMode && entry.a?.write))
+        .filter((entry) => entry.a?.destructive || (readOnlyMode && entry.a?.write))
         .map((entry) => {
           const reasons = entry.a?.destructive ? [...(entry.a.reasons ?? [])] : [];
-          if (entry.a?.realm_scoped) {
-            reasons.push(realmScopeWarning(entry.a.kind, who.realm ?? "", who.database ?? ""));
-          }
           if (readOnlyMode && entry.a?.write) {
             reasons.push(`Read-only mode is on${environment ? ` for this ${environment} connection` : ""}; this ${entry.a.kind} writes data.`);
           }
@@ -1712,7 +1707,7 @@ export function StudioWorkspace({
     } finally {
       if (mounted.current) setSplittingScript(false);
     }
-  }, [activeTabId, checkingSQL, environment, executeScript, onUnauthorized, readOnlyMode, running, splittingScript, sql, updateTab, who.realm, who.database]);
+  }, [activeTabId, checkingSQL, environment, executeScript, onUnauthorized, readOnlyMode, running, splittingScript, sql, updateTab]);
 
   const confirmPendingScript = useCallback(() => {
     if (!pendingScript) return;
@@ -1897,18 +1892,28 @@ export function StudioWorkspace({
     if (selectedTable) setSQL(`SELECT * FROM ${selectedTable} LIMIT 100`);
   }, [selectedTable]);
 
-  // Connection environment tagging (production safety). The label is a
-  // per-viewer browser preference keyed by this connection's realm/database/
-  // user — never sent anywhere, no credential stored. A production tag turns
-  // on the read-only safety mode by default for the session (the user can
+  // Connection environment tagging (production safety). When the session's
+  // connection profile declares an environment it is authoritative — the
+  // viewer cannot relabel a production server as something else. Otherwise
+  // the label is a per-viewer browser preference keyed by this connection —
+  // never sent anywhere, no credential stored. A production label turns on
+  // the read-only safety mode by default for the session (the user can
   // still toggle it off, and each write is individually overridable via the
   // confirm dialog). Every storage access is guarded: a private window or
   // blocked site data just means "no tag", which is the safe default.
+  const profileEnvironment: StudioEnvironment | null = isStudioEnvironment(who.profile?.environment)
+    ? who.profile.environment
+    : null;
   const envStorageKey = useMemo(
-    () => environmentStorageKey(who.realm ?? "", who.database ?? "", who.user ?? ""),
-    [who.realm, who.database, who.user],
+    () => environmentStorageKey(scope, who.database ?? "", who.user ?? ""),
+    [scope, who.database, who.user],
   );
   useEffect(() => {
+    if (profileEnvironment) {
+      setEnvironmentState(profileEnvironment);
+      setReadOnlyMode(profileEnvironment === "production");
+      return;
+    }
     let stored: string | null = null;
     try {
       stored = window.localStorage.getItem(envStorageKey);
@@ -1918,10 +1923,11 @@ export function StudioWorkspace({
     const env = isStudioEnvironment(stored) ? stored : null;
     setEnvironmentState(env);
     setReadOnlyMode(env === "production");
-  }, [envStorageKey]);
+  }, [envStorageKey, profileEnvironment]);
 
   const setEnvironment = useCallback(
     (next: StudioEnvironment | null) => {
+      if (profileEnvironment) return;
       setEnvironmentState(next);
       setReadOnlyMode(next === "production");
       try {
@@ -1932,44 +1938,11 @@ export function StudioWorkspace({
         // session; it just won't persist across reloads.
       }
     },
-    [envStorageKey],
-  );
-
-  // Recent connections: realm/database pairs recently switched to on this
-  // nextsqld, keyed per host + user (never a credential — a recent entry only
-  // prefills the Switch-connection form, which still asks for the password).
-  const recentKey = useMemo(
-    () => recentConnectionStorageKey(bootstrap?.server_addr ?? "", who.user ?? ""),
-    [bootstrap?.server_addr, who.user],
-  );
-  useEffect(() => {
-    try {
-      setRecentConnections(parseRecentConnections(window.localStorage.getItem(recentKey)));
-    } catch {
-      setRecentConnections([]);
-    }
-  }, [recentKey]);
-  const rememberConnection = useCallback(
-    (realm: string, database: string) => {
-      // Write synchronously here rather than inside a setState updater: a
-      // successful switch immediately remounts this component (the Studio key
-      // includes the realm/database), and a pending updater on the outgoing
-      // fiber would be discarded. localStorage is the source of truth the new
-      // mount reads.
-      try {
-        const current = parseRecentConnections(window.localStorage.getItem(recentKey));
-        const next = recordRecentConnection(current, realm, database, Date.now());
-        window.localStorage.setItem(recentKey, serializeRecentConnections(next));
-        setRecentConnections(next);
-      } catch {
-        setRecentConnections((c) => recordRecentConnection(c, realm, database, Date.now()));
-      }
-    },
-    [recentKey],
+    [envStorageKey, profileEnvironment],
   );
 
   const warnings = [...(bootstrap?.warnings ?? []), ...(detail?.warnings ?? [])];
-  const contextLabel = [who.user, who.database && `db:${who.database}`, who.realm && `realm:${who.realm}`]
+  const contextLabel = [who.user, who.database && `db:${who.database}`]
     .filter(Boolean)
     .join(" · ");
 
@@ -1987,7 +1960,7 @@ export function StudioWorkspace({
       { id: "format-sql", label: "Format SQL", hint: "Shift+Alt+F", keywords: "reflow pretty print indent beautify tidy", disabled: !sql.trim(), run: formatBuffer },
       { id: "saved", label: "Saved queries…", keywords: "snippets folders tags", run: () => setSavedOpen(true) },
       { id: "search-objects", label: "Search objects…", keywords: "find table workflow", run: openObjectSearch },
-      { id: "switch-connection", label: "Switch connection…", keywords: "realm database reconnect", run: () => setSwitchOpen(true) },
+      { id: "switch-server", label: "Switch server…", keywords: "connection profile server reconnect environment staging production", disabled: !onRequestSwitchServer, run: () => onRequestSwitchServer?.() },
       { id: "schema-diagram", label: "Schema diagram…", keywords: "er foreign keys relationships", run: () => setSchemaDiagramOpen(true) },
       { id: "data-generator", label: "Generate development data…", keywords: "seed rows insert synthetic fixture mock sample", run: () => setDataGeneratorOpen(true) },
       { id: "import-data", label: "Import CSV / JSON data…", keywords: "load file tsv ndjson insert upload", run: () => setImportOpen(true) },
@@ -2013,7 +1986,7 @@ export function StudioWorkspace({
     running, checkingSQL, splittingScript, hasSelection, sql, cancelRequested,
     addTab, requestRun, requestRunScript, cancelQuery, openSuggest, formatBuffer, openObjectSearch,
     openSecurityExplorer, openActivityExplorer, openAuditExplorer, openWorkflowExplorer,
-    openMigrationExplorer, explorerVisible, inspectorVisible, resetLayout,
+    openMigrationExplorer, explorerVisible, inspectorVisible, resetLayout, onRequestSwitchServer,
   ]);
 
   useEffect(() => {
@@ -2078,7 +2051,9 @@ export function StudioWorkspace({
         <Alert variant="warning" title="Production environment" role="alert">
           <Inline gap="sm" align="center" wrap>
             <Text size="sm">
-              This connection is tagged <strong>production</strong>.
+              {profileEnvironment
+                ? <>This server's connection profile declares <strong>production</strong>.</>
+                : <>This connection is tagged <strong>production</strong>.</>}
               {readOnlyMode
                 ? " Read-only mode is on — a write statement asks for confirmation before it runs."
                 : " Read-only mode is off — writes run without an extra prompt."}
@@ -2103,6 +2078,9 @@ export function StudioWorkspace({
           ) : (
             <Badge variant="success" dot>Connected</Badge>
           )}
+          {who.profile?.name ? (
+            <Text size="sm" weight="medium" title={`Connection profile ${who.profile.id}`}>{who.profile.name}</Text>
+          ) : null}
           {(serverConnection?.server_addr || bootstrap?.server_addr) ? (
             <Text size="sm" variant="muted" title={`nextsqld ${serverConnection?.server_addr || bootstrap?.server_addr}`}>
               {serverConnection?.server_addr || bootstrap?.server_addr}
@@ -2123,7 +2101,9 @@ export function StudioWorkspace({
           ) : null}
         </Inline>
         <Inline gap="sm" align="center" wrap>
-          <Button variant="outline" size="sm" icon={<Icon name="plug" size={14} />} onClick={() => setSwitchOpen(true)}>Switch connection…</Button>
+          {onRequestSwitchServer ? (
+            <Button variant="outline" size="sm" icon={<Icon name="plug" size={14} />} onClick={onRequestSwitchServer}>Switch server…</Button>
+          ) : null}
           <Select
             id="studio-read-consistency"
             label="Read consistency"
@@ -2160,8 +2140,9 @@ export function StudioWorkspace({
           ) : null}
           <Select
             id="studio-environment"
-            label="Environment"
+            label={profileEnvironment ? "Environment (set by the connection profile)" : "Environment"}
             labelClassName="sr-only"
+            disabled={Boolean(profileEnvironment)}
             wrapperClassName="nss-toolbar-select"
             triggerClassName="nss-toolbar-select-trigger"
             options={[
@@ -2190,22 +2171,6 @@ export function StudioWorkspace({
             <Button variant="ghost" size="sm" onClick={() => setReadConsistencyError(null)}>Dismiss</Button>
           </Inline>
         </Alert>
-      ) : null}
-
-      {switchOpen ? (
-        <SwitchConnection
-          serverAddr={bootstrap?.server_addr ?? "nextsqld"}
-          user={who.user}
-          currentRealm={who.realm ?? ""}
-          currentDatabase={who.database ?? ""}
-          recent={recentConnections}
-          onClose={() => setSwitchOpen(false)}
-          onSwitched={(next) => {
-            setSwitchOpen(false);
-            rememberConnection(next.realm, next.database);
-            onConnectionChanged(next);
-          }}
-        />
       ) : null}
 
       <div
@@ -2598,7 +2563,7 @@ export function StudioWorkspace({
               </Alert>
             ) : null}
             <div ref={editorHost} onKeyDownCapture={onEditorKeyDown} className="nss-editor-host">
-              <CodeEditor
+              <SqlCodeEditor
                 value={sql}
                 onChange={setSQL}
                 language="sql"
@@ -2993,9 +2958,7 @@ export function StudioWorkspace({
           onConfirm={confirmPendingRun}
           title={pendingRun.blockedReadOnly && !pendingRun.analysis.destructive
             ? `Read-only mode — run this ${pendingRun.analysis.kind}?`
-            : pendingRun.realmScoped && !pendingRun.analysis.destructive
-              ? `Realm-wide change — run this ${pendingRun.analysis.kind}?`
-              : `Confirm ${pendingRun.analysis.kind}`}
+            : `Confirm ${pendingRun.analysis.kind}`}
           description={
             <Stack gap="xs">
               {pendingRun.isSelection ? <Text variant="muted">This runs only the selected text.</Text> : null}
@@ -3004,9 +2967,6 @@ export function StudioWorkspace({
                   Read-only mode is on{environment ? ` for this ${environment} connection` : ""}. This{" "}
                   {pendingRun.analysis.kind} statement writes data.
                 </Text>
-              ) : null}
-              {pendingRun.realmScoped ? (
-                <Text>{realmScopeWarning(pendingRun.analysis.kind, who.realm ?? "", who.database ?? "")}</Text>
               ) : null}
               {pendingRun.analysis.reasons?.map((reason, index) => <Text key={index}>{reason}</Text>)}
             </Stack>
@@ -3026,7 +2986,7 @@ export function StudioWorkspace({
             <Stack gap="xs">
               <Text variant="muted">
                 {pendingScript.flagged.length} of {pendingScript.statements.length} statements are flagged
-                (destructive or realm-wide{readOnlyMode ? ", or a write while read-only mode is on" : ""}).
+                (destructive{readOnlyMode ? ", or a write while read-only mode is on" : ""}).
                 The script stops at the first failed or canceled statement.
               </Text>
               {pendingScript.flagged.slice(0, MAX_SCRIPT_CONFIRM_REASONS).map(({ index, reasons }) => (

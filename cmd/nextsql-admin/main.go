@@ -60,6 +60,9 @@ func run() error {
 	clientCert := fs.String("tls-client-cert", "", "Operations mode: mTLS client certificate (PEM) for the nextsqld connection")
 	clientKey := fs.String("tls-client-key", "", "Operations mode: mTLS client private key (PEM) for the nextsqld connection")
 	insecure := fs.Bool("insecure", false, "Operations mode: allow a plaintext nextsqld connection (loopback only)")
+	serverName := fs.String("server-name", "", "Operations mode: display name of the --server-addr connection profile (default: \"Default server\")")
+	serverEnv := fs.String("server-environment", "", "Operations mode: environment of the --server-addr profile: development | test | staging | production")
+	profilesFile := fs.String("profiles", "", "Operations mode: connection-profile file (JSON, version 1) declaring further nextsqld servers operators may sign in or switch to; must not be group/world-writable")
 	maxSessions := fs.Int("max-sessions", 16, "Operations mode: maximum concurrent operator sessions")
 	idleTimeout := fs.Duration("idle-timeout", 15*time.Minute, "Operations mode: session idle expiry")
 	sessionLifetime := fs.Duration("session-lifetime", 12*time.Hour, "Operations mode: session absolute expiry")
@@ -94,22 +97,25 @@ func run() error {
 
 	log := logging.New(*logLevel, os.Stderr)
 	srv, err := admin.New(admin.Config{
-		Mode:            admin.Mode(*mode),
-		Listen:          *listen,
-		ListenTLSCert:   *tlsCert,
-		ListenTLSKey:    *tlsKey,
-		NextSQLBin:      bin,
-		DataDirHint:     *dataDirHint,
-		ServerAddr:      *serverAddr,
-		ServerTLSCA:     *tlsCA,
-		ServerTLSName:   *tlsServerName,
-		ClientCert:      *clientCert,
-		ClientKey:       *clientKey,
-		InsecureServer:  *insecure,
-		MaxSessions:     *maxSessions,
-		IdleTimeout:     *idleTimeout,
-		SessionLifetime: *sessionLifetime,
-		LogLevel:        *logLevel,
+		Mode:              admin.Mode(*mode),
+		Listen:            *listen,
+		ListenTLSCert:     *tlsCert,
+		ListenTLSKey:      *tlsKey,
+		NextSQLBin:        bin,
+		DataDirHint:       *dataDirHint,
+		ServerAddr:        *serverAddr,
+		ServerTLSCA:       *tlsCA,
+		ServerTLSName:     *tlsServerName,
+		ClientCert:        *clientCert,
+		ClientKey:         *clientKey,
+		InsecureServer:    *insecure,
+		ServerName:        *serverName,
+		ServerEnvironment: *serverEnv,
+		ProfilesFile:      *profilesFile,
+		MaxSessions:       *maxSessions,
+		IdleTimeout:       *idleTimeout,
+		SessionLifetime:   *sessionLifetime,
+		LogLevel:          *logLevel,
 	}, admin.Options{Logger: log})
 	if err != nil {
 		return err

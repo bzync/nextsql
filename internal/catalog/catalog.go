@@ -138,14 +138,17 @@ const (
 )
 
 type Table struct {
-	ID           uint32
-	Name         string
-	Columns      []Column
-	Indexes      []Index
-	PK           []int
-	HeapMeta     format.PageID
-	VecMeta      format.PageID // detached vector store; 0 if the table has no VECTOR columns
-	ForeignKeys  []ForeignKey
+	ID          uint32
+	Name        string
+	Columns     []Column
+	Indexes     []Index
+	PK          []int
+	HeapMeta    format.PageID
+	VecMeta     format.PageID // detached vector store; 0 if the table has no VECTOR columns
+	ForeignKeys []ForeignKey
+	// Checks are CHECK constraints evaluated against every row written to the
+	// table. Persisted from catalog v14 onward, and only when non-empty.
+	Checks       []Check
 	CDCImages    CDCImageMode
 	Partitioning *Partitioning
 }
@@ -673,6 +676,9 @@ func TableFromAST(id uint32, stmt ast.CreateTable) (*Table, error) {
 	if err := attachForeignKeys(t, stmt); err != nil {
 		return nil, err
 	}
+	if err := attachChecks(t, stmt); err != nil {
+		return nil, err
+	}
 	return t, nil
 }
 
@@ -770,6 +776,17 @@ func defaultFromAST(c ast.ColumnDef) (Default, error) {
 	default:
 		return Default{}, nerr.New(nerr.InvalidArgument, "catalog.defaultFromAST", "unsupported default")
 	}
+}
+
+// DefaultForColumn resolves a DEFAULT expression against an existing column,
+// applying the same rules CREATE TABLE applies. ALTER TABLE ALTER COLUMN SET
+// DEFAULT uses it so a default added later cannot mean something a default
+// written at creation time could not.
+func DefaultForColumn(col Column, e ast.Expr) (Default, error) {
+	if col.ClientEncrypted() {
+		return Default{}, nerr.New(nerr.InvalidArgument, "catalog.DefaultForColumn", "ENCRYPTED CLIENT column cannot have a server-side default")
+	}
+	return defaultFromAST(ast.ColumnDef{Name: col.Name, Type: col.LogicalType(), Default: e})
 }
 
 func (t *Table) ApplyDefault(i int, v types.Value) (types.Value, error) {

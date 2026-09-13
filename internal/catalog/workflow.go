@@ -298,7 +298,10 @@ func validateWorkflowStmt(stmt ast.Stmt) error {
 
 	switch s := stmt.(type) {
 	case ast.Insert:
-		if !validName(s.Table) || !validNames(s.Columns) || !validRows(s.Rows) || s.ReturningStar || len(s.Returning) != 0 {
+		// A query source has no encoding in a workflow body (only
+		// table/columns/rows are persisted), so it must never reach the
+		// catalog: encoding then decoding one would yield an empty INSERT.
+		if s.Query != nil || !validName(s.Table) || !validNames(s.Columns) || !validRows(s.Rows) || s.ReturningStar || len(s.Returning) != 0 {
 			return unsupportedWorkflowStmt()
 		}
 	case ast.Upsert:
@@ -412,7 +415,7 @@ func validWorkflowType(t types.Type) bool {
 func appendWorkflowStmt(buf []byte, stmt ast.Stmt) ([]byte, error) {
 	switch s := stmt.(type) {
 	case ast.Insert:
-		if s.ReturningStar || len(s.Returning) != 0 {
+		if s.Query != nil || s.ReturningStar || len(s.Returning) != 0 {
 			return nil, unsupportedWorkflowStmt()
 		}
 		buf = append(buf, workflowInsert)

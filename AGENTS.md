@@ -73,7 +73,8 @@ P28      in progress — NextSQL Admin: Setup + Operations modes (2026-09-05: In
          packaging integration, service flow, and accessibility baseline are verified;
          Linux .tar.gz/.run/.deb/.rpm and silent/offline/upgrade/repair paths are
          live-verified. Recovery-key export/verification is implemented for both
-         keystores; Windows/macOS execution remains environment-blocked.
+         keystores; macOS execution remains environment-blocked. Native Windows is
+         out of scope (log #290): Windows hosts run NextSQL under WSL 2.
 P29      in progress — Studio M1–M3, five native explorers, Users/Roles,
          Transaction/Lock, Audit, bounded per-tab plan comparison plus
          ANALYZE-only profiler, catalog-aware table/column IntelliSense
@@ -151,7 +152,8 @@ release gate**: Operations mode's MVP is complete; Setup mode
 (`docs/design-admin-setup.md`) has its standalone M1 flow implemented and
 targeted-tested. Packaging integration, recovery-key export/verification,
 accessibility validation, and silent/offline install coverage are implemented;
-remaining Windows/macOS execution tests are environment-blocked.
+remaining macOS execution tests are environment-blocked; native Windows is
+out of scope (log #290), with WSL 2 the supported path on Windows hosts.
 
 Always verify the latest status in `TODO.md` before acting — its log entries
 are numbered and dated; trust the highest-numbered one over any status text

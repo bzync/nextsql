@@ -538,6 +538,8 @@ func tableOf(p planner.Logical) *catalog.Table {
 		return tableOf(n.Input)
 	case planner.Sort:
 		return tableOf(n.Input)
+	case planner.Insert:
+		return n.Table
 	case planner.Update:
 		return n.Table
 	case planner.Delete:

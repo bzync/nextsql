@@ -14,7 +14,15 @@ const (
 	// Magic is ASCII 'N','S','R','L' — replication log command.
 	Magic uint32 = 0x4C52534E
 
+	// CurrentVersion is the batch version for records a release that predates
+	// page deltas can apply, and the snapshot version.
 	CurrentVersion uint16 = 1
+	// VersionPageDeltas is written only for a batch that carries a
+	// RecPageDelta. A follower on a release that predates page deltas would
+	// otherwise log the record and skip it on apply, silently leaving its
+	// pages behind the leader's. It rejects the batch version instead, and
+	// stops applying. Batches without a delta stay byte-identical to version 1.
+	VersionPageDeltas uint16 = 2
 
 	cmdHeaderSize = 4 + 2 + 2 + 4 // magic, version, kind, count
 
@@ -32,17 +40,18 @@ func EncodeCommand(dek *crypto.DEK, recs []wal.Record) ([]byte, error) {
 	if len(recs) > 1<<20 {
 		return nil, nerr.New(nerr.InvalidArgument, "replication.EncodeCommand", "record batch too large")
 	}
-	plain := marshalBatch(recs)
+	ver := batchVersion(recs)
+	plain := marshalBatch(ver, recs)
 	aad := make([]byte, 6)
 	encoding.PutU32(aad, 0, Magic)
-	encoding.PutU16(aad, 4, CurrentVersion)
+	encoding.PutU16(aad, 4, ver)
 	nonce, ct, err := crypto.SealBytesRandom(dek, aad, plain)
 	if err != nil {
 		return nil, err
 	}
 	out := make([]byte, 4+2+2+4+12+4+len(ct))
 	encoding.PutU32(out, 0, Magic)
-	encoding.PutU16(out, 4, CurrentVersion)
+	encoding.PutU16(out, 4, ver)
 	encoding.PutU16(out, 6, uint16(dek.Suite))
 	encoding.PutU32(out, 8, uint32(dek.Version))
 	copy(out[12:24], nonce)
@@ -63,7 +72,7 @@ func DecodeCommand(keys crypto.KeyProvider, data []byte) ([]wal.Record, error) {
 		return nil, nerr.New(nerr.InvalidFormat, "replication.DecodeCommand", "bad magic")
 	}
 	ver := encoding.U16(data, 4)
-	if ver != CurrentVersion {
+	if ver != CurrentVersion && ver != VersionPageDeltas {
 		return nil, nerr.New(nerr.InvalidFormat, "replication.DecodeCommand", "unsupported command version")
 	}
 	suite := format.CipherSuite(encoding.U16(data, 6))
@@ -85,17 +94,27 @@ func DecodeCommand(keys crypto.KeyProvider, data []byte) ([]wal.Record, error) {
 	if err != nil {
 		return nil, err
 	}
-	return unmarshalBatch(plain)
+	return unmarshalBatch(ver, plain)
 }
 
-func marshalBatch(recs []wal.Record) []byte {
+// batchVersion is VersionPageDeltas exactly when recs holds a page delta.
+func batchVersion(recs []wal.Record) uint16 {
+	for _, r := range recs {
+		if r.Type == wal.RecPageDelta {
+			return VersionPageDeltas
+		}
+	}
+	return CurrentVersion
+}
+
+func marshalBatch(ver uint16, recs []wal.Record) []byte {
 	n := cmdHeaderSize
 	for _, r := range recs {
 		n += 2 + 2 + 8 + 8 + 8 + 8 + 4 + len(r.Body)
 	}
 	buf := make([]byte, n)
 	encoding.PutU32(buf, 0, Magic)
-	encoding.PutU16(buf, 4, CurrentVersion)
+	encoding.PutU16(buf, 4, ver)
 	encoding.PutU16(buf, 6, KindWALBatch)
 	encoding.PutU32(buf, 8, uint32(len(recs)))
 	off := cmdHeaderSize
@@ -113,14 +132,14 @@ func marshalBatch(recs []wal.Record) []byte {
 	return buf
 }
 
-func unmarshalBatch(plain []byte) ([]wal.Record, error) {
+func unmarshalBatch(ver uint16, plain []byte) ([]wal.Record, error) {
 	if len(plain) < cmdHeaderSize {
 		return nil, nerr.New(nerr.InvalidFormat, "replication.DecodeCommand", "truncated batch")
 	}
 	if encoding.U32(plain, 0) != Magic {
 		return nil, nerr.New(nerr.InvalidFormat, "replication.DecodeCommand", "bad batch magic")
 	}
-	if encoding.U16(plain, 4) != CurrentVersion {
+	if encoding.U16(plain, 4) != ver {
 		return nil, nerr.New(nerr.InvalidFormat, "replication.DecodeCommand", "unsupported batch version")
 	}
 	if encoding.U16(plain, 6) != KindWALBatch {
@@ -156,6 +175,12 @@ func unmarshalBatch(plain []byte) ([]wal.Record, error) {
 	}
 	if off != len(plain) {
 		return nil, nerr.New(nerr.InvalidFormat, "replication.DecodeCommand", "trailing batch bytes")
+	}
+	// The version is exact, not a ceiling: a delta in a version-1 batch is
+	// what a pre-delta follower would skip, and a version-2 batch without
+	// one has no reason to exist.
+	if batchVersion(out) != ver {
+		return nil, nerr.New(nerr.InvalidFormat, "replication.DecodeCommand", "batch version does not match its records")
 	}
 	return out, nil
 }

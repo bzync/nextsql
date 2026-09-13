@@ -198,6 +198,19 @@ func WriteFrame(w io.Writer, typ Type, payload []byte, max int) error {
 	hdr[6] = byte(typ)
 	hdr[7] = 0
 	encoding.PutU32(hdr[:], 8, uint32(len(payload)))
+	if len(payload) > 0 && len(payload) <= coalesceFrameBytes {
+		// One write for a small frame: on TLS each write is at least one
+		// record and on any socket one syscall, so a header written apart
+		// from its payload doubles both for every small frame -- and a point
+		// query's reply is four small frames.
+		buf := make([]byte, HeaderSize+len(payload))
+		copy(buf, hdr[:])
+		copy(buf[HeaderSize:], payload)
+		if _, err := w.Write(buf); err != nil {
+			return nerr.Wrap(nerr.IO, "protocol.WriteFrame", "frame", err)
+		}
+		return nil
+	}
 	if _, err := w.Write(hdr[:]); err != nil {
 		return nerr.Wrap(nerr.IO, "protocol.WriteFrame", "header", err)
 	}
@@ -209,6 +222,11 @@ func WriteFrame(w io.Writer, typ Type, payload []byte, max int) error {
 	}
 	return nil
 }
+
+// coalesceFrameBytes is the largest payload WriteFrame copies next to its
+// header to send the frame in a single write. Above it the copy would cost
+// more than the extra write saves, so header and payload go out separately.
+const coalesceFrameBytes = 16 << 10
 
 // ReadFrame reads one frame. A length larger than max is rejected without allocating it.
 func ReadFrame(r io.Reader, max int) (Type, []byte, error) {

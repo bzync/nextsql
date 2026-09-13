@@ -125,7 +125,7 @@ script, `X-Frame-Options: DENY`).
 | M1 | Serving backbone + token auth + one working flow: Welcome → data dir/key file (live capacity/permission feedback via dry-run) → resource preset → administrator account → summary → install → completion | **complete (2026-09-04; targeted tests and live API-to-database verification green)** |
 | M2 | Encryption setup wizard detail: generate-vs-import root key choice, recovery-key export/verification UX, "never upload root key" messaging surfaced explicitly (not just enforced by design) | **complete (2026-09-09)** — generate-vs-import disclosure (2026-09-04); recovery-key capability + `nextsql key` CLI (log #242); `nextsql setup --recovery-key-out` plus the wizard's default-on export, both-keystore paths, and saved-offline gate before Finish (log #243) |
 | M3 | Advanced/component selection (skip-init config-only mode, TLS certificate assistant for a remote listen address, custom buffer-pages) | **complete (2026-09-04)** — all three pieces landed: skip-init (M1, log #136), custom buffer-pages (M1, log #135), remote listen + TLS (log #138) |
-| M4 | Packaging integration: bundle `nextsql-admin` into the `.tar.gz`/`.run`/`.deb`/`.rpm`/`.msi`/`.pkg` artifacts as the default interactive entry point (`scripts/build-*-installer.sh`), auto-exit-on-completion instead of requiring Ctrl+C | **Linux (`.tar.gz`/`.run`/`.deb`/`.rpm`) complete (2026-09-05, `.rpm` added log #143)** — see below; Windows/macOS packaging out of scope (no build host in this environment) |
+| M4 | Packaging integration: bundle `nextsql-admin` into the `.tar.gz`/`.run`/`.deb`/`.rpm`/`.pkg` artifacts as the default interactive entry point (`scripts/build-*-installer.sh`), auto-exit-on-completion instead of requiring Ctrl+C | **Linux (`.tar.gz`/`.run`/`.deb`/`.rpm`) complete (2026-09-05, `.rpm` added log #143)** — see below; macOS packaging out of scope (no build host in this environment); native Windows removed from the product (log #290, WSL 2 only) |
 | M5 | Accessibility pass (keyboard-only walkthrough, screen-reader labels audit, prefers-reduced-motion, high-contrast) + light/dark/system theming | **complete (2026-09-05, log #141)** — deterministic real-Chrome Installer + Manager keyboard flows and axe WCAG 2.2 A/AA audits green; explicit three-state theme selection, transition focus/live announcements, semantic progress, associated errors, reduced motion, and increased/forced contrast landed |
 | M6 | Service registration (`PROJECT.md` §46): an optional "start automatically at boot" step that enables an *already-installed, already-matching* systemd unit | **complete (2026-09-04)**, scoped to enabling an existing unit — see below; authoring/writing a unit file stays the packaged OS installer's job |
 
@@ -412,9 +412,10 @@ real `nextsql setup` install whose `config_path` landed at exactly the
 `$XDG_CONFIG_HOME/nextsql/nextsql.conf` path `install.sh` itself computed
 for the systemd unit; `install.sh` regained control and printed its closing
 note after Finish; the resulting `nextsqld`, started against that exact
-config, served a real query. `.rpm`/Windows/macOS packaging remain out of
+config, served a real query. `.rpm`/Windows/macOS packaging remained out of
 scope, same as log #134's platform-testing note (no `rpmbuild`/Wine/macOS
-host in this environment).
+host in this environment). Native Windows was later removed entirely (log
+#290).
 
 **Update (2026-09-05, log #143)**: `.rpm` is no longer out of scope. Using a
 disposable `fedora:40` Docker container (with `rpm-build`+`systemd-rpm-macros`
@@ -425,8 +426,9 @@ were found and fixed along the way — relative `%doc`/`%license` paths (only
 valid when a spec has a `%prep`/`%build` populating `%_builddir`, which this
 one deliberately doesn't) and a `%files` list missing `nextsql-admin` (the
 renamed binary)/`USAGE.md.gz`/`VERSION` — both invisible to `.deb` since
-`dpkg` has no equivalent "installed but unpackaged files" check. Windows/macOS
-packaging remain genuinely out of scope (no build host in this environment).
+`dpkg` has no equivalent "installed but unpackaged files" check. macOS
+packaging remains out of scope (no build host in this environment); native
+Windows was removed from the product in log #290 (WSL 2 only).
 
 ### M5 accessibility + shared Installer/Manager UI baseline (2026-09-05)
 
@@ -523,8 +525,9 @@ Summary screen is guaranteed to describe exactly what Install will do.
 - No packaging integration yet (M4) — `nextsql-install` is built and tested
   standalone; wiring it into the OS installer artifacts is a separate,
   reversible follow-up once the flow is proven. **Landed for Linux
-  (`.tar.gz`/`.run`/`.deb`), 2026-09-05** — see above; Windows/macOS
-  packaging remain out of scope (no build host in this environment).
+  (`.tar.gz`/`.run`/`.deb`), 2026-09-05** — see above; macOS
+  packaging remains out of scope (no build host in this environment), and
+  native Windows was removed in log #290 (WSL 2 only).
 - Several `@bzync/rui` 0.0.9 accessibility defects are worked around rather
   than fixed upstream (same treatment as the earlier Stepper/danger-token
   contrast findings): `CodeBlock` renders its content in an `overflow-x: auto`

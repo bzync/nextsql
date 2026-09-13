@@ -48,7 +48,7 @@ here only so the taxonomy below isn't mistaken for new work.
 | `JSON` | binary `NSJB` | path extract/index, see `docs/json.md` |
 | `VECTOR<F32\|F16\|I8,N>`, `BITVECTOR<N>`, `SPARSEVECTOR<N>` | see `docs/vector.md` | Vector Engine 2.0, production-gated (P23) |
 | `POINT` / `BOX` / `LINESTRING` / `POLYGON` | see `docs/geo.md` | WGS84 fixed shapes |
-| `BOOL`, `NULL` | 1 byte / tag | — |
+| `BOOL`, `NULL` | 1 byte / tag | **Correction (log #284):** `BOOL` was listed here as shipped, but only the value kind existed — row codec, sortable key, comparisons — and the grammar had no spelling for it, so no column could be declared `BOOL` until log #284. `NULL` is the bare literal's type and is not a column type. |
 
 ## 2. Decision record
 

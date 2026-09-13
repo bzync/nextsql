@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useMemo, useState, useSyncExternalStore } from "react";
 import {
   type Artifact,
@@ -25,6 +26,7 @@ export function PlatformDownloads({ release }: { release: Release }) {
     },
     () => fallback,
   );
+  const onWindows = useSyncExternalStore(subscribeBrowser, detectWindows, () => false);
   const [selectedPlatform, setSelectedPlatform] = useState<Platform | null>(null);
   const platform = selectedPlatform ?? detected;
 
@@ -45,6 +47,16 @@ export function PlatformDownloads({ release }: { release: Release }) {
 
   return (
     <div className="space-y-4">
+      {onWindows && (
+        <p className="rounded-md border border-line px-4 py-3 text-sm text-muted">
+          NextSQL does not run natively on Windows. Install a WSL 2 distribution and use the Linux x64 packages inside it —
+          see{" "}
+          <Link href="/docs/install#windows-wsl-2" className="underline">
+            Windows (WSL 2)
+          </Link>
+          .
+        </p>
+      )}
       <div className="flex flex-wrap gap-2">
         {PLATFORMS.filter((item) => release.artifacts.some((artifact) => artifact.platform === item)).map((item) => (
           <button
@@ -89,13 +101,17 @@ function ArtifactRow({ version, artifact }: { version: string; artifact: Artifac
   );
 }
 
+// A Windows visitor is offered the Linux packages, which run inside WSL 2.
+function detectWindows(): boolean {
+  const platform = navigator.platform?.toLowerCase() ?? "";
+  return platform.startsWith("win") || navigator.userAgent.toLowerCase().includes("windows");
+}
+
 function detectPlatform(): Platform {
   const ua = navigator.userAgent.toLowerCase();
   const platform = navigator.platform?.toLowerCase() ?? "";
   const isMac = platform.includes("mac") || ua.includes("mac os");
-  const isWin = platform.includes("win") || ua.includes("windows");
   const isArm = ua.includes("arm64") || ua.includes("aarch64") || platform.includes("arm");
   if (isMac) return isArm ? "darwin-arm64" : ua.includes("intel") ? "darwin-amd64" : "darwin-arm64";
-  if (isWin) return "windows-amd64";
   return isArm ? "linux-arm64" : "linux-amd64";
 }

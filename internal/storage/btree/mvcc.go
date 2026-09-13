@@ -301,8 +301,7 @@ func (t *Tree) ApplyUndo(stx *storage.Txn, rec undo.Record) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.eng.Enter(stx)
-	err := t.applyUndoRec(rec)
-	t.eng.Leave(stx)
+	err := t.eng.LeaveOp(stx, t.applyUndoRec(rec))
 	if err == nil {
 		t.liveKnown = false
 	}

@@ -254,12 +254,22 @@ func (s *Session) hydrateRows(tab *catalog.Table, rows [][]types.Value) error {
 }
 
 func (s *Session) decodeHeapRow(tab *catalog.Table, payload []byte) ([]types.Value, error) {
-	row, err := types.DecodeRow(payload, tab.Types())
+	return s.decodeHeapRowWith(tab, tab.Types(), tab.HasVector(), payload)
+}
+
+// decodeHeapRowWith is decodeHeapRow with the table's column types and
+// vector-ness computed once by the caller. A scan decodes every row it visits,
+// and rebuilding the type slice (a copy of each column's full type descriptor)
+// and rescanning the columns per row cost about a tenth of a scan's CPU.
+func (s *Session) decodeHeapRowWith(tab *catalog.Table, typs []types.Type, hasVector bool, payload []byte) ([]types.Value, error) {
+	row, err := types.DecodeRow(payload, typs)
 	if err != nil {
 		return nil, err
 	}
-	if err := s.hydrate(tab, row); err != nil {
-		return nil, err
+	if hasVector {
+		if err := s.hydrate(tab, row); err != nil {
+			return nil, err
+		}
 	}
 	return row, nil
 }

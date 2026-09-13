@@ -1363,46 +1363,34 @@ try {
   }
 
   {
-    // Recent-connection quick-switch list.
-    assert.deepEqual(tools.parseRecentConnections(null), [], "missing storage → empty");
-    assert.deepEqual(tools.parseRecentConnections("not json"), [], "garbage → empty");
-    assert.deepEqual(tools.parseRecentConnections('{"realm":"x"}'), [], "non-array → empty");
-    assert.deepEqual(
-      tools.parseRecentConnections(JSON.stringify([
-        { realm: "acme", database: "prod", at: 3 },
-        { realm: "", database: "", at: 2 },
-        { realm: "acme", database: "prod", at: 1 },
-        { realm: "x".repeat(200), database: "y", at: 1 },
-        { realm: "beta", database: "stage", at: 1 },
-      ])),
-      [
-        { realm: "acme", database: "prod", at: 3 },
-        { realm: "beta", database: "stage", at: 1 },
-      ],
-      "drops all-empty, dedupes, drops over-long names",
+    // Per-connection storage scoping by connection profile.
+    assert.equal(tools.connectionScope(undefined), "", "no profile → the legacy empty scope");
+    assert.equal(tools.connectionScope(""), "", "empty id → the legacy empty scope");
+    assert.equal(tools.connectionScope("default"), "", "the default profile keeps the legacy empty scope");
+    assert.equal(tools.connectionScope(" staging "), "p.staging", "other profiles are prefixed");
+    // The default profile must keep every key an older build (whose first
+    // segment was the then-always-empty realm) wrote, so saved queries,
+    // drafts, layout, and environment labels survive the upgrade.
+    for (const [fn, prefix] of [
+      [tools.savedQueryStorageKey, "nextsql-studio-saved"],
+      [tools.editorDraftStorageKey, "nextsql-studio-drafts"],
+      [tools.layoutStorageKey, "nextsql-studio-layout"],
+      [tools.environmentStorageKey, "nextsql-studio-env"],
+    ]) {
+      assert.equal(fn(tools.connectionScope("default"), "main", "app"), `${prefix}:default:main:app`, `${prefix}: default profile key unchanged`);
+      assert.equal(fn(tools.connectionScope("staging"), "main", "app"), `${prefix}:p.staging:main:app`, `${prefix}: profile-scoped key`);
+      assert.notEqual(
+        fn(tools.connectionScope("staging"), "main", "app"),
+        fn(tools.connectionScope("prod"), "main", "app"),
+        `${prefix}: two servers with the same database and user do not share a slot`,
+      );
+    }
+    // A pre-#244 realm name had no ".", so it can never alias a profile scope.
+    assert.notEqual(
+      tools.savedQueryStorageKey("staging", "main", "app"),
+      tools.savedQueryStorageKey(tools.connectionScope("staging"), "main", "app"),
+      "a legacy realm-scoped key never collides with a profile-scoped key",
     );
-
-    const start = [{ realm: "acme", database: "prod", at: 1 }];
-    assert.deepEqual(
-      tools.recordRecentConnection(start, "beta", "stage", 5),
-      [
-        { realm: "beta", database: "stage", at: 5 },
-        { realm: "acme", database: "prod", at: 1 },
-      ],
-      "new entry goes to the front",
-    );
-    assert.deepEqual(
-      tools.recordRecentConnection(start, "acme", "prod", 9),
-      [{ realm: "acme", database: "prod", at: 9 }],
-      "an existing pair is moved to the front, not duplicated",
-    );
-    assert.deepEqual(tools.recordRecentConnection(start, "", "", 9), start, "the all-default pair is not recorded");
-    const many = Array.from({ length: tools.MAX_RECENT_CONNECTIONS }, (_, i) => ({ realm: `r${i}`, database: "d", at: i }));
-    assert.equal(tools.recordRecentConnection(many, "new", "d", 99).length, tools.MAX_RECENT_CONNECTIONS, "the list stays capped");
-    assert.equal(tools.recentConnectionLabel({ realm: "", database: "d", at: 0 }), "(default realm) / d");
-
-    const round = tools.parseRecentConnections(tools.serializeRecentConnections(start));
-    assert.deepEqual(round, start, "serialize → parse round-trips");
   }
 
   {
@@ -1472,20 +1460,6 @@ try {
       "Selection · 1 row · 1 column · 1 ms",
       "a selection run is labelled",
     );
-  }
-
-  {
-    // Realm-scoped administration warning.
-    const named = tools.realmScopeWarning("DropUser", "acme", "analytics");
-    assert.match(named, /realm "acme"/, "names the connected realm");
-    assert.match(named, /"analytics" database/, "names the connected database");
-    assert.match(named, /every database in/, "explains the cross-database reach");
-    assert.match(named, /^DropUser /, "leads with the statement kind");
-
-    const defaulted = tools.realmScopeWarning("", "", "");
-    assert.match(defaulted, /the default realm/, "empty realm falls back to 'the default realm'");
-    assert.match(defaulted, /the current database/, "empty database falls back to 'the current database'");
-    assert.match(defaulted, /^This statement /, "empty kind falls back to 'This statement'");
   }
 
   {

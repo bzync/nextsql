@@ -44,6 +44,16 @@ func (t *Tree) writeMeta() error {
 	}
 	rec := encodeTreeMeta(t.root, uint16(t.height))
 	p := h.Page()
+	if p.SlotCount() > 0 {
+		if cur, err := p.Get(0); err == nil && bytes.Equal(cur, rec) {
+			// Unchanged. Releasing the page dirty would log a full 16 KiB
+			// image of it in every committing transaction's WAL -- once per
+			// tree the transaction touched, heap and each index -- although
+			// recovery needs the meta page only when root or height moves.
+			// Measured: about half of a single-row insert's WAL bytes.
+			return release(h, false)
+		}
+	}
 	if p.SlotCount() == 0 {
 		if _, err := p.Insert(rec); err != nil {
 			_ = release(h, false)

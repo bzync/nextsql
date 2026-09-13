@@ -493,7 +493,7 @@ func indexExprType(e ast.Expr, tab *catalog.Table) (types.Type, error) {
 	case ast.Ident:
 		i, ok := tab.ColIndex(x.Name)
 		if !ok {
-			return types.Type{}, nerr.New(nerr.NotFound, "sql.binder", "unknown column")
+			return types.Type{}, unknownColumn(x.Name)
 		}
 		return tab.Columns[i].Type, nil
 	case ast.Path:

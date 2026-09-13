@@ -8,6 +8,7 @@ import (
 	"github.com/bzync/nextsql/internal/nerr"
 	"github.com/bzync/nextsql/internal/storage/format"
 	"github.com/bzync/nextsql/internal/storage/page"
+	"github.com/bzync/nextsql/internal/storage/row"
 )
 
 const (
@@ -25,6 +26,16 @@ var (
 	maxPayload    = format.LogicalPageSize - format.PageHeaderSize - headerSize - 2*format.SlotSize
 	maxLeafRecord = (format.LogicalPageSize - format.PageHeaderSize - headerSize - 3*format.SlotSize) / 2
 )
+
+// MaxTxnValueSize is the largest value a transactional Insert or Update can
+// store under a key of keyLen bytes: the leaf record limit less the record's
+// length prefix, the key, and the MVCC version header every transactional
+// write adds to the value. Callers that build a variable-size record (catalog
+// statistics, for example) size it against this rather than discovering the
+// limit through a failed write.
+func MaxTxnValueSize(keyLen int) int {
+	return maxLeafRecord - 4 - keyLen - row.HeaderSize
+}
 
 type nodeHeader struct {
 	prev     format.PageID

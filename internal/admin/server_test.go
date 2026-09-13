@@ -8,7 +8,6 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"testing"
 
@@ -37,9 +36,6 @@ if [ "$1" = "setup" ]; then
 fi
 exit 1
 `
-	if runtime.GOOS == "windows" {
-		t.Skip("fake nextsql script is a POSIX shell script")
-	}
 	path := filepath.Join(dir, name)
 	if err := os.WriteFile(path, []byte(body), 0o755); err != nil {
 		t.Fatal(err)

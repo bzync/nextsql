@@ -179,6 +179,32 @@ func chooseAt(p planner.Logical, stats StatsFunc, underJoin bool) (planner.Logic
 			return plan, &Node{Op: "OrderedDistinct", EstRows: rows, EstCost: cost + rows*cpuTuple, Kids: kids(sortNode)}
 		}
 		return plan, sortNode
+	case planner.Insert:
+		if n.Input == nil {
+			return n, &Node{Op: "Insert", Detail: tableName(n.Table)}
+		}
+		// An INSERT's source is a whole query plan -- projection, aggregation,
+		// joins and all -- not the bare access tree an UPDATE or DELETE filters
+		// over, so it goes through the general physical planner. chooseAccess
+		// would leave everything above the scan as an opaque "Plan" node.
+		in, kid := chooseAt(n.Input, stats, underJoin)
+		rows, cost := int64(0), int64(0)
+		if kid != nil {
+			rows, cost = kid.EstRows, kid.EstCost+kid.EstRows*cpuTuple
+		}
+		return planner.Insert{Table: n.Table, Columns: n.Columns, Rows: n.Rows, Input: in, Returning: n.Returning},
+			&Node{Op: "Insert", Detail: tableName(n.Table), EstRows: rows, EstCost: cost, Kids: kids(kid)}
+	case planner.CreateTableAs:
+		// Same reasoning as an INSERT's query source: the source is a whole
+		// query plan, so it goes through the general physical planner rather
+		// than chooseAccess.
+		in, kid := chooseAt(n.Input, stats, underJoin)
+		rows, cost := int64(0), int64(0)
+		if kid != nil {
+			rows, cost = kid.EstRows, kid.EstCost+kid.EstRows*cpuTuple
+		}
+		return planner.CreateTableAs{Name: n.Name, PK: n.PK, Columns: n.Columns, Input: in},
+			&Node{Op: "CreateTableAs", Detail: n.Name, EstRows: rows, EstCost: cost, Kids: kids(kid)}
 	case planner.Update:
 		in, kid := chooseAccess(n.Input, stats)
 		rows, cost := int64(0), int64(0)

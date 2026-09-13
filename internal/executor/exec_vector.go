@@ -1304,6 +1304,9 @@ func (s *Session) collectPlan(p planner.Logical) ([][]types.Value, error) {
 		}
 		return out, nil
 	case planner.Filter:
+		if rows, ok, err := s.filterDuringScan(n); ok {
+			return rows, err
+		}
 		rows, err := s.collectPlan(n.Input)
 		if err != nil {
 			return nil, err
@@ -1623,7 +1626,126 @@ func (s *Session) scanHeapBatch(tab *catalog.Table, low, high []types.Value, low
 	return s.scanHeapBatchPartitions(tab, nil, low, high, lowIncl, highIncl, op)
 }
 
+// rowFilter decides, during a scan, whether a decoded row is kept.
+type rowFilter func(row []types.Value) (bool, error)
+
+// filterDuringScan evaluates a Filter's predicate while its sequential scan
+// runs, keeping only matching rows, instead of materializing every row of the
+// table and filtering afterwards.
+//
+// The scan used to decode and retain the whole table before the filter ran,
+// charging I/O but not memory, so `WHERE k = $1` over a large table held every
+// row in memory outside the per-query memory budget. Measured with 64
+// concurrent filtered scans of a 40K-row table: 326 MiB of live decoded rows at
+// peak for results of about 400 rows each.
+//
+// It applies only when that is exactly equivalent and safe. The table has no
+// VECTOR column, whose values are hydrated after the scan. The predicate is
+// built only from nodes whose evaluation reads, never writes, session state
+// (see parallelSafePredicate), because parallel range workers evaluate it
+// concurrently. Anything else takes the original path. ok reports whether the
+// pushdown ran.
+func (s *Session) filterDuringScan(n planner.Filter) ([][]types.Value, bool, error) {
+	var (
+		tab      *catalog.Table
+		parts    []uint32
+		segments []planner.SegmentSpan
+	)
+	switch in := n.Input.(type) {
+	case planner.SeqScan:
+		tab, parts, segments = in.Table, in.Partitions, in.Segments
+	case planner.Scan:
+		tab = in.Table
+	default:
+		return nil, false, nil
+	}
+	if tab == nil || tab.HasVector() || !parallelSafePredicate(n.Pred) {
+		return nil, false, nil
+	}
+	keep := func(row []types.Value) (bool, error) { return s.match(n.Pred, tab, row) }
+	var rows [][]types.Value
+	if len(segments) == 0 {
+		got, err := s.scanHeapBatchFiltered(tab, parts, nil, nil, true, true, "SeqScan", keep)
+		if err != nil {
+			return nil, true, err
+		}
+		rows = got
+	} else {
+		for _, seg := range segments {
+			got, err := s.scanHeapBatchFiltered(tab, parts, seg.Low, seg.High, seg.LowIncl, seg.HighIncl, "SeqScan", keep)
+			if err != nil {
+				return nil, true, err
+			}
+			rows = append(rows, got...)
+		}
+	}
+	if s.trace != nil {
+		if node := optimizer.Find(s.trace, "Filter"); node != nil {
+			node.ActRows += int64(len(rows))
+		}
+	}
+	return rows, true, nil
+}
+
+// parallelSafePredicate reports whether evaluating e only reads session state,
+// so concurrent evaluation from parallel scan workers is safe. Subqueries write
+// the session's per-statement result caches; highlight/snippet read search
+// state built for a SEARCH; uuid/now/ai are volatile. Everything else that
+// eval dispatches is a pure function of its arguments.
+func parallelSafePredicate(e ast.Expr) bool {
+	switch x := e.(type) {
+	case nil:
+		return true
+	case ast.Literal, ast.Ident, ast.Path, ast.Param:
+		return true
+	case ast.Unary:
+		return parallelSafePredicate(x.Right)
+	case ast.Binary:
+		return parallelSafePredicate(x.Left) && parallelSafePredicate(x.Right)
+	case ast.Between:
+		return parallelSafePredicate(x.Expr) && parallelSafePredicate(x.Low) && parallelSafePredicate(x.High)
+	case ast.IsNull:
+		return parallelSafePredicate(x.Expr)
+	case ast.Case:
+		if !parallelSafePredicate(x.Operand) || !parallelSafePredicate(x.Else) {
+			return false
+		}
+		for _, w := range x.Whens {
+			if !parallelSafePredicate(w.When) || !parallelSafePredicate(w.Then) {
+				return false
+			}
+		}
+		return true
+	case ast.Call:
+		switch x.Name {
+		case "uuid", "now", "ai", "highlight", "snippet":
+			return false
+		}
+		if x.Star {
+			return false
+		}
+		for _, a := range x.Args {
+			if !parallelSafePredicate(a) {
+				return false
+			}
+		}
+		return true
+	case ast.FieldAccess:
+		return parallelSafePredicate(x.Base)
+	case ast.Subscript:
+		return parallelSafePredicate(x.Coll) && parallelSafePredicate(x.Index)
+	default:
+		return false
+	}
+}
+
 func (s *Session) scanHeapBatchPartitions(tab *catalog.Table, partitions []uint32, low, high []types.Value, lowIncl, highIncl bool, op string) ([][]types.Value, error) {
+	return s.scanHeapBatchFiltered(tab, partitions, low, high, lowIncl, highIncl, op, nil)
+}
+
+// scanHeapBatchFiltered is scanHeapBatchPartitions keeping only rows keep
+// accepts (all rows when keep is nil). keep must be safe for concurrent use.
+func (s *Session) scanHeapBatchFiltered(tab *catalog.Table, partitions []uint32, low, high []types.Value, lowIncl, highIncl bool, op string, keep rowFilter) ([][]types.Value, error) {
 	start, end, err := encodeBounds(low, high, lowIncl, highIncl)
 	if err != nil {
 		return nil, err
@@ -1635,7 +1757,7 @@ func (s *Session) scanHeapBatchPartitions(tab *catalog.Table, partitions []uint3
 			if err != nil {
 				return nil, err
 			}
-			partRows, err := s.oneRange(s.x.use(heap), tab, start, end, op)
+			partRows, err := s.oneRange(s.x.use(heap), tab, start, end, op, keep)
 			if err != nil {
 				return nil, err
 			}
@@ -1656,7 +1778,7 @@ func (s *Session) scanHeapBatchPartitions(tab *catalog.Table, partitions []uint3
 	if w > 1 {
 		splits, err := htx.SplitKeys(w)
 		if err == nil && len(splits) > 0 {
-			rows, err = s.parallelRanges(htx, tab, start, end, splits, op)
+			rows, err = s.parallelRanges(htx, tab, start, end, splits, op, keep)
 			if err != nil {
 				return nil, err
 			}
@@ -1666,7 +1788,7 @@ func (s *Session) scanHeapBatchPartitions(tab *catalog.Table, partitions []uint3
 			return rows, nil
 		}
 	}
-	rows, err = s.oneRange(htx, tab, start, end, op)
+	rows, err = s.oneRange(htx, tab, start, end, op, keep)
 	if err != nil {
 		return nil, err
 	}
@@ -1676,11 +1798,29 @@ func (s *Session) scanHeapBatchPartitions(tab *catalog.Table, partitions []uint3
 	return rows, nil
 }
 
-func (s *Session) oneRange(htx *btree.Txn, tab *catalog.Table, start, end []byte, op string) ([][]types.Value, error) {
-	b := vector.New(tab.Types(), s.budget().BatchSize())
+func (s *Session) oneRange(htx *btree.Txn, tab *catalog.Table, start, end []byte, op string, keep rowFilter) ([][]types.Value, error) {
+	typs := tab.Types()
+	b := vector.New(typs, s.budget().BatchSize())
 	var out [][]types.Value
+	var keepErr error
 	flush := func() {
-		out = append(out, b.Rows()...)
+		if keep == nil {
+			out = append(out, b.Rows()...)
+		} else {
+			for _, row := range b.Rows() {
+				if keepErr != nil {
+					break
+				}
+				ok, err := keep(row)
+				if err != nil {
+					keepErr = err
+					break
+				}
+				if ok {
+					out = append(out, row)
+				}
+			}
+		}
 		if s.trace != nil {
 			if n := optimizer.Find(s.trace, op); n != nil {
 				n.ActRows += int64(b.Count)
@@ -1695,13 +1835,13 @@ func (s *Session) oneRange(htx *btree.Txn, tab *catalog.Table, start, end []byte
 		if err := s.budget().ChargeIO(int64(len(val))); err != nil {
 			return err
 		}
-		ok, err := vector.AppendEncoded(b, val, tab.Types())
+		ok, err := vector.AppendEncoded(b, val, typs)
 		if err != nil {
 			return err
 		}
 		if !ok {
 			flush()
-			ok, err = vector.AppendEncoded(b, val, tab.Types())
+			ok, err = vector.AppendEncoded(b, val, typs)
 			if err != nil {
 				return err
 			}
@@ -1717,10 +1857,13 @@ func (s *Session) oneRange(htx *btree.Txn, tab *catalog.Table, start, end []byte
 	if b.Count > 0 {
 		flush()
 	}
+	if keepErr != nil {
+		return nil, keepErr
+	}
 	return out, nil
 }
 
-func (s *Session) parallelRanges(htx *btree.Txn, tab *catalog.Table, start, end []byte, splits [][]byte, op string) ([][]types.Value, error) {
+func (s *Session) parallelRanges(htx *btree.Txn, tab *catalog.Table, start, end []byte, splits [][]byte, op string, keep rowFilter) ([][]types.Value, error) {
 	ranges := make([][2][]byte, 0, len(splits)+1)
 	prev := start
 	for _, k := range splits {
@@ -1736,6 +1879,7 @@ func (s *Session) parallelRanges(htx *btree.Txn, tab *catalog.Table, start, end 
 	ranges = append(ranges, [2][]byte{prev, end})
 	parts := make([][][]types.Value, len(ranges))
 	tasks := make([]func() error, len(ranges))
+	typs, hasVector := tab.Types(), tab.HasVector()
 	for i := range ranges {
 		i := i
 		tasks[i] = func() error {
@@ -1747,9 +1891,18 @@ func (s *Session) parallelRanges(htx *btree.Txn, tab *catalog.Table, start, end 
 				if err := s.budget().ChargeIO(int64(len(val))); err != nil {
 					return err
 				}
-				row, err := s.decodeHeapRow(tab, val)
+				row, err := s.decodeHeapRowWith(tab, typs, hasVector, val)
 				if err != nil {
 					return err
+				}
+				if keep != nil {
+					ok, err := keep(row)
+					if err != nil {
+						return err
+					}
+					if !ok {
+						return nil
+					}
 				}
 				got = append(got, row)
 				return nil

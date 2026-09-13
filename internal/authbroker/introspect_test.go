@@ -10,7 +10,6 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -35,15 +34,13 @@ func TestReadClientSecretFile(t *testing.T) {
 		t.Fatalf("secret = %q, want super-secret-123", secret)
 	}
 
-	// Permissive mode check on non-windows
-	if runtime.GOOS != "windows" {
-		badPermPath := filepath.Join(dir, "bad-perm.secret")
-		if err := os.WriteFile(badPermPath, []byte("secret"), 0o666); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := authbroker.ReadClientSecretFile(badPermPath); err == nil {
-			t.Fatal("expected error on mode 0666 file, got nil")
-		}
+	// Permissive mode check
+	badPermPath := filepath.Join(dir, "bad-perm.secret")
+	if err := os.WriteFile(badPermPath, []byte("secret"), 0o666); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := authbroker.ReadClientSecretFile(badPermPath); err == nil {
+		t.Fatal("expected error on mode 0666 file, got nil")
 	}
 
 	// Missing path

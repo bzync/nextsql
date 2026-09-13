@@ -77,6 +77,13 @@ func (s *Session) authorize(stmt ast.Stmt) error {
 		if err := s.require(security.PrivInsert, security.ScopeTable, st.Table); err != nil {
 			return err
 		}
+		// A query source is read with the invoker's own SELECT rights, so an
+		// INSERT cannot be used to copy out of a table the user may not read.
+		if st.Query != nil {
+			if err := s.authorize(st.Query); err != nil {
+				return err
+			}
+		}
 		return s.authorizeReturning(st.ReturningStar, st.Returning, st.Table)
 	case ast.Upsert:
 		if err := s.require(security.PrivInsert, security.ScopeTable, st.Table); err != nil {
@@ -113,9 +120,25 @@ func (s *Session) authorize(stmt ast.Stmt) error {
 		}
 		return s.authorizeReturning(st.ReturningStar, st.Returning, st.Table)
 	case ast.CreateTable:
-		return s.require(security.PrivCreate, security.ScopeDatabase, "")
+		if err := s.require(security.PrivCreate, security.ScopeDatabase, ""); err != nil {
+			return err
+		}
+		// A query source is read with the invoker's own SELECT rights, so
+		// CREATE TABLE ... AS cannot be used to copy out of a table the user
+		// may not read -- the same boundary INSERT ... <query> enforces.
+		if st.Query != nil {
+			return s.authorize(st.Query)
+		}
+		return nil
 	case ast.CreateWorkflow:
 		return s.require(security.PrivCreate, security.ScopeDatabase, "")
+	case ast.CreateView:
+		// Creating a view needs CREATE, like any other object. It grants no
+		// access of its own: using the view reads the underlying tables by
+		// name, so the reader still needs privileges on those.
+		return s.require(security.PrivCreate, security.ScopeDatabase, "")
+	case ast.DropView:
+		return s.require(security.PrivDrop, security.ScopeDatabase, "")
 	case ast.RunWorkflow:
 		return s.require(security.PrivExecute, security.ScopeFunction, st.Name)
 	case ast.AlterWorkflow:
@@ -151,6 +174,11 @@ func (s *Session) authorize(stmt ast.Stmt) error {
 	case ast.ResetResourceGroup:
 		return s.require(security.PrivConnect, security.ScopeDatabase, "")
 	case ast.ShowTasks, ast.CancelTask:
+		return s.require(security.PrivConnect, security.ScopeDatabase, "")
+	case ast.CancelQuery:
+		// Any connected user may reach the statement; whose query it is decides
+		// the outcome, and that check is in execCancelQuery where the target
+		// session is known.
 		return s.require(security.PrivConnect, security.ScopeDatabase, "")
 	case ast.Subscribe:
 		return s.require(security.PrivCDC, security.ScopeTable, st.Table)
@@ -470,6 +498,10 @@ func sqlObject(stmt ast.Stmt) string {
 	switch st := stmt.(type) {
 	case ast.CreateWorkflow:
 		return st.Name
+	case ast.CreateView:
+		return st.Name
+	case ast.DropView:
+		return st.Name
 	case ast.RunWorkflow:
 		return st.Name
 	case ast.AlterWorkflow:
@@ -495,6 +527,8 @@ func sqlObject(stmt ast.Stmt) string {
 	case ast.DropResourceGroup:
 		return st.Name
 	case ast.CancelTask:
+		return st.ID
+	case ast.CancelQuery:
 		return st.ID
 	case ast.Subscribe:
 		return st.Table
@@ -583,6 +617,12 @@ func workflowAuditAction(stmt ast.Stmt) string {
 		return security.ActionResourceGroupDrop
 	case ast.CancelTask:
 		return security.ActionTaskCancel
+	case ast.CancelQuery:
+		return security.ActionQueryCancel
+	case ast.CreateView:
+		return security.ActionViewCreate
+	case ast.DropView:
+		return security.ActionViewDrop
 	default:
 		return security.ActionDDL
 	}

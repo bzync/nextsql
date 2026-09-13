@@ -10,21 +10,22 @@ health verification, all non-interactive with machine-readable output — use
 GUI installer drive that same command; every option they expose is available
 to a script.
 
+NextSQL ships Linux packages only. Native Windows is not supported; on a
+Windows machine, install the Linux packages inside WSL 2 (see
+[Windows (WSL 2)](#windows-wsl-2)).
+
 ```bash
-# Both platforms (from a Linux host; Windows is cross-compiled)
+# All release artifacts
 ./scripts/build-installers.sh
 
-# Linux only (.tar.gz, .run, .deb; .rpm if rpmbuild is installed)
+# Linux directly (.tar.gz, .run, .deb; .rpm if rpmbuild is installed)
 ./scripts/build-linux-installer.sh --arch amd64,arm64
-
-# Windows only (.zip + setup.exe; NSIS if makensis is installed)
-./scripts/build-windows-installer.sh --arch amd64
 ```
 
 Artifacts land in the gitignored `installers/` directory. They are disposable
 build output: do not commit them. Checksums are
-`installers/SHA256SUMS.linux`, `installers/SHA256SUMS.windows`, and
-`installers/SHA256SUMS` after the combined script.
+`installers/SHA256SUMS.linux`, and `installers/SHA256SUMS` after the combined
+script.
 
 For a release, push a version tag only after the gates in `RELEASING.md` are
 green. `.github/workflows/release-installers.yml` builds into runner-temporary
@@ -40,7 +41,7 @@ this is opt-in and produces no `.asc` file unless a key is given:
 gpg --verify installers/SHA256SUMS.linux.asc installers/SHA256SUMS.linux
 ```
 
-Requires Go 1.22+, `tar`, `gzip`, `zip`, `sha256sum`, and `python3`. Debian packages need `dpkg-deb` (and `fakeroot` when present). The Windows `.ico` is built with Python Pillow when that package is installed.
+Requires Go 1.22+, `tar`, `gzip`, `zip`, `sha256sum`, and `python3`. Debian packages need `dpkg-deb` (and `fakeroot` when present).
 
 ## Linux
 
@@ -67,28 +68,24 @@ Keep the root unlock key off the data volume in production. Loopback may run wit
 
 Purging the `.deb` does **not** delete `/var/lib/nextsql` or `/etc/nextsql/root.key`.
 
-## Windows
+## Windows (WSL 2)
 
-| Artifact | What it is |
-|---|---|
-| `nextsql-VERSION-windows-ARCH.zip` | Binaries + `install.ps1` / `uninstall.ps1` |
-| `nextsql-VERSION-windows-ARCH-setup.exe` | Self-extracting GUI installer (UAC) |
+There is no Windows installer. Install a WSL 2 distribution (for example
+`wsl --install -d Ubuntu`) and use the Linux artifacts above inside it. WSL 1
+is not supported. The project has not yet execution-tested this path on a
+Windows host.
 
-Silent:
-
-```text
-nextsql-VERSION-windows-amd64-setup.exe /S
-nextsql-VERSION-windows-amd64-setup.exe /uninstall /S
-```
-
-Default install: `%ProgramFiles%\NextSQL`. Data: `%ProgramData%\NextSQL\data`. Key: `%ProgramData%\NextSQL\keys\root.key`. The `NextSQL` service is demand-start and is not started by the installer.
-
-```powershell
-nextsql init --data-dir "$env:ProgramData\NextSQL\data" `
-  --key-file "$env:ProgramData\NextSQL\keys\root.key" `
-  --user app --password-file $env:TEMP\nextsql.pw
-Start-Service NextSQL
-```
+- Keep `--data-dir` and the key files on the distribution's own Linux
+  filesystem (for example under `/var/lib/nextsql`), never under `/mnt/c` or
+  another mounted Windows drive: those are 9p mounts whose fsync and file
+  locking are not a durability boundary. `nextsql setup` warns when it detects
+  one.
+- The systemd unit needs systemd enabled in the distribution
+  (`[boot] systemd=true` in `/etc/wsl.conf`, then `wsl --shutdown`). Without
+  it, run `nextsqld` in the foreground.
+- WSL 2 forwards loopback, so a `127.0.0.1` listener and `nextsql-admin` are
+  reachable from the Windows host's browser. Client drivers on Windows connect
+  to it like any other address.
 
 ## Layout
 
@@ -97,9 +94,7 @@ packaging/
   lib.sh                 shared version / arch helpers
   COPYRIGHT
   linux/                 systemd unit, sysusers, tmpfiles, Debian scripts, tarball installer
-  windows/               config, PowerShell, NSIS, setup/ (Go SFX stub)
 scripts/
   build-linux-installer.sh
-  build-windows-installer.sh
   build-installers.sh
 ```

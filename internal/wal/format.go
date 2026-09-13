@@ -41,6 +41,11 @@ const (
 	// Recovery ignores it; CDC consumes it only after the matching COMMIT is
 	// durable.
 	RecChange RecType = 12
+	// RecPageDelta is a page change encoded against the page's previous
+	// logged state (see pagedelta.go). Written only by a log whose control
+	// file is version 2, so a release that predates it refuses to open the
+	// log rather than meeting a record type it cannot decode.
+	RecPageDelta RecType = 13
 )
 
 func (t RecType) String() string {
@@ -69,13 +74,15 @@ func (t RecType) String() string {
 		return "undo"
 	case RecChange:
 		return "change"
+	case RecPageDelta:
+		return "page_delta"
 	default:
 		return "invalid"
 	}
 }
 
 func (t RecType) known() bool {
-	return t >= RecBegin && t <= RecChange
+	return t >= RecBegin && t <= RecPageDelta
 }
 
 // Record is one WAL entry after decryption.

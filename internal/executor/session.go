@@ -70,17 +70,27 @@ func (r *Result) Close() {
 
 // Session is one SQL client. Transactions are session-scoped.
 type Session struct {
+	// txnAdmission releases the admission slot held by the open transaction
+	// (see ExecContext); nil outside a transaction.
+	txnAdmission func()
+
 	db                   *DB
 	x                    *xact
 	overlay              map[string]*catalog.Table
 	workflowOverlay      map[string]*catalog.Workflow
+	viewOverlay          map[string]*catalog.View
 	triggerOverlay       map[string]*catalog.Trigger
 	scheduleOverlay      map[string]*catalog.Schedule
 	resourceGroupOverlay map[string]*catalog.ResourceGroup
 	pending              *pending
-	trace                *optimizer.Node
-	limits               scheduler.Limits
-	qbudget              *scheduler.Budget
+	// savepoints is the open transaction's savepoint stack, oldest first.
+	savepoints []savepoint
+	// ddlSeq counts schema changes in this session. A savepoint records it so
+	// a partial rollback can refuse to cross one (see savepoint.go).
+	ddlSeq  uint64
+	trace   *optimizer.Node
+	limits  scheduler.Limits
+	qbudget *scheduler.Budget
 	// txnTimeout bounds an open transaction's total wall-clock lifetime; 0
 	// (the default) is unbounded. See Session.SetTxnTimeout.
 	txnTimeout time.Duration
@@ -156,6 +166,10 @@ type Session struct {
 	queryID    uint64
 	queryText  string
 	queryStart time.Time
+	// queryCancel stops the statement this session is running. Set for the
+	// duration of each statement so another session's CANCEL QUERY can reach
+	// it; guarded by queryMu like the rest of the published query state.
+	queryCancel context.CancelFunc
 
 	// txnMu guards the open-transaction snapshot read cross-goroutine by
 	// system.transactions. s.x itself is never read/written outside this
@@ -183,12 +197,53 @@ func (s *Session) beginQuery(sql string) {
 	s.queryMu.Unlock()
 }
 
+// beginCancellableQuery publishes the statement and returns a context another
+// session can cancel through CancelQuery. The cancel funnels through the
+// context the statement already runs under, so an operator cancel stops the
+// statement exactly where a client-driven cancel does — no second stop
+// mechanism, and no path that bypasses the executor's own cleanup.
+func (s *Session) beginCancellableQuery(ctx context.Context, sql string) (context.Context, func()) {
+	// Some in-process callers pass no context at all.
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	s.beginQuery(sql)
+	s.queryMu.Lock()
+	s.queryCancel = cancel
+	s.queryMu.Unlock()
+	return ctx, func() {
+		s.queryMu.Lock()
+		s.queryCancel = nil
+		s.queryMu.Unlock()
+		cancel()
+	}
+}
+
+// CancelQuery stops the statement this session is currently running, if its
+// id matches. It reports whether a running statement was signalled.
+func (s *Session) CancelQuery(id uint64) bool {
+	if s == nil {
+		return false
+	}
+	s.queryMu.Lock()
+	cancel := s.queryCancel
+	match := s.queryID == id && s.queryText != ""
+	s.queryMu.Unlock()
+	if !match || cancel == nil {
+		return false
+	}
+	cancel()
+	return true
+}
+
 // endQuery clears the published currently-executing statement. Call in the
 // same defer that resets s.execSQL in execAdmitted.
 func (s *Session) endQuery() {
 	s.queryMu.Lock()
 	s.queryID = 0
 	s.queryText = ""
+	s.queryCancel = nil
 	s.queryMu.Unlock()
 }
 
@@ -539,7 +594,25 @@ func (s *Session) Exec(sql string) (*Result, error) {
 }
 
 // ExecContext runs one statement with a parent context and typed parameters.
+//
+// Admission is per transaction, not per statement, for a session inside an
+// explicit transaction. The statement that opens one keeps its admission slot
+// (and resource-group slot) until the transaction ends, and the transaction's
+// later statements run on it without queueing. Admitting each statement on its
+// own convoyed under contention: statements blocked on a row lock held every
+// slot while the transaction holding that lock waited in the admission queue
+// for a slot to run its next UPDATE or COMMIT, until the queue wait expired and
+// readers everywhere failed with "admission queue wait exceeded". New work
+// still queues -- at BEGIN, before it holds any lock.
 func (s *Session) ExecContext(ctx context.Context, sql string, params []Param) (*Result, error) {
+	if s != nil && s.txnAdmission != nil {
+		res, err := s.execInAdmittedTxn(ctx, sql, params)
+		if !s.InTxn() {
+			s.releaseTxnAdmission()
+		}
+		return res, err
+	}
+	release := func() {}
 	if s != nil && s.db != nil && s.db.admit != nil {
 		priority := int32(0)
 		if s.resourceGroup != "" {
@@ -554,7 +627,7 @@ func (s *Session) ExecContext(ctx context.Context, sql string, params []Param) (
 			}
 			return nil, err
 		}
-		defer rel()
+		release = rel
 		if s.db.metrics != nil {
 			s.db.metrics.AddAdmitted()
 		}
@@ -571,14 +644,42 @@ func (s *Session) ExecContext(ctx context.Context, sql string, params []Param) (
 		if gate := s.db.resourceGroupGate(s.resourceGroup); gate != nil {
 			rel, err := gate.Acquire(ctx)
 			if err != nil {
+				release()
 				if s.db.metrics != nil {
 					s.db.metrics.AddRejected()
 				}
 				return nil, err
 			}
-			defer rel()
+			outer := release
+			release = func() { rel(); outer() }
 		}
 	}
+	res, err := s.execInAdmittedTxn(ctx, sql, params)
+	if s != nil && s.InTxn() {
+		// This statement opened a transaction: keep the slot for its life.
+		var once sync.Once
+		s.txnAdmission = func() { once.Do(release) }
+	} else {
+		release()
+	}
+	return res, err
+}
+
+// releaseTxnAdmission gives back the admission slot a transaction held. It is
+// idempotent, and is called when a statement leaves the session outside a
+// transaction and from abort, the path every forced rollback and connection
+// teardown ends at.
+func (s *Session) releaseTxnAdmission() {
+	if s == nil || s.txnAdmission == nil {
+		return
+	}
+	rel := s.txnAdmission
+	s.txnAdmission = nil
+	rel()
+}
+
+// execInAdmittedTxn runs one statement that already holds its admission.
+func (s *Session) execInAdmittedTxn(ctx context.Context, sql string, params []Param) (*Result, error) {
 	start := time.Now()
 	res, err := s.execAdmitted(ctx, sql, params)
 	if s != nil && len(s.automaticMaintenance) > 0 {
@@ -601,7 +702,8 @@ func (s *Session) ExecContext(ctx context.Context, sql string, params []Param) (
 func (s *Session) execAdmitted(ctx context.Context, sql string, params []Param) (*Result, error) {
 	s.params = params
 	s.execSQL = sql
-	s.beginQuery(sql)
+	ctx, endCancellable := s.beginCancellableQuery(ctx, sql)
+	defer endCancellable()
 	s.subqueryResults = make(map[uint64]*Result)
 	s.cteRows = make(map[uint64][][]types.Value)
 	defer func() {
@@ -613,6 +715,13 @@ func (s *Session) execAdmitted(ctx context.Context, sql string, params []Param) 
 	}()
 	stmt, err := parser.Parse(sql)
 	if err != nil {
+		return nil, err
+	}
+	// A view reference becomes a CTE holding the view's query before anything
+	// authorizes or binds the statement, so the rest of the engine sees only
+	// relations it already understands — and authorization lands on the
+	// underlying tables, not on the view name.
+	if stmt, err = s.expandViews(stmt); err != nil {
 		return nil, err
 	}
 	if s.x != nil && s.txnTimeout > 0 {
@@ -932,6 +1041,7 @@ func (s *Session) execAdmitted(ctx context.Context, sql string, params []Param) 
 	if err := s.validateClientEncryptedPredicateParams(bound); err != nil {
 		return nil, err
 	}
+	bound, valueDependent := s.bindSargableParams(bound)
 	plan, err := planner.Plan(bound)
 	if err != nil {
 		return nil, err
@@ -939,13 +1049,17 @@ func (s *Session) execAdmitted(ctx context.Context, sql string, params []Param) 
 	if plan == nil {
 		return nil, nerr.New(nerr.Internal, "executor.Exec", "empty plan")
 	}
+	planCache := s.optCache()
+	if valueDependent {
+		planCache = nil // the plan carries this execution's parameter values
+	}
 	out, err := optimizer.Optimize(optimizer.Request{
 		Plan:     plan,
 		SQL:      sql,
 		CacheKey: s.planCacheKey(sql),
 		Stats:    s.lookupStats,
 		Gen:      s.statsGen(),
-		Cache:    s.optCache(),
+		Cache:    planCache,
 	})
 	if err != nil {
 		return nil, err
@@ -1065,7 +1179,7 @@ func isReadStmt(stmt ast.Stmt) bool {
 
 func isMutating(plan planner.Logical) bool {
 	switch plan.(type) {
-	case planner.CreateTable, planner.CreateWorkflow, planner.AlterWorkflow, planner.DropWorkflow, planner.RunWorkflow, planner.CreateTrigger, planner.AlterTrigger, planner.DropTrigger, planner.CreateSchedule, planner.AlterSchedule, planner.DropSchedule, planner.CreateResourceGroup, planner.AlterResourceGroup, planner.DropResourceGroup, planner.CancelTask, planner.DropTable, planner.DropIndex, planner.RebuildIndex, planner.AlterTable, planner.CreateIndex, planner.Insert, planner.Upsert, planner.Update, planner.Delete, planner.Begin, planner.Commit, planner.Rollback:
+	case planner.CreateTable, planner.CreateTableAs, planner.CreateWorkflow, planner.AlterWorkflow, planner.DropWorkflow, planner.RunWorkflow, planner.CreateTrigger, planner.AlterTrigger, planner.DropTrigger, planner.CreateSchedule, planner.AlterSchedule, planner.DropSchedule, planner.CreateResourceGroup, planner.AlterResourceGroup, planner.DropResourceGroup, planner.CancelTask, planner.CreateView, planner.DropView, planner.DropTable, planner.DropIndex, planner.RebuildIndex, planner.AlterTable, planner.CreateIndex, planner.Insert, planner.Upsert, planner.Update, planner.Delete, planner.Begin, planner.Commit, planner.Rollback:
 		return true
 	default:
 		return false
@@ -1162,6 +1276,41 @@ func (s *Session) lookupStats(name string) (*catalog.TableStats, bool) {
 		}
 	}
 	return s.db.Cat.Stats(name)
+}
+
+// lookupView resolves a view through the session's uncommitted overlay first,
+// so a view created earlier in the same transaction is usable by it.
+func (s *Session) lookupView(name string) (*catalog.View, bool) {
+	if s.viewOverlay != nil {
+		if v, ok := s.viewOverlay[name]; ok {
+			if v == nil {
+				return nil, false
+			}
+			return v.Clone(), true
+		}
+	}
+	return s.db.view(name)
+}
+
+func (s *Session) listViews() []*catalog.View {
+	byName := make(map[string]*catalog.View)
+	for _, v := range s.db.viewList() {
+		byName[v.Name] = v
+	}
+	for name, v := range s.viewOverlay {
+		if v == nil {
+			delete(byName, name)
+			continue
+		}
+		if clone := v.Clone(); clone != nil {
+			byName[name] = clone
+		}
+	}
+	out := make([]*catalog.View, 0, len(byName))
+	for _, v := range byName {
+		out = append(out, v)
+	}
+	return out
 }
 
 func (s *Session) lookupWorkflow(name string) (*catalog.Workflow, bool) {
@@ -1318,7 +1467,14 @@ func (s *Session) run(ctx context.Context, plan planner.Logical, trace *optimize
 	case planner.Commit:
 		return s.commit()
 	case planner.Rollback:
+		if p.Savepoint != "" {
+			return s.rollbackToSavepoint(p.Savepoint)
+		}
 		return s.rollback()
+	case planner.Savepoint:
+		return s.setSavepoint(p.Name)
+	case planner.ReleaseSavepoint:
+		return s.releaseSavepoint(p.Name)
 	case planner.Subscribe:
 		if s.x != nil {
 			return nil, nerr.New(nerr.InvalidArgument, "executor.Subscribe", "SUBSCRIBE cannot run inside a transaction")
@@ -1405,6 +1561,9 @@ func (s *Session) startRead(iso txn.Isolation) error {
 	if s.workflowOverlay == nil {
 		s.workflowOverlay = make(map[string]*catalog.Workflow)
 	}
+	if s.viewOverlay == nil {
+		s.viewOverlay = make(map[string]*catalog.View)
+	}
 	if s.triggerOverlay == nil {
 		s.triggerOverlay = make(map[string]*catalog.Trigger)
 	}
@@ -1432,6 +1591,9 @@ func (s *Session) start(iso txn.Isolation) error {
 	}
 	if s.workflowOverlay == nil {
 		s.workflowOverlay = make(map[string]*catalog.Workflow)
+	}
+	if s.viewOverlay == nil {
+		s.viewOverlay = make(map[string]*catalog.View)
 	}
 	if s.triggerOverlay == nil {
 		s.triggerOverlay = make(map[string]*catalog.Trigger)
@@ -1481,8 +1643,11 @@ func (s *Session) commit() (*Result, error) {
 	if err := s.x.commit(); err != nil {
 		s.x = nil
 		s.clearTxnActive()
+		s.clearSavepoints()
 		s.overlay = nil
 		s.workflowOverlay = nil
+		s.viewOverlay = nil
+		s.viewOverlay = nil
 		s.triggerOverlay = nil
 		s.scheduleOverlay = nil
 		s.resourceGroupOverlay = nil
@@ -1520,6 +1685,13 @@ func (s *Session) commit() (*Result, error) {
 			continue
 		}
 		s.db.putWorkflow(w)
+	}
+	for name, v := range s.viewOverlay {
+		if v == nil {
+			s.db.removeView(name)
+			continue
+		}
+		s.db.putView(v)
 	}
 	for name, trigger := range s.triggerOverlay {
 		if trigger == nil {
@@ -1634,8 +1806,10 @@ func (s *Session) commit() (*Result, error) {
 	}
 	s.x = nil
 	s.clearTxnActive()
+	s.clearSavepoints()
 	s.overlay = nil
 	s.workflowOverlay = nil
+	s.viewOverlay = nil
 	s.triggerOverlay = nil
 	s.scheduleOverlay = nil
 	s.resourceGroupOverlay = nil
@@ -1695,12 +1869,15 @@ func (s *Session) abort() error {
 		err = s.x.rollback()
 		s.reclaimEmptyTreesOnRollback()
 	}
+	defer s.releaseTxnAdmission()
 	s.fkBroken = false
 	s.conflictWrite = false
 	s.x = nil
 	s.clearTxnActive()
+	s.clearSavepoints()
 	s.overlay = nil
 	s.workflowOverlay = nil
+	s.viewOverlay = nil
 	s.triggerOverlay = nil
 	s.scheduleOverlay = nil
 	s.resourceGroupOverlay = nil

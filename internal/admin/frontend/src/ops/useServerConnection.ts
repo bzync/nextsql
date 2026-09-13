@@ -37,9 +37,9 @@ export function useServerConnection(onUnauthorized: () => void): {
         setStatus((prev) => ({
           connected: false,
           server_addr: prev?.server_addr ?? "",
+          profile: prev?.profile,
           user: prev?.user ?? "",
           database: prev?.database ?? "",
-          realm: prev?.realm ?? "",
           error: error instanceof Error ? error.message : String(error),
         }));
       } finally {

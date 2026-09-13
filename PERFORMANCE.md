@@ -1,10 +1,10 @@
-# NextSQL Performance and Benchmark Policy
+# Performance and benchmarks
 
-## Purpose
+How NextSQL performance is measured and reported.
 
-This document defines how NextSQL performance is measured and reported.
-
-Performance must never take priority over correctness, durability, security, or integrity.
+Performance never takes priority over correctness, durability, security, or
+integrity. Official results keep encryption, WAL, fsync, authentication,
+checksums, and MVCC enabled. Vector numbers always include recall.
 
 ---
 

@@ -58,3 +58,61 @@ jobs:
           path: artifacts/
           if-no-files-found: error
           retention-days: 30
+
+  # NextSQL Admin's web UI suites — typecheck, the Studio/setup/revision unit
+  # suites, and the real-Chrome axe WCAG 2.2 AA audit over all three modes.
+  # They ran in no gate until now, which is how the accessibility audit stayed
+  # red for dozens of increments without anyone being told: axe throws on the
+  # first violation, so every check behind it went unrun.
+  #
+  # This is a separate job rather than a step of the profile above because it
+  # needs Node and a browser, not a durable filesystem, and because a UI
+  # failure should be legible as a UI failure.
+  admin-ui:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: internal/admin/frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: internal/admin/frontend
+        run: npm ci
+
+      - name: Locate Chrome
+        id: chrome
+        shell: bash
+        run: |
+          for candidate in "$CHROME_BIN" /usr/bin/google-chrome /usr/bin/chromium /usr/bin/chromium-browser; do
+            if [ -n "$candidate" ] && [ -x "$candidate" ]; then
+              echo "bin=$candidate" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          done
+          echo "no Chrome or Chromium on the runner; the accessibility audit cannot run" >&2
+          exit 1
+
+      - name: Run Admin UI suites
+        shell: bash
+        env:
+          CHROME_BIN: ${{ steps.chrome.outputs.bin }}
+        run: |
+          set -o pipefail
+          mkdir -p artifacts
+          make test-admin-ui 2>&1 | tee artifacts/test-admin-ui.log
+
+      - name: Retain Admin UI log
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: nextsql-admin-ui-evidence-${{ github.run_id }}
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 30

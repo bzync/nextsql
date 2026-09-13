@@ -1,10 +1,13 @@
-# NextSQL Release Process
+# Releasing NextSQL
 
-## 1. Release Principle
+A version is released only when its correctness, durability, security,
+integrity, and availability gates are green. Compilation and happy-path tests
+are not enough.
 
-A version is released only when its applicable correctness, durability, security, integrity, and availability gates are green.
+## 1. Principle
 
-Do not release based only on compilation or happy-path tests.
+Never reuse a published version for different bits. Preview 0.0.1 is the first
+public tag.
 
 ---
 
@@ -146,9 +149,10 @@ Expected artifact types may include:
 
 - Linux `.deb`;
 - Linux `.tar.gz`;
-- Linux `.run`;
-- Windows `.zip`;
-- Windows installer.
+- Linux `.run`.
+
+No Windows artifacts are built: on Windows, NextSQL runs inside WSL 2 from the
+Linux packages.
 
 Only mark platforms supported if their release validation passes.
 
@@ -159,7 +163,7 @@ version exactly matches `internal/version.String`. The
 
 1. checks out and validates that exact tag;
 2. refuses to overwrite an existing GitHub Release;
-3. builds and verifies the Linux amd64 and Windows amd64 artifacts in
+3. builds and verifies the Linux amd64 artifacts in
    runner-temporary storage;
 4. publishes those artifacts and `SHA256SUMS` to GitHub Releases; and
 5. invokes the Pages workflow to rebuild the Downloads catalog from the

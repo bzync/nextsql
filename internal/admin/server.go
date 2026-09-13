@@ -72,7 +72,11 @@ func New(cfg Config, opt Options) (*Server, error) {
 		}
 		s.setupApp = app
 	case ModeOperate:
-		app, err := ops.New(cfg.opsConfig(), ops.Options{Logger: log})
+		opsCfg, err := cfg.opsConfig()
+		if err != nil {
+			return nil, err
+		}
+		app, err := ops.New(opsCfg, ops.Options{Logger: log})
 		if err != nil {
 			return nil, err
 		}

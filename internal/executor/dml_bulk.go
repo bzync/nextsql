@@ -11,6 +11,11 @@ import (
 
 // InsertRows writes pre-evaluated rows in table column order. Same WAL, MVCC,
 // encryption, and index maintenance as INSERT. Caller must be in a transaction.
+//
+// Unlike SQL INSERT, which fills a default only into a column the statement
+// did not name, InsertRows has no column list: a NULL cell takes the column
+// default. It is an internal bulk-load API (the benchmark relies on it for
+// DEFAULT UUID() keys) and is not reachable from SQL or the wire.
 func (s *Session) InsertRows(table string, rows [][]types.Value) (int64, error) {
 	if s == nil || s.x == nil {
 		return 0, nerr.New(nerr.InvalidArgument, "executor.InsertRows", "no active transaction")

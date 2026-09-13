@@ -20,14 +20,15 @@
 > change-streams explorer with a bounded accessible workflow diagram,
 > indexed-JSON-path completion and vector-aware NEAREST/USING completion
 > in the editor,
-> a production environment tag + read-only safety mode, switch-realm/database
-> connection re-targeting, a per-session read-consistency mode, a
-> recent-connections quick-switch, a global command palette, git-friendly file
+> a production environment tag + read-only safety mode, server switching
+> between operator-declared connection profiles (log #270 — it replaced the
+> same-server realm/database re-targeting and its recent-connections list,
+> both dead after log #244), a per-session read-consistency mode, a global
+> command palette, git-friendly file
 > export/import of the saved-query set, positional prepared parameters
 > ($1..$N), a canonical-DDL view (`system.table_ddl` + an inspector DDL
 > section), a unified table-inspector Constraints panel, a read-only schema-
-> migration history explorer, a visible realm-wide administration warning
-> for user/role creation and removal, and a deterministic development data
+> migration history explorer, and a deterministic development data
 > generator (`INSERT`-script builder over authorized `system.columns`), a
 > CSV / JSON / NDJSON import (a bounded, type-checked `INSERT`-script builder
 > that maps a pasted or loaded document onto the target table's columns), a
@@ -42,7 +43,8 @@
 > `CREATE INDEX` form with live native DDL preview into the editor), and a
 > client-side **SQL formatter** (a Format button / Shift+Alt+F that reflows
 > the editor buffer through a comment-preserving tokenizer guarded by a
-> re-tokenize equivalence check, never executing), a vector dataset
+> re-tokenize equivalence check, never executing), bounded NextSQL-native
+> syntax highlighting with line numbers, a vector dataset
 > importer, **live parser diagnostics** (a debounced connection-free
 > `POST /api/v1/studio/query/diagnostics` locating each statement in the
 > buffer that fails to parse, with a Go-to-error control — grammar errors
@@ -157,8 +159,9 @@ are reset before the interaction suite continues, so later checks cannot
 accidentally inherit the high-density viewport.
 
 This closes the Studio shell's browser/CSS-level high-DPI checklist item. It
-does not convert the still-unexecuted Windows/macOS packages into supported or
-tested platform claims; those remain tracked under Phase 28 packaging.
+does not convert the still-unexecuted macOS packages into supported or tested
+platform claims; those remain tracked under Phase 28 packaging. Native Windows
+is not a product platform (log #290); Windows hosts run Admin under WSL 2.
 
 ### Layout persistence without credentials
 
@@ -442,49 +445,47 @@ error is not surfaced as a warning-dialog block — the statement still runs
 and the real executor remains the sole authority on validity/authorization/
 effect, exactly as before this check existed.
 
-The same parsed-AST analysis now returns `realm_scoped=true` for `CREATE USER`,
-`DROP USER`, `CREATE ROLE`, and `DROP ROLE`. NextSQL's accepted hosting model
-defines users and roles once per realm while grants carry database scope
-(`docs/design-multidatabase-dbaas.md` §19), so those four statements can affect
-access across every database in the connected realm even though Studio is
-pointed at one database. Their confirmation therefore names both the connected
-realm and database and explains the wider reach. `GRANT`/`REVOKE` are excluded:
-their database/object scope is explicit, and the existing builder shows it.
-There are no `ALTER USER`/`ALTER ROLE` statements in the current AST. This flag
-is advisory like `destructive` and `write`; nextsqld's RBAC remains the sole
-authority. A consolidated script warning includes realm-scoped statements too,
-and a destructive realm operation retains both reasons rather than one hiding
-the other.
+**Retired (log #270): the realm-wide user/role warning.** This analysis used
+to return `realm_scoped=true` for `CREATE`/`DROP USER` and `CREATE`/`DROP ROLE`,
+and the confirm-before-run dialog warned that the statement reached "every
+database in the connected realm". Once multi-realm hosting was removed (log
+#244) a deployment serves exactly one database, so that warning described an
+effect that can no longer happen. The flag and its dialog are gone; the four
+statements are ordinary writes (`write=true`, so read-only mode still gates
+them) and `DROP USER`/`DROP ROLE` stay destructive.
 
-### Switch realm / database (connection re-targeting)
+### Server switching (connection profiles)
 
-The first true connection-manager capability: a Studio session can move its
-NSQL connection to a different **realm and/or database** on the same
-`nextsqld`, without signing out and back in. NextSQL binds the realm and
-database at handshake time only (`drivers/go`'s `Config.Realm`/`Database`
-are read once, in `handshake`), so a switch is a fresh authenticated
-connection, not an in-band command — hence the password field. Studio holds
-no credential of its own, so the password is supplied each time, used once
-to open the new connection, and never stored anywhere.
+A session is signed in to one `nextsqld` server — a **connection profile**.
+The `default` profile is `nextsql-admin`'s `--server-addr` target; an
+operator-owned `--profiles` file may declare more (format, TLS rules, file
+permissions, and the trust boundary are in
+[`design-admin-operations.md` §5.1](design-admin-operations.md)). The browser
+can only pick a profile by ID; it can never name an address or a file.
 
-* **Route** — `POST /api/v1/studio/reconnect`, CSRF-protected like every
-  other state-changing Studio route. Body `{realm, database, password}`;
-  `studio.ReconnectRequest.Validate` bounds each name to
-  `MaxConnNameBytes` (128) and, when non-empty, to the bare-identifier
-  shape NextSQL's Hello accepts (an empty name selects the deployment
-  default). The handler rebuilds the driver config from the admin process's
-  fixed host/TLS settings, sets the same NSQL user, opens the new
-  connection with a 15 s timeout, and only on success calls
-  `session.reconnect`.
-* **Atomic, fail-safe swap** — `session.reconnect` takes the connection
-  lock with `TryLock`: a switch cannot race an in-flight editor query
-  (`nerr.Conflict` / HTTP 409 if one is running). It installs the new
-  `*nextsql.Conn`, updates the session's `realm`/`database` under
-  `stateMu`, then closes the old connection. A failed open (wrong password
-  → 401, unknown realm, suspended database) never reaches `session.reconnect`,
-  so the session stays exactly as it was — verified end to end by
-  `TestAdminStudioWorkspaceOverNSQL` (a wrong-password reconnect returns
-  401 and a follow-up `SELECT 1` on the same session still succeeds).
+* **Route** — `POST /api/v1/session/switch` (an Operations session route, not
+  a Studio one, because the whole session moves). A switch is a fresh sign-in:
+  the new connection is authenticated first, and only on success is a **new**
+  session (new id, CSRF token, and cookie) swapped in for the old one. A
+  failed switch changes nothing; a switch is refused (409) while a Studio query
+  runs. The SPA re-keys its shell on the new session, so Operations and Studio
+  re-read everything against the new server.
+* **Per-server browser state** — every per-connection `localStorage` slot
+  (editor drafts, saved queries, layout, environment label) is scoped by
+  `connectionScope(profile id)` + database + user. The default profile maps to
+  the empty scope the retired realm segment always held, so no existing
+  operator state is orphaned; any other profile uses `p.<id>`, which a legacy
+  realm name (no `.`) can never alias.
+* **Environment** — a profile-declared environment is authoritative: Studio
+  shows it, a `production` profile gets the standing banner and starts in
+  read-only mode, and the environment selector is locked ("set by the
+  connection profile"). A profile without one keeps the per-viewer label.
+* **Client** — the toolbar shows the profile name and address; **Switch
+  server…** (toolbar, command palette, Shell page header, and User settings;
+  shown only when more than one profile exists) opens `ops/SwitchServer.tsx`:
+  the profile list with each target's address and TLS posture, the user
+  (pre-filled from the profile's hint), the password, and the optional
+  saved-password controls.
 * **Live reachability** — Studio's toolbar **Connected** badge is not
   decorative. Ops and Studio share `GET /api/v1/connection`, which pings
   the session's official-driver socket (`SELECT 1`, 3 s timeout, skip if a
@@ -494,39 +495,20 @@ to open the new connection, and never stored anywhere.
   Run is disabled until the probe succeeds again (5 s poll while the tab is
   visible, plus Retry). `GET /api/v1/session` still does not touch
   nextsqld — CSRF recovery must not depend on the database being up.
-* **Client** — the toolbar shows the target `nextsqld` address (new
-  `Bootstrap.server_addr`, display only) next to the user/realm/database
-  label, and a **Switch connection…** button opens `SwitchConnection.tsx`
-  (a `Modal` form: realm, database, password). On success the new
-  realm/database flow up through `onConnectionChanged` → `ops/App.tsx`'s
-  `who`, which re-keys the per-connection `localStorage` scopes (editor
-  drafts, saved queries, environment tag) and, via the Studio remount key,
-  reloads the workspace against the new connection. Unsaved editor buffers
-  for the previous connection remain in that connection's own crash-recovery
-  `localStorage` slot.
-* **Recent connections** — a successful switch records the `{realm,
-  database}` pair (never a credential) to `localStorage`, keyed per
-  `nextsqld` host + NSQL user (`recentConnectionStorageKey`). The
-  Switch-connection modal shows the most-recent pairs (bounded at
-  `MAX_RECENT_CONNECTIONS` = 10) as quick-fill buttons — clicking one
-  populates the realm/database fields and focuses the password, which is
-  still required. `parseRecentConnections` / `recordRecentConnection` /
-  `serializeRecentConnections` are pure and bounded (malformed → empty,
-  the all-default pair is not recorded, over-long names dropped), and the
-  write is synchronous in the switch handler because a successful switch
-  immediately remounts the workspace.
-* **Still out of scope** (needs the multi-target model proper): named
-  connection *profiles*, a different host/port, TLS/mTLS field entry,
-  OS-keychain credential storage, and a full recent-connections *home
-  screen*. `studio.Bootstrap` still carries only the one process-managed
-  host; this slice re-targets *within* it.
+* **History** — this replaced two earlier slices. Log #191's
+  `POST /api/v1/studio/reconnect` moved the connection to a different
+  realm/database on the *same* `nextsqld`, and log #193 kept a bounded
+  `localStorage` list of recently used realm/database pairs. After log #244
+  `nextsqld` refuses any database but its own, so re-targeting could only
+  reconnect to the same place or fail. Both were removed (the route answers
+  404), not kept as dead UI.
 
 ### Read-consistency mode
 
 A Studio session can choose how its **reads** observe replicated state —
 `STRONG` (default; every acknowledged write, leader-served behind a Raft
 read barrier), `BOUNDED` (any member within a staleness bound), or `STALE`
-(local applied state, no bound). Unlike the realm/database switch this is
+(local applied state, no bound). Unlike a server switch this is
 **not** a reconnect: the official driver's `Conn.SetReadConsistency` is a
 live session-control frame on the existing connection, so
 `POST /api/v1/studio/read-consistency` (`{mode, max_staleness_ms}`,
@@ -539,8 +521,8 @@ query → `409`) and records the mode only after the wire call succeeds.
 The mode is **per session, reads only** — writes always go to the leader,
 and nextsqld remains the authority over whether a routed read is actually
 served from a follower (a single-node deployment simply records the mode).
-A fresh connection is `STRONG`, so `session.reconnect` resets it and the
-bootstrap read reports the current `read_consistency` / `max_staleness_ms`.
+A fresh connection is `STRONG`, so a server switch (a new session) starts
+there, and the bootstrap read reports the current `read_consistency` / `max_staleness_ms`.
 The toolbar shows a `Select` (Strong / Bounded / Stale), a seconds input
 that appears for Bounded, and — whenever the mode is not Strong — a
 `warning` badge (`"bounded reads"` / `"stale reads"`) so a stale result is
@@ -548,12 +530,11 @@ never silently presented as authoritative.
 
 ### Production environment tag and read-only safety mode
 
-Studio has no multi-target connection *profile* model yet — it always runs
-on the single `nextsqld` the Operations-mode login reached (the realm and
-database within it are switchable — see the section above). What it can do,
-as another connection-manager slice, is let the operator **label** that
-connection's environment. `resultTools.ts`'s `environmentStorageKey(realm,
-database, user)` picks a `localStorage` slot; the tag is one of
+When the session's connection profile declares an environment (see "Server
+switching" above), that label is authoritative and the selector is locked.
+Otherwise the operator can **label** the connection's environment:
+`resultTools.ts`'s `environmentStorageKey(connectionScope(profile), database,
+user)` picks a `localStorage` slot; the tag is one of
 `development` / `test` / `staging` / `production`, a per-viewer browser
 preference — never sent anywhere, and not a credential (the design's
 "no credential storage" boundary is intact). Every storage access is
@@ -612,7 +593,7 @@ confirm-before-run check again on its own merits.
 The editor tab buffers — **only** each tab's title and SQL text, never its
 results, errors, plan baselines or history — are mirrored to `localStorage`
 (debounced 500 ms) under a per-connection key
-(`editorDraftStorageKey(realm, database, user)`, the same sanitized scoping
+(`editorDraftStorageKey(scope, database, user)`, the same sanitized scoping
 as the environment tag). On load, `parseEditorDrafts` rehydrates them into
 the initial tab state so a browser crash, an accidental close, or a reload
 does not lose unsaved work. The codec is pure and bounded: at most 8 tabs,
@@ -636,7 +617,7 @@ sees it.
 
 A "Saved" popover next to History keeps named, tag-grouped SQL snippets the
 operator explicitly chooses to keep — mirrored to `localStorage`
-(`savedQueryStorageKey(realm, database, user)`, the same per-connection
+(`savedQueryStorageKey(scope, database, user)`, the same per-connection
 scoping and "your browser only, never sent anywhere" property as crash
 recovery). A **folder is just a tag**: the panel has a tag `Select` that
 filters the list, and a free-text filter over name and SQL body. Each entry
@@ -774,7 +755,7 @@ A script is capped at `MaxScriptStatements` (200) statements and the existing
 The browser analyzes every split statement (reusing the same
 confirm-before-run classifier) before running anything, and shows one
 consolidated confirmation naming how many statements are flagged as
-destructive, realm-wide, or (when enabled) writes under read-only mode, plus a
+destructive or (when enabled) writes under read-only mode, plus a
 bounded list of reasons — not a dialog interrupting the script partway
 through. A statement that belongs to more than one category retains every
 applicable reason. Once confirmed (or immediately, if nothing is flagged),
@@ -857,10 +838,9 @@ metacharacters is never misinterpreted as a pattern.
 Navigation (`nextMatchIndex`/`previousMatchIndex`) always wraps: Next past
 the last match returns to the first, Previous past the first returns to the
 last. A match is shown by moving the real textarea's native selection to it
-(`textarea.setSelectionRange`) — no separate highlight overlay is drawn, so
-this hits none of the "no highlight-overlay primitive" blockers that ruled
-out syntax highlighting (log #154) and formatting; the browser's own
-selection rendering is enough. Replace acts on the current selection only
+(`textarea.setSelectionRange`) — it does not add a second find-result layer to
+the syntax overlay; the browser's own selection remains the authoritative
+highlight. Replace acts on the current selection only
 when it exactly matches one of the live matches (mirroring common editor
 "Replace" behavior); otherwise it just finds the next occurrence first,
 requiring a second click to actually replace, rather than guessing which
@@ -1312,6 +1292,30 @@ Caps: 64 table columns, 16 btree keys, 8 fulltext fields, 128-character
 identifiers, CHAR 65535, DECIMAL 38, VECTOR dim 8192. Every name is
 rendered through `quoteIdentifier`.
 
+### NextSQL-native syntax highlighting
+
+Studio's editable surface is `SqlCodeEditor`, a controlled textarea over a
+scroll-synchronized, `aria-hidden` highlighted copy of exactly the same SQL.
+Keywords and type keywords come from a browser-side presentation set that
+`test-sql-editor.mjs` compares mechanically with
+`internal/sql/lexer/lexer.go`'s authoritative `keywords` map, in both
+directions, on every Studio test run. It therefore cannot silently acquire a
+generic-SQL keyword or omit a newly added NextSQL keyword. Call-shaped
+identifiers, strings, BLOB literals, parameters, numbers, comments, operators,
+and punctuation are colored without changing the source; the unit test
+reassembles every emitted token and requires byte-for-byte equality with the
+input. The server parser and the diagnostics route remain authoritative.
+
+The overlay adds no keyword completion. The separate catalog-aware completer
+below still offers only server-visible table/column/path/vector metadata. To
+keep rendering bounded, highlighting and the line-number gutter pause above
+262,144 characters or 10,000 lines while the ordinary textarea remains fully
+editable; the editor says when it has entered that fallback. The textarea owns focus,
+selection, caret, clipboard, and input, with a visible `:focus-within` ring.
+Forced-colors mode hides the cosmetic overlay and restores ordinary
+`CanvasText`. No server route, persistent state, query semantics, or RBAC
+surface is involved.
+
 ### Catalog-aware IntelliSense
 
 A bounded, keyboard-operable suggestion list (SQL-editor scope), reachable
@@ -1760,7 +1764,7 @@ anywhere in the workspace (a `window` `keydown` listener) or via the
 **Commands** button in the Database-explorer header. It adds no behavior:
 every entry maps to an existing handler — New query tab, Run query / Run
 script / Cancel (each disabled exactly when its toolbar button is),
-Suggest, Saved queries…, Search objects…, Switch connection…, Schema
+Suggest, Saved queries…, Search objects…, Switch server… (when more than one connection profile exists), Schema
 diagram…, the GRANT/REVOKE builder, each dedicated explorer
 (Full-text / Vector / Hybrid / Geo / Users & roles / Transactions & locks
 / Audit / Workflows), Hide/Show explorer, Hide/Show inspector, and Reset
@@ -1872,13 +1876,13 @@ require its per-session `X-NSM-CSRF` token.
 |---|---|---|
 | `GET /api/v1/connection` | Live nextsqld reachability for this admin session (`connected` true/false). Shared by Ops and Studio. Does not sign the operator out when the database is down. | 3 s ping; skipped while a query holds the connection |
 | `GET /api/v1/studio/bootstrap` | `system.capabilities`, the authorized table list, and the target `nextsqld` address (`server_addr`, display only) | 1,000 tables; detail omitted |
-| `POST /api/v1/studio/reconnect` | Re-target the session's connection to a different realm/database on the same `nextsqld` (fresh authenticated connection; password used once, never stored) | 128-byte bare-identifier names; 15 s open; `409` if a query is in flight |
+| `POST /api/v1/session/switch` | Operations session route Studio uses to move the whole session to another connection profile — a fresh sign-in that issues a new session (see `design-admin-operations.md` §3, §5.1). Replaced the retired `POST /api/v1/studio/reconnect` | profile ID only (never an address); 15 s open; `409` while a Studio query runs |
 | `POST /api/v1/studio/read-consistency` | Set the session's read-consistency mode (`strong`/`bounded`/`stale`) — a live session-control frame on the current connection, reads only | mode enum; `0…1 h` staleness bound; `409` if a query is in flight |
 | `GET /api/v1/studio/table?name=…` | Lazy `system.tables`/`columns`/`indexes`/`foreign_keys` (outbound)/`referencing_keys` (inbound)/`table_stats`/`index_stats`/`table_ddl` detail | one validated bare identifier |
 | `GET /api/v1/studio/workflows` | Read-only `system.workflows` + `system.triggers` + `system.schedules` + `system.tasks` + `system.change_streams` for the Workflows & CDC explorer | RBAC-filtered; every result independently capped at 500 rows |
 | `GET /api/v1/studio/schema-graph` | Read-only whole-catalog `system.foreign_keys` for the schema-relationship diagram | 4,000 rows; RBAC-filtered by the system catalog |
 | `GET /api/v1/studio/migrations` | Read-only `nsql_schema_migrations` history for the migration explorer (`present`, `history`, `truncated`) | 2,000 rows; not `required` — an absent/invisible table yields `present=false`, not an error; authority is the caller's own SELECT privilege on the reserved table |
-| `POST /api/v1/studio/query/analyze` | Parse-only confirm-before-run classification (`kind`, `destructive`, `write`, `realm_scoped`) | 1 MiB SQL; no driver connection |
+| `POST /api/v1/studio/query/analyze` | Parse-only confirm-before-run classification (`kind`, `destructive`, `write`) | 1 MiB SQL; no driver connection |
 | `POST /api/v1/studio/query` | Execute one editor request through the official driver | 1 MiB SQL; ≤32 positional params × ≤64 KiB each; 25 seconds; one active query per session |
 | `POST /api/v1/studio/query/stream` | Primary browser query path: NDJSON metadata/row-batch/completion frames | 5,000 rows; 8 MiB aggregate; 1 MiB/row; 128 rows/batch; same param bound |
 | `POST /api/v1/studio/query/cancel` | Cancel the matching active query | query id scoped to the current session |
@@ -2011,10 +2015,9 @@ surface.
 | Layout persistence without credentials | Main shell / UX scope | yes | pure `serializeStudioLayout`/`parseStudioLayout` unit (round-trip/garbage/clamp/truncate/no-credential) + real-Chrome hide-explorer→localStorage→reload-stays-hidden/restores-selected-table/axe/show-splitter/hide-inspector | no |
 | RBAC boundary (limited user confined to grants across every route) | design invariant | yes | `TestAdminStudioEnforcesRBAC` — real ACL, negative-path over bootstrap/table/query/workflows + zero-row admin views | closes the MVP exit-gate RBAC line |
 | Confirm-before-run destructive-statement warning | partial connection-manager scope | yes | classification unit + live NSQL parse + real-browser confirm/cancel/axe | no |
-| Visible cross-database administration warning (realm-wide users/roles) | Developer operations / connection-manager scope | yes | parsed-AST positive/negative unit cases + live HTTP/NSQL analysis + pure realm/database label tests + real-browser single/script confirm/cancel/both-reasons/axe | no |
+| ~~Visible cross-database administration warning (realm-wide users/roles)~~ — **retired** (log #270): a deployment serves one database, so the warning described an impossible effect | — | removed | `TestAnalyzePrincipalStatementsAreOrdinaryWrites` + live HTTP/NSQL analysis (no `realm_scoped` key) + real-browser CREATE USER runs with no prompt / script dialog never mentions realms | no |
 | Production environment tag + read-only safety mode | connection-manager scope (partial) | yes | write-classification unit (`isMutating` mirror) + live analyze `write` flag + real-browser tag/banner/read-only-confirm/toggle/axe | no |
-| Switch realm/database (connection re-targeting) | connection-manager scope (partial) | yes | `ReconnectRequest.Validate` + `session.reconnect` swap/busy-guard Go unit + `TestAdminStudioWorkspaceOverNSQL` (CSRF / bad-name / wrong-password-then-still-usable / valid-swap-then-whoami over NSQL) + real-browser Switch-connection modal open/axe/real-switch/switch-back | no |
-| Recent connections (realm/database quick-switch) | connection-manager scope (partial) | yes | `parseRecentConnections` / `recordRecentConnection` / `serializeRecentConnections` / `recentConnectionLabel` pure unit (garbage/dedupe/move-to-front/cap/all-default-drop/round-trip) + real-browser switch→reopen→recent-entry-offered | no |
+| Server switching between connection profiles (replaced realm/database re-targeting + recent connections, log #270) | connection-manager scope | yes | `internal/admin/profile` strict-format/permission/bounds unit + `FuzzParse`; `credential.DelegationKey` binding unit; ops unit (pre-auth list names no target, login targets the chosen profile, switch needs session+CSRF, new session + rotated CSRF + old cookie dead, failed switch keeps session, 409 during a query, saved password bound to the saving principal, stale saved password forgotten, forget reaches only the caller's own); `TestAdminSwitchesBetweenServerProfiles` over two real TLS `nextsqld` with different CAs (profile file with relative `tls_ca`, marker tables prove isolation both ways, old cookie 401, old CSRF 403); real-browser login server choice + switch dialog axe / failed switch / switch + locked environment / switch back | no |
 | Read-consistency mode (strong/bounded/stale) | connection-manager scope (partial) | yes | `SetReadConsistencyRequest.Validate` + `session.setReadConsistency` busy/no-conn guard Go unit + `TestAdminStudioWorkspaceOverNSQL` (CSRF / unknown-mode / set-bounded-then-bootstrap-reflects / SELECT-under-bounded / non-bounded-drops-bound over NSQL) + real-browser Select→Bounded staleness-input/badge/axe→Strong | no |
 | Execute selection | SQL editor scope | yes | real-browser scripted-selection run + fixture-captured request bodies + axe | no |
 | Query history with privacy controls | SQL editor scope | yes | real-browser record/reload/clear + axe | no |
@@ -2026,6 +2029,7 @@ surface.
 | Multi-tab editing | SQL editor scope | yes | real-browser cross-tab isolation/busy-notice/bound + axe | no |
 | Execute script | SQL editor scope | yes | real-lexer split unit + live NSQL split/query + real-browser confirm/sequence/null-result-regression/axe | no |
 | Find/replace | SQL editor scope | yes | literal-match/wrap-around/replace unit + real-browser Ctrl+F/navigate/replace/replace-all/axe | no |
+| NextSQL-native syntax highlighting + line numbers | SQL editor scope | yes | native-lexer keyword-set parity + source-preserving tokenization/bound unit; real-browser exact-overlay/keyword/gutter assertion + axe | no |
 | Prepared parameters (positional $1..$N) | SQL editor scope | yes | `extractQueryParams` pure unit + `studio.ValidateParams`/`ParamValues` Go unit + `TestAdminStudioWorkspaceOverNSQL` string→INT64 bind / typed-NULL bind / 413-overflow over NSQL + real-browser panel/NULL-toggle/params-in-request/axe | closes the MVP exit-gate "Prepared parameters" line |
 | Dedicated JSON Explorer | yes | yes | path/tree/query/index pure unit + quoted-array parser regression + real-browser select/index/insert/axe | no |
 | Basic Full-text Explorer | yes | yes | catalog/query/bound pure unit + parser/executor generated-SQL regression + real-browser insert/run/rank/marker/axe | no |
@@ -2081,11 +2085,9 @@ constraints + an inbound "Referenced by" grid), a schema-relationship
 diagram and a global object search in the database explorer, the read-only
 Workflows, trigger/schedule relationships, tasks & change-streams explorer,
 indexed-JSON-path completion, vector-aware NEAREST/USING completion,
-the production environment tag + read-only safety mode, switch-realm/database
-connection re-targeting, a per-session read-consistency mode
-(strong/bounded/stale), a recent-connections quick-switch, a global
-command palette, the visible cross-database administration warning for
-realm-wide user/role DDL, git-friendly
+the production environment tag + read-only safety mode, server switching
+between operator-declared connection profiles, a per-session read-consistency
+mode (strong/bounded/stale), a global command palette, git-friendly
 file export/import of the saved-query set, positional prepared
 parameters ($1..$N), a canonical-DDL view (`system.table_ddl` + an
 inspector DDL section), the unified table Constraints panel, and a
@@ -2114,27 +2116,19 @@ implemented; the RBAC boundary is integration-test-covered.
 The next coherent Studio work should preserve this boundary and choose one
 of:
 
-1. the remaining connection-manager scope: multi-environment *profiles*
-   with OS credential storage and TLS/mTLS fields. The confirm-before-run
-   destructive-statement warning, the visible realm-wide administration
-   warning, the production environment tag + read-only safety mode, the
-   **switch realm/database** re-targeting, and the per-session
-   **read-consistency** mode above are the connection-manager checklist slices
-   already implemented — the first three work against whichever connection
-   Studio currently holds; the fourth
-   moves that connection to a different realm/database on the same
-   `nextsqld` (a fresh authenticated connection swapped in atomically;
-   `POST /api/v1/studio/reconnect`; password supplied each time, never
-   stored); the fifth sets STRONG/BOUNDED/STALE live on the current
-   connection (`POST /api/v1/studio/read-consistency`, reads only). A
-   bounded `localStorage` **recent connections** quick-switch (realm/
-   database pairs, never a credential) already prefills the switch form.
-   What remains is architecturally larger than a single slice:
-   `internal/admin/studio.Bootstrap` still carries only the one
-   process-managed host, so *named profiles* pointing at **different**
-   `nextsqld` hosts — with their own TLS/mTLS material and an OS-keychain
-   credential store — plus a full recent-connections *home screen* first
-   need a real multi-target connection model, not just new form fields;
+1. the remaining connection-manager scope. **Server switching between
+   operator-declared connection profiles is now implemented** (log #270):
+   named profiles for different `nextsqld` servers with their own TLS/mTLS
+   material and a declared environment, a sign-in server choice, a whole-
+   session switch that issues a new session, per-server browser state, and
+   an optional saved password in the OS credential store bound to the
+   principal that saved it. What remains: a recent-connections *home screen*,
+   and **editing** profiles from the UI — deliberately not done, because the
+   profile file decides where operators' passwords are sent, and a
+   browser-editable target list would give any signed-in operator (or a
+   remote browser, when Admin is served over TLS) the power to point Admin at
+   an arbitrary host. A future editor would need its own authorization story
+   (for example, loopback-only plus local confirmation), not just a form;
 2. the remaining SQL-editor scope: source-position **binder**
    diagnostics
    (execute-selection, query history, multi-tab editing, execute script,
@@ -2160,9 +2154,10 @@ of:
    ever change whitespace and keyword case, never meaning. It never
    executes and adds no route; parenthesized groups (column-def lists,
    VALUES tuples, subqueries) are kept on one line by design.
-   NextSQL-native syntax highlighting stays blocked on `@bzync/rui`'s
-   `CodeEditor` having no highlight-overlay primitive at all — materially
-   larger than this frontend can make alone in one slice; **live parser
+   **NextSQL-native syntax highlighting is now implemented** by the bounded,
+   source-preserving `SqlCodeEditor` overlay described above; its keyword set
+   is mechanically checked against the native lexer and it deliberately adds
+   no generic keyword completion. **Live parser
    diagnostics are now implemented** without touching the ~100 individual
    parser error sites — `parser.ParseDiag` attaches the stopped-on token's
    byte offset at the top of `Parse`, `studio.Diagnostics` maps it per

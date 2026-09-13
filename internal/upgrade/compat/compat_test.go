@@ -11,12 +11,18 @@ func TestCatalogCoversKnownFamilies(t *testing.T) {
 	seen := map[Family]bool{}
 	for _, s := range Catalog() {
 		if s.Family == FamilyCatalog {
-			if s.Current != 13 || s.MinReadable != 1 || s.MaxReadable != 13 {
+			// v14 is readable but written only by a table with a CHECK.
+			if s.Current != 13 || s.MinReadable != 1 || s.MaxReadable != 14 {
 				t.Fatalf("%s: %+v", s.Family, s)
 			}
 		} else if s.Family == FamilyKeystore {
 			// v2 is readable but written only on opt-in, so Current stays 1.
 			if s.Current != 1 || s.MinReadable != 1 || s.MaxReadable != 2 {
+				t.Fatalf("%s: %+v", s.Family, s)
+			}
+		} else if s.Family == FamilyWALCtrl || s.Family == FamilyRepl {
+			// v2 carries page deltas; v1 stays readable.
+			if s.Current != 2 || s.MinReadable != 1 || s.MaxReadable != 2 {
 				t.Fatalf("%s: %+v", s.Family, s)
 			}
 		} else if s.Current != 1 || s.MinReadable != 1 || s.MaxReadable != 1 {
@@ -79,8 +85,17 @@ func TestCatalogFamilyWindow(t *testing.T) {
 	if err := Check(FamilyCatalog, 13); err != nil {
 		t.Fatalf("v13: %v", err)
 	}
-	if err := Check(FamilyCatalog, 14); !nerr.HasCode(err, nerr.InvalidFormat) {
+	if err := Check(FamilyCatalog, 14); err != nil {
 		t.Fatalf("v14: %v", err)
+	}
+	if err := Check(FamilyCatalog, 15); !nerr.HasCode(err, nerr.InvalidFormat) {
+		t.Fatalf("v15: %v", err)
+	}
+	if err := Check(FamilyWALCtrl, 2); err != nil {
+		t.Fatalf("wal_control v2: %v", err)
+	}
+	if err := Check(FamilyWALCtrl, 3); !nerr.HasCode(err, nerr.InvalidFormat) {
+		t.Fatalf("wal_control v3: %v", err)
 	}
 }
 

@@ -1,6 +1,9 @@
 package storage
 
 import (
+	"fmt"
+	"github.com/bzync/nextsql/internal/encoding"
+	"github.com/bzync/nextsql/internal/storage/page"
 	"os"
 	"slices"
 	"sync"
@@ -30,6 +33,10 @@ type Engine struct {
 	TM     *txn.Manager
 
 	mu sync.Mutex
+	// exclusiveMu serializes maintenance write transactions (see
+	// BeginExclusiveWrite). Lock order: a tree's mutex, then exclusiveMu,
+	// then pageMu, then mu.
+	exclusiveMu sync.Mutex
 	// pageMu separates page mutation from commit-time physical snapshots.
 	// Buffer-pool pins alias frame bytes, so pool.mu cannot protect a copy
 	// from a writer that already holds a Handle.
@@ -38,8 +45,23 @@ type Engine struct {
 	writers    map[format.TxnID]*Txn
 	opTxn      *Txn
 	pageWriter bool
-	crash      *wal.Injector
-	closed     bool
+	// Structure-modification logging; see LeaveOp. opDirty is every page
+	// dirtied inside the current Enter..Leave operation, opSMO whether that
+	// operation allocated or dropped a page (a split or merge), and
+	// smoPending pages a structure modification left unlogged because its
+	// WAL append failed.
+	opDirty    []format.PageID
+	opDirtySet map[format.PageID]struct{}
+	opSMO      bool
+	smoPending map[format.PageID]struct{}
+	// unstamped counts, by first LSN, page-image batches that are appended to
+	// the WAL but not yet stamped onto their buffer frames (stamping runs
+	// outside e.mu). A checkpoint treats them as unflushed; see Checkpoint.
+	unstamped map[format.LSN]int
+	// pageLog holds page-delta bases; nil when page deltas are disabled.
+	pageLog *pageLogCache
+	crash   *wal.Injector
+	closed  bool
 
 	repl    Replicator
 	replMu  sync.Mutex
@@ -106,12 +128,23 @@ type Txn struct {
 	lastUndo     format.UndoID
 	liveTargets  []UndoTarget
 	dirty        map[format.PageID]*undoPage
-	snap         map[format.PageID][]byte
 	created      map[format.PageID]struct{}
 	changes      []wal.Change
 	changeBytes  int
 	changeBroken bool
 	done         bool
+	// legacy marks a single-writer maintenance transaction (BeginWrite, or
+	// OnDirty's implicit begin). Its commit keeps the engine mutex across the
+	// durability wait; see commitAndReplicate.
+	legacy bool
+	// loggedPages are the pages whose state this transaction has logged,
+	// so their delta bases can be settled when its commit is appended.
+	loggedPages []format.PageID
+	// durableWait is set while the transaction's commit record is appended
+	// and its commit is waiting, outside e.mu, for the WAL to make it
+	// durable. A rollback in that window is refused: the commit record may
+	// already be on stable storage.
+	durableWait bool
 }
 
 // UndoTarget reverses one logical undo record against the live, in-memory
@@ -181,7 +214,6 @@ func (t *Txn) StageChange(change wal.Change) error {
 }
 
 type undoPage struct {
-	before  []byte
 	created bool
 }
 
@@ -198,6 +230,15 @@ func CreateWithIdentity(path string, id format.Identity, keys crypto.KeyProvider
 	return open(path, keys, bufferPages, id, true, OpenOptions{})
 }
 
+// CreateWith creates a database with explicit options.
+func CreateWith(path string, keys crypto.KeyProvider, bufferPages int, opt OpenOptions) (*Engine, error) {
+	id, err := format.NewIdentity()
+	if err != nil {
+		return nil, err
+	}
+	return open(path, keys, bufferPages, id, true, opt)
+}
+
 func Open(path string, keys crypto.KeyProvider, bufferPages int) (*Engine, error) {
 	return OpenWith(path, keys, bufferPages, OpenOptions{})
 }
@@ -211,6 +252,39 @@ type OpenOptions struct {
 	// bufferPages frames unconditionally. Reserved once at open, released
 	// once at Close.
 	Budget *buffer.Budget
+	// PageDeltas chooses whether commits may log page deltas instead of full
+	// page images (see pagelog.go and docs/wal.md).
+	PageDeltas PageDeltaMode
+}
+
+// PageDeltaMode selects page-delta logging.
+type PageDeltaMode uint8
+
+const (
+	// PageDeltasAuto enables deltas for a database this binary creates and
+	// leaves an existing database's log as it is: a log already at control
+	// version 2 writes deltas, an older one keeps full images and stays
+	// readable by the release that created it.
+	PageDeltasAuto PageDeltaMode = iota
+	// PageDeltasOn also moves an existing log to control version 2. It is
+	// one-way: releases that predate page deltas can no longer open it.
+	PageDeltasOn
+	// PageDeltasOff never writes deltas. Reading them is always supported.
+	PageDeltasOff
+)
+
+// ParsePageDeltaMode maps the wal_page_deltas configuration value; the empty
+// string is auto.
+func ParsePageDeltaMode(s string) (PageDeltaMode, error) {
+	switch s {
+	case "", "auto":
+		return PageDeltasAuto, nil
+	case "on":
+		return PageDeltasOn, nil
+	case "off":
+		return PageDeltasOff, nil
+	}
+	return 0, nerr.New(nerr.InvalidArgument, "storage.ParsePageDeltaMode", "wal_page_deltas must be auto, on, or off")
 }
 
 // OpenWith opens an existing database and optionally stops redo at UntilLSN.
@@ -279,7 +353,9 @@ func open(path string, keys crypto.KeyProvider, bufferPages int, id format.Ident
 	var lg *wal.Log
 	walOpt := wal.Options{Archiver: opt.Archiver}
 	if create {
-		lg, err = wal.Create(wdir, keys, ident, walOpt)
+		createOpt := walOpt
+		createOpt.PageDeltas = opt.PageDeltas != PageDeltasOff
+		lg, err = wal.Create(wdir, keys, ident, createOpt)
 	} else if _, statErr := os.Stat(wdir); os.IsNotExist(statErr) {
 		lg, err = wal.Create(wdir, keys, ident, walOpt)
 	} else {
@@ -319,14 +395,18 @@ func open(path string, keys crypto.KeyProvider, bufferPages int, id format.Ident
 		return nil, err
 	}
 	if !create {
-		uncommitted, uerr := recovery.UncommittedUntil(lg, opt.UntilLSN)
+		open, aborted, uerr := recovery.NotCommittedUntil(lg, opt.UntilLSN)
 		if uerr != nil {
 			_ = ul.Close()
 			_ = lg.Close()
 			_ = fm.Close()
 			return nil, uerr
 		}
-		if err := undo.Apply(fm, ul, uncommitted); err != nil {
+		// Undo is applied to aborted transactions too: see
+		// recovery.NotCommittedUntil. It only reverses versions still carrying
+		// the transaction's id, so versions written after a completed rollback
+		// are untouched.
+		if err := undo.Apply(fm, ul, append(append([]format.TxnID(nil), open...), aborted...)); err != nil {
 			_ = ul.Close()
 			_ = lg.Close()
 			_ = fm.Close()
@@ -354,6 +434,14 @@ func open(path string, keys crypto.KeyProvider, bufferPages int, id format.Ident
 		_ = fm.Close()
 		return nil, err
 	}
+	if !create && opt.PageDeltas == PageDeltasOn {
+		if err := lg.EnablePageDeltas(); err != nil {
+			_ = ul.Close()
+			_ = lg.Close()
+			_ = fm.Close()
+			return nil, err
+		}
+	}
 	e := &Engine{
 		File:         fm,
 		Alloc:        alloc,
@@ -367,10 +455,15 @@ func open(path string, keys crypto.KeyProvider, bufferPages int, id format.Ident
 		budgetFrames: bufferPages,
 		openNextLSN:  lg.NextLSN(),
 	}
+	if lg.PageDeltas() && opt.PageDeltas != PageDeltasOff {
+		// Half the buffer pool's frames: the bases worth keeping are the pages
+		// being written, which are also the pages kept in memory.
+		e.pageLog = newPageLogCache(bufferPages / 2)
+	}
 	if !create {
-		uncommitted, uerr := recovery.UncommittedUntil(lg, opt.UntilLSN)
+		open, aborted, uerr := recovery.NotCommittedUntil(lg, opt.UntilLSN)
 		if uerr == nil {
-			e.TM.Recover(lg.NextTxn(), nil, uncommitted)
+			e.TM.Recover(lg.NextTxn(), nil, append(open, aborted...))
 		}
 		e.recheckIsolated()
 	}
@@ -452,6 +545,11 @@ func (e *Engine) NewPage(typ format.PageType) (*buffer.Handle, error) {
 	if !typ.Known() || typ == format.PageTypeSuperblock || typ == format.PageTypeInvalid {
 		return nil, nerr.New(nerr.InvalidArgument, "storage.NewPage", "invalid page type")
 	}
+	e.mu.Lock()
+	if e.pageWriter {
+		e.opSMO = true
+	}
+	e.mu.Unlock()
 	id, err := e.Alloc.Alloc()
 	if err != nil {
 		return nil, err
@@ -497,9 +595,11 @@ func (e *Engine) SetPrimaryTree(root format.PageID, height uint16) error {
 
 func (e *Engine) Drop(id format.PageID) error {
 	e.mu.Lock()
+	if e.pageWriter {
+		e.opSMO = true
+	}
 	if e.txn != nil {
 		delete(e.txn.dirty, id)
-		delete(e.txn.snap, id)
 		e.txn.created[id] = struct{}{}
 	}
 	e.mu.Unlock()
@@ -682,6 +782,45 @@ func (e *Engine) Kill() {
 	}
 }
 
+// BeginExclusiveWrite starts a maintenance write transaction and returns its
+// handle, holding the engine's exclusive-writer lock until EndExclusiveWrite
+// or AbandonExclusiveWrite.
+//
+// Maintenance writers (tombstone purge, tree creation) used to call
+// BeginWrite and then Commit, both of which act on the single engine-global
+// e.txn slot. Two of them running at once -- a heap purge and an index purge
+// after concurrent commits -- overwrote each other's slot: the first Commit
+// committed the second writer's transaction, and the first writer's own
+// transaction stayed in e.writers forever with pages AllowFlush would never
+// release. The explicit handle and the lock remove both halves of that.
+func (e *Engine) BeginExclusiveWrite() (*Txn, error) {
+	e.exclusiveMu.Lock()
+	e.mu.Lock()
+	t, err := e.beginLocked(true)
+	e.mu.Unlock()
+	if err != nil {
+		e.exclusiveMu.Unlock()
+		return nil, err
+	}
+	return t, nil
+}
+
+// EndExclusiveWrite commits (or rolls back) t and releases the exclusive
+// writer lock.
+func (e *Engine) EndExclusiveWrite(t *Txn, commit bool) error {
+	defer e.exclusiveMu.Unlock()
+	if commit {
+		return e.CommitTxn(t)
+	}
+	return e.RollbackTxn(t)
+}
+
+// AbandonExclusiveWrite releases the exclusive writer lock without resolving
+// t. It exists only for an injected crash, after which the engine is dead.
+func (e *Engine) AbandonExclusiveWrite() {
+	e.exclusiveMu.Unlock()
+}
+
 func (e *Engine) BeginWrite() error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -700,7 +839,189 @@ func (e *Engine) Enter(t *Txn) {
 	e.mu.Lock()
 	e.opTxn = t
 	e.pageWriter = true
+	e.opDirty = e.opDirty[:0]
+	if e.opDirtySet == nil {
+		e.opDirtySet = make(map[format.PageID]struct{})
+	} else {
+		clear(e.opDirtySet)
+	}
+	e.opSMO = false
 	e.mu.Unlock()
+}
+
+// LeaveOp ends a page-writing operation begun with Enter, first making any
+// structure modification it performed durable-by-order.
+//
+// A B+tree split or merge takes effect immediately: other transactions route
+// through the new page and write into it, and rollback never reverts it. Its
+// redo, though, used to be only the page images the splitting transaction
+// logs when it commits. If that transaction never committed, a committed
+// transaction could make durable an image that points to, or lives in, a page
+// whose own image was never logged -- after a crash, recovery found the page
+// unreadable and the committed rows that had moved into it were gone
+// (tests/crash TestConcurrentCommitsSurvivePowerLoss reproduced it about one
+// round in three, with or without group commit).
+//
+// So a successful operation that allocated or dropped a page logs every page
+// it dirtied as its own small committed system transaction (Begin, page
+// images, AllocState, Commit), the standard nested-top-action treatment. It
+// does not fsync: WAL order puts it ahead of any commit that can depend on it,
+// so the flush that makes such a commit durable makes this durable first. The
+// images may hold another transaction's uncommitted row versions; recovery's
+// undo and MVCC visibility treat those exactly as they treat any shared page.
+// A failed operation logs nothing -- its half-done structure must not become
+// redo -- and a failed append leaves the pages pending: AllowFlush refuses
+// them and the next commit retries them.
+func (e *Engine) LeaveOp(t *Txn, opErr error) error {
+	err := opErr
+	if err == nil {
+		err = e.logStructure(true, true)
+	}
+	e.Leave(t)
+	return err
+}
+
+// logStructure logs pending structure modifications and, when ownOp is set,
+// the one the calling operation just performed. ownOp must only be set by the
+// goroutine that called Enter for the current operation: another goroutine
+// reading the operation state would log a split that is still half done.
+// pageWriteHeld reports whether the caller holds pageMu for writing;
+// otherwise it is taken for reading while page images are copied. Called
+// without e.mu.
+func (e *Engine) logStructure(ownOp, pageWriteHeld bool) error {
+	e.mu.Lock()
+	includeOp := ownOp && e.opSMO
+	if ownOp {
+		e.opSMO = false
+	}
+	if e.WAL == nil || (!includeOp && len(e.smoPending) == 0) {
+		e.mu.Unlock()
+		return nil
+	}
+	seen := make(map[format.PageID]struct{}, len(e.opDirty)+len(e.smoPending))
+	var ids []format.PageID
+	if includeOp {
+		for _, id := range e.opDirty {
+			if _, ok := seen[id]; !ok {
+				seen[id] = struct{}{}
+				ids = append(ids, id)
+			}
+		}
+	}
+	for id := range e.smoPending {
+		if _, ok := seen[id]; !ok {
+			seen[id] = struct{}{}
+			ids = append(ids, id)
+		}
+	}
+	e.mu.Unlock()
+	slices.Sort(ids)
+
+	if !pageWriteHeld {
+		e.pageMu.RLock()
+	}
+	kept := ids[:0]
+	images := make([][]byte, 0, len(ids))
+	for _, id := range ids {
+		data, ok := e.Buffer.CopyPageInto(id, nil)
+		if !ok {
+			continue // dropped by the operation itself
+		}
+		kept = append(kept, id)
+		images = append(images, data)
+	}
+	if !pageWriteHeld {
+		e.pageMu.RUnlock()
+	}
+	ids = kept
+
+	e.mu.Lock()
+	markPending := func() {
+		if e.smoPending == nil {
+			e.smoPending = make(map[format.PageID]struct{})
+		}
+		for _, id := range ids {
+			e.smoPending[id] = struct{}{}
+		}
+	}
+	if len(ids) == 0 {
+		e.mu.Unlock()
+		return nil
+	}
+	sys := e.WAL.AllocTxn()
+	begin, err := e.WAL.Append(wal.BeginRec(sys))
+	if err != nil {
+		markPending()
+		e.mu.Unlock()
+		return err
+	}
+	lsns, last, first, err := e.appendPageStatesLocked(sys, begin, ids, images, false)
+	if err != nil {
+		markPending()
+		e.mu.Unlock()
+		return err
+	}
+	next, head, count := e.File.AllocState()
+	allocLSN, err := e.WAL.Append(wal.AllocState(sys, last, next, head, count))
+	if err != nil {
+		markPending()
+		e.mu.Unlock()
+		return err
+	}
+	if _, err := e.WAL.Append(wal.CommitRec(sys, allocLSN)); err != nil {
+		markPending()
+		for _, id := range ids {
+			e.pageLog.forget(id) // its record will never be replayed
+		}
+		e.mu.Unlock()
+		return err
+	}
+	e.pageLog.settle(sys, ids)
+	for _, id := range ids {
+		delete(e.smoPending, id)
+	}
+	e.noteUnstampedLocked(first)
+	e.mu.Unlock()
+	e.stampImages(ids, lsns, first)
+	return nil
+}
+
+// noteUnstampedLocked records that a batch starting at lsn is appended but not
+// yet stamped. Called with e.mu held, in the same critical section as the
+// append.
+func (e *Engine) noteUnstampedLocked(lsn format.LSN) {
+	if e.unstamped == nil {
+		e.unstamped = make(map[format.LSN]int)
+	}
+	e.unstamped[lsn]++
+}
+
+// stampImages stamps each page's frame with its image LSN and then retires
+// the batch's unstamped entry. Called without e.mu.
+func (e *Engine) stampImages(ids []format.PageID, lsns []format.LSN, first format.LSN) {
+	for i, id := range ids {
+		e.Buffer.StampLSN(id, lsns[i])
+	}
+	if first == 0 {
+		return
+	}
+	e.mu.Lock()
+	if n := e.unstamped[first]; n <= 1 {
+		delete(e.unstamped, first)
+	} else {
+		e.unstamped[first] = n - 1
+	}
+	e.mu.Unlock()
+}
+
+func (e *Engine) minUnstampedLocked() format.LSN {
+	var min format.LSN
+	for lsn := range e.unstamped {
+		if min == 0 || lsn < min {
+			min = lsn
+		}
+	}
+	return min
 }
 
 func (e *Engine) Leave(t *Txn) {
@@ -725,8 +1046,8 @@ func (e *Engine) beginLocked(legacy bool) (*Txn, error) {
 		prev:    lsn,
 		first:   lsn,
 		dirty:   make(map[format.PageID]*undoPage),
-		snap:    make(map[format.PageID][]byte),
 		created: make(map[format.PageID]struct{}),
+		legacy:  legacy,
 	}
 	if e.writers == nil {
 		e.writers = make(map[format.TxnID]*Txn)
@@ -791,9 +1112,7 @@ func (e *Engine) commitAndReplicate(t *Txn) error {
 	needRepl := e.repl != nil
 	e.mu.Unlock()
 	if !needRepl {
-		e.mu.Lock()
-		defer e.mu.Unlock()
-		return e.commitLocked(t, false)
+		return e.commitUnreplicated(t)
 	}
 	e.replMu.Lock()
 	defer e.replMu.Unlock()
@@ -877,6 +1196,117 @@ func (e *Engine) commitLocked(txn *Txn, pageWriteHeld bool) error {
 	return err
 }
 
+// appendCommitBodyLocked runs a commit up to, but not including, its commit
+// record: the change-stream check, the undo and dirty-page flushes, and the
+// AllocState and Change records. Every commit path shares it, so their
+// ordering cannot drift apart. Called with e.mu held.
+func (e *Engine) appendCommitBodyLocked(txn *Txn, pageWriteHeld bool) error {
+	if txn.changeBroken {
+		return nerr.New(nerr.Conflict, "storage.CommitTxn", "transaction change stream is incomplete; rollback required")
+	}
+	if len(e.smoPending) > 0 {
+		// A structure modification this commit may depend on is not logged
+		// yet (its append failed). Log it first, or refuse to commit.
+		e.mu.Unlock()
+		err := e.logStructure(false, pageWriteHeld)
+		e.mu.Lock()
+		if err != nil {
+			return err
+		}
+	}
+	if e.Undo != nil {
+		if err := e.Undo.Flush(); err != nil {
+			return err
+		}
+	}
+	if err := e.flushDirtyImages(txn, pageWriteHeld); err != nil {
+		return err
+	}
+	// Alloc.Flush is deliberately NOT called here: unlike WAL records
+	// (gated by AppendHeld/ReleaseHold) and buffer-pool pages (gated by
+	// AllowFlush refusing eviction while txn is still in e.writers),
+	// Allocator.Flush persists directly to the data file's
+	// superblock/freelist pages with no durability gate of its own and no
+	// undo log — Alloc.Reload() only re-reads whatever is already on disk,
+	// it cannot revert a persist that already happened. Calling it before
+	// a hold resolves would make finishCommitDiscarded's Alloc.Reload()
+	// silently fail to undo the discarded transaction's page allocations
+	// (it would just reload the same, already-persisted state back). It
+	// runs instead in finishCommitOK, once the transaction is known to be
+	// actually committing (both here for the non-replicated path, where
+	// this is the very next call, and after a hold resolves) — see
+	// AllocState's own record below, which reads Allocator's in-memory
+	// mirror (SetAllocStateMem) and is therefore already correct
+	// regardless of when the physical persist happens.
+	if err := e.hitLocked(wal.PointBeforeCommitRecord); err != nil {
+		return err
+	}
+	next, head, count := e.File.AllocState()
+	allocLSN, err := e.WAL.Append(wal.AllocState(txn.id, txn.prev, next, head, count))
+	if err != nil {
+		return err
+	}
+	txn.prev = allocLSN
+	for _, change := range txn.changes {
+		rec, err := wal.ChangeRec(txn.id, txn.prev, change)
+		if err != nil {
+			return err
+		}
+		changeLSN, err := e.WAL.Append(rec)
+		if err != nil {
+			return err
+		}
+		txn.prev = changeLSN
+	}
+	return nil
+}
+
+// commitUnreplicated commits t on a node with no replicator.
+//
+// The durability wait -- the WAL fsync -- runs without e.mu. Every commit used
+// to hold the engine-wide mutex across its own fsync, so no other transaction
+// could even append its commit record until it finished: N concurrent commits
+// paid N fsyncs and throughput stayed flat from 1 to 64 connections. With e.mu
+// released, commits that arrive during one fsync append their records and are
+// made durable together by the next (wal.Log.Flush).
+//
+// The ordering that makes a commit correct is unchanged: every record,
+// including the commit record, is appended under e.mu; the transaction stays
+// in e.writers -- unacknowledged, invisible to other snapshots, still holding
+// its locks, and still counted as active by a checkpoint -- until the commit
+// record is durable; only then does it become visible (TM.Commit), under e.mu.
+// A crash before durability recovers it as uncommitted, and after, as
+// committed, exactly as before.
+//
+// A legacy maintenance transaction keeps the original fully-locked commit:
+// those callers are single-writer by construction and rely on nothing else
+// interleaving with them.
+func (e *Engine) commitUnreplicated(t *Txn) error {
+	e.mu.Lock()
+	if t.legacy {
+		defer e.mu.Unlock()
+		return e.commitLocked(t, false)
+	}
+	lsn, err := e.prepareDeferredCommitLocked(t)
+	if err != nil {
+		e.mu.Unlock()
+		return err
+	}
+	t.durableWait = true
+	e.mu.Unlock()
+
+	ferr := e.WAL.Flush(lsn)
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	t.durableWait = false
+	if ferr != nil {
+		return ferr
+	}
+	e.completeCommitLocked(t)
+	return nil
+}
+
 // prepareCommitLocked runs a transaction's commit through appending its
 // CommitRec. Called with e.mu held.
 //
@@ -907,52 +1337,8 @@ func (e *Engine) commitLocked(txn *Txn, pageWriteHeld bool) error {
 // again. The caller must replicate recs and then call finishCommitOK or
 // finishCommitDiscarded to resolve it.
 func (e *Engine) prepareCommitLocked(txn *Txn, pageWriteHeld, hold bool) (recs []wal.Record, lsn, preReplLSN format.LSN, err error) {
-	if txn.changeBroken {
-		return nil, 0, 0, nerr.New(nerr.Conflict, "storage.CommitTxn", "transaction change stream is incomplete; rollback required")
-	}
-	if e.Undo != nil {
-		if err := e.Undo.Flush(); err != nil {
-			return nil, 0, 0, err
-		}
-	}
-	if err := e.flushDirtyImages(txn, pageWriteHeld); err != nil {
+	if err := e.appendCommitBodyLocked(txn, pageWriteHeld); err != nil {
 		return nil, 0, 0, err
-	}
-	// Alloc.Flush is deliberately NOT called here: unlike WAL records
-	// (gated by AppendHeld/ReleaseHold) and buffer-pool pages (gated by
-	// AllowFlush refusing eviction while txn is still in e.writers),
-	// Allocator.Flush persists directly to the data file's
-	// superblock/freelist pages with no durability gate of its own and no
-	// undo log — Alloc.Reload() only re-reads whatever is already on disk,
-	// it cannot revert a persist that already happened. Calling it before
-	// a hold resolves would make finishCommitDiscarded's Alloc.Reload()
-	// silently fail to undo the discarded transaction's page allocations
-	// (it would just reload the same, already-persisted state back). It
-	// runs instead in finishCommitOK, once the transaction is known to be
-	// actually committing (both here for the non-replicated path, where
-	// this is the very next call, and after a hold resolves) — see
-	// AllocState's own record below, which reads Allocator's in-memory
-	// mirror (SetAllocStateMem) and is therefore already correct
-	// regardless of when the physical persist happens.
-	if err := e.hitLocked(wal.PointBeforeCommitRecord); err != nil {
-		return nil, 0, 0, err
-	}
-	next, head, count := e.File.AllocState()
-	allocLSN, err := e.WAL.Append(wal.AllocState(txn.id, txn.prev, next, head, count))
-	if err != nil {
-		return nil, 0, 0, err
-	}
-	txn.prev = allocLSN
-	for _, change := range txn.changes {
-		rec, err := wal.ChangeRec(txn.id, txn.prev, change)
-		if err != nil {
-			return nil, 0, 0, err
-		}
-		changeLSN, err := e.WAL.Append(rec)
-		if err != nil {
-			return nil, 0, 0, err
-		}
-		txn.prev = changeLSN
 	}
 	commitRec := wal.CommitRec(txn.id, txn.prev)
 	if hold {
@@ -987,10 +1373,36 @@ func (e *Engine) prepareCommitLocked(txn *Txn, pageWriteHeld, hold bool) (recs [
 		return nil, 0, 0, err
 	}
 	txn.prev = commitLSN
+	e.pageLog.settle(txn.id, txn.loggedPages)
 	if err := e.finishCommitOK(txn, commitLSN); err != nil {
 		return nil, 0, 0, err
 	}
 	return nil, commitLSN, 0, nil
+}
+
+// prepareDeferredCommitLocked appends txn's commit and runs everything
+// finishCommitOK does before the durability wait, returning the LSN the caller
+// must make durable before calling completeCommitLocked. Called with e.mu held.
+func (e *Engine) prepareDeferredCommitLocked(txn *Txn) (format.LSN, error) {
+	if err := e.appendCommitBodyLocked(txn, false); err != nil {
+		return 0, err
+	}
+	commitLSN, err := e.WAL.Append(wal.CommitRec(txn.id, txn.prev))
+	if err != nil {
+		return 0, err
+	}
+	txn.prev = commitLSN
+	e.pageLog.settle(txn.id, txn.loggedPages)
+	if err := e.Alloc.Flush(); err != nil {
+		return 0, err
+	}
+	if commitLSN > e.replLSN {
+		e.replLSN = commitLSN
+	}
+	if err := e.hitLocked(wal.PointAfterCommitRecordBeforeSync); err != nil {
+		return 0, err
+	}
+	return commitLSN, nil
 }
 
 // finishCommitOK makes a transaction durable, visible, and unlocked: it
@@ -1004,6 +1416,8 @@ func (e *Engine) finishCommitOK(txn *Txn, lsn format.LSN) error {
 	if err := e.WAL.ReleaseHold(true); err != nil {
 		return err
 	}
+	// A held commit record becomes replayable only once released.
+	e.pageLog.settle(txn.id, txn.loggedPages)
 	// The held CommitRec itself was never seen by takeReplLocked's scan
 	// (it wasn't durable yet), so the watermark sits one short; advance it
 	// past this record now that it's known to be staying, so a later
@@ -1020,6 +1434,14 @@ func (e *Engine) finishCommitOK(txn *Txn, lsn format.LSN) error {
 	if err := e.WAL.Flush(lsn); err != nil {
 		return err
 	}
+	e.completeCommitLocked(txn)
+	return nil
+}
+
+// completeCommitLocked makes a durable commit visible and releases the
+// transaction. Called with e.mu held, only after txn's commit record is
+// durable.
+func (e *Engine) completeCommitLocked(txn *Txn) {
 	txn.done = true
 	delete(e.writers, txn.id)
 	if e.txn == txn {
@@ -1034,7 +1456,6 @@ func (e *Engine) finishCommitOK(txn *Txn, lsn format.LSN) error {
 	if e.Undo != nil && (e.TM == nil || e.TM.LiveSnapshots() == 0) {
 		e.Undo.ForgetTxn(txn.id)
 	}
-	return nil
 }
 
 // finishCommitDiscarded undoes a held commit whose replication is known to
@@ -1064,13 +1485,13 @@ func (e *Engine) finishCommitDiscarded(txn *Txn, preReplLSN format.LSN) error {
 	if e.opTxn == txn {
 		e.opTxn = nil
 	}
-	delete(e.writers, txn.id)
 	e.replLSN = preReplLSN
 	e.mu.Unlock()
 
 	// Best-effort: see the doc comment on undoTxnLogical for why a failure
 	// here does not abort the discard itself.
 	_ = e.undoTxnLogical(txn)
+	e.retireRolledBack(txn)
 
 	if _, err := e.WAL.Append(wal.AbortRec(txn.id, txn.prev)); err != nil {
 		if e.TM != nil {
@@ -1091,6 +1512,28 @@ func (e *Engine) Rollback() error {
 	return e.RollbackTxn(t)
 }
 
+// retireRolledBack ends a rolled-back transaction's hold on its pages.
+//
+// Rollback changes pages -- the transaction's own edits and the undo that
+// reverses them -- without logging them, so each such page's content no longer
+// matches the state its LSN names. That was harmless with full page images, but
+// a delta encoded against that logged state would be applied to different
+// bytes. So the transaction stays in e.writers, keeping its pages unflushable,
+// until undo has finished; then every delta base for those pages is discarded
+// (their next logged state is a full image) and only then are the pages
+// released for flushing.
+func (e *Engine) retireRolledBack(txn *Txn) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for id := range txn.dirty {
+		e.pageLog.forget(id)
+	}
+	for _, id := range txn.loggedPages {
+		e.pageLog.forget(id)
+	}
+	delete(e.writers, txn.id)
+}
+
 func (e *Engine) RollbackTxn(txn *Txn) error {
 	if err := e.CrashAt(wal.PointBeforeRollback); err != nil {
 		return err
@@ -1099,18 +1542,22 @@ func (e *Engine) RollbackTxn(txn *Txn) error {
 		return nil
 	}
 	e.mu.Lock()
+	if txn.durableWait {
+		e.mu.Unlock()
+		return nerr.New(nerr.Conflict, "storage.RollbackTxn", "transaction is committing; its commit record may already be durable")
+	}
 	if e.txn == txn {
 		e.txn = nil
 	}
 	if e.opTxn == txn {
 		e.opTxn = nil
 	}
-	delete(e.writers, txn.id)
 	e.mu.Unlock()
 
 	// Best-effort: see the doc comment on undoTxnLogical for why a failure
 	// here does not abort the rollback itself.
 	_ = e.undoTxnLogical(txn)
+	e.retireRolledBack(txn)
 
 	if _, err := e.WAL.Append(wal.AbortRec(txn.id, txn.prev)); err != nil {
 		if e.TM != nil {
@@ -1174,6 +1621,89 @@ func (e *Engine) undoTxnLogical(txn *Txn) error {
 			return err
 		}
 	}
+	return nil
+}
+
+// Savepoint is a position inside an open write transaction: how much undo the
+// transaction had logged and how many CDC changes it had staged. It is a
+// value, not a handle, so holding one costs nothing and a session can keep a
+// bounded stack of them.
+type Savepoint struct {
+	undoLen     int
+	changeLen   int
+	changeBytes int
+}
+
+// Savepoint captures the transaction's current position.
+func (t *Txn) Savepoint() Savepoint {
+	if t == nil {
+		return Savepoint{}
+	}
+	t.eng.mu.Lock()
+	defer t.eng.mu.Unlock()
+	return Savepoint{undoLen: len(t.liveTargets), changeLen: len(t.changes), changeBytes: t.changeBytes}
+}
+
+// RollbackToSavepoint reverses everything the transaction did after sp,
+// leaving the transaction open with its locks still held — the SQL rule for
+// ROLLBACK TO SAVEPOINT.
+//
+// Reversal replays the undo records logged after sp, newest first, through the
+// same per-tree targets a full rollback uses, so a key is found even if a
+// concurrent split moved it. Nothing extra is logged: redo is page-image based
+// and a commit writes each dirty page's final image, which already reflects
+// the reversal. The undo chain deliberately keeps the reversed records —
+// applying one twice is idempotent (re-deleting a row already gone, or
+// restoring a version already restored), so a later full rollback, or a second
+// rollback to the same savepoint, stays correct.
+//
+// Staged CDC changes are truncated to the savepoint: a row that was rolled
+// back must not be published as a change event.
+func (e *Engine) RollbackToSavepoint(txn *Txn, sp Savepoint) error {
+	if txn == nil {
+		return nerr.New(nerr.InvalidArgument, "storage.RollbackToSavepoint", "no active transaction")
+	}
+	e.mu.Lock()
+	if txn.done {
+		e.mu.Unlock()
+		return nerr.New(nerr.InvalidArgument, "storage.RollbackToSavepoint", "transaction is not active")
+	}
+	n := len(txn.liveTargets)
+	if sp.undoLen > n || sp.changeLen > len(txn.changes) {
+		e.mu.Unlock()
+		return nerr.New(nerr.InvalidArgument, "storage.RollbackToSavepoint", "savepoint is not part of this transaction")
+	}
+	targets := append([]UndoTarget(nil), txn.liveTargets...)
+	e.mu.Unlock()
+
+	if e.Undo != nil && n > sp.undoLen {
+		recs := e.Undo.Chain(txn.lastUndo) // newest -> oldest
+		if len(recs) != n {
+			return nerr.New(nerr.Internal, "storage.RollbackToSavepoint", "undo chain length does not match recorded targets")
+		}
+		// recs[i] corresponds to targets[n-1-i]; everything with an index at
+		// or past sp.undoLen was written after the savepoint.
+		for i, rec := range recs {
+			pos := n - 1 - i
+			if pos < sp.undoLen {
+				break
+			}
+			target := targets[pos]
+			if target == nil {
+				continue
+			}
+			if err := target.ApplyUndo(txn, rec); err != nil {
+				return err
+			}
+		}
+	}
+
+	e.mu.Lock()
+	if sp.changeLen <= len(txn.changes) {
+		txn.changes = txn.changes[:sp.changeLen]
+		txn.changeBytes = sp.changeBytes
+	}
+	e.mu.Unlock()
 	return nil
 }
 
@@ -1244,6 +1774,25 @@ func (e *Engine) Checkpoint() error {
 	if err := e.CrashAt(wal.PointDuringPageFlush); err != nil {
 		return err
 	}
+	// The redo boundary is fuzzy: recovery must replay every logged change
+	// not yet in the data file, and a checkpoint cannot flush everything --
+	// a page a running transaction has dirtied stays in memory (no-steal),
+	// together with any committed image of it that predates that write. The
+	// boundary used to be the log's end after the flush, which skipped such
+	// images: after a crash an acknowledged commit was gone
+	// (tests/crash TestStorageCheckpointKeepsCommittedKeyOnDirtiedPage).
+	//
+	// It is the smallest of: the log's end captured before flushing
+	// (anything appended later is at or after it); the first LSN of any
+	// image batch appended but not yet stamped onto its frames; and the
+	// oldest unflushed change of any frame. The samples are taken in that
+	// order so none can be missed: a batch stamped after its unstamped entry
+	// is sampled is by then visible to MinRecLSN or already flushed. The
+	// pool mutex is never taken under e.mu (AllowFlush takes e.mu under the
+	// pool mutex).
+	e.mu.Lock()
+	start := e.WAL.NextLSN()
+	e.mu.Unlock()
 	if err := e.Buffer.FlushAll(); err != nil {
 		return err
 	}
@@ -1251,6 +1800,22 @@ func (e *Engine) Checkpoint() error {
 		return err
 	}
 	e.mu.Lock()
+	unstampedMin := e.minUnstampedLocked()
+	// Nor may it pass the Begin record of a transaction still running.
+	// Recovery finds uncommitted transactions by scanning for Begin records
+	// from the boundary, and an id it never sees defaults to committed. A
+	// committed transaction's page image can carry a running transaction's
+	// row versions (the page is shared), so a boundary past that Begin let a
+	// transaction that never committed come back after a crash as committed
+	// -- half of a transfer, with no undo (tests/crash
+	// TestRollbacksWithPageDeltasSurvivePowerLoss reproduced it with full
+	// images alone).
+	var activeFirst format.LSN
+	for _, w := range e.writers {
+		if w != nil && !w.done && w.first != 0 && (activeFirst == 0 || w.first < activeFirst) {
+			activeFirst = w.first
+		}
+	}
 	txnID := format.TxnID(0)
 	prev := format.LSN(0)
 	if e.txn != nil {
@@ -1258,6 +1823,16 @@ func (e *Engine) Checkpoint() error {
 		prev = e.txn.prev
 	}
 	e.mu.Unlock()
+	redoFloor := start
+	if unstampedMin != 0 && unstampedMin < redoFloor {
+		redoFloor = unstampedMin
+	}
+	if activeFirst != 0 && activeFirst < redoFloor {
+		redoFloor = activeFirst
+	}
+	if rec := e.Buffer.MinRecLSN(); rec != 0 && rec < redoFloor {
+		redoFloor = rec
+	}
 
 	// Nothing has happened on this Engine instance since it was opened (no
 	// transaction touched it, and — since a checkpoint call is the only
@@ -1280,9 +1855,12 @@ func (e *Engine) Checkpoint() error {
 		return nil
 	}
 
+	e.mu.Lock()
+	e.pageLog.raiseFloor(redoFloor)
+	e.mu.Unlock()
 	root, height := e.File.PrimaryTree()
 	next, head, count := e.File.AllocState()
-	redo := e.WAL.NextLSN()
+	redo := redoFloor
 	body := wal.CheckpointBody{
 		RedoLSN:    redo,
 		DurableLSN: e.WAL.DurableLSN(),
@@ -1348,27 +1926,17 @@ func (e *Engine) hitLocked(p wal.Point) error {
 	return e.crash.Hit(p)
 }
 
-func (e *Engine) OnPin(id format.PageID, data []byte) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	t := e.opTxn
-	if t == nil {
-		t = e.txn
-	}
-	if t == nil {
-		return
-	}
-	if _, ok := t.snap[id]; ok {
-		return
-	}
-	if _, ok := t.dirty[id]; ok {
-		return
-	}
-	if _, ok := t.created[id]; ok {
-		return
-	}
-	t.snap[id] = append([]byte(nil), data...)
-}
+// OnPin is the buffer pool's per-pin hook. It does nothing.
+//
+// It used to copy the whole 16 KiB page into the pinning transaction's
+// before-image map on first pin, under the engine mutex, while the buffer
+// pool held its own mutex -- for every pin by any goroutine whenever some
+// transaction was current, including pure reads attributed to an unrelated
+// writer. Nothing has read those before-images since rollback moved to the
+// durable logical undo chain, so the copy was pure cost: measured as the
+// largest serialization point for concurrent scans, together with the pool
+// mutex it was taken under.
+func (e *Engine) OnPin(id format.PageID, data []byte) {}
 
 func (e *Engine) OnInstall(id format.PageID) {
 	e.mu.Lock()
@@ -1393,6 +1961,12 @@ func (e *Engine) OnDirty(id format.PageID, data []byte) (format.LSN, error) {
 	if t == nil {
 		t = e.txn
 	}
+	if t != nil && t.durableWait {
+		// Its page images are already appended and it is only waiting for
+		// them to become durable; a page attributed to it now would never be
+		// logged. Treat the write as unowned.
+		t = nil
+	}
 	auto := false
 	if t == nil {
 		var err error
@@ -1404,7 +1978,13 @@ func (e *Engine) OnDirty(id format.PageID, data []byte) (format.LSN, error) {
 	}
 	if _, ok := t.dirty[id]; !ok {
 		_, created := t.created[id]
-		t.dirty[id] = &undoPage{before: t.snap[id], created: created}
+		t.dirty[id] = &undoPage{created: created}
+	}
+	if e.pageWriter {
+		if _, ok := e.opDirtySet[id]; !ok {
+			e.opDirtySet[id] = struct{}{}
+			e.opDirty = append(e.opDirty, id)
+		}
 	}
 	// Redo is physical page images. One image per dirty page is enough:
 	// recovery applies the last committed image. Logging every pin/release
@@ -1420,6 +2000,55 @@ func (e *Engine) OnDirty(id format.PageID, data []byte) (format.LSN, error) {
 // flushDirtyImages writes the final committed image of each dirty page.
 // Called with e.mu held. Buffer operations drop the engine lock so they
 // cannot deadlock with Pin → OnPin (pool.mu then e.mu).
+// appendPageStatesLocked logs the state of each page -- a RecPageDelta
+// against its cached base where one is safe (see pagelog.go), otherwise a full
+// image -- and records the logged states as the pages' new bases, unsettled
+// until settle. images[i] must be a private copy of page ids[i]; each is
+// stamped with its record's LSN and retained as the base. It returns each
+// page's LSN, the last LSN appended and the first. Called with e.mu held.
+func (e *Engine) appendPageStatesLocked(txnID format.TxnID, prev format.LSN, ids []format.PageID, images [][]byte, settled bool) (lsns []format.LSN, last, first format.LSN, err error) {
+	lsns = make([]format.LSN, len(ids))
+	var fullIDs []format.PageID
+	var fullImages [][]byte
+	var fullAt []int
+	for i, id := range ids {
+		if b := e.pageLog.base(id, images[i]); b != nil {
+			if body, ok := wal.EncodePageDelta(b.lsn, b.content, images[i], maxPageDeltaBody); ok {
+				lsn, aerr := e.WAL.Append(wal.PageDeltaRec(txnID, prev, id, body))
+				if aerr != nil {
+					return nil, 0, 0, aerr
+				}
+				encoding.PutU64(images[i], wal.PageLSNOffset, uint64(lsn))
+				lsns[i], prev = lsn, lsn
+				if first == 0 {
+					first = lsn
+				}
+				continue
+			}
+		}
+		fullIDs = append(fullIDs, id)
+		fullImages = append(fullImages, images[i])
+		fullAt = append(fullAt, i)
+	}
+	if len(fullIDs) > 0 {
+		got, lastFull, aerr := e.WAL.AppendPageImages(txnID, prev, fullIDs, fullImages)
+		if aerr != nil {
+			return nil, 0, 0, aerr
+		}
+		for k, i := range fullAt {
+			lsns[i] = got[k]
+		}
+		if first == 0 {
+			first = got[0]
+		}
+		prev = lastFull
+	}
+	for i, id := range ids {
+		e.pageLog.put(id, lsns[i], txnID, settled, images[i])
+	}
+	return lsns, prev, first, nil
+}
+
 func (e *Engine) flushDirtyImages(txn *Txn, pageWriteHeld bool) error {
 	if e.WAL == nil || txn == nil || len(txn.dirty) == 0 {
 		return nil
@@ -1449,15 +2078,15 @@ func (e *Engine) flushDirtyImages(txn *Txn, pageWriteHeld bool) error {
 		e.pageMu.RUnlock()
 	}
 	e.mu.Lock()
-	lsns, last, err := e.WAL.AppendPageImages(txn.id, txn.prev, ids, images)
+	lsns, last, first, err := e.appendPageStatesLocked(txn.id, txn.prev, ids, images, false)
 	if err != nil {
 		return err
 	}
 	txn.prev = last
+	txn.loggedPages = append(txn.loggedPages, ids...)
+	e.noteUnstampedLocked(first)
 	e.mu.Unlock()
-	for i, id := range ids {
-		e.Buffer.StampLSN(id, lsns[i])
-	}
+	e.stampImages(ids, lsns, first)
 	e.mu.Lock()
 	return nil
 }
@@ -1467,6 +2096,9 @@ func (e *Engine) AllowFlush(id format.PageID, lsn format.LSN) bool {
 	defer e.mu.Unlock()
 	if lsn == 0 {
 		return false
+	}
+	if _, pending := e.smoPending[id]; pending {
+		return false // a structure modification's image is not logged yet
 	}
 	for _, t := range e.writers {
 		if t != nil && !t.done {
@@ -1578,6 +2210,10 @@ func (e *Engine) ApplyReplicated(recs []wal.Record) error {
 			if err := e.Buffer.Replace(r.PageID, r.Body); err != nil {
 				return err
 			}
+		case wal.RecPageDelta:
+			if err := e.applyReplicatedDelta(r); err != nil {
+				return err
+			}
 		case wal.RecTreeMeta:
 			nr, nh, err := wal.DecodeTreeMeta(r.Body)
 			if err != nil {
@@ -1619,4 +2255,34 @@ func (e *Engine) ApplyReplicated(recs []wal.Record) error {
 		e.replLSN = last
 	}
 	return nil
+}
+
+// applyReplicatedDelta applies a RecPageDelta on a replica, with the same rule
+// recovery uses: a page already at or past the delta is left alone, and
+// otherwise it must be exactly the delta's base. The replica's current copy is
+// the buffer frame when the page is cached (it may be newer than the file),
+// else the data file.
+func (e *Engine) applyReplicatedDelta(r wal.Record) error {
+	if r.PageID == 0 {
+		return nerr.New(nerr.Corruption, "storage.ApplyReplicated", "page delta missing page id")
+	}
+	d, err := wal.DecodePageDelta(r.Body)
+	if err != nil {
+		return nerr.Wrap(nerr.Corruption, "storage.ApplyReplicated", "undecodable page delta", err)
+	}
+	cur, ok := e.Buffer.CopyPageInto(r.PageID, nil)
+	if !ok {
+		cur, err = e.File.ReadLogical(r.PageID)
+		if err != nil {
+			return nerr.Wrap(nerr.Corruption, "storage.ApplyReplicated", fmt.Sprintf("page %d is unreadable for the delta at LSN %d", r.PageID, r.LSN), err)
+		}
+	}
+	if page.LSNOf(cur) >= r.LSN {
+		return nil
+	}
+	if err := wal.ApplyPageDelta(cur, d, r.LSN); err != nil {
+		return nerr.Wrap(nerr.Corruption, "storage.ApplyReplicated", fmt.Sprintf(
+			"page %d is at LSN %d; the delta at LSN %d needs base LSN %d", r.PageID, page.LSNOf(cur), r.LSN, d.BaseLSN), err)
+	}
+	return e.Buffer.Replace(r.PageID, cur)
 }

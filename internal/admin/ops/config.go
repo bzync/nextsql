@@ -14,11 +14,11 @@
 package ops
 
 import (
-	"crypto/tls"
 	"time"
 
 	nextsql "github.com/bzync/nextsql/drivers/go"
 	"github.com/bzync/nextsql/internal/admin/credential"
+	"github.com/bzync/nextsql/internal/admin/profile"
 	"github.com/bzync/nextsql/internal/nerr"
 	"github.com/bzync/nextsql/internal/security"
 )
@@ -38,14 +38,20 @@ const (
 // Config is the resolved Operations-mode configuration. The command layer
 // builds it from flags (and later a config file); New validates it.
 type Config struct {
-	// ServerAddr is the nextsqld address Operations mode connects to on
-	// behalf of each logged-in operator.
+	// ServerAddr is the nextsqld address of the "default" connection
+	// profile — the one a sign-in uses unless it names another profile.
 	ServerAddr     string
 	ServerTLSCA    string
 	ServerTLSName  string
 	ClientCert     string
 	ClientKey      string
 	InsecureServer bool
+	// ServerName and ServerEnvironment label the default profile.
+	ServerName        string
+	ServerEnvironment string
+	// Profiles are the further, operator-declared nextsqld servers (from the
+	// --profiles file) a session may sign in or switch to.
+	Profiles []profile.Profile
 
 	MaxSessions     int
 	IdleTimeout     time.Duration
@@ -58,8 +64,9 @@ type Config struct {
 
 	LogLevel string
 
-	// CredentialStore is the OS-backed store used only when a Studio operator
-	// explicitly asks to save a reconnect password. It has no file fallback.
+	// CredentialStore is the OS-backed store used only when an operator
+	// switching servers explicitly asks to save that server's password. It
+	// has no file fallback.
 	CredentialStore credential.Store
 }
 
@@ -104,6 +111,12 @@ func (c Config) validate() error {
 		return nerr.New(nerr.InvalidArgument, "ops.Config",
 			"--insecure is only allowed for a loopback --server-addr")
 	}
+	if err := c.defaultProfile().ValidateTarget(); err != nil {
+		return err
+	}
+	if err := c.validateProfiles(); err != nil {
+		return err
+	}
 	if c.SessionLifetime < c.IdleTimeout {
 		return nerr.New(nerr.InvalidArgument, "ops.Config",
 			"--session-lifetime must not be shorter than --idle-timeout")
@@ -111,30 +124,85 @@ func (c Config) validate() error {
 	return nil
 }
 
-// driverConfig builds the per-login nextsqld driver Config: everything except
-// the operator's user/password/database/realm, which login supplies.
-func (c Config) driverConfig() (nextsql.Config, error) {
-	cfg := nextsql.Config{
-		Address:       c.ServerAddr,
-		InsecureNoTLS: c.InsecureServer,
+// DefaultServerName labels the --server-addr profile when no --server-name
+// is given.
+const DefaultServerName = "Default server"
+
+// defaultProfile is the implicit "default" connection profile built from the
+// --server-addr / --tls-* flags. A CA always wins over --insecure, exactly as
+// before profiles existed, so no existing flag combination changes meaning.
+func (c Config) defaultProfile() profile.Profile {
+	name := c.ServerName
+	if name == "" {
+		name = DefaultServerName
 	}
-	if c.ServerTLSCA != "" {
-		name := c.ServerTLSName
-		if name == "" {
-			name = hostOf(c.ServerAddr)
+	p := profile.Profile{
+		ID:            profile.DefaultID,
+		Name:          name,
+		Environment:   c.ServerEnvironment,
+		Address:       c.ServerAddr,
+		TLSCA:         c.ServerTLSCA,
+		TLSServerName: c.ServerTLSName,
+		TLSClientCert: c.ClientCert,
+		TLSClientKey:  c.ClientKey,
+		Insecure:      c.InsecureServer && c.ServerTLSCA == "",
+	}
+	if p.Insecure {
+		// A server name means nothing without TLS; the flags used to
+		// tolerate the pair, so keep tolerating it rather than refusing.
+		p.TLSServerName = ""
+	}
+	return p
+}
+
+// allProfiles returns the default profile followed by the file-declared ones.
+func (c Config) allProfiles() []profile.Profile {
+	out := make([]profile.Profile, 0, 1+len(c.Profiles))
+	out = append(out, c.defaultProfile())
+	return append(out, c.Profiles...)
+}
+
+// validateProfiles checks the file-declared profiles again (Config can be
+// built programmatically, not only through profile.Load) and the default
+// profile's labels.
+func (c Config) validateProfiles() error {
+	if len(c.ServerName) > 64 {
+		return nerr.New(nerr.InvalidArgument, "ops.Config", "--server-name is longer than 64 bytes")
+	}
+	if err := profile.ValidateEnvironment(c.ServerEnvironment); err != nil {
+		return nerr.New(nerr.InvalidArgument, "ops.Config", "--server-environment: "+err.Error())
+	}
+	if len(c.Profiles) > profile.MaxProfiles {
+		return nerr.New(nerr.InvalidArgument, "ops.Config", "too many connection profiles")
+	}
+	seen := map[string]bool{profile.DefaultID: true}
+	for _, p := range c.Profiles {
+		if err := p.Validate(); err != nil {
+			return err
 		}
-		var (
-			tlsCfg *tls.Config
-			err    error
-		)
-		if c.ClientCert != "" {
-			tlsCfg, err = security.ClientMTLS(name, c.ServerTLSCA, c.ClientCert, c.ClientKey)
-		} else {
-			tlsCfg, err = security.ClientTLS(name, c.ServerTLSCA)
+		if seen[p.ID] {
+			return nerr.New(nerr.InvalidArgument, "ops.Config", "duplicate connection profile id "+p.ID)
 		}
-		if err != nil {
-			return nextsql.Config{}, err
-		}
+		seen[p.ID] = true
+	}
+	return nil
+}
+
+// driverConfigFor builds the driver Config for one profile: everything
+// except the operator's user/password, which sign-in supplies. TLS material
+// is re-read from disk on every connection so a rotated CA or client
+// certificate takes effect without restarting Admin.
+func driverConfigFor(p profile.Profile) (nextsql.Config, error) {
+	cfg := nextsql.Config{
+		Address:       p.Address,
+		Database:      p.Database,
+		InsecureNoTLS: p.Insecure,
+	}
+	tlsCfg, err := p.ClientTLS()
+	if err != nil {
+		return nextsql.Config{}, err
+	}
+	if tlsCfg != nil {
 		cfg.TLS = tlsCfg
 		cfg.InsecureNoTLS = false
 	}

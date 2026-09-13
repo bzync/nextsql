@@ -30,6 +30,7 @@ Native wire protocol → TLS 1.3 → authn → RBAC
 | Clustered B+Tree first | Primary leaves hold rows. Secondary indexes hold secondary key + primary key |
 | Vectorized execution | Batches, not row-at-a-time as the primary model |
 | Bounded resources | No unbounded goroutines, allocations, or result materialization |
+| One database per daemon | One `nextsqld` serves one database, with its own files, keys, users, and ACL. Run another daemon for another database |
 | Raft, not a new consensus | HA only after single-node durability is proven |
 | Deterministic optimizer | No LLM as the primary planner |
 | Honest threat model | A live unlocked host with keys in RAM can expose plaintext |

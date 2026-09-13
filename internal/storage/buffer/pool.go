@@ -30,6 +30,11 @@ type frame struct {
 	pins     int
 	dirty    bool
 	ref      bool
+	// recLSN is the LSN of the oldest logged change to this page that has
+	// not yet been written to the data file, or zero when the file holds
+	// everything logged. A checkpoint may not place its redo boundary past
+	// any frame's recLSN (see MinRecLSN).
+	recLSN format.LSN
 }
 
 // Handle is a pinned logical page. Release must be called exactly once.
@@ -158,6 +163,7 @@ func (p *Pool) Pin(id format.PageID) (*Handle, error) {
 			return nil, err
 		}
 		fr.occupied = true
+		fr.recLSN = 0
 		fr.loading = true
 		fr.id = id
 		fr.pins = 1
@@ -194,6 +200,7 @@ func (p *Pool) Pin(id format.PageID) (*Handle, error) {
 func (p *Pool) abortLoad(fr *frame) {
 	delete(p.index, fr.id)
 	fr.occupied = false
+	fr.recLSN = 0
 	fr.loading = false
 	fr.id = 0
 	fr.pins = 0
@@ -226,6 +233,7 @@ func (p *Pool) Install(pg *page.Page) (*Handle, error) {
 		return nil, err
 	}
 	fr.occupied = true
+	fr.recLSN = 0
 	fr.id = id
 	fr.pins = 1
 	fr.dirty = true
@@ -256,6 +264,7 @@ func (p *Pool) InstallNew(id format.PageID, typ format.PageType) (*Handle, error
 		return nil, err
 	}
 	fr.occupied = true
+	fr.recLSN = 0
 	fr.id = id
 	fr.pins = 1
 	fr.dirty = true
@@ -280,6 +289,7 @@ func (p *Pool) Drop(id format.PageID) error {
 	}
 	delete(p.index, fr.id)
 	fr.occupied = false
+	fr.recLSN = 0
 	fr.id = 0
 	fr.pins = 0
 	fr.dirty = false
@@ -349,7 +359,26 @@ func (p *Pool) StampLSN(id format.PageID, lsn format.LSN) {
 	defer p.mu.Unlock()
 	if fr, ok := p.index[id]; ok && fr.occupied && !fr.loading {
 		page.StampLSN(fr.data, lsn)
+		if fr.recLSN == 0 || lsn < fr.recLSN {
+			fr.recLSN = lsn
+		}
 	}
+}
+
+// MinRecLSN returns the smallest recLSN of any frame, or zero when every
+// logged change is already in the data file. Recovery must replay from at
+// least this LSN: a page a running transaction keeps dirty cannot be flushed,
+// so its committed images may be older than anything a checkpoint wrote.
+func (p *Pool) MinRecLSN() format.LSN {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	var min format.LSN
+	for _, fr := range p.frames {
+		if fr.occupied && fr.recLSN != 0 && (min == 0 || fr.recLSN < min) {
+			min = fr.recLSN
+		}
+	}
+	return min
 }
 
 // Replace writes a replica page image to disk and updates a cached copy.
@@ -372,6 +401,7 @@ func (p *Pool) Replace(id format.PageID, data []byte) error {
 	if fr, ok := p.index[id]; ok {
 		copy(fr.data, data)
 		fr.dirty = false
+		fr.recLSN = 0
 	}
 	p.mu.Unlock()
 	return p.file.WriteLogical(id, data)
@@ -458,11 +488,13 @@ func (p *Pool) drop(fr *frame) error {
 	}
 	delete(p.index, fr.id)
 	fr.occupied = false
+	fr.recLSN = 0
 	fr.loading = false
 	fr.id = 0
 	fr.pins = 0
 	fr.dirty = false
 	fr.ref = false
+	fr.recLSN = 0
 	return nil
 }
 
@@ -481,5 +513,6 @@ func (p *Pool) writeFrame(fr *frame) error {
 		return err
 	}
 	fr.dirty = false
+	fr.recLSN = 0
 	return nil
 }

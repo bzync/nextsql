@@ -18,9 +18,24 @@ import (
 const dmlChunk = 4096
 
 func (s *Session) execPlan(plan planner.Logical) (*Result, error) {
+	// A schema change is not reversible through the row undo chain a savepoint
+	// rolls back, so note it: a later ROLLBACK TO a savepoint set before this
+	// statement refuses rather than half-reverting (see savepoint.go).
+	switch plan.(type) {
+	case planner.CreateTable, planner.CreateTableAs, planner.DropTable, planner.AlterTable,
+		planner.CreateView, planner.DropView,
+		planner.CreateIndex, planner.DropIndex, planner.RebuildIndex,
+		planner.CreateWorkflow, planner.AlterWorkflow, planner.DropWorkflow,
+		planner.CreateTrigger, planner.AlterTrigger, planner.DropTrigger,
+		planner.CreateSchedule, planner.AlterSchedule, planner.DropSchedule,
+		planner.CreateResourceGroup, planner.AlterResourceGroup, planner.DropResourceGroup:
+		s.ddlSeq++
+	}
 	switch p := plan.(type) {
 	case planner.CreateTable:
 		return s.execCreateTable(p)
+	case planner.CreateTableAs:
+		return s.execCreateTableAs(p)
 	case planner.CreateWorkflow:
 		return s.execCreateWorkflow(p)
 	case planner.RunWorkflow:
@@ -51,6 +66,12 @@ func (s *Session) execPlan(plan planner.Logical) (*Result, error) {
 		return s.execShowTasks(p)
 	case planner.CancelTask:
 		return s.execCancelTask(p)
+	case planner.CancelQuery:
+		return s.execCancelQuery(p.ID)
+	case planner.CreateView:
+		return s.execCreateView(p)
+	case planner.DropView:
+		return s.execDropView(p)
 	case planner.DropTable:
 		return s.execDropTable(p)
 	case planner.DropIndex:
@@ -613,6 +634,9 @@ func (s *Session) execInsert(p planner.Insert) (*Result, error) {
 		return nil, err
 	}
 	htx := s.x.use(heap)
+	if p.Input != nil {
+		return s.execInsertQuery(p, tab, htx)
+	}
 	var n int64
 	var out [][]types.Value
 	empty := make([]types.Value, len(tab.Columns))
@@ -621,6 +645,7 @@ func (s *Session) execInsert(p planner.Insert) (*Result, error) {
 	}
 	for _, exprs := range p.Rows {
 		row := append([]types.Value(nil), empty...)
+		named := make([]bool, len(tab.Columns))
 		for j, ex := range exprs {
 			v, err := s.evalInsertValue(ex, tab, p.Columns[j], row)
 			if err != nil {
@@ -631,24 +656,112 @@ func (s *Session) execInsert(p planner.Insert) (*Result, error) {
 				return nil, err
 			}
 			row[p.Columns[j]] = v
+			named[p.Columns[j]] = !requestsDefault(ex)
 		}
-		for i := range row {
-			nv, err := s.applyDefault(tab, i, row[i])
+		if err := s.finishInsertRow(tab, htx, row, named, p.Returning, &out); err != nil {
+			return nil, err
+		}
+		n++
+	}
+	if err := s.maybeAutoAnalyze(tab, n); err != nil {
+		return nil, err
+	}
+	return returningResult(p.Returning, out, n), nil
+}
+
+// finishInsertRow completes a row whose named columns are already filled:
+// defaults, the NOT NULL check, the legacy-tenant check, the write itself and
+// RETURNING. Both insert forms end here, so a VALUES row and a query row are
+// subject to exactly the same rules.
+//
+// named marks the columns the statement supplied a value for. A column default
+// fills only a column the statement did not name: an explicit NULL is a value,
+// stored as NULL and refused by NOT NULL. Filling every NULL cell instead made
+// `INSERT ... VALUES ($1)` with a NULL parameter store the default, and made a
+// logical export/import replace every stored NULL in a defaulted column with
+// the default -- fabricating NOW() and UUID() values on restore.
+func (s *Session) finishInsertRow(tab *catalog.Table, htx *btree.Txn, row []types.Value, named []bool, ret binder.Returning, out *[][]types.Value) error {
+	for i := range row {
+		if named[i] {
+			if row[i].Null && tab.Columns[i].NotNull {
+				return nerr.New(nerr.InvalidArgument, "executor.Insert", "NULL in NOT NULL column")
+			}
+			if !row[i].Null && tab.Columns[i].Default.Kind == catalog.DefAI {
+				// An explicit value still advances the column's AI() counter.
+				if _, err := s.applyDefault(tab, i, row[i]); err != nil {
+					return err
+				}
+			}
+			continue
+		}
+		nv, err := s.applyDefault(tab, i, row[i])
+		if err != nil {
+			return err
+		}
+		if nv.Null && tab.Columns[i].NotNull {
+			return nerr.New(nerr.InvalidArgument, "executor.Insert", "NULL in NOT NULL column")
+		}
+		row[i] = nv
+	}
+	if err := s.checkLegacyTenantRow(tab, row); err != nil {
+		return err
+	}
+	if err := s.writeRow(tab, htx, row, true); err != nil {
+		return err
+	}
+	return s.collectReturning(out, ret, tab, row, nil)
+}
+
+// execInsertQuery runs `INSERT INTO t [(cols)] <query>`.
+//
+// The source runs as an ordinary query and is read to completion before the
+// first row is written. That is a correctness requirement, not a convenience:
+// a transaction sees its own writes -- txn.Snapshot.Sees is true for its own
+// id, and there is no statement-level command id that would cut a statement's
+// own output out of its input -- so a streaming `INSERT INTO t SELECT ... FROM
+// t` would read back the rows it had just written and feed itself without
+// bound. Reading the source first is what makes it a fixed relation, whether
+// the self-reference is direct or reached through a CTE, a view or a join.
+//
+// Running it through execPlan is also what bounds it: the query path already
+// caps a result by max_result_rows and max_result_bytes and charges it to the
+// statement's memory budget, so an oversized source is the same explicit
+// Exhausted rejection any other query of that size would get, never an OOM
+// and never a silently truncated insert.
+func (s *Session) execInsertQuery(p planner.Insert, tab *catalog.Table, htx *btree.Txn) (*Result, error) {
+	res, err := s.execPlan(p.Input)
+	if err != nil {
+		return nil, err
+	}
+	if res == nil {
+		return nil, nerr.New(nerr.Internal, "executor.Insert", "INSERT source produced no result")
+	}
+	if len(res.Columns) != len(p.Columns) {
+		return nil, nerr.New(nerr.Internal, "executor.Insert", "INSERT source column count changed after binding")
+	}
+	var (
+		n   int64
+		out [][]types.Value
+	)
+	empty := make([]types.Value, len(tab.Columns))
+	for i := range empty {
+		empty[i] = types.Null(tab.Columns[i].Type)
+	}
+	for _, vals := range res.Rows {
+		if len(vals) != len(p.Columns) {
+			return nil, nerr.New(nerr.Internal, "executor.Insert", "INSERT source row width changed after binding")
+		}
+		row := append([]types.Value(nil), empty...)
+		named := make([]bool, len(tab.Columns))
+		for j, v := range vals {
+			cv, err := types.Coerce(v, tab.Columns[p.Columns[j]].Type)
 			if err != nil {
 				return nil, err
 			}
-			if nv.Null && tab.Columns[i].NotNull {
-				return nil, nerr.New(nerr.InvalidArgument, "executor.Insert", "NULL in NOT NULL column")
-			}
-			row[i] = nv
+			row[p.Columns[j]] = cv
+			named[p.Columns[j]] = true
 		}
-		if err := s.checkLegacyTenantRow(tab, row); err != nil {
-			return nil, err
-		}
-		if err := s.writeRow(tab, htx, row, true); err != nil {
-			return nil, err
-		}
-		if err := s.collectReturning(&out, p.Returning, tab, row, nil); err != nil {
+		if err := s.finishInsertRow(tab, htx, row, named, p.Returning, &out); err != nil {
 			return nil, err
 		}
 		n++
@@ -914,6 +1027,9 @@ func (s *Session) writeRow(tab *catalog.Table, htx *btree.Txn, row []types.Value
 	if err := validateClientEncryptedRow(tab, row); err != nil {
 		return err
 	}
+	if err := s.checkRowConstraints(tab, row); err != nil {
+		return err
+	}
 	event := ast.TriggerInsert
 	if !insert {
 		event = ast.TriggerUpdate
@@ -977,6 +1093,9 @@ func (s *Session) writeRow(tab *catalog.Table, htx *btree.Txn, row []types.Value
 
 func (s *Session) replaceRow(tab *catalog.Table, htx *btree.Txn, old, neu []types.Value) error {
 	if err := validateClientEncryptedRow(tab, neu); err != nil {
+		return err
+	}
+	if err := s.checkRowConstraints(tab, neu); err != nil {
 		return err
 	}
 	if err := s.fireTriggers(tab, ast.TriggerUpdate, ast.TriggerBefore, old, neu); err != nil {

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import {
+  Alert,
   AppShell,
   AppShellBody,
   AppShellMain,
@@ -25,7 +26,8 @@ import {
   Topbar,
   TopbarTitle,
 } from "@bzync/rui";
-import type { Whoami } from "./api";
+import { api, type Whoami } from "./api";
+import { SwitchServer } from "./SwitchServer";
 import { useServerConnection } from "./useServerConnection";
 import { AdminSearchModal } from "./AdminSearchModal";
 import { UserSettingsModal } from "./UserSettingsModal";
@@ -122,11 +124,13 @@ function PanelIcon({ collapsed }: { collapsed: boolean }) {
 export function Shell({
   who,
   onSignOut,
-  onConnectionChanged,
+  onSwitched,
 }: {
   who: Whoami;
   onSignOut: () => void;
-  onConnectionChanged: (next: { realm: string; database: string }) => void;
+  // Called with the NEW session after a successful server switch; the App
+  // re-keys this Shell on it, so everything re-reads against the new server.
+  onSwitched: (next: Whoami) => void;
 }) {
   const hashRouter = useHashRoute("overview");
   const tab = (VIEW_LABELS[hashRouter.section] ? hashRouter.section : "overview") as ViewId;
@@ -139,6 +143,37 @@ export function Shell({
   const onUnauthorized = onSignOut;
   const { status: serverConnection, checking: connectionChecking, refresh: refreshConnection } = useServerConnection(onUnauthorized);
   const { preferences } = useUserPreferences();
+
+  // Server switching is offered only when this Admin declares more than one
+  // connection profile. The list is fixed for the process, so one read is
+  // enough; a failure just hides the action (sign-out still works).
+  const [switchOpen, setSwitchOpen] = useState(false);
+  const [profileCount, setProfileCount] = useState(0);
+  useEffect(() => {
+    let stopped = false;
+    api
+      .sessionProfiles()
+      .then((list) => {
+        if (!stopped) setProfileCount(list.profiles.length);
+      })
+      .catch(() => undefined);
+    return () => {
+      stopped = true;
+    };
+  }, []);
+  const canSwitch = profileCount > 1;
+  const openSwitch = useCallback(() => setSwitchOpen(true), []);
+  // A switch that succeeded but could not save the password (or did save it)
+  // says so once, on the new session's first render.
+  const [switchNotice, setSwitchNotice] = useState<{ variant: "warning" | "success"; text: string } | null>(() =>
+    who.warning
+      ? { variant: "warning", text: who.warning }
+      : who.credential_saved
+        ? { variant: "success", text: `Password saved in the operating system's credential store for ${who.user} on ${who.profile?.name ?? "this server"}.` }
+        : null,
+  );
+  const serverName = who.profile?.name || "nextsqld";
+  const serverEnvironment = who.profile?.environment;
 
   const [sidebarCollapsed, setSidebarCollapsed] = useState(readSidebarCollapsed);
   const toggleSidebar = useCallback(() => {
@@ -249,49 +284,10 @@ export function Shell({
                 {!sidebarCollapsed ? (
                   <div className="nsm-sidebar-user-text">
                     <span className="nsm-sidebar-user-name">{who.user}</span>
-                    <span className="nsm-sidebar-user-sub font-mono">{who.database || "default"}</span>
+                    <span className="nsm-sidebar-user-sub font-mono">{serverName}{who.database ? ` · ${who.database}` : ""}</span>
                   </div>
                 ) : null}
-                {!sidebarCollapsed ? (
-                  <Icon name="settings" size={14} className="nsm-sidebar-user-gear" />
-                ) : null}
               </button>
-              <div className="nsm-sidebar-footer-actions">
-                {sidebarCollapsed ? (
-                  <>
-                    <Tooltip content="User settings" position="right">
-                      <IconButton label="User settings" onClick={() => setSettingsOpen(true)}>
-                        <Icon name="settings" size={16} />
-                      </IconButton>
-                    </Tooltip>
-                    <Tooltip content="Sign out" position="right">
-                      <IconButton label="Sign out" onClick={onSignOut}>
-                        <Icon name="logout" size={16} />
-                      </IconButton>
-                    </Tooltip>
-                  </>
-                ) : (
-                  <Inline gap="xs" align="center" className="w-full">
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      icon={<Icon name="settings" size={14} />}
-                      onClick={() => setSettingsOpen(true)}
-                      className="flex-1 justify-center"
-                    >
-                      Settings
-                    </Button>
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      icon={<Icon name="logout" size={14} />}
-                      onClick={onSignOut}
-                      title="Sign out"
-                      aria-label="Sign out"
-                    />
-                  </Inline>
-                )}
-              </div>
             </div>
           </aside>
           <AppShellBody className="nsm-body">
@@ -323,6 +319,14 @@ export function Shell({
                 {serverConnection && !serverConnection.connected ? (
                   <StatusDot status="offline" label="nextsqld unreachable" />
                 ) : null}
+                <span className="nsm-topbar-server" title={who.profile?.address ? `${serverName} — ${who.profile.address}` : serverName}>
+                  <Badge variant="muted" size="sm" className="font-mono nsm-topbar-server-name">{serverName}</Badge>
+                  {serverEnvironment ? (
+                    <Badge variant={serverEnvironment === "production" ? "warning" : "muted"} size="sm">
+                      {serverEnvironment}
+                    </Badge>
+                  ) : null}
+                </span>
                 <button
                   type="button"
                   className="nsm-topbar-profile-btn"
@@ -335,23 +339,8 @@ export function Shell({
                   <Badge variant="muted" size="sm" className="hidden xl:inline-flex font-mono">
                     {who.database || "default"}
                   </Badge>
-                  <Icon name="settings" size={13} className="text-muted-foreground ml-1" />
                 </button>
-                <Tooltip content="User settings">
-                  <IconButton label="User settings" onClick={() => setSettingsOpen(true)}>
-                    <Icon name="settings" size={16} />
-                  </IconButton>
-                </Tooltip>
                 <ThemeSelect />
-                <Button
-                  className="nsm-topbar-signout"
-                  variant="outline"
-                  size="sm"
-                  icon={<Icon name="logout" size={14} />}
-                  onClick={onSignOut}
-                >
-                  Sign out
-                </Button>
               </Inline>
             </Topbar>
             <TabsList className="nsm-mobile-nav" aria-label="Operations">
@@ -367,6 +356,7 @@ export function Shell({
                 <PageHeader
                   breadcrumbs={(
                     <Breadcrumb
+                      className="nsm-breadcrumb"
                       items={[
                         { label: "NextSQL Admin" },
                         { label: tab === "studio" ? "Studio" : "Operations" },
@@ -379,12 +369,23 @@ export function Shell({
                   description={view.description}
                   actions={(
                     <Inline gap="sm">
+                      {canSwitch ? (
+                        <Button variant="ghost" size="sm" icon={<Icon name="plug" size={14} />} onClick={openSwitch}>Switch server</Button>
+                      ) : null}
                       <Button variant="ghost" size="sm" icon={<Icon name="refresh" size={14} />} onClick={refresh}>Refresh</Button>
                       <Button variant="ghost" size="sm" icon={<Icon name="settings" size={14} />} onClick={() => setSettingsOpen(true)}>Settings</Button>
                       <Button className="nsm-mobile-signout" variant="outline" size="sm" icon={<Icon name="logout" size={14} />} onClick={onSignOut}>Sign out</Button>
                     </Inline>
                   )}
                 />
+                {switchNotice ? (
+                  <Alert variant={switchNotice.variant} role="status" className="nsm-switch-notice">
+                    <Inline gap="sm" align="center" wrap>
+                      <span>{switchNotice.text}</span>
+                      <Button variant="ghost" size="sm" onClick={() => setSwitchNotice(null)}>Dismiss</Button>
+                    </Inline>
+                  </Alert>
+                ) : null}
                 <TabsContent value="overview">
                   <Overview key={`o-${refreshKey}`} onUnauthorized={onUnauthorized} />
                 </TabsContent>
@@ -414,10 +415,10 @@ export function Shell({
                 </TabsContent>
                 <TabsContent value="studio">
                   <StudioWorkspace
-                    key={`studio-${refreshKey}-${who.realm}-${who.database}`}
+                    key={`studio-${refreshKey}`}
                     who={who}
                     onUnauthorized={onUnauthorized}
-                    onConnectionChanged={onConnectionChanged}
+                    onRequestSwitchServer={canSwitch ? openSwitch : undefined}
                     serverConnection={serverConnection}
                     connectionChecking={connectionChecking}
                     onRetryConnection={refreshConnection}
@@ -442,11 +443,23 @@ export function Shell({
         onSignOut={onSignOut}
         onOpenSettings={() => setSettingsOpen(true)}
       />
+      {switchOpen ? (
+        <SwitchServer
+          who={who}
+          onClose={() => setSwitchOpen(false)}
+          onSwitched={(next) => {
+            setSwitchOpen(false);
+            onSwitched(next);
+          }}
+          onUnauthorized={onUnauthorized}
+        />
+      ) : null}
       <UserSettingsModal
         open={settingsOpen}
         onClose={() => setSettingsOpen(false)}
         who={who}
         onSignOut={onSignOut}
+        onSwitchConnection={canSwitch ? openSwitch : undefined}
       />
     </>
   );

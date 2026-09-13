@@ -14,9 +14,32 @@ import (
 
 type Parser struct {
 	lx         *lexer.Lexer
+	src        string
 	tok        lexer.Token
 	subqueryID uint64
+	// depth is the current recursive-descent nesting. Every grammar rule that
+	// can re-enter itself (expressions, unary operators, queries, statements)
+	// passes through enter, so the parser's own stack is bounded before the
+	// finished tree is measured against ast.MaxNestingDepth.
+	depth int
 }
+
+// errNesting is returned for a statement nested deeper than
+// ast.MaxNestingDepth. It is a limit, not a grammar error, so it uses the
+// invalid_argument class like the parser's other structural bounds.
+func errNesting() error {
+	return nerr.New(nerr.InvalidArgument, "sql.parser", "statement nesting exceeds the maximum depth of "+strconv.Itoa(ast.MaxNestingDepth))
+}
+
+func (p *Parser) enter() error {
+	p.depth++
+	if p.depth > ast.MaxNestingDepth {
+		return errNesting()
+	}
+	return nil
+}
+
+func (p *Parser) leave() { p.depth-- }
 
 func (p *Parser) nextSubqueryID() uint64 {
 	p.subqueryID++
@@ -47,7 +70,7 @@ func Parse(src string) (ast.Stmt, error) {
 // offending token) and err is the same typed error Parse returns — the two
 // are always set together. Callers that do not need the location use Parse.
 func ParseDiag(src string) (ast.Stmt, *SyntaxDiag, error) {
-	p := &Parser{lx: lexer.New(src)}
+	p := &Parser{lx: lexer.New(src), src: src}
 	p.next()
 	if p.tok.Kind == lexer.EOF {
 		return nil, p.diag(nil, "empty statement"), nerr.New(nerr.Syntax, "sql.parser", "empty statement")
@@ -64,6 +87,12 @@ func ParseDiag(src string) (ast.Stmt, *SyntaxDiag, error) {
 	}
 	if err := p.lx.Err(); err != nil {
 		return nil, p.diag(err, ""), err
+	}
+	// Operator and set-operation chains are parsed iteratively into left-deep
+	// trees, so the recursion counter alone does not bound the tree's depth.
+	if ast.ExceedsDepth(stmt, ast.MaxNestingDepth) {
+		err := errNesting()
+		return nil, &SyntaxDiag{Offset: 0, Message: "statement nesting exceeds the maximum depth of " + strconv.Itoa(ast.MaxNestingDepth)}, err
 	}
 	return stmt, nil, nil
 }
@@ -92,6 +121,31 @@ func (p *Parser) next() {
 }
 
 func (p *Parser) stmt() (ast.Stmt, error) {
+	if err := p.enter(); err != nil {
+		return nil, err
+	}
+	defer p.leave()
+	// SAVEPOINT and RELEASE stay contextual identifiers rather than reserved
+	// words, so a table or column named either keeps working.
+	if p.identIs("savepoint") {
+		p.next()
+		name, err := p.ident()
+		if err != nil {
+			return nil, err
+		}
+		return ast.Savepoint{Name: name}, nil
+	}
+	if p.identIs("release") {
+		p.next()
+		if p.identIs("savepoint") {
+			p.next()
+		}
+		name, err := p.ident()
+		if err != nil {
+			return nil, err
+		}
+		return ast.ReleaseSavepoint{Name: name}, nil
+	}
 	if p.tok.Kind == lexer.Ident && strings.EqualFold(p.tok.Lit, "verify") {
 		return p.verifyBackupStmt()
 	}
@@ -154,6 +208,19 @@ func (p *Parser) stmt() (ast.Stmt, error) {
 		p.next()
 		if p.tok.Kind == lexer.KwTransaction {
 			p.next()
+		}
+		// ROLLBACK TO [SAVEPOINT] name rolls back part of the transaction and
+		// leaves it open; a bare ROLLBACK ends it.
+		if p.tok.Kind == lexer.KwTo {
+			p.next()
+			if p.identIs("savepoint") {
+				p.next()
+			}
+			name, err := p.ident()
+			if err != nil {
+				return nil, err
+			}
+			return ast.Rollback{Savepoint: name}, nil
 		}
 		return ast.Rollback{}, nil
 	default:
@@ -450,6 +517,17 @@ func (p *Parser) clusterStmt() (ast.Stmt, error) {
 
 func (p *Parser) cancelTask() (ast.Stmt, error) {
 	p.next()
+	// CANCEL QUERY '<id>' stops a running statement; QUERY stays a contextual
+	// identifier, like the other operational nouns.
+	if p.identIs("query") {
+		p.next()
+		if p.tok.Kind != lexer.String || p.tok.Lit == "" {
+			return nil, nerr.New(nerr.Syntax, "sql.parser", "CANCEL QUERY requires a query id string")
+		}
+		out := ast.CancelQuery{ID: p.tok.Lit}
+		p.next()
+		return out, nil
+	}
 	if err := p.expect(lexer.KwTask, "TASK"); err != nil {
 		return nil, err
 	}
@@ -462,6 +540,10 @@ func (p *Parser) cancelTask() (ast.Stmt, error) {
 }
 
 func (p *Parser) queryOrWith() (ast.Stmt, error) {
+	if err := p.enter(); err != nil {
+		return nil, err
+	}
+	defer p.leave()
 	if p.tok.Kind == lexer.KwWith {
 		return p.withQuery()
 	}
@@ -537,11 +619,19 @@ func (p *Parser) withQuery() (ast.Stmt, error) {
 }
 
 func (p *Parser) query() (ast.Stmt, error) {
+	base := p.depth
+	if err := p.enter(); err != nil {
+		return nil, err
+	}
+	defer func() { p.depth = base }()
 	left, err := p.intersectQuery()
 	if err != nil {
 		return nil, err
 	}
 	for p.tok.Kind == lexer.KwUnion || p.tok.Kind == lexer.KwExcept {
+		if err := p.enter(); err != nil {
+			return nil, err
+		}
 		op := "union"
 		if p.tok.Kind == lexer.KwExcept {
 			op = "except"
@@ -568,11 +658,16 @@ func (p *Parser) query() (ast.Stmt, error) {
 }
 
 func (p *Parser) intersectQuery() (ast.Stmt, error) {
+	base := p.depth
+	defer func() { p.depth = base }()
 	left, err := p.sel()
 	if err != nil {
 		return nil, err
 	}
 	for p.tok.Kind == lexer.KwIntersect {
+		if err := p.enter(); err != nil {
+			return nil, err
+		}
 		p.next()
 		if p.tok.Kind == lexer.KwAll {
 			return nil, nerr.New(nerr.Syntax, "sql.parser", "INTERSECT ALL is not implemented")
@@ -648,6 +743,17 @@ func (p *Parser) create() (ast.Stmt, error) {
 		// answers with the reason rather than a bare syntax error.
 		return nil, nerr.New(nerr.Syntax, "sql.parser",
 			"CREATE DATABASE is not supported: a NextSQL deployment serves exactly one database")
+	case lexer.KwOr:
+		// CREATE OR REPLACE VIEW
+		p.next()
+		if !p.identIs("replace") {
+			return nil, nerr.New(nerr.Syntax, "sql.parser", "expected REPLACE after CREATE OR")
+		}
+		p.next()
+		if !p.identIs("view") {
+			return nil, nerr.New(nerr.Syntax, "sql.parser", "CREATE OR REPLACE supports VIEW")
+		}
+		return p.createView(true)
 	case lexer.KwWorkflow:
 		return p.createWorkflow()
 	case lexer.KwTrigger:
@@ -657,8 +763,54 @@ func (p *Parser) create() (ast.Stmt, error) {
 	case lexer.KwResource:
 		return p.createResourceGroup()
 	default:
-		return nil, nerr.New(nerr.Syntax, "sql.parser", "expected TABLE, INDEX, DATABASE, WORKFLOW, TRIGGER, SCHEDULE, or RESOURCE GROUP")
+		// VIEW stays a contextual identifier, so a table or column named
+		// `view` keeps working.
+		if p.identIs("view") {
+			return p.createView(false)
+		}
+		return nil, nerr.New(nerr.Syntax, "sql.parser", "expected TABLE, VIEW, INDEX, DATABASE, WORKFLOW, TRIGGER, SCHEDULE, or RESOURCE GROUP")
 	}
+}
+
+// createView parses `CREATE [OR REPLACE] VIEW name [(col, ...)] AS <query>`.
+// The defining query is captured as written — the same bytes the operator
+// sent — because a view has to re-resolve against the catalog as it is at each
+// use, not against the shapes that existed when it was created.
+func (p *Parser) createView(replace bool) (ast.Stmt, error) {
+	p.next()
+	name, err := p.ident()
+	if err != nil {
+		return nil, err
+	}
+	var cols []string
+	if p.tok.Kind == lexer.LParen {
+		cols, err = p.identList()
+		if err != nil {
+			return nil, err
+		}
+	}
+	if err := p.expect(lexer.KwAs, "AS"); err != nil {
+		return nil, err
+	}
+	if p.tok.Kind != lexer.KwSelect && p.tok.Kind != lexer.KwWith {
+		return nil, nerr.New(nerr.Syntax, "sql.parser", "CREATE VIEW requires a SELECT query")
+	}
+	start := p.tok.Pos
+	if _, err := p.queryOrWith(); err != nil {
+		return nil, err
+	}
+	end := len(p.src)
+	if p.tok.Kind != lexer.EOF {
+		end = p.tok.Pos
+	}
+	if start < 0 || start > len(p.src) || end < start {
+		return nil, nerr.New(nerr.Internal, "sql.parser", "could not capture the view query")
+	}
+	query := strings.TrimRight(strings.TrimSpace(p.src[start:end]), ";")
+	if query == "" {
+		return nil, nerr.New(nerr.Syntax, "sql.parser", "CREATE VIEW requires a SELECT query")
+	}
+	return ast.CreateView{Name: name, Columns: cols, Query: query, Replace: replace}, nil
 }
 
 func (p *Parser) createSchedule() (ast.Stmt, error) {
@@ -1279,7 +1431,10 @@ func walkWorkflowExpr(expr ast.Expr, param func(string) error) error {
 func workflowBodyStmtAllowed(stmt ast.Stmt) bool {
 	switch s := stmt.(type) {
 	case ast.Insert:
-		return !s.ReturningStar && len(s.Returning) == 0
+		// A workflow body is persisted as table/columns/rows, so a query
+		// source has nowhere to be stored and would decode as an empty
+		// INSERT. Refuse it here rather than silently drop it.
+		return s.Query == nil && !s.ReturningStar && len(s.Returning) == 0
 	case ast.Upsert:
 		return !s.ReturningStar && len(s.Returning) == 0
 	case ast.Update:
@@ -1388,6 +1543,24 @@ func (p *Parser) drop() (ast.Stmt, error) {
 			return nil, err
 		}
 		return ast.DropIndex{Name: name, IfExists: ifExists}, nil
+	case lexer.Ident:
+		if p.tok.Lit != "view" {
+			break
+		}
+		p.next()
+		ifExists := false
+		if p.tok.Kind == lexer.KwIf {
+			p.next()
+			if err := p.expect(lexer.KwExists, "EXISTS"); err != nil {
+				return nil, err
+			}
+			ifExists = true
+		}
+		name, err := p.ident()
+		if err != nil {
+			return nil, err
+		}
+		return ast.DropView{Name: name, IfExists: ifExists}, nil
 	case lexer.KwUser:
 		p.next()
 		name, err := p.ident()
@@ -1449,9 +1622,8 @@ func (p *Parser) drop() (ast.Stmt, error) {
 		return ast.DropSchedule{Name: name, IfExists: ifExists}, nil
 	case lexer.KwResource:
 		return p.dropResourceGroup()
-	default:
-		return nil, nerr.New(nerr.Syntax, "sql.parser", "expected TABLE, INDEX, USER, ROLE, WORKFLOW, TRIGGER, SCHEDULE, or RESOURCE GROUP")
 	}
+	return nil, nerr.New(nerr.Syntax, "sql.parser", "expected TABLE, VIEW, INDEX, USER, ROLE, WORKFLOW, TRIGGER, SCHEDULE, or RESOURCE GROUP")
 }
 
 func (p *Parser) alter() (ast.Stmt, error) {
@@ -1558,10 +1730,13 @@ func (p *Parser) alterCmd() (ast.AlterCmd, error) {
 			}
 			return ast.AlterAddPartition{Partition: part}, nil
 		}
-		if p.tok.Kind == lexer.KwConstraint || p.tok.Kind == lexer.KwForeign {
-			fk, err := p.tableFK()
+		if p.tok.Kind == lexer.KwConstraint || p.tok.Kind == lexer.KwForeign || p.identIs("check") {
+			fk, chk, err := p.tableConstraint()
 			if err != nil {
 				return nil, err
+			}
+			if chk != nil {
+				return ast.AlterAddConstraint{Check: chk}, nil
 			}
 			return ast.AlterAddConstraint{FK: fk}, nil
 		}
@@ -1627,6 +1802,51 @@ func (p *Parser) alterCmd() (ast.AlterCmd, error) {
 			return nil, err
 		}
 		return ast.AlterRenameColumn{Old: old, New: neu}, nil
+	case lexer.KwAlter:
+		// ALTER TABLE ALTER [COLUMN] c SET/DROP NOT NULL | SET/DROP DEFAULT.
+		p.next()
+		if p.tok.Kind == lexer.KwColumn {
+			p.next()
+		}
+		name, err := p.ident()
+		if err != nil {
+			return nil, err
+		}
+		switch p.tok.Kind {
+		case lexer.KwSet:
+			p.next()
+			if p.tok.Kind == lexer.KwNot {
+				p.next()
+				if err := p.expect(lexer.KwNull, "NULL"); err != nil {
+					return nil, err
+				}
+				return ast.AlterColumn{Name: name, SetNotNull: true}, nil
+			}
+			if p.tok.Kind == lexer.KwDefault {
+				p.next()
+				ex, err := p.primary()
+				if err != nil {
+					return nil, err
+				}
+				return ast.AlterColumn{Name: name, SetDefault: ex}, nil
+			}
+			return nil, nerr.New(nerr.Syntax, "sql.parser", "expected NOT NULL or DEFAULT after ALTER COLUMN ... SET")
+		case lexer.KwDrop:
+			p.next()
+			if p.tok.Kind == lexer.KwNot {
+				p.next()
+				if err := p.expect(lexer.KwNull, "NULL"); err != nil {
+					return nil, err
+				}
+				return ast.AlterColumn{Name: name, DropNotNull: true}, nil
+			}
+			if p.tok.Kind == lexer.KwDefault {
+				p.next()
+				return ast.AlterColumn{Name: name, DropDefault: true}, nil
+			}
+			return nil, nerr.New(nerr.Syntax, "sql.parser", "expected NOT NULL or DEFAULT after ALTER COLUMN ... DROP")
+		}
+		return nil, nerr.New(nerr.Syntax, "sql.parser", "expected SET or DROP after ALTER COLUMN")
 	case lexer.KwSet:
 		p.next()
 		if p.tok.Kind != lexer.Ident || p.tok.Lit != "cdc" {
@@ -1644,7 +1864,7 @@ func (p *Parser) alterCmd() (ast.AlterCmd, error) {
 		p.next()
 		return ast.AlterSetCDCImages{Mode: mode}, nil
 	default:
-		return nil, nerr.New(nerr.Syntax, "sql.parser", "expected ADD, DROP, RENAME, or SET CDC IMAGES")
+		return nil, nerr.New(nerr.Syntax, "sql.parser", "expected ADD, DROP, ALTER COLUMN, RENAME, or SET CDC IMAGES")
 	}
 }
 
@@ -1825,13 +2045,51 @@ func (p *Parser) createTable() (ast.Stmt, error) {
 	if err != nil {
 		return nil, err
 	}
+	// `CREATE TABLE name PRIMARY KEY (cols) AS <query>` takes its column names
+	// and types from the query's output instead of a written column list. The
+	// key is named explicitly rather than inferred: every NextSQL table is
+	// clustered on its primary key and a query's output carries no key, so
+	// there is nothing to inherit and no rowid to fall back on.
+	if p.tok.Kind == lexer.KwPrimary {
+		pk, err := p.tablePK()
+		if err != nil {
+			return nil, err
+		}
+		if err := p.expect(lexer.KwAs, "AS"); err != nil {
+			return nil, err
+		}
+		// Parsed by the same entry points a standalone query uses, so the
+		// source nests, joins, aggregates and carries CTEs identically --
+		// there is no second grammar for the query inside a CREATE TABLE.
+		var q ast.Stmt
+		switch p.tok.Kind {
+		case lexer.KwWith:
+			q, err = p.withQuery()
+		case lexer.KwSelect:
+			q, err = p.query()
+		default:
+			return nil, nerr.New(nerr.Syntax, "sql.parser", "expected a query after AS")
+		}
+		if err != nil {
+			return nil, err
+		}
+		return ast.CreateTable{Name: name, PK: pk, Query: q}, nil
+	}
+	// The standard spelling of CTAS omits the key, which this dialect cannot
+	// accept -- so say what is missing instead of reporting a bare "expected
+	// (" against the column list the operator never meant to write.
+	if p.tok.Kind == lexer.KwAs {
+		return nil, nerr.New(nerr.Syntax, "sql.parser",
+			"CREATE TABLE ... AS <query> requires PRIMARY KEY (col, ...) before AS: a table is clustered on its primary key and a query's output carries none")
+	}
 	if err := p.expect(lexer.LParen, "("); err != nil {
 		return nil, err
 	}
 	var (
-		cols []ast.ColumnDef
-		pk   []string
-		fks  []ast.ForeignKeyDef
+		cols   []ast.ColumnDef
+		pk     []string
+		fks    []ast.ForeignKeyDef
+		checks []ast.CheckDef
 	)
 	for {
 		if p.tok.Kind == lexer.KwPrimary {
@@ -1843,12 +2101,16 @@ func (p *Parser) createTable() (ast.Stmt, error) {
 				return nil, nerr.New(nerr.Syntax, "sql.parser", "multiple PRIMARY KEY clauses")
 			}
 			pk = names
-		} else if p.tok.Kind == lexer.KwConstraint || p.tok.Kind == lexer.KwForeign {
-			fk, err := p.tableFK()
+		} else if p.tok.Kind == lexer.KwConstraint || p.tok.Kind == lexer.KwForeign || p.identIs("check") {
+			fk, chk, err := p.tableConstraint()
 			if err != nil {
 				return nil, err
 			}
-			fks = append(fks, fk)
+			if chk != nil {
+				checks = append(checks, *chk)
+			} else {
+				fks = append(fks, fk)
+			}
 		} else {
 			col, err := p.columnDef()
 			if err != nil {
@@ -1860,6 +2122,9 @@ func (p *Parser) createTable() (ast.Stmt, error) {
 				}
 				pk = []string{col.Name}
 			}
+			// Collected as written, so a constraint's generated name follows
+			// the order the operator sees in the statement.
+			checks = append(checks, col.Checks...)
 			cols = append(cols, col)
 		}
 		if p.tok.Kind == lexer.Comma {
@@ -1879,7 +2144,7 @@ func (p *Parser) createTable() (ast.Stmt, error) {
 		}
 		part = spec
 	}
-	return ast.CreateTable{Name: name, Columns: cols, PK: pk, FKs: fks, Partition: part}, nil
+	return ast.CreateTable{Name: name, Columns: cols, PK: pk, FKs: fks, Checks: checks, Partition: part}, nil
 }
 
 func (p *Parser) partitionSpec() (*ast.PartitionSpec, error) {
@@ -2209,10 +2474,61 @@ func (p *Parser) columnDef() (ast.ColumnDef, error) {
 				return ast.ColumnDef{}, err
 			}
 			col.References = &fk
+		case lexer.Ident:
+			// CHECK is contextual: only a constraint clause here, so a column
+			// named `check` elsewhere keeps working.
+			if p.tok.Lit != "check" {
+				return col, nil
+			}
+			chk, err := p.checkConstraint("")
+			if err != nil {
+				return ast.ColumnDef{}, err
+			}
+			col.Checks = append(col.Checks, chk)
 		default:
 			return col, nil
 		}
 	}
+}
+
+// tableConstraint parses a table-level constraint: `[CONSTRAINT name]` followed
+// by either `FOREIGN KEY ...` or `CHECK (...)`. Exactly one of the two results
+// is set.
+func (p *Parser) tableConstraint() (ast.ForeignKeyDef, *ast.CheckDef, error) {
+	name := ""
+	if p.tok.Kind == lexer.KwConstraint {
+		p.next()
+		n, err := p.ident()
+		if err != nil {
+			return ast.ForeignKeyDef{}, nil, err
+		}
+		name = n
+	}
+	if p.identIs("check") {
+		chk, err := p.checkConstraint(name)
+		if err != nil {
+			return ast.ForeignKeyDef{}, nil, err
+		}
+		return ast.ForeignKeyDef{}, &chk, nil
+	}
+	fk, err := p.tableFKNamed(name)
+	return fk, nil, err
+}
+
+// checkConstraint parses `CHECK (expr)`; the CHECK token is current.
+func (p *Parser) checkConstraint(name string) (ast.CheckDef, error) {
+	p.next()
+	if err := p.expect(lexer.LParen, "("); err != nil {
+		return ast.CheckDef{}, err
+	}
+	ex, err := p.or()
+	if err != nil {
+		return ast.CheckDef{}, err
+	}
+	if err := p.expect(lexer.RParen, ")"); err != nil {
+		return ast.CheckDef{}, err
+	}
+	return ast.CheckDef{Name: name, Expr: ex}, nil
 }
 
 func (p *Parser) tableFK() (ast.ForeignKeyDef, error) {
@@ -2225,6 +2541,12 @@ func (p *Parser) tableFK() (ast.ForeignKeyDef, error) {
 		}
 		name = n
 	}
+	return p.tableFKNamed(name)
+}
+
+// tableFKNamed parses `FOREIGN KEY (...) REFERENCES ...` for an already-read
+// constraint name.
+func (p *Parser) tableFKNamed(name string) (ast.ForeignKeyDef, error) {
 	if err := p.expect(lexer.KwForeign, "FOREIGN"); err != nil {
 		return ast.ForeignKeyDef{}, err
 	}
@@ -2468,6 +2790,9 @@ func (p *Parser) colTypeD(depth int) (types.Type, error) {
 	case lexer.KwUint64:
 		p.next()
 		return types.Uint64(), nil
+	case lexer.KwBool:
+		p.next()
+		return types.Bool(), nil
 	case lexer.KwChar:
 		p.next()
 		n, err := p.charLen()
@@ -3006,7 +3331,39 @@ func (p *Parser) insert() (ast.Stmt, error) {
 			return nil, err
 		}
 	}
-	if err := p.expect(lexer.KwValues, "VALUES"); err != nil {
+	// The source is either a VALUES list or a query. A query source is parsed
+	// by the same entry points a standalone query uses, so it nests, joins,
+	// aggregates and carries CTEs identically -- there is no second grammar
+	// for the SELECT inside an INSERT.
+	if p.tok.Kind == lexer.KwSelect || p.tok.Kind == lexer.KwWith {
+		var (
+			q   ast.Stmt
+			err error
+		)
+		if p.tok.Kind == lexer.KwWith {
+			q, err = p.withQuery()
+		} else {
+			q, err = p.query()
+		}
+		if err != nil {
+			return nil, err
+		}
+		ret, star, err := p.returning()
+		if err != nil {
+			return nil, err
+		}
+		// `INSERT INTO t SELECT <exprs>` with no FROM is one row of values
+		// written a different way, so it becomes exactly that. A FROM-less
+		// SELECT is evaluated by its own restricted evaluator rather than the
+		// query pipeline, and normalising here means no other layer needs a
+		// special case for it -- and the row goes through the VALUES path,
+		// which is what captures NOW()/UUID() once for replication.
+		if row, ok := noFromInsertRow(q); ok {
+			return ast.Insert{Table: table, Columns: cols, Rows: [][]ast.Expr{row}, Returning: ret, ReturningStar: star}, nil
+		}
+		return ast.Insert{Table: table, Columns: cols, Query: q, Returning: ret, ReturningStar: star}, nil
+	}
+	if err := p.expect(lexer.KwValues, "VALUES or a query"); err != nil {
 		return nil, err
 	}
 	var rows [][]ast.Expr
@@ -3027,6 +3384,29 @@ func (p *Parser) insert() (ast.Stmt, error) {
 		return nil, err
 	}
 	return ast.Insert{Table: table, Columns: cols, Rows: rows, Returning: ret, ReturningStar: star}, nil
+}
+
+// noFromInsertRow returns the value row equivalent to a FROM-less SELECT used
+// as an INSERT source. It applies only to the plain shape -- a bare select
+// list. Anything that filters, orders, bounds or deduplicates the single row
+// it would produce is left alone for the binder to refuse by name, rather than
+// silently dropped here.
+func noFromInsertRow(q ast.Stmt) ([]ast.Expr, bool) {
+	sel, ok := q.(ast.Select)
+	if !ok || !sel.NoFrom {
+		return nil, false
+	}
+	if sel.Star || sel.Distinct || sel.Where != nil || len(sel.Order) > 0 || sel.Limit != nil || sel.Offset != nil {
+		return nil, false
+	}
+	if len(sel.List) == 0 {
+		return nil, false
+	}
+	row := make([]ast.Expr, len(sel.List))
+	for i, item := range sel.List {
+		row[i] = item.Expr
+	}
+	return row, true
 }
 
 func (p *Parser) upsert() (ast.Stmt, error) {
@@ -3798,11 +4178,22 @@ func (p *Parser) begin() (ast.Stmt, error) {
 }
 
 func (p *Parser) or() (ast.Expr, error) {
+	base := p.depth
+	if err := p.enter(); err != nil {
+		return nil, err
+	}
+	defer func() { p.depth = base }()
 	left, err := p.and()
 	if err != nil {
 		return nil, err
 	}
 	for p.tok.Kind == lexer.KwOr {
+		// Each chained operator deepens the left-deep tree by one, so it is
+		// charged like nesting: a chain longer than the budget is refused
+		// while parsing rather than after a huge tree already exists.
+		if err := p.enter(); err != nil {
+			return nil, err
+		}
 		p.next()
 		right, err := p.and()
 		if err != nil {
@@ -3814,19 +4205,44 @@ func (p *Parser) or() (ast.Expr, error) {
 }
 
 func (p *Parser) and() (ast.Expr, error) {
-	left, err := p.cmp()
+	base := p.depth
+	defer func() { p.depth = base }()
+	left, err := p.not()
 	if err != nil {
 		return nil, err
 	}
 	for p.tok.Kind == lexer.KwAnd {
+		if err := p.enter(); err != nil {
+			return nil, err
+		}
 		p.next()
-		right, err := p.cmp()
+		right, err := p.not()
 		if err != nil {
 			return nil, err
 		}
 		left = ast.Binary{Op: "AND", Left: left, Right: right}
 	}
 	return left, nil
+}
+
+// not parses a prefix NOT at predicate precedence: it binds more loosely than
+// comparison, IS [NOT] NULL, BETWEEN and IN, so `NOT a = b` is `NOT (a = b)`
+// and `NOT a IS NULL` is `NOT (a IS NULL)`. A NOT that appears inside an
+// operand (`a = NOT b`) is still accepted by unary.
+func (p *Parser) not() (ast.Expr, error) {
+	if p.tok.Kind != lexer.KwNot {
+		return p.cmp()
+	}
+	if err := p.enter(); err != nil {
+		return nil, err
+	}
+	defer p.leave()
+	p.next()
+	r, err := p.not()
+	if err != nil {
+		return nil, err
+	}
+	return ast.Unary{Op: "NOT", Right: r}, nil
 }
 
 func (p *Parser) cmp() (ast.Expr, error) {
@@ -3851,13 +4267,19 @@ func (p *Parser) cmp() (ast.Expr, error) {
 		if p.tok.Kind == lexer.KwIn {
 			return p.inSubquery(left, true)
 		}
+		if p.tok.Kind == lexer.KwLike {
+			return p.likePredicate(left, true)
+		}
 		if p.tok.Kind != lexer.KwBetween {
-			return nil, nerr.New(nerr.Syntax, "sql.parser", "expected BETWEEN or IN")
+			return nil, nerr.New(nerr.Syntax, "sql.parser", "expected BETWEEN, IN, or LIKE")
 		}
 		return p.between(left, true)
 	}
 	if p.tok.Kind == lexer.KwIn {
 		return p.inSubquery(left, false)
+	}
+	if p.tok.Kind == lexer.KwLike {
+		return p.likePredicate(left, false)
 	}
 	if p.tok.Kind == lexer.KwBetween {
 		return p.between(left, false)
@@ -3893,7 +4315,7 @@ func (p *Parser) inSubquery(left ast.Expr, not bool) (ast.Expr, error) {
 		return nil, err
 	}
 	if p.tok.Kind != lexer.KwSelect && p.tok.Kind != lexer.KwWith {
-		return nil, nerr.New(nerr.Syntax, "sql.parser", "IN currently requires a SELECT subquery")
+		return p.inValueList(left, not)
 	}
 	query, err := p.queryOrWith()
 	if err != nil {
@@ -3903,6 +4325,150 @@ func (p *Parser) inSubquery(left ast.Expr, not bool) (ast.Expr, error) {
 		return nil, err
 	}
 	return ast.InSubquery{Expr: left, Query: query, Not: not, ID: p.nextSubqueryID()}, nil
+}
+
+// MaxInListValues bounds `x IN (a, b, c, ...)`. The list becomes one
+// comparison per value, so it is bounded work per row; the cap keeps a single
+// predicate from turning into unbounded per-row evaluation.
+const MaxInListValues = 4096
+
+// inValueList parses `IN (v1, v2, ...)` — the opening parenthesis is already
+// consumed — and builds the disjunction of equalities that ISO/IEC 9075
+// defines the predicate to be: `x IN (a, b)` is `x = a OR x = b`, and
+// `x NOT IN (a, b)` is its negation. Three-valued logic follows from the
+// expansion rather than from a separate rule: a NULL on either side yields
+// UNKNOWN, so an unmatched IN over a list containing NULL is UNKNOWN and its
+// NOT IN is UNKNOWN too.
+//
+// The expansion is deliberate. A dedicated node would have to be understood
+// by every walker in the engine — RBAC column authorization, result-cache
+// volatility, partition pruning, client-encryption checks — and several of
+// those answer "nothing here" for a node they do not know, which fails open.
+// The expansion produces only nodes every stage already handles.
+func (p *Parser) inValueList(left ast.Expr, not bool) (ast.Expr, error) {
+	if hasVolatileCall(left) {
+		// Each value compares against its own evaluation of the left side, so
+		// a left operand that changes per evaluation has no defined meaning.
+		return nil, nerr.New(nerr.InvalidArgument, "sql.parser", "IN value list requires a stable left operand: UUID(), NOW() and AI() are not allowed there")
+	}
+	var values []ast.Expr
+	for {
+		if len(values) >= MaxInListValues {
+			return nil, nerr.New(nerr.InvalidArgument, "sql.parser", "IN value list exceeds "+strconv.Itoa(MaxInListValues)+" values")
+		}
+		v, err := p.or()
+		if err != nil {
+			return nil, err
+		}
+		values = append(values, v)
+		if p.tok.Kind == lexer.Comma {
+			p.next()
+			continue
+		}
+		break
+	}
+	if err := p.expect(lexer.RParen, ")"); err != nil {
+		return nil, err
+	}
+	eqs := make([]ast.Expr, len(values))
+	for i, v := range values {
+		eqs[i] = ast.Binary{Op: "=", Left: left, Right: v}
+	}
+	// Balanced rather than left-deep: the leaves keep their written order, so
+	// evaluation order is unchanged, but a long list stays shallow instead of
+	// nesting one level per value.
+	out := balancedOr(eqs)
+	if not {
+		return ast.Unary{Op: "NOT", Right: out}, nil
+	}
+	return out, nil
+}
+
+// balancedOr ORs the terms together as a balanced tree, preserving their
+// in-order sequence.
+func balancedOr(terms []ast.Expr) ast.Expr {
+	if len(terms) == 1 {
+		return terms[0]
+	}
+	mid := len(terms) / 2
+	return ast.Binary{Op: "OR", Left: balancedOr(terms[:mid]), Right: balancedOr(terms[mid:])}
+}
+
+// hasVolatileCall reports whether e calls a function whose value changes per
+// evaluation. It mirrors the volatility rule the binder, optimizer and catalog
+// apply to UUID(), NOW() and AI().
+func hasVolatileCall(e ast.Expr) bool {
+	found := false
+	var walk func(ast.Expr, int)
+	walk = func(e ast.Expr, depth int) {
+		if found || e == nil || depth > ast.MaxNestingDepth {
+			return
+		}
+		switch x := e.(type) {
+		case ast.Call:
+			switch x.Name {
+			case "uuid", "now", "ai":
+				found = true
+				return
+			}
+			for _, a := range x.Args {
+				walk(a, depth+1)
+			}
+		case ast.Unary:
+			walk(x.Right, depth+1)
+		case ast.Binary:
+			walk(x.Left, depth+1)
+			walk(x.Right, depth+1)
+		case ast.Between:
+			walk(x.Expr, depth+1)
+			walk(x.Low, depth+1)
+			walk(x.High, depth+1)
+		case ast.IsNull:
+			walk(x.Expr, depth+1)
+		case ast.Case:
+			walk(x.Operand, depth+1)
+			walk(x.Else, depth+1)
+			for _, arm := range x.Whens {
+				walk(arm.When, depth+1)
+				walk(arm.Then, depth+1)
+			}
+		case ast.FieldAccess:
+			walk(x.Base, depth+1)
+		case ast.Subscript:
+			walk(x.Coll, depth+1)
+			walk(x.Index, depth+1)
+		}
+	}
+	walk(e, 0)
+	return found
+}
+
+// likePredicate parses `[NOT] LIKE pattern [ESCAPE 'c']`. The predicate is
+// represented as the native LIKE(value, pattern[, escape]) call: every stage
+// of the engine already walks a Call's arguments — RBAC authorization,
+// volatility, client-encryption and partition analysis included — so the
+// operator needs no node of its own that a walker could silently skip.
+// ESCAPE stays a contextual identifier rather than a reserved word.
+func (p *Parser) likePredicate(left ast.Expr, not bool) (ast.Expr, error) {
+	p.next()
+	pattern, err := p.add()
+	if err != nil {
+		return nil, err
+	}
+	args := []ast.Expr{left, pattern}
+	if p.identIs("escape") {
+		p.next()
+		esc, err := p.add()
+		if err != nil {
+			return nil, err
+		}
+		args = append(args, esc)
+	}
+	var out ast.Expr = ast.Call{Name: "like", Args: args}
+	if not {
+		out = ast.Unary{Op: "NOT", Right: out}
+	}
+	return out, nil
 }
 
 func (p *Parser) between(left ast.Expr, not bool) (ast.Expr, error) {
@@ -3922,11 +4488,16 @@ func (p *Parser) between(left ast.Expr, not bool) (ast.Expr, error) {
 }
 
 func (p *Parser) add() (ast.Expr, error) {
+	base := p.depth
+	defer func() { p.depth = base }()
 	left, err := p.mul()
 	if err != nil {
 		return nil, err
 	}
 	for p.tok.Kind == lexer.Plus || p.tok.Kind == lexer.Minus {
+		if err := p.enter(); err != nil {
+			return nil, err
+		}
 		op := p.tok.Lit
 		p.next()
 		right, err := p.mul()
@@ -3939,11 +4510,16 @@ func (p *Parser) add() (ast.Expr, error) {
 }
 
 func (p *Parser) mul() (ast.Expr, error) {
+	base := p.depth
+	defer func() { p.depth = base }()
 	left, err := p.unary()
 	if err != nil {
 		return nil, err
 	}
 	for p.tok.Kind == lexer.Star || p.tok.Kind == lexer.Slash {
+		if err := p.enter(); err != nil {
+			return nil, err
+		}
 		op := p.tok.Lit
 		p.next()
 		right, err := p.unary()
@@ -3956,6 +4532,12 @@ func (p *Parser) mul() (ast.Expr, error) {
 }
 
 func (p *Parser) unary() (ast.Expr, error) {
+	if p.tok.Kind == lexer.Minus || p.tok.Kind == lexer.KwNot {
+		if err := p.enter(); err != nil {
+			return nil, err
+		}
+		defer p.leave()
+	}
 	if p.tok.Kind == lexer.Minus {
 		p.next()
 		r, err := p.unary()
@@ -3976,11 +4558,16 @@ func (p *Parser) unary() (ast.Expr, error) {
 }
 
 func (p *Parser) postfix() (ast.Expr, error) {
+	base := p.depth
+	defer func() { p.depth = base }()
 	left, err := p.primary()
 	if err != nil {
 		return nil, err
 	}
 	for p.tok.Kind == lexer.LBracket {
+		if err := p.enter(); err != nil {
+			return nil, err
+		}
 		p.next()
 		idx, err := p.or()
 		if err != nil {
@@ -4189,6 +4776,31 @@ func (p *Parser) primary() (ast.Expr, error) {
 	}
 }
 
+// castExpr parses `CAST(expr AS type)` — the name and the opening parenthesis
+// position are already known. The target type is carried as a typed NULL
+// literal argument, so the exact types.Type (including DECIMAL precision and
+// scale, CHAR/VARCHAR length, ENUM labels and vector element type) reaches the
+// binder and executor without being re-parsed from text. CAST is contextual,
+// not reserved, so a column named `cast` keeps working.
+func (p *Parser) castExpr() (ast.Expr, error) {
+	p.next() // (
+	val, err := p.or()
+	if err != nil {
+		return nil, err
+	}
+	if err := p.expect(lexer.KwAs, "AS"); err != nil {
+		return nil, err
+	}
+	target, err := p.colType()
+	if err != nil {
+		return nil, err
+	}
+	if err := p.expect(lexer.RParen, ")"); err != nil {
+		return nil, err
+	}
+	return ast.Call{Name: "cast", Args: []ast.Expr{val, ast.Literal{Value: types.Null(target)}}}, nil
+}
+
 func (p *Parser) caseExpr() (ast.Expr, error) {
 	p.next()
 	var out ast.Case
@@ -4234,6 +4846,9 @@ func (p *Parser) caseExpr() (ast.Expr, error) {
 func (p *Parser) nameOrCall() (ast.Expr, error) {
 	name := p.tok.Lit
 	p.next()
+	if name == "cast" && p.tok.Kind == lexer.LParen {
+		return p.castExpr()
+	}
 	if p.tok.Kind == lexer.LParen {
 		p.next()
 		if p.tok.Kind == lexer.Star {

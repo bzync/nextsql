@@ -30,6 +30,7 @@ func (s *Session) execUpsert(p planner.Upsert) (*Result, error) {
 	)
 	for _, exprs := range p.Rows {
 		row := append([]types.Value(nil), empty...)
+		named := make([]bool, len(tab.Columns))
 		for j, ex := range exprs {
 			v, err := s.evalInsertValue(ex, tab, p.Columns[j], row)
 			if err != nil {
@@ -40,8 +41,22 @@ func (s *Session) execUpsert(p planner.Upsert) (*Result, error) {
 				return nil, err
 			}
 			row[p.Columns[j]] = v
+			named[p.Columns[j]] = !requestsDefault(ex)
 		}
 		for i := range row {
+			// Same rule as finishInsertRow: a default fills only a column the
+			// statement did not name.
+			if named[i] {
+				if row[i].Null && tab.Columns[i].NotNull {
+					return nil, nerr.New(nerr.InvalidArgument, "executor.Upsert", "NULL in NOT NULL column")
+				}
+				if !row[i].Null && tab.Columns[i].Default.Kind == catalog.DefAI {
+					if _, err := s.applyDefault(tab, i, row[i]); err != nil {
+						return nil, err
+					}
+				}
+				continue
+			}
 			nv, err := s.applyDefault(tab, i, row[i])
 			if err != nil {
 				return nil, err

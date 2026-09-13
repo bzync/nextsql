@@ -91,9 +91,17 @@ TIMEOUT=${NEXTSQL_TEST_TIMEOUT:-45m}
 # internal/limits is the operational limit catalog every one of these packages
 # validates against, and docs/limits.md is generated from it — a drift between
 # the two is a release-note defect, so the gate checks it.
+#
+# tests/docs is the same kind of check one level up: the statement surface is
+# written out in four documents for four different readers, and it derives the
+# truth from the parser instead of from another document. `SHOW REALMS` stayed
+# in the dialect reference for months after the parser stopped accepting it
+# (log #280) because nothing compared the two. It only reads files and parses
+# strings, so it costs the gate nothing.
 light=(
   ./internal/config
   ./internal/limits
+  ./tests/docs
   ./internal/scheduler
   ./internal/protocol
   ./internal/json

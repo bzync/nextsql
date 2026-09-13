@@ -4,26 +4,17 @@ import { api, setCsrf, type Whoami } from "./api";
 import { Login } from "./Login";
 import { Shell } from "./Shell";
 
-type AuthState = { phase: "checking" } | { phase: "out" } | { phase: "in"; who: Whoami };
+// serial counts sign-ins in this tab. A server switch is a new session, so
+// the Shell is keyed on it and remounts from scratch — every Operations view
+// and the Studio workspace re-read against the new server.
+type AuthState = { phase: "checking" } | { phase: "out" } | { phase: "in"; who: Whoami; serial: number };
 
 export function App() {
   const [auth, setAuth] = useState<AuthState>({ phase: "checking" });
 
   const signedIn = useCallback((who: Whoami) => {
     setCsrf(who.csrf_token);
-    setAuth({ phase: "in", who });
-  }, []);
-
-  // A Studio reconnect changes the session's realm/database in place (same
-  // session id, same CSRF token). Merge those two fields so every consumer of
-  // `who` — localStorage scoping keys, the identity label, the Studio remount
-  // key — follows the live connection.
-  const connectionChanged = useCallback((next: { realm: string; database: string }) => {
-    setAuth((current) =>
-      current.phase === "in"
-        ? { phase: "in", who: { ...current.who, realm: next.realm, database: next.database } }
-        : current,
-    );
+    setAuth((current) => ({ phase: "in", who, serial: (current.phase === "in" ? current.serial : 0) + 1 }));
   }, []);
 
   const signOut = useCallback(() => {
@@ -55,5 +46,5 @@ export function App() {
     </>
   );
   if (auth.phase === "out") return <Login onSignedIn={signedIn} />;
-  return <Shell who={auth.who} onSignOut={signOut} onConnectionChanged={connectionChanged} />;
+  return <Shell key={auth.serial} who={auth.who} onSignOut={signOut} onSwitched={signedIn} />;
 }

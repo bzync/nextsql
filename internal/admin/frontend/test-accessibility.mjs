@@ -513,6 +513,23 @@ async function testOperateMode() {
     ["      BitmapIndex idx_t_fast", "rows=2 cost=50", "rows=2", "3µs", "3µs", "0", "0", "0", "0", "1", "idx_t_fast"],
   ];
   let authenticated = false;
+  // Two connection profiles, so the sign-in page offers a server choice and
+  // the Shell offers "Switch server". The staging profile declares its
+  // environment, which Studio must treat as authoritative.
+  const adminProfiles = {
+    default: { id: "default", name: "Local server", address: "127.0.0.1:7210", tls: false, mtls: false },
+    staging: { id: "staging", name: "Staging", environment: "staging", address: "10.0.0.5:7210", tls: true, mtls: false, user: "stage_op", database: "stagedb" },
+  };
+  let currentProfile = "default";
+  let switchCalls = [];
+  const sessionBody = (extra = {}) => ({
+    authenticated: true,
+    user: currentProfile === "staging" ? "stage_op" : "operator",
+    database: "default",
+    profile: adminProfiles[currentProfile],
+    csrf_token: `browser-test-${currentProfile}`,
+    ...extra,
+  });
   let streamCalls = 0;
   let lastAnalyzeSQL = null;
   let lastStreamSQL = null;
@@ -532,12 +549,13 @@ async function testOperateMode() {
     if (serveAssets(request, response)) return;
     if (url.pathname === "/api/v1/mode") return json(response, 200, { mode: "operate" });
     if (url.pathname === "/api/v1/session" && request.method === "GET") {
-      if (authenticated) return json(response, 200, { authenticated: true, user: "operator", database: "default", realm: "default", csrf_token: "browser-test" });
+      if (authenticated) return json(response, 200, sessionBody());
       return json(response, 401, { error: "not signed in" });
     }
     if (url.pathname === "/api/v1/session" && request.method === "POST") {
       authenticated = true;
-      return json(response, 200, { authenticated: true, user: "operator", database: "default", realm: "default", csrf_token: "browser-test" });
+      currentProfile = "default";
+      return json(response, 200, sessionBody());
     }
     if (url.pathname === "/api/v1/session" && request.method === "DELETE") {
       authenticated = false;
@@ -545,7 +563,37 @@ async function testOperateMode() {
     }
     if (url.pathname === "/api/v1/connection") {
       if (!authenticated) return json(response, 401, { error: "not signed in" });
-      return json(response, 200, { connected: true, server_addr: "127.0.0.1:7210", user: "operator", database: "default", realm: "default" });
+      return json(response, 200, { connected: true, server_addr: adminProfiles[currentProfile].address, profile: adminProfiles[currentProfile], user: sessionBody().user, database: "default" });
+    }
+    if (url.pathname === "/api/v1/profiles") {
+      // Pre-auth: names and environments only, never an address.
+      return json(response, 200, {
+        default: "default",
+        profiles: Object.values(adminProfiles).map(({ id, name, environment }) => ({ id, name, ...(environment ? { environment } : {}) })),
+      });
+    }
+    if (url.pathname === "/api/v1/session/profiles") {
+      if (!authenticated) return json(response, 401, { error: "not authenticated" });
+      return json(response, 200, { current: currentProfile, profiles: Object.values(adminProfiles) });
+    }
+    if (url.pathname === "/api/v1/session/switch" && request.method === "POST") {
+      let data = "";
+      request.on("data", (chunk) => { data += chunk; });
+      request.on("end", () => {
+        let body = {};
+        try { body = JSON.parse(data); } catch { body = {}; }
+        switchCalls.push(body);
+        if (!adminProfiles[body.profile]) return json(response, 400, { error: "unknown connection profile" });
+        if (body.password === "wrong") return json(response, 401, { error: "authentication failed" });
+        currentProfile = body.profile;
+        json(response, 200, sessionBody(body.save_password ? { credential_saved: true } : {}));
+      });
+      return;
+    }
+    if (url.pathname === "/api/v1/session/credential/forget" && request.method === "POST") {
+      response.writeHead(204);
+      response.end();
+      return;
     }
     if (url.pathname === "/api/v1/security") {
       securityCalls++;
@@ -634,23 +682,13 @@ async function testOperateMode() {
     if (url.pathname === "/api/v1/studio/bootstrap") {
       return json(response, 200, {
         generated_at: new Date(0).toISOString(),
-        server_addr: "127.0.0.1:7210",
+        server_addr: adminProfiles[currentProfile].address,
         read_consistency: "strong",
         max_staleness_ms: 0,
         capabilities: studioCapabilities,
         tables: studioTables,
         tables_truncated: false,
       });
-    }
-    if (url.pathname === "/api/v1/studio/reconnect" && request.method === "POST") {
-      let data = "";
-      request.on("data", (chunk) => { data += chunk; });
-      request.on("end", () => {
-        let body = {};
-        try { body = JSON.parse(data); } catch { body = {}; }
-        json(response, 200, { user: "operator", realm: body.realm ?? "", database: body.database ?? "" });
-      });
-      return;
     }
     if (url.pathname === "/api/v1/studio/read-consistency" && request.method === "POST") {
       let data = "";
@@ -783,10 +821,10 @@ async function testOperateMode() {
           return json(response, 200, { kind: "Insert", destructive: false, write: true });
         }
         if (/^\s*CREATE\s+USER\b/.test(upper)) {
-          return json(response, 200, { kind: "CreateUser", destructive: false, write: true, realm_scoped: true });
+          return json(response, 200, { kind: "CreateUser", destructive: false, write: true });
         }
         if (/^\s*DROP\s+USER\b/.test(upper)) {
-          return json(response, 200, { kind: "DropUser", destructive: true, write: true, realm_scoped: true, reasons: ["Permanently removes login contractor."] });
+          return json(response, 200, { kind: "DropUser", destructive: true, write: true, reasons: ["Permanently removes login contractor."] });
         }
         return json(response, 200, { kind: write ? "Write" : "SELECT", destructive: false, write });
       });
@@ -874,6 +912,8 @@ async function testOperateMode() {
   }, async (browser) => {
     await browser.waitFor("document.querySelector('h1')?.textContent === 'NextSQL Admin'", "the Operations login view");
     await runAxe(browser, axe.source, "Operations login");
+    assert.equal(await browser.evaluate("document.getElementById('f-profile') !== null"), true, "with two connection profiles the sign-in page should offer a server choice");
+    assert.equal(await browser.evaluate("document.body.textContent.includes('10.0.0.5')"), false, "the sign-in page must not reveal where a profile points");
     await themeCheck(browser, "Operations");
     await contrastAndMotionCheck(browser, "Operations");
 
@@ -993,6 +1033,19 @@ async function testOperateMode() {
     await browser.waitFor("document.body.textContent.includes('articles')", "the authorized Studio catalog");
     assert.equal(await browser.evaluate("window.location.hash"), "#!/studio", "selecting Studio should update the URL route");
     assert.equal(await browser.evaluate("document.querySelector('[aria-label=\"SQL editor\"]') !== null"), true, "the SQL editor should have an accessible name");
+    const syntaxEditor = await browser.evaluate(`(() => {
+      const textarea = document.querySelector('[aria-label="SQL editor"]');
+      const overlay = document.querySelector('.nss-sql-editor-highlight code');
+      return {
+        source: textarea?.value ?? null,
+        highlightedSource: overlay?.textContent ?? null,
+        hasKeyword: Boolean(overlay?.querySelector('.nss-token-keyword')),
+        hasLineNumbers: Boolean(document.querySelector('.nss-sql-editor-gutter')),
+      };
+    })()`);
+    assert.equal(syntaxEditor.highlightedSource, syntaxEditor.source, "the syntax overlay must preserve the editor text exactly");
+    assert.equal(syntaxEditor.hasKeyword, true, "the native SELECT keyword should be highlighted");
+    assert.equal(syntaxEditor.hasLineNumbers, true, "the bounded editor should render its line-number gutter");
     assert.equal(await browser.evaluate("document.body.textContent.includes('127.0.0.1:7210')"), true, "the toolbar should show the nextsqld the session targets");
     await browser.waitFor("document.body.textContent.includes('Connected')", "Studio live connection status");
     await runAxe(browser, axe.source, "Studio workspace");
@@ -1002,50 +1055,50 @@ async function testOperateMode() {
       "getComputedStyle(document.querySelector('.nss-layout')).gridTemplateColumns.split(' ').length === 1",
     );
 
-    // The connection switcher: open the modal, axe-check it, perform a real
-    // realm switch, then confirm it is offered as a recent connection.
+    // Server switching: the Studio toolbar opens the Shell's Switch-server
+    // dialog, which lists the connection profiles with where each points.
+    // A failed switch keeps the session; a successful one re-keys the whole
+    // Shell onto the new session, and the staging profile's declared
+    // environment is authoritative (the environment select is locked).
     const openSwitch = `(() => {
-      const button = [...document.querySelectorAll("button")].find((item) => item.textContent.trim() === "Switch connection…");
+      const button = [...document.querySelectorAll("button")].find((item) => item.textContent.trim() === "Switch server…" || item.textContent.trim() === "Switch server");
       button?.click();
       return Boolean(button);
     })()`;
-    assert.equal(await browser.evaluate(openSwitch), true, "the toolbar should offer a Switch connection control");
-    await browser.waitFor("document.querySelector('[role=dialog]')?.textContent.includes('Switch connection')", "the switch-connection modal");
-    await runAxe(browser, axe.source, "Studio switch-connection modal");
-    await browser.evaluate(`(() => {
-      const setValue = (el, value) => {
-        const proto = Object.getPrototypeOf(el);
-        Object.getOwnPropertyDescriptor(proto, "value").set.call(el, value);
-        el.dispatchEvent(new Event("input", { bubbles: true }));
-      };
-      const dialog = document.querySelector("[role=dialog]");
-      const text = [...dialog.querySelectorAll('input:not([type="password"])')];
-      setValue(text[0], "reporting");
-      setValue(dialog.querySelector('input[type="password"]'), "s3cret");
-      [...dialog.querySelectorAll("button")].find((b) => b.textContent.trim() === "Switch")?.click();
-    })()`);
-    await browser.waitFor("document.querySelector('[role=dialog]') === null", "the switch-connection modal to close after a switch");
-    await browser.waitFor("document.body.textContent.includes('realm:reporting')", "the toolbar to reflect the switched realm");
-    await browser.evaluate(openSwitch);
-    await browser.waitFor("document.querySelector('[role=dialog]')?.textContent.includes('Recent on this server')", "the recent-connections section");
-    assert.equal(
-      await browser.evaluate(`[...document.querySelectorAll('[role=dialog] button')].some((b) => b.textContent.includes('reporting'))`),
-      true,
-      "the just-used connection should be offered as a recent quick-switch",
-    );
-    // Switch back to the default connection so later tests run against it.
-    await browser.evaluate(`(() => {
+    const fillSwitch = (password) => `(() => {
       const setValue = (el, value) => {
         Object.getOwnPropertyDescriptor(Object.getPrototypeOf(el), "value").set.call(el, value);
         el.dispatchEvent(new Event("input", { bubbles: true }));
       };
       const dialog = document.querySelector("[role=dialog]");
-      setValue(dialog.querySelector('input:not([type="password"])'), "");
-      setValue(dialog.querySelector('input[type="password"]'), "s3cret");
+      setValue(dialog.querySelector('input[type="password"]'), ${JSON.stringify(password)});
       [...dialog.querySelectorAll("button")].find((b) => b.textContent.trim() === "Switch")?.click();
-    })()`);
-    await browser.waitFor("document.querySelector('[role=dialog]') === null", "the switch-connection modal to close");
-    await browser.waitFor("!document.body.textContent.includes('realm:reporting')", "the toolbar to return to the default connection");
+    })()`;
+    assert.equal(await browser.evaluate(openSwitch), true, "Studio should offer a Switch server control when two profiles exist");
+    await browser.waitFor("document.querySelector('[role=dialog]')?.textContent.includes('10.0.0.5:7210')", "the switch-server dialog showing the staging target");
+    assert.equal(
+      await browser.evaluate("[...document.querySelectorAll('[role=dialog] input')].some((el) => el.value === 'stage_op')"),
+      true,
+      "the user field should be pre-filled from the profile's user hint",
+    );
+    await runAxe(browser, axe.source, "Switch-server dialog");
+    await browser.evaluate(fillSwitch("wrong"));
+    await browser.waitFor("[...document.querySelectorAll('[role=dialog] [role=alert]')].some((el) => el.textContent.includes('authentication failed'))", "a failed switch to report its error in the dialog");
+    assert.equal(await browser.evaluate("document.body.textContent.includes('Local server')"), true, "a failed switch must leave the session on its current server");
+    await runAxe(browser, axe.source, "Switch-server dialog after a failed switch");
+    await browser.evaluate(fillSwitch("s3cret"));
+    await browser.waitFor("document.querySelector('[role=dialog]') === null", "the switch-server dialog to close after a switch");
+    await browser.waitFor("document.querySelector('.nss-toolbar')?.textContent.includes('Staging') === true", "the Studio toolbar to show the new server");
+    assert.equal(await browser.evaluate("document.querySelector('.nss-toolbar')?.textContent.includes('10.0.0.5:7210')"), true, "the toolbar should show the new server's address");
+    assert.equal(await browser.evaluate("document.getElementById('studio-environment')?.disabled === true || document.getElementById('studio-environment')?.getAttribute('aria-disabled') === 'true'"), true, "a profile-declared environment should lock the environment selector");
+    assert.equal(switchCalls.at(-1)?.profile, "staging", "the switch should name the chosen profile by ID");
+    await runAxe(browser, axe.source, "Studio after switching to a staging profile");
+    // Switch back so later checks run against the default server.
+    assert.equal(await browser.evaluate(openSwitch), true, "the Switch server control should remain after a switch");
+    await browser.waitFor("document.querySelector('[role=dialog]')?.textContent.includes('127.0.0.1:7210')", "the switch-server dialog defaulting to the other server");
+    await browser.evaluate(fillSwitch("s3cret"));
+    await browser.waitFor("document.querySelector('[role=dialog]') === null", "the switch-server dialog to close");
+    await browser.waitFor("document.querySelector('.nss-toolbar')?.textContent.includes('Local server') === true", "the toolbar to return to the default server");
 
     // Read-consistency control: switching to Bounded reveals a staleness
     // input and shows the stale-reads badge; switching back to Strong hides
@@ -1395,19 +1448,13 @@ async function testOperateMode() {
     await waitForStreamCalls(callsBeforeSafe + 1, "a safe statement should execute without a confirmation");
     assert.equal(await browser.evaluate("document.querySelector('[role=dialog]') === null"), true, "no confirmation should appear for a safe statement");
 
-    // Cross-database administration warning: CREATE/DROP USER and
-    // CREATE/DROP ROLE change the realm-wide principal namespace, so the
-    // confirm-before-run dialog names the realm and current database even
-    // though the statement is not "destructive".
-    const callsBeforeRealm = streamCalls;
+    // A deployment serves one database (log #244), so CREATE USER is an
+    // ordinary write: no "realm-wide" confirmation, it runs directly.
+    const callsBeforePrincipal = streamCalls;
     await setSQL("CREATE USER contractor IDENTIFIED BY 'pw'");
-    assert.equal(await clickButton("Run query"), true, "Run query should be clickable for a realm-scoped statement");
-    await browser.waitFor("document.querySelector('[role=dialog] h2')?.textContent === 'Realm-wide change — run this CreateUser?'", "the realm-wide confirmation");
-    assert.equal(await browser.evaluate("document.querySelector('[role=dialog]')?.textContent.includes('every database in the default realm')"), true, "the confirmation should explain the realm-wide reach");
-    await runAxe(browser, axe.source, "Studio realm-wide administration confirmation");
-    assert.equal(await clickDialogButton("Cancel"), true, "the realm-wide confirmation's Cancel should be available");
-    await browser.waitFor("document.querySelector('[role=dialog]') === null", "the realm-wide confirmation to close on cancel");
-    assert.equal(streamCalls, callsBeforeRealm, "canceling the realm-wide confirmation must not execute the statement");
+    assert.equal(await clickButton("Run query"), true, "Run query should be clickable for CREATE USER");
+    await waitForStreamCalls(callsBeforePrincipal + 1, "CREATE USER should run without an extra confirmation");
+    assert.equal(await browser.evaluate("document.querySelector('[role=dialog]') === null"), true, "no realm-wide confirmation should appear");
 
     // Production safety mode: tagging the connection "production" shows a
     // standing banner and turns on read-only mode, which asks for
@@ -1505,7 +1552,10 @@ async function testOperateMode() {
     assert.equal(await clickButtonStartingWith("History"), true, "the History control should be available");
     await browser.waitFor("document.querySelector('[role=dialog][aria-label=\"Query history\"]') !== null", "the query history panel to open");
     const historyEntries = await browser.evaluate("[...document.querySelectorAll('.nss-history-item')].map((el) => el.textContent)");
-    assert.equal(historyEntries.length, 5, `five successful statements should have been recorded, got ${historyEntries.length}`);
+    // Six: CREATE USER now runs as an ordinary write (it used to be canceled
+    // at the retired realm-wide confirmation, so it never reached history).
+    assert.equal(historyEntries.length, 6, `six successful statements should have been recorded, got ${historyEntries.length}`);
+    assert.equal(historyEntries.some((e) => e.includes("CREATE USER contractor")), true, "CREATE USER should be recorded now that it runs without a realm-wide prompt");
     assert.equal(historyEntries[0].includes("DELETE FROM articles") && historyEntries[0].includes("success"), true, "the most recent run should be first and show its outcome");
     assert.equal(historyEntries.some((e) => e.includes("INSERT INTO articles")), true, "the write run after turning off read-only mode should be recorded");
     await runAxe(browser, axe.source, "Studio query history panel");
@@ -1699,19 +1749,18 @@ async function testOperateMode() {
     assert.equal(await browser.evaluate(`[...document.querySelectorAll(".nss-script-item")].every((item) => item.textContent.includes("success"))`), true, "every script statement should report success");
     await runAxe(browser, axe.source, "Studio script results");
 
-    // A destructive realm-wide statement must retain both warnings in the
-    // consolidated script dialog. Otherwise DROP USER/ROLE could hide its
-    // cross-database reach behind the destructive reason.
+    // A destructive statement inside a script keeps its reason in the
+    // consolidated script dialog, and makes no "realm-wide" claim.
     await setSQL("SELECT 1;\nDROP USER contractor;");
-    const queryCallsBeforeRealmScript = queryCalls;
-    assert.equal(await clickButton("Run script"), true, "Run script should be clickable for realm-wide DDL");
-    await browser.waitFor("document.querySelector('[role=dialog] h2')?.textContent === 'Confirm script (2 statements)'", "the realm-wide script confirmation");
+    const queryCallsBeforePrincipalScript = queryCalls;
+    assert.equal(await clickButton("Run script"), true, "Run script should be clickable for DROP USER");
+    await browser.waitFor("document.querySelector('[role=dialog] h2')?.textContent === 'Confirm script (2 statements)'", "the destructive script confirmation");
     assert.equal(await browser.evaluate("document.querySelector('[role=dialog]')?.textContent.includes('Permanently removes login contractor')"), true, "the script confirmation should retain the destructive reason");
-    assert.equal(await browser.evaluate("document.querySelector('[role=dialog]')?.textContent.includes('every database in the default realm')"), true, "the script confirmation should retain the realm-wide warning");
-    await runAxe(browser, axe.source, "Studio realm-wide script confirmation");
-    assert.equal(await clickDialogButton("Cancel"), true, "the realm-wide script confirmation should be cancelable");
-    await browser.waitFor("document.querySelector('[role=dialog]') === null", "the realm-wide script confirmation to close");
-    assert.equal(queryCalls, queryCallsBeforeRealmScript, "canceling the realm-wide script must execute no statement");
+    assert.equal(await browser.evaluate("document.querySelector('[role=dialog]')?.textContent.includes('realm')"), false, "the script confirmation must not mention realms");
+    await runAxe(browser, axe.source, "Studio destructive script confirmation");
+    assert.equal(await clickDialogButton("Cancel"), true, "the destructive script confirmation should be cancelable");
+    await browser.waitFor("document.querySelector('[role=dialog]') === null", "the destructive script confirmation to close");
+    assert.equal(queryCalls, queryCallsBeforePrincipalScript, "canceling the script must execute no statement");
 
     // Selecting the DDL/DML statement's row must render its null-columns
     // result without throwing — this is the exact shape that crashed before

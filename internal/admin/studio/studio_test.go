@@ -2,6 +2,7 @@ package studio
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -81,32 +82,6 @@ func TestValidateAndConvertQueryParams(t *testing.T) {
 	}
 	if !got[1].Null || got[1].Typ.Kind != types.KindNull {
 		t.Fatalf("nil value = %+v, want typed NULL", got[1])
-	}
-}
-
-func TestValidateReconnectRequest(t *testing.T) {
-	ok := []ReconnectRequest{
-		{Password: "pw"},
-		{Database: "prod", Password: "pw"},
-		{Database: "d-1_2", Password: "pw"},
-	}
-	for _, r := range ok {
-		if err := r.Validate(); err != nil {
-			t.Errorf("Validate(%+v): unexpected %v", r, err)
-		}
-	}
-	bad := []ReconnectRequest{
-		{Database: "prod"},                                                  // no password
-		{Realm: "acme", Password: "pw"},                                     // realm selection was removed
-		{Realm: "default", Password: "pw"},                                  // including the one realm that exists
-		{Database: "bad/name", Password: "pw"},                              // slash
-		{Realm: strings.Repeat("a", MaxConnNameBytes+1), Password: "pw"},    // over cap
-		{Database: strings.Repeat("a", MaxConnNameBytes+1), Password: "pw"}, // over cap
-	}
-	for _, r := range bad {
-		if err := r.Validate(); !nerr.HasCode(err, nerr.InvalidArgument) {
-			t.Errorf("Validate(%+v): want invalid_argument, got %v", r, err)
-		}
 	}
 }
 
@@ -472,37 +447,29 @@ func TestAnalyzeClassifiesWrites(t *testing.T) {
 	}
 }
 
-func TestAnalyzeFlagsRealmScopedPrincipalStatements(t *testing.T) {
-	realmScoped := []string{
+// A deployment serves exactly one database (log #244), so a user or role
+// statement reaches nothing beyond it: the analysis must not claim a wider
+// ("realm-wide") effect. It is still a write for the read-only safety mode.
+func TestAnalyzePrincipalStatementsAreOrdinaryWrites(t *testing.T) {
+	for _, sql := range []string{
 		"CREATE USER alice IDENTIFIED BY 'pw'",
 		"DROP USER alice",
 		"CREATE ROLE analysts",
 		"DROP ROLE analysts",
-	}
-	for _, sql := range realmScoped {
+	} {
 		a, err := Analyze(sql)
 		if err != nil {
 			t.Fatalf("Analyze(%q): %v", sql, err)
 		}
-		if !a.RealmScoped {
-			t.Fatalf("Analyze(%q).RealmScoped = false, want true", sql)
+		if !a.Write {
+			t.Fatalf("Analyze(%q).Write = false, want true", sql)
 		}
-	}
-
-	notRealmScoped := []string{
-		"GRANT SELECT ON TABLE accounts TO alice",
-		"REVOKE SELECT ON TABLE accounts FROM alice",
-		"CREATE TABLE t (id INT64 PRIMARY KEY)",
-		"DROP TABLE accounts",
-		"SELECT * FROM accounts",
-	}
-	for _, sql := range notRealmScoped {
-		a, err := Analyze(sql)
+		raw, err := json.Marshal(a)
 		if err != nil {
-			t.Fatalf("Analyze(%q): %v", sql, err)
+			t.Fatal(err)
 		}
-		if a.RealmScoped {
-			t.Fatalf("Analyze(%q).RealmScoped = true, want false", sql)
+		if strings.Contains(string(raw), "realm") {
+			t.Fatalf("Analyze(%q) still reports a realm scope: %s", sql, raw)
 		}
 	}
 }

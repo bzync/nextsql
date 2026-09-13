@@ -87,8 +87,14 @@ type Config struct {
 	// Lower it for containers, embedded use, or a host running many small
 	// databases, where that cost is paid once per database.
 	PreallocAheadPages int
-	RequireClientKey   bool
-	AuditFile          string
+	// WALPageDeltas is auto, on, or off (empty means auto). auto logs page
+	// deltas for a database created by this release and leaves an existing
+	// database's WAL at the version it has; on also moves an existing WAL to
+	// control version 2, which releases that predate page deltas cannot
+	// open; off logs full page images only. See docs/wal.md "Page deltas".
+	WALPageDeltas    string
+	RequireClientKey bool
+	AuditFile        string
 	// AuditSigningKeyset is an optional NSAK signer keyset. When configured,
 	// nextsqld verifies the retained signed segment before append and signs
 	// every new audit record. Private key material stays outside the database.
@@ -171,10 +177,14 @@ type Config struct {
 	// executor.defaultTaskWorkers" (the same default every individual
 	// TaskRuntime used before centralizing) — like MaxOpenDatabases, this is
 	// not itself a valid "unbounded" sentinel.
-	TaskWorkers   int
-	MaxQueryQueue int
-	QueueWaitMS   int
-	MaxResultRows int
+	TaskWorkers int
+	// MaxConcurrentPasswordHashes bounds how many password hashes run at
+	// once, process-wide (internal/auth/hashgate.go). Zero leaves the
+	// CPU-derived default.
+	MaxConcurrentPasswordHashes int
+	MaxQueryQueue               int
+	QueueWaitMS                 int
+	MaxResultRows               int
 	// Native-wire limits are independent operational defaults. Zero preserves
 	// protocol defaults; Load rejects values above their absolute ceilings.
 	MaxFrameBytes     int
@@ -429,6 +439,8 @@ func loadFrom(r io.Reader) (Config, error) {
 			cfg.TLSClientCRL = v
 		case "tls_ocsp_mode":
 			cfg.TLSOCSPMode = strings.ToLower(strings.TrimSpace(v))
+		case "wal_page_deltas":
+			cfg.WALPageDeltas = strings.ToLower(strings.TrimSpace(v))
 		case "tls_ocsp_responder":
 			cfg.TLSOCSPResponder = strings.TrimSpace(v)
 		case "token_verify_keyset":
@@ -530,6 +542,12 @@ func loadFrom(r io.Reader) (Config, error) {
 				return Config{}, err
 			}
 			cfg.TaskWorkers = n
+		case "max_concurrent_password_hashes":
+			n, err := limitValue("max_concurrent_password_hashes", v)
+			if err != nil {
+				return Config{}, err
+			}
+			cfg.MaxConcurrentPasswordHashes = n
 		case "max_query_queue":
 			n, err := limitValue("max_query_queue", v)
 			if err != nil {
@@ -742,6 +760,7 @@ func (c Config) Marshal() []byte {
 	str("deployment_profile", c.DeploymentProfile)
 	num("buffer_pages", c.BufferPages)
 	num("prealloc_ahead_pages", c.PreallocAheadPages)
+	str("wal_page_deltas", c.WALPageDeltas)
 
 	str("tls_cert", c.TLSCert)
 	str("tls_key", c.TLSKey)
@@ -791,6 +810,7 @@ func (c Config) Marshal() []byte {
 	num("max_open_databases", c.MaxOpenDatabases)
 	num("max_total_buffer_pages", c.MaxTotalBufferPages)
 	num("task_workers", c.TaskWorkers)
+	num("max_concurrent_password_hashes", c.MaxConcurrentPasswordHashes)
 	num("max_query_queue", c.MaxQueryQueue)
 	num("query_queue_wait_ms", c.QueueWaitMS)
 	num("max_result_rows", c.MaxResultRows)
@@ -882,7 +902,7 @@ var settableKeys = func() map[string]bool {
 	// bool true — so Marshal emits one line per settable key.
 	probe := Config{
 		DataDir: "x", KeyFile: "x", InstanceKeyFile: "x", AuthFile: "x",
-		ListenAddr: "x", LogLevel: "x", DeploymentProfile: "x", BufferPages: 1, PreallocAheadPages: 1,
+		ListenAddr: "x", LogLevel: "x", DeploymentProfile: "x", BufferPages: 1, PreallocAheadPages: 1, WALPageDeltas: "x",
 		TLSCert: "x", TLSKey: "x", TLSClientCA: "x", TLSClientCRL: "x", TLSOCSPMode: "x", TLSOCSPResponder: "x", RequireClientKey: true,
 		TokenKeyset: "x", TokenRevocations: "x", TokenAudience: "x",
 		TokenIdentitySourceHints: map[uint32]string{1: "x"},
@@ -890,7 +910,7 @@ var settableKeys = func() map[string]bool {
 		AuditFile: "x", AuditSigningKeyset: "x", WalArchive: "x", BackupDir: "x", WalRetentionMS: 1, CheckpointIntervalMS: 1,
 		DiskWatermarkCheckMS: 1, DiskWatermarkWarnPercent: 1, DiskWatermarkRejectPercent: 1,
 		ReplicaLagCheckMS: 1, ReplicaLagWarnEntries: 1,
-		MaxInflight: 1, MaxOpenDatabases: 1, MaxTotalBufferPages: 1, TaskWorkers: 1,
+		MaxInflight: 1, MaxOpenDatabases: 1, MaxTotalBufferPages: 1, TaskWorkers: 1, MaxConcurrentPasswordHashes: 1,
 		MaxQueryQueue: 1, QueueWaitMS: 1, MaxResultRows: 1,
 		MaxFrameBytes: 1, MaxStatementBytes: 1, MaxParameters: 1, MaxPrepared: 1, MaxResultBytes: 1,
 		MaxConnections: 1, MaxConnectionsPerUser: 1, MaxConnectionsPerDatabase: 1, MaxConnectionsPerRealm: 1,
@@ -1134,6 +1154,11 @@ func (c Config) Validate() error {
 	if c.TLSClientCRL != "" && c.TLSClientCA == "" {
 		return nerr.New(nerr.InvalidArgument, "config.Validate", "tls_client_crl requires tls_client_ca")
 	}
+	switch c.WALPageDeltas {
+	case "", "auto", "on", "off":
+	default:
+		return nerr.New(nerr.InvalidArgument, "config.Validate", "wal_page_deltas must be auto, on, or off")
+	}
 	if c.TLSOCSPMode != "" {
 		switch c.TLSOCSPMode {
 		case "disabled", "optional", "enforce":
@@ -1298,6 +1323,8 @@ func (c Config) limitValue(key string) (int, bool) {
 		return c.StatementTimeoutMS, true
 	case "task_workers":
 		return c.TaskWorkers, true
+	case "max_concurrent_password_hashes":
+		return c.MaxConcurrentPasswordHashes, true
 	case "transaction_timeout_ms":
 		return c.TransactionTimeoutMS, true
 	case "wal_retention_ms":

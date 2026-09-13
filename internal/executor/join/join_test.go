@@ -438,4 +438,3 @@ func TestRightHashRefusesSpill(t *testing.T) {
 		t.Fatal("expected RIGHT to refuse spill")
 	}
 }
-

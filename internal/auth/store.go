@@ -2,6 +2,7 @@
 package auth
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
@@ -231,7 +232,12 @@ func (s *Store) UpsertInRealm(realm hosting.ID, user, password string) error {
 	if err := validatePassword(password); err != nil {
 		return err
 	}
+	release, err := acquireHashSlot(context.Background())
+	if err != nil {
+		return err
+	}
 	rec, err := hashPasswordArgon2id(password)
+	release()
 	if err != nil {
 		return err
 	}
@@ -258,6 +264,13 @@ func (s *Store) Verify(user, password string) error {
 // the deployment-wide (hosting.ID{}) entry of the same name — a realm's own
 // principal shadows a same-named deployment-wide one when both exist.
 func (s *Store) VerifyInRealm(realm hosting.ID, user, password string) error {
+	return s.VerifyInRealmContext(context.Background(), realm, user, password)
+}
+
+// VerifyInRealmContext is VerifyInRealm bounded by ctx while it waits for a
+// password-hash slot (see hashgate.go). A caller that cannot get one receives
+// an Exhausted error rather than an authentication verdict.
+func (s *Store) VerifyInRealmContext(ctx context.Context, realm hosting.ID, user, password string) error {
 	name, err := validateUser(user)
 	if err != nil {
 		return nerr.New(nerr.Unauthorized, "auth.Verify", "authentication failed")
@@ -273,6 +286,13 @@ func (s *Store) VerifyInRealm(realm hosting.ID, user, password string) error {
 		foundRealm = hosting.ID{}
 	}
 	s.mu.Unlock()
+	// The slot is taken before either branch, so a missing user and a wrong
+	// password wait and hash identically.
+	release, err := acquireHashSlot(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
 	if !ok {
 		// Use the current algorithm and cost so missing users are not a cheap
 		// username-enumeration path relative to an existing Argon2id user.

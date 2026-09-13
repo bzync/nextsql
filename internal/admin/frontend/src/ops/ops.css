@@ -803,6 +803,7 @@
   align-items: center !important;
   gap: 6px;
   white-space: nowrap;
+  flex-shrink: 0 !important;
 }
 
 /* A tab strip with more triggers than fit scrolls horizontally, but RUI
@@ -810,17 +811,23 @@
    affordance and, on a plain mouse with no horizontal wheel, no way to
    reach the tabs past the edge at all — keyboard arrows are the only route.
    Give these strips a slim, visible, draggable scrollbar instead. */
-.nsm-content [role="tablist"] {
+.nsm-content [role="tablist"],
+[role="dialog"] [role="tablist"] {
   scrollbar-width: thin;
   scrollbar-color: var(--color-border) transparent;
+  -webkit-overflow-scrolling: touch;
 }
-.nsm-content [role="tablist"]::-webkit-scrollbar { height: 6px; }
-.nsm-content [role="tablist"]::-webkit-scrollbar-track { background: transparent; }
-.nsm-content [role="tablist"]::-webkit-scrollbar-thumb {
+.nsm-content [role="tablist"]::-webkit-scrollbar,
+[role="dialog"] [role="tablist"]::-webkit-scrollbar { height: 6px; }
+.nsm-content [role="tablist"]::-webkit-scrollbar-track,
+[role="dialog"] [role="tablist"]::-webkit-scrollbar-track { background: transparent; }
+.nsm-content [role="tablist"]::-webkit-scrollbar-thumb,
+[role="dialog"] [role="tablist"]::-webkit-scrollbar-thumb {
   background: var(--color-border);
   border-radius: 999px;
 }
-.nsm-content [role="tablist"]:hover::-webkit-scrollbar-thumb {
+.nsm-content [role="tablist"]:hover::-webkit-scrollbar-thumb,
+[role="dialog"] [role="tablist"]:hover::-webkit-scrollbar-thumb {
   background: var(--color-accent-500);
 }
 
@@ -894,4 +901,33 @@
   border-radius: var(--nsa-radius);
   background: var(--color-background, var(--color-surface));
   overflow: hidden;
+}
+
+/* rui's Breadcrumb list scrolls horizontally (overflow-x-auto) when the page
+   header is narrow — at 2x density, or once the header carries the Switch
+   server action. A scrolling list of plain text has nothing focusable, so a
+   keyboard user could never reach the clipped crumbs (axe
+   scrollable-region-focusable). Wrap instead: every crumb stays visible. */
+.nsm-breadcrumb > ol {
+  flex-wrap: wrap;
+  overflow-x: visible;
+}
+
+/* The topbar's server identity: profile name + environment on one line. On
+   narrow screens the name yields its space to the search field, but the
+   environment badge stays — "production" must be visible on every view. */
+.nsm-topbar-server {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  white-space: nowrap;
+}
+@media (max-width: 40rem) {
+  .nsm-topbar-server-name {
+    display: none;
+  }
+}
+
+.nsm-switch-notice {
+  margin-block-end: 1rem;
 }

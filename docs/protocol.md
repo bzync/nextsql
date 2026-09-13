@@ -241,6 +241,27 @@ DML sends `CommandComplete` only.
 
 HelloOK includes a 64-bit cancel secret. The driver opens a second connection, sends Hello with the cancel flag and that secret, and the backend cancels the current query context and unblocks any `FlowAck` wait. In-band `Cancel` on the query connection is also accepted while waiting for flow control.
 
+A cancel never interrupts a write. The backend cancels the statement's context
+so it stops producing results, and pulls the read deadline to "now" only while
+the statement is blocked waiting for a `FlowAck`. A response frame already being
+written is finished. Until log #285 a cancel set the whole connection deadline
+to "now". On TLS, a write cut off by a deadline leaves a record half-sent and
+permanently disables the connection's write side. The session then kept reading
+requests but could never answer: the client waited out the idle timeout and
+then saw `tls: bad record MAC`.
+
+`FlowAck`, `Cancel` and `Terminate` carry no payload, so each is one write and
+one TLS record, and an interrupted flow-control read cannot consume half of one.
+A cancel that arrives when no statement is running does nothing; it does not
+wait for the next statement. A client that cancels asynchronously must not
+start another statement on the connection until its cancel request has been
+answered. The Go driver waits for it, bounded by a 10 s cancel timeout that also
+bounds the side connection's dial and handshake.
+
+`WriteFrame` sends a frame with a payload of up to 16 KiB as a single write, so
+a small frame is one syscall and, on TLS, one record. Larger payloads go out as
+a header write followed by a payload write.
+
 ## Limits (defaults)
 
 | Limit | Default |

@@ -21,6 +21,11 @@ func FuzzDecodeCommand(f *testing.F) {
 		f.Fatal(err)
 	}
 	f.Add(good)
+	delta, err := EncodeCommand(dek, []wal.Record{{Type: wal.RecPageDelta, LSN: 2, TxnID: 1, PageID: 3, Body: []byte{1}}})
+	if err != nil {
+		f.Fatal(err)
+	}
+	f.Add(delta)
 	f.Add([]byte{})
 	f.Add([]byte("NSRL"))
 	f.Fuzz(func(t *testing.T, data []byte) {

@@ -19,11 +19,13 @@ import (
 // Manager runs for this session goes through it, so server-side RBAC applies.
 // A Conn is not safe for concurrent queries, so callers hold mu.
 type session struct {
-	id        string
-	csrf      string
-	user      string
-	database  string
-	realm     string
+	id       string
+	csrf     string
+	user     string
+	database string
+	// profile is the connection-profile ID this session signed in to. It is
+	// fixed for the session's life: switching servers creates a new session.
+	profile   string
 	createdAt time.Time
 
 	// mu serializes use of conn. Operations read-models wait their turn;
@@ -34,9 +36,9 @@ type session struct {
 
 	// stateMu is deliberately separate from mu: an authenticated cancellation
 	// request must be able to refresh the idle clock and cancel a query while
-	// that query owns the connection lock. It also guards realm/database and
-	// the read-consistency mode, which Studio session-control requests can
-	// change while a read-model handler is reading them.
+	// that query owns the connection lock. It also guards the
+	// read-consistency mode, which Studio session-control requests can
+	// change while a read-model handler is reading it.
 	stateMu     sync.Mutex
 	lastSeen    time.Time
 	inFlight    int
@@ -45,14 +47,6 @@ type session struct {
 	// is the BOUNDED freshness bound in milliseconds (0 ⇒ server default).
 	readMode           string
 	readMaxStalenessMS int64
-}
-
-// target returns the realm and database the session's connection is
-// currently bound to. Guarded by stateMu because reconnect mutates them.
-func (s *session) target() (realm, database string) {
-	s.stateMu.Lock()
-	defer s.stateMu.Unlock()
-	return s.realm, s.database
 }
 
 // readConsistency reports the session's current read-consistency mode. An
@@ -89,33 +83,15 @@ func (s *session) setReadConsistency(mode nextsql.ReadConsistency, maxStaleness 
 	return nil
 }
 
-// reconnect atomically replaces the session's driver connection with an
-// already-opened one bound to a different realm/database (same nextsqld,
-// same NSQL user). The caller opens newConn first; reconnect installs it and
-// closes the old one only on success, so a failed switch leaves the session
-// exactly as it was. It fails fast (nerr.Conflict) if a Studio query is
-// in flight — the switch must not race an active query on the old
-// connection.
-func (s *session) reconnect(newConn *nextsql.Conn, realm, database string) error {
-	if !s.mu.TryLock() {
-		return nerr.New(nerr.Conflict, "ops.session.reconnect",
-			"this connection is busy; cancel the running query before switching")
-	}
-	defer s.mu.Unlock()
-	old := s.conn
-	s.conn = newConn
+// busy reports whether a Studio query is running on the session. It is a
+// point-in-time check used to refuse a server switch with a clear message
+// rather than silently cancelling the operator's query. It deliberately does
+// not probe the connection lock: the shared reachability probe holds that
+// for a moment every few seconds, which would make a switch fail at random.
+func (s *session) busy() bool {
 	s.stateMu.Lock()
-	s.realm = realm
-	s.database = database
-	// A freshly opened connection is STRONG; the previous connection's
-	// read-consistency choice does not carry over.
-	s.readMode = ""
-	s.readMaxStalenessMS = 0
-	s.stateMu.Unlock()
-	if old != nil {
-		_ = old.Close()
-	}
-	return nil
+	defer s.stateMu.Unlock()
+	return s.activeQuery != nil
 }
 
 type activeStudioQuery struct {
@@ -396,7 +372,20 @@ func newSessionStore(max int, idle, lifetime time.Duration) *sessionStore {
 
 // create registers a new session for an already-open connection. It returns
 // nerr.Exhausted when the store is full.
-func (st *sessionStore) create(conn *nextsql.Conn, user, database, realm string) (*session, error) {
+func (st *sessionStore) create(conn *nextsql.Conn, user, database, profileID string) (*session, error) {
+	return st.replace("", conn, user, database, profileID)
+}
+
+// replace registers a new session and, in the same critical section, drops
+// the session oldID (if it still exists), so a server switch never needs a
+// spare slot and never leaves both sessions live. The new session gets a
+// fresh ID and CSRF token: the authenticated principal changed, so nothing
+// the browser held for the old one stays valid. The old session is closed
+// after the lock is released, on its own goroutine: close waits for the
+// connection lock, and an Operations action already running on the old
+// connection (a backup verification, say) must not hold the switch response
+// hostage. At most one such goroutine exists per replaced session.
+func (st *sessionStore) replace(oldID string, conn *nextsql.Conn, user, database, profileID string) (*session, error) {
 	id, err := randToken()
 	if err != nil {
 		return nil, err
@@ -407,17 +396,28 @@ func (st *sessionStore) create(conn *nextsql.Conn, user, database, realm string)
 	}
 	now := time.Now()
 	s := &session{
-		id: id, csrf: csrf, user: user, database: database, realm: realm,
+		id: id, csrf: csrf, user: user, database: database, profile: profileID,
 		createdAt: now, lastSeen: now, conn: conn,
 	}
 
 	st.mu.Lock()
-	defer st.mu.Unlock()
+	old, hadOld := st.byID[oldID]
+	if hadOld {
+		delete(st.byID, oldID)
+	}
 	if len(st.byID) >= st.max {
+		if hadOld {
+			st.byID[oldID] = old
+		}
+		st.mu.Unlock()
 		return nil, nerr.New(nerr.Exhausted, "ops.sessionStore",
 			"the maximum number of Manager sessions is already active")
 	}
 	st.byID[id] = s
+	st.mu.Unlock()
+	if hadOld {
+		go old.close()
+	}
 	return s, nil
 }
 

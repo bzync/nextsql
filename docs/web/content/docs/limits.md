@@ -1,13 +1,14 @@
 # Limits and current gaps
 
-This is still **0.0.1**. Treat it as an engine under measurement, not a drop-in production replacement, until you have run `nextsql-bench --slo` and the crash/HA suites on your hardware.
+**0.0.1** is a preview. Treat it as an engine under measurement, not a drop-in production replacement, until you have run `nextsql-bench --slo` and the crash/HA suites on your hardware.
 
-A live install uses `nextsql setup --profile production` (Setup-mode GUI default) so `nextsqld` fail-closes instead of shipping developer defaults. NextSQL Admin Setup and Operations are usable; Studio is in progress. NextSQL Intelligence / built-in RAG is not in the product.
+A live install uses `nextsql setup --profile production` so `nextsqld` fail-closes instead of shipping developer defaults. NextSQL Admin Setup, Operations, and Studio are available on loopback.
 
 ## Hard limits
 
 | Limit | Value |
 |---|---|
+| Databases per `nextsqld` | 1, by design (see [One database per daemon](#one-database-per-daemon)) |
 | Logical page | 16 KiB |
 | Packet / SQL text | 64 MiB / 16 MiB (configurable within these ceilings) |
 | Parameters | 65,535 (configurable ceiling) |
@@ -32,8 +33,15 @@ A live install uses `nextsql setup --profile production` (Setup-mode GUI default
 
 - General searchable field-level encryption (randomized `NSCE1.` and HKDF-separated RFC 5297 AES-SIV deterministic-equality `NSCE2.` are implemented across Go, JS/TS, Bun, and PHP drivers with key rotation, fuzz, PITR, and HA coverage)
 - Multi-primary writes (deployments strictly adhere to single-leader Raft consensus)
+- Native Windows (servers and tools run on Windows only inside WSL 2)
 
-Windows/macOS packaged Admin execution remains environment-blocked. Linux `.tar.gz` / `.run` / `.deb` / `.rpm` and silent/offline/upgrade/repair paths are live-verified.
+macOS packaged Admin execution remains environment-blocked. Linux `.tar.gz` / `.run` / `.deb` / `.rpm` and silent/offline/upgrade/repair paths are live-verified.
+
+## One database per daemon
+
+NextSQL is built so one `nextsqld` serves exactly one database. The data directory, root key, users, roles, and ACL all belong to that one database, so isolation is the whole process. `CREATE DATABASE` is not part of the dialect, and `nextsqld` refuses to start against a deployment registry that holds more than one database.
+
+To run another database, `nextsql init` a new data directory with its own root key and start another `nextsqld` for it. [NextSQL Admin](/docs/admin) can sign in to and switch between several servers.
 
 ## Known measurement notes (0.0.1)
 

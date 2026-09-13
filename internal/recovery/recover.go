@@ -1,6 +1,7 @@
 package recovery
 
 import (
+	"fmt"
 	"github.com/bzync/nextsql/internal/nerr"
 	"github.com/bzync/nextsql/internal/storage/file"
 	"github.com/bzync/nextsql/internal/storage/format"
@@ -27,6 +28,23 @@ func RedoUntil(fm *file.Manager, lg *wal.Log, until format.LSN) error {
 		return err
 	}
 	recs, last = clipRecords(recs, last, until)
+
+	// A log holding a page delta must say so in its control file before
+	// anything depends on it, so a release that predates deltas refuses the
+	// log instead of reading the record as a torn tail. The engine and the
+	// replica path keep that true as they write; a point-in-time restore can
+	// still pair a base backup's version-1 control file with archived
+	// segments written after the source moved to version 2.
+	if !lg.PageDeltas() {
+		for _, r := range recs {
+			if r.Type == wal.RecPageDelta {
+				if err := lg.EnablePageDeltas(); err != nil {
+					return err
+				}
+				break
+			}
+		}
+	}
 
 	committed := make(map[format.TxnID]struct{})
 	var maxTxn format.TxnID
@@ -66,6 +84,10 @@ func RedoUntil(fm *file.Manager, lg *wal.Log, until format.LSN) error {
 		switch r.Type {
 		case wal.RecPageImage:
 			if err := applyPage(fm, r); err != nil {
+				return err
+			}
+		case wal.RecPageDelta:
+			if err := applyPageDelta(fm, r); err != nil {
 				return err
 			}
 		case wal.RecTreeMeta:
@@ -147,6 +169,53 @@ func UncommittedUntil(lg *wal.Log, until format.LSN) ([]format.TxnID, error) {
 	return out, nil
 }
 
+// NotCommittedUntil returns every transaction recovery must treat as not
+// committed: those that began after the redo boundary and never committed or
+// aborted, and those that aborted. Both lists are undone and marked aborted.
+//
+// The aborted ones matter as much as the open ones. A rollback changes pages
+// without logging them, but another transaction's committed image of a shared
+// page may already carry the aborted transaction's row versions. Recovery
+// replays that image; if it then neither undid the aborted transaction nor
+// knew its outcome, the transaction manager would default it to committed and
+// the rolled-back versions would come back as live data.
+func NotCommittedUntil(lg *wal.Log, until format.LSN) (open, aborted []format.TxnID, err error) {
+	if lg == nil {
+		return nil, nil, nerr.New(nerr.InvalidArgument, "recovery.NotCommitted", "nil WAL")
+	}
+	recs, last, err := lg.ScanFrom(lg.RedoLSN())
+	if err != nil {
+		return nil, nil, err
+	}
+	recs, _ = clipRecords(recs, last, until)
+	began := map[format.TxnID]struct{}{}
+	committed := map[format.TxnID]struct{}{}
+	abortedSet := map[format.TxnID]struct{}{}
+	for _, r := range recs {
+		switch r.Type {
+		case wal.RecBegin:
+			began[r.TxnID] = struct{}{}
+		case wal.RecCommit:
+			committed[r.TxnID] = struct{}{}
+		case wal.RecAbort:
+			abortedSet[r.TxnID] = struct{}{}
+		}
+	}
+	for id := range began {
+		_, c := committed[id]
+		_, a := abortedSet[id]
+		if !c && !a {
+			open = append(open, id)
+		}
+	}
+	for id := range abortedSet {
+		if _, c := committed[id]; !c {
+			aborted = append(aborted, id)
+		}
+	}
+	return open, aborted, nil
+}
+
 func clipRecords(recs []wal.Record, last format.LSN, until format.LSN) ([]wal.Record, format.LSN) {
 	if until == 0 {
 		return recs, last
@@ -176,4 +245,34 @@ func applyPage(fm *file.Manager, r wal.Record) error {
 		}
 	}
 	return fm.WriteLogical(r.PageID, r.Body)
+}
+
+// applyPageDelta replays a RecPageDelta onto the data file.
+//
+// A page already at or past the delta's LSN is left alone, exactly as for a
+// full image. Otherwise the page must be precisely the delta's base -- at its
+// base LSN, with its base digest -- because the records replayed before this
+// one are what put it there. Anything else means the log and the data file
+// disagree, and applying the delta would write a wrong page, so recovery
+// fails closed naming the page and both LSNs.
+func applyPageDelta(fm *file.Manager, r wal.Record) error {
+	if r.PageID == 0 {
+		return nerr.New(nerr.Corruption, "recovery.applyPageDelta", "page delta missing page id")
+	}
+	d, err := wal.DecodePageDelta(r.Body)
+	if err != nil {
+		return nerr.Wrap(nerr.Corruption, "recovery.applyPageDelta", "undecodable page delta", err)
+	}
+	existing, err := fm.ReadLogical(r.PageID)
+	if err != nil {
+		return nerr.Wrap(nerr.Corruption, "recovery.applyPageDelta", fmt.Sprintf("page %d is unreadable for the delta at LSN %d", r.PageID, r.LSN), err)
+	}
+	if page.LSNOf(existing) >= r.LSN {
+		return nil
+	}
+	if err := wal.ApplyPageDelta(existing, d, r.LSN); err != nil {
+		return nerr.Wrap(nerr.Corruption, "recovery.applyPageDelta", fmt.Sprintf(
+			"page %d is at LSN %d; the delta at LSN %d needs base LSN %d", r.PageID, page.LSNOf(existing), r.LSN, d.BaseLSN), err)
+	}
+	return fm.WriteLogical(r.PageID, existing)
 }

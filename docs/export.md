@@ -66,6 +66,13 @@ Uncommitted writes are not exported. The scan uses a snapshot.
 2. Unwrap the export DEK (keystore + root, or the live source provider).
 3. Decrypt the payload and check SHA-256 and counts.
 4. Import into a temporary database and run a probe `SELECT`.
+5. Read every imported table back and require it to hold exactly the dumped
+   rows, compared as a multiset of digests of each row's canonical record.
+   Rows stream through the table scan, so a large table is neither buffered
+   as a query result nor bound by statement limits. Loading without an error
+   is not enough: until log #287 an import silently replaced stored `NULL`s in
+   defaulted columns with the default, and this step would have refused to
+   publish that export.
 
 Tamper, truncate, or a wrong key fails closed. An unpublished
 `*.partial` directory from a crash is deleted and never treated as an

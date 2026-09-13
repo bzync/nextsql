@@ -66,7 +66,22 @@ Runtime feedback (`EXPLAIN ANALYZE` actual vs estimate) is recorded on the datab
 
 Durable catalog rows, magic `NSST`, key `S` + table name.
 
-Collected: row count, per-column nulls / NDV / min / max / equi-height histogram / most common values / Spearman correlation vs the first PK column, per-index selectivity, PK-ordered segment min/max (up to 8 segments), per-`VECTOR` column statistics (non-null count, dimension, HNSW index name / `M` / `efConstruction` when a vector index exists), and exact row counts keyed by stable physical-partition ID. Global sampling is a fixed-seed reservoir (max 100 000 rows) so the same heap contents produce the same snapshot. Stats format `NSST` version 2 added the vector block and version 3 adds the bounded partition-count block; versions 1 and 2 still decode.
+Collected: row count, per-column nulls / NDV / min / max / equi-height histogram / most common values / Spearman correlation vs the first PK column, per-index selectivity, PK-ordered segment min/max (up to 8 segments), per-`VECTOR` column statistics (non-null count, dimension, HNSW index name / `M` / `efConstruction` when a vector index exists), and exact row counts keyed by stable physical-partition ID. Global sampling is a fixed-seed reservoir (max 100 000 rows) so the same heap contents produce the same snapshot. A table's statistics are one catalog record, and a record cannot exceed half
+a page. Full detail costs about 2 KiB per column, so before log #286 an explicit
+`ANALYZE` of any table wider than three or four columns failed with `record
+exceeds page capacity`. The record is now reduced until it fits, always in this
+order, so the same data yields the same record:
+
+1. segment summaries are dropped;
+2. every histogram is halved by merging adjacent buckets (so counts stay exact)
+   and every most-common-values list is halved, down to four buckets and two
+   values;
+3. histograms and most-common values are dropped entirely, which is the
+   automatic refresh's shape;
+4. per-column minimum and maximum are dropped.
+
+Row, `NULL` and distinct counts are always kept. `RENAME TABLE` re-fits the
+record, because its key grows with a longer name. Stats format `NSST` version 2 added the vector block and version 3 adds the bounded partition-count block; versions 1 and 2 still decode.
 
 A partitioned `ANALYZE` also writes one compact `NSPS` v1 catalog record per
 stable physical partition. A deterministic reservoir of at most 4,096 rows per
@@ -83,6 +98,34 @@ DDL between `ANALYZE` runs cannot manufacture an empty or overconfident plan.
 ## Plan cache
 
 Keyed by SQL text + catalog generation. DDL and `ANALYZE` bump the generation. Transaction-control, `EXPLAIN`, `ANALYZE`, and DDL are not cached. Capacity 256, FIFO eviction.
+
+## Bound parameters
+
+Access-path selection recognizes a comparison against a constant. A bound
+parameter compared directly with a column (`col = $1`, `$1 < col`, and so on,
+including under `AND`/`OR`) in the `WHERE` of a single-table `SELECT`, an
+`UPDATE` or a `DELETE` has its bound value substituted before planning
+(`internal/executor/param_sarg.go`). Such a statement is planned exactly as its
+literal form, so it can use the primary key or a secondary index.
+
+Until log #286 it could not. `WHERE id = $1`, the form every driver sends,
+planned as a sequential scan with a filter. Over the wire on a 32K-row table, a
+primary-key lookup took 31 ms, the same as a full scan. It now takes 150 µs, at
+~6,000 lookups/s on one connection and ~33,000/s on 16.
+
+A substituted plan depends on the values, so it is **not** stored in or read
+from the plan cache. Reusing it for other values would answer every later
+execution with the first execution's row. The substitution is skipped in these
+cases, where the parameter keeps its runtime evaluation:
+
+- the compared column is `ENCRYPTED CLIENT`, whose ciphertext checks need the
+  parameter;
+- the parameter is `NULL`;
+- the parameter is inside a larger expression;
+- the statement has joins.
+
+`EXPLAIN` with bound parameters shows the substituted plan, which is the one
+that would run.
 
 ## EXPLAIN
 

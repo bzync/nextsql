@@ -303,4 +303,3 @@ func TestArrayAggAndMapAgg(t *testing.T) {
 		t.Fatal("expected error for duplicate MAP key, got nil")
 	}
 }
-

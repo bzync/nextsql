@@ -39,18 +39,7 @@ import (
 	"github.com/bzync/nextsql/internal/version"
 )
 
-// serviceStop is closed by the Windows service manager when a stop is
-// requested. It is nil in the foreground (systemd / console) path.
-var serviceStop <-chan struct{}
-
 func main() {
-	if handled, err := runAsWindowsService(); handled {
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "nextsqld: %v\n", err)
-			os.Exit(1)
-		}
-		return
-	}
 	if err := run(); err != nil {
 		fmt.Fprintf(os.Stderr, "nextsqld: %v\n", err)
 		os.Exit(1)
@@ -58,19 +47,7 @@ func main() {
 }
 
 func serveContext() (context.Context, context.CancelFunc) {
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	if serviceStop == nil {
-		return ctx, stop
-	}
-	ctx2, cancel := context.WithCancel(ctx)
-	go func() {
-		select {
-		case <-serviceStop:
-			cancel()
-		case <-ctx.Done():
-		}
-	}()
-	return ctx2, func() { stop(); cancel() }
+	return signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 }
 
 func run() error {
@@ -243,6 +220,10 @@ func run() error {
 	// per database. cfg.MaxTotalBufferPages == 0 (default) makes it
 	// unbounded, matching pre-M2-3b-2 behavior exactly.
 	bufBudget := buffer.NewBudget(cfg.MaxTotalBufferPages)
+	pageDeltas, err := storage.ParsePageDeltaMode(cfg.WALPageDeltas)
+	if err != nil {
+		return err
+	}
 	// taskPool (M2-3b-3a) is the shared, fixed-size worker set every open
 	// database's task execution submits claimed tasks to — either directly
 	// via a dedicated TaskRuntime (the legacy/non-hosted primary), or via
@@ -258,6 +239,9 @@ func run() error {
 	// before taskPool.Close() runs, or its worker goroutines could exit out
 	// from under a still-open submitter's pending submission — see
 	// TaskPool.Close's own doc comment.
+	// Bound concurrent password hashing before the listener can accept a
+	// single login (internal/auth/hashgate.go).
+	auth.SetMaxConcurrentPasswordHashes(cfg.MaxConcurrentPasswordHashes)
 	taskPool, err := executor.NewTaskPool(nil, cfg.TaskWorkers)
 	if err != nil {
 		return err
@@ -317,7 +301,7 @@ func run() error {
 			return err
 		}
 		env = opened
-		db, err = executor.OpenWith(dbPath, keys, cfg.BufferPages, storage.OpenOptions{Budget: bufBudget})
+		db, err = executor.OpenWith(dbPath, keys, cfg.BufferPages, storage.OpenOptions{Budget: bufBudget, PageDeltas: pageDeltas})
 		if err != nil {
 			return err
 		}
@@ -665,7 +649,7 @@ func run() error {
 			if err != nil {
 				return err
 			}
-			openedDB, err := executor.OpenWith(dbPath, opened, cfg.BufferPages, storage.OpenOptions{Budget: bufBudget})
+			openedDB, err := executor.OpenWith(dbPath, opened, cfg.BufferPages, storage.OpenOptions{Budget: bufBudget, PageDeltas: pageDeltas})
 			if err != nil {
 				_ = opened.Close()
 				return err
@@ -890,7 +874,6 @@ func run() error {
 		"require_client_key", cfg.RequireClientKey,
 		"raft", cfg.RaftBind,
 		"node", cfg.NodeID,
-		"realm", hostedRealm.Name,
 		"database", hostedDatabase.Name,
 	)
 
@@ -1292,6 +1275,11 @@ func installArchiver(db *executor.DB, keys crypto.KeyProvider, dir string) error
 // canceled context alone cannot prevent a ticker callback already in progress
 // from using a handle that is about to be closed.
 func startDatabaseBackground(ctx context.Context, db *executor.DB, cfg config.Config, log *slog.Logger) func() {
+	// A stored view whose body no longer parses fails only when someone
+	// queries it; say so at startup, naming the fix.
+	for name, err := range db.UnparseableViews() {
+		log.Warn("stored view no longer parses; recreate it with CREATE OR REPLACE VIEW", "view", name, "error", err.Error())
+	}
 	waits := []func(){
 		startCheckpointController(ctx, db, cfg.CheckpointIntervalMS, log),
 		startWALRetentionUpdater(ctx, db, cfg.WalArchive, cfg.WalRetentionMS, log),

@@ -230,26 +230,34 @@ func (t *Tree) addLive(n int64) {
 	}
 }
 
+// apply runs fn as one maintenance write transaction on its own explicit
+// handle (see storage.Engine.BeginExclusiveWrite). The page changes run inside
+// Enter..LeaveOp like every other write, so dirty pages are attributed to this
+// transaction rather than to whichever SQL operation happens to be entered,
+// and a split or merge fn performs is logged; the commit then runs outside
+// pageMu, which the commit's page-image copy needs.
 func (t *Tree) apply(fn func() error) error {
 	snapR, snapH, snapL, snapK := t.root, t.height, t.liveRows, t.liveKnown
-	if err := t.eng.BeginWrite(); err != nil {
+	tx, err := t.eng.BeginExclusiveWrite()
+	if err != nil {
 		return err
 	}
-	if err := fn(); err != nil {
-		if !wal.IsCrash(err) {
-			_ = t.eng.Rollback()
+	t.eng.Enter(tx)
+	err = fn()
+	if err == nil {
+		err = t.persist()
+	}
+	err = t.eng.LeaveOp(tx, err)
+	if err != nil {
+		if wal.IsCrash(err) {
+			t.eng.AbandonExclusiveWrite()
+		} else {
+			_ = t.eng.EndExclusiveWrite(tx, false)
 		}
 		t.root, t.height, t.liveRows, t.liveKnown = snapR, snapH, snapL, snapK
 		return err
 	}
-	if err := t.persist(); err != nil {
-		if !wal.IsCrash(err) {
-			_ = t.eng.Rollback()
-		}
-		t.root, t.height, t.liveRows, t.liveKnown = snapR, snapH, snapL, snapK
-		return err
-	}
-	if err := t.eng.Commit(); err != nil {
+	if err := t.eng.EndExclusiveWrite(tx, true); err != nil {
 		t.root, t.height, t.liveRows, t.liveKnown = snapR, snapH, snapL, snapK
 		return err
 	}

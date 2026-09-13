@@ -88,9 +88,31 @@ func (s *Session) guardLegacyTenancy(stmt ast.Stmt) (ast.Stmt, error) {
 			return nil, err
 		}
 		return st, nil
+	case ast.CreateTable:
+		// The source reads relations, so it is guarded exactly as the same
+		// query would be on its own. The table being created is new and so
+		// can never be a legacy TENANT table.
+		if st.Query == nil {
+			return st, nil
+		}
+		q, err := s.guardLegacyTenancy(st.Query)
+		if err != nil {
+			return nil, err
+		}
+		st.Query = q
+		return st, nil
 	case ast.Insert:
 		if err := s.guardLegacyTenantTable(st.Table); err != nil {
 			return nil, err
+		}
+		// A query source reads relations, so it is guarded exactly as the same
+		// query would be on its own.
+		if st.Query != nil {
+			q, err := s.guardLegacyTenancy(st.Query)
+			if err != nil {
+				return nil, err
+			}
+			st.Query = q
 		}
 		return st, s.guardLegacyTenantExprs(insertExprs(st))
 	case ast.Upsert:

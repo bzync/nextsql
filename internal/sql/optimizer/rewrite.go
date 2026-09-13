@@ -131,6 +131,13 @@ func rewriteOnce(p planner.Logical) planner.Logical {
 		}
 		n.Input = in
 		return n
+	case planner.Insert:
+		if n.Input == nil {
+			return n
+		}
+		return planner.Insert{Table: n.Table, Columns: n.Columns, Rows: n.Rows, Input: rewriteOnce(n.Input), Returning: n.Returning}
+	case planner.CreateTableAs:
+		return planner.CreateTableAs{Name: n.Name, PK: n.PK, Columns: n.Columns, Input: rewriteOnce(n.Input)}
 	case planner.Update:
 		return planner.Update{Input: rewriteOnce(n.Input), Table: n.Table, Sets: n.Sets, Limit: n.Limit, Returning: n.Returning}
 	case planner.Delete:
@@ -821,6 +828,13 @@ func formatPlan(p planner.Logical) string {
 		return s
 	case planner.Empty:
 		return "Empty"
+	case planner.Insert:
+		if n.Input == nil {
+			return "Insert " + tableName(n.Table)
+		}
+		return "Insert " + tableName(n.Table) + "\n" + indent(formatPlan(n.Input))
+	case planner.CreateTableAs:
+		return "CreateTableAs " + n.Name + "\n" + indent(formatPlan(n.Input))
 	case planner.Update:
 		return "Update " + tableName(n.Table) + "\n" + indent(formatPlan(n.Input))
 	case planner.Delete:
@@ -837,8 +851,6 @@ func formatPlan(p planner.Logical) string {
 		return "CreateTable"
 	case planner.CreateIndex:
 		return "CreateIndex"
-	case planner.Insert:
-		return "Insert"
 	case planner.Upsert:
 		return "Upsert"
 	default:

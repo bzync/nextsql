@@ -136,6 +136,14 @@ const (
 	GeomSubGeometryCollection
 )
 
+// GeomSubAnyName is the spelling GeomSubAny takes inside
+// GEOMETRY(<sub>, <srid>). A column that accepts any subtype still has to name
+// one when it carries an SRID, because the grammar reads the subtype first --
+// GEOGRAPHY's default WGS84 SRID means every plain GEOGRAPHY column renders
+// this way. Both the renderer below and GeomSubByName use this constant, so the
+// rendered DDL parses back to the type it came from.
+const GeomSubAnyName = "Geometry"
+
 // GeomSubName is the spelling used inside GEOMETRY(<sub>, <srid>).
 func GeomSubName(s uint16) string {
 	switch s {
@@ -159,8 +167,12 @@ func GeomSubName(s uint16) string {
 }
 
 // GeomSubByName is the inverse of GeomSubName (case-insensitive); ok is false
-// for an unknown spelling.
+// for an unknown spelling. GeomSubAnyName maps back to GeomSubAny, which
+// GeomSubName cannot spell (it has no single subtype to name).
 func GeomSubByName(name string) (sub uint16, ok bool) {
+	if strings.EqualFold(GeomSubAnyName, name) {
+		return GeomSubAny, true
+	}
 	for s := GeomSubPoint; s <= GeomSubGeometryCollection; s++ {
 		if strings.EqualFold(GeomSubName(s), name) {
 			return s, true
@@ -657,7 +669,7 @@ func (t Type) String() string {
 			return name
 		}
 		if sub == "" {
-			sub = "Geometry"
+			sub = GeomSubAnyName
 		}
 		if t.Precision == 0 {
 			return name + "(" + sub + ")"

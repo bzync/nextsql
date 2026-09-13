@@ -18,6 +18,23 @@ type (
 	CreateTable struct {
 		Table *catalog.Table
 	}
+	// CreateTableAs is `CREATE TABLE name PRIMARY KEY (cols) AS <query>`.
+	// Input is the source plan, optimized like any other query; the table
+	// itself is built by the executor from the types the source's values
+	// carry, which is why there is no *catalog.Table here.
+	//
+	// It deliberately carries no table identity either. Unlike CreateTable,
+	// this node does not short-circuit ahead of the optimizer's plan cache --
+	// its source has to be optimized -- so anything stored in it can be
+	// replayed for a later statement with the same text. A catalog identity is
+	// reserved per execution and must never be reused, so the executor
+	// allocates it when it builds the table.
+	CreateTableAs struct {
+		Name    string
+		PK      []string
+		Columns []string
+		Input   Logical
+	}
 	CreateWorkflow struct {
 		Workflow    *catalog.Workflow
 		IfNotExists bool
@@ -78,6 +95,19 @@ type (
 		After string
 		Limit int
 	}
+	CancelQuery struct {
+		ID string
+	}
+	CreateView struct {
+		Name    string
+		Columns []string
+		Query   string
+		Replace bool
+	}
+	DropView struct {
+		Name     string
+		IfExists bool
+	}
 	CancelTask struct {
 		ID string
 	}
@@ -116,9 +146,12 @@ type (
 		Index catalog.Index
 	}
 	Insert struct {
-		Table     *catalog.Table
-		Columns   []int
-		Rows      [][]ast.Expr
+		Table   *catalog.Table
+		Columns []int
+		Rows    [][]ast.Expr
+		// Input is the source plan of an `INSERT INTO t <query>`; it is
+		// mutually exclusive with Rows.
+		Input     Logical
 		Returning binder.Returning
 	}
 	Upsert struct {
@@ -346,8 +379,16 @@ type (
 		Iso txn.Isolation
 	}
 	Commit   struct{}
-	Rollback struct{}
-	Explain  struct {
+	Rollback struct {
+		Savepoint string
+	}
+	Savepoint struct {
+		Name string
+	}
+	ReleaseSavepoint struct {
+		Name string
+	}
+	Explain struct {
 		Input   Logical
 		Analyze bool
 	}
@@ -386,6 +427,7 @@ type (
 )
 
 func (CreateTable) logical()         {}
+func (CreateTableAs) logical()       {}
 func (CreateWorkflow) logical()      {}
 func (RunWorkflow) logical()         {}
 func (AlterWorkflow) logical()       {}
@@ -401,6 +443,9 @@ func (AlterResourceGroup) logical()  {}
 func (DropResourceGroup) logical()   {}
 func (ShowTasks) logical()           {}
 func (CancelTask) logical()          {}
+func (CancelQuery) logical()         {}
+func (CreateView) logical()          {}
+func (DropView) logical()            {}
 func (Subscribe) logical()           {}
 func (DropTable) logical()           {}
 func (DropIndex) logical()           {}
@@ -431,6 +476,8 @@ func (Delete) logical()              {}
 func (Begin) logical()               {}
 func (Commit) logical()              {}
 func (Rollback) logical()            {}
+func (Savepoint) logical()           {}
+func (ReleaseSavepoint) logical()    {}
 func (Explain) logical()             {}
 func (Analyze) logical()             {}
 func (Maintain) logical()            {}
@@ -540,6 +587,17 @@ func Plan(b binder.Bound) (Logical, error) {
 		return SetOperation{Left: left, Right: right, Op: s.Op, All: s.All, Names: append([]string(nil), s.Names...)}, nil
 	case binder.CreateTable:
 		return CreateTable{Table: s.Table}, nil
+	case binder.CreateTableAs:
+		in, err := Plan(s.Query)
+		if err != nil {
+			return nil, err
+		}
+		return CreateTableAs{
+			Name:    s.Name,
+			PK:      append([]string(nil), s.PK...),
+			Columns: append([]string(nil), s.Columns...),
+			Input:   in,
+		}, nil
 	case binder.CreateWorkflow:
 		return CreateWorkflow{Workflow: s.Workflow, IfNotExists: s.IfNotExists, Existing: s.Existing}, nil
 	case binder.RunWorkflow:
@@ -570,6 +628,12 @@ func Plan(b binder.Bound) (Logical, error) {
 		return ShowTasks{After: s.After, Limit: s.Limit}, nil
 	case binder.CancelTask:
 		return CancelTask{ID: s.ID}, nil
+	case binder.CancelQuery:
+		return CancelQuery{ID: s.ID}, nil
+	case binder.CreateView:
+		return CreateView{Name: s.Name, Columns: s.Columns, Query: s.Query, Replace: s.Replace}, nil
+	case binder.DropView:
+		return DropView{Name: s.Name, IfExists: s.IfExists}, nil
 	case binder.Subscribe:
 		return Subscribe{Table: s.Table, Operation: s.Operation, After: s.After}, nil
 	case binder.DropTable:
@@ -599,7 +663,15 @@ func Plan(b binder.Bound) (Logical, error) {
 			Offset: s.Offset,
 		}, nil
 	case binder.Insert:
-		return Insert{Table: s.Table, Columns: s.Columns, Rows: s.Rows, Returning: s.Returning}, nil
+		var in Logical
+		if s.Query != nil {
+			var err error
+			in, err = Plan(s.Query)
+			if err != nil {
+				return nil, err
+			}
+		}
+		return Insert{Table: s.Table, Columns: s.Columns, Rows: s.Rows, Input: in, Returning: s.Returning}, nil
 	case binder.Upsert:
 		return Upsert{
 			Table:      s.Table,
@@ -793,7 +865,11 @@ func Plan(b binder.Bound) (Logical, error) {
 	case binder.Commit:
 		return Commit{}, nil
 	case binder.Rollback:
-		return Rollback{}, nil
+		return Rollback{Savepoint: s.Savepoint}, nil
+	case binder.Savepoint:
+		return Savepoint{Name: s.Name}, nil
+	case binder.ReleaseSavepoint:
+		return ReleaseSavepoint{Name: s.Name}, nil
 	case binder.Explain:
 		inner, err := Plan(s.Stmt)
 		if err != nil {

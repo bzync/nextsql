@@ -69,6 +69,7 @@ const (
 	KwUint16
 	KwUint32
 	KwUint64
+	KwBool
 	KwChar
 	KwVarchar
 	KwEnum
@@ -198,6 +199,7 @@ const (
 	KwReconcile
 	KwConfirm
 	KwUnnest
+	KwLike
 	// symbols
 	LParen
 	RParen
@@ -227,8 +229,8 @@ func (k Kind) String() string {
 
 var kindNames = map[Kind]string{
 	EOF: "EOF", Ident: "ident", String: "string", Number: "number", Param: "param", HexLit: "hex literal",
-	KwUnnest: "UNNEST",
-	LParen:   "(", RParen: ")", LBracket: "[", RBracket: "]", Comma: ",", Dot: ".", Star: "*", Eq: "=", Neq: "<>",
+	KwUnnest: "UNNEST", KwLike: "LIKE",
+	LParen: "(", RParen: ")", LBracket: "[", RBracket: "]", Comma: ",", Dot: ".", Star: "*", Eq: "=", Neq: "<>",
 	Lt: "<", Gt: ">", Lte: "<=", Gte: ">=", Plus: "+", Minus: "-", Slash: "/", Semi: ";",
 }
 
@@ -518,6 +520,7 @@ var keywords = map[string]Kind{
 	"snapshot": KwSnapshot, "serializable": KwSerializable, "uuid": KwUuid, "string": KwString,
 	"text": KwText, "blob": KwBlob, "int8": KwInt8, "int16": KwInt16, "int32": KwInt32, "int64": KwInt64,
 	"uint8": KwUint8, "uint16": KwUint16, "uint32": KwUint32, "uint64": KwUint64,
+	"bool": KwBool,
 	"char": KwChar, "varchar": KwVarchar, "enum": KwEnum, "float32": KwFloat32, "float64": KwFloat64,
 	"decimal": KwDecimal, "timestamptz": KwTimestamptz, "timestamp": KwTimestamp, "date": KwDate, "time": KwTime, "interval": KwInterval, "json": KwJson,
 	"struct": KwStruct, "array": KwArray, "map": KwMap,
@@ -559,4 +562,7 @@ var keywords = map[string]Kind{
 	"reconcile":   KwReconcile,
 	"confirm":     KwConfirm,
 	"unnest":      KwUnnest,
+	// LIKE is a reserved word, as in ISO/IEC 9075: unquoted it is the pattern
+	// operator, quoted ("like") it is an ordinary identifier.
+	"like": KwLike,
 }

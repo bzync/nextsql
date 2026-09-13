@@ -192,6 +192,11 @@ var catalog = []Spec{
 		Why: "bounds how long one statement blocks holding its own locks",
 	},
 	{
+		Key: "max_concurrent_password_hashes", Class: ClassConcurrency, Unit: UnitCount,
+		Min: 1, Max: 1024, ZeroMeans: "one per four schedulable CPUs, at least two",
+		Why: "each password hash allocates its full Argon2id memory cost (64 MiB) before the client is authenticated, so peak login memory is this many times that; unbounded, a burst of wrong-password clients is an out-of-memory path",
+	},
+	{
 		Key: "max_connections", Class: ClassConcurrency, Unit: UnitCount,
 		Min: 1, Max: maxSockets,
 		Why: "every accepted connection carries a session, buffers and a file descriptor",
@@ -508,5 +513,10 @@ func RenderMarkdown() string {
 	b.WriteString("| FK cascade depth / rows | 8 / 100,000 | `internal/security` | Bounds recursive mutation, WAL growth and transaction work. |\n")
 	b.WriteString("| Workflow statements / params | 256 / 64 | `internal/catalog` | Bounds stored descriptor and execution work. |\n")
 	b.WriteString("| FTS fuzzy vocabulary | 4096 | `internal/fulltext` | Bounds vocabulary expansion and CPU work. |\n")
+	b.WriteString("| Statement nesting | 4096 | `internal/sql/ast` | Every stage after the parser walks the tree recursively; an unbounded tree is an unbounded goroutine stack. Refused as invalid_argument. |\n")
+	b.WriteString("| IN value list | 4096 | `internal/sql/parser` | One comparison per value, evaluated per row; bounds per-predicate work. |\n")
+	b.WriteString("| CHECK constraints per table | 16 | `internal/catalog` | Every check runs on every row written; bounds per-write work, like foreign keys. |\n")
+	b.WriteString("| Savepoints per transaction | 64 | `internal/executor` | Client-controlled stack inside one transaction; bounded like every other per-session structure. |\n")
+	b.WriteString("| View nesting depth | 8 | `internal/catalog` | A view over a view is expanded at bind time; bounds expansion work and catches cycles. |\n")
 	return b.String()
 }

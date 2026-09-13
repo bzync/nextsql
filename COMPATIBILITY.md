@@ -1,8 +1,8 @@
-# NextSQL Compatibility Policy
+# Compatibility
 
-NextSQL is a native database and does not target PostgreSQL/MySQL/MariaDB compatibility.
-
-This document defines compatibility expectations for NextSQL itself.
+NextSQL is a native database. It does not target PostgreSQL, MySQL, or MariaDB
+compatibility. This document is about compatibility of NextSQL with itself —
+storage, WAL, catalog, backup, protocol, SQL, drivers, and CLI.
 
 ---
 

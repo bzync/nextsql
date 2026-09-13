@@ -65,15 +65,15 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build Linux and Windows installers
+      # Linux only: on Windows, NextSQL runs inside WSL 2 from these packages.
+      - name: Build Linux installers
         shell: bash
         env:
           RELEASE_DIST: ${{ runner.temp }}/nextsql-installers
         run: |
           set -euo pipefail
           ./scripts/build-linux-installer.sh --arch amd64 --out "$RELEASE_DIST" --skip-rpm
-          ./scripts/build-windows-installer.sh --arch amd64 --out "$RELEASE_DIST" --skip-nsis
-          cat "$RELEASE_DIST/SHA256SUMS.linux" "$RELEASE_DIST/SHA256SUMS.windows" > "$RELEASE_DIST/SHA256SUMS"
+          cp "$RELEASE_DIST/SHA256SUMS.linux" "$RELEASE_DIST/SHA256SUMS"
 
       - name: Verify release payload
         shell: bash
@@ -87,8 +87,6 @@ jobs:
             "nextsql-${RELEASE_TAG#v}-linux-amd64.run"
             "nextsql-${RELEASE_TAG#v}-linux-amd64.tar.gz"
             "nextsql_${RELEASE_TAG#v}_amd64.deb"
-            "nextsql-${RELEASE_TAG#v}-windows-amd64-setup.exe"
-            "nextsql-${RELEASE_TAG#v}-windows-amd64.zip"
             "SHA256SUMS"
           )
           for file in "${expected[@]}"; do
@@ -128,8 +126,6 @@ jobs:
             "$RELEASE_DIST/nextsql-${version}-linux-amd64.run"
             "$RELEASE_DIST/nextsql-${version}-linux-amd64.tar.gz"
             "$RELEASE_DIST/nextsql_${version}_amd64.deb"
-            "$RELEASE_DIST/nextsql-${version}-windows-amd64-setup.exe"
-            "$RELEASE_DIST/nextsql-${version}-windows-amd64.zip"
             "$RELEASE_DIST/SHA256SUMS"
           )
           gh release create "$RELEASE_TAG" "${assets[@]}" "${flags[@]}"

@@ -9,43 +9,27 @@
 
 ---
 
-## Current State
+## Current state
+
+**0.0.1** is the first public preview. Engine phases P0–P27 are complete.
+P28 (Admin Setup + Operations) and P29 (Studio) are in progress.
 
 ```text
 P0–P15  complete
-P16      complete — exit gate green; terminal 100M B+Tree soak deferred as a standalone measurement
-P17      complete — ONLINE rebuild proven for non-partitioned B+Tree/UNIQUE/JSON-path/spatial indexes; blocking fallback elsewhere
-P18      implementable scope complete
-P19      complete — v1 implementation and clean repository-wide functional gate green
-P20      complete — native committed CDC streaming, images, retention, RBAC, and failover verified
-P21      complete — RANGE/HASH/LIST (1–8 col keys) DDL, routing, tuple-tight pruning, recovery, ADD/DROP plus validated ATTACH/DETACH ownership transfer, local B+Tree-family/FULLTEXT/HNSW indexes, cross-partition secondary UNIQUE, partition-aware UPSERT, stable-ID statistics + costing, bounded maintenance, backup/restore/PITR, benchmarks, randomized pruning-soundness property test, and explicit offline legacy TENANT migration (`nextsql registry migrate-tenant`); distributed sharding is a separate future phase
-P22      complete — follower reads / read scaling
-P23      complete — Vector Engine 2.0 (quantised types, quantised HNSW, IVF/IVF-PQ, sparse retrieval, dense+sparse+BM25 fusion; production-gating sign-off 2026-08-31)
-P24      complete — Full-text Search 2.0; compatibility, adversarial bounds, quality, and encrypted recovery exit gate closed 2026-08-31
-P25      complete — Security 2.0; mTLS, short-lived credentials, external IdP broker, field-level client encryption, password-hash evolution, and audit-chain hardening all production-gated; exit gate closed 2026-09-02
-P26      complete — System catalog / introspection 2.0; virtual system schema, live session/security-administration tables, SHOW aliases, and an authoritative capability registry all production-gated; exit gate closed 2026-09-02
-P27      complete — lifecycle/drain, session controls, resource groups, operational CLI, rolling-upgrade, and connection-governance gate closed 2026-09-03
-P28      in progress — Setup/Operations largely complete; production/developer deployment profile and fail-closed preflight landed; remaining recovery-key and Windows/macOS items are capability/environment blocked
-P29      in progress — M1 workspace + M2 streaming/virtualization + M3 bounded result tools/native inspectors + all five dedicated native explorers (JSON, Full-text, Vector, Hybrid, Geo) + Users/Roles, live Transaction/Lock, verified Audit, bounded per-tab plan comparison, and ANALYZE-only profiler implemented; MVP gate open
-Hosting   partial — selectable bounded multi-realm/multi-database routing (M2) complete; M3 suspend/resume, rename, and drop landed; independent backup/PITR/key/HA lifecycle remains open
+P16      complete — terminal 100M B+Tree soak deferred as a standalone measurement
+P17      complete — ONLINE rebuild for non-partitioned B+Tree-family indexes
+P18–P27  complete
+P28      in progress — Setup and Operations usable; remaining macOS items
+         are environment-blocked; native Windows is out of scope (WSL 2)
+P29      in progress — Studio workspace, explorers, EXPLAIN, and catalog
+         tools landed; MVP gate open
 ```
 
-Cross-cutting baseline work also includes rich bounded operations over the
-existing geo and F32 vector types, a WAL/catalog-invalidated SELECT result
-cache, and durable database-user-scoped mutation idempotency. This does not close
-P23 follow-ons such as a `BITVECTOR`/Hamming `--vecquant` row or an IVF-PQ
-process-local cache.
+One deployment serves one database. Multi-realm/multi-database hosting was
+removed; isolation is the whole deployment. See `docs/design-multidatabase-dbaas.md`
+for withdrawn design history.
 
-The managed-hosting track now provides an encrypted/versioned deployment
-registry, separate registry root, stable realm/database identities, declarative
-bootstrap, realm-scoped auth, storage caps, and bounded per-connection routing
-through `internal/dbmanager`. Idle secondary databases evict, open failures are
-quarantined, buffer memory is budgeted process-wide, and task execution/polling
-uses shared bounded infrastructure. Suspend/resume and offline managed-database
-drop are implemented. Database-addressed backup/PITR/import/export,
-key lifecycle, registry DR/Raft, and multi-database HA remain open. Realm
-and database rename is implemented. See
-`docs/design-multidatabase-dbaas.md`.
+This file is a summary. `TODO.md` is authoritative for status.
 
 ---
 
@@ -476,8 +460,9 @@ same branded RUI shell/theme behavior, backed by real-Chrome keyboard and axe
 WCAG 2.2 A/AA regression tests. Developer and production deployment profiles
 plus a fail-closed production security preflight landed (log #208): the GUI
 defaults to production; `nextsqld` re-enforces `deployment_profile=production`
-at start. Remaining: recovery-key UX, Windows/macOS packaging and execution,
-and upgrade/repair verification through the installer path.
+at start. Remaining: recovery-key UX, macOS packaging and execution,
+and upgrade/repair verification through the installer path. Native Windows packaging was removed (log #290); Windows hosts run the
+Linux packages under WSL 2.
 
 ---
 
@@ -557,24 +542,21 @@ across every Studio route — is integration-test-covered
 connection's environment (dev/test/staging/production); a production tag
 shows a standing banner and turns on a read-only safety mode that holds
 every write behind a confirmation (the analyze endpoint now returns a
-`write` flag mirroring nextsqld's own mutation classification). A
-**Switch connection…** control re-targets the session to a different realm
-or database on the same `nextsqld` without signing out — a fresh
-authenticated connection (password supplied each time, never stored)
-swapped in atomically, failing closed on a busy connection or a bad
-credential — and the toolbar shows the server address it targets. A
-read-consistency selector sets the session to strong (default), bounded
-(with a staleness bound) or stale — a live session-control change on the
-current connection affecting reads only, with a warning badge whenever the
-mode is not strong. The switch form also offers the realm/database pairs
-recently used on the current server as quick-fill buttons (stored in the
-browser, never a credential). Parsed-AST pre-run analysis also marks
-`CREATE`/`DROP USER` and `CREATE`/`DROP ROLE` as realm-wide: the confirmation
-names the connected realm/database and explains the cross-database reach,
-including inside a consolidated script warning. These
-are the connection-manager slices landed ahead of the full multi-target
-profile model (named multi-host profiles, TLS/mTLS fields, and OS
-credential storage still to come). The database explorer itself is now a lazy-loaded object tree: a
+`write` flag mirroring nextsqld's own mutation classification). The
+toolbar shows the server the session targets, and a read-consistency
+selector sets the session to strong (default), bounded (with a staleness
+bound) or stale — a live session-control change on the current connection
+affecting reads only, with a warning badge whenever the mode is not strong.
+**Server switching between connection profiles** (log #270) lets one Admin
+sign in to, and switch between, several `nextsqld` servers declared by the
+operator in a strict, versioned `--profiles` file (the browser only ever
+picks a profile by ID): a switch is a fresh sign-in that issues a new
+session, a profile-declared `production` environment is authoritative, and a
+password may optionally be kept in the OS credential store, bound to the
+principal that saved it. It replaced the same-server realm/database
+**Switch connection…** re-targeting, its recent-connections list, and the
+realm-wide user/role confirmation — all dead after log #244, when a
+deployment became one database. The database explorer itself is now a lazy-loaded object tree: a
 Tables branch whose nodes fetch each table's existing per-table detail
 bundle once to reveal Columns/Indexes sub-branches (selecting a name
 still opens the full inspector), plus a read-only Workflows branch that
@@ -591,7 +573,7 @@ a grouped relationship list as its text alternative and large-schema
 fallback (no layout library, pure unit-tested layout math). A **Search
 objects** finder gives keyboard-driven ranked lookup across table and
 workflow names, and a **command palette** (Ctrl/Cmd+K) does the same across
-Studio's own actions — run a query, open an explorer, switch connection —
+Studio's own actions — run a query, open an explorer, switch server —
 without adding any behavior of its own. Unsaved editor tabs (title + SQL text only) are mirrored to
 the browser and restored on reload, so a crash or accidental close does not
 lose work — a narrow, documented exception to Studio's otherwise
@@ -634,7 +616,7 @@ shared browser gate also runs Setup, Operations, and Studio at DPR 2, asserting
 their compact layouts, no page-level horizontal overflow or undersized raster
 source, loaded scalable fonts, and axe WCAG 2.2 AA before resetting device
 metrics; this closes Studio's browser/CSS high-DPI item without changing the
-unverified Windows/macOS package status. Explorer/inspector visibility and
+unverified macOS package status. Explorer/inspector visibility and
 pane widths, plus the last authorized table name, persist in per-connection
 browser storage with accessible splitters and Hide/Show/Reset layout controls
 — never a credential. See

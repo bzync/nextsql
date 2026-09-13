@@ -2,16 +2,16 @@
   "releases": [
     {
       "version": "0.0.1",
-      "title": "Engine complete",
+      "title": "First public preview",
       "status": "published",
       "channel": "preview",
       "latest": true,
-      "releasedAt": "2026-09-10T02:45:31Z",
-      "summary": "Storage, WAL, MVCC, SQL, optimizer, protocol, JSON, full-text, vectors, hybrid plans, security, backup/PITR/export, and Raft HA ship in this tree.",
+      "releasedAt": "2026-09-13T00:00:00Z",
+      "summary": "The first public release of NextSQL: one encrypted ACID engine for SQL, JSON, vectors, full-text, and geo, with official drivers at 0.0.1.",
       "highlights": [
         "One WAL, one MVCC, and one optimizer for SQL, JSON, vectors, full-text, and geo",
-        "AES-256-GCM envelope encryption on by default",
-        "Native NSQL v1 protocol with official Go, Node, Bun, PHP, Python, and Ruby drivers"
+        "AES-256-GCM envelope encryption and group-commit WAL with page-delta redo",
+        "Official Go, Node, Bun, PHP, Python, and Ruby drivers at 0.0.1"
       ],
       "changes": [
         {
@@ -72,7 +72,19 @@
           "id": "c10",
           "kind": "added",
           "area": "Drivers",
-          "text": "Official Go, Node, Bun, PHP, Python, and Ruby drivers (npm @bzync/nextsql, Composer bzync/nextsql, PyPI/RubyGems bzync-nextsql). Keys never go in a URL."
+          "text": "Official Go, Node, Bun, PHP, Python, and Ruby drivers at 0.0.1 (npm @bzync/nextsql, Composer bzync/nextsql, PyPI/RubyGems bzync-nextsql). Keys never go in a URL."
+        },
+        {
+          "id": "c11",
+          "kind": "added",
+          "area": "Engine",
+          "text": "Page-delta WAL redo: a commit logs only the bytes that changed, about 8× less disk writing per insert, without weakening fsync."
+        },
+        {
+          "id": "c12",
+          "kind": "removed",
+          "area": "Ops",
+          "text": "Native Windows packages are not shipped. On Windows, run the Linux packages inside WSL 2."
         }
       ],
       "artifacts": [
@@ -93,24 +105,6 @@
           "size": 21791130,
           "sha256": "372d1ac04e00b408d8f7daed207a9968e4d6692efefdb4ad31a7ce439193c1e5",
           "url": "https://github.com/bzync/nextsql/releases/download/v0.0.1/nextsql-0.0.1-linux-amd64.tar.gz"
-        },
-        {
-          "id": "nextsql-0.0.1-windows-amd64-setup.exe",
-          "kind": "setup",
-          "platform": "windows-amd64",
-          "filename": "nextsql-0.0.1-windows-amd64-setup.exe",
-          "size": 19893883,
-          "sha256": "f021f97751177d4cd6b069fa2be60bfc400459c06a2593f5b90991348110d593",
-          "url": "https://github.com/bzync/nextsql/releases/download/v0.0.1/nextsql-0.0.1-windows-amd64-setup.exe"
-        },
-        {
-          "id": "nextsql-0.0.1-windows-amd64.zip",
-          "kind": "archive",
-          "platform": "windows-amd64",
-          "filename": "nextsql-0.0.1-windows-amd64.zip",
-          "size": 17369707,
-          "sha256": "a44e813779c71dd5087f871d0bfbe39c6db14f2a008d63efcecf2aedf5ab3317",
-          "url": "https://github.com/bzync/nextsql/releases/download/v0.0.1/nextsql-0.0.1-windows-amd64.zip"
         },
         {
           "id": "nextsql_0.0.1_amd64.deb",

@@ -24,6 +24,14 @@ func (s *Session) applyDefault(tab *catalog.Table, i int, v types.Value) (types.
 	return s.nextAI(tab, i)
 }
 
+// requestsDefault reports whether an INSERT value expression asks for the
+// column's default rather than supplying a value: `AI()` on a DEFAULT AI()
+// column evaluates to NULL precisely so the default generates the next value.
+func requestsDefault(ex ast.Expr) bool {
+	c, ok := ex.(ast.Call)
+	return ok && c.Name == "ai"
+}
+
 func (s *Session) evalInsertValue(ex ast.Expr, tab *catalog.Table, col int, row []types.Value) (types.Value, error) {
 	if c, ok := ex.(ast.Call); ok && c.Name == "ai" {
 		if col < 0 || col >= len(tab.Columns) || tab.Columns[col].Default.Kind != catalog.DefAI {

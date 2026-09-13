@@ -90,18 +90,44 @@ type backend struct {
 	mu        sync.Mutex
 	cancel    context.CancelFunc
 	queryConn net.Conn
-	prepared  map[uint32]string
-	nextStmt  uint32
+	// cancelled records that the running statement was asked to stop, so a
+	// flow-control wait that begins after the request still honours it.
+	cancelled bool
+	// flowWait is true only while the statement's goroutine is blocked
+	// reading a flow-control ack. That read is the one blocking operation a
+	// cancel may interrupt with a deadline; see requestCancel.
+	flowWait bool
+	prepared map[uint32]string
+	nextStmt uint32
 }
 
+// requestCancel stops the running statement.
+//
+// It must never interrupt a write. A cancel used to set the connection deadline
+// to "now" unconditionally, and on a TLS connection a write cut off by a
+// deadline leaves a record half-sent and latches the error on the write side:
+// the session went on reading and running requests but could never answer
+// again, the client waited out the whole idle timeout, and the close alert
+// finally sent after the half-written record surfaced as `tls: bad record MAC`
+// (TestCancelWhileServerWriteIsBlockedLeavesSessionIntact reproduces it every
+// time). A write in progress is left to finish: the context cancellation stops
+// the executor from producing more, and a client that asked to cancel is
+// reading its response.
+//
+// The one read worth interrupting is the wait for a flow-control ack, since a
+// client may cancel instead of acknowledging. Every ack, cancel and terminate
+// frame is header-only and therefore a single TLS record, so a read deadline
+// cannot split one: the read either returns a whole header or no bytes at all.
 func (b *backend) requestCancel() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if b.cancel != nil {
-		b.cancel()
+	if b.cancel == nil {
+		return // nothing running; a late cancel must not touch the next statement
 	}
-	if b.queryConn != nil {
-		_ = b.queryConn.SetDeadline(time.Now())
+	b.cancel()
+	b.cancelled = true
+	if b.flowWait && b.queryConn != nil {
+		_ = b.queryConn.SetReadDeadline(time.Now())
 	}
 }
 
@@ -581,7 +607,12 @@ func (s *Server) serveConn(ctx context.Context, conn net.Conn) {
 			tokenClaims = claims
 		}
 	} else {
-		authErr = s.Auth.VerifyInRealm(realmID, hello.User, authMsg.Password)
+		// Bounded by the same idle deadline the handshake runs under, so a
+		// client queued behind the process-wide hash gate (auth/hashgate.go)
+		// is refused as busy instead of holding its connection slot forever.
+		verifyCtx, cancelVerify := context.WithTimeout(ctx, lim.Idle)
+		authErr = s.Auth.VerifyInRealmContext(verifyCtx, realmID, hello.User, authMsg.Password)
+		cancelVerify()
 	}
 	// identityOK is folded in here, after the real (or dummy, on a bad
 	// username) password-hash comparison already ran above, rather than
@@ -977,12 +1008,15 @@ func (s *Server) runSQL(parent context.Context, conn net.Conn, b *backend, sql s
 	b.mu.Lock()
 	b.cancel = cancel
 	b.queryConn = conn
+	b.cancelled = false
+	b.flowWait = false
 	b.mu.Unlock()
 	defer func() {
 		cancel()
 		b.mu.Lock()
 		b.cancel = nil
 		b.queryConn = nil
+		b.cancelled = false
 		b.mu.Unlock()
 	}()
 
@@ -992,7 +1026,7 @@ func (s *Server) runSQL(parent context.Context, conn net.Conn, b *backend, sql s
 		s.writeErrReady(conn, err, lim, caps)
 		return
 	}
-	if err := s.streamResult(conn, res, lim); err != nil {
+	if err := s.streamResult(conn, b, res, lim); err != nil {
 		_ = conn.SetDeadline(time.Now().Add(lim.Idle))
 		s.writeErrReady(conn, err, lim, caps)
 		return
@@ -1008,12 +1042,15 @@ func (s *Server) runIdempotentSQL(parent context.Context, conn net.Conn, b *back
 	b.mu.Lock()
 	b.cancel = cancel
 	b.queryConn = conn
+	b.cancelled = false
+	b.flowWait = false
 	b.mu.Unlock()
 	defer func() {
 		cancel()
 		b.mu.Lock()
 		b.cancel = nil
 		b.queryConn = nil
+		b.cancelled = false
 		b.mu.Unlock()
 	}()
 
@@ -1023,13 +1060,13 @@ func (s *Server) runIdempotentSQL(parent context.Context, conn net.Conn, b *back
 		s.writeErrReady(conn, err, lim, caps)
 		return
 	}
-	if err := s.streamResult(conn, res, lim); err != nil {
+	if err := s.streamResult(conn, b, res, lim); err != nil {
 		_ = conn.SetDeadline(time.Now().Add(lim.Idle))
 		s.writeErrReady(conn, err, lim, caps)
 	}
 }
 
-func (s *Server) streamResult(conn net.Conn, res *executor.Result, lim Limits) error {
+func (s *Server) streamResult(conn net.Conn, b *backend, res *executor.Result, lim Limits) error {
 	if res == nil {
 		if err := WriteFrame(conn, TypeCommandComplete, EncodeCommandComplete(CommandComplete{}), lim.MaxPacket); err != nil {
 			return err
@@ -1071,7 +1108,7 @@ func (s *Server) streamResult(conn net.Conn, res *executor.Result, lim Limits) e
 		if err := WriteFrame(conn, TypeDataBatch, payload, lim.MaxPacket); err != nil {
 			return err
 		}
-		return s.waitFlow(conn, lim)
+		return s.waitFlow(conn, b, lim)
 	}
 
 	batch := make([][]types.Value, 0, DefaultBatchRows)
@@ -1131,9 +1168,34 @@ func (s *Server) streamResult(conn net.Conn, res *executor.Result, lim Limits) e
 	return WriteFrame(conn, TypeReady, nil, lim.MaxPacket)
 }
 
-func (s *Server) waitFlow(conn net.Conn, lim Limits) error {
+// waitFlow blocks for the client's ack of the batch just sent. The deadline is
+// armed before flowWait is published under b.mu, so a cancel can never have
+// its "now" deadline overwritten by this function's own idle deadline; and
+// flowWait is withdrawn under b.mu before returning, so no cancel can move the
+// deadline of whatever read comes next.
+func (s *Server) waitFlow(conn net.Conn, b *backend, lim Limits) error {
 	_ = conn.SetDeadline(time.Now().Add(lim.Idle))
+	b.mu.Lock()
+	if b.cancelled {
+		b.mu.Unlock()
+		return nerr.New(nerr.Canceled, "protocol", "query cancelled")
+	}
+	b.flowWait = true
+	b.mu.Unlock()
 	typ, _, err := ReadFrame(conn, lim.MaxPacket)
+	b.mu.Lock()
+	b.flowWait = false
+	cancelled := b.cancelled
+	b.mu.Unlock()
+	if cancelled {
+		// Restore the read deadline a cancel may have pulled to "now" before
+		// the error and Ready frames are written and the next request is read.
+		_ = conn.SetDeadline(time.Now().Add(lim.Idle))
+		if err == nil && typ != TypeFlowAck && typ != TypeCancel && typ != TypeTerminate {
+			return nerr.New(nerr.Protocol, "protocol", "expected flow ack")
+		}
+		return nerr.New(nerr.Canceled, "protocol", "query cancelled")
+	}
 	if err != nil {
 		return nerr.New(nerr.Canceled, "protocol", "query cancelled")
 	}

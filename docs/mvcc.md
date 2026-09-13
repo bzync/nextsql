@@ -10,11 +10,33 @@ Current row → undo record → previous version → older version
 
 | Level | Snapshot | Locks |
 |---|---|---|
-| READ COMMITTED | Refreshed on each statement | Writers take exclusive key locks until end of transaction |
-| SNAPSHOT | Taken at `Begin` | Writers take exclusive key locks; first-committer-wins on write-write |
+| READ COMMITTED | Refreshed on each statement | Writers take exclusive key locks until end of transaction; a live writer's row is never overwritten |
+| SNAPSHOT | Taken at `Begin` | Writers take exclusive key locks; first-committer-wins on write-write; a live writer's row is never overwritten |
 | SERIALIZABLE | Taken at `Begin` | Snapshot plus shared key locks on point reads and shared range locks on scans (strict 2PL) |
 
 Serializable is lock-based, not SSI. Anomaly tests cover dirty read, non-repeatable read, phantoms, write skew, and deadlock. Do not describe it as snapshot isolation.
+
+### Dirty writes are refused at every level
+
+A write whose target row's current version was written by a **different
+transaction that is still running** fails with `serialization` ("write-write
+conflict") — at every isolation level, including READ COMMITTED. Overwriting
+such a row would be a dirty write: the other transaction may still abort, in
+which case the value never existed, or commit, in which case its write is lost
+with nothing reported to either side.
+
+This check does not depend on key locks, and cannot: `lockWrite` skips locking
+below SERIALIZABLE when only one transaction is live *at that moment*, so the
+first writer of a row often leaves no lock behind for a later writer to block
+on. It is also separate from the snapshot first-committer-wins check below it,
+which fires only once the other writer has **committed** — an in-progress
+writer is invisible to that test. Under SERIALIZABLE the key lock still takes
+effect first, so the second writer waits rather than failing fast.
+
+`TM.Status` reports `StatusInProgress` only for a transaction the manager still
+holds as active; an id it no longer knows reads as committed, so an old version
+can never be mistaken for a live writer. A transaction writing the same row
+twice never conflicts with itself.
 
 A deadlock in the wait-for graph aborts the requester (`nerr.Deadlock`). The aborted transaction must roll back so waiters can proceed.
 

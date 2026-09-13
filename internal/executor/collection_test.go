@@ -297,4 +297,3 @@ func TestUnnestInFrom(t *testing.T) {
 		t.Fatalf("combining UNNEST and ARRAY_AGG failed: %+v", got.Rows)
 	}
 }
-

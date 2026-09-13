@@ -61,7 +61,12 @@ one first — same isolation discipline as every D-item.
 `GEOMETRY(Point, 3857)`, `GEOGRAPHY(Polygon, 4326)`. Both the subtype and
 the SRID are optional: `GEOMETRY` alone = any subtype, SRID 0;
 `GEOMETRY(Point)` = points, SRID 0; `GEOGRAPHY` alone = any subtype, SRID
-4326 (WGS84 is the only geodetic frame this engine models). Chosen over a
+4326 (WGS84 is the only geodetic frame this engine models). "Any subtype"
+is spelled `Geometry` when an SRID follows it — `GEOGRAPHY(Geometry, 4326)`
+is what a plain `GEOGRAPHY` column renders as. Until log #284 the renderer
+emitted that spelling but the grammar rejected it, so any database with a
+plain `GEOGRAPHY` column failed `nextsql export` at its built-in import test.
+Chosen over a
 per-value SRID tag: simpler storage (no 4 bytes/value), simpler index (one
 CRS per index), and a compile-time check that every value in a column
 shares a frame — the per-value flexibility PostGIS allows is rarely used

@@ -27,8 +27,6 @@ export function classifyArtifact(filename, version) {
     [new RegExp(`^nextsql_${v}_(amd64|arm64)\\.deb$`), "deb", (arch) => `linux-${arch}`],
     [new RegExp(`^nextsql-${rpmVersion}-1\\.(x86_64|aarch64)\\.rpm$`), "rpm", (arch) =>
       arch === "x86_64" ? "linux-amd64" : "linux-arm64"],
-    [new RegExp(`^nextsql-${v}-windows-(amd64)-setup\\.exe$`), "setup", (arch) => `windows-${arch}`],
-    [new RegExp(`^nextsql-${v}-windows-(amd64)\\.zip$`), "archive", (arch) => `windows-${arch}`],
     [new RegExp(`^nextsql-${v}-darwin-(amd64|arm64)\\.tar\\.gz$`), "archive", (arch) => `darwin-${arch}`],
   ];
 

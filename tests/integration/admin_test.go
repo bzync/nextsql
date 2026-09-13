@@ -865,21 +865,20 @@ func TestAdminStudioWorkspaceOverNSQL(t *testing.T) {
 	if write, _ := readAnalysis["write"].(bool); write {
 		t.Fatalf("SELECT classified as a write: %v", readAnalysis)
 	}
-	if rs, _ := readAnalysis["realm_scoped"].(bool); rs {
-		t.Fatalf("SELECT flagged realm_scoped: %v", readAnalysis)
-	}
-
-	// analyze flags a realm-wide principal change so the editor's
-	// confirm-before-run dialog can name the connected realm/database — the
-	// "visible cross-database administration warning".
-	res, realmAnalysis := doJSON(t, c, "POST", base+"/api/v1/studio/query/analyze", csrf, map[string]any{
+	// A deployment serves exactly one database, so a user/role change is an
+	// ordinary write: the analysis must not claim a wider ("realm-wide")
+	// effect, which is what it used to warn about before log #244.
+	res, principalAnalysis := doJSON(t, c, "POST", base+"/api/v1/studio/query/analyze", csrf, map[string]any{
 		"sql": "CREATE USER studio_contractor IDENTIFIED BY 'pw'",
 	})
 	if res.StatusCode != http.StatusOK {
-		t.Fatalf("analyze CREATE USER: want 200, got %d (%v)", res.StatusCode, realmAnalysis)
+		t.Fatalf("analyze CREATE USER: want 200, got %d (%v)", res.StatusCode, principalAnalysis)
 	}
-	if rs, _ := realmAnalysis["realm_scoped"].(bool); !rs {
-		t.Fatalf("CREATE USER not flagged realm_scoped: %v", realmAnalysis)
+	if write, _ := principalAnalysis["write"].(bool); !write {
+		t.Fatalf("CREATE USER not classified as a write: %v", principalAnalysis)
+	}
+	if _, stale := principalAnalysis["realm_scoped"]; stale {
+		t.Fatalf("CREATE USER still reports a realm scope: %v", principalAnalysis)
 	}
 
 	res, analysis = doJSON(t, c, "POST", base+"/api/v1/studio/query/analyze", csrf, map[string]any{
@@ -1017,70 +1016,25 @@ func TestAdminStudioWorkspaceOverNSQL(t *testing.T) {
 		t.Fatalf("cancel finished query: want 404, got %d", res.StatusCode)
 	}
 
-	// Connection re-targeting. The bootstrap advertises which nextsqld the
-	// session talks to.
+	// The bootstrap advertises which nextsqld the session talks to (its
+	// connection profile's address). Switching servers is covered by
+	// TestAdminSwitchesBetweenServerProfiles.
 	res, bootstrap = doJSON(t, c, "GET", base+"/api/v1/studio/bootstrap", "", nil)
 	if res.StatusCode != http.StatusOK {
-		t.Fatalf("bootstrap before reconnect: %d (%v)", res.StatusCode, bootstrap)
+		t.Fatalf("bootstrap: %d (%v)", res.StatusCode, bootstrap)
 	}
 	if got, _ := bootstrap["server_addr"].(string); got != addr {
 		t.Fatalf("bootstrap server_addr = %q, want %q", got, addr)
 	}
-
-	// A reconnect is state-changing and requires this session's CSRF token.
-	res, _ = doJSON(t, c, "POST", base+"/api/v1/studio/reconnect", "", map[string]any{
+	// The retired same-server reconnect route is gone, not silently kept.
+	if res, _ := doJSON(t, c, "POST", base+"/api/v1/studio/reconnect", csrf, map[string]any{
 		"database": "studio_test", "password": "s3cret",
-	})
-	if res.StatusCode != http.StatusForbidden {
-		t.Fatalf("reconnect without CSRF: want 403, got %d", res.StatusCode)
-	}
-
-	// An invalid target name is rejected before any network I/O.
-	res, badName := doJSON(t, c, "POST", base+"/api/v1/studio/reconnect", csrf, map[string]any{
-		"realm": "not a realm", "password": "s3cret",
-	})
-	if res.StatusCode != http.StatusBadRequest {
-		t.Fatalf("reconnect with a bad realm name: want 400, got %d (%v)", res.StatusCode, badName)
-	}
-
-	// A wrong password fails 401 and must leave the session on its working
-	// connection — a follow-up query still succeeds.
-	res, _ = doJSON(t, c, "POST", base+"/api/v1/studio/reconnect", csrf, map[string]any{
-		"database": "studio_test", "password": "wrong-password",
-	})
-	if res.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("reconnect with a wrong password: want 401, got %d", res.StatusCode)
-	}
-	if res, body := doJSON(t, c, "POST", base+"/api/v1/studio/query", csrf, map[string]any{
-		"query_id": "post-failed-reconnect", "sql": "SELECT 1",
-	}); res.StatusCode != http.StatusOK {
-		t.Fatalf("session unusable after a failed reconnect: SELECT 1 got %d (%v)", res.StatusCode, body)
-	}
-
-	// A valid reconnect swaps the connection and reports the now-active
-	// target; whoami follows.
-	res, reconnected := doJSON(t, c, "POST", base+"/api/v1/studio/reconnect", csrf, map[string]any{
-		"database": "studio_test", "password": "s3cret",
-	})
-	if res.StatusCode != http.StatusOK {
-		t.Fatalf("valid reconnect: want 200, got %d (%v)", res.StatusCode, reconnected)
-	}
-	if reconnected["user"] != "app" || reconnected["database"] != "studio_test" {
-		t.Fatalf("reconnect response = %v, want user app / database studio_test", reconnected)
-	}
-	res, who := doJSON(t, c, "GET", base+"/api/v1/session", "", nil)
-	if res.StatusCode != http.StatusOK || who["database"] != "studio_test" {
-		t.Fatalf("whoami after reconnect = %d %v", res.StatusCode, who)
-	}
-	if res, body := doJSON(t, c, "POST", base+"/api/v1/studio/query", csrf, map[string]any{
-		"query_id": "post-reconnect", "sql": "SELECT id FROM studio_items ORDER BY id LIMIT 1",
-	}); res.StatusCode != http.StatusOK {
-		t.Fatalf("query on the reconnected session: want 200, got %d (%v)", res.StatusCode, body)
+	}); res.StatusCode != http.StatusNotFound {
+		t.Fatalf("retired /studio/reconnect: want 404, got %d", res.StatusCode)
 	}
 
 	// Read consistency: a live session-control change on the existing
-	// connection, no reconnect. A fresh session (and a fresh reconnect) is
-	// STRONG.
+	// connection, no reconnect. A fresh session is STRONG.
 	res, bootstrap = doJSON(t, c, "GET", base+"/api/v1/studio/bootstrap", "", nil)
 	if res.StatusCode != http.StatusOK || bootstrap["read_consistency"] != "strong" {
 		t.Fatalf("bootstrap read_consistency = %v (status %d), want strong", bootstrap["read_consistency"], res.StatusCode)
@@ -1117,6 +1071,167 @@ func TestAdminStudioWorkspaceOverNSQL(t *testing.T) {
 	})
 	if res.StatusCode != http.StatusOK || rc["mode"] != "strong" || rc["max_staleness_ms"] != float64(0) {
 		t.Fatalf("reset to strong: %d %v", res.StatusCode, rc)
+	}
+}
+
+// TestAdminSwitchesBetweenServerProfiles drives the connection-profile model
+// against two real, independent TLS nextsqld servers, each with its own CA:
+// the second is declared only in an operator-owned profiles file (with a
+// relative tls_ca), the browser picks it by ID, and a switch is a fresh
+// sign-in that swaps in a new session. Data written on one server must not be
+// visible from the other, and the old session must be dead after a switch.
+func TestAdminSwitchesBetweenServerProfiles(t *testing.T) {
+	addrA, _ := startTLSServer(t)
+	caA := lastClientCAPEM
+	addrB, _ := startTLSServer(t)
+	caB := lastClientCAPEM
+
+	dir := t.TempDir()
+	caAPath := filepath.Join(dir, "a-ca.pem")
+	if err := os.WriteFile(caAPath, caA, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "b-ca.pem"), caB, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	profilesPath := filepath.Join(dir, "profiles.json")
+	profiles := fmt.Sprintf(`{"version": 1, "profiles": [
+		{"id": "second", "name": "Second server", "environment": "staging",
+		 "address": %q, "tls_ca": "b-ca.pem", "tls_server_name": "localhost", "user": "app"}]}`, addrB)
+	if err := os.WriteFile(profilesPath, []byte(profiles), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	srv, err := admin.New(admin.Config{
+		Mode:              admin.ModeOperate,
+		Listen:            "127.0.0.1:0",
+		ServerAddr:        addrA,
+		ServerTLSCA:       caAPath,
+		ServerTLSName:     "localhost",
+		ServerName:        "First server",
+		ServerEnvironment: "development",
+		ProfilesFile:      profilesPath,
+		MaxSessions:       4,
+	}, admin.Options{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	if err != nil {
+		t.Fatalf("admin.New: %v", err)
+	}
+	t.Cleanup(func() { _ = srv.Close() })
+	go func() { _ = srv.Serve() }()
+	base := "http://" + srv.Addr().String()
+	c := mustClient(t)
+
+	// The sign-in page can list the profiles, but learns nothing about where
+	// they point.
+	res, list := doJSON(t, c, "GET", base+"/api/v1/profiles", "", nil)
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("pre-auth profiles: %d (%v)", res.StatusCode, list)
+	}
+	raw, _ := json.Marshal(list)
+	if !strings.Contains(string(raw), `"second"`) || !strings.Contains(string(raw), `"First server"`) {
+		t.Fatalf("profile list = %s", raw)
+	}
+	if strings.Contains(string(raw), addrB) || strings.Contains(string(raw), addrA) || strings.Contains(string(raw), "b-ca.pem") {
+		t.Fatalf("pre-auth profile list leaks a target: %s", raw)
+	}
+
+	// Sign in to the default (first) server and leave a marker table there.
+	res, who := doJSON(t, c, "POST", base+"/api/v1/session", "", map[string]any{"user": "app", "password": "s3cret"})
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("login: %d (%v)", res.StatusCode, who)
+	}
+	csrf, _ := who["csrf_token"].(string)
+	if p, _ := who["profile"].(map[string]any); p["id"] != "default" || p["address"] != addrA {
+		t.Fatalf("login profile = %v", who["profile"])
+	}
+	if res, body := doJSON(t, c, "POST", base+"/api/v1/studio/query", csrf, map[string]any{
+		"query_id": "mark-a", "sql": "CREATE TABLE only_on_first (id INT64 PRIMARY KEY)",
+	}); res.StatusCode != http.StatusOK {
+		t.Fatalf("create marker on first: %d (%v)", res.StatusCode, body)
+	}
+	baseURL, _ := http.NewRequest("GET", base, nil)
+	oldCookies := c.Jar.Cookies(baseURL.URL)
+
+	// A switch is state-changing (CSRF) and a failed one changes nothing.
+	switchBody := map[string]any{"profile": "second", "user": "app", "password": "s3cret"}
+	if res, _ := doJSON(t, c, "POST", base+"/api/v1/session/switch", "", switchBody); res.StatusCode != http.StatusForbidden {
+		t.Fatalf("switch without CSRF: want 403, got %d", res.StatusCode)
+	}
+	if res, _ := doJSON(t, c, "POST", base+"/api/v1/session/switch", csrf, map[string]any{
+		"profile": "second", "user": "app", "password": "wrong",
+	}); res.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("switch with a wrong password: want 401, got %d", res.StatusCode)
+	}
+	if res, body := doJSON(t, c, "POST", base+"/api/v1/studio/query", csrf, map[string]any{
+		"query_id": "still-first", "sql": "SELECT id FROM only_on_first",
+	}); res.StatusCode != http.StatusOK {
+		t.Fatalf("session unusable after a failed switch: %d (%v)", res.StatusCode, body)
+	}
+
+	// A valid switch lands on the second server with a new session.
+	res, switched := doJSON(t, c, "POST", base+"/api/v1/session/switch", csrf, switchBody)
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("switch: %d (%v)", res.StatusCode, switched)
+	}
+	newCSRF, _ := switched["csrf_token"].(string)
+	if newCSRF == "" || newCSRF == csrf {
+		t.Fatal("switch did not rotate the CSRF token")
+	}
+	if p, _ := switched["profile"].(map[string]any); p["id"] != "second" || p["environment"] != "staging" || p["address"] != addrB {
+		t.Fatalf("switched profile = %v", switched["profile"])
+	}
+	res, bootstrap := doJSON(t, c, "GET", base+"/api/v1/studio/bootstrap", "", nil)
+	if res.StatusCode != http.StatusOK || bootstrap["server_addr"] != addrB {
+		t.Fatalf("bootstrap after switch: %d server_addr=%v", res.StatusCode, bootstrap["server_addr"])
+	}
+	if res, _ := doJSON(t, c, "POST", base+"/api/v1/studio/query", newCSRF, map[string]any{
+		"query_id": "not-on-second", "sql": "SELECT id FROM only_on_first",
+	}); res.StatusCode == http.StatusOK {
+		t.Fatal("the first server's table is visible after switching to the second")
+	}
+	if res, body := doJSON(t, c, "POST", base+"/api/v1/studio/query", newCSRF, map[string]any{
+		"query_id": "mark-b", "sql": "CREATE TABLE only_on_second (id INT64 PRIMARY KEY)",
+	}); res.StatusCode != http.StatusOK {
+		t.Fatalf("create marker on second: %d (%v)", res.StatusCode, body)
+	}
+	if res, _ := doJSON(t, c, "POST", base+"/api/v1/studio/query", csrf, map[string]any{
+		"query_id": "old-csrf", "sql": "SELECT 1",
+	}); res.StatusCode != http.StatusForbidden {
+		t.Fatalf("the old CSRF token still works after a switch: %d", res.StatusCode)
+	}
+
+	// The old session cookie is dead.
+	stale := &http.Client{Timeout: 30 * time.Second}
+	req, _ := http.NewRequest("GET", base+"/api/v1/session", nil)
+	for _, ck := range oldCookies {
+		req.AddCookie(ck)
+	}
+	staleRes, err := stale.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = staleRes.Body.Close()
+	if staleRes.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("old session after a switch: want 401, got %d", staleRes.StatusCode)
+	}
+
+	// And back: the first server still has its own table, not the second's.
+	res, back := doJSON(t, c, "POST", base+"/api/v1/session/switch", newCSRF, map[string]any{
+		"profile": "default", "user": "app", "password": "s3cret",
+	})
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("switch back: %d (%v)", res.StatusCode, back)
+	}
+	backCSRF, _ := back["csrf_token"].(string)
+	if res, body := doJSON(t, c, "POST", base+"/api/v1/studio/query", backCSRF, map[string]any{
+		"query_id": "first-again", "sql": "SELECT id FROM only_on_first",
+	}); res.StatusCode != http.StatusOK {
+		t.Fatalf("first server's table after switching back: %d (%v)", res.StatusCode, body)
+	}
+	if res, _ := doJSON(t, c, "POST", base+"/api/v1/studio/query", backCSRF, map[string]any{
+		"query_id": "second-hidden", "sql": "SELECT id FROM only_on_second",
+	}); res.StatusCode == http.StatusOK {
+		t.Fatal("the second server's table is visible from the first")
 	}
 }
 

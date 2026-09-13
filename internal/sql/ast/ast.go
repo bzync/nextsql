@@ -11,7 +11,14 @@ type (
 		Columns   []ColumnDef
 		PK        []string
 		FKs       []ForeignKeyDef
+		Checks    []CheckDef
 		Partition *PartitionSpec
+		// Query is the source of `CREATE TABLE name PRIMARY KEY (cols) AS
+		// <query>`. It is mutually exclusive with Columns: the column names
+		// and types come from the query's output rather than being written
+		// out, so PK names which of those output columns the table is
+		// clustered on.
+		Query Stmt
 	}
 	PartitionSpec struct {
 		Kind       string // RANGE, HASH, LIST, or TENANT
@@ -160,6 +167,11 @@ type (
 	CancelTask struct {
 		ID string
 	}
+	// CancelQuery stops a statement another session is running, named by the
+	// query id system.active_queries / SHOW QUERIES report.
+	CancelQuery struct {
+		ID string
+	}
 	Subscribe struct {
 		Table     string
 		Operation string
@@ -202,7 +214,19 @@ type (
 	// local to the node this connection reached, like ClusterMaintenance:
 	// not Raft-replicated.
 	ClusterReconcileConfirm struct{}
-	DropTable               struct {
+	// CreateView stores a named query. Query is the defining SELECT, kept as
+	// written so it re-resolves against the catalog at each use.
+	CreateView struct {
+		Name    string
+		Columns []string
+		Query   string
+		Replace bool
+	}
+	DropView struct {
+		Name     string
+		IfExists bool
+	}
+	DropTable struct {
 		Name     string
 		IfExists bool
 	}
@@ -240,9 +264,13 @@ type (
 		Where        Expr       // partial-index predicate
 	}
 	Insert struct {
-		Table         string
-		Columns       []string
-		Rows          [][]Expr
+		Table   string
+		Columns []string
+		Rows    [][]Expr
+		// Query is the source of an `INSERT INTO t <query>`; it is mutually
+		// exclusive with Rows. A query source is a SELECT, a set operation or
+		// a WITH, exactly as it would be written on its own.
+		Query         Stmt
 		Returning     []SelectItem
 		ReturningStar bool
 	}
@@ -352,9 +380,21 @@ type (
 	Begin struct {
 		Isolation string // empty, "read committed", "snapshot", "serializable"
 	}
-	Commit   struct{}
-	Rollback struct{}
-	Explain  struct {
+	Commit struct{}
+	// Rollback with an empty Savepoint is a whole-transaction ROLLBACK;
+	// with one it is ROLLBACK TO [SAVEPOINT] name.
+	Rollback struct {
+		Savepoint string
+	}
+	// Savepoint is SAVEPOINT name.
+	Savepoint struct {
+		Name string
+	}
+	// ReleaseSavepoint is RELEASE [SAVEPOINT] name.
+	ReleaseSavepoint struct {
+		Name string
+	}
+	Explain struct {
 		Analyze bool
 		Stmt    Stmt
 	}
@@ -462,6 +502,7 @@ func (SetConfig) stmt()               {}
 func (BackupDatabase) stmt()          {}
 func (VerifyBackup) stmt()            {}
 func (ShowTasks) stmt()               {}
+func (CancelQuery) stmt()             {}
 func (CancelTask) stmt()              {}
 func (Subscribe) stmt()               {}
 func (TransferLeader) stmt()          {}
@@ -469,6 +510,8 @@ func (ClusterDrain) stmt()            {}
 func (ClusterMaintenance) stmt()      {}
 func (ClusterReconcileConfirm) stmt() {}
 func (CreateIndex) stmt()             {}
+func (CreateView) stmt()              {}
+func (DropView) stmt()                {}
 func (DropTable) stmt()               {}
 func (DropIndex) stmt()               {}
 func (RebuildIndex) stmt()            {}
@@ -481,6 +524,8 @@ func (With) stmt()                    {}
 func (Update) stmt()                  {}
 func (Delete) stmt()                  {}
 func (Begin) stmt()                   {}
+func (Savepoint) stmt()               {}
+func (ReleaseSavepoint) stmt()        {}
 func (Commit) stmt()                  {}
 func (Rollback) stmt()                {}
 func (Explain) stmt()                 {}
@@ -503,6 +548,15 @@ type (
 	AlterDropColumn struct {
 		Name string
 	}
+	// AlterColumn is ALTER TABLE ALTER COLUMN c SET/DROP NOT NULL or
+	// SET/DROP DEFAULT. Exactly one action is set.
+	AlterColumn struct {
+		Name        string
+		SetNotNull  bool
+		DropNotNull bool
+		SetDefault  Expr
+		DropDefault bool
+	}
 	AlterRenameColumn struct {
 		Old, New string
 	}
@@ -511,6 +565,9 @@ type (
 	}
 	AlterAddConstraint struct {
 		FK ForeignKeyDef
+		// Check is set instead of FK for ALTER TABLE ADD [CONSTRAINT name]
+		// CHECK (...). Exactly one of the two is populated.
+		Check *CheckDef
 	}
 	AlterDropConstraint struct {
 		Name string
@@ -534,6 +591,7 @@ type (
 
 func (AlterAddColumn) alterCmd()       {}
 func (AlterDropColumn) alterCmd()      {}
+func (AlterColumn) alterCmd()          {}
 func (AlterRenameColumn) alterCmd()    {}
 func (AlterRenameTable) alterCmd()     {}
 func (AlterAddConstraint) alterCmd()   {}
@@ -564,6 +622,14 @@ type ForeignKeyDef struct {
 	OnUpdate FKAction
 }
 
+// CheckDef is a CHECK constraint as written, either beside a column
+// (`n INT64 CHECK (n > 0)`) or at table level (`CONSTRAINT c CHECK (...)`).
+// An unnamed constraint is named when it reaches the catalog.
+type CheckDef struct {
+	Name string
+	Expr Expr
+}
+
 type ColumnDef struct {
 	Name string
 	Type types.Type
@@ -577,6 +643,7 @@ type ColumnDef struct {
 	Primary                      bool
 	Default                      Expr
 	References                   *ForeignKeyDef
+	Checks                       []CheckDef
 }
 
 // Expr is a parsed expression.

@@ -195,7 +195,7 @@ Version: ${DEB_VER}
 Section: database
 Priority: optional
 Architecture: ${debarch}
-Maintainer: NextSQL <nextsql@bzync>
+Maintainer: NextSQL <admin@bzync.com>
 Homepage: https://github.com/bzync/nextsql
 Installed-Size: ${size}
 Recommends: systemd

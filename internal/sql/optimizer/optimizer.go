@@ -190,9 +190,16 @@ func Optimize(req Request) (Outcome, error) {
 	if _, ok := req.Plan.(planner.Analyze); ok {
 		return Outcome{Plan: req.Plan, Trace: &Node{Op: "Analyze"}}, nil
 	}
-	switch req.Plan.(type) {
-	case planner.Begin, planner.Commit, planner.Rollback, planner.Subscribe, planner.CreateTable, planner.DropTable, planner.DropIndex, planner.RebuildIndex, planner.AlterTable, planner.CreateIndex, planner.Insert, planner.Upsert:
+	switch n := req.Plan.(type) {
+	case planner.Begin, planner.Commit, planner.Rollback, planner.Subscribe, planner.CreateTable, planner.DropTable, planner.DropIndex, planner.RebuildIndex, planner.AlterTable, planner.CreateIndex, planner.Upsert:
 		return Outcome{Plan: req.Plan, Trace: leafTrace(req.Plan)}, nil
+	case planner.Insert:
+		// A VALUES insert has nothing to optimize, but an `INSERT ... <query>`
+		// carries a full source plan that needs access selection and join
+		// ordering like any other query.
+		if n.Input == nil {
+			return Outcome{Plan: req.Plan, Trace: leafTrace(req.Plan)}, nil
+		}
 	}
 	key := req.SQL
 	if req.CacheKey != "" {

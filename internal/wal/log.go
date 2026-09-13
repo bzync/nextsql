@@ -44,6 +44,10 @@ type Options struct {
 	SegmentSize int64
 	Crash       *Injector
 	Archiver    Archiver
+	// PageDeltas creates the log at control version 2, which permits
+	// RecPageDelta records. It applies to Create only; an existing log keeps
+	// its version until EnablePageDeltas.
+	PageDeltas bool
 }
 
 // Log is the write-ahead log. Records are encrypted with a WAL DEK that is
@@ -96,6 +100,9 @@ type Log struct {
 	segmentSize int64
 	crash       *Injector
 	archiver    Archiver
+	// ctrlVersion is the control file version; controlVersionPageDeltas
+	// permits page delta records.
+	ctrlVersion uint16
 
 	retentionPins map[uint64]format.LSN
 	nextPin       uint64
@@ -161,6 +168,10 @@ func Create(dir string, pageKeys crypto.KeyProvider, ident format.Identity, opt 
 		segmentSize: opt.SegmentSize,
 		crash:       opt.Crash,
 		archiver:    opt.Archiver,
+		ctrlVersion: controlVersionFullImages,
+	}
+	if opt.PageDeltas {
+		l.ctrlVersion = controlVersionPageDeltas
 	}
 	l.cv = sync.NewCond(&l.mu)
 	if err := l.writeControlLocked(); err != nil {
@@ -214,6 +225,7 @@ func Open(dir string, pageKeys crypto.KeyProvider, ident format.Identity, opt Op
 		segmentSize: opt.SegmentSize,
 		crash:       opt.Crash,
 		archiver:    opt.Archiver,
+		ctrlVersion: ctrl.Version,
 	}
 	l.cv = sync.NewCond(&l.mu)
 	if l.redoLSN == 0 {
@@ -347,6 +359,21 @@ func (l *Log) InstallRecords(recs []Record) error {
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	// A leader whose log is at control version 2 ships page deltas. The
+	// version must reach this log's control file before the first delta
+	// reaches a segment, or a release that predates deltas would open the
+	// log as one it understands and fail on the record instead of refusing
+	// the log.
+	if l.ctrlVersion != controlVersionPageDeltas {
+		for _, rec := range recs {
+			if rec.Type == RecPageDelta && rec.LSN >= l.nextLSN {
+				if err := l.enablePageDeltasLocked(); err != nil {
+					return err
+				}
+				break
+			}
+		}
+	}
 	for _, rec := range recs {
 		if rec.LSN == 0 {
 			return nerr.New(nerr.InvalidArgument, "wal.InstallRecords", "LSN 0 is reserved")
@@ -554,6 +581,9 @@ func (l *Log) appendLocked(rec Record) (format.LSN, error) {
 	if l.seg == nil {
 		return 0, nerr.New(nerr.Internal, "wal.Append", "log is closed")
 	}
+	if rec.Type == RecPageDelta && l.ctrlVersion != controlVersionPageDeltas {
+		return 0, nerr.New(nerr.InvalidArgument, "wal.Append", "page delta on a log that has not enabled page deltas")
+	}
 	lsn := l.nextLSN
 	rec.LSN = lsn
 	payload := encodePayload(rec)
@@ -654,10 +684,22 @@ func (l *Log) ReleaseHold(commit bool) error {
 
 // Flush group-commits until lsn is durable. Commit must not be acknowledged
 // until this returns nil.
+//
+// Group commit happens here. flushLocked releases l.mu for the write and the
+// fsync, so while one caller is inside the barrier every other transaction
+// can still append its records, and when it wakes the next flush writes and
+// syncs all of them at once. Holding l.mu across the fsync -- as the log used
+// to -- made every append wait for the previous commit's fsync, so N
+// concurrent commits paid N fsyncs.
 func (l *Log) Flush(lsn format.LSN) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	for l.durableLSN < lsn {
+		if l.seg == nil {
+			// Closed or crash-closed while this commit waited: its record
+			// never reached stable storage and never will through this log.
+			return nerr.New(nerr.Unavailable, "wal.Flush", "log is closed")
+		}
 		if l.held && l.heldLSN <= lsn {
 			// The target LSN needs bytes flushLocked won't write while
 			// held. Wait for ReleaseHold's broadcast rather than spinning
@@ -672,18 +714,40 @@ func (l *Log) Flush(lsn format.LSN) error {
 			}
 			continue
 		}
-		l.flushing = true
+		before := l.durableLSN
 		l.flushErr = l.flushLocked()
-		l.flushing = false
-		l.cv.Broadcast()
 		if l.flushErr != nil {
 			return l.flushErr
+		}
+		if l.durableLSN == before && l.durableLSN < lsn && !l.flushing {
+			// Nothing flushable covers lsn yet: AppendPageImages reserves
+			// LSNs, then releases l.mu to encrypt before it appends the
+			// bytes. Yield until they arrive, as the log always has, rather
+			// than holding l.mu in a tight loop.
+			l.mu.Unlock()
+			runtime.Gosched()
+			l.mu.Lock()
 		}
 	}
 	return nil
 }
 
+// flushLocked writes and syncs the flushable prefix of the buffer. It is
+// called with l.mu held and returns with it held, but releases it for the
+// write and the fsync so appends continue meanwhile.
+//
+// Exactly one flush owns the segment write at a time (l.flushing). Anything
+// that closes or replaces l.seg reaches it through flushLocked (rotation,
+// Close, ClipTo) or waits for l.flushing to clear (CrashClose), so the file,
+// offset and bytes captured below cannot change underneath the write.
+// Appends only grow l.buf past the captured prefix; ReleaseHold's splice only
+// touches bytes at or after a held record, which is never inside the prefix
+// (the prefix ends at heldOffset). Offsets that refer into l.buf are rebased
+// after the prefix is consumed.
 func (l *Log) flushLocked() error {
+	for l.flushing {
+		l.cv.Wait()
+	}
 	if l.durabilityErr != nil {
 		return l.durabilityErr
 	}
@@ -699,10 +763,40 @@ func (l *Log) flushLocked() error {
 	if err := l.hit(PointBeforeWALWrite); err != nil {
 		return err
 	}
-	buf := l.buf[:toFlush]
-	n, err := diskio.WriteAt(l.seg, buf, l.segOff)
+	seg, off, crash := l.seg, l.segOff, l.crash
+	buf := l.buf[:toFlush:toFlush]
+	l.flushing = true
+	l.mu.Unlock()
+
+	n, err := diskio.WriteAt(seg, buf, off)
 	if n < len(buf) && err == nil {
 		err = io.ErrShortWrite
+	}
+	var syncErr error
+	if err == nil {
+		if crash != nil {
+			syncErr = crash.Hit(PointAfterWALWriteBeforeSync)
+		}
+		if syncErr == nil {
+			if serr := diskio.DataSync(seg); serr != nil {
+				syncErr = serr
+				// A failed fsync is latched, unlike a crash-injection stop.
+				l.mu.Lock()
+				l.durabilityErr = serr
+				l.mu.Unlock()
+			}
+		}
+	}
+
+	l.mu.Lock()
+	l.flushing = false
+	l.cv.Broadcast()
+	consume := func(k int) {
+		l.segOff += int64(k)
+		l.buf = l.buf[k:]
+		if l.held {
+			l.heldOffset -= k
+		}
 	}
 	if err != nil {
 		wrapped := nerr.Wrap(nerr.IO, "wal.Flush", "write", err)
@@ -712,30 +806,20 @@ func (l *Log) flushLocked() error {
 			// place. Latch. A write that consumed nothing left the buffer
 			// intact at an unchanged offset and stays retryable, so a
 			// transient ENOSPC an operator clears can still make progress.
-			l.segOff += int64(n)
-			l.buf = l.buf[n:]
-			if l.held {
-				l.heldOffset -= n
-			}
+			consume(n)
 			l.durabilityErr = wrapped
 		}
 		return wrapped
 	}
-	l.segOff += int64(len(buf))
+	consume(len(buf))
 	l.written += int64(len(buf))
-	l.buf = l.buf[len(buf):]
-	if l.held {
-		l.heldOffset = 0
-	}
-	if err := l.hit(PointAfterWALWriteBeforeSync); err != nil {
-		return err
-	}
-	if err := diskio.DataSync(l.seg); err != nil {
-		l.durabilityErr = err
-		return err
+	if syncErr != nil {
+		return syncErr
 	}
 	l.syncOff = l.segOff
-	l.durableLSN = last
+	if last > l.durableLSN {
+		l.durableLSN = last
+	}
 	return nil
 }
 
@@ -810,8 +894,39 @@ func (l *Log) reserveNonceLocked() error {
 	return nil
 }
 
+// PageDeltas reports whether this log may contain page delta records.
+func (l *Log) PageDeltas() bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.ctrlVersion == controlVersionPageDeltas
+}
+
+// EnablePageDeltas moves the control file to version 2 so page delta records
+// may be written. It is one-way: a release that predates page deltas can no
+// longer open this log, which is why an existing database does it only on an
+// operator's explicit opt-in.
+func (l *Log) EnablePageDeltas() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.enablePageDeltasLocked()
+}
+
+func (l *Log) enablePageDeltasLocked() error {
+	if l.ctrlVersion == controlVersionPageDeltas {
+		return nil
+	}
+	prev := l.ctrlVersion
+	l.ctrlVersion = controlVersionPageDeltas
+	if err := l.writeControlLocked(); err != nil {
+		l.ctrlVersion = prev
+		return err
+	}
+	return nil
+}
+
 func (l *Log) writeControlLocked() error {
 	return writeControlAtomic(l.dir, controlFile{
+		Version:       l.ctrlVersion,
 		NextLSN:       l.nextLSN,
 		DurableLSN:    l.durableLSN,
 		Checkpoint:    l.checkpoint,
@@ -1298,6 +1413,9 @@ func (l *Log) CrashClose() {
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	for l.flushing {
+		l.cv.Wait()
+	}
 	l.buf = nil
 	l.held = false
 	l.heldOffset = 0

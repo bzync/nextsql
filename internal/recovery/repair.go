@@ -29,28 +29,49 @@ func RepairPage(fm *file.Manager, lg *wal.Log, id format.PageID) ([]byte, error)
 			committed[r.TxnID] = struct{}{}
 		}
 	}
+	// Rebuild the page from its committed records in LSN order: a full image
+	// resets it, a delta applies to the state the previous records produced.
+	// A delta whose base is not the rebuilt state (its full image predates the
+	// retained segments, say) cannot be used, and neither can anything before
+	// it: the page it would produce is older than a committed change the log
+	// holds, which is a silently stale page, not a repair. The rebuild
+	// restarts at the next full image, and with none it fails closed.
 	var (
 		best    []byte
-		bestLSN format.LSN
+		current []byte
 	)
 	for _, r := range recs {
-		if r.Type != wal.RecPageImage || r.PageID != id {
+		if r.PageID != id || (r.Type != wal.RecPageImage && r.Type != wal.RecPageDelta) {
 			continue
 		}
 		if _, ok := committed[r.TxnID]; !ok {
 			continue
 		}
-		if len(r.Body) != format.LogicalPageSize {
-			continue
+		switch r.Type {
+		case wal.RecPageImage:
+			if len(r.Body) != format.LogicalPageSize {
+				continue
+			}
+			current = append(current[:0], r.Body...)
+			best = append([]byte(nil), current...)
+		case wal.RecPageDelta:
+			if current == nil {
+				best = nil
+				continue
+			}
+			d, err := wal.DecodePageDelta(r.Body)
+			if err != nil {
+				current, best = nil, nil
+				continue
+			}
+			next := append([]byte(nil), current...)
+			if err := wal.ApplyPageDelta(next, d, r.LSN); err != nil {
+				current, best = nil, nil
+				continue
+			}
+			current = next
+			best = append([]byte(nil), current...)
 		}
-		if r.LSN < bestLSN {
-			continue
-		}
-		bestLSN = r.LSN
-		best = r.Body
-	}
-	if best == nil {
-		return nil, nerr.New(nerr.Corruption, "recovery.RepairPage", "no committed page image")
 	}
 	// WAL stamps the page LSN after the writer finalized the checksum.
 	// Structural validation is the gate; WriteLogical recomputes CRC32C.

@@ -156,6 +156,20 @@ func TestBuildPlanWarnsOnEphemeralFilesystem(t *testing.T) {
 	}
 }
 
+func TestBuildPlanWarnsOnWindowsDriveUnderWSL(t *testing.T) {
+	for _, fs := range []string{"9p", "drvfs"} {
+		p := baseParams()
+		p.Info.Filesystem = fs
+		plan, err := BuildPlan(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !hasWarningContaining(plan.Warnings, "WSL 2 Linux filesystem") {
+			t.Errorf("%s: expected a WSL Windows-drive advisory, got %v", fs, plan.Warnings)
+		}
+	}
+}
+
 func TestBuildPlanWarnsOnLowDiskAndMissingAdmin(t *testing.T) {
 	p := baseParams()
 	p.Info.DiskFreeBytes = 256 << 20 // 256 MiB

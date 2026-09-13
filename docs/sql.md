@@ -28,7 +28,7 @@ UTC, numeric-only); see `docs/workflows.md` for the cron grammar.
 
 ## Statements
 
-`CREATE TABLE` (including `FOREIGN KEY` / column `REFERENCES`), `DROP TABLE` [`IF EXISTS`], `ALTER TABLE` (`ADD`/`DROP` `[COLUMN]`, bounded `ADD`/`DROP`/`ATTACH`/`DETACH PARTITION`, `RENAME` `[COLUMN]`/`TO`, `ADD`/`DROP CONSTRAINT`), `CREATE INDEX` / `CREATE UNIQUE INDEX` (including JSON paths such as `metadata.category`, `INCLUDE`, `WHERE`, and expression keys), `CREATE SPATIAL INDEX`, `CREATE FULLTEXT INDEX` [`WITH (ANALYZER = 'simple' | 'english' | 'french' | 'german' | 'spanish')`] (one to eight `STRING`/`TEXT` columns), `CREATE VECTOR INDEX … USING HNSW | IVF | IVFPQ | SPARSE`, `DROP INDEX` [`IF EXISTS`], `REBUILD INDEX`, `CREATE` / `ALTER` / `DROP WORKFLOW`, `RUN WORKFLOW`, `CREATE` / `ALTER` / `DROP TRIGGER`, `CREATE` / `ALTER` / `DROP SCHEDULE`, `CREATE` / `ALTER` / `DROP RESOURCE GROUP`, `SET RESOURCE GROUP name`, `RESET RESOURCE GROUP`, `SET CONFIG key = value`, `BACKUP DATABASE`, `VERIFY BACKUP 'name'`, `SHOW TASKS`, `SHOW DATABASES` / `REALMS` / `TABLES` / `INDEXES` / `CONNECTIONS` / `QUERIES` / `TRANSACTIONS` / `LOCKS` / `CLUSTER` / `STORAGE`, `CANCEL TASK`, `MAINTAIN DATABASE` / `MAINTAIN TABLE` / `MAINTAIN INDEX`, `CLUSTER TRANSFER LEADER`, `CLUSTER DRAIN` [`WITH (TIMEOUT_MS = n)`], `CLUSTER MAINTENANCE ENABLE` / `DISABLE`, `CLUSTER RECONCILE CONFIRM`, `INSERT` [`RETURNING`], `UPSERT` [`ON UNIQUE`] [`SET`] [`RETURNING`], `SELECT` (including `WITH` / `WITH RECURSIVE`, `DISTINCT`, `JOIN` / `GROUP BY` / `ORDER BY` / `LIMIT` / `OFFSET` / `COUNT` `SUM` `AVG` `MIN` `MAX`, window functions with `OVER`, JSON path extract, `SEARCH col [WEIGHT n] [, col [WEIGHT n] …] FOR '…'`, `FACET col [, col …]`, and `NEAREST col TO …`), `UPDATE` [`RETURNING`], `DELETE` [`RETURNING`], `BEGIN` [`READ COMMITTED` | `SNAPSHOT` | `SERIALIZABLE`], `COMMIT`, `ROLLBACK`, `ANALYZE` [`table`], `EXPLAIN` [`ANALYZE`] `<statement>`, `CREATE USER` / `DROP USER`, `CREATE ROLE` / `DROP ROLE`, `GRANT` / `REVOKE` (`docs/security.md`, including `GRANT USAGE ON RESOURCE GROUP name TO grantee`). Every other `SET`/`RESET` spelling — including `SET TENANT`, `RESET TENANT` — and `PARTITION BY TENANT` are rejected; provision a hosted database instead.
+`CREATE TABLE` (including `FOREIGN KEY` / column `REFERENCES`), `CREATE TABLE name PRIMARY KEY (col, ...) AS <query>`, `DROP TABLE` [`IF EXISTS`], `ALTER TABLE` (`ADD`/`DROP` `[COLUMN]`, `ALTER [COLUMN] c SET`/`DROP NOT NULL`, `ALTER [COLUMN] c SET`/`DROP DEFAULT`, bounded `ADD`/`DROP`/`ATTACH`/`DETACH PARTITION`, `RENAME` `[COLUMN]`/`TO`, `ADD`/`DROP CONSTRAINT` — foreign key or `CHECK`), `CREATE INDEX` / `CREATE UNIQUE INDEX` (including JSON paths such as `metadata.category`, `INCLUDE`, `WHERE`, and expression keys), `CREATE SPATIAL INDEX`, `CREATE FULLTEXT INDEX` [`WITH (ANALYZER = 'simple' | 'english' | 'french' | 'german' | 'spanish')`] (one to eight `STRING`/`TEXT` columns), `CREATE VECTOR INDEX … USING HNSW | IVF | IVFPQ | SPARSE`, `DROP INDEX` [`IF EXISTS`], `REBUILD INDEX`, `CREATE [OR REPLACE] VIEW` [`(col, ...)`] `AS <query>`, `DROP VIEW` [`IF EXISTS`], `CREATE` / `ALTER` / `DROP WORKFLOW`, `RUN WORKFLOW`, `CREATE` / `ALTER` / `DROP TRIGGER`, `CREATE` / `ALTER` / `DROP SCHEDULE`, `CREATE` / `ALTER` / `DROP RESOURCE GROUP`, `SET RESOURCE GROUP name`, `RESET RESOURCE GROUP`, `SET CONFIG key = value`, `BACKUP DATABASE`, `VERIFY BACKUP 'name'`, `SHOW TASKS`, `SHOW DATABASES` / `TABLES` / `INDEXES` / `CONNECTIONS` / `QUERIES` / `TRANSACTIONS` / `LOCKS` / `CLUSTER` / `STORAGE`, `CANCEL TASK`, `CANCEL QUERY`, `MAINTAIN DATABASE` / `MAINTAIN TABLE` / `MAINTAIN INDEX`, `CLUSTER TRANSFER LEADER`, `CLUSTER DRAIN` [`WITH (TIMEOUT_MS = n)`], `CLUSTER MAINTENANCE ENABLE` / `DISABLE`, `CLUSTER RECONCILE CONFIRM`, `INSERT` (`VALUES` or a query) [`RETURNING`], `UPSERT` [`ON UNIQUE`] [`SET`] [`RETURNING`], `SELECT` (including `WITH` / `WITH RECURSIVE`, `DISTINCT`, `JOIN` / `GROUP BY` / `ORDER BY` / `LIMIT` / `OFFSET` / `COUNT` `SUM` `AVG` `MIN` `MAX`, window functions with `OVER`, JSON path extract, `SEARCH col [WEIGHT n] [, col [WEIGHT n] …] FOR '…'`, `FACET col [, col …]`, and `NEAREST col TO …`), `UPDATE` [`RETURNING`], `DELETE` [`RETURNING`], `BEGIN` [`READ COMMITTED` | `SNAPSHOT` | `SERIALIZABLE`], `COMMIT`, `ROLLBACK`, `SAVEPOINT name`, `ROLLBACK TO` [`SAVEPOINT`] `name`, `RELEASE` [`SAVEPOINT`] `name`, `ANALYZE` [`table`], `EXPLAIN` [`ANALYZE`] `<statement>`, `CREATE USER` / `DROP USER`, `CREATE ROLE` / `DROP ROLE`, `GRANT` / `REVOKE` (`docs/security.md`, including `GRANT USAGE ON RESOURCE GROUP name TO grantee`). Every other `SET`/`RESET` spelling — including `SET TENANT`, `RESET TENANT` — and `PARTITION BY TENANT` are rejected. Shared row tenancy was removed: a deployment serves exactly one database, and isolation is a whole deployment.
 
 `SELECT <expr-list>` with no `FROM` at all (e.g. `SELECT 1`, `SELECT NOW()`, `SELECT 1 + 1 AS n`) evaluates the select list exactly once against no row/table context and bypasses the normal binder/planner entirely — the same architectural precedent as the `system.*` virtual-table bypass. `SELECT *` still requires `FROM` (there is no table to expand). An optional `WHERE`/`ORDER BY`/`LIMIT`/`OFFSET` still applies to that single synthetic row; `GROUP BY`/`HAVING`/`SEARCH`/`NEAREST`/`FACET`/`JOIN` need a table or index and are rejected at parse time. A bare column reference has nothing to resolve against and fails closed (`invalid_argument`), not silently.
 
@@ -36,7 +36,160 @@ Unquoted identifiers fold to lowercase. Quoted `"ident"` is preserved.
 
 Table names that start with `nsql_` (case-folded) are reserved. The only exception is `CREATE TABLE nsql_schema_migrations` with the exact history DDL (`docs/design-cli-migrate-fk-joins.md` C.2) when that table is absent. Any other `nsql_*` name, or a different column list for `nsql_schema_migrations`, is `invalid_argument`. After that reserved DDL is accepted, the executor grants `SELECT`/`INSERT`/`UPDATE`/`DELETE` on the table to the session user (no `GRANT` SQL, no `PrivGrant`).
 
-Reserved words include `FOREIGN`, `REFERENCES`, `CONSTRAINT`, `CASCADE`, `RESTRICT`, `ACTION`, `MATCH`, `ALTER`, `ADD`, `RENAME`, `ORDER`, `ASC`, `DESC`, `IF`, `EXISTS`, `WITH`, `OVER`, `UPSERT`, and `RETURNING` (same rule as `USER`, `KEY`, `TO`): unquoted they are keywords; quoted `"foreign"` is an identifier. `RECURSIVE`, `MATERIALIZED`, `PARTITION`, `ROWS`, `RANGE`, `UNBOUNDED`, `PRECEDING`, `FOLLOWING`, `CURRENT`, `ROW`, `EXCLUDED`, `INCLUDE`, and `FACET` are contextual identifiers, not reserved words.
+Reserved words include `FOREIGN`, `REFERENCES`, `CONSTRAINT`, `CASCADE`, `RESTRICT`, `ACTION`, `MATCH`, `ALTER`, `ADD`, `RENAME`, `ORDER`, `ASC`, `DESC`, `IF`, `EXISTS`, `WITH`, `OVER`, `UPSERT`, `LIKE`, and `RETURNING` (same rule as `USER`, `KEY`, `TO`): unquoted they are keywords; quoted `"foreign"` is an identifier. `RECURSIVE`, `MATERIALIZED`, `PARTITION`, `ROWS`, `RANGE`, `UNBOUNDED`, `PRECEDING`, `FOLLOWING`, `CURRENT`, `ROW`, `EXCLUDED`, `INCLUDE`, `CAST`, `ESCAPE`, and `FACET` are contextual identifiers, not reserved words — `CAST` and `ESCAPE` are recognised only in `CAST(x AS type)` and after a `LIKE` pattern, so a column named `cast` or `escape` keeps working unquoted.
+
+## Altering a column
+
+`ALTER TABLE t ALTER [COLUMN] c SET NOT NULL` / `DROP NOT NULL` and
+`ALTER TABLE t ALTER [COLUMN] c SET DEFAULT <expr>` / `DROP DEFAULT` change a
+column's nullability and default in place. One action per statement.
+
+`SET NOT NULL` scans the table first and fails without changing anything if the
+column holds NULL in any existing row — nothing re-checks stored rows
+afterwards. `DROP NOT NULL` is refused on a primary-key column, which is NOT
+NULL by definition.
+
+A `DEFAULT` follows the same rules as one written at `CREATE TABLE`: a literal
+coercible to the column type, or `UUID()` / `NOW()` / `AI()` for the types each
+requires, and never on an `ENCRYPTED CLIENT` column. Changing a default is a
+catalog-only change: it supplies a value for writes that omit the column and
+does not rewrite rows already stored.
+
+Changing a column's *type* is not supported; it stays a table rebuild.
+
+## Views
+
+`CREATE [OR REPLACE] VIEW name [(col, ...)] AS <query>` stores a named query;
+`DROP VIEW [IF EXISTS] name` removes it. A view and a table share one relation
+namespace, so a name in `FROM` means exactly one thing.
+
+The defining query is stored as **text**, with every identifier written in
+quoted form (`SELECT "id" FROM "emp"`, which is what `system.views` shows), and
+is re-resolved at each use. Quoting changes no meaning, since an unquoted name
+is the quoted form of its lower-case spelling, but it keeps the stored text
+parsing when a word it uses as a name later becomes a reserved keyword.
+`nextsqld` logs a warning at startup naming any stored view that no longer
+parses (possible only for a view created before log #287);
+`CREATE OR REPLACE VIEW` repairs one. The re-resolution at each use means a view
+follows the tables under it as they change — new rows, added columns, new
+indexes. Using a view expands it into a common table expression holding that
+query, which is why a view joins, filters, aggregates and nests exactly like
+any other relation, including inside a subquery of an `UPDATE` or `DELETE`. A
+`WITH` clause naming the same identifier shadows the view, as a local
+definition should. Views may be built over views, up to 8 levels; a definition
+that reaches itself is refused as a cycle.
+
+**Authorization is the invoker's, never the definer's.** The expansion reads
+the underlying tables by name, so using a view requires exactly the privileges
+that writing its query by hand would require. A view is a convenience, not a
+way to reach data the caller could not otherwise read. `system.views` shows a
+view's definition to an admin or to its owner.
+
+Boundaries, each explicit rather than partial:
+
+- **Read-only.** `INSERT` / `UPDATE` / `DELETE` / `UPSERT` against a view are
+  refused. An updatable view needs a documented row-mapping rule back to base
+  rows, and writing to the wrong place silently is worse than the refusal.
+- A view's query must read at least one relation: `CREATE VIEW v AS SELECT 1`
+  is refused, because a CTE body has nothing to read.
+- Dropping a table or view that another view is defined over is refused, so a
+  view is never left pointing at something that no longer exists.
+- A view is validated when created — it must parse, resolve, and be one the
+  creator may run — and again at each use.
+- Views live in the catalog, so a physical backup carries them. Logical export
+  covers table data and table DDL only; views, like workflows and triggers, are
+  not part of it.
+
+## Cancelling a running statement
+
+`CANCEL QUERY '<id>'` stops a statement another session is running, named by
+the `query_id` that `system.active_queries` and `SHOW QUERIES` report. A user
+may always cancel their own; cancelling anyone else's requires `ADMIN`, the
+same boundary that decides whether the statement is visible at all. Cancelling
+an id that is no longer running is not an error — the statement asked for it to
+stop, and it has.
+
+The cancel funnels through the context the target statement already runs under,
+so it unwinds through the executor's ordinary cleanup, exactly as a
+client-driven cancel does. `CANCEL TASK '<id>'` is unchanged and still cancels
+a background task rather than a statement.
+
+## Savepoints
+
+`SAVEPOINT name` marks a position inside an open write transaction.
+`ROLLBACK TO [SAVEPOINT] name` reverses everything written after that mark and
+leaves the transaction open, holding its locks; `RELEASE [SAVEPOINT] name`
+drops the mark and keeps the work. Both destroy every savepoint established
+after the named one, and re-using a live name replaces that savepoint, as in
+the standard. A transaction holds at most 64.
+
+Reversal replays the transaction's own undo records through the trees that
+produced them, so secondary indexes, vector stores and the heap are all
+reversed together and a unique key freed by a rollback is immediately
+reusable. Nothing extra is logged: redo is page-image based and a commit
+writes each dirty page's final image, which already reflects the reversal.
+Rolling back to the same savepoint twice is well defined — applying an undo
+record again re-deletes a row already gone or restores a version already
+restored — and a later whole-transaction `ROLLBACK` still reverts everything.
+
+Two boundaries are explicit rather than partial:
+
+- `SAVEPOINT` requires an open **write** transaction; outside one, or in a
+  read-only transaction, it is refused.
+- `ROLLBACK TO` is refused when a schema change ran after the savepoint was
+  set. DDL is not part of the row undo chain a savepoint reverses, so crossing
+  one would leave the catalog and the data disagreeing.
+
+Staged change-stream events are truncated with the rollback, so a row that was
+rolled back is never published as a CDC change.
+
+## Column defaults on insert
+
+A column's `DEFAULT` fills a column the `INSERT` or `UPSERT` does not name. A
+value the statement supplies is used as given: an explicit `NULL`, as a literal,
+a bound parameter or a value from the source query, is stored as `NULL`, and a
+`NOT NULL` column refuses it even if the column has a default. `AI()` in the
+value list asks for the next generated value, and an explicit value still
+advances the column's `AI()` counter.
+
+Until log #287 an explicit `NULL` was replaced by the default. A driver binding
+`NULL` got the default stored, and a logical export/import replaced every stored
+`NULL` in a defaulted column with the default, including fresh `NOW()` and
+`UUID()` values.
+
+## Check constraints
+
+A `CHECK` is written beside a column (`n INT64 CHECK (n > 0)`) or at table
+level (`CONSTRAINT ab CHECK (a < b)`), and added or removed later with
+`ALTER TABLE ADD [CONSTRAINT name] CHECK (...)` / `DROP CONSTRAINT name`.
+Foreign keys and checks share one constraint namespace, so a name identifies
+exactly one constraint. An unnamed constraint is named `ck_<table>_<n>` by its
+position in the statement as written. A table holds at most 16.
+
+A row is refused only when a check evaluates to FALSE. UNKNOWN satisfies the
+constraint, which is the SQL rule and the reason `CHECK (n > 0)` admits a NULL
+`n` — `NOT NULL` is the constraint that rejects it.
+
+Checks are evaluated on the leader inside the writing transaction, before the
+row reaches the heap, on every path that writes a row: `INSERT` (including the
+multi-row bulk path), `UPDATE`, `UPSERT`, and foreign-key `CASCADE` /
+`SET NULL` / `SET DEFAULT` writes to a child row. A violation aborts the
+statement with nothing written. Followers apply the resulting WAL and never
+re-evaluate the predicate.
+
+A stored predicate must therefore be deterministic and depend on nothing but
+the row. These are refused at DDL time: subqueries (nothing re-validates the
+constraint when the other table changes), aggregates and window functions
+(they depend on other rows), `UUID()` / `NOW()` / `AI()` (a row that passed
+once could fail an identical later evaluation, and a replica or a recovery
+replay could disagree with the leader), parameters (no value at DDL time), and
+references to an `ENCRYPTED CLIENT` column (the server holds only ciphertext).
+
+`ALTER TABLE ADD CONSTRAINT ... CHECK` validates every existing row first and
+fails without adding the constraint if any row contradicts it, so a table can
+never hold rows that no write could reproduce. Only the constraint being added
+is re-scanned. Checks appear in `system.checks` and in the canonical DDL that
+`system.table_ddl` and logical export emit.
 
 ## Foreign keys
 
@@ -77,7 +230,8 @@ CREATE TABLE lines (
 - A child `CREATE TABLE` in the same transaction can reference a parent created earlier in that transaction (session overlay). `CREATE TABLE` bind and parent `DELETE` inbound probes both use overlay ∪ catalog lookup, so an uncommitted child table is visible to the same-txn parent delete.
 - `MATCH SIMPLE`: if any foreign-key column is NULL, the existence check and parent-delete probe for that constraint are skipped.
 
-Do not revert this binary after a catalog rewrite has written `NSCT` v13.
+Do not revert this binary after a catalog rewrite has written `NSCT` v13, or
+v14 for a table that declares a `CHECK` constraint.
 Restore a pre-v5 backup or use an explicit format-aware migration first.
 
 ## Types
@@ -85,12 +239,20 @@ Restore a pre-v5 backup or use an explicit format-aware migration first.
 | Type | Storage | Notes |
 |---|---|---|
 | `UUID` | 16 bytes | `DEFAULT UUID()` |
+| `BOOL` | 1 byte | `TRUE` / `FALSE`; the type every comparison, `IS NULL` test and `AND`/`OR`/`NOT` produces; index keys order `FALSE` before `TRUE` (usable as `PRIMARY KEY`/`ORDER BY`); isolated from every other family — no coercion to or from text or numbers, in either direction, including `CAST` (write `CAST(flag AS STRING)` to render one as `'TRUE'`/`'FALSE'`); ordinary FK-eligible scalar; `ENCRYPTED CLIENT` supported |
 | `STRING` / `TEXT` | `u32` length + UTF-8 | same encoding |
+| `CHAR(n)` / `VARCHAR(n)` | same encoding as `STRING`/`TEXT`; `n` in `Type.Precision` | `n` counts **runes**, not bytes; `CHAR(n)` is true fixed-width — shorter input is right-padded with spaces to exactly `n`, and over-length input whose excess is entirely trailing spaces is trimmed back to `n` (the one ISO-standard silent trim), any other over-length input errors; `VARCHAR(n)` is a length ceiling that never truncates; both order byte-lexicographically on the stored form; not `ENCRYPTED CLIENT`; see `docs/design-datatypes.md` D4 |
 | `BLOB` | `u32` length + raw bytes | variable-length, no UTF-8 validation; literal syntax `X'<hex>'` (e.g. `X'DEADBEEF'`, `X''` for empty); orders byte-lexicographically (usable as `PRIMARY KEY`/`ORDER BY`); isolated from `STRING`/`TEXT` — coercion either way requires hex text, never a byte-for-byte reinterpretation; `ENCRYPTED CLIENT` supported; see `docs/design-datatypes.md` D1 |
 | `INT8` / `INT16` / `INT32` / `INT64` | 1 / 2 / 4 / 8 bytes, two's complement | exact fixed-width signed integers; index keys sign-bit-flip so `ORDER BY`/`PRIMARY KEY` sort numerically; narrowing (including a literal that doesn't fit) errors rather than wrapping; `+ - * /` and unary `-` always promote to `DECIMAL` (arbitrary precision, cannot overflow mid-operation) — only an explicit assignment back into a fixed-width column re-checks range; ordinary FK-eligible scalars; `ENCRYPTED CLIENT` supported; see `docs/design-datatypes.md` D2 |
 | `UINT8` / `UINT16` / `UINT32` / `UINT64` | 1 / 2 / 4 / 8 bytes, plain unsigned | exact fixed-width unsigned integers; index keys use plain unsigned big-endian order (no sign-bit flip needed); narrowing and negative-to-unsigned assignment error rather than wrapping; `+ - * /` and unary `-` always promote to `DECIMAL`, same as `INT8..64`; also directly coercible to/from `INT8..64` (range/sign checked either way — the two families share one coercible "exact integer" group); ordinary FK-eligible scalars; `ENCRYPTED CLIENT` supported; see `docs/design-datatypes.md` D3 |
 | `DECIMAL(p,s)` | `1 <= p <= 38`, `s <= p` | unscaled integer + scale; `DEFAULT AI()` when `s = 0` |
+| `FLOAT32` / `FLOAT64` | 4 / 8 bytes IEEE-754 | inexact by design, for interop with external numeric data; index keys use the canonical total order `-Inf < negative < 0 < positive < +Inf < NaN`, with `-0.0` canonicalized to `+0.0` and every NaN payload collapsed to one value; arithmetic stays floating (it does not promote to `DECIMAL`); assignment into `FLOAT32` re-rounds; see `docs/design-datatypes.md` D8 |
+| `DATE` | `int32` day count since 1970-01-01 | text form `YYYY-MM-DD`; no dedicated literal prefix — a quoted string coerces; isolated from every family but text; index keys sign-bit-flip so pre-1970 dates sort first; no arithmetic without `INTERVAL`; see `docs/design-datatypes.md` D5 |
+| `TIME` | `int64` nanos since midnight, `< 24h` | text form `HH:MM:SS[.fraction]`; a quoted string coerces; isolated from every family but text; plain unsigned key order (always non-negative); see `docs/design-datatypes.md` D5 |
+| `TIMESTAMP` | `int64` nanos | a plain date-and-time with **no** time zone, read literally with no offset applied; deliberately isolated from `TIMESTAMPTZ` — converting between them needs an assumed zone, so it is text coercion only; see `docs/design-datatypes.md` D7 |
 | `TIMESTAMPTZ` | `int64` UTC nanos | `DEFAULT NOW()` |
+| `INTERVAL` | `int32` months + `int32` days + `int64` nanos | a calendar duration, literal `INTERVAL '1 month 3 days'`; month and day steps are applied calendar-correctly (Jan 31 + 1 month = Feb 28/29) before the nanosecond remainder; ordering uses the justified heuristic (1 month = 30 days = 24h), so `1 month` and `30 days` compare equal though their fields differ; see `docs/design-datatypes.md` D6 |
+| `ENUM('a', 'b', …)` | `u16` ordinal into the column's declared label list | ordered by **declaration position**, not alphabetically (`small < medium` however the labels read); the label list is per-column catalog metadata, so two `ENUM` columns with different labels are different types; isolated from every family but text; see `docs/design-datatypes.md` D11 |
 | `JSON` | compact binary `NSJB` | path extract and path indexes; see `docs/json.md` |
 | `VECTOR<F32,N>` / `<F16,N>` / `<I8,N>` | heap reference; payload in vector store (F16 halves, I8 signed bytes + scale) | `NEAREST`, `COSINE` / `L2` / `INNER_PRODUCT`; see `docs/vector.md` |
 | `BITVECTOR<N>` | heap reference; payload is `ceil(N/8)` packed bits | `NEAREST … USING HAMMING` (default and only metric); elements must be 0 or 1; see `docs/vector.md` |
@@ -100,7 +262,7 @@ Restore a pre-v5 backup or use an explicit format-aware migration first.
 | `LINESTRING` | `u16` count + lon/lat pairs | at least two vertices; see `docs/geo.md` |
 | `POLYGON` | rings of closed lon/lat | exterior + optional holes; 256-vertex cap |
 | `GEOMETRY` / `GEOMETRY(sub, srid)` | EWKB (`u32` length prefix + extended WKB) | general OGC geometry (`Point`/`LineString`/`Polygon`/`Multi*`/`GeometryCollection`), planar/Cartesian math, per-column SRID+subtype; alongside (not a generalization of) `POINT`/`BOX`/`LINESTRING`/`POLYGON`; see `docs/design-spatial.md` |
-| `GEOGRAPHY` / `GEOGRAPHY(sub, srid)` | same EWKB encoding | same general OGC geometry, geodetic/great-circle math (SRID defaults to 4326); see `docs/design-spatial.md` |
+| `GEOGRAPHY` / `GEOGRAPHY(sub, srid)` | same EWKB encoding | same general OGC geometry, geodetic/great-circle math (SRID defaults to 4326); a column that accepts any subtype but carries an SRID spells the subtype `Geometry` — a plain `GEOGRAPHY` column is reported as `GEOGRAPHY(Geometry, 4326)`, and that spelling parses back to the same type; see `docs/design-spatial.md` |
 | `STRUCT<name T, …>` | self-describing nested `NSRW` sub-encoding (`u32` body length + `u32` field count + null bitmap + members) | fixed, named, heterogeneous fields; construct with `STRUCT(expr AS name, …)`; read a field with `col.field[.field…]`; orders field-by-field lexicographically (usable as `PRIMARY KEY`/`ORDER BY`); NULL fields sort first; not `ENCRYPTED CLIENT`, not FK-eligible; see `docs/design-collections.md` C1 |
 | `ARRAY<T>` | same nested sub-encoding; `T` is any type incl. another collection | variable-length homogeneous list; construct with `ARRAY(e1, e2, …)`; `ELEMENT_AT(arr, i)` (1-based), `CARDINALITY`/`ARRAY_LENGTH`, `ARRAY_CONTAINS(arr, x)`; orders element-by-element (a shorter prefix sorts first); nesting bounded at depth 8, `2²⁰` elements; not `ENCRYPTED CLIENT`, not FK-eligible; see `docs/design-collections.md` C2 |
 | `MAP<K,V>` | same nested sub-encoding; entries stored in canonical key order | `K` must be an orderable scalar; construct with `MAP(k1, v1, k2, v2, …)`; `ELEMENT_AT(map, key)`, `MAP_CONTAINS_KEY`, `MAP_KEYS`, `MAP_VALUES`, `MAP_SIZE`; duplicate keys rejected; two MAPs with the same entries encode and compare identically regardless of insertion order; not `ENCRYPTED CLIENT`, not FK-eligible; see `docs/design-collections.md` C3 |
@@ -496,6 +658,47 @@ A scalar subquery may appear wherever an expression is accepted. It must expose
 exactly one column and return at most one row; an empty result becomes SQL NULL,
 while multiple rows fail explicitly.
 
+`expr IN (v1, v2, ...)` and `expr NOT IN (v1, v2, ...)` take a value list of
+up to 4,096 expressions. The predicate is exactly the disjunction ISO/IEC 9075
+defines it to be — `x IN (a, b)` is `x = a OR x = b` — so three-valued logic
+follows from the expansion rather than from a separate rule: an unmatched `IN`
+over a list containing NULL is UNKNOWN, and so is its `NOT IN`. Because each
+value is compared against its own evaluation of the left operand, a left
+operand calling `UUID()`, `NOW()` or `AI()` is rejected rather than given an
+undefined meaning. A value list is not an index access path: it is evaluated
+per row like any other predicate, exactly as the equivalent `OR` chain is.
+
+`expr [NOT] LIKE pattern [ESCAPE c]` matches Unicode code points: `_` matches
+exactly one character, `%` matches any sequence including the empty one, and
+every other character matches itself. Matching is case-sensitive — NextSQL has
+no collation that folds case behind the operator, so write `LOWER(col) LIKE
+'a%'` when that is what you mean. `ESCAPE` declares a single character that
+must be followed by `%`, `_`, or itself; any other escape sequence, a dangling
+escape, or a multi-character escape is rejected. A NULL value, pattern or
+escape yields UNKNOWN, not false. The matcher resumes from the last `%` on a
+mismatch, so a pattern cannot cost exponential time the way a backtracking
+regular-expression engine can. `LIKE` is not an index access path either;
+`STARTS_WITH` is the prefix predicate the optimizer understands.
+
+`CAST(expr AS type)` converts a value using the same conversion rules the
+engine applies everywhere else (`types.Coerce`), so a cast can never reach a
+conversion an `INSERT` would not accept. The target type is the written type
+including `DECIMAL` precision and scale, `CHAR`/`VARCHAR` length, `ENUM` label
+set and vector element type. A NULL input casts to a NULL of the target type;
+a conversion the rules reject (`CAST('abc' AS INT64)`) is an error, never a
+silent zero.
+
+`NOT` binds more loosely than comparison, `IS [NOT] NULL`, `BETWEEN`, `IN` and
+`LIKE`, as in the standard: `NOT a = b` is `NOT (a = b)` and `NOT a IS NULL` is
+`NOT (a IS NULL)`. A `NOT` written inside an operand (`a = NOT b`) is still
+accepted.
+
+Statements nest at most 4,096 levels deep, counting parentheses, operator
+chains, subqueries, set operations and workflow bodies; a deeper statement is
+refused with `invalid_argument` before it is bound. Every stage after the
+parser walks the tree recursively, so the bound is what keeps a single
+statement from exhausting the process stack.
+
 `expr IN (SELECT ...)` and `expr NOT IN (SELECT ...)` require one subquery
 column and use three-valued SQL membership. A matching value wins even when
 other rows are NULL; without a match, a NULL on either side produces UNKNOWN.
@@ -620,6 +823,121 @@ FROM items;
 
 `EXPLAIN` shows `Window`. Tenant predicates and `SELECT` privilege checks apply
 to the underlying table; a window cannot see another tenant's rows.
+
+## INSERT from a query
+
+`INSERT` takes its rows either from a `VALUES` list or from a query:
+
+```sql
+INSERT INTO archive (id, total) SELECT id, total FROM orders WHERE closed;
+INSERT INTO daily WITH r AS (SELECT day, amount FROM sales) SELECT day, SUM(amount) FROM r GROUP BY day;
+INSERT INTO copy SELECT * FROM orders RETURNING id;
+```
+
+- The source is an ordinary query — `SELECT`, a set operation, or a `WITH` —
+  bound by the ordinary query binder and optimized like any other. Joins,
+  aggregates, subqueries, views and CTEs behave exactly as they would on their
+  own, and there is no second grammar for the query inside an `INSERT`.
+- The query's output columns must match the columns being written, position by
+  position: the named column list, or every column in declaration order when
+  none is given. A count mismatch is `invalid_argument`.
+- A target column the query does not supply takes its `DEFAULT`. Every
+  constraint that applies to a `VALUES` insert applies here: `NOT NULL`,
+  `CHECK`, primary key and unique keys, and foreign keys.
+- **The source is read to completion before the first row is written.** A
+  transaction sees its own writes and there is no statement-level command id,
+  so a streaming implementation of `INSERT INTO t SELECT ... FROM t` would read
+  back the rows it had just written and feed itself without bound. Reading
+  first is what makes the source a fixed relation, whether the self-reference
+  is direct or reached through a CTE, a view or a join — so
+  `INSERT INTO t SELECT id + 100, v FROM t` doubles `t` exactly once.
+- Because the source runs as a query, it is bounded like one:
+  `max_result_rows` and `max_result_bytes` apply and the rows are charged to
+  the statement's memory budget, so an oversized source is an explicit
+  `exhausted` error, never a silently truncated insert (`docs/limits.md`).
+- Triggers on the target fire and its foreign keys are checked, because a
+  query-sourced row is written by the same path a `VALUES` row is.
+- `EXPLAIN` shows the source plan under the `Insert` node (`Insert → Project →
+  Filter → SeqScan`); a `VALUES` insert stays a single node.
+- Privileges: `INSERT` on the target, plus `SELECT` on every relation the query
+  reads — the source is read with the invoker's own rights, so an `INSERT`
+  cannot copy out of a table the user may not read. `RETURNING` also requires
+  `SELECT` on the target.
+- `INSERT INTO t SELECT <exprs>` with no `FROM` is one row of values written a
+  different way, and is treated as exactly that (which is also what captures
+  `NOW()`/`UUID()` once for replication). A FROM-less source that filters,
+  orders, bounds or deduplicates that single row is rejected — write `VALUES`.
+- Not accepted: a query source writing an `ENCRYPTED CLIENT` column (that
+  column takes only an encrypted parameter, `NULL`, or a direct ciphertext
+  copy, none of which a query's output can be shown to be at bind time), a
+  query source on a legacy `TENANT`-partitioned table, and a query-sourced
+  `INSERT` in a workflow body (a workflow persists table/columns/rows only).
+  `UPSERT` takes `VALUES` only.
+
+## CREATE TABLE from a query
+
+`CREATE TABLE` also builds a table from a query, taking the column names and
+types from that query's output instead of a written column list:
+
+```sql
+CREATE TABLE archive PRIMARY KEY (id) AS SELECT id, name, qty FROM orders WHERE qty > 10;
+CREATE TABLE totals PRIMARY KEY (day) AS SELECT day, SUM(amount) AS amount FROM sales GROUP BY day;
+CREATE TABLE joined PRIMARY KEY (id) AS SELECT o.id AS id, c.name AS name FROM orders o JOIN customers c ON o.cid = c.id;
+```
+
+- **The key is named, not inferred.** Every NextSQL table is clustered on its
+  primary key and a query's output carries none, so `PRIMARY KEY (col, ...)` is
+  required and each column named must be one of the query's output columns.
+  There is no rowid to fall back on.
+- The source is an ordinary query — `SELECT`, a set operation, or a `WITH` —
+  bound by the ordinary query binder and optimized like any other, exactly as
+  for `INSERT` from a query. `EXPLAIN` shows the source plan under the
+  `CreateTableAs` node.
+- **It is a snapshot, not a view.** The rows are read once and stored, so later
+  changes to the source do not reach it. Use `CREATE VIEW` for a relation that
+  re-resolves at each use (see *Views*).
+- **Every output column must be usable as a column.** An unaliased expression
+  reports its name as `?`, which no column may be called, so
+  `SELECT id, qty + 1 FROM t` is rejected and `SELECT id, qty + 1 AS twice FROM t`
+  is what to write. A repeated output name is rejected for the same reason.
+- **Column types come from the values the query produced**, because a NextSQL
+  query has no static output type — a result column's type travels with its
+  values. Two consequences worth knowing:
+  - Integer arithmetic and `COUNT`/`SUM` produce an exact decimal whose
+    precision and scale live in the value rather than the type, so a column
+    derived from `qty * 2` is `DECIMAL(38, s)` where `s` is the scale the
+    values actually needed — nothing is rounded away. A plain copy of a
+    declared `DECIMAL(12,2)` column keeps `DECIMAL(12,2)`.
+  - A derived type that no `CREATE TABLE` could declare is rejected rather
+    than stored, so the new table is always one an operator could have written
+    and whose canonical DDL (`system.table_ddl`, logical export) re-parses.
+    The check is the round trip itself — render the candidate table, parse it
+    back, require every column type to match — so a type added later cannot
+    quietly reintroduce the problem. A comparison such as `qty > 15` yields
+    `BOOL`, which is an ordinary column type, so that column is stored as
+    `BOOL`; a derived type the dialect cannot spell is refused by name and
+    `CAST` is the remedy.
+- **The query must return at least one row**, since an empty result carries no
+  values to derive types from. A `NULL` does carry its type (a `NULL` read from
+  a `STRING` column is a `STRING` `NULL`, and `CAST(x AS t)` produces a typed
+  `NULL`), so a column that is `NULL` in every row is still typed. Only the
+  bare `NULL` literal is untyped and rejected — `CAST` it.
+- Nullability is not inferred from the data: only the primary-key columns are
+  `NOT NULL`. A result that happened to contain no `NULL` does not decide what
+  the new table accepts afterwards. A `NULL` in a column named as the key is
+  rejected.
+- The statement is atomic. If the rows cannot be stored — a repeated value in
+  the key column, say — the table is not left behind, and a `ROLLBACK` takes
+  it with it.
+- Like the source of an `INSERT`, the query is bounded as a query:
+  `max_result_rows`, `max_result_bytes` and the statement memory budget apply,
+  so an oversized source is an explicit `exhausted` error (`docs/limits.md`).
+- Privileges: `CREATE`, plus `SELECT` on every relation the query reads — the
+  source is read with the invoker's own rights, so it cannot copy out of a
+  table the user may not read.
+- The new table has no indexes, foreign keys or checks; add them with
+  `CREATE INDEX` / `ALTER TABLE` afterwards. Partitioning is not accepted in
+  this form, and neither is a query source in a workflow body.
 
 ## UPSERT and RETURNING
 

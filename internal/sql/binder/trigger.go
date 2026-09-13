@@ -1,6 +1,8 @@
 package binder
 
 import (
+	"strconv"
+
 	"github.com/bzync/nextsql/internal/catalog"
 	"github.com/bzync/nextsql/internal/nerr"
 	"github.com/bzync/nextsql/internal/sql/ast"
@@ -42,6 +44,15 @@ func BindAutomation(stmt ast.Stmt, tables Lookup, workflows WorkflowLookup, work
 			return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "invalid task id")
 		}
 		return CancelTask{ID: s.ID}, nil
+	case ast.CancelQuery:
+		// A query id is the decimal counter system.active_queries publishes.
+		if s.ID == "" || len(s.ID) > 20 {
+			return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "invalid query id")
+		}
+		if _, err := strconv.ParseUint(s.ID, 10, 64); err != nil {
+			return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "invalid query id")
+		}
+		return CancelQuery{ID: s.ID}, nil
 	}
 	if bound, handled, err := bindSchedule(stmt, workflows, schedules, nextID, owner); handled {
 		return bound, err

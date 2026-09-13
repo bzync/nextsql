@@ -56,6 +56,7 @@ require_client_key=false
 audit_file=
 wal_archive=/var/lib/nextsql-wal
 wal_retention_ms=0
+wal_page_deltas=auto
 disk_watermark_check_ms=0
 disk_watermark_warn_percent=85
 disk_watermark_reject_percent=95
@@ -68,7 +69,7 @@ max_result_rows=1000000
 max_connections=128
 max_connections_per_user=0
 max_connections_per_database=0
-max_connections_per_realm=0
+max_concurrent_password_hashes=0
 idle_timeout_ms=60000
 statement_timeout_ms=30000
 transaction_timeout_ms=0
@@ -107,7 +108,7 @@ Defaults: 32 in-flight, 128 queued, 5 s wait.
 
 Per-query budgets (defaults): 64 MiB memory, 256 MiB spill, 1 GiB I/O, 30 s, 1 000 000 result rows / 64 MiB result bytes. Exceeding a budget fails with `exhausted`. Worker goroutines are bounded (`min(GOMAXPROCS, 8)` per query through a process pool).
 
-Wire defaults: 64 MiB frame, 16 MiB SQL text, 65,535 parameters, 64 prepared statements per session, 64 MiB result bytes, 128 concurrent sessions, and 60 s idle. The independently configurable `max_frame_bytes`, `max_statement_bytes`, `max_parameters`, `max_prepared_statements`, and `max_result_bytes` are checked against absolute ceilings before the server allocates or retains the corresponding state. SQL text may not exceed its enclosing frame; result limits fail the query with `exhausted` rather than truncating it. `max_connections` and `idle_timeout_ms` override the 128-session cap and 60 s idle deadline; `max_connections_per_user` (0 = unlimited) additionally caps concurrent authenticated connections held by one user name. `max_connections_per_database` and the retained `max_connections_per_realm` compatibility setting can each cap sessions for this deployment's one database. All connection limits are process-wide and node-local (not synchronized across a cluster). See [Production limits](/docs/limits) for every default, ceiling, and sentinel.
+Wire defaults: 64 MiB frame, 16 MiB SQL text, 65,535 parameters, 64 prepared statements per session, 64 MiB result bytes, 128 concurrent sessions, and 60 s idle. The independently configurable `max_frame_bytes`, `max_statement_bytes`, `max_parameters`, `max_prepared_statements`, and `max_result_bytes` are checked against absolute ceilings before the server allocates or retains the corresponding state. SQL text may not exceed its enclosing frame; result limits fail the query with `exhausted` rather than truncating it. `max_connections` and `idle_timeout_ms` override the 128-session cap and 60 s idle deadline; `max_connections_per_user` (0 = unlimited) additionally caps concurrent authenticated connections held by one user name. `max_connections_per_database` (0 = unlimited) caps sessions for the deployment's one database. `max_concurrent_password_hashes` (0 = one per four CPUs, at least two) bounds concurrent password hashing, each 64 MiB, which runs before a client is authenticated. All connection limits are process-wide and node-local (not synchronized across a cluster). See [Production limits](/docs/limits) for every default, ceiling, and sentinel.
 
 Each deployment opens one database. `max_open_databases` is accepted only for configuration compatibility and has no routing effect. `max_total_buffer_pages` still bounds the process buffer-pool reservation and must be zero (unbounded) or at least `buffer_pages`; `task_workers` bounds scheduled-task execution for the deployment.
 
@@ -120,6 +121,8 @@ On SIGINT/SIGTERM, `nextsqld` stops accepting new connections and closes each ex
 ## WAL archival and retention
 
 `wal_archive` (default unset) enables the PITR archiver: recycled WAL segments are copied, encrypted, to this directory before local deletion. `wal_retention_ms` (default 0 = unmanaged) additionally makes `nextsqld` keep `DB.SetWALRetentionHorizon` current with a time-based policy — the newest archived segment's LSN at or before `now - wal_retention_ms`, recomputed roughly every 1/24th of that window (clamped to 1–60 minutes). It requires `wal_archive` to be set too and is a no-op otherwise. Neither key prunes anything by itself: pruning still only happens during a `MAINTAIN DATABASE` you run or schedule yourself. See `docs/wal.md` "Retention".
+
+`wal_page_deltas` (default `auto`) controls what a commit logs for each page it changed. It can log only the bytes that differ from the page's previous logged state (a page delta), or the full 16 KiB page. Under `auto` a new database logs deltas. An existing database keeps the WAL version it already has, so a database created by an older release still opens with that release. `on` also moves an existing database's WAL forward on open, and older releases can then no longer open it. `off` logs full pages only. Durability and fsync behavior are identical in every mode. In a cluster, set `on` only after every node runs this release. See `docs/wal.md` "Page deltas".
 
 ## Disk watermarks
 

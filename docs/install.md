@@ -369,6 +369,28 @@ header) and is the basis for the "configuration viewer" / "config backup
 before upgrade" items still to come in the Manager and installer-lifecycle
 tracks.
 
+## Windows (WSL 2)
+
+NextSQL's server and tools do not run natively on Windows, and no Windows
+installer is built: the binaries refuse a `GOOS=windows` build with a message
+naming WSL 2. On a Windows machine, install a WSL 2 distribution and use the
+Linux packages inside it. WSL 1 is not supported. The official drivers remain
+usable from native Windows applications, which connect to the server in WSL 2
+like any other client.
+
+- **Data and keys stay on the Linux filesystem.** `/mnt/c` and other mounted
+  Windows drives are 9p mounts whose fsync and file locking are not a
+  durability boundary. `nextsql setup` adds a plan warning when the data
+  volume's filesystem is `9p` or `drvfs`, the same advisory class as `tmpfs`
+  and `overlay`.
+- **systemd** must be enabled in the distribution (`[boot] systemd=true` in
+  `/etc/wsl.conf`, then `wsl --shutdown`) for the packaged unit and Setup's
+  start-at-boot step; otherwise run `nextsqld` in the foreground.
+- **Browser hand-off.** WSL 2 forwards loopback, so NextSQL Admin and OIDC
+  login pages served on `127.0.0.1` open in the Windows browser.
+  `internal/browseropen` detects WSL (`WSL_DISTRO_NAME` / `WSL_INTEROP`) and
+  launches `wslview` when installed, otherwise `explorer.exe`.
+
 ## Still to come in Phase 28
 
 The `nextsql lifecycle` backbone (`detect` / `preflight` / `backup-config` /
@@ -392,9 +414,9 @@ including increased contrast and reduced motion. **M2 is complete**: `nextsql se
 recovery key for both keystores during a first install, and the Setup wizard
 offers it by default and gates Finish on the operator confirming they saved
 both files (see `docs/security.md` "Recovery keys"). Remaining work is
-non-Linux packaging and
+macOS packaging and
 full silent/upgrade/repair installer-path coverage, plus platform execution
-tests for `.rpm` and the Windows
-artifacts (blocked on `rpmbuild`/Wine not being available in every build
-environment). All are tracked in `TODO.md` under Phase 28. This note grows
+tests for `.rpm` (blocked on `rpmbuild` not being available in every build
+environment). Native Windows is out of scope: on Windows, NextSQL runs inside
+WSL 2 (see "Windows (WSL 2)" above). All are tracked in `TODO.md` under Phase 28. This note grows
 as they land.

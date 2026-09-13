@@ -7,7 +7,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -148,7 +147,7 @@ func (s *Store) Load(idp, host string) (*Credential, error) {
 	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
 		return nil, nerr.New(nerr.InvalidFormat, "oidcclient.Store.Load", "credential path is not a regular file")
 	}
-	if runtime.GOOS != "windows" && info.Mode().Perm()&0o077 != 0 {
+	if info.Mode().Perm()&0o077 != 0 {
 		return nil, nerr.New(nerr.Forbidden, "oidcclient.Store.Load", "credential file permissions are too broad; require mode 0600")
 	}
 	f, err := os.Open(path)
@@ -195,7 +194,7 @@ func (s *Store) Save(c *Credential) error {
 	if !dirInfo.IsDir() || dirInfo.Mode()&os.ModeSymlink != 0 {
 		return nerr.New(nerr.Forbidden, op, "credentials path must be a real directory")
 	}
-	if runtime.GOOS != "windows" && dirInfo.Mode().Perm()&0o077 != 0 {
+	if dirInfo.Mode().Perm()&0o077 != 0 {
 		if err := os.Chmod(s.Dir, 0o700); err != nil {
 			return nerr.Wrap(nerr.Forbidden, op, "restrict credentials directory to mode 0700", err)
 		}
@@ -271,7 +270,7 @@ func (s *Store) List() ([]Credential, error) {
 		if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Size() > maxStoredCredentialBytes {
 			continue
 		}
-		if runtime.GOOS != "windows" && info.Mode().Perm()&0o077 != 0 {
+		if info.Mode().Perm()&0o077 != 0 {
 			continue
 		}
 		f, err := os.Open(path)

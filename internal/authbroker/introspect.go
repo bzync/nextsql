@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -38,7 +37,7 @@ func ReadClientSecretFile(path string) (string, error) {
 	if !before.Mode().IsRegular() || before.Mode()&os.ModeSymlink != 0 {
 		return "", nerr.New(nerr.Forbidden, op, "client secret path must be a regular file")
 	}
-	if runtime.GOOS != "windows" && before.Mode().Perm()&0o077 != 0 {
+	if before.Mode().Perm()&0o077 != 0 {
 		return "", nerr.New(nerr.Forbidden, op, "client secret file permissions are too broad; require mode 0600")
 	}
 	f, err := os.Open(path)
@@ -50,7 +49,7 @@ func ReadClientSecretFile(path string) (string, error) {
 	if err != nil || !after.Mode().IsRegular() || !os.SameFile(before, after) {
 		return "", nerr.New(nerr.Forbidden, op, "client secret file changed while opening")
 	}
-	if runtime.GOOS != "windows" && after.Mode().Perm()&0o077 != 0 {
+	if after.Mode().Perm()&0o077 != 0 {
 		return "", nerr.New(nerr.Forbidden, op, "client secret file permissions changed while opening")
 	}
 	raw, err := io.ReadAll(io.LimitReader(f, maxClientSecretBytes+1))

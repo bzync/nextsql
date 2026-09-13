@@ -3,7 +3,6 @@ export const PLATFORMS = [
   "linux-arm64",
   "darwin-amd64",
   "darwin-arm64",
-  "windows-amd64",
 ] as const;
 
 export const ARTIFACT_KINDS = [
@@ -13,7 +12,6 @@ export const ARTIFACT_KINDS = [
   "deb",
   "rpm",
   "run",
-  "setup",
   "archive",
 ] as const;
 
@@ -141,7 +139,6 @@ export function platformLabel(platform: Platform): string {
     "linux-arm64": "Linux ARM64",
     "darwin-amd64": "macOS Intel",
     "darwin-arm64": "macOS Apple Silicon",
-    "windows-amd64": "Windows x64",
   };
   return labels[platform];
 }
@@ -154,8 +151,7 @@ export function kindLabel(kind: ArtifactKind): string {
     deb: "Debian package (.deb)",
     rpm: "RPM package (.rpm)",
     run: "Linux installer (.run)",
-    setup: "Windows setup (.exe)",
-    archive: "Archive (.tar.gz / .zip)",
+    archive: "Archive (.tar.gz)",
   };
   return labels[kind];
 }

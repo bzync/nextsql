@@ -1041,6 +1041,8 @@ func setLimitForTest(c *Config, key string, v int) bool {
 		c.StatementTimeoutMS = v
 	case "task_workers":
 		c.TaskWorkers = v
+	case "max_concurrent_password_hashes":
+		c.MaxConcurrentPasswordHashes = v
 	case "transaction_timeout_ms":
 		c.TransactionTimeoutMS = v
 	case "wal_retention_ms":
@@ -1080,5 +1082,29 @@ func TestMarshalTokenIdentitySourceHintsHighKeyIDs(t *testing.T) {
 	}
 	if n := len(got.TokenIdentitySourceHints); n != len(cfg.TokenIdentitySourceHints) {
 		t.Errorf("round-tripped %d hints, want %d", n, len(cfg.TokenIdentitySourceHints))
+	}
+}
+
+func TestWALPageDeltasKey(t *testing.T) {
+	for _, v := range []string{"auto", "ON", " off "} {
+		path := filepath.Join(t.TempDir(), "wal.conf")
+		if err := os.WriteFile(path, []byte("wal_page_deltas="+v+"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		cfg, err := Load(path)
+		if err != nil {
+			t.Fatalf("%q: %v", v, err)
+		}
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("%q: %v", v, err)
+		}
+		if !strings.Contains(string(cfg.Marshal()), "wal_page_deltas="+strings.ToLower(strings.TrimSpace(v))) {
+			t.Fatalf("%q does not round-trip: %s", v, cfg.Marshal())
+		}
+	}
+	cfg := Default()
+	cfg.WALPageDeltas = "maybe"
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("wal_page_deltas=maybe accepted")
 	}
 }

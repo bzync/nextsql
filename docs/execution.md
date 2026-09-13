@@ -41,6 +41,7 @@ Spill files (`NSPL`) are AES-256-GCM encrypted with a per-query DEK that exists 
 | Operator | Notes |
 |---|---|
 | Sequential / index scan | Batch decode; parallel heap scan splits on interior separators; page decrypt is concurrent. `IndexScan … covering` reconstructs the row from the index key, primary key, `INCLUDE` payload, and partial-index equality constants and skips the heap |
+| Filter over a sequential scan | The predicate is evaluated inside the scan, including in the parallel range workers, so only matching rows are ever retained (log #288). This applies when the table has no `VECTOR` column and the predicate is concurrency-safe: no subqueries, and none of `UUID()`, `NOW()`, `AI()`, `HIGHLIGHT()`, `SNIPPET()`. Otherwise the whole scan is collected and then filtered. |
 | Filter / project | Selection + expression eval over batches |
 | Hash join | Build on the right, probe the left; equality keys from `ON` |
 | Hash semi/anti-join | Build on the right, probe the left, emit left rows only; first match wins. NULL keys do not match. Spills the build side when the memory budget is exceeded |

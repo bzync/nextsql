@@ -21,6 +21,7 @@ controlled rejection, never OOM.
 | idle_timeout_ms | time | ms | subsystem default | [1, 86400000] | - | an idle connection holds a session, its buffers and a file descriptor |
 | idle_transaction_timeout_ms | time | ms | 0 | 0 or [1, 86400000] | no idle-transaction timeout | an idle open transaction pins a snapshot and its UNDO, holding back vacuum |
 | lock_timeout_ms | time | ms | 0 | 0 or [1, 86400000] | wait indefinitely for a lock | bounds how long one statement blocks holding its own locks |
+| max_concurrent_password_hashes | concurrency | count | 0 | 0 or [1, 1024] | one per four schedulable CPUs, at least two | each password hash allocates its full Argon2id memory cost (64 MiB) before the client is authenticated, so peak login memory is this many times that; unbounded, a burst of wrong-password clients is an out-of-memory path |
 | max_connections | concurrency | count | subsystem default | [1, 1048576] | - | every accepted connection carries a session, buffers and a file descriptor |
 | max_connections_per_database | concurrency | count | 0 | 0 or [1, 1048576] | unlimited within max_connections | keeps one database from consuming the whole connection budget |
 | max_connections_per_realm | concurrency | count | 0 | 0 or [1, 1048576] | unlimited within max_connections | keeps one tenant realm from consuming the whole connection budget |
@@ -69,3 +70,8 @@ live with the code that defines the encoding.
 | FK cascade depth / rows | 8 / 100,000 | `internal/security` | Bounds recursive mutation, WAL growth and transaction work. |
 | Workflow statements / params | 256 / 64 | `internal/catalog` | Bounds stored descriptor and execution work. |
 | FTS fuzzy vocabulary | 4096 | `internal/fulltext` | Bounds vocabulary expansion and CPU work. |
+| Statement nesting | 4096 | `internal/sql/ast` | Every stage after the parser walks the tree recursively; an unbounded tree is an unbounded goroutine stack. Refused as invalid_argument. |
+| IN value list | 4096 | `internal/sql/parser` | One comparison per value, evaluated per row; bounds per-predicate work. |
+| CHECK constraints per table | 16 | `internal/catalog` | Every check runs on every row written; bounds per-write work, like foreign keys. |
+| Savepoints per transaction | 64 | `internal/executor` | Client-controlled stack inside one transaction; bounded like every other per-session structure. |
+| View nesting depth | 8 | `internal/catalog` | A view over a view is expanded at bind time; bounds expansion work and catches cycles. |

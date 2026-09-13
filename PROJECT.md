@@ -2234,6 +2234,10 @@ UX principles:
 
 Installer must not imply unsupported OS/platform combinations are production-ready.
 
+Native Windows is not a product platform. On a Windows machine, NextSQL's server,
+CLI and Admin run inside WSL 2 from the Linux packages; the official client drivers
+remain usable from native Windows applications.
+
 ---
 
 # 47. NextSQL Admin — Operations Mode

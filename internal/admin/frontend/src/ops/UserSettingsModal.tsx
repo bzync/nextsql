@@ -48,8 +48,8 @@ export function UserSettingsModal({
   const copyDiagnosticInfo = async () => {
     const diagnostic = {
       user: who.user,
-      realm: who.realm || "default",
       database: who.database || "default",
+      server: who.profile ? { profile: who.profile.id, name: who.profile.name, environment: who.profile.environment ?? null } : null,
       timestamp: new Date().toISOString(),
       userAgent: typeof navigator !== "undefined" ? navigator.userAgent : "unknown",
       density: preferences.density,
@@ -71,9 +71,6 @@ export function UserSettingsModal({
       onClose={onClose}
       size="lg"
       scrollable
-      title="User & Workspace Settings"
-      description="Session identity, operator console preferences, and security parameters."
-      icon={<Icon name="settings" size={20} />}
       ariaLabel="User & Workspace Settings modal"
     >
       <ModalHeader>
@@ -82,7 +79,7 @@ export function UserSettingsModal({
           <Stack gap="xs">
             <ModalTitle as="h2">User & Workspace Settings</ModalTitle>
             <ModalDescription>
-              Connected as <strong className="font-semibold text-foreground">{who.user}</strong> · Database: <code className="text-xs font-mono">{who.database || "default"}</code> · Realm: <code className="text-xs font-mono">{who.realm || "default"}</code>
+              Connected as <strong className="font-semibold text-foreground">{who.user}</strong> · Server: <strong className="font-semibold text-foreground">{who.profile?.name ?? "nextsqld"}</strong> · Database: <code className="text-xs font-mono">{who.database || "default"}</code>
             </ModalDescription>
           </Stack>
         </Inline>
@@ -90,7 +87,14 @@ export function UserSettingsModal({
 
       <ModalBody scrollable>
         <Tabs defaultValue="profile" value={tab} onValueChange={setTab}>
-          <TabsList className="mb-4 overflow-x-auto">
+          <TabsList
+            className="mb-4 overflow-x-auto max-w-full"
+            onWheel={(e) => {
+              if (e.deltaY !== 0 && e.currentTarget.scrollWidth > e.currentTarget.clientWidth) {
+                e.currentTarget.scrollLeft += e.deltaY;
+              }
+            }}
+          >
             <TabsTrigger value="profile" icon={<Icon name="user" size={14} />}>
               Identity & Session
             </TabsTrigger>
@@ -108,24 +112,38 @@ export function UserSettingsModal({
                 <CardBody>
                   <Stack gap="sm">
                     <Text size="sm" weight="semibold">Authenticated Principal</Text>
-                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-sm">
-                      <div className="flex flex-col gap-1 p-2.5 rounded bg-surface-muted border border-border">
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 text-sm">
+                      <div className="flex flex-col gap-1.5 p-4 rounded-lg bg-surface-muted border border-border">
                         <span className="text-xs text-muted-foreground uppercase font-semibold tracking-wider">Username</span>
                         <span className="font-mono font-medium text-foreground">{who.user}</span>
                       </div>
-                      <div className="flex flex-col gap-1 p-2.5 rounded bg-surface-muted border border-border">
-                        <span className="text-xs text-muted-foreground uppercase font-semibold tracking-wider">Authorization Role</span>
-                        <span className="inline-flex items-center gap-1.5 font-medium">
-                          <Badge variant="info" size="sm">SUPERUSER / ADMIN</Badge>
+                      {/* The server this session is signed in to. (This card used to
+                          show a hardcoded "SUPERUSER / ADMIN" role for every
+                          user; Admin does not know the principal's privileges
+                          without asking nextsqld, and RBAC decides them there.) */}
+                      <div className="flex flex-col gap-1.5 p-4 rounded-lg bg-surface-muted border border-border">
+                        <span className="text-xs text-muted-foreground uppercase font-semibold tracking-wider">Server</span>
+                        <span className="inline-flex flex-wrap items-center gap-1.5 font-medium">
+                          <span>{who.profile?.name ?? "nextsqld"}</span>
+                          {who.profile?.environment ? (
+                            <Badge variant={who.profile.environment === "production" ? "warning" : "muted"} size="sm">
+                              {who.profile.environment}
+                            </Badge>
+                          ) : null}
                         </span>
+                        {who.profile?.address ? (
+                          <span className="font-mono text-xs text-muted-foreground">
+                            {who.profile.address} · {who.profile.tls ? (who.profile.mtls ? "TLS 1.3 + client certificate" : "TLS 1.3") : "plaintext (loopback)"}
+                          </span>
+                        ) : null}
                       </div>
-                      <div className="flex flex-col gap-1 p-2.5 rounded bg-surface-muted border border-border">
-                        <span className="text-xs text-muted-foreground uppercase font-semibold tracking-wider">Active Realm</span>
-                        <span className="font-mono text-foreground">{who.realm || "default"}</span>
-                      </div>
-                      <div className="flex flex-col gap-1 p-2.5 rounded bg-surface-muted border border-border">
+                      <div className="flex flex-col gap-1.5 p-4 rounded-lg bg-surface-muted border border-border">
                         <span className="text-xs text-muted-foreground uppercase font-semibold tracking-wider">Active Database</span>
                         <span className="font-mono text-foreground">{who.database || "default"}</span>
+                      </div>
+                      <div className="flex flex-col gap-1.5 p-4 rounded-lg bg-surface-muted border border-border">
+                        <span className="text-xs text-muted-foreground uppercase font-semibold tracking-wider">Deployment</span>
+                        <span className="font-mono text-foreground">Single-database</span>
                       </div>
                     </div>
                   </Stack>
@@ -158,7 +176,7 @@ export function UserSettingsModal({
                             onSwitchConnection();
                           }}
                         >
-                          Switch Realm / DB…
+                          Switch server…
                         </Button>
                       ) : null}
                     </Inline>

@@ -53,14 +53,22 @@ func Catalog() []Spec {
 		{Family: FamilyPage, Magic: "NSQL", Current: 1, MinReadable: 1, MaxReadable: 1, Notes: "superblock + logical pages"},
 		{Family: FamilyEnvelope, Magic: "env", Current: 1, MinReadable: 1, MaxReadable: 1, Notes: "AES-256-GCM page envelope"},
 		{Family: FamilyWAL, Magic: "NSWL", Current: 1, MinReadable: 1, MaxReadable: 1, Notes: "encrypted WAL records"},
-		{Family: FamilyWALCtrl, Magic: "NSWC", Current: 1, MinReadable: 1, MaxReadable: 1, Notes: "WAL control file"},
+		// Current is 2: a database this binary creates logs page deltas. An
+		// existing v1 log stays v1 (and readable by releases that predate
+		// v2) unless wal_page_deltas = on moves it forward. A v2 log may hold
+		// RecPageDelta records, which a v1 reader could not replay, so the
+		// version is the gate; the NSWL record framing itself is unchanged.
+		{Family: FamilyWALCtrl, Magic: "NSWC", Current: 2, MinReadable: 1, MaxReadable: 2, Notes: "WAL control file; v2 marks a log that may contain page-delta redo records"},
 		{Family: FamilyUNDO, Magic: "NSUD", Current: 1, MinReadable: 1, MaxReadable: 1, Notes: "encrypted UNDO records"},
 		{Family: FamilyUNDOCtrl, Magic: "NSUC", Current: 1, MinReadable: 1, MaxReadable: 1, Notes: "UNDO control file"},
-		{Family: FamilyCatalog, Magic: "NSCT", Current: 13, MinReadable: 1, MaxReadable: 13, Notes: "table descriptors; v1 empty FKs, v2 foreign keys, v3 CDC image policy, v4 partition metadata, v5 stable partition identity allocator, v6 per-index HNSW traversal quantisation, v7 per-index vector ANN method + IVF list/probe counts, v8 per-index IVF-PQ subspace count, v9 per-index full-text analyzer id+revision, v10 per-column ENCRYPTED CLIENT logical type, v11 per-column ENUM label list, v12 per-column recursive STRUCT/ARRAY/MAP descriptor, v13 per-column client-encryption mode"},
+		{Family: FamilyCatalog, Magic: "NSCT", Current: 13, MinReadable: 1, MaxReadable: 14, Notes: "table descriptors; v1 empty FKs, v2 foreign keys, v3 CDC image policy, v4 partition metadata, v5 stable partition identity allocator, v6 per-index HNSW traversal quantisation, v7 per-index vector ANN method + IVF list/probe counts, v8 per-index IVF-PQ subspace count, v9 per-index full-text analyzer id+revision, v10 per-column ENCRYPTED CLIENT logical type, v11 per-column ENUM label list, v12 per-column recursive STRUCT/ARRAY/MAP descriptor, v13 per-column client-encryption mode, v14 CHECK constraints (written only by a table that declares one, so a database without them stays readable by a release that predates v14)"},
 		{Family: FamilyBackup, Magic: "NSBK", Current: 1, MinReadable: 1, MaxReadable: 1, Notes: "physical backup header"},
 		{Family: FamilyExport, Magic: "NSXP", Current: 1, MinReadable: 1, MaxReadable: 1, Notes: "logical export header"},
 		{Family: FamilyProtocol, Magic: "NSQL", Current: 1, MinReadable: 1, MaxReadable: 1, Notes: "native wire protocol"},
-		{Family: FamilyRepl, Magic: "NSRL", Current: 1, MinReadable: 1, MaxReadable: 1, Notes: "encrypted Raft command batch"},
+		// A batch is v2 exactly when it carries a page delta, which a follower
+		// on a release that predates deltas must refuse rather than skip.
+		// Every other batch, and the FSM snapshot, stays v1.
+		{Family: FamilyRepl, Magic: "NSRL", Current: 2, MinReadable: 1, MaxReadable: 2, Notes: "encrypted Raft command batch; v2 only for a batch carrying a page delta"},
 		{Family: FamilyIsolated, Magic: "NSQI", Current: 1, MinReadable: 1, MaxReadable: 1, Notes: "isolated-page quarantine sidecar"},
 		// Current is 1, not MaxReadable: a keystore is written as v2 only
 		// once an operator configures a recovery key, so the version this

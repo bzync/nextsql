@@ -10,6 +10,7 @@ import (
 	"github.com/bzync/nextsql/internal/nerr"
 	"github.com/bzync/nextsql/internal/sql/planner"
 	"github.com/bzync/nextsql/internal/sql/types"
+	"github.com/bzync/nextsql/internal/storage/btree"
 )
 
 const (
@@ -129,8 +130,96 @@ func (s *Session) execAnalyze(p planner.Analyze) (*Result, error) {
 	return &Result{Affected: n}, nil
 }
 
-func (s *Session) persistStats(st *catalog.TableStats) error {
+// fitStats reduces st, if necessary, until its encoded record fits the catalog
+// tree's value limit, and returns the encoding.
+//
+// A table's statistics are one catalog record, and a record cannot exceed half
+// a page. Full detail costs about 2 KiB per column (a 32-bucket histogram
+// holds two values per bucket, plus up to ten most-common values), so an
+// explicit ANALYZE of any table with more than three or four columns used to
+// fail outright with "record exceeds page capacity" -- leaving the planner with
+// no statistics for exactly the tables that most need them. The automatic
+// refresh never hit it only because it already strips the detail.
+//
+// Detail is removed in a fixed order, so the same table and data always yield
+// the same record: segment summaries first; then every histogram is halved by
+// merging adjacent buckets (counts are summed, so bucket totals stay exact) and
+// every most-common-values list is halved, down to four buckets and two values;
+// then histograms and most-common values go entirely, which is the automatic
+// refresh's shape; and last, per-column minimum and maximum. Row, NULL and
+// distinct counts are always kept.
+func fitStats(st *catalog.TableStats) ([]byte, error) {
+	limit := btree.MaxTxnValueSize(len(catalog.StatsKey(st.Table)))
 	raw, err := catalog.EncodeStats(st)
+	if err != nil || len(raw) <= limit {
+		return raw, err
+	}
+	fits := func() (bool, error) {
+		raw, err = catalog.EncodeStats(st)
+		return err == nil && len(raw) <= limit, err
+	}
+	st.Segments = nil
+	if ok, err := fits(); ok || err != nil {
+		return raw, err
+	}
+	for {
+		reduced := false
+		for i := range st.Columns {
+			c := &st.Columns[i]
+			if len(c.Histogram) > 4 {
+				c.Histogram = mergeHistogramPairs(c.Histogram)
+				reduced = true
+			}
+			if len(c.MCV) > 2 {
+				c.MCV = c.MCV[:len(c.MCV)/2]
+				reduced = true
+			}
+		}
+		if !reduced {
+			break
+		}
+		if ok, err := fits(); ok || err != nil {
+			return raw, err
+		}
+	}
+	for i := range st.Columns {
+		st.Columns[i].Histogram = nil
+		st.Columns[i].MCV = nil
+	}
+	if ok, err := fits(); ok || err != nil {
+		return raw, err
+	}
+	for i := range st.Columns {
+		st.Columns[i].Min, st.Columns[i].Max = types.Value{}, types.Value{}
+		st.Columns[i].HasMinMax = false
+	}
+	if ok, err := fits(); ok || err != nil {
+		return raw, err
+	}
+	return nil, nerr.New(nerr.Exhausted, "executor.Analyze", "table statistics exceed the catalog record limit even without per-column detail")
+}
+
+// mergeHistogramPairs halves a histogram by merging each adjacent pair of
+// buckets. An odd trailing bucket is kept as it is.
+func mergeHistogramPairs(h []catalog.HistBucket) []catalog.HistBucket {
+	out := make([]catalog.HistBucket, 0, (len(h)+1)/2)
+	for i := 0; i < len(h); i += 2 {
+		if i+1 == len(h) {
+			out = append(out, h[i])
+			break
+		}
+		out = append(out, catalog.HistBucket{
+			Lower: h[i].Lower,
+			Upper: h[i+1].Upper,
+			Count: h[i].Count + h[i+1].Count,
+			NDV:   h[i].NDV + h[i+1].NDV,
+		})
+	}
+	return out
+}
+
+func (s *Session) persistStats(st *catalog.TableStats) error {
+	raw, err := fitStats(st)
 	if err != nil {
 		return err
 	}

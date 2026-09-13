@@ -589,4 +589,3 @@ func TestPartitionLocalSparseVectorIndex(t *testing.T) {
 		t.Fatalf("reopened partition SPARSE search: %+v", got.Rows)
 	}
 }
-

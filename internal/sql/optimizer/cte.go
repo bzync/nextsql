@@ -98,6 +98,15 @@ func decideCTEs(p planner.Logical, stats StatsFunc) planner.Logical {
 		return n
 	case planner.Rerank:
 		return mapRerankInputs(n, func(p planner.Logical) planner.Logical { return decideCTEs(p, stats) })
+	case planner.Insert:
+		if n.Input == nil {
+			return n
+		}
+		n.Input = decideCTEs(n.Input, stats)
+		return n
+	case planner.CreateTableAs:
+		n.Input = decideCTEs(n.Input, stats)
+		return n
 	case planner.Update:
 		n.Input = decideCTEs(n.Input, stats)
 		return n
@@ -216,6 +225,13 @@ func countCTEScans(p planner.Logical, id uint64) int {
 			total += countCTEScans(e, id)
 		}
 		return total
+	case planner.Insert:
+		if n.Input == nil {
+			return 0
+		}
+		return countCTEScans(n.Input, id)
+	case planner.CreateTableAs:
+		return countCTEScans(n.Input, id)
 	case planner.Update:
 		return countCTEScans(n.Input, id)
 	case planner.Delete:
@@ -286,6 +302,15 @@ func replaceCTEScan(p planner.Logical, id uint64, repl planner.Logical) planner.
 		return n
 	case planner.Rerank:
 		return mapRerankInputs(n, func(p planner.Logical) planner.Logical { return replaceCTEScan(p, id, repl) })
+	case planner.Insert:
+		if n.Input == nil {
+			return n
+		}
+		n.Input = replaceCTEScan(n.Input, id, repl)
+		return n
+	case planner.CreateTableAs:
+		n.Input = replaceCTEScan(n.Input, id, repl)
+		return n
 	case planner.Update:
 		n.Input = replaceCTEScan(n.Input, id, repl)
 		return n

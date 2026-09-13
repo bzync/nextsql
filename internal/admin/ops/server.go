@@ -1,14 +1,18 @@
 package ops
 
 import (
+	"context"
+	"fmt"
 	"log/slog"
-	"net"
 	"net/http"
 	"os"
 	"strings"
 	"time"
 
+	nextsql "github.com/bzync/nextsql/drivers/go"
+	"github.com/bzync/nextsql/internal/admin/profile"
 	"github.com/bzync/nextsql/internal/logging"
+	"github.com/bzync/nextsql/internal/nerr"
 )
 
 // Server is Operations mode's request handling. Construct it with New; the
@@ -20,6 +24,14 @@ type Server struct {
 	sessions *sessionStore
 	mux      *http.ServeMux
 	tls      bool
+
+	// profiles is the default profile followed by the file-declared ones;
+	// profileByID indexes it. Both are fixed for the process's life.
+	profiles    []profile.Profile
+	profileByID map[string]profile.Profile
+	// open dials nextsqld; tests substitute it to exercise sign-in and
+	// switching without a live server.
+	open func(context.Context, nextsql.Config) (*nextsql.Conn, error)
 
 	handler http.Handler
 }
@@ -41,12 +53,28 @@ func New(cfg Config, opt Options) (*Server, error) {
 		log = logging.New(cfg.LogLevel, os.Stderr)
 	}
 
+	profiles := cfg.allProfiles()
+	byID := make(map[string]profile.Profile, len(profiles))
+	for _, p := range profiles {
+		// Build each profile's TLS configuration once so an unreadable CA or
+		// client key pair fails at startup, not at an operator's first
+		// sign-in. It is rebuilt per connection (driverConfigFor).
+		if _, err := driverConfigFor(p); err != nil {
+			return nil, nerr.Wrap(nerr.InvalidArgument, "ops.New",
+				fmt.Sprintf("connection profile %q: TLS material", p.ID), err)
+		}
+		byID[p.ID] = p
+	}
+
 	s := &Server{
-		cfg:      cfg,
-		log:      log,
-		tls:      cfg.TLS,
-		sessions: newSessionStore(cfg.MaxSessions, cfg.IdleTimeout, cfg.SessionLifetime),
-		mux:      http.NewServeMux(),
+		cfg:         cfg,
+		log:         log,
+		tls:         cfg.TLS,
+		sessions:    newSessionStore(cfg.MaxSessions, cfg.IdleTimeout, cfg.SessionLifetime),
+		mux:         http.NewServeMux(),
+		profiles:    profiles,
+		profileByID: byID,
+		open:        nextsql.OpenContext,
 	}
 	s.routes()
 	s.handler = s.withBaseMiddleware(s.mux)
@@ -66,7 +94,11 @@ func (s *Server) Close() error {
 }
 
 func (s *Server) routes() {
+	s.mux.HandleFunc("GET /api/v1/profiles", s.handleProfiles)
 	s.mux.HandleFunc("POST /api/v1/session", s.handleLogin)
+	s.mux.HandleFunc("GET /api/v1/session/profiles", s.authed(s.handleSessionProfiles))
+	s.mux.HandleFunc("POST /api/v1/session/switch", s.authed(s.handleSwitch))
+	s.mux.HandleFunc("POST /api/v1/session/credential/forget", s.authed(s.handleForgetCredential))
 	s.mux.HandleFunc("GET /api/v1/session", s.authed(s.handleWhoami))
 	s.mux.HandleFunc("GET /api/v1/connection", s.authed(s.handleConnection))
 	s.mux.HandleFunc("DELETE /api/v1/session", s.authed(s.handleLogout))
@@ -96,7 +128,6 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /api/v1/studio/query", s.authed(s.handleStudioQuery))
 	s.mux.HandleFunc("POST /api/v1/studio/query/stream", s.authed(s.handleStudioQueryStream))
 	s.mux.HandleFunc("POST /api/v1/studio/query/cancel", s.authed(s.handleStudioCancel))
-	s.mux.HandleFunc("POST /api/v1/studio/reconnect", s.authed(s.handleStudioReconnect))
 	s.mux.HandleFunc("POST /api/v1/studio/read-consistency", s.authed(s.handleStudioReadConsistency))
 }
 
@@ -190,11 +221,4 @@ func (w *statusWriter) Flush() {
 	if flusher, ok := w.ResponseWriter.(http.Flusher); ok {
 		flusher.Flush()
 	}
-}
-
-func hostOf(addr string) string {
-	if h, _, err := net.SplitHostPort(addr); err == nil && h != "" {
-		return h
-	}
-	return "localhost"
 }

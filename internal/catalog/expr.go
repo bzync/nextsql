@@ -139,6 +139,16 @@ func appendExpr(buf []byte, e ast.Expr) ([]byte, error) {
 }
 
 func takeExpr(raw []byte, off int) (ast.Expr, int, error) {
+	return takeExprD(raw, off, 0)
+}
+
+// takeExprD decodes one expression at nesting depth. Stored expressions were
+// produced by the parser, so a tree deeper than ast.MaxStoredNestingDepth can
+// only be corrupt; refusing it keeps this decoder's recursion bounded.
+func takeExprD(raw []byte, off, depth int) (ast.Expr, int, error) {
+	if depth >= ast.MaxStoredNestingDepth {
+		return nil, 0, nerr.New(nerr.InvalidFormat, "catalog.takeExpr", "expression nesting too deep")
+	}
 	if off >= len(raw) {
 		return nil, 0, nerr.New(nerr.InvalidFormat, "catalog.takeExpr", "truncated expression")
 	}
@@ -193,7 +203,7 @@ func takeExpr(raw []byte, off int) (ast.Expr, int, error) {
 		if err != nil {
 			return nil, 0, err
 		}
-		right, off, err := takeExpr(raw, off)
+		right, off, err := takeExprD(raw, off, depth+1)
 		if err != nil {
 			return nil, 0, err
 		}
@@ -203,11 +213,11 @@ func takeExpr(raw []byte, off int) (ast.Expr, int, error) {
 		if err != nil {
 			return nil, 0, err
 		}
-		left, off, err := takeExpr(raw, off)
+		left, off, err := takeExprD(raw, off, depth+1)
 		if err != nil {
 			return nil, 0, err
 		}
-		right, off, err := takeExpr(raw, off)
+		right, off, err := takeExprD(raw, off, depth+1)
 		if err != nil {
 			return nil, 0, err
 		}
@@ -218,15 +228,15 @@ func takeExpr(raw []byte, off int) (ast.Expr, int, error) {
 		}
 		not := raw[off] != 0
 		off++
-		ex, off, err := takeExpr(raw, off)
+		ex, off, err := takeExprD(raw, off, depth+1)
 		if err != nil {
 			return nil, 0, err
 		}
-		low, off, err := takeExpr(raw, off)
+		low, off, err := takeExprD(raw, off, depth+1)
 		if err != nil {
 			return nil, 0, err
 		}
-		high, off, err := takeExpr(raw, off)
+		high, off, err := takeExprD(raw, off, depth+1)
 		if err != nil {
 			return nil, 0, err
 		}
@@ -237,7 +247,7 @@ func takeExpr(raw []byte, off int) (ast.Expr, int, error) {
 		}
 		not := raw[off] != 0
 		off++
-		ex, off, err := takeExpr(raw, off)
+		ex, off, err := takeExprD(raw, off, depth+1)
 		if err != nil {
 			return nil, 0, err
 		}
@@ -259,7 +269,7 @@ func takeExpr(raw []byte, off int) (ast.Expr, int, error) {
 		args := make([]ast.Expr, 0, n)
 		for i := 0; i < int(n); i++ {
 			var a ast.Expr
-			a, off, err = takeExpr(raw, off)
+			a, off, err = takeExprD(raw, off, depth+1)
 			if err != nil {
 				return nil, 0, err
 			}
@@ -274,7 +284,7 @@ func takeExpr(raw []byte, off int) (ast.Expr, int, error) {
 		var err error
 		if raw[off] != 0 {
 			off++
-			operand, off, err = takeExpr(raw, off)
+			operand, off, err = takeExprD(raw, off, depth+1)
 			if err != nil {
 				return nil, 0, err
 			}
@@ -288,11 +298,11 @@ func takeExpr(raw []byte, off int) (ast.Expr, int, error) {
 		whens := make([]ast.CaseWhen, 0, n)
 		for i := 0; i < int(n); i++ {
 			var when, then ast.Expr
-			when, off, err = takeExpr(raw, off)
+			when, off, err = takeExprD(raw, off, depth+1)
 			if err != nil {
 				return nil, 0, err
 			}
-			then, off, err = takeExpr(raw, off)
+			then, off, err = takeExprD(raw, off, depth+1)
 			if err != nil {
 				return nil, 0, err
 			}
@@ -304,7 +314,7 @@ func takeExpr(raw []byte, off int) (ast.Expr, int, error) {
 		var els ast.Expr
 		if raw[off] != 0 {
 			off++
-			els, off, err = takeExpr(raw, off)
+			els, off, err = takeExprD(raw, off, depth+1)
 			if err != nil {
 				return nil, 0, err
 			}

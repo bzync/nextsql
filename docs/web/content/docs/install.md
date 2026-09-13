@@ -41,18 +41,21 @@ sudo ./nextsql-0.0.1-linux-amd64/install.sh
 
 There is no Linux ARM64 package in this snapshot. Use [Docker](/docs/docker) (`linux/amd64` and `linux/arm64`) or [build from source](#build-from-source-optional).
 
-## Windows x64
+## Windows (WSL 2)
 
-Download from [Downloads](/download) or the [GitHub release](https://github.com/bzync/nextsql/releases/tag/v0.0.1):
+NextSQL does not run natively on Windows, and there is no Windows installer. On a Windows machine, run it inside WSL 2 with the Linux x64 packages above:
 
-| Artifact | What |
-|---|---|
-| `nextsql-0.0.1-windows-amd64-setup.exe` | GUI installer (UAC). Silent: `setup.exe /S` |
-| `nextsql-0.0.1-windows-amd64.zip` | Binaries + `install.ps1` / `uninstall.ps1` |
+```powershell
+wsl --install -d Ubuntu
+```
 
-Default install: `%ProgramFiles%\NextSQL`. Data: `%ProgramData%\NextSQL\data`. Key: `%ProgramData%\NextSQL\keys\root.key`. The `NextSQL` service is demand-start and is not started by the installer.
+Then, inside the distribution, install the `.deb`, `.run` or tarball exactly as on Linux. WSL 1 is not supported. The project has not yet execution-tested this path on a Windows host.
 
-Windows `setup.exe` is produced by the installer scripts; execution is **unverified** (no Windows host in this project). macOS packages are not a supported path.
+- Keep `--data-dir` and the key files on the distribution's Linux filesystem (for example `/var/lib/nextsql`), never under `/mnt/c` or another mounted Windows drive. Those are 9p mounts whose fsync and file locking are not a durability boundary; `nextsql setup` warns when it detects one.
+- The systemd unit needs systemd enabled in the distribution: add `[boot]` / `systemd=true` to `/etc/wsl.conf`, then run `wsl --shutdown`. Without systemd, run `nextsqld` in the foreground.
+- WSL 2 forwards loopback, so a `127.0.0.1` listener and NextSQL Admin are reachable from the Windows browser. Applications on Windows connect with the official drivers like any other client.
+
+macOS packages are not a supported path.
 
 ## After install
 
@@ -74,7 +77,7 @@ sudo systemctl enable --now nextsql
 
 `production` writes `deployment_profile=production` and fills zero-valued disk-watermark, replica-lag, drain, statement/idle/lock timeout, and connection-limit fields. `nextsqld --production` forces the same profile at start even if the file still says `developer`. The preflight refuses an unlock key on the data volume, `--skip-init`, a mutating install without an administrator, and missing watermark / drain / statement / idle timeouts. tmpfs/ramfs is a warning (CI and some containers report it for `/tmp`).
 
-Linux `.tar.gz` / `.run` / `.deb` and silent/offline/upgrade/repair paths are live-verified. `nextsql setup --recovery-key-out FILE` exports verified recovery keys for both the database and deployment-registry keystores (`FILE.instance` by default); it is rejected with `--skip-init`. Store both exports offline and separately from the root keys. Setup mode offers the same export by default and requires confirmation that both files were copied offline before completion. Windows/macOS packaged execution remains unverified.
+Linux `.tar.gz` / `.run` / `.deb` and silent/offline/upgrade/repair paths are live-verified. `nextsql setup --recovery-key-out FILE` exports verified recovery keys for both the database and deployment-registry keystores (`FILE.instance` by default); it is rejected with `--skip-init`. Store both exports offline and separately from the root keys. Setup mode offers the same export by default and requires confirmation that both files were copied offline before completion. macOS packaged execution remains unverified; native Windows is not supported (use WSL 2).
 
 Keep the root unlock key **off** the data volume in production. A production install with `--key-file` inside `--data-dir` fails closed. Details: [`packaging/README.md`](https://github.com/bzync/nextsql/blob/main/packaging/README.md).
 
@@ -178,7 +181,7 @@ go build -o nextsql-auth-broker ./cmd/nextsql-auth-broker
 go build -o nextsql-admin       ./cmd/nextsql-admin
 ```
 
-OS packages (`.deb`, `.rpm`, `.tar.gz`, `.run`, Windows `.zip` / `setup.exe`):
+OS packages (`.deb`, `.rpm`, `.tar.gz`, `.run`):
 
 ```bash
 ./scripts/build-installers.sh

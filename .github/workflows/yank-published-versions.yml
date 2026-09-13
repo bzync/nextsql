@@ -1,0 +1,189 @@
+name: Remove published preview versions
+
+# Manual only. Unpublishes or yanks driver versions and Docker Hub tags so a
+# fresh 0.0.1 can be what installers resolve. Does not touch GitHub Releases
+# (those are deleted with `gh release delete`).
+#
+# RubyGems 0.0.1 is left in place: yanked gem versions cannot be re-pushed.
+# npm never published 0.0.1; PyPI never published 0.0.1.
+
+on:
+  workflow_dispatch:
+    inputs:
+      npm_versions:
+        description: "Comma-separated @bzync/nextsql versions to unpublish"
+        required: false
+        default: "0.1.1,0.1.0"
+      gem_versions:
+        description: "Comma-separated bzync-nextsql gem versions to yank"
+        required: false
+        default: "0.1.1,0.1.0"
+      pypi_versions:
+        description: "Comma-separated bzync-nextsql PyPI versions to yank"
+        required: false
+        default: "0.1.1,0.1.0"
+      docker_tags:
+        description: "Comma-separated bzynchub/nextsql tags to delete"
+        required: false
+        default: "0.0.1"
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  npm:
+    name: Unpublish npm versions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+      - name: Unpublish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          VERSIONS: ${{ inputs.npm_versions }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.npm"
+          printf '//registry.npmjs.org/:_authToken=%s\n' "$NODE_AUTH_TOKEN" > "$HOME/.npmrc"
+          IFS=',' read -ra vers <<< "$VERSIONS"
+          for v in "${vers[@]}"; do
+            v="$(echo "$v" | tr -d '[:space:]')"
+            [ -n "$v" ] || continue
+            echo "unpublish @bzync/nextsql@$v"
+            npm unpublish "@bzync/nextsql@$v" --force
+          done
+
+  rubygems:
+    name: Yank RubyGems versions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.4"
+          rubygems: latest
+      - name: Yank
+        env:
+          RUBYGEMS_API_KEY: ${{ secrets.RUBYGEMS_API_KEY }}
+          VERSIONS: ${{ inputs.gem_versions }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.gem"
+          printf -- '---\n:rubygems_api_key: %s\n' "$RUBYGEMS_API_KEY" > "$HOME/.gem/credentials"
+          chmod 0600 "$HOME/.gem/credentials"
+          IFS=',' read -ra vers <<< "$VERSIONS"
+          for v in "${vers[@]}"; do
+            v="$(echo "$v" | tr -d '[:space:]')"
+            [ -n "$v" ] || continue
+            echo "yank bzync-nextsql $v"
+            gem yank bzync-nextsql -v "$v"
+          done
+
+  pypi:
+    name: Yank PyPI versions
+    runs-on: ubuntu-latest
+    # Trusted publishing is bound to pypi-publish-python-driver.yml and the
+    # `pypi` environment (tag python-v*), so this job is best-effort. If it
+    # cannot mint a token, yank 0.1.0 and 0.1.1 at
+    # https://pypi.org/manage/project/bzync-nextsql/
+    continue-on-error: true
+    steps:
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Yank via OIDC
+        env:
+          VERSIONS: ${{ inputs.pypi_versions }}
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          import base64
+          import json
+          import os
+          import sys
+          import urllib.error
+          import urllib.request
+
+          def request(url, data=None, headers=None, method=None):
+              req = urllib.request.Request(url, data=data, headers=headers or {}, method=method)
+              try:
+                  with urllib.request.urlopen(req, timeout=60) as resp:
+                      return resp.status, resp.read()
+              except urllib.error.HTTPError as e:
+                  return e.code, e.read()
+
+          oidc_url = os.environ["ACTIONS_ID_TOKEN_REQUEST_URL"] + "&audience=pypi"
+          status, body = request(
+              oidc_url,
+              headers={"Authorization": "Bearer " + os.environ["ACTIONS_ID_TOKEN_REQUEST_TOKEN"]},
+          )
+          if status != 200:
+              print(f"github oidc token failed: {status} {body[:500]!r}")
+              print("Yank https://pypi.org/manage/project/bzync-nextsql/ releases 0.1.0 and 0.1.1")
+              sys.exit(1)
+          github_token = json.loads(body)["value"]
+
+          status, body = request(
+              "https://pypi.org/_/oidc/github/mint-token",
+              data=json.dumps({"token": github_token}).encode(),
+              headers={"Content-Type": "application/json"},
+              method="POST",
+          )
+          if status != 200:
+              print(f"pypi mint-token failed: {status} {body[:800]!r}")
+              print("Yank https://pypi.org/manage/project/bzync-nextsql/ releases 0.1.0 and 0.1.1")
+              sys.exit(1)
+          pypi_token = json.loads(body)["token"]
+          basic = base64.b64encode(("__token__:" + pypi_token).encode()).decode()
+
+          failed = False
+          for raw in os.environ["VERSIONS"].split(","):
+              version = raw.strip()
+              if not version:
+                  continue
+              url = f"https://pypi.org/pypi/bzync-nextsql/{version}/yank"
+              status, body = request(
+                  url,
+                  data=b"",
+                  headers={"Authorization": "Basic " + basic},
+                  method="POST",
+              )
+              print(f"yank bzync-nextsql {version}: {status} {body[:300]!r}")
+              if status not in (200, 201, 204):
+                  failed = True
+          if failed:
+              print("Yank https://pypi.org/manage/project/bzync-nextsql/ releases 0.1.0 and 0.1.1")
+              sys.exit(1)
+          PY
+
+  dockerhub:
+    name: Delete Docker Hub tags
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete tags
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          TAGS: ${{ inputs.docker_tags }}
+        run: |
+          set -euo pipefail
+          login="$(curl -fsS -H 'Content-Type: application/json' \
+            -d "{\"username\":\"${DOCKERHUB_USERNAME}\",\"password\":\"${DOCKERHUB_TOKEN}\"}" \
+            https://hub.docker.com/v2/users/login/)"
+          jwt="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])' <<<"$login")"
+          IFS=',' read -ra tags <<< "$TAGS"
+          for tag in "${tags[@]}"; do
+            tag="$(echo "$tag" | tr -d '[:space:]')"
+            [ -n "$tag" ] || continue
+            echo "delete bzynchub/nextsql:$tag"
+            code="$(curl -sS -o /tmp/dh.out -w '%{http_code}' -X DELETE \
+              -H "Authorization: JWT ${jwt}" \
+              "https://hub.docker.com/v2/repositories/bzynchub/nextsql/tags/${tag}/")"
+            echo "status $code $(head -c 200 /tmp/dh.out)"
+            case "$code" in
+              200|202|204) ;;
+              *) echo "failed to delete tag $tag" >&2; exit 1 ;;
+            esac
+          done

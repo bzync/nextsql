@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/bzync/nextsql/internal/admin/ops"
+	"github.com/bzync/nextsql/internal/admin/profile"
 	"github.com/bzync/nextsql/internal/admin/setup"
 	"github.com/bzync/nextsql/internal/nerr"
 	"github.com/bzync/nextsql/internal/security"
@@ -72,12 +73,20 @@ type Config struct {
 	RunTimeout time.Duration
 
 	// Operations-mode fields (see ops.Config) — ignored in Setup mode.
-	ServerAddr      string
-	ServerTLSCA     string
-	ServerTLSName   string
-	ClientCert      string
-	ClientKey       string
-	InsecureServer  bool
+	ServerAddr     string
+	ServerTLSCA    string
+	ServerTLSName  string
+	ClientCert     string
+	ClientKey      string
+	InsecureServer bool
+	// ServerName / ServerEnvironment label the --server-addr target (the
+	// "default" connection profile) in the sign-in and switch UI.
+	ServerName        string
+	ServerEnvironment string
+	// ProfilesFile names an operator-owned connection-profile file declaring
+	// further nextsqld servers a session may sign in or switch to (see
+	// internal/admin/profile). Empty means the default target only.
+	ProfilesFile    string
 	MaxSessions     int
 	IdleTimeout     time.Duration
 	SessionLifetime time.Duration
@@ -132,18 +141,28 @@ func (c Config) setupConfig() setup.Config {
 	}
 }
 
-func (c Config) opsConfig() ops.Config {
-	return ops.Config{
-		ServerAddr:      c.ServerAddr,
-		ServerTLSCA:     c.ServerTLSCA,
-		ServerTLSName:   c.ServerTLSName,
-		ClientCert:      c.ClientCert,
-		ClientKey:       c.ClientKey,
-		InsecureServer:  c.InsecureServer,
-		MaxSessions:     c.MaxSessions,
-		IdleTimeout:     c.IdleTimeout,
-		SessionLifetime: c.SessionLifetime,
-		TLS:             c.ListenTLSCert != "",
-		LogLevel:        c.LogLevel,
+func (c Config) opsConfig() (ops.Config, error) {
+	var profiles []profile.Profile
+	if c.ProfilesFile != "" {
+		var err error
+		if profiles, err = profile.Load(c.ProfilesFile); err != nil {
+			return ops.Config{}, err
+		}
 	}
+	return ops.Config{
+		ServerAddr:        c.ServerAddr,
+		ServerName:        c.ServerName,
+		ServerEnvironment: c.ServerEnvironment,
+		Profiles:          profiles,
+		ServerTLSCA:       c.ServerTLSCA,
+		ServerTLSName:     c.ServerTLSName,
+		ClientCert:        c.ClientCert,
+		ClientKey:         c.ClientKey,
+		InsecureServer:    c.InsecureServer,
+		MaxSessions:       c.MaxSessions,
+		IdleTimeout:       c.IdleTimeout,
+		SessionLifetime:   c.SessionLifetime,
+		TLS:               c.ListenTLSCert != "",
+		LogLevel:          c.LogLevel,
+	}, nil
 }

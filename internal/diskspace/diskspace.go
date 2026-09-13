@@ -24,7 +24,7 @@ func (u Usage) UsedFraction() float64 {
 // Stat reports total and free bytes for the filesystem containing path.
 // Free is space available to this process (not reserved for privileged
 // use), matching how an operator's own "df" reasoning about headroom
-// works. Implemented per-OS: see diskspace_unix.go / diskspace_windows.go.
+// works. Implemented in diskspace_unix.go.
 func Stat(path string) (Usage, error) {
 	total, free, err := stat(path)
 	if err != nil {

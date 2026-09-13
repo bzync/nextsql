@@ -3,6 +3,7 @@ package integration
 import (
 	"context"
 	"crypto/tls"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -23,6 +24,14 @@ import (
 var lastClientCAPEM []byte
 
 func startTLSServer(t *testing.T, configure ...func(*protocol.Server)) (addr string, clientTLS *tls.Config) {
+	t.Helper()
+	return startTLSServerOn(t, nil, configure...)
+}
+
+// startTLSServerOn is startTLSServer with the raw TCP listener passed through
+// wrap before TLS is layered on, so a test can interpose on the bytes the
+// server writes (see gatedListener).
+func startTLSServerOn(t *testing.T, wrap func(net.Listener) net.Listener, configure ...func(*protocol.Server)) (addr string, clientTLS *tls.Config) {
 	t.Helper()
 	dir := t.TempDir()
 	keyPath := filepath.Join(dir, "master.key")
@@ -85,7 +94,15 @@ func startTLSServer(t *testing.T, configure ...func(*protocol.Server)) (addr str
 	t.Cleanup(cancel)
 	t.Cleanup(func() { _ = srv.Close() })
 	serveErr := make(chan error, 1)
-	go func() { serveErr <- srv.ListenAndServe(ctx, "127.0.0.1:0") }()
+	if wrap == nil {
+		go func() { serveErr <- srv.ListenAndServe(ctx, "127.0.0.1:0") }()
+	} else {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		go func() { serveErr <- srv.Serve(ctx, tls.NewListener(wrap(ln), srv.TLS)) }()
+	}
 	deadline := time.Now().Add(2 * time.Second)
 	for srv.Addr() == nil && time.Now().Before(deadline) {
 		select {

@@ -122,10 +122,10 @@ type StreamFrame struct {
 
 // Bootstrap is the capability-aware, bounded first read for the Studio
 // workspace. Tables are listed here; their columns/indexes are lazy-loaded.
-// ServerAddr is the host:port of the nextsqld the running nextsql-admin
-// process targets — display only, so the workspace can show which server the
-// authenticated session is talking to. It is fixed for the process; the
-// realm and database within it are switchable via the reconnect route.
+// ServerAddr is the host:port of the nextsqld this session's connection
+// profile targets — display only, so the workspace can show which server the
+// authenticated session is talking to. Switching servers creates a new
+// session (POST /api/v1/session/switch), which remounts the workspace.
 type Bootstrap struct {
 	GeneratedAt     string    `json:"generated_at"`
 	ServerAddr      string    `json:"server_addr"`
@@ -182,74 +182,6 @@ func (r SetReadConsistencyRequest) Validate() error {
 type ReadConsistencyState struct {
 	Mode           string `json:"mode"`
 	MaxStalenessMS int64  `json:"max_staleness_ms"`
-}
-
-// MaxConnNameBytes bounds a realm or database name on the reconnect route
-// before it is sent to nextsqld. NextSQL realm/database names are bare
-// identifiers well under this; the cap is a hard backstop on the browser
-// request, not an expected ceiling.
-const MaxConnNameBytes = 128
-
-// connNamePattern is the exact shape a non-empty realm or database name may
-// take on the reconnect route: the bare-identifier characters NextSQL's
-// Hello accepts. An empty string is allowed (it selects the deployment
-// default), so the pattern is only applied to a non-empty value.
-var connNamePattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
-
-// ReconnectRequest re-targets the current Studio session's connection to a
-// different realm and/or database on the same nextsqld, as the same NSQL
-// user. The password is required because NextSQL binds realm/database at
-// handshake time only — a switch needs a fresh authenticated connection —
-// and Studio persists no credential of its own. The password is used once to
-// open the new connection and is never stored.
-type ReconnectRequest struct {
-	Realm             string `json:"realm"`
-	Database          string `json:"database"`
-	Password          string `json:"password"`
-	UseStoredPassword bool   `json:"use_stored_password,omitempty"`
-	SavePassword      bool   `json:"save_password,omitempty"`
-}
-
-// Validate bounds and shape-checks a reconnect request before any network
-// I/O. It does not check that the realm/database exist or that the password
-// is correct — nextsqld remains the sole authority over that.
-func (r ReconnectRequest) Validate() error {
-	if r.UseStoredPassword && r.Password != "" {
-		return nerr.New(nerr.InvalidArgument, "studio.ReconnectRequest", "password and use_stored_password are mutually exclusive")
-	}
-	if r.SavePassword && (r.Password == "" || r.UseStoredPassword) {
-		return nerr.New(nerr.InvalidArgument, "studio.ReconnectRequest", "save_password requires a supplied password")
-	}
-	if r.Password == "" && !r.UseStoredPassword {
-		return nerr.New(nerr.InvalidArgument, "studio.ReconnectRequest", "password or use_stored_password is required to switch connection")
-	}
-	if len(r.Realm) > MaxConnNameBytes || len(r.Database) > MaxConnNameBytes {
-		return nerr.New(nerr.InvalidArgument, "studio.ReconnectRequest",
-			fmt.Sprintf("realm and database names may be at most %d bytes", MaxConnNameBytes))
-	}
-	// Multi-realm hosting was removed: a deployment serves exactly one
-	// database. A caller that names a realm asked for something this server
-	// will not do, so it is refused rather than quietly ignored.
-	if r.Realm != "" {
-		return nerr.New(nerr.InvalidArgument, "studio.ReconnectRequest",
-			"realm selection was removed: a NextSQL deployment serves exactly one database")
-	}
-	if r.Database != "" && !connNamePattern.MatchString(r.Database) {
-		return nerr.New(nerr.InvalidArgument, "studio.ReconnectRequest", "database name is not a valid identifier")
-	}
-	return nil
-}
-
-// Connection is the current Studio session's connection identity returned by
-// a successful reconnect: the NSQL user (unchanged), and the now-active realm
-// and database. It carries no credential and no CSRF token — the session id
-// and its CSRF token are unchanged by a reconnect.
-type Connection struct {
-	User            string `json:"user"`
-	Realm           string `json:"realm"`
-	Database        string `json:"database"`
-	CredentialSaved bool   `json:"credential_saved,omitempty"`
-	Warning         string `json:"warning,omitempty"`
 }
 
 // TableDetail is the authorized server metadata for one selected table.
@@ -380,15 +312,6 @@ type Analysis struct {
 	// user explicitly overrides it; it is advisory, never a substitute for
 	// server-side RBAC.
 	Write bool `json:"write"`
-	// RealmScoped is true for a statement that changes the realm-wide
-	// principal namespace — CREATE/DROP USER, CREATE/DROP ROLE. NextSQL
-	// identities are defined once per realm ("realm identities and roles
-	// with database-scoped grants", docs/design-multidatabase-dbaas.md §19),
-	// so the effect reaches every database in the connected realm, not just
-	// the one the Studio session is pointed at. The confirm-before-run
-	// dialog names the realm so a cross-database change is never silent.
-	// Advisory only, exactly like Destructive/Write.
-	RealmScoped bool `json:"realm_scoped,omitempty"`
 }
 
 // Analyze classifies one editor statement for a confirm-before-run warning.
@@ -406,25 +329,7 @@ func Analyze(sql string) (Analysis, error) {
 	}
 	a := classify(stmt)
 	a.Write = isWriteStmt(stmt)
-	a.RealmScoped = isRealmScopedStmt(stmt)
 	return a, nil
-}
-
-// isRealmScopedStmt reports whether the statement mutates the realm-wide
-// principal namespace that every database in the realm shares. GRANT/REVOKE
-// are deliberately excluded: a NextSQL grant carries a DatabaseID and can be
-// database-scoped, and the GRANT/REVOKE builder already shows the operator
-// the exact object and scope. CREATE/DROP USER and CREATE/DROP ROLE have no
-// such scoping — the identity exists once for the whole realm, so running one
-// against the wrong Studio connection changes access for databases the
-// operator never opened.
-func isRealmScopedStmt(stmt ast.Stmt) bool {
-	switch stmt.(type) {
-	case ast.CreateUser, ast.DropUser, ast.CreateRole, ast.DropRole:
-		return true
-	default:
-		return false
-	}
 }
 
 // isWriteStmt mirrors nextsqld's executor.isMutating (DML / DDL / workflow /

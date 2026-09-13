@@ -130,7 +130,7 @@ P24      complete — Full-text Search 2.0; exit gate closed 2026-08-31
 P25      complete — Security 2.0; exit gate closed 2026-09-02, security review sign-off in docs/security.md
 P26      complete — System catalog / introspection 2.0; exit gate closed 2026-09-02, see docs/system-catalog.md "P26 exit gate closure"
 P27      complete — Operational maturity + workload governance; exit gate closed 2026-09-03
-P28      in progress — remaining recovery-key and Windows/macOS items blocked
+P28      in progress — remaining macOS items blocked; native Windows out of scope (WSL 2 only)
 P29      in progress — Studio M1 workspace + M2 streaming/virtualization + M3 bounded result tools/native inspectors + all five native explorers + Users/Roles, Transaction/Lock, and Audit developer-operations explorers + bounded plan comparison/ANALYZE profiler + catalog-aware table/column IntelliSense + deterministic misspelled FROM/JOIN table-name suggestions implemented; MVP gate open
 ```
 
@@ -530,6 +530,27 @@ Preserve correctness for:
 - window functions
 - UPSERT
 - INSERT/UPDATE/DELETE RETURNING
+- IN / NOT IN value lists (expanded to the disjunction the standard defines)
+- LIKE / NOT LIKE with ESCAPE
+- CAST(expr AS type)
+- CHECK constraints (refused only on FALSE; UNKNOWN satisfies)
+- ALTER COLUMN SET/DROP NOT NULL and SET/DROP DEFAULT
+- SAVEPOINT / ROLLBACK TO / RELEASE
+- views (read-only, invoker's privileges, expanded into a CTE)
+
+Two rules the above depend on, both learned from defects (logs #271-#279):
+
+- **A new expression node is a fail-open risk.** Roughly two dozen walkers
+  switch over expression types — RBAC column authorization, result-cache
+  volatility, partition pruning, client-encryption checks — and several answer
+  "nothing here" for a node they do not know. Prefer expanding new syntax into
+  nodes every stage already handles (a disjunction, a native call) unless the
+  feature genuinely needs its own node, and then audit every walker.
+- **Statement nesting is bounded** (`ast.MaxNestingDepth`). Every stage after
+  the parser walks the tree recursively, so an unbounded tree is an unbounded
+  goroutine stack — which kills the process rather than the statement. Chains
+  parsed iteratively still produce deep trees: bound the tree, not just the
+  parser's recursion.
 
 Window functions include:
 

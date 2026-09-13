@@ -32,14 +32,6 @@ deb_version() {
 	awk -v v="$1" 'BEGIN { sub("-", "~", v); print v "-1" }'
 }
 
-# Windows FILEVERSION / ProductVersion: 0.0.1 -> 0.1.0.0
-win_version() {
-	local v="$1"
-	v="${v%%-*}"
-	IFS=. read -r a b c _ <<<"${v}.0.0"
-	printf '%s.%s.%s.0\n' "${a:-0}" "${b:-0}" "${c:-0}"
-}
-
 # Safe file token: 0.0.1 stays 0.0.1.
 file_version() {
 	printf '%s\n' "$1"
@@ -80,7 +72,6 @@ default_go_arches() {
 	host="$(go env GOARCH)"
 	case "$os" in
 	linux) echo "${host:-amd64}" ;;
-	windows) echo "${host:-amd64}" ;;
 	*) echo amd64 ;;
 	esac
 }

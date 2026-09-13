@@ -31,6 +31,9 @@ func (s *Session) execDropTable(p planner.DropTable) (*Result, error) {
 	if len(s.inboundFKs(p.Table)) > 0 {
 		return nil, nerr.New(nerr.ForeignKey, "executor.DropTable", "table is referenced by a foreign key")
 	}
+	if err := s.refuseIfViewsDependOn(name); err != nil {
+		return nil, err
+	}
 	heap, err := s.heapOf(p.Table)
 	if err != nil {
 		return nil, err
@@ -465,6 +468,10 @@ func (s *Session) execAlterTable(p planner.AlterTable) (*Result, error) {
 			return nil, err
 		}
 		if err := s.putCatalog(neu, old.Name); err != nil {
+			return nil, err
+		}
+	case ast.AlterColumn:
+		if err := s.alterColumn(old, neu, cmd); err != nil {
 			return nil, err
 		}
 	case ast.AlterRenameTable:
@@ -944,7 +951,8 @@ func (s *Session) alterRenameTable(old, neu *catalog.Table) error {
 	}
 	if st, ok := s.lookupStats(old.Name); ok {
 		st.Table = neu.Name
-		body, err := catalog.EncodeStats(st)
+		// The key grows with a longer name, so re-fit rather than re-encode.
+		body, err := fitStats(st)
 		if err != nil {
 			return err
 		}
@@ -1037,11 +1045,73 @@ func (s *Session) rewriteInboundRefTable(oldName, newName string) error {
 	return nil
 }
 
+// alterColumn applies SET/DROP NOT NULL and SET/DROP DEFAULT. Only SET NOT
+// NULL depends on the data: the stored rows have to satisfy it already, since
+// nothing would ever re-check them afterwards. A DEFAULT change is catalog-only
+// and does not rewrite existing rows — a default supplies a value for writes
+// that omit the column, and rows already written kept the value they were
+// written with.
+func (s *Session) alterColumn(old, neu *catalog.Table, cmd ast.AlterColumn) error {
+	if cmd.SetNotNull {
+		idx, ok := old.ColIndex(cmd.Name)
+		if !ok {
+			return nerr.New(nerr.NotFound, "executor.AlterTable", "unknown column")
+		}
+		heap, err := s.heapOf(old)
+		if err != nil {
+			return err
+		}
+		htx := s.x.use(heap)
+		if err := htx.Range(nil, nil, func(_, val []byte) error {
+			row, err := s.decodeHeapRow(old, val)
+			if err != nil {
+				return err
+			}
+			if idx < len(row) && row[idx].Null {
+				return nerr.New(nerr.InvalidArgument, "executor.AlterTable", "cannot set NOT NULL: the column holds NULL in an existing row")
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
+	}
+	return s.putCatalog(neu, old.Name)
+}
+
 func (s *Session) alterAddConstraint(old, neu *catalog.Table) error {
 	if err := s.validateExistingFKs(neu); err != nil {
 		return err
 	}
+	// Only the checks this statement adds are validated against existing
+	// rows: the ones already stored were validated when they were added, and
+	// re-running them would turn every ADD CONSTRAINT into a full re-scan for
+	// every constraint on the table.
+	if added := addedChecks(old, neu); len(added) > 0 {
+		if err := s.validateExistingChecks(old, added); err != nil {
+			return err
+		}
+	}
 	return s.putCatalog(neu, old.Name)
+}
+
+// addedChecks returns the checks present on neu but not on old, by name.
+func addedChecks(old, neu *catalog.Table) []catalog.Check {
+	if neu == nil || len(neu.Checks) == 0 {
+		return nil
+	}
+	had := make(map[string]struct{}, len(old.Checks))
+	if old != nil {
+		for _, c := range old.Checks {
+			had[c.Name] = struct{}{}
+		}
+	}
+	var out []catalog.Check
+	for _, c := range neu.Checks {
+		if _, ok := had[c.Name]; !ok {
+			out = append(out, c)
+		}
+	}
+	return out
 }
 
 func (s *Session) validateExistingFKs(tab *catalog.Table) error {

@@ -387,26 +387,28 @@ func TestStudioCancellationIsSessionScoped(t *testing.T) {
 	}
 }
 
-func TestSessionReconnectSwapsTargetAndGuardsBusy(t *testing.T) {
-	sess := &session{realm: "old-realm", database: "old-db"}
-
-	if err := sess.reconnect(nil, "new-realm", "new-db"); err != nil {
-		t.Fatalf("reconnect on an idle session: %v", err)
+func TestSessionBusyTracksStudioQueryNotConnectionLock(t *testing.T) {
+	sess := &session{}
+	if sess.busy() {
+		t.Fatal("idle session reported busy")
 	}
-	if realm, database := sess.target(); realm != "new-realm" || database != "new-db" {
-		t.Fatalf("target after reconnect = (%q, %q), want (new-realm, new-db)", realm, database)
-	}
-
-	// A reconnect must fail closed while the connection lock is held (a query
-	// is in flight), leaving the target untouched.
+	// The reachability probe holds the connection lock briefly every few
+	// seconds; that alone must not make a server switch fail.
 	sess.mu.Lock()
-	err := sess.reconnect(nil, "raced-realm", "raced-db")
+	busyUnderLock := sess.busy()
 	sess.mu.Unlock()
-	if !nerr.HasCode(err, nerr.Conflict) {
-		t.Fatalf("reconnect while busy: want conflict, got %v", err)
+	if busyUnderLock {
+		t.Fatal("connection lock alone made the session busy")
 	}
-	if realm, database := sess.target(); realm != "new-realm" || database != "new-db" {
-		t.Fatalf("target after a refused reconnect changed to (%q, %q)", realm, database)
+	if err := sess.beginStudioQuery("query-1", func() {}); err != nil {
+		t.Fatal(err)
+	}
+	if !sess.busy() {
+		t.Fatal("a running Studio query did not make the session busy")
+	}
+	sess.finishStudioQuery("query-1")
+	if sess.busy() {
+		t.Fatal("session stayed busy after its query finished")
 	}
 }
 
@@ -458,7 +460,7 @@ func TestConnectionProbeReportsDisconnectedWithoutConn(t *testing.T) {
 		t.Fatalf("no session: want 401, got %d", rec.Code)
 	}
 
-	sess, err := s.sessions.create(nil, "op", "maindb", "acme")
+	sess, err := s.sessions.create(nil, "op", "maindb", "default")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -523,7 +525,7 @@ func TestLogoutRequiresCSRF(t *testing.T) {
 
 func TestWhoamiWorksWithCookieOnly(t *testing.T) {
 	s := testServer(t)
-	sess, _ := s.sessions.create(nil, "op", "maindb", "acme")
+	sess, _ := s.sessions.create(nil, "op", "maindb", "default")
 
 	req := httptest.NewRequest("GET", "/api/v1/session", nil)
 	req.AddCookie(&http.Cookie{Name: sessionCookie, Value: sess.id})

@@ -1,117 +1,63 @@
-# NextSQL Security Policy
+# Security policy
 
-## Security Model
+NextSQL is encrypted by default. It is not “unhackable” and does not claim
+absolute security.
 
-NextSQL is an encrypted-by-default database, but it is not “unhackable” and does not claim absolute security.
+A privileged attacker who controls a live, unlocked `nextsqld` process may
+read plaintext and active key material in memory, because the database must
+decrypt data to execute queries. Encryption protects data at rest. TLS 1.3
+protects data in transit off loopback.
 
-A privileged attacker controlling a live unlocked `nextsqld` process may access plaintext and active key material in memory because the database must decrypt data to execute queries.
+## Supported versions
 
-Encryption protects persisted data and TLS protects remote transport.
+| Version | Status |
+|---|---|
+| 0.0.1 | Current preview release |
 
----
+Treat security guarantees as development-stage until you have run the security,
+crash, and HA suites on your deployment.
 
-## Supported Development Status
+## Reporting a vulnerability
 
-NextSQL is currently `0.0.1`.
+Do not open a public issue for an exploitable vulnerability.
 
-Security guarantees should be treated as development-stage until the applicable release gates and security suites are green.
-
----
-
-## Reporting a Vulnerability
-
-Do not publish exploitable security vulnerabilities in a public issue before remediation.
-
-Report privately through the project's designated security contact/channel.
+Report privately through [GitHub private vulnerability reporting](https://github.com/bzync/nextsql/security/advisories/new).
 
 A useful report includes:
 
-- affected version/commit;
-- environment;
-- reproduction steps;
-- expected behavior;
-- observed behavior;
-- impact;
-- proof of concept where safe;
-- whether secrets or tenant isolation are involved.
+- affected version or commit
+- environment
+- reproduction steps
+- expected and observed behavior
+- impact
+- a proof of concept where it is safe to include one
+- whether secrets, authentication, or tenant isolation are involved
 
 Do not include real customer secrets or personal data.
 
----
+## What we protect
 
-## Security Priorities
+- Authentication and authorization (RBAC)
+- Root unlock keys and data-encryption keys (never in URLs, never logged)
+- Page, WAL, UNDO, backup, and replication encryption (AES-256-GCM)
+- TLS 1.3 for any non-loopback listener
+- Protocol parsing of untrusted input
+- Audit integrity
+- NextSQL Admin authorization (Setup, Operations, and Studio)
 
-Security-sensitive areas include:
+One deployment serves one database. Physical table partitioning is never an
+authorization boundary.
 
-- authentication;
-- authorization;
-- realm/database isolation;
-- root/key handling;
-- encryption;
-- WAL/backup confidentiality;
-- protocol parsing;
-- TLS;
-- Raft/replication authentication;
-- audit integrity;
-- NextSQL Admin authorization (Setup/Operations/Studio modes).
+## Cryptography rules
 
----
+- Use established algorithms only. Never invent a primitive.
+- Keys must not appear in connection URLs.
+- Secrets must not be logged.
+- Encrypted units carry version and key metadata.
+- Nonce uniqueness is preserved.
+- Wrong or missing keys fail closed.
 
-## Cryptography Rules
+## Claims we will not make
 
-- use established cryptographic algorithms;
-- never invent a custom primitive;
-- keys must not be placed in connection URLs;
-- secrets must not be logged;
-- encrypted units must carry version/key metadata;
-- nonce uniqueness must be preserved;
-- wrong/missing keys must fail closed.
-
-Current page encryption uses AES-256-GCM.
-
----
-
-## Realm and Database Isolation
-
-Cross-realm/database data leakage tolerance is zero. Shared row tenancy has
-been removed; a connection is bound to one resolved hosted realm/database and
-physical table partitioning is never an authorization boundary.
-
-Every new feature must preserve:
-
-- immutable session realm/database context;
-- RBAC;
-- realm-local authentication and database-scoped authorization;
-- authorization checks;
-- auditability.
-
-Partitioning is not an authorization boundary.
-
----
-
-## Protocol Security
-
-Remote production connections require secure TLS configuration.
-
-Protocol implementations must validate:
-
-- packet sizes;
-- SQL lengths;
-- parameter counts;
-- attacker-controlled lengths;
-- result bounds;
-- cancellation state;
-- authentication state.
-
----
-
-## Security Claims
-
-Do not describe NextSQL as:
-
-- unhackable;
-- 100% secure;
-- guaranteed zero downtime;
-- impossible to lose data.
-
-Use threat-model-specific, tested claims.
+Do not describe NextSQL as unhackable, 100% secure, guaranteed zero-downtime,
+or impossible to lose data. Use threat-model-specific, tested claims.

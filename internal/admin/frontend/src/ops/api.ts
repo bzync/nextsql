@@ -13,20 +13,48 @@ export type ResultSet = {
   affected?: number;
 };
 
+// Environment labels a connection profile may declare. The same four Studio's
+// per-viewer environment tag offers (resultTools STUDIO_ENVIRONMENTS).
+export type ProfileEnvironment = "development" | "test" | "staging" | "production";
+
+// What the unauthenticated sign-in page may know about a connection profile:
+// its ID, display name, and environment — never where it points.
+export type PublicProfile = {
+  id: string;
+  name: string;
+  environment?: ProfileEnvironment;
+};
+
+// What a signed-in session may know about a profile: where a password would
+// be sent (address + TLS posture) and the operator-declared sign-in hints.
+// Never a local file path.
+export type SessionProfile = PublicProfile & {
+  address: string;
+  user?: string;
+  database?: string;
+  tls: boolean;
+  mtls: boolean;
+};
+
 export type Whoami = {
   authenticated: boolean;
   user: string;
   database: string;
-  realm: string;
+  // The nextsqld server (connection profile) this session is signed in to.
+  // Fixed for the session: switching servers issues a new session.
+  profile: SessionProfile;
   csrf_token: string;
+  // Set only on a switch response.
+  credential_saved?: boolean;
+  warning?: string;
 };
 
 export type ServerConnection = {
   connected: boolean;
   server_addr: string;
+  profile?: SessionProfile;
   user: string;
   database: string;
-  realm: string;
   error?: string;
 };
 
@@ -34,7 +62,23 @@ export type LoginBody = {
   user: string;
   password: string;
   database?: string;
-  realm?: string;
+  // Connection-profile ID; omitted or "" selects the default server.
+  profile?: string;
+};
+
+export type ProfileList = { default: string; profiles: PublicProfile[] };
+export type SessionProfileList = { current: string; profiles: SessionProfile[] };
+
+// Body for POST /api/v1/session/switch: exactly one of a typed password or
+// use_saved_password. A saved password is usable only from the same server
+// and user that saved it; save_password stores a typed password in the
+// operating system's credential store after it signs in successfully.
+export type SwitchServerBody = {
+  profile: string;
+  user: string;
+  password?: string;
+  use_saved_password?: boolean;
+  save_password?: boolean;
 };
 
 export type Overview = {
@@ -201,22 +245,6 @@ export type StudioReadConsistencyState = {
   max_staleness_ms: number;
 };
 
-// The current Studio session connection after a successful reconnect. The
-// NSQL user never changes; realm and database are the now-active target.
-export type StudioConnection = {
-  user: string;
-  realm: string;
-  database: string;
-};
-
-// Body for POST /api/v1/studio/reconnect. The password is required (NextSQL
-// binds realm/database at handshake only) and is never stored anywhere.
-export type StudioReconnectBody = {
-  realm: string;
-  database: string;
-  password: string;
-};
-
 export type StudioTableDetail = {
   generated_at: string;
   name: string;
@@ -286,11 +314,6 @@ export type StudioAnalysis = {
   destructive: boolean;
   reasons?: string[];
   write: boolean;
-  // True for CREATE/DROP USER and CREATE/DROP ROLE: NextSQL identities are
-  // realm-scoped, so the statement affects every database in the connected
-  // realm, not just the one this Studio session targets. Drives an extra
-  // confirm-before-run line naming the realm.
-  realm_scoped?: boolean;
 };
 
 // StudioDiagnostic locates one parse failure in the editor buffer, in the
@@ -503,6 +526,11 @@ async function studioQueryStream(body: StudioQueryRequest, handlers: StudioStrea
 export const api = {
   whoami: () => request<Whoami>("GET", "/api/v1/session"),
   login: (b: LoginBody) => request<Whoami>("POST", "/api/v1/session", b),
+  profiles: () => request<ProfileList>("GET", "/api/v1/profiles"),
+  sessionProfiles: () => request<SessionProfileList>("GET", "/api/v1/session/profiles"),
+  switchServer: (b: SwitchServerBody) => request<Whoami>("POST", "/api/v1/session/switch", b),
+  forgetSavedPassword: (b: { profile: string; user: string }) =>
+    request<void>("POST", "/api/v1/session/credential/forget", b),
   logout: () => request<void>("DELETE", "/api/v1/session"),
   connection: () => request<ServerConnection>("GET", "/api/v1/connection"),
   overview: () => request<Overview>("GET", "/api/v1/overview"),
@@ -541,8 +569,6 @@ export const api = {
     request<StudioDiagnosticReport>("POST", "/api/v1/studio/query/diagnostics", { sql }),
   studioCancel: (queryId: string) =>
     request<{ canceled: boolean; query_id: string }>("POST", "/api/v1/studio/query/cancel", { query_id: queryId }),
-  studioReconnect: (body: StudioReconnectBody) =>
-    request<StudioConnection>("POST", "/api/v1/studio/reconnect", body),
   studioSetReadConsistency: (body: StudioReadConsistencyState) =>
     request<StudioReadConsistencyState>("POST", "/api/v1/studio/read-consistency", body),
 };

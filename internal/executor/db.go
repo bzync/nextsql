@@ -21,6 +21,7 @@ import (
 	"github.com/bzync/nextsql/internal/scheduler"
 	"github.com/bzync/nextsql/internal/security"
 	"github.com/bzync/nextsql/internal/sql/optimizer"
+	"github.com/bzync/nextsql/internal/sql/parser"
 	"github.com/bzync/nextsql/internal/storage"
 	"github.com/bzync/nextsql/internal/storage/btree"
 	"github.com/bzync/nextsql/internal/storage/format"
@@ -50,6 +51,7 @@ type DB struct {
 	partVecs  map[string]*btree.Tree // key: partitionHeapKey(table, partitionID)
 	partIdxs  map[string]*btree.Tree // key: partitionIndexKey(table, partitionID, indexName)
 	workflows map[string]*catalog.Workflow
+	views     map[string]*catalog.View
 	triggers  map[string]*catalog.Trigger
 	schedules map[string]*catalog.Schedule
 	resGroups map[string]*catalog.ResourceGroup
@@ -1587,6 +1589,29 @@ func (db *DB) reloadCatalog() error {
 	if err != nil {
 		return err
 	}
+	views := make(map[string]*catalog.View)
+	start = catalog.ViewKey("")
+	end = []byte{catalog.KeyView + 1}
+	err = db.CatTree.Range(start, end, func(k, v []byte) error {
+		if len(k) == 0 || k[0] != catalog.KeyView {
+			return nil
+		}
+		view, err := catalog.DecodeView(v)
+		if err != nil {
+			return err
+		}
+		if string(k[1:]) != view.Name {
+			return nerr.New(nerr.InvalidFormat, "executor.reloadCatalog", "view catalog key/name mismatch")
+		}
+		if _, exists := views[view.Name]; exists {
+			return nerr.New(nerr.InvalidFormat, "executor.reloadCatalog", "duplicate view")
+		}
+		views[view.Name] = view
+		return nil
+	})
+	if err != nil {
+		return err
+	}
 	triggers := make(map[string]*catalog.Trigger)
 	start = catalog.TriggerKey("")
 	end = []byte{catalog.KeyTrigger + 1}
@@ -1677,12 +1702,16 @@ func (db *DB) reloadCatalog() error {
 	db.partVecs = make(map[string]*btree.Tree)
 	db.partIdxs = make(map[string]*btree.Tree)
 	db.workflows = workflows
+	db.views = views
 	db.triggers = triggers
 	db.schedules = schedules
 	db.resGroups = resGroups
 	db.resGroupGates = nil
 	for _, w := range workflows {
 		db.Cat.SetNextID(w.ID + 1)
+	}
+	for _, v := range views {
+		db.Cat.SetNextID(v.ID + 1)
 	}
 	for _, trigger := range triggers {
 		db.Cat.SetNextID(trigger.ID + 1)
@@ -1753,6 +1782,50 @@ func (db *DB) workflow(name string) (*catalog.Workflow, bool) {
 		return nil, false
 	}
 	return w.Clone(), true
+}
+
+// view returns a copy of the named view descriptor.
+func (db *DB) view(name string) (*catalog.View, bool) {
+	if db == nil {
+		return nil, false
+	}
+	db.mu.RLock()
+	v, ok := db.views[name]
+	db.mu.RUnlock()
+	if !ok || v == nil {
+		return nil, false
+	}
+	return v.Clone(), true
+}
+
+// UnparseableViews names every stored view whose body no longer parses. A view
+// body is SQL text parsed again on each use; one written before identifiers
+// were stored quoted can stop parsing when a word it uses as a name becomes a
+// reserved keyword in a newer release. Such a view fails only when queried,
+// so the server reports them at startup. CREATE OR REPLACE VIEW repairs one.
+func (db *DB) UnparseableViews() map[string]error {
+	out := map[string]error{}
+	for _, v := range db.viewList() {
+		if _, err := parser.Parse(v.Query); err != nil {
+			out[v.Name] = err
+		}
+	}
+	return out
+}
+
+func (db *DB) viewList() []*catalog.View {
+	if db == nil {
+		return nil
+	}
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	out := make([]*catalog.View, 0, len(db.views))
+	for _, v := range db.views {
+		if clone := v.Clone(); clone != nil {
+			out = append(out, clone)
+		}
+	}
+	return out
 }
 
 func (db *DB) workflowList() []*catalog.Workflow {
@@ -1956,6 +2029,27 @@ func (db *DB) putWorkflow(w *catalog.Workflow) {
 	// The transaction overlay owns w and is cleared immediately after commit;
 	// committed descriptors are immutable. Readers receive a deep clone.
 	db.workflows[w.Name] = w
+	db.mu.Unlock()
+}
+
+func (db *DB) putView(v *catalog.View) {
+	if db == nil || v == nil {
+		return
+	}
+	db.mu.Lock()
+	if db.views == nil {
+		db.views = make(map[string]*catalog.View)
+	}
+	db.views[v.Name] = v
+	db.mu.Unlock()
+}
+
+func (db *DB) removeView(name string) {
+	if db == nil {
+		return
+	}
+	db.mu.Lock()
+	delete(db.views, name)
 	db.mu.Unlock()
 }
 

@@ -44,7 +44,6 @@ export type Params = {
   bufferPages: number;
   adminUser: string;
   adminPassword: string;
-  realm: string;
   database: string;
   skipInit: boolean;
   listenAddr: string;
@@ -65,7 +64,6 @@ export function defaultParams(): Params {
     bufferPages: 0,
     adminUser: "",
     adminPassword: "",
-    realm: "",
     // Empty means "no database": `nextsql setup` then initializes the
     // deployment only. The wizard asks for the name on the Resources step
     // rather than inventing one here.

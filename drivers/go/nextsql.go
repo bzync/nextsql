@@ -938,11 +938,39 @@ func (c *Conn) queryPayload(ctx context.Context, typ protocol.Type, payload []by
 // after readRows returned made context cancellation ineffective during that
 // entire interval. A result completed in the first frame is disarmed here;
 // streaming results transfer ownership of stop to Rows.Close.
+//
+// The cancel runs on its own goroutine, so by the time it reaches the server
+// the statement may already have finished. Releasing the connection while that
+// request is still in flight would let it cancel whatever statement the caller
+// issues next, so stopping a cancel that has already started waits for it to
+// complete; cancelTimeout bounds that wait.
 func (c *Conn) readRowsContext(ctx context.Context) (*Rows, error) {
 	var stop func() bool
 	if ctx != nil {
 		conn := c
-		stop = context.AfterFunc(ctx, func() { _ = conn.Cancel(context.Background()) })
+		finished := make(chan struct{})
+		stopAfter := context.AfterFunc(ctx, func() {
+			defer close(finished)
+			cctx, cancel := context.WithTimeout(context.Background(), cancelTimeout)
+			defer cancel()
+			_ = conn.Cancel(cctx)
+		})
+		var once sync.Once
+		var stopped bool
+		stop = func() bool {
+			once.Do(func() {
+				// AfterFunc's stop reports false as soon as the context is
+				// done -- possibly before the callback goroutine has run a
+				// single line -- and in that case the callback is guaranteed
+				// to run. So a false here means "a cancel is or will be in
+				// flight": wait for it, which cancelTimeout bounds.
+				stopped = stopAfter()
+				if !stopped {
+					<-finished
+				}
+			})
+			return stopped
+		}
 	}
 	rows, err := c.readRows()
 	if err != nil {
@@ -1150,17 +1178,33 @@ func (c *Conn) Prepare(ctx context.Context, sql string) (*Stmt, error) {
 	return &Stmt{c: c, id: id}, nil
 }
 
-func (c *Conn) Cancel(_ context.Context) error {
+// cancelTimeout bounds a cancel request that ctx does not bound itself: the
+// dial, the TLS handshake and the request/response exchange on the side
+// connection. A cancel must never hang on a server that cannot be reached.
+const cancelTimeout = 10 * time.Second
+
+func (c *Conn) Cancel(ctx context.Context) error {
 	// Must not take c.mu: an in-flight Query holds it until Rows.Close.
 	secret := c.secret
 	if secret == 0 {
 		return nerr.New(nerr.Unavailable, "nextsql.Cancel", "not connected")
 	}
-	side, err := dialRaw(c.cfg.Address, c.cfg.TLS, c.cfg.InsecureNoTLS)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, cancelTimeout)
+		defer cancel()
+	}
+	side, err := dialRawContext(ctx, c.cfg.Address, c.cfg.TLS, c.cfg.InsecureNoTLS)
 	if err != nil {
 		return err
 	}
 	defer side.Close()
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = side.SetDeadline(deadline)
+	}
 	lim := protocol.DefaultLimits()
 	payload, err := protocol.EncodeHello(protocol.Hello{
 		Version: protocol.Version,
@@ -1386,8 +1430,9 @@ func unexpected(typ protocol.Type, body []byte, lim protocol.Limits) error {
 	return nerr.New(nerr.Protocol, "nextsql", "unexpected message type")
 }
 
-func dialRaw(addr string, tlsCfg *tls.Config, insecure bool) (net.Conn, error) {
-	raw, err := net.Dial("tcp", addr)
+func dialRawContext(ctx context.Context, addr string, tlsCfg *tls.Config, insecure bool) (net.Conn, error) {
+	var d net.Dialer
+	raw, err := d.DialContext(ctx, "tcp", addr)
 	if err != nil {
 		return nil, nerr.Wrap(nerr.IO, "nextsql.Cancel", "dial", err)
 	}
@@ -1401,7 +1446,7 @@ func dialRaw(addr string, tlsCfg *tls.Config, insecure bool) (net.Conn, error) {
 			tc.ServerName = host
 		}
 		tlsConn := tls.Client(raw, tc)
-		if err := tlsConn.Handshake(); err != nil {
+		if err := tlsConn.HandshakeContext(ctx); err != nil {
 			_ = raw.Close()
 			return nil, nerr.Wrap(nerr.Protocol, "nextsql.Cancel", "tls handshake", err)
 		}

@@ -11,7 +11,6 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -520,9 +519,6 @@ func TestStoreNamesDoNotCollideAfterSanitizing(t *testing.T) {
 }
 
 func TestStoreRejectsUnsafeCredentialPath(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("Unix permission and symlink semantics")
-	}
 	store := &oidcclient.Store{Dir: filepath.Join(t.TempDir(), "credentials")}
 	c := &oidcclient.Credential{
 		Version: 1, IdP: "corp", Host: "db:7423", Principal: "alice",
@@ -669,9 +665,6 @@ scopes = ["openid", "profile", "groups"]
 }
 
 func TestReadClientSecretFileFailsClosed(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("Unix permission and symlink semantics")
-	}
 	dir := t.TempDir()
 	broad := filepath.Join(dir, "broad.secret")
 	if err := os.WriteFile(broad, []byte("secret"), 0o644); err != nil {

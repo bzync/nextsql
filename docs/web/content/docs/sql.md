@@ -49,10 +49,14 @@ A table **must** declare `PRIMARY KEY`. Secondary indexes store secondary key + 
 
 ```sql
 CREATE TABLE   [FOREIGN KEY / REFERENCES …] [PARTITION BY RANGE|HASH|LIST]
-CREATE DATABASE [IF NOT EXISTS]
+CREATE TABLE name PRIMARY KEY (col, …) AS <query>
 DROP TABLE [IF EXISTS]
-ALTER TABLE    ADD/DROP [COLUMN] | RENAME | ADD/DROP CONSTRAINT
+ALTER TABLE    ADD/DROP [COLUMN] | ALTER [COLUMN] SET/DROP NOT NULL
+               | ALTER [COLUMN] SET/DROP DEFAULT | RENAME
+               | ADD/DROP CONSTRAINT (FOREIGN KEY or CHECK)
                | ADD/DROP/ATTACH/DETACH PARTITION
+CREATE [OR REPLACE] VIEW name [(col, ...)] AS <query>
+DROP VIEW [IF EXISTS]
 CREATE INDEX / CREATE UNIQUE INDEX
 CREATE SPATIAL INDEX   (POINT, or GEOMETRY / GEOGRAPHY)
 CREATE FULLTEXT INDEX [WITH (ANALYZER = 'simple' | 'english' | 'french' | 'german' | 'spanish')]
@@ -60,16 +64,21 @@ CREATE VECTOR INDEX … USING HNSW | IVF | IVFPQ | SPARSE
 DROP INDEX [IF EXISTS]
 REBUILD INDEX [ONLINE]
 MAINTAIN INDEX|TABLE|DATABASE
-INSERT   [RETURNING]
+INSERT   VALUES (...) | <query>   [RETURNING]
 UPSERT   [ON UNIQUE] [SET] [RETURNING]
 SELECT   [WITH] [DISTINCT] [JOIN …] [WHERE] [GROUP BY] [HAVING] [ORDER BY] [SEARCH] [NEAREST] [NEAREST] [LIMIT] [OFFSET]
 UPDATE   [WHERE] [LIMIT] [RETURNING]
 DELETE   [WHERE] [LIMIT] [RETURNING]
 BEGIN    [READ COMMITTED | SNAPSHOT | SERIALIZABLE]
 COMMIT
-ROLLBACK [TRANSACTION]
+ROLLBACK [TRANSACTION] | ROLLBACK TO [SAVEPOINT] name
+SAVEPOINT name
+RELEASE [SAVEPOINT] name
+CANCEL QUERY '<id>'
 ANALYZE  [table]
 EXPLAIN  [ANALYZE] <statement>
+BACKUP DATABASE
+VERIFY BACKUP 'name'
 CREATE / ALTER / DROP WORKFLOW    RUN WORKFLOW
 CREATE / ALTER / DROP TRIGGER
 CREATE / ALTER / DROP SCHEDULE    SHOW TASKS    CANCEL TASK
@@ -85,7 +94,15 @@ SHOW DATABASES | TABLES | INDEXES | CONNECTIONS | QUERIES | TRANSACTIONS | LOCKS
 
 `SELECT 1` and other FROM-less `SELECT` expressions are accepted (health checks, `NOW()`, constants).
 
-`CREATE DATABASE [IF NOT EXISTS] name` creates a new database file named `name` in the same directory as the current database (same key provider). It cannot run inside a transaction and is not written to the current database WAL.
+`INSERT` takes its rows from a `VALUES` list or from a query:
+
+```sql
+INSERT INTO archive (id, total) SELECT id, total FROM orders WHERE closed;
+```
+
+The source is an ordinary `SELECT`, set operation or `WITH`, bound and optimized like any other query, and its output columns must match the columns being written. The source is read to completion before the first row is written, so `INSERT INTO t SELECT ... FROM t` doubles `t` exactly once instead of feeding itself. Reading it needs `SELECT` on every relation it touches, on top of `INSERT` on the target. `UPSERT` takes `VALUES` only.
+
+`CREATE DATABASE` is not supported: a deployment serves exactly one database, and the parser rejects the statement (`syntax`, `IF NOT EXISTS` included) with that reason. To run another database, `nextsql init` a separate deployment. See [Limits](/docs/limits).
 
 `DROP TABLE [IF EXISTS] name` removes the catalog row. A table referenced by a foreign key cannot be dropped (`foreign_key`). After commit and after older snapshots drain, detached heap, vector-store, and index pages return to the durable allocator freelist.
 
@@ -122,6 +139,7 @@ The complete signatures, return behavior, NULL rules, and examples are in the
 | Geo | `POINT`, `BOX`, `LON`/`LAT`, `DISTANCE`, `DISTANCE_SPHEROID`, `DWITHIN`, `WITHIN`, `COVERS`, `LINELENGTH` (and `ST_*` aliases) |
 | Collections | `ELEMENT_AT`, `CARDINALITY` / `ARRAY_LENGTH`, `ARRAY_CONTAINS`, `MAP_CONTAINS_KEY`, `MAP_KEYS`, `MAP_VALUES`, `MAP_SIZE` |
 | Search | `HIGHLIGHT(col [, pre, post])`, `SNIPPET(col [, width [, pre, post]])` (require `SEARCH`) |
+| Predicates | `x [NOT] IN (v1, v2, ...)`, `x [NOT] LIKE pattern [ESCAPE c]`, `CAST(x AS type)` |
 
 `UUID()`, `NOW()`, and `AI()` are evaluated at execution, not folded by the optimizer. `AI()` is a `DECIMAL(p,0)` autoincrement starting at 1. Explicit inserts bump the sequence when the value is at least the next number. Allocation is in the statement transaction (`ROLLBACK` reuses). Concurrent inserts exclusive-lock the sequence key.
 

@@ -11,7 +11,6 @@ import (
 	"time"
 
 	nextsql "github.com/bzync/nextsql/drivers/go"
-	"github.com/bzync/nextsql/internal/admin/credential"
 	"github.com/bzync/nextsql/internal/admin/studio"
 	"github.com/bzync/nextsql/internal/nerr"
 )
@@ -44,7 +43,7 @@ func (s *Server) handleStudioBootstrap(w http.ResponseWriter, r *http.Request, s
 	readMode, readMaxMS := sess.readConsistency()
 	writeJSON(w, http.StatusOK, studio.Bootstrap{
 		GeneratedAt:     b.GeneratedAt,
-		ServerAddr:      s.cfg.ServerAddr,
+		ServerAddr:      s.sessionProfile(sess).Address,
 		ReadConsistency: readMode,
 		MaxStalenessMS:  readMaxMS,
 		Capabilities:    studioResult(b.Tables["capabilities"]),
@@ -90,73 +89,6 @@ func (s *Server) handleStudioReadConsistency(w http.ResponseWriter, r *http.Requ
 	}
 	sess.touch()
 	writeJSON(w, http.StatusOK, studio.ReadConsistencyState{Mode: req.Mode, MaxStalenessMS: req.MaxStalenessMS})
-}
-
-// handleStudioReconnect re-targets the current session's connection to a
-// different realm/database on the same nextsqld, as the same NSQL user. It
-// opens a fresh authenticated connection first (NextSQL binds realm/database
-// only at handshake), and swaps it in only on success — a failed switch
-// (wrong password, unknown realm, suspended database) leaves the session on
-// its existing connection. The password is used once and never stored.
-func (s *Server) handleStudioReconnect(w http.ResponseWriter, r *http.Request, sess *session) {
-	var req studio.ReconnectRequest
-	if err := json.NewDecoder(io.LimitReader(r.Body, maxLoginBody)).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON body")
-		return
-	}
-	req.Realm = strings.TrimSpace(req.Realm) // rejected by Validate when non-empty
-	req.Database = strings.TrimSpace(req.Database)
-	if err := req.Validate(); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-
-	base, err := s.cfg.driverConfig()
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "ops TLS configuration error")
-		s.log.Error("studio reconnect driver config", "err", err.Error())
-		return
-	}
-	base.User = sess.user
-	password := req.Password
-	credentialKey := credential.Key(base.Address, sess.user, req.Realm, req.Database)
-	if req.UseStoredPassword {
-		password, err = s.cfg.CredentialStore.Get(credentialKey)
-		if err != nil || password == "" {
-			writeError(w, http.StatusUnauthorized, "saved credential is unavailable; enter a password")
-			return
-		}
-	}
-	base.Password = password
-	base.Database = req.Database
-	base.Realm = ""
-
-	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
-	defer cancel()
-	conn, err := nextsql.OpenContext(ctx, base)
-	if err != nil {
-		status, msg := loginErrorStatus(err)
-		writeError(w, status, msg)
-		s.log.Info("studio reconnect failed", "user", sess.user, "status", status)
-		return
-	}
-	if err := sess.reconnect(conn, req.Realm, req.Database); err != nil {
-		_ = conn.Close()
-		writeBundleError(w, err)
-		return
-	}
-	sess.touch()
-	response := studio.Connection{User: sess.user, Realm: req.Realm, Database: req.Database}
-	if req.SavePassword {
-		if err := s.cfg.CredentialStore.Set(credentialKey, password); err != nil {
-			response.Warning = "Connected, but the operating-system credential store could not save the password."
-			s.log.Warn("studio credential save failed", "user", sess.user, "err", err.Error())
-		} else {
-			response.CredentialSaved = true
-		}
-	}
-	s.log.Info("studio reconnect", "user", sess.user, "realm", req.Realm, "database", req.Database)
-	writeJSON(w, http.StatusOK, response)
 }
 
 // handleStudioTable lazy-loads the server-authorized metadata for one table.

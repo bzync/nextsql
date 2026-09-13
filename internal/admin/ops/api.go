@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	nextsql "github.com/bzync/nextsql/drivers/go"
+	"github.com/bzync/nextsql/internal/admin/profile"
 	"github.com/bzync/nextsql/internal/config"
 	"github.com/bzync/nextsql/internal/nerr"
 )
@@ -23,17 +23,56 @@ type loginRequest struct {
 	User     string `json:"user"`
 	Password string `json:"password"`
 	Database string `json:"database"`
+	// Profile is the connection-profile ID to sign in to; empty selects the
+	// default (--server-addr) profile.
+	Profile string `json:"profile"`
 	// Realm is decoded only to refuse it: multi-realm hosting was removed, so
 	// a caller naming a realm asked for something this server will not do.
 	// Silently ignoring it would connect them somewhere they did not choose.
 	Realm string `json:"realm"`
 }
 
-type loginResponse struct {
-	User      string `json:"user"`
-	Database  string `json:"database"`
-	Realm     string `json:"realm"`
-	CSRFToken string `json:"csrf_token"`
+// sessionView is the signed-in identity returned by sign-in, whoami, and a
+// server switch: who the session is, which profile (server) it is bound to,
+// and the CSRF token for its state-changing calls.
+type sessionView struct {
+	Authenticated   bool           `json:"authenticated"`
+	User            string         `json:"user"`
+	Database        string         `json:"database"`
+	Profile         profile.Detail `json:"profile"`
+	CSRFToken       string         `json:"csrf_token"`
+	CredentialSaved bool           `json:"credential_saved,omitempty"`
+	Warning         string         `json:"warning,omitempty"`
+}
+
+// sessionProfile returns the profile a session is bound to. Profiles are
+// fixed for the process's life, so the lookup cannot miss for a session this
+// process created; the default is a defensive fallback only.
+func (s *Server) sessionProfile(sess *session) profile.Profile {
+	if p, ok := s.profileByID[sess.profile]; ok {
+		return p
+	}
+	return s.profiles[0]
+}
+
+func (s *Server) sessionView(sess *session) sessionView {
+	return sessionView{
+		Authenticated: true,
+		User:          sess.user,
+		Database:      sess.database,
+		Profile:       s.sessionProfile(sess).Detail(),
+		CSRFToken:     sess.csrf,
+	}
+}
+
+// lookupProfile resolves a request's profile ID ("" = default).
+func (s *Server) lookupProfile(id string) (profile.Profile, bool) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		id = profile.DefaultID
+	}
+	p, ok := s.profileByID[id]
+	return p, ok
 }
 
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
@@ -47,36 +86,44 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "user and password are required")
 		return
 	}
-
-	base, err := s.cfg.driverConfig()
-	if err != nil {
-		// A misconfigured Manager, not a bad credential.
-		writeError(w, http.StatusInternalServerError, "ops TLS configuration error")
-		s.log.Error("ops driver config", "err", err.Error())
-		return
-	}
-	base.User = req.User
-	base.Password = req.Password
-	base.Database = strings.TrimSpace(req.Database)
 	if strings.TrimSpace(req.Realm) != "" {
 		writeError(w, http.StatusBadRequest, "realm selection was removed: a NextSQL deployment serves exactly one database")
 		return
 	}
-	base.Realm = ""
-
-	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
-	defer cancel()
-	conn, err := nextsql.OpenContext(ctx, base)
-	if err != nil {
-		status, msg := loginErrorStatus(err)
-		writeError(w, status, msg)
-		s.log.Info("ops login failed", "user", req.User, "status", status)
+	target, ok := s.lookupProfile(req.Profile)
+	if !ok {
+		writeError(w, http.StatusBadRequest, "unknown connection profile")
 		return
 	}
 
-	sess, err := s.sessions.create(conn, req.User, base.Database, "")
+	base, err := driverConfigFor(target)
 	if err != nil {
-		_ = conn.Close()
+		// A misconfigured Admin, not a bad credential.
+		writeError(w, http.StatusInternalServerError, "ops TLS configuration error")
+		s.log.Error("ops driver config", "profile", target.ID, "err", err.Error())
+		return
+	}
+	base.User = req.User
+	base.Password = req.Password
+	if db := strings.TrimSpace(req.Database); db != "" {
+		base.Database = db
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+	defer cancel()
+	conn, err := s.open(ctx, base)
+	if err != nil {
+		status, msg := loginErrorStatus(err)
+		writeError(w, status, msg)
+		s.log.Info("ops login failed", "user", req.User, "profile", target.ID, "status", status)
+		return
+	}
+
+	sess, err := s.sessions.create(conn, req.User, base.Database, target.ID)
+	if err != nil {
+		if conn != nil {
+			_ = conn.Close()
+		}
 		if nerr.HasCode(err, nerr.Exhausted) {
 			writeError(w, http.StatusServiceUnavailable, "too many active Manager sessions")
 			return
@@ -86,22 +133,12 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	setSessionCookie(w, sess.id, s.tls)
-	s.log.Info("ops login", "user", req.User, "sessions", s.sessions.len())
-	realm, database := sess.target()
-	writeJSON(w, http.StatusOK, loginResponse{
-		User: sess.user, Database: database, Realm: realm, CSRFToken: sess.csrf,
-	})
+	s.log.Info("ops login", "user", req.User, "profile", target.ID, "sessions", s.sessions.len())
+	writeJSON(w, http.StatusOK, s.sessionView(sess))
 }
 
 func (s *Server) handleWhoami(w http.ResponseWriter, _ *http.Request, sess *session) {
-	realm, database := sess.target()
-	writeJSON(w, http.StatusOK, map[string]any{
-		"authenticated": true,
-		"user":          sess.user,
-		"database":      database,
-		"realm":         realm,
-		"csrf_token":    sess.csrf,
-	})
+	writeJSON(w, http.StatusOK, s.sessionView(sess))
 }
 
 // handleConnection reports whether this admin session's driver connection
@@ -112,12 +149,12 @@ func (s *Server) handleWhoami(w http.ResponseWriter, _ *http.Request, sess *sess
 func (s *Server) handleConnection(w http.ResponseWriter, r *http.Request, sess *session) {
 	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
 	defer cancel()
-	realm, database := sess.target()
+	p := s.sessionProfile(sess)
 	out := map[string]any{
-		"server_addr": s.cfg.ServerAddr,
+		"server_addr": p.Address,
+		"profile":     p.Detail(),
 		"user":        sess.user,
-		"database":    database,
-		"realm":       realm,
+		"database":    sess.database,
 	}
 	if err := sess.ping(ctx); err != nil {
 		out["connected"] = false
@@ -506,8 +543,7 @@ func (s *Server) handleDiagnosticsBundle(w http.ResponseWriter, r *http.Request,
 		"version":      1,
 		"generated_at": b.GeneratedAt,
 		"connection": func() map[string]any {
-			realm, database := sess.target()
-			return map[string]any{"user": sess.user, "database": database, "realm": realm}
+			return map[string]any{"user": sess.user, "database": sess.database, "profile": sess.profile}
 		}(),
 		"note": "Assembled from admin-only system.* read surfaces only. " +
 			"config/tls/key_versions are redacted at their source and carry " +

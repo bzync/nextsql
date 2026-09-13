@@ -1,6 +1,6 @@
-# NextSQL Development Guide
+# Development
 
-> Local development, build, test, fuzz, benchmark, and debugging workflow.
+Local build, test, fuzz, benchmark, and debugging workflow.
 
 ---
 

@@ -113,6 +113,19 @@ func CreateTableSQLWithParents(t *catalog.Table, parents map[string]*catalog.Tab
 		b.WriteString(", ")
 		b.WriteString(clause)
 	}
+	// Checks render as named table-level constraints regardless of whether
+	// they were written beside a column, so the emitted DDL round-trips to the
+	// same catalog and DROP CONSTRAINT has a name to take.
+	for _, c := range t.Checks {
+		if c.Name == "" || c.Expr == nil {
+			return "", nerr.New(nerr.InvalidFormat, "catalog.ddl.CreateTableSQL", "invalid CHECK constraint")
+		}
+		b.WriteString(", CONSTRAINT ")
+		b.WriteString(QuoteIdent(c.Name))
+		b.WriteString(" CHECK (")
+		b.WriteString(catalog.FormatExpr(c.Expr))
+		b.WriteByte(')')
+	}
 	b.WriteByte(')')
 	return b.String(), nil
 }

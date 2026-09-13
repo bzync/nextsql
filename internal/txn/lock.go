@@ -100,6 +100,7 @@ func (lm *LockManager) AcquireContext(ctx context.Context, txn format.TxnID, key
 	lm.mu.Lock()
 	if lm.canGrantKey(txn, k, key, mode) {
 		lm.grantKey(txn, k, mode, tag)
+		lm.refreshWaitsForKey(key)
 		lm.mu.Unlock()
 		return nil
 	}
@@ -133,6 +134,7 @@ func (lm *LockManager) AcquireRangeContext(ctx context.Context, txn format.TxnID
 	lm.mu.Lock()
 	if lm.canGrantRange(txn, start, end, mode) {
 		lm.grantRange(txn, start, end, mode, tag)
+		lm.refreshWaitsForRange(start, end)
 		lm.mu.Unlock()
 		return nil
 	}
@@ -396,6 +398,34 @@ func (lm *LockManager) blockersRange(self format.TxnID, start, end []byte, mode 
 	return out
 }
 
+// refreshWaitsForKey rebuilds the wait-for edges of queued requests that a
+// new holder of key can block. A compatible grant (a shared lock beside other
+// shared holders) is made immediately even while an exclusive request waits on
+// the same key, so without this the waiter's edges would omit the new holder
+// and a cycle through it would go undetected.
+func (lm *LockManager) refreshWaitsForKey(key []byte) {
+	for _, w := range lm.waiters {
+		switch {
+		case w.rng == nil && w.key == string(key):
+			lm.setWait(w.txn, lm.blockersKey(w.txn, w.key, []byte(w.key), w.mode))
+		case w.rng != nil && inRange(key, w.rng.start, w.rng.end):
+			lm.setWait(w.txn, lm.blockersRange(w.txn, w.rng.start, w.rng.end, w.mode))
+		}
+	}
+}
+
+// refreshWaitsForRange is refreshWaitsForKey for a granted range.
+func (lm *LockManager) refreshWaitsForRange(start, end []byte) {
+	for _, w := range lm.waiters {
+		switch {
+		case w.rng == nil && inRange([]byte(w.key), start, end):
+			lm.setWait(w.txn, lm.blockersKey(w.txn, w.key, []byte(w.key), w.mode))
+		case w.rng != nil && rangeOverlap(start, end, w.rng.start, w.rng.end):
+			lm.setWait(w.txn, lm.blockersRange(w.txn, w.rng.start, w.rng.end, w.mode))
+		}
+	}
+}
+
 func (lm *LockManager) setWait(txn format.TxnID, blockers []format.TxnID) {
 	m := make(map[format.TxnID]struct{}, len(blockers))
 	for _, b := range blockers {
@@ -467,6 +497,20 @@ func (lm *LockManager) wake() {
 			again = true
 		}
 		lm.waiters = kept
+	}
+	// Every waiter still queued is now blocked by whoever holds its key after
+	// these grants, not by the transaction that released it. Rebuild each
+	// edge so cycle detection sees the current wait-for graph. Leaving them
+	// stale let a deadlock that formed after a hand-off go undetected: the
+	// cycle check followed an edge to a transaction that had already
+	// released and was waiting on nothing, and both real participants
+	// waited out their whole statement budget.
+	for _, w := range lm.waiters {
+		if w.rng != nil {
+			lm.setWait(w.txn, lm.blockersRange(w.txn, w.rng.start, w.rng.end, w.mode))
+		} else {
+			lm.setWait(w.txn, lm.blockersKey(w.txn, w.key, []byte(w.key), w.mode))
+		}
 	}
 }
 

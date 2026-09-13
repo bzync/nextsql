@@ -50,7 +50,9 @@ func (h *Handle) context() context.Context {
 
 // Manager allocates transaction ids, snapshots, and the lock table.
 type Manager struct {
-	mu       sync.Mutex
+	// mu is read-locked by the per-row visibility check (Status) and the
+	// other pure reads, so concurrent scans do not serialize on it.
+	mu       sync.RWMutex
 	next     format.TxnID
 	nextRead uint64
 	active   map[format.TxnID]*Handle
@@ -129,8 +131,8 @@ func (m *Manager) ActiveCount() int {
 	if m == nil {
 		return 0
 	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	return len(m.active)
 }
 
@@ -172,14 +174,14 @@ func (m *Manager) LiveSnapshots() int {
 	if m == nil {
 		return 0
 	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	return len(m.active) + len(m.readers)
 }
 
 func (m *Manager) Status(id format.TxnID) Status {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	return m.statusLocked(id)
 }
 

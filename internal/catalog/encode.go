@@ -28,6 +28,7 @@ const (
 	tableVersionV11 = 11
 	tableVersionV12 = 12
 	tableVersionV13 = 13
+	tableVersionV14 = 14
 	// KeyTable prefixes durable table descriptors in the catalog tree.
 	KeyTable byte = 'T'
 	// KeyStats prefixes durable table statistics in the catalog tree.
@@ -98,9 +99,17 @@ func EncodeTable(t *Table) ([]byte, error) {
 	if err := validateClientTable(t); err != nil {
 		return nil, err
 	}
+	// A descriptor is written at the oldest version that can express it, so a
+	// database that uses no CHECK constraint keeps producing bytes a release
+	// that predates them can still read. Only a table that declares one moves
+	// to v14 — the same opt-in rule the keystore's recovery-key version uses.
+	version := uint16(tableVersion)
+	if len(t.Checks) > 0 {
+		version = tableVersionV14
+	}
 	var buf []byte
 	buf = append(buf, tableMagic...)
-	buf = appendU16(buf, tableVersion)
+	buf = appendU16(buf, version)
 	buf = appendU32(buf, t.ID)
 	buf = appendString(buf, t.Name)
 	buf = appendU64(buf, uint64(t.HeapMeta))
@@ -197,6 +206,27 @@ func EncodeTable(t *Table) ([]byte, error) {
 	// mode is valid only when the v10 client-encryption flag is present.
 	for _, col := range t.Columns {
 		buf = append(buf, col.ClientEncryptionMode)
+	}
+	if version >= tableVersionV14 {
+		// v14: CHECK constraints, name plus predicate, in declaration order.
+		if len(t.Checks) > MaxChecksPerTable {
+			return nil, nerr.New(nerr.InvalidArgument, "catalog.EncodeTable", "too many CHECK constraints")
+		}
+		buf = appendU16(buf, uint16(len(t.Checks)))
+		for _, c := range t.Checks {
+			if c.Name == "" || len(c.Name) > maxCheckNameLen {
+				return nil, nerr.New(nerr.InvalidArgument, "catalog.EncodeTable", "invalid CHECK constraint name")
+			}
+			if c.Expr == nil {
+				return nil, nerr.New(nerr.InvalidArgument, "catalog.EncodeTable", "CHECK constraint has no predicate")
+			}
+			buf = appendString(buf, c.Name)
+			var err error
+			buf, err = appendExpr(buf, c.Expr)
+			if err != nil {
+				return nil, err
+			}
+		}
 	}
 	return buf, nil
 }
@@ -744,6 +774,39 @@ func DecodeTable(raw []byte) (*Table, error) {
 		}
 		if err := validateClientTable(t); err != nil {
 			return nil, nerr.Wrap(nerr.InvalidFormat, "catalog.DecodeTable", "invalid ENCRYPTED CLIENT table", err)
+		}
+	}
+	if ver >= tableVersionV14 {
+		n, off2, err := takeU16(raw, off)
+		if err != nil {
+			return nil, err
+		}
+		off = off2
+		if int(n) > MaxChecksPerTable {
+			return nil, nerr.New(nerr.InvalidFormat, "catalog.DecodeTable", "too many CHECK constraints")
+		}
+		names := make(map[string]struct{}, n)
+		for i := 0; i < int(n); i++ {
+			name, off2, err := takeString(raw, off)
+			if err != nil {
+				return nil, err
+			}
+			if name == "" || len(name) > maxCheckNameLen {
+				return nil, nerr.New(nerr.InvalidFormat, "catalog.DecodeTable", "invalid CHECK constraint name")
+			}
+			if _, dup := names[name]; dup {
+				return nil, nerr.New(nerr.InvalidFormat, "catalog.DecodeTable", "duplicate CHECK constraint name")
+			}
+			names[name] = struct{}{}
+			expr, off3, err := takeExpr(raw, off2)
+			if err != nil {
+				return nil, err
+			}
+			if expr == nil {
+				return nil, nerr.New(nerr.InvalidFormat, "catalog.DecodeTable", "CHECK constraint has no predicate")
+			}
+			off = off3
+			t.Checks = append(t.Checks, Check{Name: name, Expr: expr})
 		}
 	}
 	if off != len(raw) {

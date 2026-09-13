@@ -1,8 +1,7 @@
 # NSQL reference
 
 Companion to `SKILL.md`. Authoritative source is `docs/sql.md` and the
-per-model docs; this is a working summary for the current release (**0.0.1**;
-driver packages are `0.1.1`).
+per-model docs; this is a working summary for the current release (**0.0.1**).
 
 ## Types
 
@@ -42,7 +41,7 @@ indexes store secondary key + primary key.
 
 ```text
 CREATE TABLE [FOREIGN KEY / REFERENCES …] [PARTITION BY RANGE|HASH|LIST]
-CREATE DATABASE [IF NOT EXISTS]            -- new file, same directory; not in a txn
+CREATE TABLE name PRIMARY KEY (col, …) AS <query>  -- snapshot; types from the query's output
 DROP TABLE [IF EXISTS]
 ALTER TABLE  ADD/DROP [COLUMN] | RENAME [COLUMN] … TO | RENAME TO
              | ADD/DROP CONSTRAINT | ADD FOREIGN KEY
@@ -52,13 +51,15 @@ CREATE SPATIAL INDEX
 CREATE FULLTEXT INDEX [WITH (ANALYZER = 'simple'|'english'|'french'|'german'|'spanish')]
 CREATE VECTOR INDEX … USING HNSW | IVF | IVFPQ | SPARSE
 DROP INDEX [IF EXISTS] | REBUILD INDEX [ONLINE] | MAINTAIN INDEX|TABLE|DATABASE
-INSERT [RETURNING]
-UPSERT [ON UNIQUE (cols)] [SET …] [RETURNING]
+INSERT VALUES (...) | <query>  [RETURNING]   -- query source: SELECT / set op / WITH
+UPSERT [ON UNIQUE (cols)] [SET …] [RETURNING]  -- VALUES only
 SELECT [WITH] [DISTINCT] [JOIN …] [WHERE] [GROUP BY] [HAVING]
        [SEARCH …] [NEAREST …] [NEAREST …] [ORDER BY] [LIMIT] [OFFSET]
 UPDATE [WHERE] [LIMIT] [RETURNING]         -- LIMIT only, no ORDER BY
 DELETE [WHERE] [LIMIT] [RETURNING]
 BEGIN [READ COMMITTED | SNAPSHOT | SERIALIZABLE] / COMMIT / ROLLBACK [TRANSACTION]
+SAVEPOINT name / ROLLBACK TO [SAVEPOINT] name / RELEASE [SAVEPOINT] name
+BACKUP DATABASE / VERIFY BACKUP 'name'
 ANALYZE [table]
 EXPLAIN [ANALYZE] <statement>
 CREATE/ALTER/DROP WORKFLOW | RUN WORKFLOW | CREATE/ALTER/DROP TRIGGER
@@ -71,6 +72,15 @@ SHOW DATABASES | TABLES | INDEXES | CONNECTIONS | QUERIES | TRANSACTIONS | LOCKS
 ```
 
 `SELECT 1` and other FROM-less `SELECT`s are accepted (health checks, `NOW()`).
+
+`INSERT INTO t [(cols)] <query>` fills a table from a `SELECT`, set operation
+or `WITH`. The query's output columns must match the columns written; omitted
+columns take their `DEFAULT`; constraints, triggers and foreign keys apply as
+for `VALUES`. It needs `SELECT` on every relation the query reads as well as
+`INSERT` on the target. The source is read before anything is written, so
+`INSERT INTO t SELECT ... FROM t` doubles `t` once. A query source cannot write
+an `ENCRYPTED CLIENT` column and cannot appear in a workflow body; `UPSERT`
+takes `VALUES` only.
 
 ## Functions
 

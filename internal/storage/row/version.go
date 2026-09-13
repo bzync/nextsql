@@ -17,6 +17,10 @@ const (
 	curVersion = 1
 )
 
+// HeaderSize is the number of bytes the MVCC header adds to every
+// transactionally written leaf value.
+const HeaderSize = headerSize
+
 // Version is one row version: current → undo → previous.
 type Version struct {
 	Xmin    format.TxnID

@@ -7,7 +7,11 @@ import (
 	"github.com/bzync/nextsql/internal/sql/types"
 )
 
-func bindInsertRows(table string, columns []string, rows [][]ast.Expr, lookup Lookup, kind string) (*catalog.Table, []int, error) {
+// insertTarget resolves the target relation and the ordinals an INSERT or
+// UPSERT writes: the named column list, or every column in declaration order
+// when none is given. Both the VALUES and the query form use it, so the two
+// agree on which columns a bare `INSERT INTO t` fills.
+func insertTarget(table string, columns []string, lookup Lookup) (*catalog.Table, []int, error) {
 	tab, err := mustTable(lookup, table)
 	if err != nil {
 		return nil, nil, err
@@ -17,19 +21,27 @@ func bindInsertRows(table string, columns []string, rows [][]ast.Expr, lookup Lo
 		for i := range tab.Columns {
 			cols = append(cols, i)
 		}
-	} else {
-		seen := make(map[int]struct{}, len(columns))
-		for _, name := range columns {
-			i, ok := tab.ColIndex(name)
-			if !ok {
-				return nil, nil, nerr.New(nerr.NotFound, "sql.binder", "unknown insert column")
-			}
-			if _, dup := seen[i]; dup {
-				return nil, nil, nerr.New(nerr.InvalidArgument, "sql.binder", "duplicate insert column")
-			}
-			seen[i] = struct{}{}
-			cols = append(cols, i)
+		return tab, cols, nil
+	}
+	seen := make(map[int]struct{}, len(columns))
+	for _, name := range columns {
+		i, ok := tab.ColIndex(name)
+		if !ok {
+			return nil, nil, nerr.New(nerr.NotFound, "sql.binder", "unknown insert column: "+name)
 		}
+		if _, dup := seen[i]; dup {
+			return nil, nil, nerr.New(nerr.InvalidArgument, "sql.binder", "duplicate insert column: "+name)
+		}
+		seen[i] = struct{}{}
+		cols = append(cols, i)
+	}
+	return tab, cols, nil
+}
+
+func bindInsertRows(table string, columns []string, rows [][]ast.Expr, lookup Lookup, kind string) (*catalog.Table, []int, error) {
+	tab, cols, err := insertTarget(table, columns, lookup)
+	if err != nil {
+		return nil, nil, err
 	}
 	for _, row := range rows {
 		if len(row) != len(cols) {
@@ -314,4 +326,61 @@ func sameIntSet(a, b []int) bool {
 		}
 	}
 	return len(seen) == 0
+}
+
+// bindInsertQuery binds `INSERT INTO t [(cols)] <query> [RETURNING ...]`.
+//
+// The query is bound by the ordinary query binder, so it is the same relation
+// it would be on its own -- joins, aggregates, set operations, CTEs and views
+// all behave identically, and its tables are authorized as reads in the usual
+// way. What this adds is the match between the query's output columns and the
+// columns being written.
+func bindInsertQuery(s ast.Insert, lookup Lookup, nextID uint32, ctes map[string]*CTE) (Bound, error) {
+	for _, item := range s.Returning {
+		if err := rejectClientEncryptedSubqueryExpr(item.Expr, lookup, ctes); err != nil {
+			return nil, err
+		}
+	}
+	tab, cols, err := insertTarget(s.Table, s.Columns, lookup)
+	if err != nil {
+		return nil, err
+	}
+	if tab.Partitioning != nil && tab.Partitioning.Kind == catalog.PartitionLegacyTenant {
+		// Legacy shared-tenant tables are compatibility/migration surface
+		// only, exactly as for UPSERT.
+		return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "INSERT ... <query> is not supported on legacy TENANT-partitioned tables")
+	}
+	// An ENCRYPTED CLIENT column accepts only an encrypted parameter, NULL, or
+	// a direct ciphertext copy -- none of which a query's output column can be
+	// shown to be at bind time. Refuse rather than write plaintext into a
+	// column declared encrypted.
+	for _, i := range cols {
+		if tab.Columns[i].ClientEncrypted() {
+			return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "INSERT ... <query> cannot write the ENCRYPTED CLIENT column: "+tab.Columns[i].Name)
+		}
+	}
+	// A FROM-less SELECT is evaluated outside the query pipeline, so it cannot
+	// be bound as a source relation. The plain shape never reaches here (the
+	// parser turns it into the equivalent VALUES row); what remains is one
+	// that filters, orders, bounds or deduplicates, and it is refused by name
+	// rather than through a confusing "unknown table".
+	if sel, ok := s.Query.(ast.Select); ok && sel.NoFrom {
+		return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "INSERT from a FROM-less SELECT accepts only a plain select list; write VALUES instead")
+	}
+	q, err := bind(s.Query, lookup, nextID, ctes)
+	if err != nil {
+		return nil, err
+	}
+	names, ok := boundNames(q)
+	if !ok {
+		return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "INSERT source must be a query")
+	}
+	if len(names) != len(cols) {
+		return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "INSERT column count does not match the query's column count")
+	}
+	ret, err := bindReturning(s.ReturningStar, s.Returning, tab, nil)
+	if err != nil {
+		return nil, err
+	}
+	return Insert{Table: tab, Columns: cols, Query: q, Returning: ret}, nil
 }

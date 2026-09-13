@@ -1,8 +1,7 @@
-# NextSQL Environment Variables
+# Environment variables
 
-This document is the authoritative environment-variable contract for NextSQL.
-It separates deployment settings, server/bootstrap credentials, and database
-client credentials so that one scope cannot silently become another.
+Deployment settings, server/bootstrap credentials, and database client
+credentials are separate scopes. One must not silently become another.
 
 ## Naming model
 

@@ -584,6 +584,10 @@ func (s *Session) systemRows(name string, schema *catalog.Table) ([][]types.Valu
 		return s.systemIndexesRows()
 	case "system.foreign_keys":
 		return s.systemForeignKeysRows()
+	case "system.checks":
+		return s.systemChecksRows()
+	case "system.views":
+		return s.systemViewsRows()
 	case "system.table_ddl":
 		return s.systemTableDDLRows()
 	case "system.triggers":
@@ -779,6 +783,65 @@ func (s *Session) systemIndexesRows() ([][]types.Value, error) {
 			return out[i][1].Str < out[j][1].Str
 		}
 		return out[i][0].Str < out[j][0].Str
+	})
+	return out, nil
+}
+
+// systemViewsRows lists views with their stored definition. A definition names
+// the tables it reads, so it is shown only to an admin or to the view's owner —
+// the same reasoning that keeps a table out of system.tables for a caller who
+// cannot select from it.
+func (s *Session) systemViewsRows() ([][]types.Value, error) {
+	if s == nil || s.db == nil {
+		return [][]types.Value{}, nil
+	}
+	admin := s.acl == nil || s.isAdmin()
+	views := s.listViews()
+	sort.Slice(views, func(i, j int) bool { return views[i].Name < views[j].Name })
+	out := make([][]types.Value, 0, len(views))
+	for _, v := range views {
+		if v == nil {
+			continue
+		}
+		if !admin && !strings.EqualFold(v.Owner, s.user) {
+			continue
+		}
+		out = append(out, []types.Value{
+			types.StringValue(v.Name),
+			types.StringValue(v.Owner),
+			types.StringValue(strings.Join(v.Columns, ", ")),
+			types.StringValue(v.Query),
+		})
+	}
+	return out, nil
+}
+
+// systemChecksRows lists CHECK constraints, one row per constraint, filtered
+// by table visibility exactly like system.foreign_keys.
+func (s *Session) systemChecksRows() ([][]types.Value, error) {
+	if s.db == nil || s.db.Cat == nil {
+		return [][]types.Value{}, nil
+	}
+	list := s.db.Cat.List()
+	sort.Slice(list, func(i, j int) bool { return list[i].Name < list[j].Name })
+	var out [][]types.Value
+	for _, t := range list {
+		if !s.canSeeTable(t.Name) {
+			continue
+		}
+		for _, c := range t.Checks {
+			out = append(out, []types.Value{
+				types.StringValue(t.Name),
+				types.StringValue(c.Name),
+				types.StringValue(catalog.FormatExpr(c.Expr)),
+			})
+		}
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i][0].Str != out[j][0].Str {
+			return out[i][0].Str < out[j][0].Str
+		}
+		return out[i][1].Str < out[j][1].Str
 	})
 	return out, nil
 }

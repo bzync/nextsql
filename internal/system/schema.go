@@ -71,6 +71,17 @@ func init() {
 		{Name: "on_delete", Type: types.String()},
 		{Name: "on_update", Type: types.String()},
 	})
+	register("views", []catalog.Column{
+		{Name: "view_name", Type: types.String()},
+		{Name: "owner", Type: types.String()},
+		{Name: "columns", Type: types.String()},
+		{Name: "definition", Type: types.String()},
+	})
+	register("checks", []catalog.Column{
+		{Name: "table_name", Type: types.String()},
+		{Name: "constraint_name", Type: types.String()},
+		{Name: "predicate", Type: types.String()},
+	})
 	register("table_ddl", []catalog.Column{
 		{Name: "table_name", Type: types.String()},
 		{Name: "object_type", Type: types.String()},
@@ -493,6 +504,8 @@ func Capabilities() [][]types.Value {
 		rowCap("field_encryption_client", "supported", "server-opaque randomized NSCE1 and opt-in deterministic NSCE2 ENCRYPTED CLIENT fields; Go, Node.js/TypeScript, Bun, and PHP helpers", version.String),
 		rowCap("expression_indexes", "supported", "expression indexes", "0.1.0"),
 		rowCap("foreign_keys", "supported", "FOREIGN KEY constraints", "0.1.0"),
+		rowCap("checks", "supported", "CHECK constraints", "0.1.0"),
+		rowCap("views", "supported", "views", "0.1.0"),
 		rowCap("fulltext", "supported", "full-text SEARCH with simple and language analyzers, prefix/fuzzy/typo matching, HIGHLIGHT/SNIPPET, multi-field indexes, per-field WEIGHT, and FACET histograms", "0.1.0"),
 		rowCap("geo", "supported", "rich POINT/BOX/LINESTRING/POLYGON operations and spatial index", "0.1.0"),
 		rowCap("hybrid_search", "supported", "hybrid SEARCH+NEAREST and dense+sparse+BM25 fusion", "0.1.0"),

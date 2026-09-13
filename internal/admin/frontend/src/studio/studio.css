@@ -456,6 +456,235 @@
 .nss-editor-host > div > div:last-child > div[aria-hidden="true"] {
   color: var(--color-muted-foreground);
 }
+
+/* NextSQL Studio Code Editor */
+.nss-sql-editor {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  border-radius: var(--radius-xl, 12px);
+  border: 1px solid var(--color-border);
+  background: var(--color-surface);
+  overflow: hidden;
+  box-shadow: 0 1px 2px 0 rgba(0, 0, 0, 0.05);
+}
+
+.nss-sql-editor:focus-within {
+  outline: 2px solid var(--color-accent-500);
+  outline-offset: 2px;
+}
+
+.nss-sql-editor-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 14px;
+  background: var(--color-surface-muted);
+  border-bottom: 1px solid var(--color-border);
+  user-select: none;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+.nss-sql-editor-badge {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  color: var(--color-muted-foreground);
+}
+
+.nss-sql-editor-header-right {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  font-size: 11px;
+  color: var(--color-muted-foreground);
+}
+
+.nss-sql-editor-sel {
+  color: var(--color-foreground);
+  font-weight: 500;
+}
+
+.nss-sql-editor-body {
+  position: relative;
+  display: flex;
+  background: var(--color-surface);
+  min-height: 250px;
+}
+
+.nss-sql-editor-gutter {
+  padding: 12px 10px 12px 14px;
+  text-align: right;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  font-size: 13.5px;
+  line-height: 24px;
+  user-select: none;
+  overflow: hidden;
+  border-right: 1px solid var(--color-border);
+  background: var(--color-surface-muted);
+  color: var(--color-muted-foreground);
+  min-width: 44px;
+  box-sizing: border-box;
+}
+
+.nss-sql-editor-gutter-line {
+  height: 24px;
+  line-height: 24px;
+}
+
+.nss-sql-editor-surface {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  min-height: 250px;
+}
+
+.nss-sql-editor-highlight,
+.nss-sql-editor-textarea {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  padding: 12px 16px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace !important;
+  font-size: 13.5px !important;
+  line-height: 24px !important;
+  letter-spacing: 0 !important;
+  tab-size: 2 !important;
+  -moz-tab-size: 2 !important;
+  white-space: pre !important;
+  word-wrap: normal !important;
+  word-break: normal !important;
+  overflow-wrap: normal !important;
+  box-sizing: border-box !important;
+}
+
+.nss-sql-editor-highlight {
+  overflow: hidden;
+  pointer-events: none;
+  user-select: none;
+  background: transparent;
+  color: var(--color-foreground);
+  z-index: 1;
+}
+
+.nss-sql-editor-highlight code {
+  font-family: inherit !important;
+  font-size: inherit !important;
+  line-height: inherit !important;
+  background: transparent !important;
+  padding: 0 !important;
+}
+
+.nss-sql-editor-textarea {
+  color: transparent !important;
+  -webkit-text-fill-color: transparent !important;
+  caret-color: var(--color-foreground) !important;
+  background: transparent !important;
+  border: none !important;
+  outline: none !important;
+  resize: none;
+  overflow: auto;
+  z-index: 2;
+}
+
+.nss-sql-editor-textarea::placeholder {
+  color: var(--color-muted-foreground) !important;
+  -webkit-text-fill-color: var(--color-muted-foreground) !important;
+}
+
+.nss-sql-editor-textarea::selection {
+  background: rgba(99, 102, 241, 0.3) !important;
+}
+
+.nss-sql-editor--plain .nss-sql-editor-textarea {
+  color: var(--color-foreground) !important;
+  -webkit-text-fill-color: var(--color-foreground) !important;
+}
+
+/* Syntax Highlighting Tokens - WCAG AA compliant contrast */
+.nss-token-keyword {
+  color: #7c3aed;
+  font-weight: 600;
+}
+.dark .nss-token-keyword {
+  color: #c084fc;
+  font-weight: 600;
+}
+
+.nss-token-type {
+  color: #0f766e;
+  font-weight: 500;
+}
+.dark .nss-token-type {
+  color: #5eead4;
+  font-weight: 500;
+}
+
+.nss-token-function {
+  color: #0284c7;
+  font-weight: 500;
+}
+.dark .nss-token-function {
+  color: #38bdf8;
+  font-weight: 500;
+}
+
+.nss-token-string {
+  color: #15803d;
+}
+.dark .nss-token-string {
+  color: #86efac;
+}
+
+.nss-token-number {
+  color: #b45309;
+}
+.dark .nss-token-number {
+  color: #fde047;
+}
+
+.nss-token-comment {
+  color: var(--color-muted-foreground);
+  font-style: italic;
+}
+.dark .nss-token-comment {
+  color: var(--color-muted-foreground);
+  font-style: italic;
+}
+
+.nss-token-operator {
+  color: #475569;
+}
+.dark .nss-token-operator {
+  color: #cbd5e1;
+}
+
+.nss-token-punctuation {
+  color: #64748b;
+}
+.dark .nss-token-punctuation {
+  color: #94a3b8;
+}
+
+.nss-token-parameter {
+  color: #c2410c;
+  font-weight: 500;
+}
+.dark .nss-token-parameter {
+  color: #fdba74;
+  font-weight: 500;
+}
+
+.nss-token-identifier {
+  color: var(--color-foreground);
+}
+
+.nss-token-plain {
+  color: var(--color-foreground);
+}
 .nss-query-status { min-height: 24px; }
 .nss-table-fixes { display: flex; flex-direction: column; gap: 8px; }
 .nss-parse-diags { display: flex; flex-direction: column; gap: 8px; }
@@ -823,6 +1052,14 @@
   .nss-more-group + .nss-more-group { border-top-width: 2px; }
 }
 
+@media (forced-colors: active) {
+  .nss-sql-editor-highlight { display: none; }
+  .nss-sql-editor-textarea {
+    color: CanvasText !important;
+    -webkit-text-fill-color: CanvasText !important;
+  }
+}
+
 .nss-schema-diagram-scroll {
   overflow: auto;
   max-height: 460px;
@@ -988,4 +1225,3 @@
   border-radius: var(--radius-sm);
   background: var(--color-surface-muted);
 }
-

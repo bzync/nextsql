@@ -43,7 +43,7 @@ Client                                         Server
 14..   database       utf8 bytes
 ..     user_len       u16 username length
 ..     user           utf8 bytes
-..     realm_len      u16 reserved (0x0000)
+..     reserved_len   u16 reserved, must be 0x0000
 
 # Query (Type 0x05, C→S)
 0-3    sql_len        u32 SQL statement byte length (max 16 MiB)
@@ -63,7 +63,7 @@ Client                                         Server
 
 | Type | Direction | Payload |
 |---|---|---|
-| Hello | C→S | version, flags, cancel secret, database, user, realm (optional trailing field; reserved, must be empty) |
+| Hello | C→S | version, flags, cancel secret, database, user, reserved (optional trailing field; must be empty) |
 | HelloOK | S→C | version, auth method (1 = password), cancel secret, accepted capability flags (optional trailing `u16`) |
 | Auth | C→S | password (TLS) |
 | AuthOK | S→C | empty |
@@ -150,7 +150,7 @@ conn = NextSQL.connect(NextSQL::Config.new(
   `connect_cluster`) that routes eligible reads to a healthy follower; the
   server enforces every barrier regardless. See [HA](/docs/ha).
 - Each deployment serves exactly one database. Hello may name that database;
-  an empty name accepts the deployment default, while another database or any
-  non-empty realm is rejected without disclosing deployment names.
+  an empty name accepts the deployment default, while another database name is
+  rejected without disclosing deployment names.
 
 See [Drivers](/docs/drivers) for language-specific examples and [TLS](/docs/tls) for unlock-over-TLS (`TypeUnlock`).

@@ -2,9 +2,9 @@ package executor
 
 import (
 	"fmt"
-	"strings"
 	"math"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/bzync/nextsql/internal/sql/types"
@@ -219,7 +219,7 @@ func TestSpatialS3(t *testing.T) {
 	}
 	usedIndex := false
 	for _, row := range ex.Rows {
-		if l := row[0].String(); (contains2(l, "IndexScan") && contains2(l, "spatial")) {
+		if l := row[0].String(); contains2(l, "IndexScan") && contains2(l, "spatial") {
 			usedIndex = true
 		}
 	}

@@ -182,8 +182,18 @@ max_connections=128
 max_connections_per_user=0
 max_connections_per_database=0
 max_connections_per_realm=0
+max_concurrent_password_hashes=0
 idle_timeout_ms=60000
 ```
+
+`max_concurrent_password_hashes` (default 0 = one per four schedulable CPUs,
+at least two) bounds how many password hashes run at once. Each allocates its
+full Argon2id memory cost, 64 MiB, before the client is authenticated, so peak
+login memory is this value times 64 MiB. A client that cannot get a slot within
+its connection's idle deadline is refused with `exhausted`. A larger value only
+adds memory: each hash already uses four cores, so throughput stops rising once
+hashes outnumber CPUs/4. Measured on 12 CPUs, the default completed a burst of
+120 logins at 86/s; unbounded, it managed 51/s with 12× the peak memory.
 
 `max_connections` (default 128) rejects a new TCP/TLS accept once the
 process-wide connection count is reached — before any bytes are read, so it
@@ -451,6 +461,17 @@ node:
    throughout every single node's cycle, so writes never stop landing
    cluster-wide during a properly sequenced rolling upgrade — only the node
    being upgraded itself is briefly unreachable.
+
+**Page deltas across a rolling upgrade.** A database created before page
+deltas has a version-1 WAL, and the default `wal_page_deltas=auto` leaves it
+there. Its leader keeps shipping full page images, which every release can
+apply, so a mixed-version cluster needs no extra step. Set
+`wal_page_deltas=on` only after every node runs a release that reads page
+deltas. A batch carrying a delta is replication batch version 2
+(`docs/wal.md` "Page deltas"). A follower on an older release rejects it and
+stops applying rather than skipping the record and diverging silently. Its
+`system.replica_health.apply_backlog` grows. Upgrade that node and bring it
+back with the replica repair procedure in `docs/ha.md`.
 
 `CLUSTER MAINTENANCE ENABLE` (see above) is not part of this sequence by
 default — draining and restarting one node at a time is already safe on its

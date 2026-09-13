@@ -81,6 +81,9 @@ func (s *Session) eval(e ast.Expr, tab *catalog.Table, row []types.Value) (types
 				}
 				args[i] = v
 			}
+			if v, ok, err := evalPredicateFn(x.Name, args); err != nil || ok {
+				return v, err
+			}
 			if v, ok, err := evalStringFn(x.Name, args); err != nil || ok {
 				return v, err
 			}

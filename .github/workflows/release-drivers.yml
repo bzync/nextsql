@@ -2,8 +2,8 @@ name: Release drivers
 
 # One entry point to publish every official driver package at the same version.
 #
-#   git tag drivers-v0.1.0 && git push origin drivers-v0.1.0
-#     -> checks drivers/{node,bun,python,ruby} manifests all read 0.1.0 and
+#   git tag drivers-v0.0.1 && git push origin drivers-v0.0.1
+#     -> checks drivers/{node,bun,python,ruby} manifests all read 0.0.1 and
 #        drivers/php/composer.json name, then publishes in parallel:
 #          @bzync/nextsql  -> npm
 #          bzync-nextsql   -> PyPI
@@ -33,7 +33,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Driver version to publish, e.g. 0.1.0 (must already be committed in every driver manifest)"
+        description: "Driver version to publish, e.g. 0.0.1 (must already be committed in every driver manifest)"
         required: true
         type: string
 

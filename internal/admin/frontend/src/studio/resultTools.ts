@@ -2498,13 +2498,14 @@ export function applyTableNameFix(sql: string, fix: TableNameFix): string {
 
 // --- Connection environment tagging (production safety) ------------------
 //
-// Studio has no multi-target connection model yet — it always runs on the
-// single nextsqld the Operations-mode login reached. What it can do is let
-// the operator label *that* connection's environment so a production
-// connection shows a standing banner and defaults to a read-only safety
-// mode. The label is a per-viewer browser preference only: it is stored in
-// localStorage keyed by realm/database/user, never sent anywhere, and is
-// not a security boundary (server-side RBAC is). No credential is stored.
+// A session is signed in to one nextsqld server (a connection profile). When
+// the profile file declares that server's environment, that label is
+// authoritative: a "production" profile always shows the standing banner and
+// starts in the read-only safety mode, and the viewer cannot relabel it. A
+// profile without a declared environment can still be labelled by the
+// operator as a per-viewer browser preference, stored in localStorage keyed
+// by connection. Either way the label is advisory, never a security boundary
+// (server-side RBAC is), and no credential is stored.
 
 export const STUDIO_ENVIRONMENTS = ["development", "test", "staging", "production"] as const;
 export type StudioEnvironment = (typeof STUDIO_ENVIRONMENTS)[number];
@@ -2513,102 +2514,40 @@ export function isStudioEnvironment(value: unknown): value is StudioEnvironment 
   return typeof value === "string" && (STUDIO_ENVIRONMENTS as readonly string[]).includes(value);
 }
 
+// connectionScope is the first segment of every per-connection storage key.
+// It used to hold the realm, which was always empty after log #244, so the
+// default profile maps to "" and keeps every key it had — operators' saved
+// queries, drafts, layout, and environment labels survive this change. Any
+// other profile gets "p.<id>": realm names never contained a ".", so a
+// profile key can never collide with a key an older build wrote.
+export function connectionScope(profileId: string | undefined): string {
+  const id = (profileId ?? "").trim();
+  return id === "" || id === "default" ? "" : `p.${id}`;
+}
+
 // environmentStorageKey identifies which localStorage slot a connection's
 // environment label lives in. Segments are sanitized so an exotic
-// realm/database/user name can't break the key shape; this is a storage
-// key, not an identity check.
-export function environmentStorageKey(realm: string, database: string, user: string): string {
+// database/user name can't break the key shape; this is a storage key, not
+// an identity check.
+export function environmentStorageKey(scope: string, database: string, user: string): string {
   const seg = (s: string) => (s || "default").replace(/[^A-Za-z0-9_.-]/g, "_");
-  return `nextsql-studio-env:${seg(realm)}:${seg(database)}:${seg(user || "unknown")}`;
+  return `nextsql-studio-env:${seg(scope)}:${seg(database)}:${seg(user || "unknown")}`;
 }
 
 // editorDraftStorageKey is the localStorage slot for this connection's unsaved
 // editor buffers (crash recovery). Same per-connection scoping and segment
 // sanitization as environmentStorageKey.
-export function editorDraftStorageKey(realm: string, database: string, user: string): string {
+export function editorDraftStorageKey(scope: string, database: string, user: string): string {
   const seg = (s: string) => (s || "default").replace(/[^A-Za-z0-9_.-]/g, "_");
-  return `nextsql-studio-drafts:${seg(realm)}:${seg(database)}:${seg(user || "unknown")}`;
+  return `nextsql-studio-drafts:${seg(scope)}:${seg(database)}:${seg(user || "unknown")}`;
 }
 
 // layoutStorageKey is the localStorage slot for this connection's IDE
 // layout (pane visibility + widths + last selected table name). Same
 // per-connection scoping as the draft buffers. Never a credential.
-export function layoutStorageKey(realm: string, database: string, user: string): string {
+export function layoutStorageKey(scope: string, database: string, user: string): string {
   const seg = (s: string) => (s || "default").replace(/[^A-Za-z0-9_.-]/g, "_");
-  return `nextsql-studio-layout:${seg(realm)}:${seg(database)}:${seg(user || "unknown")}`;
-}
-
-// --- Recent connections (realm/database quick-switch) -----------------
-//
-// A convenience list of realm/database pairs recently switched to on the
-// current nextsqld, scoped per host + user (those are what stay fixed; the
-// realm/database are what vary). No credential is ever stored — a recent
-// entry only prefills the Switch-connection form, which still requires the
-// password. Pure/bounded so the browser storage read/write in the component
-// stays trivial and try/caught.
-
-export const MAX_RECENT_CONNECTIONS = 10;
-const MAX_RECENT_NAME_LEN = 128;
-
-export type RecentConnection = { realm: string; database: string; at: number };
-
-// recentConnectionStorageKey scopes the list to one nextsqld + NSQL user.
-export function recentConnectionStorageKey(serverAddr: string, user: string): string {
-  const seg = (s: string) => (s || "default").replace(/[^A-Za-z0-9_.-]/g, "_");
-  return `nextsql-studio-recents:${seg(serverAddr)}:${seg(user || "unknown")}`;
-}
-
-// parseRecentConnections decodes the stored JSON array. Anything malformed —
-// not an array, wrong field types, over-long names — yields an empty list
-// rather than a throw, matching every other Studio browser-state codec.
-export function parseRecentConnections(raw: string | null): RecentConnection[] {
-  if (!raw) return [];
-  let data: unknown;
-  try {
-    data = JSON.parse(raw);
-  } catch {
-    return [];
-  }
-  if (!Array.isArray(data)) return [];
-  const out: RecentConnection[] = [];
-  for (const item of data) {
-    if (!item || typeof item !== "object") continue;
-    const rec = item as Record<string, unknown>;
-    const realm = typeof rec.realm === "string" ? rec.realm : "";
-    const database = typeof rec.database === "string" ? rec.database : "";
-    const at = typeof rec.at === "number" && Number.isFinite(rec.at) ? rec.at : 0;
-    if (realm.length > MAX_RECENT_NAME_LEN || database.length > MAX_RECENT_NAME_LEN) continue;
-    if (realm === "" && database === "") continue;
-    if (out.some((e) => e.realm === realm && e.database === database)) continue;
-    out.push({ realm, database, at });
-    if (out.length >= MAX_RECENT_CONNECTIONS) break;
-  }
-  return out;
-}
-
-export function serializeRecentConnections(list: RecentConnection[]): string {
-  return JSON.stringify(list.slice(0, MAX_RECENT_CONNECTIONS));
-}
-
-// recordRecentConnection returns a new list with (realm, database) moved to
-// the front (most recent first), de-duplicated, and capped. An all-empty
-// pair (the deployment default) is not worth recording on its own — the
-// toolbar already shows the current connection — so it is dropped.
-export function recordRecentConnection(
-  list: RecentConnection[],
-  realm: string,
-  database: string,
-  now: number,
-): RecentConnection[] {
-  if (realm === "" && database === "") return list.slice(0, MAX_RECENT_CONNECTIONS);
-  const rest = list.filter((e) => !(e.realm === realm && e.database === database));
-  return [{ realm, database, at: now }, ...rest].slice(0, MAX_RECENT_CONNECTIONS);
-}
-
-// recentConnectionLabel renders one entry for a button/menu: "(default)" for
-// an empty segment, "realm / database" otherwise.
-export function recentConnectionLabel(entry: RecentConnection): string {
-  return `${entry.realm || "(default realm)"} / ${entry.database || "(default database)"}`;
+  return `nextsql-studio-layout:${seg(scope)}:${seg(database)}:${seg(user || "unknown")}`;
 }
 
 // --- Workflow trigger/schedule relationship diagram --------------------
@@ -3318,22 +3257,6 @@ export function queryResultSummary(
   return `${prefix}${rows} ${result.rows.length === 1 ? "row" : "rows"} · ${cols} ${result.columns.length === 1 ? "column" : "columns"} · ${ms}${limit}`;
 }
 
-// --- Realm-scoped administration warning -----------------------------
-//
-// CREATE/DROP USER and CREATE/DROP ROLE change the realm-wide principal
-// namespace. NextSQL identities are defined once per realm ("realm
-// identities and roles with database-scoped grants",
-// docs/design-multidatabase-dbaas.md §19), so such a statement reaches
-// every database in the connected realm — not just the one this Studio
-// session is pointed at. The confirm-before-run dialog shows this line so a
-// cross-database change is never made silently. Pure; unit-tested.
-
-export function realmScopeWarning(kind: string, realm: string, database: string): string {
-  const realmLabel = realm.trim() ? `realm "${realm.trim()}"` : "the default realm";
-  const dbLabel = database.trim() ? `the "${database.trim()}" database` : "the current database";
-  return `${kind || "This statement"} changes a realm-wide user or role: it affects every database in ${realmLabel}, not just ${dbLabel} you are connected to.`;
-}
-
 // --- Global command palette ------------------------------------------
 //
 // A keyboard-driven launcher (Ctrl/Cmd+K) over Studio's own actions —
@@ -3493,9 +3416,9 @@ export function filterSavedQueries(
   });
 }
 
-export function savedQueryStorageKey(realm: string, database: string, user: string): string {
+export function savedQueryStorageKey(scope: string, database: string, user: string): string {
   const seg = (s: string) => (s || "default").replace(/[^A-Za-z0-9_.-]/g, "_");
-  return `nextsql-studio-saved:${seg(realm)}:${seg(database)}:${seg(user || "unknown")}`;
+  return `nextsql-studio-saved:${seg(scope)}:${seg(database)}:${seg(user || "unknown")}`;
 }
 
 // --- Git-friendly export / import of the saved-query set ---------------

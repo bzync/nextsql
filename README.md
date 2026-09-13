@@ -1,8 +1,10 @@
 # NextSQL
 
-NextSQL is a high-performance, encrypted-by-default, native multimodel database written in Go. It unifies relational SQL, binary JSON, vector search (HNSW), full-text search (BM25), and geospatial types into **one ACID engine, one write-ahead log (WAL), and one cost-based query optimizer**.
+NextSQL is a high-performance, encrypted-by-default multimodel database written in Go. Relational SQL, binary JSON, vector search (HNSW), full-text search (BM25), and geospatial types share **one ACID engine, one write-ahead log, and one cost-based query optimizer**.
 
-NextSQL is completely native—it is not a wrapper, fork, or compatibility layer for PostgreSQL, MySQL, MongoDB, or Elasticsearch. It has its own 16 KiB page storage engine, SQL dialect, binary wire protocol, and first-party drivers.
+It is a new database — not a wrapper, fork, or compatibility layer for PostgreSQL, MySQL, MongoDB, or Elasticsearch. It has its own 16 KiB page storage engine, SQL dialect, binary wire protocol (NSQL v1), and first-party drivers.
+
+The current release is **0.0.1** (preview). Linux packages are on [GitHub Releases](https://github.com/bzync/nextsql/releases/tag/v0.0.1). On Windows, run them inside [WSL 2](docs/install.md#windows-wsl-2).
 
 ---
 
@@ -37,13 +39,13 @@ LIMIT 20;
 
 ---
 
-## Key Highlights
+## Highlights
 
-- **Unified Multimodel Engine**: Relational, JSON (`NSJB`), vectors (`HNSW`), full-text (`BM25`), and geo (`WGS84`) within a single ACID transaction and shared cost model.
-- **Encrypted by Default**: Transparent AES-256-GCM envelope encryption across data pages, WAL, undo logs, secondary indexes, and backups. Root unlock keys remain strictly outside the data volume.
-- **Strict Durability & ACID**: WAL with group commit and `fsync` before commit acknowledgment. Strict MVCC with snapshot and serializable isolation.
-- **High Availability**: Built-in Raft consensus clustering (minimum 3 nodes) for automatic failover and quorum-replicated writes without external dependencies.
-- **First-Party Native Drivers**: Official drivers speaking the native binary protocol for Go, Node.js, Bun, Python, PHP, and Ruby. Passwords and keys are never sent in connection URLs.
+- **One engine for every model.** Relational columns, JSON (`NSJB`), vectors (`HNSW`), full-text (`BM25`), and geo (`WGS84`) share a single ACID transaction and cost model.
+- **Encrypted by default.** AES-256-GCM envelope encryption on data pages, WAL, undo, indexes, and backups. The root unlock key stays off the data volume.
+- **Durable commits.** Group-commit WAL and `fsync` before a commit is acknowledged. MVCC with snapshot and serializable isolation.
+- **Built-in HA.** Optional Raft cluster (three voting nodes minimum). Writes wait for a quorum. No external coordinator.
+- **Official drivers.** Go, Node.js, Bun, Python, PHP, and Ruby speak NSQL v1. Passwords and keys never go in a connection URL.
 
 ---
 
@@ -56,13 +58,13 @@ go install github.com/bzync/nextsql/cmd/nextsql@latest
 go install github.com/bzync/nextsql/cmd/nextsqld@latest
 ```
 
-*Pre-built Linux (`.deb`, `.rpm`, `.run`) and Windows installers are available via `./scripts/build-installers.sh`.*
+Pre-built Linux installers (`.deb`, `.tar.gz`, `.run`) are on the [v0.0.1 release](https://github.com/bzync/nextsql/releases/tag/v0.0.1). Native Windows is not supported; on Windows, run NextSQL inside [WSL 2](docs/install.md#windows-wsl-2).
 
 ### 2. Initialize and Run
 
 ```bash
 # Initialize encrypted data directory with a root key
-nextsql init --data-dir /var/lib/nextsql --key-file /etc/nextsql/root.key --user app --password-file /tmp/nextsql.pw
+nextsql init --data-dir /var/lib/nextsql --key-file /etc/nextsql/root.key --user app --password-file /tmp/nextsql.pw --database app
 
 # Start the daemon
 nextsqld --data-dir /var/lib/nextsql --key-file /etc/nextsql/root.key --listen 127.0.0.1:7210 --user app --password-file /tmp/nextsql.pw
@@ -77,11 +79,11 @@ nextsql exec --addr 127.0.0.1:7210 --user app --password-file /tmp/nextsql.pw --
 
 ## Documentation
 
-- **[User Manual (`USAGE.md`)](USAGE.md)** — Comprehensive guide to installation, SQL dialect, drivers, backups, and operations.
-- **[Architecture & Scope (`PROJECT.md`)](PROJECT.md)** — Canonical project specification and end-state design.
-- **[Implementation Tracker (`TODO.md`)](TODO.md)** — Development roadmap, phase gates, and benchmark measurements.
-- **[Engineering Contract (`SKILLS.md`)](SKILLS.md)** — Safety invariants, architecture discipline, and verification guidelines.
-- **[Technical Documentation (`docs/`)](docs/)** — In-depth guides for [Storage](docs/storage-format.md), [WAL](docs/wal.md), [MVCC](docs/mvcc.md), [Optimizer](docs/optimizer.md), [Security](docs/security.md), and [HA](docs/ha.md).
+- **[Usage manual](USAGE.md)** — install, SQL, drivers, backups, and operations
+- **[Changelog](CHANGELOG.md)** — what shipped in 0.0.1
+- **[Support](SUPPORT.md)** and **[Security](SECURITY.md)**
+- **[docs/](docs/)** — storage, WAL, MVCC, optimizer, security, and HA
+- Product site: [nextsql.bzync.com](https://nextsql.bzync.com)
 
 ---
 

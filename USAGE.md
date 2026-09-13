@@ -1,83 +1,45 @@
-# NextSQL Usage Manual
+# NextSQL usage manual
 
-End-to-end user documentation for **NextSQL 0.0.1**. This manual documents the **currently usable product surface**, not every capability planned in `PROJECT.md`.
+Operator and application guide for **NextSQL 0.0.1**.
 
-NextSQL is a new database. It is not PostgreSQL, MySQL, MongoDB, Elasticsearch, or a vector-store compatibility layer. It has its own storage format, SQL dialect, wire protocol (NSQL v1), and official drivers.
+NextSQL is a native, encrypted-by-default multimodel database. It is not
+PostgreSQL, MySQL, MongoDB, Elasticsearch, or a vector-store compatibility
+layer. It has its own storage format, SQL dialect, wire protocol (NSQL v1),
+and official drivers.
 
-**Implementation status (2026-09-04):** phases P0–P27 are complete. P28 is
-in progress: `nextsql setup`/`nextsql lifecycle` and the nine-slice Manager
-MVP are complete; standalone GUI installer M1 is implemented and
-targeted-tested, while packaging integration, richer wizard flows,
-accessibility validation, silent-install coverage, and remaining platform
-execution gates are open. Multi-database hosting M2 is complete; M3
-suspend/resume and offline drop are landed, while independent backup/PITR,
-key, and HA lifecycle remain open.
+0.0.1 is a preview. Before you rely on it, run `nextsql-bench --slo` and the
+crash, recovery, security, and HA suites on your hardware.
 
-Treat 0.0.1 as an engine under measurement, not a drop-in production replacement, until you have run `nextsql-bench --slo` plus the relevant crash, recovery, security, and HA suites on your hardware.
-
-Documentation roles:
-
-```text
-PROJECT.md = intended finished product
-TODO.md    = implementation/status truth
-TODO.md    = implementation status, sequencing, dependencies, and gates
-SKILLS.md  = engineering/agent contract
-AGENTS.md  = repository agent entrypoint
-this file  = current user/operator surface
-```
-
-Internal format and design notes live in [`docs/`](docs/). This file is the operator and application walkthrough.
+Internal design notes live in [`docs/`](docs/). The product site is
+[nextsql.bzync.com](https://nextsql.bzync.com).
 
 ---
 
 ## Contents
 
 1. [What you need to know first](#1-what-you-need-to-know-first)
-
 2. [Install and build](#2-install-and-build)
-
 3. [End-to-end walkthrough](#3-end-to-end-walkthrough)
-
 4. [SQL dialect](#4-sql-dialect)
-
 5. [Relational data](#5-relational-data)
-
 6. [JSON](#6-json)
-
 7. [Full-text search](#7-full-text-search)
-
 8. [Vectors](#8-vectors)
-
 9. [Hybrid queries](#9-hybrid-queries)
-
 10. [Geospatial](#10-geospatial)
-
 11. [Transactions](#11-transactions)
-
 12. [Users, roles, and tenants](#12-users-roles-and-tenants)
-
 13. [Command-line reference](#13-command-line-reference)
-
 14. [Schema migrations](#14-schema-migrations)
-
 15. [Server configuration](#15-server-configuration)
-
 16. [Drivers](#16-drivers)
-
 17. [TLS and client-held keys](#17-tls-and-client-held-keys)
-
 18. [Backup, restore, and PITR](#18-backup-restore-and-pitr)
-
 19. [Logical export and import](#19-logical-export-and-import)
-
 20. [High availability](#20-high-availability)
-
 21. [Status, diagnostics, and benches](#21-status-diagnostics-and-benches)
-
 22. [Limits and current gaps](#22-limits-and-current-gaps)
-
 23. [System catalog](#23-system-catalog)
-
 24. [Further reading](#24-further-reading)
 
 ---
@@ -87,47 +49,29 @@ Internal format and design notes live in [`docs/`](docs/). This file is the oper
 ### Binaries
 
 | Binary | Role |
-
 |---|---|
-
 | `nextsql` | CLI: init, exec, migrate, backup, restore, verify, export, import, diagnose, status, cluster |
-
 | `nextsqld` | Server. Speaks the native NSQL v1 protocol on `--listen` (default `127.0.0.1:7210`) |
-
 | `nextsql-bench` | Official measurements. Encryption, WAL, and fsync stay on |
-
 | `nextsql-auth-broker` | Optional. OIDC token-exchange broker: validates an external ID token and mints an `NSSC1.` short-lived credential. `nextsqld` never talks to it |
-
-| `nextsql-admin` | NextSQL Admin — one binary, three modes: Setup (token-authenticated loopback wizard that drives `nextsql setup`), Operations (loopback web UI over the native driver, server-enforced RBAC), Studio (placeholder, P29) |
+| `nextsql-admin` | NextSQL Admin — one loopback web UI with three modes: Setup (drives `nextsql setup`), Operations, and Studio |
 
 ### Files that matter
 
 A data directory is **not** a single file. After `nextsql init` and the first server start you typically have:
 
 ```text
-
 DATA-DIR/
-
   nextsql.instance      encrypted deployment registry (its one database)
-
   nextsql.instance.keys wrapped registry keys — never the registry root
-
   nextsql.db            encrypted pages (16 KiB logical)
-
   nextsql.db.keys       wrapped DEKs only — never the root unlock key
-
   nextsql.db.wal/       encrypted WAL control + segments
-
   nextsql.db.undo/      encrypted UNDO log
-
   nextsql.users         versioned password hashes (Argon2id; legacy PBKDF2 readable)
-
   nextsql.acl           roles and grants
-
   nextsql.audit         JSON-lines audit log (mode 0600)
-
   raft/                 present only when Raft HA is enabled
-
 ```
 
 The **root unlock key** is a separate `--key-file` (`NSKY`, mode `0600`). Keep it **off** the data volume. Stolen disks, snapshots, WAL, backups, vector trees, and full-text trees stay ciphertext without that file.
@@ -158,40 +102,28 @@ A privileged attacker on a **live unlocked** `nextsqld` can see keys, pages, and
 
 ### Packages
 
-From a NextSQL checkout, build Linux (`.deb`, `.tar.gz`, `.run`) and Windows (`.zip`, `setup.exe`) installers:
+From a NextSQL checkout, build the Linux (`.deb`, `.tar.gz`, `.run`) installers:
 
 ```bash
-
 ./scripts/build-installers.sh
-
 ```
 
 Linux:
 
 ```bash
-
 sudo dpkg -i installers/nextsql_*_amd64.deb
-
 # or: sudo ./installers/nextsql-*-linux-amd64.run
-
 ```
 
-Windows: run `installers/nextsql-*-windows-amd64-setup.exe` as Administrator (`/S` for silent).
+Windows: native Windows is not supported. Install a WSL 2 distribution and use the Linux packages inside it, keeping the data directory and key files on the Linux filesystem rather than `/mnt/c` (see `docs/install.md`, "Windows (WSL 2)").
 
 The packages copy binaries and a config file. They do **not** initialize a data directory or start `nextsqld`. After install:
 
 ```bash
-
 printf 'secret\n' > /tmp/nextsql.pw && chmod 600 /tmp/nextsql.pw
-
-nextsql init --data-dir /var/lib/nextsql --key-file /etc/nextsql/root.key \\
-
+nextsql init --data-dir /var/lib/nextsql --key-file /etc/nextsql/root.key \
   --database production --user app --password-file /tmp/nextsql.pw
-
-sudo systemctl enable --now nextsql          # Linux
-
-# Windows: Start-Service NextSQL
-
+sudo systemctl enable --now nextsql          # Linux, or WSL 2 with systemd enabled
 ```
 
 **`--database` is optional, and it decides whether a database exists.**
@@ -228,31 +160,20 @@ default OS-package entry point. See [`docs/install.md`](docs/install.md) and
 Requires **Go 1.22+**.
 
 ```bash
-
 git clone https://github.com/bzync/nextsql.git
-
 cd nextsql
-
 go build -o nextsql       ./cmd/nextsql
-
 go build -o nextsqld      ./cmd/nextsqld
-
 go build -o nextsql-bench ./cmd/nextsql-bench
-
 go build -o nextsql-auth-broker ./cmd/nextsql-auth-broker
-
 go build -o nextsql-admin ./cmd/nextsql-admin
-
 ```
 
 Confirm:
 
 ```bash
-
 ./nextsql version
-
 # nextsql 0.0.1
-
 ```
 
 Official drivers live in the same tree (`drivers/go`, `drivers/node`,
@@ -273,19 +194,13 @@ Use two terminals. Paths below are examples. In production put the key file on a
 ### 3.1 Create a password file and initialize
 
 ```bash
-
 printf 'secret\n' > /tmp/nextsql.pw
-
 chmod 600 /tmp/nextsql.pw
-
-./nextsql init \\
-
-  --data-dir /var/lib/nextsql \\
-
-  --key-file /etc/nextsql/root.key \\
-
-  --user app --password-file /tmp/nextsql.pw
-
+./nextsql init \
+  --data-dir /var/lib/nextsql \
+  --key-file /etc/nextsql/root.key \
+  --user app --password-file /tmp/nextsql.pw \
+  --database app
 ```
 
 What that does:
@@ -303,17 +218,11 @@ Printed output includes the data-file path plus database and file identity UUIDs
 ### 3.2 Start the server (loopback)
 
 ```bash
-
-./nextsqld \\
-
-  --data-dir /var/lib/nextsql \\
-
-  --key-file /etc/nextsql/root.key \\
-
-  --listen 127.0.0.1:7210 \\
-
+./nextsqld \
+  --data-dir /var/lib/nextsql \
+  --key-file /etc/nextsql/root.key \
+  --listen 127.0.0.1:7210 \
   --user app --password-file /tmp/nextsql.pw
-
 ```
 
 `--user` on `nextsqld` upserts that user if you want the server to create or refresh credentials at start. At least one user must exist or `nextsqld` refuses to start.
@@ -325,41 +234,25 @@ Loopback may run without TLS. Any bind that is not loopback requires `--tls-cert
 `nextsql exec` is a one-shot client. After resolve, `user`, a password, and SQL are required. SQL is `-c` or a single positional argument. Flags, `NEXTSQL_*` environment variables, and `.env` files can supply the rest (see [§13](#13-command-line-reference)).
 
 ```bash
-
 CLI=(./nextsql exec --addr 127.0.0.1:7210 --user app --password-file /tmp/nextsql.pw --insecure)
-
 ```
 
 Create the product table used throughout this manual:
 
 ```bash
-
 "${CLI[@]}" -c "
-
 CREATE TABLE products (
-
     id          UUID PRIMARY KEY DEFAULT UUID(),
-
     account_id   UUID NOT NULL,
-
     name        STRING NOT NULL,
-
     description TEXT,
-
     price       DECIMAL(12,2),
-
     metadata    JSON,
-
     embedding   VECTOR<F32,8>,
-
     location    POINT,
-
     created_at  TIMESTAMPTZ DEFAULT NOW()
-
 )
-
 "
-
 ```
 
 `VECTOR<F32,1536>` is the production-shaped type. The walkthrough uses dimension **8** so you can type literals by hand. Dimension must match between the column, inserts, and `NEAREST`. `VECTOR<F16,N>` is the same type with half-precision on-disk storage — half the payload-store size, ~0.1% per-element quantisation error, and no change to queries or HNSW. `VECTOR<I8,N>` goes further — signed bytes plus a per-vector scale, ~¼ the payload-store size at high dimension, but a larger quantisation error, so validate recall for your embedding model. `BITVECTOR<N>` packs one bit per element (1/32 the size) and ranks by `HAMMING`; every element must be `0` or `1`.
@@ -367,43 +260,24 @@ CREATE TABLE products (
 Insert two rows (JSON is a string literal that is parsed and stored as binary `NSJB`; vectors are parenthesized floats; points are `POINT(lon, lat)`):
 
 ```bash
-
 "${CLI[@]}" -c "
-
 INSERT INTO products (account_id, name, description, price, metadata, embedding, location)
-
 VALUES
-
   ('11111111-1111-1111-1111-111111111111',
-
    'Aero 2',
-
    'wireless noise cancelling headphones',
-
    12900.00,
-
    '{\\"category\\":\\"headphones\\",\\"color\\":\\"black\\"}',
-
    (0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8),
-
    POINT(-73.9857, 40.7484)),
-
   ('11111111-1111-1111-1111-111111111111',
-
    'Desk Lamp',
-
    'adjustable LED desk lamp',
-
    4500.00,
-
    '{\\"category\\":\\"lighting\\",\\"color\\":\\"white\\"}',
-
    (0.9, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
-
    POINT(-73.9780, 40.7580))
-
 "
-
 ```
 
 Successful DML prints `affected N`.
@@ -411,11 +285,8 @@ Successful DML prints `affected N`.
 ### 3.4 Query
 
 ```bash
-
 "${CLI[@]}" -c "SELECT name, price FROM products WHERE price BETWEEN 4000 AND 15000"
-
 "${CLI[@]}" -c "SELECT name FROM products WHERE metadata.category = 'headphones'"
-
 ```
 
 Result columns are tab-separated.
@@ -423,79 +294,46 @@ Result columns are tab-separated.
 ### 3.5 Indexes
 
 ```bash
-
 "${CLI[@]}" -c "CREATE INDEX ix_category ON products (metadata.category)"
-
 "${CLI[@]}" -c "CREATE FULLTEXT INDEX ix_desc ON products (description)"
-
 "${CLI[@]}" -c "CREATE VECTOR INDEX ix_emb ON products (embedding) USING HNSW"
-
 "${CLI[@]}" -c "CREATE SPATIAL INDEX ix_loc ON products (location)"
-
 "${CLI[@]}" -c "ANALYZE products"
-
 ```
 
 `ANALYZE` writes statistics the optimizer uses. `EXPLAIN` shows the chosen access path:
 
 ```bash
-
 "${CLI[@]}" -c "EXPLAIN SELECT name FROM products WHERE metadata.category = 'headphones'"
-
 "${CLI[@]}" -c "EXPLAIN SELECT name FROM products SEARCH description FOR 'wireless noise cancelling' LIMIT 5"
-
 "${CLI[@]}" -c "EXPLAIN SELECT name FROM products NEAREST embedding TO (0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8) LIMIT 5"
-
 ```
 
 ### 3.6 Full text, vectors, hybrid, geo
 
 ```bash
-
 "${CLI[@]}" -c "
-
 SELECT name FROM products
-
 SEARCH description FOR 'wireless noise cancelling'
-
 LIMIT 5
-
 "
-
 "${CLI[@]}" -c "
-
 SELECT name FROM products
-
 NEAREST embedding TO (0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8)
-
 USING COSINE
-
 LIMIT 5
-
 "
-
 "${CLI[@]}" -c "
-
 SELECT name, price FROM products
-
 WHERE metadata.category = 'headphones' AND price <= 15000
-
 SEARCH description FOR 'wireless noise cancelling'
-
 NEAREST embedding TO (0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8)
-
 LIMIT 5
-
 "
-
 "${CLI[@]}" -c "
-
 SELECT name FROM products
-
 WHERE DWITHIN(location, POINT(-73.9857, 40.7484), 2000)
-
 "
-
 ```
 
 That hybrid statement is one physical plan: structured filters, BM25, and ANN share the same cost model and the same WAL / MVCC / encryption path.
@@ -505,13 +343,9 @@ That hybrid statement is one physical plan: structured filters, BM25, and ANN sh
 `nextsql exec` sends one statement per invocation, so a `BEGIN` … `COMMIT` session needs a driver (see [§16](#16-drivers)). From a Go session:
 
 ```go
-
 conn.Exec(ctx, `BEGIN SNAPSHOT`)
-
 conn.Exec(ctx, `UPDATE products SET price = price * 1.1 WHERE name = $1`, types.StringValue("Aero 2"))
-
 conn.Exec(ctx, `COMMIT`)
-
 ```
 
 Without `BEGIN`, each statement is its own committed transaction.
@@ -519,11 +353,8 @@ Without `BEGIN`, each statement is its own committed transaction.
 ### 3.8 Inspect the instance
 
 ```bash
-
 ./nextsql diagnose --data-dir /var/lib/nextsql
-
 ./nextsql status --local --data-dir /var/lib/nextsql --key-file /etc/nextsql/root.key
-
 ```
 
 `diagnose` reads plaintext headers only (no key). `status --local` also opens the database and prints table count, LSNs, isolated pages, query counters, and admission stats. Default `status` (no `--local`) dials `nextsqld` and prints `mode server`.
@@ -552,7 +383,7 @@ See [`docs/sql.md`](docs/sql.md) for catalog internals.
 
 - `DROP TABLE [IF EXISTS] name` removes the catalog row. A table referenced by a foreign key cannot be dropped (`foreign_key`). Detached heap/index pages are reclaimed only when safe with respect to active MVCC snapshots, then become reusable through the durable freelist.
 
-- `ALTER TABLE` supports `ADD [COLUMN]`, `DROP [COLUMN]`, `RENAME [COLUMN] … TO`, `RENAME TO`, `ADD CONSTRAINT` / `ADD FOREIGN KEY`, and `DROP CONSTRAINT`. Adding a `NOT NULL` column to a non-empty table requires a `DEFAULT`. A `PRIMARY KEY` column cannot be dropped. `CREATE DATABASE [IF NOT EXISTS] name` creates a new database file named `name` in the same directory as the current database (same key provider). It cannot run inside a transaction and is not written to the current database WAL.
+- `ALTER TABLE` supports `ADD [COLUMN]`, `DROP [COLUMN]`, `RENAME [COLUMN] … TO`, `RENAME TO`, `ADD CONSTRAINT` / `ADD FOREIGN KEY`, and `DROP CONSTRAINT`. Adding a `NOT NULL` column to a non-empty table requires a `DEFAULT`. A `PRIMARY KEY` column cannot be dropped. `CREATE DATABASE` is not supported: a deployment serves exactly one database, and the parser rejects the statement (`IF NOT EXISTS` included) with that reason. To run another database, `nextsql init` a separate deployment.
 
 - `FOREIGN KEY` / `REFERENCES` is validated at `CREATE TABLE` and `ALTER TABLE ADD CONSTRAINT` (referenced table, types, PK or UNIQUE target, tenant rule). Insert, update, and delete enforce the stored action. `RESTRICT` / `NO ACTION` reject live children. `CASCADE` deletes or rewrites children (recursive, depth 8 / 100 000 row caps). `SET NULL` nulls FK columns. `SET DEFAULT` evaluates `ApplyDefault(i, Null(type))` on the leader, not the live FK value. Missing parent, illegal SET DEFAULT, or `RESTRICT` children return `foreign_key`; cap hits return `exhausted`.
 
@@ -565,59 +396,33 @@ See [`docs/sql.md`](docs/sql.md) for catalog internals.
 ### Types
 
 | Type | Notes |
-
 |---|---|
-
 | `UUID` | 16 bytes. `DEFAULT UUID()` |
-
+| `BOOL` | `TRUE` / `FALSE`. No coercion from numbers or strings; `CAST(b AS STRING)` renders it. `bool` is a reserved word — quote it (`"bool"`) as an identifier |
 | `STRING` / `TEXT` | UTF-8. Same encoding; `TEXT` is the long-form name |
-
 | `BLOB` | Raw bytes; `X'<hex>'` literals; byte-lexicographic ordering |
-
 | `CHAR(n)` / `VARCHAR(n)` | UTF-8 character-count bounds; `CHAR` pads on assignment and ignores trailing spaces for comparison |
-
 | `INT8` / `INT16` / `INT32` / `INT64` | Exact fixed-width signed integers; narrowing is range checked |
-
 | `UINT8` / `UINT16` / `UINT32` / `UINT64` | Exact fixed-width unsigned integers; negative/narrowing assignments fail |
-
 | `DECIMAL(p,s)` | `1 ≤ p ≤ 38`, `s ≤ p`. Unscaled integer + scale. `DEFAULT AI()` when `s = 0` |
-
 | `TIMESTAMPTZ` | UTC nanoseconds. `DEFAULT NOW()` |
-
 | `DATE` / `TIME` / `TIMESTAMP` | Civil date, time-of-day, and timezone-free civil timestamp |
-
 | `INTERVAL` | Months + days + nanoseconds; native date/time arithmetic |
-
-| `FLOAT32` / `FLOAT64` | IEEE 754 finite values; NaN and infinities are rejected |
-
+| `FLOAT32` / `FLOAT64` | IEEE 754. `NaN` and `±Infinity` are stored; keys order `-Inf < negatives < 0 < positives < +Inf < NaN`, and `-0.0` is stored as `+0.0` |
 | `ENUM('label', …)` | Declaration-order scalar; catalog labels are part of the type |
-
 | `JSON` | Compact binary `NSJB`. Insert a JSON text literal |
-
 | `VECTOR<F32,N>` | `N` in `1…8192`. Finite floats only. Stored off-row |
-
 | `VECTOR<F16,N>` | Same, stored as IEEE 754 halves (half the payload size); values quantised on write, widened to `float32` for all math and `NEAREST` |
-
 | `VECTOR<I8,N>` | Same, stored as signed bytes with a per-vector scale (~¼ the payload size at high `N`); larger quantisation error than `F16` — validate recall; widened to `float32` for all math and `NEAREST` |
-
 | `BITVECTOR<N>` | `N` single-bit elements packed into `ceil(N/8)` bytes (1/32 of `VECTOR<F32,N>`). Each element must be `0` or `1` on write. Ranks by `HAMMING` (default and only metric); widened to `float32` `0`/`1` for all math and `NEAREST` |
-
 | `SPARSEVECTOR<N>` | Sorted non-zero coordinate/value pairs; sparse inverted index and cosine/inner-product retrieval |
-
 | `POINT` / `LOCATION` | WGS84 longitude, latitude |
-
 | `BOX` | west, south, east, north |
-
 | `LINESTRING` | at least two vertices |
-
 | `POLYGON` | closed exterior ring, optional holes; 256-vertex cap |
-
 | `GEOMETRY[(subtype, srid)]` / `GEOGRAPHY[(subtype, srid)]` | General OGC common-subset geometry with EWKB storage; planar vs geodetic semantics |
-
 | `STRUCT<name T, …>` | Fixed named heterogeneous fields; nested field access with `col.field` |
-
 | `ARRAY<T>` | Bounded homogeneous nested sequence; `ELEMENT_AT`, `CARDINALITY`, `ARRAY_CONTAINS` |
-
 | `MAP<K,V>` | Canonically key-sorted map with scalar orderable keys; lookup/key/value helpers |
 
 A table **must** declare `PRIMARY KEY`. Secondary indexes store secondary key + primary key. B-tree indexes may add `INCLUDE (cols)`, `WHERE predicate`, and expression keys such as `LOWER(name)`; `EXPLAIN` shows `covering` when the scan does not fetch the heap.
@@ -625,82 +430,49 @@ A table **must** declare `PRIMARY KEY`. Secondary indexes store secondary key + 
 ### Statements
 
 ```text
-
 CREATE TABLE   [FOREIGN KEY / REFERENCES …]
-
+CREATE TABLE name PRIMARY KEY (col, …) AS <query>   -- snapshot; types from the query's output
 CREATE INDEX / CREATE UNIQUE INDEX
-
 CREATE SPATIAL INDEX
-
 CREATE FULLTEXT INDEX [WITH (ANALYZER = 'simple' | 'english' | 'french' | 'german' | 'spanish')]
-
 CREATE VECTOR INDEX … USING HNSW [WITH (QUANTIZATION = 'F16' | 'I8' | 'NONE')]
-
 CREATE VECTOR INDEX … USING IVF WITH (LISTS = n [, PROBES = m])
-
 CREATE VECTOR INDEX … USING IVFPQ WITH (LISTS = n, SUBSPACES = M [, PROBES = m])
-
 DROP INDEX [IF EXISTS] name
-
 REBUILD INDEX name [ONLINE]
-
 MAINTAIN DATABASE
-
 MAINTAIN TABLE table_name
-
 MAINTAIN INDEX index_name
-
-INSERT   [RETURNING]
-
+INSERT   VALUES (...) | <query>   [RETURNING]
 UPSERT   [ON UNIQUE] [SET] [RETURNING]
-
 SELECT   [JOIN | LEFT [OUTER] JOIN] [WHERE] [GROUP BY] [SEARCH] [NEAREST] [LIMIT] [OFFSET]
-
 UPDATE   [WHERE] [LIMIT] [RETURNING]
-
 DELETE   [WHERE] [LIMIT] [RETURNING]
-
 BEGIN    [READ COMMITTED | SNAPSHOT | SERIALIZABLE]
-
 COMMIT
-
-ROLLBACK [TRANSACTION]
-
+ROLLBACK [TRANSACTION] | ROLLBACK TO [SAVEPOINT] name
+SAVEPOINT name
+RELEASE [SAVEPOINT] name
 ANALYZE  [table]
-
 EXPLAIN  [ANALYZE] <statement>
 
-
 CREATE USER / DROP USER
-
 CREATE ROLE / DROP ROLE
-
 GRANT / REVOKE
-
 CREATE / ALTER / DROP RESOURCE GROUP; SET / RESET RESOURCE GROUP
-
 SET CONFIG key = value
-
 BACKUP DATABASE; VERIFY BACKUP 'name'
-
 ```
 
 ### Functions (common)
 
 | Area | Calls |
-
 |---|---|
-
 | Defaults | `UUID()`, `NOW()`, `AI()` |
-
 | Aggregates | `COUNT(*)`, `COUNT(col)`, `SUM`, `AVG`, `MIN`, `MAX` |
-
 | Windows | `ROW_NUMBER`, `RANK`, `DENSE_RANK`, `LAG`, `LEAD`, `FIRST_VALUE`, `LAST_VALUE`, and aggregate `OVER (...)` |
-
 | Vector | `COSINE(a,b)`, `L2(a,b)`, `INNER_PRODUCT(a,b)` |
-
 | Geo | fixed WGS84 constructors plus `ST_*` measurement, predicate, overlay, WKT/EWKB/GeoJSON helpers for `GEOMETRY`/`GEOGRAPHY` |
-
 | Collections | `STRUCT`, `ARRAY`, `MAP`, `ELEMENT_AT`, `CARDINALITY`/`ARRAY_LENGTH`, `MAP_SIZE`, containment/key/value helpers |
 
 ### Index lifecycle and maintenance
@@ -710,7 +482,6 @@ BACKUP DATABASE; VERIFY BACKUP 'name'
 ```sql
 DROP INDEX ix_category;
 DROP INDEX IF EXISTS ix_old;
-
 REBUILD INDEX ix_category;
 REBUILD INDEX ix_category ONLINE;
 ```
@@ -737,91 +508,54 @@ Maintenance may reclaim safe dead versions/pages, clean index tombstones, compac
 ## 5. Relational data
 
 ```sql
-
 CREATE TABLE items (
-
     id    UUID PRIMARY KEY DEFAULT UUID(),
-
     sku   STRING NOT NULL,
-
     qty   DECIMAL(10,0),
-
     price DECIMAL(12,2)
-
 );
-
 CREATE UNIQUE INDEX uq_sku ON items (sku);
-
 CREATE INDEX ix_sku_cover ON items (sku) INCLUDE (qty, price);
-
 CREATE INDEX ix_low_sku ON items (LOWER(sku));
-
 INSERT INTO items (sku, qty, price) VALUES
-
     ('A-1', 3, 19.50),
-
     ('B-2', 9, 44.00);
-
+INSERT INTO items_archive (sku, qty, price)
+    SELECT sku, qty, price FROM items WHERE qty = 0;
 SELECT sku, qty FROM items WHERE sku = 'B-2';
-
 SELECT sku FROM items WHERE price BETWEEN 10 AND 50 LIMIT 20;
-
 SELECT sku FROM items ORDER BY sku LIMIT 10 OFFSET 10;
-
 UPDATE items SET qty = qty + 1 WHERE sku = 'A-1';
-
 DELETE FROM items WHERE qty = 0;
-
 UPSERT INTO items (id, sku, qty, price) VALUES (UUID(), 'A-1', 4, 19.50)
-
     ON UNIQUE (sku)
-
     SET qty = excluded.qty
-
     RETURNING sku, qty;
-
 SELECT COUNT(*) FROM items;
-
 SELECT sku, SUM(qty) FROM items GROUP BY sku;
-
 ```
+
+`INSERT` takes its rows from a `VALUES` list or from a query — an ordinary `SELECT`, set operation or `WITH`, whose output columns must match the columns being written. Omitted columns take their `DEFAULT`, and every constraint, trigger and foreign key that applies to a `VALUES` insert applies here. The source is read to completion before the first row is written, so `INSERT INTO t SELECT ... FROM t` doubles `t` exactly once rather than feeding itself. Reading it requires `SELECT` on every relation the query touches, on top of `INSERT` on the target, and the source is bounded like any query (`max_result_rows`, `max_result_bytes`), so an oversized one is an explicit `exhausted` error rather than a truncated insert. `UPSERT` takes `VALUES` only. See `docs/sql.md`.
 
 Foreign keys may be declared on `CREATE TABLE`. The referenced columns must be exactly a `PRIMARY KEY` or `UNIQUE` btree index (same columns, any order). `DECIMAL` precision and scale must match. `NO ACTION` is stored as `RESTRICT`. Recommended account-scoped key pattern is a composite `PRIMARY KEY (account_id, id)` so the FK can include `account_id` on both sides at the same position.
 
 ```sql
-
 CREATE TABLE customers (
-
     account_id UUID NOT NULL,
-
     id        UUID NOT NULL DEFAULT UUID(),
-
     email     STRING NOT NULL,
-
     PRIMARY KEY (account_id, id)
-
 );
-
 CREATE TABLE orders (
-
     account_id   UUID NOT NULL,
-
     id          UUID NOT NULL DEFAULT UUID(),
-
     customer_id UUID NOT NULL,
-
     PRIMARY KEY (account_id, id),
-
     CONSTRAINT fk_orders_customer
-
         FOREIGN KEY (account_id, customer_id)
-
         REFERENCES customers (account_id, id)
-
         ON DELETE RESTRICT
-
 );
-
 ```
 
 These constraints are stored in the catalog (`NSCT` v2) and enforced on `INSERT` / `UPDATE` / `DELETE`. Cascades are ordinary leader-side row writes (WAL + UNDO); followers do not re-run the action. After any `CREATE TABLE` or `CREATE INDEX` (which rewrites descriptors as v2), do not roll the server binary back without restoring a pre-v2 backup.
@@ -829,53 +563,31 @@ These constraints are stored in the catalog (`NSCT` v2) and enforced on `INSERT`
 Joins are cost-based left-deep inner trees (up to eight tables; outer joins are not reordered). `INNER JOIN` / bare `JOIN`, `LEFT` / `RIGHT` / `FULL` `[OUTER] JOIN`, and `CROSS JOIN` are accepted. Hash join is the default and builds the right input. Merge join is chosen for INNER and LEFT when both sides are already index-ordered on the join keys. `FULL` is hash-only and refuses to spill (`exhausted`). `RIGHT` is rewritten to `LEFT`. `NULL` keys do not match. Result order is unspecified unless `ORDER BY` is present.
 
 ```sql
-
 SELECT orders.k, items.sku
-
 FROM orders JOIN items ON orders.k = items.k;
-
 SELECT o.id, c.name, l.sku
-
 FROM orders o
-
 JOIN customers c ON c.id = o.customer_id
-
 JOIN lines l ON l.order_id = o.id;
-
 SELECT customers.name, orders.id
-
 FROM customers
-
 LEFT JOIN orders ON orders.customer_id = customers.id;
-
 SELECT customers.name, orders.id
-
 FROM orders
-
 RIGHT JOIN customers ON orders.customer_id = customers.id;
-
 SELECT a.email, b.email
-
 FROM accounts a
-
 FULL OUTER JOIN accounts b ON a.email = b.email AND a.id <> b.id;
-
 SELECT a.n, b.n
-
 FROM t a
-
 CROSS JOIN u b;
-
 ```
 
 `UPDATE` / `DELETE` accept `LIMIT` so large mutations can be batched (the official bulk path commits every 8192 rows).
 
 ```sql
-
 UPDATE scan SET n = 0 WHERE n <> 0 LIMIT 8192;
-
 DELETE FROM scan LIMIT 8192;
-
 ```
 
 ---
@@ -885,29 +597,17 @@ DELETE FROM scan LIMIT 8192;
 JSON is a first-class column. The stored form is binary `NSJB`, not UTF-8 text. Insert a JSON string; the engine parses it.
 
 ```sql
-
 CREATE TABLE products (
-
     id       UUID PRIMARY KEY DEFAULT UUID(),
-
     name     STRING NOT NULL,
-
     metadata JSON
-
 );
-
 INSERT INTO products (name, metadata) VALUES
-
     ('alpha', '{"category":"electronics","n":1}'),
-
     ('beta',  '{"category":"books","n":2}');
-
 CREATE INDEX category_index ON products (metadata.category);
-
 SELECT name FROM products WHERE metadata.category = 'electronics';
-
 SELECT metadata.category FROM products WHERE name = 'alpha';
-
 ```
 
 Path extract: `column.part.part`. A numeric part indexes an array (`tags.0`). A missing path is SQL `NULL`. Scalars become `STRING`, `BOOL`, or `DECIMAL`; nested objects and arrays stay `JSON`.
@@ -921,46 +621,27 @@ Limits (fail closed): depth 32, document 1 MiB, string 1 MiB, 1 048 576 arra
 ## 7. Full-text search
 
 ```sql
-
 CREATE TABLE articles (
-
     id    UUID PRIMARY KEY DEFAULT UUID(),
-
     title STRING NOT NULL,
-
     body  TEXT
-
 );
-
 CREATE FULLTEXT INDEX ix_body ON articles (body);
 CREATE FULLTEXT INDEX ix_tb ON articles (title, body);
-
 SELECT title FROM articles SEARCH body FOR 'database performance' LIMIT 20;
 SELECT title FROM articles SEARCH title, body FOR 'database performance' LIMIT 20;
 SELECT title FROM articles SEARCH title WEIGHT 3, body FOR 'database performance' LIMIT 20;
-
 SELECT title FROM articles SEARCH body FOR '"database performance"';
-
 SELECT title FROM articles SEARCH body FOR 'cat*';
-
 SELECT title FROM articles SEARCH body FOR '"data* performance"';
-
 SELECT title FROM articles SEARCH body FOR 'cat~';
-
 SELECT title FROM articles SEARCH body FOR '"databas~ performance"';
-
 SELECT title FROM articles SEARCH body FOR 'databse';
-
 SELECT title FROM articles SEARCH body FOR '"databse performance"';
-
 SELECT title, HIGHLIGHT(body) FROM articles SEARCH body FOR 'database performance';
-
 SELECT title, SNIPPET(body) FROM articles SEARCH body FOR 'cat';
-
 SELECT * FROM articles SEARCH body FOR 'database performance' FACET category;
-
 SELECT * FROM articles SEARCH title WEIGHT 3, body FOR 'database' FACET category, year LIMIT 5;
-
 ```
 
 `SEARCH col [, col …] FOR <string>` sits after `WHERE` / `GROUP BY` and before `FACET` / `LIMIT`. Unquoted tokens are required (AND) and ranked with BM25. A multi-column `SEARCH` uses a `FULLTEXT` index whose column list matches in the same order; phrases do not cross fields. Optional `WEIGHT <number>` after a column scales that field's BM25 term frequency (`SEARCH title WEIGHT 3, body FOR '…'`; omitted = 1; range `(0, 64]`; query-time only, no catalog bump). A trailing ASCII `*` is prefix search (`cat*` matches `catalog`; exact `cat` does not). A trailing ASCII `~` is fuzzy matching (`cat~` matches `cot`; optional `~1` / `~2`; AUTO distance by token length). Prefix and fuzzy tokens skip stemming, stop words, and synonyms; matching terms are a disjunction at that position and consume the query-expansion caps (fail closed). Unadorned tokens apply typo tolerance only when the analyzed term is absent from the vocabulary (`databse` matches `database`; `cat` does not match `cot` when `cat` is indexed; AUTO typo is 0/1/2 for 1–4 / 5–8 / 9+ runes). Fuzzy/typo edit-distance work inspects at most 4096 distinct vocabulary terms. Double-quoted groups are phrases (consecutive positions). Results are score descending, then primary key.
@@ -982,19 +663,12 @@ Limits: term 128 runes, document 100 000 tokens (combined across SEARCH fields
 ## 8. Vectors
 
 ```sql
-
 CREATE TABLE documents (
-
     id        UUID PRIMARY KEY DEFAULT UUID(),
-
     name      STRING NOT NULL,
-
     embedding VECTOR<F32,1536>
-
 );
-
 INSERT INTO documents (name, embedding) VALUES ('one', (1, 0, 0 /* … dim must match */));
-
 CREATE VECTOR INDEX docs_embedding ON documents (embedding) USING HNSW;
 -- or a coarse-quantiser (inverted-file) index:
 CREATE VECTOR INDEX docs_embedding ON documents (embedding)
@@ -1002,13 +676,9 @@ CREATE VECTOR INDEX docs_embedding ON documents (embedding)
 -- or IVF with product-quantised residual codes:
 CREATE VECTOR INDEX docs_embedding ON documents (embedding)
     USING IVFPQ WITH (LISTS = 256, PROBES = 16, SUBSPACES = 8);
-
 SELECT name FROM documents NEAREST embedding TO $1 LIMIT 20;
-
 SELECT name FROM documents NEAREST embedding TO (1, 0, 0) USING L2 LIMIT 5;
-
 SELECT name, COSINE(embedding, (1, 0, 0)) FROM documents;
-
 ```
 
 `NEAREST col TO <vector>` sits after `WHERE` / `GROUP BY` / `SEARCH` and before `LIMIT`. Optional `USING COSINE | L2 | INNER_PRODUCT | HAMMING` (default `COSINE`, or `HAMMING` for a `BITVECTOR` column — the only metric a bit column accepts).
@@ -1044,21 +714,13 @@ LIMIT 20;
 `EXPLAIN` shows `Rerank bm25+vector+sparse fusion`. At most two `NEAREST` clauses; they must be one dense vector and one sparse vector.
 
 ```sql
-
 SELECT id, name, price
-
 FROM products
-
 WHERE metadata.category = 'headphones'
-
   AND price <= 15000
-
 SEARCH description FOR 'wireless noise cancelling'
-
 NEAREST embedding TO $query
-
 LIMIT 20;
-
 ```
 
 `EXPLAIN` shows `Candidates` and `Rerank bm25+vector`. Operator order is not hard-coded. Run `ANALYZE` first so statistics exist.
@@ -1076,37 +738,21 @@ common-subset values; NextSQL defines native semantics rather than claiming
 PostGIS compatibility.
 
 ```sql
-
 CREATE TABLE places (
-
     id   UUID PRIMARY KEY DEFAULT UUID(),
-
     name STRING NOT NULL,
-
     loc  POINT NOT NULL
-
 );
-
 INSERT INTO places (name, loc) VALUES
-
     ('empire', POINT(-73.9857, 40.7484)),
-
     ('jfk',    'POINT(-73.7781 40.6413)');
-
 CREATE SPATIAL INDEX ix_loc ON places (loc);
-
 SELECT name FROM places
-
 WHERE DWITHIN(loc, POINT(-73.9857, 40.7484), 5000);
-
 SELECT name, DISTANCE(loc, POINT(-73.9857, 40.7484))
-
 FROM places
-
 WHERE WITHIN(loc, BOX(-74.1, 40.6, -73.8, 40.9));
-
 SELECT DISTANCE_SPHEROID(POINT(-74.0060, 40.7128), POINT(-118.2437, 34.0522));
-
 ```
 
 WKT also coerces: `POINT(lon lat)`, `BOX(w s, e n)`, `LINESTRING(...)`, `POLYGON((...))`.
@@ -1131,29 +777,29 @@ remain out of scope. Details: [`docs/geo.md`](docs/geo.md) and
 ## 11. Transactions
 
 ```sql
-
 BEGIN;                    -- default SNAPSHOT
-
 BEGIN READ COMMITTED;
-
 BEGIN SNAPSHOT;
-
 BEGIN SERIALIZABLE;
-
 COMMIT;
-
 ROLLBACK;
-
+SAVEPOINT s1;             -- mark a position inside an open write transaction
+ROLLBACK TO SAVEPOINT s1; -- undo back to it, transaction stays open
+RELEASE SAVEPOINT s1;     -- forget the mark, keep the writes
 ```
 
+`SAVEPOINT name` marks a position inside an open **write** transaction, so a
+client can retry one failed statement instead of replaying the whole
+transaction. `ROLLBACK TO [SAVEPOINT] name` reverses everything written after
+that mark and leaves the transaction open, still holding its locks; a later
+`ROLLBACK` still reverts everything. `ROLLBACK TO` is refused when a schema
+change ran after the savepoint was set, because DDL is not part of the row undo
+chain. The stack is capped at 64. See `docs/sql.md`.
+
 | Level | Snapshot | Locks |
-
 |---|---|---|
-
 | `READ COMMITTED` | Refreshed each statement | Exclusive key locks until end of transaction |
-
 | `SNAPSHOT` | Taken at `BEGIN` | Exclusive key locks; first-committer-wins on write-write |
-
 | `SERIALIZABLE` | Taken at `BEGIN` | Snapshot plus shared key/range locks (strict 2PL) |
 
 `SERIALIZABLE` is lock-based, not SSI. Deadlock aborts the requester (`deadlock`); that transaction must `ROLLBACK`.
@@ -1171,21 +817,13 @@ Readers do not see uncommitted writes. Commit is acknowledged only after group-c
 ### SQL
 
 ```sql
-
 CREATE USER reporter IDENTIFIED BY 's3cret';
-
 CREATE ROLE analyst;
-
 GRANT analyst TO reporter;
-
 GRANT SELECT ON TABLE products TO analyst;
-
 GRANT ADMIN ON CLUSTER TO dba;
-
 REVOKE SELECT ON TABLE products FROM analyst;
-
 DROP USER reporter;
-
 ```
 
 A new principal has no rights until granted. Least privilege is fail-closed.
@@ -1250,131 +888,70 @@ registry access).
 ## 13. Command-line reference
 
 ```text
-
 nextsql init     --data-dir DIR --key-file FILE [--instance-key-file FILE]
-
                  [--database NAME] [--user NAME --password-file FILE]
-
                  [--buffer-pages N]
-
                  [--env-file PATH | --no-env]
-
 nextsql registry adopt --data-dir DIR --key-file FILE [--instance-key-file FILE]
-
                  [--database NAME] --confirm
-
                  [--env-file PATH | --no-env]
-
 nextsql registry migrate-tenant --source-data-dir DIR --source-key-file FILE
-
                  --tenant VALUE --data-dir DIR --key-file FILE
-
                  [--instance-key-file FILE] [--database NAME]
-
                  [--batch-rows N] [--buffer-pages N] --confirm
-
 nextsql registry show --data-dir DIR [--instance-key-file FILE]
-
 nextsql login    --idp NAME [--addr HOST:PORT] [--idp-config FILE]
-
                  [--database NAME] [--no-browser] [--timeout DURATION]
-
 nextsql logout   (--idp NAME --addr HOST:PORT | --all)
-
 nextsql whoami   --idp NAME [--addr HOST:PORT] [--idp-config FILE] [--json]
-
 nextsql exec     [--addr HOST:PORT] [--user NAME] [--password-file FILE | --idp NAME]
-
                  [--database NAME] [--tls-ca FILE | --insecure]
-
                  [--env-file PATH | --no-env]
-
                  [-c SQL | SQL]
-
 nextsql migrate  status|pending|version|validate|create|up|down|force|repair
-
                  [--dir DIR] [--addr HOST:PORT] [--user NAME]
-
                  [--password-file FILE] [--tls-ca FILE | --insecure]
-
                  [--env-file PATH | --no-env]
-
 nextsql backup   --data-dir DIR --key-file FILE --out DIR
-
 nextsql backup list  --base-dir DIR
-
 nextsql backup prune --base-dir DIR (--keep-count N | --keep-days N) [--confirm]
-
 nextsql restore  --from DIR --data-dir DIR --key-file FILE
-
                  [--wal-archive DIR] [--until-lsn N | --until RFC3339]
-
 nextsql verify   --from DIR --key-file FILE
-
 nextsql export   --data-dir DIR --key-file FILE --out DIR
-
 nextsql import   --from DIR --data-dir DIR --key-file FILE
-
 nextsql diagnose --data-dir DIR
-
 nextsql status   [--addr HOST:PORT] [--user NAME] [--password-file FILE | --idp NAME]
-
                  [--database NAME] [--tls-ca FILE | --insecure]
-
                  [--env-file PATH | --no-env]
-
 nextsql status --local [--data-dir DIR] [--key-file FILE]
-
 nextsql cluster status --data-dir DIR
-
 nextsql cluster transfer-leader [--addr HOST:PORT] [--user NAME] [--password-file FILE]
-
                  [--database NAME] [--tls-ca FILE | --insecure] [--env-file PATH | --no-env]
-
 nextsql cluster drain [--timeout-ms N] [--addr HOST:PORT] [--user NAME] [--password-file FILE]
-
                  [--database NAME] [--tls-ca FILE | --insecure] [--env-file PATH | --no-env]
-
 nextsql key      status --data-dir DIR [--json]
-
                  add-recovery --data-dir DIR --key-file FILE --recovery-key-out FILE
                       [--keystore database|instance] [--replace]
-
                  verify-recovery --data-dir DIR --recovery-key FILE
                       [--keystore database|instance]
-
                  remove-recovery --data-dir DIR --key-file FILE --confirm
                       [--keystore database|instance]
-
                  recover --data-dir DIR --recovery-key FILE --key-file-out FILE --confirm
                       [--keystore database|instance]
-
 nextsql token    keygen --keyset FILE
-
                  rotate --keyset FILE | retire --keyset FILE --key-id N
-
                  list-keys --keyset FILE | export-public --keyset FILE --out FILE
-
                  mint --keyset FILE --principal NAME [--audience S] [--database S]
-
                       [--role NAME ...] [--ttl DUR] [--not-before RFC3339]
-
                  revoke --revocations FILE (--token-id HEX | --principal NAME [--before RFC3339])
-
                  verify --keyset FILE [--revocations FILE] [--audience S] TOKEN
-
 nextsql audit    keygen --keyset FILE
-
                  rotate --keyset FILE | retire --keyset FILE --key-id N
-
                  list-keys --keyset FILE | export-public --keyset FILE --out FILE
-
                  verify --file FILE [--keyset FILE | --pubkey FILE] [--json]
-
 nextsql version
-
 nextsql help
-
 ```
 
 `--out` for backup and export must not already exist. The tool writes a temporary directory, verifies, then publishes atomically.
@@ -1384,15 +961,12 @@ nextsql help
 The authentication broker lets an operator delegate *who a person is* to an OpenID Connect provider while NextSQL keeps full control of *what they may do*. It runs standalone as `nextsql-auth-broker`, or inside a single-node `nextsqld` on a separate listener. It validates an IdP ID token or explicitly enabled client-credentials JWT access token against a cached JWKS, maps the verified claims to a native principal and role set through an `NSIP` identity policy, and mints an ordinary `NSSC1.` short-lived credential. The SQL listener gains **no** OIDC parsing and makes **no** outbound calls — it only needs the broker's public issuing key in `token_verify_keyset`.
 
 ```text
-
 nextsql-auth-broker --config PATH        # POST /v1/exchange, /healthz; SIGHUP reloads policy + keyset
-
 ```
 
 Minimal `auth-broker.conf`:
 
 ```text
-
 listen              = 127.0.0.1:8645
 tls_cert            = /etc/nextsql/broker.crt
 tls_key             = /etc/nextsql/broker.key
@@ -1400,14 +974,12 @@ identity_policy     = /etc/nextsql/idp-policy.nsip
 issuing_keyset      = /etc/nextsql/broker-issuing.nstk   # a private NSTK key
 deployment_audience = prod-eu
 oidc_credential_ttl = 1h
-
 [idp "corp"]
 issuer     = https://corp.okta.com/oauth2/abc
 client_id  = 0oa...
 access_token_audience = api://nextsql-broker  # enables JWT client-credentials exchange
 jwks_uri   = https://corp.okta.com/oauth2/abc/v1/keys
 group_claim = groups
-
 ```
 
 Create the issuing keyset with `nextsql token keygen --keyset broker-issuing.nstk`, then `nextsql token export-public --keyset broker-issuing.nstk --out verify.nstk` and point every server's `token_verify_keyset` at `verify.nstk`. The minted credential's lifetime is `min(oidc_credential_ttl, time until the IdP token expires)`; its roles are the policy-mapped set, and the server's `ACL.AllowedScoped` still drops any role the principal does not actually hold.
@@ -1508,28 +1080,16 @@ flags > non-empty process env > `.env.local` > `.env`; for `nextsqld`, those
 sources also override `--config` field values.
 
 | Variable | Hosting use |
-
 |---|---|
-
 | `NEXTSQL_DATA_DIR` | Deployment data directory |
-
 | `NEXTSQL_KEY_FILE` | Database root **file path**, never key bytes |
-
 | `NEXTSQL_INSTANCE_KEY_FILE` | Deployment registry root **file path**, never key bytes |
-
-
 | `NEXTSQL_DATABASE` | Logical name created/adopted and client Hello database |
-
 | `NEXTSQL_BUFFER_PAGES` | Init/adoption recovery and server buffer pages |
-
 | `NEXTSQL_SERVER_USER` | Server/bootstrap principal; never a client fallback |
-
 | `NEXTSQL_SERVER_PASSWORD_FILE` | Preferred server/bootstrap password-file path |
-
 | `NEXTSQL_SERVER_PASS` | Inline server/bootstrap password; automation fallback only |
-
 | `NEXTSQL_REGISTRY_CONFIRM` | `true` for non-interactive explicit adoption |
-
 | `NEXTSQL_ADDR` | Client address; also the `nextsqld` listen address |
 
 Use a host-only mode-`0600` provisioning env file. Never commit it or expose
@@ -1554,35 +1114,19 @@ Priority, highest wins: explicit flags (including empty strings) > non-empty pro
 `--no-env` skips dotenv files. `--env-file PATH` loads only that file (missing path is an error). Empty environment variables do not override a file value.
 
 | Variable | Meaning | Default |
-
 |---|---|---|
-
 | `NEXTSQL_ADDR` | `host:port` | `127.0.0.1:7210` |
-
 | `NEXTSQL_DATABASE_USER` | Database/client auth user | none (required) |
-
 | `NEXTSQL_DATABASE_PASSWORD_FILE` | Database/client password file (newline stripped) | none |
-
 | `NEXTSQL_DATABASE_PASS` | Inline database/client password (CI convenience) | none |
-
 | `NEXTSQL_IDP` | Named `[idp.NAME]` profile; replaces password auth with a stored broker credential | none |
-
 | `NEXTSQL_IDP_CONFIG` | OIDC client profile file | user config dir `nextsql/config.toml` |
-
-
 | `NEXTSQL_DATABASE` | Hello database name; a deployment serves exactly one | empty (server default) |
-
 | `NEXTSQL_TLS_CA` | PEM CA / server cert | none |
-
 | `NEXTSQL_TLS_SERVER_NAME` | TLS certificate/SNI server name | host from `NEXTSQL_ADDR` |
-
 | `NEXTSQL_TLS_CLIENT_CERT` | mTLS client certificate path | none |
-
 | `NEXTSQL_TLS_CLIENT_KEY` | mTLS client private-key path | none |
-
 | `NEXTSQL_INSECURE` | `true` / `1` / `yes` → plaintext, loopback only | false |
-
-
 | `NEXTSQL_MIGRATION_DIR` | Migration file directory | `./migrations` |
 
 If both a password file and an inline password are set, the file wins. Server
@@ -1610,15 +1154,10 @@ Full walkthrough, `.env` examples, and sample files: [§14](#14-schema-migration
 `nextsql migrate` is always **server mode**. It never reads `--data-dir` or the root key. Default directory is `./migrations`.
 
 ```text
-
 nextsql migrate validate | create NAME | status | pending | version
-
 nextsql migrate up|down [--count N] [--to VERSION] [--dry-run]
-
 nextsql migrate force VERSION --confirm
-
 nextsql migrate repair --confirm
-
 ```
 
 Recommended v1 workflow is still forward-only (`up`). `down` may apply compensating DML plus supported schema lifecycle statements such as `DROP TABLE`, `ALTER TABLE`, `CREATE TABLE`, and `DROP INDEX`. `DROP INDEX` is now understood by the migration parser/validator.
@@ -1636,47 +1175,27 @@ Default directory is `./migrations` (`--dir` / `NEXTSQL_MIGRATION_DIR`). Connect
 ### Commands
 
 ```text
-
 nextsql migrate validate
-
 nextsql migrate create add_orders
-
 nextsql migrate status
-
 nextsql migrate pending
-
 nextsql migrate version
-
 nextsql migrate up   [--count N] [--to VERSION] [--dry-run]
-
 nextsql migrate down [--count N] [--to VERSION] [--dry-run]
-
 nextsql migrate force VERSION --confirm
-
 nextsql migrate repair --confirm
-
 ```
 
 | Command | Connects? | Notes |
-
 |---|---|---|
-
 | `validate` | no | filenames, pairing, parse; no server |
-
 | `create NAME` | no | writes empty `.up.sql` / `.down.sql` |
-
 | `status` | yes | version, dirty, applied/pending, checksum mismatches |
-
 | `pending` | yes | unapplied versions |
-
 | `version` | yes | one line: version or `none` |
-
 | `up` | yes | apply pending in order |
-
 | `down` | yes | newest-first; legal compensating SQL only |
-
 | `force VERSION --confirm` | yes | rewrite history; does **not** run SQL |
-
 | `repair --confirm` | yes | refresh stored checksums of already-applied files |
 
 `validate` / `create` do not connect. `status` / `up` / `down` / `force` / `repair` create `nsql_schema_migrations` if it is missing. The CLI never sends `GRANT` SQL: creating that table grants `SELECT`/`INSERT`/`UPDATE`/`DELETE` on it to the handshake user.
@@ -1690,33 +1209,20 @@ Each up file is one transaction: `BEGIN`, dirty history insert, each statement, 
 `.env` is safe to commit if it contains no secrets. `.env.local` is gitignored and is the place for the password-file path.
 
 ```bash
-
 # .env  — safe to commit if it contains no secrets
-
 NEXTSQL_ADDR=127.0.0.1:7210
-
 NEXTSQL_DATABASE_USER=app
-
 NEXTSQL_INSECURE=true
-
 NEXTSQL_MIGRATION_DIR=./migrations
-
 # NEXTSQL_DATABASE is optional; leave unset on 0.0.1
-
 ```
 
 ```bash
-
 # .env.local  — gitignored
-
 NEXTSQL_DATABASE_PASSWORD_FILE=/home/dev/secrets/nextsql.pw
-
 # Optional local-only operator vars; ignored by exec/migrate:
-
 # NEXTSQL_DATA_DIR=/var/lib/nextsql
-
 # NEXTSQL_KEY_FILE=/etc/nextsql/root.key
-
 ```
 
 Do **not** put the root key path in the committed `.env`. Do **not** put `NEXTSQL_DATABASE_PASS=...` in a committed file. The password file is preferred over an inline password.
@@ -1728,29 +1234,18 @@ Do **not** put the root key path in the committed `.env`. Do **not** put `NEXTSQ
 Load this on the migrate runner, not on the database host. The VPS `nextsqld` already has the root key; the migrator must not.
 
 ```bash
-
 # .env.production  — loaded with --env-file on the migrate runner, not on the DB host
-
 NEXTSQL_ADDR=db.example.com:7210
-
 NEXTSQL_DATABASE_USER=migrator
-
 NEXTSQL_DATABASE_PASSWORD_FILE=/run/secrets/nextsql-migrator.pw
-
 NEXTSQL_TLS_CA=/etc/nextsql/ca.pem
-
 NEXTSQL_MIGRATION_DIR=./migrations
-
 # no NEXTSQL_KEY_FILE — the VPS nextsqld has the key; CI must not
-
 ```
 
 ```bash
-
 nextsql migrate up --env-file .env.production
-
 nextsql exec --env-file .env.production -c "SELECT version FROM nsql_schema_migrations"
-
 ```
 
 Remote connections need `--tls-ca` (or `NEXTSQL_TLS_CA`). `--insecure` is rejected off loopback.
@@ -1760,17 +1255,11 @@ On Raft, connect to the **leader**. Writes already fail with `unavailable` if th
 ### File names
 
 ```text
-
 migrations/
-
   20260818120000_create_customers.up.sql
-
   20260818120000_create_customers.down.sql
-
   20260818120100_create_orders.up.sql
-
   20260818120100_create_orders.down.sql
-
 ```
 
 Pattern: `YYYYMMDDHHMMSS_slug.up.sql` (optional matching `.down.sql`). Migration versions are timestamp-formatted, monotonically increasing identifiers. `migrate create NAME` slugs the name (lowercase, non-alphanumerics to `_`, max 64 characters) and allocates the later of the current UTC second or one second after the latest existing version. When multiple migrations are created within the same wall-clock second, NextSQL continues allocating subsequent versions without waiting, including when existing versions are ahead of the wall clock. This supports bulk and programmatic migration generation while preserving the 14-digit format.
@@ -1790,101 +1279,59 @@ Copies of the first two files live in [`docs/examples/migrations/`](docs/example
 `20260818120000_create_customers.up.sql`:
 
 ```sql
-
 CREATE TABLE customers (
-
     account_id  UUID NOT NULL,
-
     id         UUID NOT NULL DEFAULT UUID(),
-
     email      STRING NOT NULL,
-
     name       STRING NOT NULL,
-
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-
     PRIMARY KEY (account_id, id)
-
 );
-
 CREATE UNIQUE INDEX ux_customers_tenant_email ON customers (account_id, email);
-
 ```
 
 A v1-legal compensating down for seed data:
 
 ```sql
-
 DELETE FROM customers;
-
 ```
 
 `20260818120100_create_orders.up.sql`:
 
 ```sql
-
 CREATE TABLE orders (
-
     account_id   UUID NOT NULL,
-
     id          UUID NOT NULL DEFAULT UUID(),
-
     customer_id UUID NOT NULL,
-
     total       DECIMAL(12,2) NOT NULL,
-
     created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-
     PRIMARY KEY (account_id, id),
-
     CONSTRAINT fk_orders_customer
-
         FOREIGN KEY (account_id, customer_id)
-
         REFERENCES customers (account_id, id)
-
         ON DELETE RESTRICT
-
         ON UPDATE RESTRICT
-
 );
-
 CREATE INDEX ix_orders_customer ON orders (account_id, customer_id);
-
 ```
 
 `20260818120200_create_lines.up.sql`:
 
 ```sql
-
 CREATE TABLE lines (
-
     account_id  UUID NOT NULL,
-
     id         UUID NOT NULL DEFAULT UUID(),
-
     order_id   UUID NOT NULL,
-
     sku        STRING NOT NULL,
-
     qty        DECIMAL(12,0) NOT NULL,
-
     PRIMARY KEY (account_id, id),
-
     CONSTRAINT fk_lines_order
-
         FOREIGN KEY (account_id, order_id)
-
         REFERENCES orders (account_id, id)
-
         ON DELETE CASCADE
-
         ON UPDATE RESTRICT
-
 );
-
 CREATE INDEX ix_lines_order ON lines (account_id, order_id);
-
 ```
 
 `RESTRICT` rejects a parent `DELETE`/`UPDATE` that still has children. `CASCADE` deletes or rewrites matching children on the leader (depth 8 / 100 000 row caps). `SET NULL` / `SET DEFAULT` are also enforced.
@@ -1892,33 +1339,21 @@ CREATE INDEX ix_lines_order ON lines (account_id, order_id);
 After apply, multi-join and `LEFT JOIN` work (up to eight tables). Inner joins may be reordered; result order is unspecified unless `ORDER BY` is present. `SEARCH` / `NEAREST` may run on the `FROM` table of an inner join; outer join + search is rejected.
 
 ```sql
-
 SELECT orders.id, customers.name, lines.sku
-
 FROM orders
-
 JOIN customers ON customers.account_id = orders.account_id
-
               AND customers.id = orders.customer_id
-
 JOIN lines     ON lines.account_id = orders.account_id
-
               AND lines.order_id = orders.id;
-
 ```
 
 ### Apply
 
 ```bash
-
 nextsql migrate validate
-
 nextsql migrate up --dry-run
-
 nextsql migrate up
-
 nextsql migrate status
-
 ```
 
 `validate` needs no server. `up` and `status` need a running `nextsqld` and the same user / password / TLS settings as `exec`.
@@ -1929,7 +1364,7 @@ The recommended v1 workflow is still **forward-only** (`up`) when you want expan
 
 `migrate down` walks applied versions newest-first (`--count` / `--to`; `--count 0` means all). Each down file is one transaction: mark the history row dirty with `direction='down'`, run statements, `DELETE` that history row. On error the file is rolled back and the up row stays.
 
-Legal down statements include `DELETE`, `INSERT`, `UPDATE`, supported `CREATE TABLE` / `CREATE INDEX`, `DROP TABLE`, `DROP INDEX`, `ALTER TABLE`, and `CREATE DATABASE`. A version with no `.down.sql` is refused (exit 6). Security DDL (`CREATE USER`, `GRANT`, …) remains outside the normal migration-file surface unless explicitly supported by the current implementation.
+Legal down statements include `DELETE`, `INSERT`, `UPDATE`, supported `CREATE TABLE` / `CREATE INDEX`, `DROP TABLE`, `DROP INDEX`, and `ALTER TABLE`. A version with no `.down.sql` is refused (exit 6). Security DDL (`CREATE USER`, `GRANT`, …) remains outside the normal migration-file surface unless explicitly supported by the current implementation.
 
 `force VERSION --confirm` is an operator action. It rewrites history without running SQL. `VERSION` `0` or `none` deletes all history rows (objects stay). Otherwise rows newer than `VERSION` are deleted and `VERSION` is upserted clean.
 
@@ -1950,31 +1385,18 @@ Migrations run only in the database selected by the connection. There is no row-
 ## 15. Server configuration
 
 ```text
-
 nextsqld --data-dir DIR --key-file FILE [--instance-key-file FILE]
-
          [--listen 127.0.0.1:7210] [--config FILE]
-
          [--env-file PATH | --no-env]
-
          [--tls-cert FILE --tls-key FILE [--tls-client-ca FILE [--tls-client-crl FILE]]]
-
          [--auth-broker-listen ADDR [--auth-broker-config FILE]]
-
          [--require-client-key]
-
          [--user NAME --password-file FILE]
-
          [--auth-file FILE] [--audit-file FILE]
-
          [--buffer-pages N] [--log-level debug|info|warn|error]
-
          [--wal-archive DIR]
-
          [--node-id ID --raft-bind ADDR --raft-join id=addr,... [--raft-bootstrap]]
-
          [--raft-heartbeat-ms N] [--raft-election-ms N] [--raft-leader-lease-ms N] [--raft-commit-timeout-ms N]
-
 ```
 
 `--data-dir` is required (flag or config). `--key-file` is required unless `--require-client-key` is set.
@@ -1984,80 +1406,46 @@ nextsqld --data-dir DIR --key-file FILE [--instance-key-file FILE]
 Simple `key=value`. Comments start with `#`. Unknown keys are rejected.
 
 ```text
-
 data_dir=/var/lib/nextsql
-
 key_file=/etc/nextsql/root.key
-
 listen_addr=127.0.0.1:7210
-
 log_level=info
-
 buffer_pages=1024
-
 tls_cert=/etc/nextsql/server.crt
-
 tls_key=/etc/nextsql/server.key
-
 tls_client_ca=
-
 tls_client_crl=
-
 token_verify_keyset=
-
 token_revocations=
-
 token_audience=
-
 token_identity_source_hint=
-
 auth_broker_config=
-
 auth_broker_listen=
-
 require_client_key=false
-
 audit_file=
-
 wal_archive=/var/lib/nextsql-wal
-
 max_inflight_queries=32
-
 max_query_queue=128
-
 query_queue_wait_ms=5000
-
 max_result_rows=1000000
-
 max_connections=128
-
 max_connections_per_user=0
-
+max_concurrent_password_hashes=0
 idle_timeout_ms=60000
-
 shutdown_drain_ms=30000
-
 node_id=
-
 raft_bind=
-
 raft_join=
-
 raft_bootstrap=false
-
 # Raft intervals in ms; 0 (the default) leaves the built-in value.
 # raft_leader_lease_ms must not exceed raft_heartbeat_ms, and
 # raft_election_ms must be at least raft_heartbeat_ms. Raising
 # raft_heartbeat_ms also widens the follower-read freshness window,
 # which is five heartbeats. See docs/ha.md.
 raft_heartbeat_ms=0
-
 raft_election_ms=0
-
 raft_leader_lease_ms=0
-
 raft_commit_timeout_ms=0
-
 ```
 
 Command-line flags override the file.
@@ -2098,97 +1486,51 @@ Common API: `exec` (materialize), `query` (stream rows), `prepare` / execute, `c
 ### Go
 
 ```go
-
 package main
-
 import (
-
   "context"
-
   "fmt"
-
   "log"
-
   "os"
-
   nextsql "github.com/bzync/nextsql/drivers/go"
-
   "github.com/bzync/nextsql/internal/sql/types"
-
 )
-
 func main() {
-
   conn, err := nextsql.Open(nextsql.Config{
-
     Address:       "127.0.0.1:7210",
-
     User:          "app",
-
     Password:      os.Getenv("NEXTSQL_DATABASE_PASS"),
-
     InsecureNoTLS: true, // loopback only
-
   })
-
   if err != nil {
-
     log.Fatal(err)
-
   }
-
   defer conn.Close()
-
   dec, err := types.ParseDecimal("50.00")
-
   if err != nil {
-
     log.Fatal(err)
-
   }
-
   res, err := conn.Exec(context.Background(),
-
     `SELECT name FROM items WHERE price < $1`,
-
     types.DecimalValue(dec, types.Type{Kind: types.KindDecimal, Precision: 12, Scale: 2}),
-
   )
-
   if err != nil {
-
     log.Fatal(err)
-
   }
-
   for _, row := range res.Rows {
-
     fmt.Println(row[0].String())
-
   }
-
   stmt, err := conn.Prepare(context.Background(),
-
     `SELECT sku FROM items WHERE sku = $1`)
-
   if err != nil {
-
     log.Fatal(err)
-
   }
-
   defer stmt.Close()
-
   _, err = stmt.Exec(context.Background(), types.StringValue("A-1"))
-
   if err != nil {
-
     log.Fatal(err)
-
   }
-
 }
-
 ```
 
 `Query` returns `*Rows` (`Next`, `Values`, `Columns`, `Close`). Canceling the `Query` context opens a side connection and cancels the in-flight statement.
@@ -2199,29 +1541,19 @@ For `--require-client-key`, set `Config.KeyProvider` (never a URL). See [§17](#
 
 ```js
 const { connect } = require("./drivers/node/nextsql"); // Bun: drivers/bun/nextsql.js
-
 const conn = await connect({
   address: "127.0.0.1:7210",
-
   user: "app",
-
   password: process.env.NEXTSQL_DATABASE_PASS,
-
   insecureNoTLS: true,
 });
-
 const res = await conn.exec("SELECT name FROM items WHERE price < $1", [
   { kind: "decimal", value: "50.00" },
 ]);
-
 console.log(res.rows);
-
 const stmt = await conn.prepare("SELECT sku FROM items WHERE sku = $1");
-
 const rows = await stmt.query(["A-1"]);
-
 await stmt.close();
-
 await conn.close();
 ```
 
@@ -2232,47 +1564,28 @@ TypeScript: `import { connect, type Config } from "@bzync/nextsql"`.
 ### PHP 8.1+
 
 ```php
-
 require 'drivers/php/autoload.php';
-
 $conn = NextSQL\Client::connect([
-
     'address' => '127.0.0.1:7210',
-
     'user' => 'app',
-
     'password' => getenv('NEXTSQL_DATABASE_PASS'),
-
     'insecureNoTLS' => true,
-
 ]);
-
 $res = $conn->exec('SELECT name FROM items WHERE price < $1', [
-
     ['kind' => 'decimal', 'value' => '50.00'],
-
 ]);
-
 $conn->close();
-
 ```
 
 Remote TLS:
 
 ```php
-
 $conn = NextSQL\Client::connect([
-
     'address' => 'db.example.com:7210',
-
     'user' => 'app',
-
     'password' => getenv('NEXTSQL_DATABASE_PASS'),
-
     'tls' => ['cafile' => '/etc/nextsql/ca.pem', 'servername' => 'db.example.com'],
-
 ]);
-
 ```
 
 ### Python 3.10+
@@ -2280,11 +1593,9 @@ $conn = NextSQL\Client::connect([
 Stdlib only, not published to PyPI — import from the tree directly.
 
 ```python
-
 import sys
 sys.path.insert(0, 'drivers/python')
 import nextsql
-
 conn = nextsql.connect(nextsql.Config(
     address='127.0.0.1:7210',
     user='app',
@@ -2293,20 +1604,17 @@ conn = nextsql.connect(nextsql.Config(
 ))
 res = conn.exec('SELECT name FROM items WHERE price < $1', [decimal.Decimal('50.00')])
 conn.close()
-
 ```
 
 Remote TLS:
 
 ```python
-
 conn = nextsql.connect(nextsql.Config(
     address='db.example.com:7210',
     user='app',
     password=os.environ['NEXTSQL_DATABASE_PASS'],
     tls=nextsql.TLSConfig(cafile='/etc/nextsql/ca.pem', server_name='db.example.com'),
 ))
-
 ```
 
 ### Ruby 3.0+
@@ -2314,10 +1622,8 @@ conn = nextsql.connect(nextsql.Config(
 Stdlib only, not published as a gem — require from the tree directly.
 
 ```ruby
-
 $LOAD_PATH.unshift('drivers/ruby/lib')
 require 'nextsql'
-
 conn = NextSQL.connect(NextSQL::Config.new(
   address: '127.0.0.1:7210',
   user: 'app',
@@ -2326,20 +1632,17 @@ conn = NextSQL.connect(NextSQL::Config.new(
 ))
 res = conn.exec('SELECT name FROM items WHERE price < $1', [BigDecimal('50.00')])
 conn.close
-
 ```
 
 Remote TLS:
 
 ```ruby
-
 conn = NextSQL.connect(NextSQL::Config.new(
   address: 'db.example.com:7210',
   user: 'app',
   password: ENV['NEXTSQL_DATABASE_PASS'],
   tls: NextSQL::TLSConfig.new(cafile: '/etc/nextsql/ca.pem', server_name: 'db.example.com'),
 ))
-
 ```
 
 ---
@@ -2351,47 +1654,28 @@ conn = NextSQL.connect(NextSQL::Config.new(
 Any listen address that is not loopback requires TLS 1.3:
 
 ```bash
-
 # example self-signed pair for a lab — replace with a real certificate
-
-openssl req -x509 -newkey rsa:2048 -sha256 -days 365 -nodes \\
-
-  -keyout /etc/nextsql/server.key \\
-
-  -out    /etc/nextsql/server.crt \\
-
+openssl req -x509 -newkey rsa:2048 -sha256 -days 365 -nodes \
+  -keyout /etc/nextsql/server.key \
+  -out    /etc/nextsql/server.crt \
   -subj "/CN=db.example.com"
-
-./nextsqld \\
-
-  --data-dir /var/lib/nextsql \\
-
-  --key-file /etc/nextsql/root.key \\
-
-  --listen 0.0.0.0:7210 \\
-
-  --tls-cert /etc/nextsql/server.crt \\
-
-  --tls-key  /etc/nextsql/server.key \\
-
+./nextsqld \
+  --data-dir /var/lib/nextsql \
+  --key-file /etc/nextsql/root.key \
+  --listen 0.0.0.0:7210 \
+  --tls-cert /etc/nextsql/server.crt \
+  --tls-key  /etc/nextsql/server.key \
   --user app --password-file /tmp/nextsql.pw
-
 ```
 
 Client:
 
 ```bash
-
-./nextsql exec \\
-
-  --addr db.example.com:7210 \\
-
-  --tls-ca /etc/nextsql/server.crt \\
-
-  --user app --password-file /tmp/nextsql.pw \\
-
+./nextsql exec \
+  --addr db.example.com:7210 \
+  --tls-ca /etc/nextsql/server.crt \
+  --user app --password-file /tmp/nextsql.pw \
   -c "SELECT 1"
-
 ```
 
 `--insecure` against a remote host is rejected.
@@ -2421,15 +1705,12 @@ keyset and revocation list (last known-good on failure).
 # once: create an issuer keyset, then a verify-only copy for the servers
 nextsql token keygen        --keyset /secure/token.keyset
 nextsql token export-public  --keyset /secure/token.keyset --out /etc/nextsql/token.keyset.pub
-
 # issue a 15-minute read-only credential for user "app" in one database
 nextsql token mint --keyset /secure/token.keyset --principal app \
   --audience prod-eu --database orders --role readonly --ttl 15m
-
 # revoke one credential, or every credential for a principal
 nextsql token revoke --revocations /etc/nextsql/token.revocations --token-id <hex>
 nextsql token revoke --revocations /etc/nextsql/token.revocations --principal app
-
 # rotate the signing key (overlap), then retire the old one later
 nextsql token rotate --keyset /secure/token.keyset
 nextsql token retire --keyset /secure/token.keyset --key-id 1
@@ -2446,17 +1727,11 @@ the credential expires. See [`docs/security.md`](docs/security.md).
 `nextsqld --require-client-key` does **not** load `--key-file`. After password auth the first client sends the 32-byte root over TLS (`TypeUnlock`). The host does not keep a long-lived key file.
 
 ```bash
-
-./nextsqld \\
-
-  --data-dir /var/lib/nextsql \\
-
-  --require-client-key \\
-
-  --listen 127.0.0.1:7210 \\
-
+./nextsqld \
+  --data-dir /var/lib/nextsql \
+  --require-client-key \
+  --listen 127.0.0.1:7210 \
   --user app --password-file /tmp/nextsql.pw
-
 ```
 
 The root still exists in RAM for the life of the unlocked process. That is not a zero-knowledge property.
@@ -2490,15 +1765,12 @@ records cannot be rewritten without an accepted private key.
 nextsql audit keygen --keyset /secure/nextsql-audit.nsak
 nextsql audit export-public --keyset /secure/nextsql-audit.nsak \
   --out /verify/nextsql-audit-public.nsak
-
 # configure the server to sign new records
 nextsqld --audit-signing-keyset /secure/nextsql-audit.nsak ...
-
 # verify the chain (and every signature, given a keyset)
 nextsql audit verify --file /var/lib/nextsql/nextsql.audit \
   --pubkey /verify/nextsql-audit-public.nsak
 nextsql audit verify --file /var/lib/nextsql/nextsql.audit --json
-
 # rotate the signing key (overlap), then retire the old one later
 nextsql audit rotate --keyset /secure/nextsql-audit.nsak
 kill -HUP <nextsqld-pid>
@@ -2521,31 +1793,18 @@ signatures" for the full threat boundary.
 A successful write is not a valid backup. `nextsql backup` publishes the destination only after hash checks **and** a restore-test open.
 
 ```bash
-
 # physical backup (pages, WAL, UNDO, users, ACL — still ciphertext)
-
-./nextsql backup \\
-
-  --data-dir /var/lib/nextsql \\
-
-  --key-file /etc/nextsql/root.key \\
-
+./nextsql backup \
+  --data-dir /var/lib/nextsql \
+  --key-file /etc/nextsql/root.key \
   --out /backups/nextsql-2026-08-18
-
 # re-check later
-
 ./nextsql verify --from /backups/nextsql-2026-08-18 --key-file /etc/nextsql/root.key
-
 # restore into an empty directory
-
-./nextsql restore \\
-
-  --from /backups/nextsql-2026-08-18 \\
-
-  --data-dir /var/lib/nextsql-restored \\
-
+./nextsql restore \
+  --from /backups/nextsql-2026-08-18 \
+  --data-dir /var/lib/nextsql-restored \
   --key-file /etc/nextsql/root.key
-
 ```
 
 The backup directory is not a tar of plaintext files. Layout (`NSBK` v1): `header`, `keystore` (wrapped DEKs only), `manifest`, `members/*`, `verified`. Stolen backups are unreadable without the root unlock key. Audit logs are operational and are **not** part of the backup.
@@ -2555,51 +1814,30 @@ The backup directory is not a tar of plaintext files. Layout (`NSBK` v1): `heade
 Enable WAL archival on the server:
 
 ```bash
-
-./nextsqld \\
-
-  --data-dir /var/lib/nextsql \\
-
-  --key-file /etc/nextsql/root.key \\
-
-  --wal-archive /var/lib/nextsql-wal \\
-
+./nextsqld \
+  --data-dir /var/lib/nextsql \
+  --key-file /etc/nextsql/root.key \
+  --wal-archive /var/lib/nextsql-wal \
   --user app --password-file /tmp/nextsql.pw
-
 ```
 
 Recycled (and checkpoint-time current) segments are copied as sealed `NSWA` archives.
 
 ```bash
-
 # replay committed records with LSN <= N
-
-./nextsql restore \\
-
-  --from /backups/nextsql-2026-08-18 \\
-
-  --data-dir /var/lib/nextsql-pitr \\
-
-  --key-file /etc/nextsql/root.key \\
-
-  --wal-archive /var/lib/nextsql-wal \\
-
+./nextsql restore \
+  --from /backups/nextsql-2026-08-18 \
+  --data-dir /var/lib/nextsql-pitr \
+  --key-file /etc/nextsql/root.key \
+  --wal-archive /var/lib/nextsql-wal \
   --until-lsn 12000
-
 # stop at the latest backup/archive stamp <= this time
-
-./nextsql restore \\
-
-  --from /backups/nextsql-2026-08-18 \\
-
-  --data-dir /var/lib/nextsql-pitr \\
-
-  --key-file /etc/nextsql/root.key \\
-
-  --wal-archive /var/lib/nextsql-wal \\
-
+./nextsql restore \
+  --from /backups/nextsql-2026-08-18 \
+  --data-dir /var/lib/nextsql-pitr \
+  --key-file /etc/nextsql/root.key \
+  --wal-archive /var/lib/nextsql-wal \
   --until 2026-08-18T15:04:05Z
-
 ```
 
 `--until` is **backup / archive time**, not per-commit time. Do not treat it as a commit-accurate clock. Details: [`docs/backup.md`](docs/backup.md).
@@ -2611,23 +1849,14 @@ Recycled (and checkpoint-time current) segments are copied as sealed `NSWA` arch
 Export is a **logical** snapshot (schema + committed rows). It is not a page-level backup and it is not PITR. Vector payloads are inlined; indexes are recreated on import.
 
 ```bash
-
-./nextsql export \\
-
-  --data-dir /var/lib/nextsql \\
-
-  --key-file /etc/nextsql/root.key \\
-
+./nextsql export \
+  --data-dir /var/lib/nextsql \
+  --key-file /etc/nextsql/root.key \
   --out /exports/nextsql-2026-08-18
-
-./nextsql import \\
-
-  --from /exports/nextsql-2026-08-18 \\
-
-  --data-dir /var/lib/nextsql-copy \\
-
+./nextsql import \
+  --from /exports/nextsql-2026-08-18 \
+  --data-dir /var/lib/nextsql-copy \
   --key-file /etc/nextsql/root.key
-
 ```
 
 The destination is created if `nextsql.db` is missing, with a **new** identity under the same root. Existing dest tables with the same name fail closed (`already_exists`). Uncommitted writes are not exported.
@@ -2655,51 +1884,29 @@ Engineering targets on a healthy 3-node cluster: leader election `< 3 s`, servic
 Only **one** node bootstraps. The other two use the same `--raft-join` list without `--raft-bootstrap`. All replicas share the keystore / root unlock key.
 
 ```bash
-
 # node n1 (bootstrap)
-
-./nextsqld --data-dir /var/lib/nextsql-n1 --key-file /etc/nextsql/root.key \\
-
-  --tls-cert cert.pem --tls-key key.pem --listen 0.0.0.0:7210 \\
-
-  --user app --password-file /tmp/nextsql.pw \\
-
-  --node-id n1 --raft-bind 10.0.0.1:7211 \\
-
-  --raft-join n1=10.0.0.1:7211,n2=10.0.0.2:7211,n3=10.0.0.3:7211 \\
-
+./nextsqld --data-dir /var/lib/nextsql-n1 --key-file /etc/nextsql/root.key \
+  --tls-cert cert.pem --tls-key key.pem --listen 0.0.0.0:7210 \
+  --user app --password-file /tmp/nextsql.pw \
+  --node-id n1 --raft-bind 10.0.0.1:7211 \
+  --raft-join n1=10.0.0.1:7211,n2=10.0.0.2:7211,n3=10.0.0.3:7211 \
   --raft-bootstrap
-
 # node n2
-
-./nextsqld --data-dir /var/lib/nextsql-n2 --key-file /etc/nextsql/root.key \\
-
-  --tls-cert cert.pem --tls-key key.pem --listen 0.0.0.0:7210 \\
-
-  --user app --password-file /tmp/nextsql.pw \\
-
-  --node-id n2 --raft-bind 10.0.0.2:7211 \\
-
+./nextsqld --data-dir /var/lib/nextsql-n2 --key-file /etc/nextsql/root.key \
+  --tls-cert cert.pem --tls-key key.pem --listen 0.0.0.0:7210 \
+  --user app --password-file /tmp/nextsql.pw \
+  --node-id n2 --raft-bind 10.0.0.2:7211 \
   --raft-join n1=10.0.0.1:7211,n2=10.0.0.2:7211,n3=10.0.0.3:7211
-
 # node n3 — same as n2 with n3 / 10.0.0.3
-
 ```
 
 ```bash
-
 ./nextsql cluster status --data-dir /var/lib/nextsql-n1
-
 # node n1
-
 # state Leader
-
 # leader n1
-
 # voters 3
-
 # has_leader true
-
 ```
 
 Before restarting or taking the current leader down for maintenance, hand
@@ -2707,13 +1914,9 @@ off leadership first so the new leader is already serving before the old one
 stops:
 
 ```bash
-
 ./nextsql cluster transfer-leader --addr 10.0.0.1:7210 --user app --password-file /tmp/nextsql.pw
-
 # result
-
 # transfer_initiated
-
 ```
 
 Drain a specific node for planned maintenance — no signal or restart
@@ -2721,13 +1924,9 @@ required, and no Raft leadership requirement (a follower is exactly as
 drainable as a leader):
 
 ```bash
-
 ./nextsql cluster drain --addr 10.0.0.2:7210 --user app --password-file /tmp/nextsql.pw --timeout-ms 30000
-
 # result
-
 # drain_initiated
-
 ```
 
 A wiped replica is restored with `nextsql backup` / `restore` (same identity and keys), then rejoined. Raft logs are ciphertext (replication DEK). HA is not a substitute for backups.
@@ -2751,13 +1950,9 @@ Details: [`docs/ha.md`](docs/ha.md).
 ### Diagnose and status
 
 ```bash
-
 ./nextsql status
-
 ./nextsql status --local --data-dir /var/lib/nextsql --key-file /etc/nextsql/root.key
-
 ./nextsql diagnose --data-dir /var/lib/nextsql
-
 ```
 
 `nextsql status` (default) is **server mode**. It dials a running `nextsqld`, completes the NSQL handshake, and prints `mode server`, `addr`, `user`, `database`, and `ok`. It does not open the data directory and does not print LSNs. Connection flags and dotenv match `exec` (`--addr`, `--user`, `--password-file`, `--database`, `--tls-ca` / `--insecure`, `--env-file` / `--no-env`). Mixing `--data-dir` / `--key-file` onto server-mode `status` is an error.
@@ -2773,23 +1968,14 @@ Isolated pages are a fail-closed corruption path (`*.isolated`). NextSQL never r
 `nextsql` maps errors to process exit codes for CI:
 
 | Code | When |
-
 |---|---|
-
 | 0 | Success |
-
 | 1 | Usage, unknown command, invalid flags |
-
 | 2 | Connection, authentication, or TLS |
-
 | 3 | Dirty migration history (`migrate up` / `down` / `status`) |
-
 | 4 | Migration checksum mismatch |
-
 | 5 | SQL execution error |
-
 | 6 | Migration validation error (bad files, unimplemented down, `--to`) |
-
 | 7 | Local-mode missing `--data-dir` / `--key-file` |
 
 ### `nextsql-bench`
@@ -2797,31 +1983,18 @@ Isolated pages are a fail-closed corruption path (`*.isolated`). NextSQL never r
 Official numbers keep encryption, WAL, `fsync`, checksums, MVCC, and authentication on. Numbers from one host are not product guarantees.
 
 ```bash
-
 ./nextsql-bench --quick
-
 ./nextsql-bench --workload all|page|point|range|insert|update|delete|txn|join|agg|json|fulltext|vector|hybrid
-
 ./nextsql-bench --duration 1s --rows 128 --concurrency 1
-
 # labeled SLO suite (hardware, filesystem, encryption, durability printed on every row)
-
 ./nextsql-bench --slo
-
 ./nextsql-bench --slo --slo-max-rows 1000000 --slo-vectors 256 --duration 2s
-
 # partition-pruning comparison: RANGE-partitioned vs unpartitioned, same rows
-
 ./nextsql-bench --partition --partition-rows 40000 --duration 3s
-
 # follower-read scaling: STRONG vs STALE/BOUNDED reads across a 3-node cluster
-
 ./nextsql-bench --readscale --readscale-rows 10000 --duration 5s
-
 # quantised-vector comparison: F32 vs F16 vs I8 element types, F16/I8-quantised HNSW graphs, IVF / IVF-PQ, and a SPARSEVECTOR inverted index — size, build, NEAREST latency + recall
-
 ./nextsql-bench --vecquant --vecquant-rows 5000 --vecquant-dim 256 --vecquant-sparse-dim 4096 --vecquant-sparse-nnz 24
-
 ```
 
 `--slo` seeds a throwaway encrypted database and measures cached PK lookup, secondary-index equality, durable single-row INSERT/UPDATE, bulk INSERT plus `COUNT(*)` / `GROUP BY` / range / join at each scale, hybrid `WHERE`+`SEARCH`+`NEAREST`, and HNSW recall\@10 / recall\@100.
@@ -2835,13 +2008,9 @@ Official numbers keep encryption, WAL, `fsync`, checksums, MVCC, and authenticat
 ### Tests
 
 ```bash
-
 go test ./...
-
 go test -race ./...          # needs a C compiler
-
 go test ./tests/integration ./tests/crash ./tests/ha
-
 ```
 
 ---
@@ -2851,39 +2020,22 @@ go test ./tests/integration ./tests/crash ./tests/ha
 ### Hard limits
 
 | Limit | Value |
-
 |---|---|
-
 | Logical page | 16 KiB |
-
 | Packet / SQL text | 64 MiB / 16 MiB (configurable within these ceilings) |
-
 | Parameters | 65,535 (configurable ceiling) |
-
 | Prepared statements / session | 64 default; 4,096 ceiling |
-
 | JSON depth / size | 32 / 1 MiB |
-
 | Vector dimension | 8192 dense/bit; 65535 sparse, finite elements |
-
 | Collection nesting / length | depth 8 / 1,048,576 elements |
-
 | LINESTRING / POLYGON vertices | 256 |
-
 | GEOMETRY / GEOGRAPHY vertices / nesting / parts | 65,536 / 8 / 4,096 |
-
 | JOIN tables | 8 (`FROM` + up to seven `JOIN`s) |
-
 | Foreign keys per table | 16 |
-
 | Columns per foreign key | 8 |
-
 | FK cascade depth | 8 |
-
 | FK cascade touched rows | 100 000 |
-
 | Wire result | 64 MiB |
-
 | Default result rows | 1 000 000 |
 
 ### Shipped after the original P0–P15 manual baseline
@@ -3021,51 +2173,28 @@ return an empty/not-attached view for those process-wide sources.
 ## 24. Further reading
 
 | Document | Topic |
-
 |---|---|
-
 | [PROJECT.md](PROJECT.md) | Intended final NextSQL product/end-state |
-
 | [TODO.md](TODO.md) | Current implementation status, open gates, measurements |
-
 | [ROADMAP.md](ROADMAP.md) | Simplified, non-authoritative roadmap derived from `TODO.md` |
-
 | [SKILLS.md](SKILLS.md) | Engineering and agent operating contract |
-
 | [AGENTS.md](AGENTS.md) | Repository agent entrypoint |
-
 | [README.md](README.md) | Product overview and quick start |
-
 | [docs/sql.md](docs/sql.md) | Dialect, types, catalog |
-
 | [docs/optimizer.md](docs/optimizer.md) | Rewrites, costing, hybrid plans, `EXPLAIN` |
-
 | [docs/execution.md](docs/execution.md) | Vectorized batches, budgets |
-
 | [docs/json.md](docs/json.md) | Binary JSON and path indexes |
-
 | [docs/fulltext.md](docs/fulltext.md) | Tokenizer, BM25, inverted index |
-
 | [docs/vector.md](docs/vector.md) | `VECTOR<F32,N>`, HNSW, distances |
-
 | [docs/geo.md](docs/geo.md) | WGS84 types and predicates |
-
 | [docs/mvcc.md](docs/mvcc.md) | Isolation, UNDO |
-
 | [docs/wal.md](docs/wal.md) | WAL, checkpoints |
-
 | [docs/protocol.md](docs/protocol.md) | Native wire protocol |
-
 | [docs/security.md](docs/security.md) | Keys, TLS, RBAC, tenants |
-
 | [docs/backup.md](docs/backup.md) | Backup, restore, PITR |
-
 | [docs/export.md](docs/export.md) | Logical export / import |
-
 | [docs/ops.md](docs/ops.md) | Metrics, admission, SLO numbers |
-
 | [docs/ha.md](docs/ha.md) | Raft clustering |
-
 | [docs/examples/migrations/](docs/examples/migrations/) | Sample `customers` / `orders` migration files |
 
 For implementation truth, always prefer the matching-version `TODO.md` and measured `docs/*` over older examples or planned product descriptions.
@@ -3079,13 +2208,10 @@ This manual is intentionally narrower than `PROJECT.md`.
 ```text
 PROJECT.md
 → what NextSQL is expected to become
-
 TODO.md
 → what is implemented now
-
 SKILLS.md / AGENTS.md
 → how repository agents must build and verify it
-
 this manual
 → how users operate the currently shipped surface
 ```

@@ -1723,8 +1723,8 @@ func TestPartitionCrossPartitionUniqueSustainedConcurrentWrites(t *testing.T) {
 	)`)
 	execOK(t, s, `CREATE UNIQUE INDEX ux_cpu_email ON cpu_race (email)`)
 
-	const idSpace = 400   // per-shard id range, so shard+id stays a stable PK per slot
-	const emailPool = 24  // small on purpose: forces frequent cross-shard collisions
+	const idSpace = 400  // per-shard id range, so shard+id stays a stable PK per slot
+	const emailPool = 24 // small on purpose: forces frequent cross-shard collisions
 	var stop atomic.Bool
 	var writes atomic.Int64
 	var wg sync.WaitGroup
@@ -1956,4 +1956,3 @@ func TestPartitionForeignKeys(t *testing.T) {
 	execOK(t, s, `DELETE FROM fk_both_child WHERE shard = 'west' AND cid = 1`)
 	execOK(t, s, `DELETE FROM fk_both_parent WHERE cat = 'electronics' AND pid = 1`)
 }
-

@@ -22,9 +22,33 @@ type (
 	CreateTable struct {
 		Table *catalog.Table
 	}
+	// CreateTableAs is `CREATE TABLE name PRIMARY KEY (cols) AS <query>`.
+	// Unlike CreateTable it carries no *catalog.Table: the column types come
+	// from the values the source query produces, so the table is built in the
+	// executor once the source has been read. Columns holds the source's
+	// output names in order, already checked to be usable as column names.
+	CreateTableAs struct {
+		Name    string
+		PK      []string
+		Columns []string
+		Query   Bound
+	}
 	ShowTasks struct {
 		After string
 		Limit int
+	}
+	CancelQuery struct {
+		ID string
+	}
+	CreateView struct {
+		Name    string
+		Columns []string
+		Query   string
+		Replace bool
+	}
+	DropView struct {
+		Name     string
+		IfExists bool
 	}
 	CancelTask struct {
 		ID string
@@ -64,9 +88,12 @@ type (
 		Index catalog.Index
 	}
 	Insert struct {
-		Table     *catalog.Table
-		Columns   []int
-		Rows      [][]ast.Expr
+		Table   *catalog.Table
+		Columns []int
+		Rows    [][]ast.Expr
+		// Query is the bound source of an `INSERT INTO t <query>`; it is
+		// mutually exclusive with Rows.
+		Query     Bound
 		Returning Returning
 	}
 	Upsert struct {
@@ -214,9 +241,19 @@ type (
 	Begin struct {
 		Iso txn.Isolation
 	}
-	Commit   struct{}
-	Rollback struct{}
-	Explain  struct {
+	Commit struct{}
+	// Savepoint / ReleaseSavepoint / a Rollback carrying a savepoint name are
+	// transaction-control statements: they touch no table and bind no schema.
+	Savepoint struct {
+		Name string
+	}
+	ReleaseSavepoint struct {
+		Name string
+	}
+	Rollback struct {
+		Savepoint string
+	}
+	Explain struct {
 		Analyze bool
 		Stmt    Bound
 	}
@@ -229,30 +266,36 @@ type (
 	}
 )
 
-func (CreateTable) bound()  {}
-func (ShowTasks) bound()    {}
-func (CancelTask) bound()   {}
-func (Subscribe) bound()    {}
-func (DropTable) bound()    {}
-func (DropIndex) bound()    {}
-func (RebuildIndex) bound() {}
-func (AlterTable) bound()   {}
-func (CreateIndex) bound()  {}
-func (Insert) bound()       {}
-func (Upsert) bound()       {}
-func (Select) bound()       {}
-func (Unnest) bound()       {}
-func (SetOperation) bound() {}
-func (With) bound()         {}
-func (CTERef) bound()       {}
-func (Update) bound()       {}
-func (Delete) bound()       {}
-func (Begin) bound()        {}
-func (Commit) bound()       {}
-func (Rollback) bound()     {}
-func (Explain) bound()      {}
-func (Analyze) bound()      {}
-func (Maintain) bound()     {}
+func (CreateTable) bound()      {}
+func (CreateTableAs) bound()    {}
+func (ShowTasks) bound()        {}
+func (CancelTask) bound()       {}
+func (CancelQuery) bound()      {}
+func (CreateView) bound()       {}
+func (DropView) bound()         {}
+func (Subscribe) bound()        {}
+func (DropTable) bound()        {}
+func (DropIndex) bound()        {}
+func (RebuildIndex) bound()     {}
+func (AlterTable) bound()       {}
+func (CreateIndex) bound()      {}
+func (Insert) bound()           {}
+func (Upsert) bound()           {}
+func (Select) bound()           {}
+func (Unnest) bound()           {}
+func (SetOperation) bound()     {}
+func (With) bound()             {}
+func (CTERef) bound()           {}
+func (Update) bound()           {}
+func (Delete) bound()           {}
+func (Begin) bound()            {}
+func (Commit) bound()           {}
+func (Savepoint) bound()        {}
+func (ReleaseSavepoint) bound() {}
+func (Rollback) bound()         {}
+func (Explain) bound()          {}
+func (Analyze) bound()          {}
+func (Maintain) bound()         {}
 
 func Bind(stmt ast.Stmt, lookup Lookup, nextID uint32) (Bound, error) {
 	return bind(stmt, lookup, nextID, nil)
@@ -284,6 +327,9 @@ func bind(stmt ast.Stmt, lookup Lookup, nextID uint32, ctes map[string]*CTE) (Bo
 		}
 		return SetOperation{Left: left, Right: right, Op: s.Op, All: s.All, Names: ln}, nil
 	case ast.CreateTable:
+		if s.Query != nil {
+			return bindCreateTableAs(s, lookup, nextID, ctes)
+		}
 		t, err := catalog.TableFromAST(nextID, s)
 		if err != nil {
 			return nil, err
@@ -297,6 +343,9 @@ func bind(stmt ast.Stmt, lookup Lookup, nextID uint32, ctes map[string]*CTE) (Bo
 			}
 		}
 		if err := catalog.ValidateForeignKeys(t, lookup); err != nil {
+			return nil, err
+		}
+		if err := validateChecks(t); err != nil {
 			return nil, err
 		}
 		if t.Partitioning != nil {
@@ -373,6 +422,9 @@ func bind(stmt ast.Stmt, lookup Lookup, nextID uint32, ctes map[string]*CTE) (Bo
 	case ast.CreateIndex:
 		return bindCreateIndex(s, lookup)
 	case ast.Insert:
+		if s.Query != nil {
+			return bindInsertQuery(s, lookup, nextID, ctes)
+		}
 		for _, row := range s.Rows {
 			for _, ex := range row {
 				if err := rejectClientEncryptedSubqueryExpr(ex, lookup, ctes); err != nil {
@@ -497,8 +549,36 @@ func bind(stmt ast.Stmt, lookup Lookup, nextID uint32, ctes map[string]*CTE) (Bo
 		return Begin{Iso: iso}, nil
 	case ast.Commit:
 		return Commit{}, nil
+	case ast.CreateView:
+		if s.Name == "" {
+			return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "CREATE VIEW requires a name")
+		}
+		if catalog.ReservedName(s.Name) {
+			return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "view name prefix nsql_ is reserved")
+		}
+		// A view and a table share one relation namespace: a name in FROM has
+		// to mean exactly one thing.
+		if _, ok := lookup(s.Name); ok {
+			return nil, nerr.New(nerr.AlreadyExists, "sql.binder", "a table with that name already exists")
+		}
+		return CreateView{Name: s.Name, Columns: s.Columns, Query: s.Query, Replace: s.Replace}, nil
+	case ast.DropView:
+		if s.Name == "" {
+			return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "DROP VIEW requires a name")
+		}
+		return DropView{Name: s.Name, IfExists: s.IfExists}, nil
 	case ast.Rollback:
-		return Rollback{}, nil
+		return Rollback{Savepoint: s.Savepoint}, nil
+	case ast.Savepoint:
+		if s.Name == "" {
+			return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "SAVEPOINT requires a name")
+		}
+		return Savepoint{Name: s.Name}, nil
+	case ast.ReleaseSavepoint:
+		if s.Name == "" {
+			return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "RELEASE SAVEPOINT requires a name")
+		}
+		return ReleaseSavepoint{Name: s.Name}, nil
 	case ast.Explain:
 		inner, err := bind(s.Stmt, lookup, nextID, ctes)
 		if err != nil {
@@ -527,6 +607,11 @@ func bind(stmt ast.Stmt, lookup Lookup, nextID uint32, ctes map[string]*CTE) (Bo
 		return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "unsupported statement")
 	}
 }
+
+// OutputNames reports the column names a bound query produces. It is the
+// exported form of boundNames, used to check a view's declared column list
+// against the query it stores.
+func OutputNames(b Bound) ([]string, bool) { return boundNames(b) }
 
 func boundNames(b Bound) ([]string, bool) {
 	switch x := b.(type) {
@@ -559,15 +644,33 @@ func boundNames(b Bound) ([]string, bool) {
 	}
 }
 
+// mustTable resolves a relation name, naming it in the error. A client that is
+// told which identifier failed can point at it; one told only "unknown table"
+// has to guess which of the names in the statement was meant.
 func mustTable(lookup Lookup, name string) (*catalog.Table, error) {
 	if lookup == nil {
-		return nil, nerr.New(nerr.NotFound, "sql.binder", "unknown table")
+		return nil, unknownRelation(name)
 	}
 	t, ok := lookup(name)
 	if !ok {
-		return nil, nerr.New(nerr.NotFound, "sql.binder", "unknown table")
+		return nil, unknownRelation(name)
 	}
 	return t, nil
+}
+
+func unknownRelation(name string) error {
+	if name == "" {
+		return nerr.New(nerr.NotFound, "sql.binder", "unknown table")
+	}
+	return nerr.New(nerr.NotFound, "sql.binder", "unknown table: "+name)
+}
+
+// unknownColumn names the identifier that did not resolve.
+func unknownColumn(name string) error {
+	if name == "" {
+		return nerr.New(nerr.NotFound, "sql.binder", "unknown column")
+	}
+	return nerr.New(nerr.NotFound, "sql.binder", "unknown column: "+name)
 }
 
 func checkExpr(e ast.Expr, tab *catalog.Table, hint types.Type, allowNil bool) error {
@@ -599,7 +702,7 @@ func checkExpr(e ast.Expr, tab *catalog.Table, hint types.Type, allowNil bool) e
 		return nil
 	case ast.Ident:
 		if _, ok := tab.ColIndex(x.Name); !ok {
-			return nerr.New(nerr.NotFound, "sql.binder", "unknown column")
+			return unknownColumn(x.Name)
 		}
 		return nil
 	case ast.Path:
@@ -617,7 +720,7 @@ func checkExpr(e ast.Expr, tab *catalog.Table, hint types.Type, allowNil bool) e
 		}
 		i, ok := tab.ColIndex(x.Parts[0])
 		if !ok {
-			return nerr.New(nerr.NotFound, "sql.binder", "unknown column")
+			return unknownColumn(x.Parts[0])
 		}
 		switch tab.Columns[i].Type.Kind {
 		case types.KindJSON:
@@ -735,6 +838,29 @@ func checkExpr(e ast.Expr, tab *catalog.Table, hint types.Type, allowNil bool) e
 			if x.Star || (len(x.Args) != 2 && len(x.Args) != 3) {
 				return nerr.New(nerr.InvalidArgument, "sql.binder", "substring takes two or three arguments")
 			}
+		case "like":
+			// LIKE(value, pattern[, escape]) — the parsed form of the
+			// `x [NOT] LIKE p [ESCAPE c]` predicate.
+			if x.Star || (len(x.Args) != 2 && len(x.Args) != 3) {
+				return nerr.New(nerr.InvalidArgument, "sql.binder", "LIKE takes a value, a pattern, and an optional ESCAPE character")
+			}
+			for _, a := range x.Args {
+				if err := checkExpr(a, tab, types.Type{}, false); err != nil {
+					return err
+				}
+			}
+			return nil
+		case "cast":
+			// CAST(value AS type) — the target type arrives as a typed NULL
+			// literal the parser built from the declared type.
+			if x.Star || len(x.Args) != 2 {
+				return nerr.New(nerr.InvalidArgument, "sql.binder", "CAST takes a value and a target type")
+			}
+			lit, ok := x.Args[1].(ast.Literal)
+			if !ok || !lit.Value.Null || lit.Value.Typ.Kind == types.KindInvalid {
+				return nerr.New(nerr.InvalidArgument, "sql.binder", "CAST requires a declared target type")
+			}
+			return checkExpr(x.Args[0], tab, types.Type{}, false)
 		case "replace", "starts_with", "ends_with", "contains":
 			if x.Star || len(x.Args) != 3 && x.Name == "replace" || len(x.Args) != 2 && x.Name != "replace" {
 				return nerr.New(nerr.InvalidArgument, "sql.binder", x.Name+" has invalid argument count")
@@ -891,6 +1017,11 @@ func scalarQueryColumns(stmt ast.Stmt) int {
 		return len(q.List)
 	case ast.SetOperation:
 		return scalarQueryColumns(q.Left)
+	case ast.With:
+		// A CTE-wrapped subquery produces whatever its body produces. This is
+		// what a hand-written `IN (WITH c AS (...) SELECT x FROM c)` needs, and
+		// what a view referenced inside a subquery expands to.
+		return scalarQueryColumns(q.Query)
 	default:
 		return -1
 	}
@@ -1945,7 +2076,7 @@ func bindAlter(s ast.AlterTable, lookup Lookup, nextID uint32) (Bound, error) {
 	case ast.AlterDropColumn:
 		idx, ok := neu.ColIndex(cmd.Name)
 		if !ok {
-			return nil, nerr.New(nerr.NotFound, "sql.binder", "unknown column")
+			return nil, unknownColumn(cmd.Name)
 		}
 		if len(neu.Columns) <= 1 {
 			return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "cannot drop the last column")
@@ -1979,7 +2110,7 @@ func bindAlter(s ast.AlterTable, lookup Lookup, nextID uint32) (Bound, error) {
 	case ast.AlterRenameColumn:
 		idx, ok := neu.ColIndex(cmd.Old)
 		if !ok {
-			return nil, nerr.New(nerr.NotFound, "sql.binder", "unknown column")
+			return nil, unknownColumn(cmd.Old)
 		}
 		if neu.Columns[idx].ClientEncrypted() && cmd.New != cmd.Old {
 			return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "rename of an ENCRYPTED CLIENT column requires client-side decrypt/re-encrypt migration")
@@ -1998,6 +2129,39 @@ func bindAlter(s ast.AlterTable, lookup Lookup, nextID uint32) (Bound, error) {
 			}
 		}
 		neu.Columns[idx].Name = cmd.New
+	case ast.AlterColumn:
+		idx, ok := neu.ColIndex(cmd.Name)
+		if !ok {
+			return nil, unknownColumn(cmd.Name)
+		}
+		col := neu.Columns[idx]
+		switch {
+		case cmd.SetNotNull:
+			col.NotNull = true
+		case cmd.DropNotNull:
+			// A primary key column is NOT NULL by definition; dropping it
+			// would leave the key able to hold a NULL.
+			if col.Primary {
+				return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "cannot drop NOT NULL from a primary key column")
+			}
+			for _, ord := range neu.PK {
+				if ord == idx {
+					return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "cannot drop NOT NULL from a primary key column")
+				}
+			}
+			col.NotNull = false
+		case cmd.DropDefault:
+			col.Default = catalog.Default{Kind: catalog.DefNone}
+		case cmd.SetDefault != nil:
+			def, err := catalog.DefaultForColumn(col, cmd.SetDefault)
+			if err != nil {
+				return nil, err
+			}
+			col.Default = def
+		default:
+			return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "ALTER COLUMN requires SET/DROP NOT NULL or SET/DROP DEFAULT")
+		}
+		neu.Columns = append(append([]catalog.Column{}, neu.Columns[:idx]...), append([]catalog.Column{col}, neu.Columns[idx+1:]...)...)
 	case ast.AlterRenameTable:
 		if tableHasClientEncrypted(neu) && cmd.New != tab.Name {
 			return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "rename of a table with ENCRYPTED CLIENT columns requires client-side decrypt/re-encrypt migration")
@@ -2013,6 +2177,15 @@ func bindAlter(s ast.AlterTable, lookup Lookup, nextID uint32) (Bound, error) {
 		neu.Name = cmd.New
 		newName = cmd.New
 	case ast.AlterAddConstraint:
+		if cmd.Check != nil {
+			if err := validateCheckExpr(neu, cmd.Check.Expr); err != nil {
+				return nil, err
+			}
+			if _, err := catalog.AddCheck(neu, *cmd.Check); err != nil {
+				return nil, err
+			}
+			break
+		}
 		if err := catalog.AddForeignKey(neu, cmd.FK); err != nil {
 			return nil, err
 		}
@@ -2020,6 +2193,7 @@ func bindAlter(s ast.AlterTable, lookup Lookup, nextID uint32) (Bound, error) {
 			return nil, err
 		}
 	case ast.AlterDropConstraint:
+		// Foreign keys and checks share one constraint namespace.
 		found := -1
 		for i, fk := range neu.ForeignKeys {
 			if fk.Name == cmd.Name {
@@ -2027,10 +2201,13 @@ func bindAlter(s ast.AlterTable, lookup Lookup, nextID uint32) (Bound, error) {
 				break
 			}
 		}
-		if found < 0 {
+		if found >= 0 {
+			neu.ForeignKeys = append(neu.ForeignKeys[:found], neu.ForeignKeys[found+1:]...)
+			break
+		}
+		if !catalog.DropCheck(neu, cmd.Name) {
 			return nil, nerr.New(nerr.NotFound, "sql.binder", "unknown constraint")
 		}
-		neu.ForeignKeys = append(neu.ForeignKeys[:found], neu.ForeignKeys[found+1:]...)
 	case ast.AlterSetCDCImages:
 		switch cmd.Mode {
 		case "KEYS":

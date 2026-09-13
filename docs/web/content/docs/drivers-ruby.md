@@ -1,7 +1,7 @@
 # Ruby driver
 
 Ruby 3.0+ (stdlib only — `socket`, `openssl`, `bigdecimal`, `json`; no
-gem dependencies). MIT, versioned independently of the engine (gem `0.1.1`).
+gem dependencies). MIT. Gem version **0.0.1**, matching the engine.
 
 ```bash
 gem install bzync-nextsql
@@ -52,8 +52,7 @@ request. Frames, SQL text, parameters, prepared statements, and batches obey
 the limits documented in [Wire protocol](/docs/protocol).
 
 The driver does not emulate PostgreSQL or MySQL and exposes no compatibility
-protocol. `database` names the deployment database; `realm` is reserved and
-must remain empty. Field-encryption helpers are not yet present in Ruby, so an
+protocol. `database` names the deployment database. Field-encryption helpers are not yet present in Ruby, so an
 application must not bind plaintext to an `ENCRYPTED CLIENT` column.
 
 ## Types

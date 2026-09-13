@@ -24,7 +24,7 @@ Keep Admin on loopback. It is not a remote management plane.
 
 ## Setup mode
 
-Covers welcome, paths and dry-run validation, resource preset, administrator, summary, install, and completion. The GUI defaults to **Production** (`--profile production`): skip-init is disabled and an administrator is required. The CLI default remains `developer` so `--skip-init` scripts keep working. On a first install, recovery-key export is enabled by default for both keystores; Finish remains disabled until the operator confirms both exported files were copied offline. The wizard passes paths to `nextsql setup` and never handles key material itself. Linux `.tar.gz` / `.run` / `.deb` / `.rpm` and silent/offline/upgrade/repair paths are live-verified. Windows/macOS packaged execution remains environment-blocked.
+Covers welcome, paths and dry-run validation, resource preset, administrator, summary, install, and completion. The GUI defaults to **Production** (`--profile production`): skip-init is disabled and an administrator is required. The CLI default remains `developer` so `--skip-init` scripts keep working. On a first install, recovery-key export is enabled by default for both keystores; Finish remains disabled until the operator confirms both exported files were copied offline. The wizard passes paths to `nextsql setup` and never handles key material itself. Linux `.tar.gz` / `.run` / `.deb` / `.rpm` and silent/offline/upgrade/repair paths are live-verified. macOS packaged execution remains environment-blocked. Native Windows is not supported; use WSL 2.
 
 The same work can be done without the GUI:
 
@@ -42,6 +42,24 @@ See [Install](/docs/install) and [Command line](/docs/cli).
 
 It talks to `nextsqld` over NSQL with the operator's credentials. Server-enforced RBAC still applies: a user without `ADMIN` does not get a security dashboard by visiting Admin. Surfaces include overview, storage, connections and activity, cluster, backup, configuration, and audit — all from `system.*` and the official CLI, never by opening data-directory files. The Databases view expands the deployment's database into its tables. Backup and verification controls keep their in-flight state visible and disable conflicting actions; a request in flight keeps an Operations session from expiring by idleness, while its absolute lifetime remains enforced.
 
+### Connection profiles
+
+One Admin can sign in to, and switch between, several `nextsqld` servers — a deployment serves exactly one database, so this is how you work with several. The `--server-addr` target is the `default` profile (`--server-name` / `--server-environment` label it); a `--profiles FILE` names more:
+
+```json
+{
+  "version": 1,
+  "profiles": [
+    {"id": "staging", "name": "Staging", "environment": "staging",
+     "address": "db.staging.internal:7210", "tls_ca": "certs/staging-ca.pem", "user": "app"},
+    {"id": "prod", "name": "Production", "environment": "production",
+     "address": "db.prod.internal:7210", "tls_ca": "/etc/nextsql/prod-ca.pem"}
+  ]
+}
+```
+
+The file, not the browser, decides which servers Admin may reach: the sign-in page and the **Switch server** dialog can only pick a profile by ID, and the sign-in page never shows where a profile points. The file holds no secret, is read strictly (an unknown key is an error), and must not be writable by group or others. Each profile follows the same TLS rules as the flags (`tls_ca` required unless `insecure`, which is loopback-only). A switch is a fresh sign-in that replaces your session only once it succeeds. A `production` profile shows a banner on every view and starts Studio in read-only mode. On a switch you may save the password in the operating system's credential store; it is usable only when switching again from the same server and user that saved it.
+
 ## Studio mode
 
 Studio is in progress on the same Operations session. Current surfaces include:
@@ -54,7 +72,7 @@ Studio is in progress on the same Operations session. Current surfaces include:
 - table inspector: statistics, foreign keys, inbound “Referenced by”, constraints, DDL, dependencies
 - schema-relationship diagram, global object search, command palette (Ctrl/Cmd+K)
 - bounded per-tab EXPLAIN comparison and an ANALYZE-only profiler
-- Switch connection / recent connections / read-consistency control
+- server switching between connection profiles, and a read-consistency control
 - review-only builders that load SQL into the editor and never execute: data generator, CSV/JSON/NDJSON import, parameterized DML, table/index designer with live native DDL preview
 
 Studio is not a generic SQL client. It uses official NextSQL interfaces only. NextSQL Intelligence / RAG is **not in the product**.

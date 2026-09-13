@@ -94,7 +94,7 @@ without recall.
 printf 'secret\n' > /tmp/nextsql.pw && chmod 600 /tmp/nextsql.pw
 
 ./nextsql init --data-dir /tmp/nextsql-data --key-file /tmp/nextsql-root.key \
-  --user app --password-file /tmp/nextsql.pw
+  --user app --password-file /tmp/nextsql.pw --database app
 
 ./nextsqld --data-dir /tmp/nextsql-data --key-file /tmp/nextsql-root.key \
   --listen 127.0.0.1:7210 --user app --password-file /tmp/nextsql.pw
@@ -181,7 +181,8 @@ tests/                     integration, crash, ha (cross-package suites; unit te
                             alongside their package under internal/)
 docs/                      per-subsystem implementation notes (see table below)
 docs/web/                  product site (`npm run dev` there)
-packaging/, scripts/       Linux/Windows installer sources and build scripts
+packaging/, scripts/       Linux installer sources and build scripts (no native Windows;
+                            Windows hosts run NextSQL under WSL 2)
 ```
 
 Key `docs/*.md`: `sql.md` (dialect/catalog), `optimizer.md`, `execution.md`, `json.md`,

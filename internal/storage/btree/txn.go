@@ -209,6 +209,33 @@ func (tx *Txn) soleWriter() bool {
 	return tx.tree.eng.TM.LiveSnapshots() <= 1
 }
 
+// conflictsWithLiveWriter reports whether the version occupying a key was
+// written by a different transaction that is still running. Overwriting it
+// would be a dirty write: the other transaction could still abort, in which
+// case its value never existed, or commit, in which case its write is lost
+// with nothing reported to either side.
+//
+// SQL forbids a dirty write at every isolation level, so this check is not
+// gated on the isolation level the way the snapshot conflict check below it
+// is. It cannot be left to key locks either: lockWrite deliberately skips
+// locking when only one transaction is active at that moment, so the first
+// writer of a row may leave no lock at all for a later writer to block on —
+// which is exactly how two transactions could both update a row, both commit,
+// and silently lose one of the writes.
+//
+// TM.Status reports StatusInProgress only for a transaction the manager still
+// holds as active; an id it no longer knows reads as committed, so an old
+// version can never be mistaken for a live writer.
+func (tx *Txn) conflictsWithLiveWriter(ver row.Version, has bool) bool {
+	if !has || tx.tree == nil || tx.tree.eng == nil || tx.tree.eng.TM == nil {
+		return false
+	}
+	if ver.Xmin == 0 || ver.Xmin == tx.wal.ID() {
+		return false
+	}
+	return tx.tree.eng.TM.Status(ver.Xmin) == txn.StatusInProgress
+}
+
 func (tx *Txn) lockWrite(key []byte) error {
 	if tx.tree.eng.TM == nil || tx.h == nil {
 		return nil
@@ -252,8 +279,9 @@ func (tx *Txn) lockRange(start, end []byte) error {
 func (tx *Txn) withWrite(fn func() error) error {
 	tx.tree.mu.Lock()
 	tx.tree.eng.Enter(tx.wal)
-	err := fn()
-	tx.tree.eng.Leave(tx.wal)
+	// LeaveOp logs a split or merge fn performed before other transactions
+	// can come to depend on it; see storage.Engine.LeaveOp.
+	err := tx.tree.eng.LeaveOp(tx.wal, fn())
 	tx.tree.mu.Unlock()
 	return err
 }
@@ -306,6 +334,9 @@ func (tx *Txn) insertAt(key, value []byte, snap txn.Snapshot) error {
 			}
 			if vis {
 				return nerr.New(nerr.AlreadyExists, "btree.Txn.Insert", "duplicate key")
+			}
+			if tx.conflictsWithLiveWriter(ver, has) {
+				return nerr.New(nerr.Serialization, "btree.Txn.Insert", "write-write conflict")
 			}
 			if tx.h != nil && tx.h.Iso >= txn.SnapshotIsolation && has {
 				if ver.Xmin != tx.wal.ID() && !snap.Sees(ver.Xmin, tx.tree.eng.TM.Status) &&
@@ -490,6 +521,9 @@ func (tx *Txn) updateAt(key, value []byte, snap txn.Snapshot) (oldPayload []byte
 		if !has {
 			ver = row.Version{Payload: payload}
 		}
+		if tx.conflictsWithLiveWriter(ver, has) {
+			return nerr.New(nerr.Serialization, "btree.Txn.Update", "write-write conflict")
+		}
 		if tx.h != nil && tx.h.Iso >= txn.SnapshotIsolation && has {
 			if ver.Xmin != tx.wal.ID() && !snap.Sees(ver.Xmin, tx.tree.eng.TM.Status) &&
 				tx.tree.eng.TM.Status(ver.Xmin) == txn.StatusCommitted {
@@ -595,6 +629,9 @@ func (tx *Txn) deleteAt(key []byte, snap txn.Snapshot) (oldPayload []byte, err e
 		}
 		if !has {
 			ver = row.Version{Payload: payload}
+		}
+		if tx.conflictsWithLiveWriter(ver, has) {
+			return nerr.New(nerr.Serialization, "btree.Txn.Delete", "write-write conflict")
 		}
 		if tx.h != nil && tx.h.Iso >= txn.SnapshotIsolation && has {
 			if ver.Xmin != tx.wal.ID() && !snap.Sees(ver.Xmin, tx.tree.eng.TM.Status) &&

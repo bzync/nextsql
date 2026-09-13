@@ -634,6 +634,20 @@ record by an explicit algorithm byte:
   memory cost 64 MiB, parallelism 4, 32-byte output — the package
   documentation's recommended values. Verification allocates the full 64 MiB
   working set per attempt by design; see the DoS-capacity benchmark below.
+  **Concurrent hashing is bounded process-wide** (`internal/auth/hashgate.go`,
+  `max_concurrent_password_hashes`, default one per four schedulable CPUs and
+  at least two). Hashing runs before the client is authenticated. A login with
+  an unknown user deliberately hashes a dummy record at the same cost, so N
+  simultaneous connection attempts with any password allocated N × 64 MiB.
+  Measured before the bound: 64 wrong-password clients took an in-process
+  server from 9 MiB to 3.8 GiB of heap, an unauthenticated out-of-memory path.
+  With the default bound on 12 CPUs, a burst of 120 logins peaks at about
+  0.5 GiB of heap and completes at 86 logins/s. Unbounded, the same burst
+  peaked at 5.9–6.9 GiB and managed 51 logins/s. The hash cost itself is
+  unchanged: security ranks above efficiency. A client that waits past its
+  connection's idle deadline for a slot is refused as `exhausted`. That is not
+  an authentication verdict, and both a real verification and a dummy one take
+  the slot, so it says nothing about whether the user exists.
 - **PBKDF2-HMAC-SHA256** (RFC 8018, hand-rolled — no third-party PBKDF2
   package) — the original algorithm, retained only for decoding pre-existing
   records. No new PBKDF2 record is ever created.

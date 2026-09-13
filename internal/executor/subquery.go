@@ -36,16 +36,26 @@ func (s *Session) correlateSubquery(stmt ast.Stmt, outer *catalog.Table, row []t
 		q.Joins = append([]ast.JoinSpec(nil), q.Joins...)
 		var inner *catalog.Table
 		correlated := false
+		// innerOpaque means this scope reads a relation whose columns are not
+		// visible here — a CTE, which lookup (a table lookup) cannot resolve.
+		// An unqualified name in such a scope may well belong to that relation,
+		// so treating it as an outer reference would replace a perfectly good
+		// inner column with the outer row's value and silently answer the
+		// wrong question. Only an explicitly qualified outer reference is
+		// correlated there.
+		innerOpaque := false
 		if q.FromQuery != nil {
 			fq, c := s.correlateSubquery(q.FromQuery, outer, row)
 			q.FromQuery = fq
 			correlated = c
 			inner = derivedSchema(q.FromQuery, q.Alias)
-		} else {
+			innerOpaque = inner == nil
+		} else if q.Table != "" {
 			inner, _ = s.lookup(q.Table)
+			innerOpaque = inner == nil
 		}
 		rewrite := func(e ast.Expr) ast.Expr {
-			out, changed := correlateExpr(e, inner, q.Table, q.Alias, outer, row)
+			out, changed := correlateExpr(e, inner, q.Table, q.Alias, outer, row, innerOpaque)
 			correlated = correlated || changed
 			return out
 		}
@@ -118,7 +128,7 @@ func stmtOutputNames(stmt ast.Stmt) []string {
 	}
 }
 
-func correlateExpr(e ast.Expr, inner *catalog.Table, innerName, innerAlias string, outer *catalog.Table, row []types.Value) (ast.Expr, bool) {
+func correlateExpr(e ast.Expr, inner *catalog.Table, innerName, innerAlias string, outer *catalog.Table, row []types.Value, innerOpaque bool) (ast.Expr, bool) {
 	if e == nil {
 		return nil, false
 	}
@@ -135,6 +145,11 @@ func correlateExpr(e ast.Expr, inner *catalog.Table, innerName, innerAlias strin
 			if _, ok := inner.ColIndex(x.Name); ok {
 				return e, false
 			}
+		}
+		if innerOpaque {
+			// The inner relation's columns are unknown here, so an unqualified
+			// name is assumed to be one of them.
+			return e, false
 		}
 		if v, ok := outerValue(x.Name); ok {
 			return v, true
@@ -154,55 +169,55 @@ func correlateExpr(e ast.Expr, inner *catalog.Table, innerName, innerAlias strin
 		}
 		return e, false
 	case ast.Unary:
-		right, changed := correlateExpr(x.Right, inner, innerName, innerAlias, outer, row)
+		right, changed := correlateExpr(x.Right, inner, innerName, innerAlias, outer, row, innerOpaque)
 		x.Right = right
 		return x, changed
 	case ast.Binary:
-		left, lc := correlateExpr(x.Left, inner, innerName, innerAlias, outer, row)
-		right, rc := correlateExpr(x.Right, inner, innerName, innerAlias, outer, row)
+		left, lc := correlateExpr(x.Left, inner, innerName, innerAlias, outer, row, innerOpaque)
+		right, rc := correlateExpr(x.Right, inner, innerName, innerAlias, outer, row, innerOpaque)
 		x.Left, x.Right = left, right
 		return x, lc || rc
 	case ast.Between:
-		value, vc := correlateExpr(x.Expr, inner, innerName, innerAlias, outer, row)
-		low, lc := correlateExpr(x.Low, inner, innerName, innerAlias, outer, row)
-		high, hc := correlateExpr(x.High, inner, innerName, innerAlias, outer, row)
+		value, vc := correlateExpr(x.Expr, inner, innerName, innerAlias, outer, row, innerOpaque)
+		low, lc := correlateExpr(x.Low, inner, innerName, innerAlias, outer, row, innerOpaque)
+		high, hc := correlateExpr(x.High, inner, innerName, innerAlias, outer, row, innerOpaque)
 		x.Expr, x.Low, x.High = value, low, high
 		return x, vc || lc || hc
 	case ast.IsNull:
-		value, changed := correlateExpr(x.Expr, inner, innerName, innerAlias, outer, row)
+		value, changed := correlateExpr(x.Expr, inner, innerName, innerAlias, outer, row, innerOpaque)
 		x.Expr = value
 		return x, changed
 	case ast.Call:
 		changed := false
 		for i := range x.Args {
-			x.Args[i], changed = correlateOne(x.Args[i], inner, innerName, innerAlias, outer, row, changed)
+			x.Args[i], changed = correlateOne(x.Args[i], inner, innerName, innerAlias, outer, row, changed, innerOpaque)
 		}
 		return x, changed
 	case ast.Window:
 		changed := false
-		fn, ch := correlateExpr(x.Fn, inner, innerName, innerAlias, outer, row)
+		fn, ch := correlateExpr(x.Fn, inner, innerName, innerAlias, outer, row, innerOpaque)
 		if call, ok := fn.(ast.Call); ok {
 			x.Fn = call
 		}
 		changed = changed || ch
 		for i := range x.Partition {
-			x.Partition[i], changed = correlateOne(x.Partition[i], inner, innerName, innerAlias, outer, row, changed)
+			x.Partition[i], changed = correlateOne(x.Partition[i], inner, innerName, innerAlias, outer, row, changed, innerOpaque)
 		}
 		for i := range x.Order {
-			x.Order[i].Expr, changed = correlateOne(x.Order[i].Expr, inner, innerName, innerAlias, outer, row, changed)
+			x.Order[i].Expr, changed = correlateOne(x.Order[i].Expr, inner, innerName, innerAlias, outer, row, changed, innerOpaque)
 		}
 		return x, changed
 	case ast.Case:
 		changed := false
-		x.Operand, changed = correlateOne(x.Operand, inner, innerName, innerAlias, outer, row, changed)
+		x.Operand, changed = correlateOne(x.Operand, inner, innerName, innerAlias, outer, row, changed, innerOpaque)
 		for i := range x.Whens {
-			x.Whens[i].When, changed = correlateOne(x.Whens[i].When, inner, innerName, innerAlias, outer, row, changed)
-			x.Whens[i].Then, changed = correlateOne(x.Whens[i].Then, inner, innerName, innerAlias, outer, row, changed)
+			x.Whens[i].When, changed = correlateOne(x.Whens[i].When, inner, innerName, innerAlias, outer, row, changed, innerOpaque)
+			x.Whens[i].Then, changed = correlateOne(x.Whens[i].Then, inner, innerName, innerAlias, outer, row, changed, innerOpaque)
 		}
-		x.Else, changed = correlateOne(x.Else, inner, innerName, innerAlias, outer, row, changed)
+		x.Else, changed = correlateOne(x.Else, inner, innerName, innerAlias, outer, row, changed, innerOpaque)
 		return x, changed
 	case ast.InSubquery:
-		value, changed := correlateExpr(x.Expr, inner, innerName, innerAlias, outer, row)
+		value, changed := correlateExpr(x.Expr, inner, innerName, innerAlias, outer, row, innerOpaque)
 		x.Expr = value
 		return x, changed
 	default:
@@ -210,7 +225,7 @@ func correlateExpr(e ast.Expr, inner *catalog.Table, innerName, innerAlias strin
 	}
 }
 
-func correlateOne(e ast.Expr, inner *catalog.Table, innerName, innerAlias string, outer *catalog.Table, row []types.Value, changed bool) (ast.Expr, bool) {
-	out, one := correlateExpr(e, inner, innerName, innerAlias, outer, row)
+func correlateOne(e ast.Expr, inner *catalog.Table, innerName, innerAlias string, outer *catalog.Table, row []types.Value, changed, innerOpaque bool) (ast.Expr, bool) {
+	out, one := correlateExpr(e, inner, innerName, innerAlias, outer, row, innerOpaque)
 	return out, changed || one
 }

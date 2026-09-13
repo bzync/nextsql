@@ -1,6 +1,10 @@
 package parser
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/bzync/nextsql/internal/sql/ast"
+)
 
 func FuzzParse(f *testing.F) {
 	seeds := []string{
@@ -34,6 +38,15 @@ func FuzzParse(f *testing.F) {
 		"SHOW STORAGE",
 		"SELECT id, name FROM products WHERE price BETWEEN 1 AND 2 LIMIT 10",
 		"CREATE TABLE t (id UUID PRIMARY KEY DEFAULT UUID(), n STRING NOT NULL)",
+		"CREATE TABLE t (id INT64 PRIMARY KEY, active BOOL NOT NULL DEFAULT FALSE)",
+		"CREATE TABLE t (active BOOL PRIMARY KEY, \"bool\" STRING)",
+		"SELECT CAST(active AS BOOL) FROM t WHERE active",
+		"CREATE TABLE t (id INT64 PRIMARY KEY, area GEOGRAPHY(Geometry, 4326), plan GEOMETRY(geometry))",
+		"CREATE TABLE c PRIMARY KEY (id) AS SELECT id, name FROM t",
+		"CREATE TABLE c PRIMARY KEY (a, b) AS SELECT a, b, c FROM t WHERE c > 1",
+		"CREATE TABLE c PRIMARY KEY (id) AS WITH w AS (SELECT id FROM t) SELECT id FROM w",
+		"CREATE TABLE c PRIMARY KEY (id) AS SELECT id FROM t UNION SELECT id FROM u",
+		"CREATE TABLE c PRIMARY KEY (n) AS SELECT name AS n, COUNT(*) AS k FROM t GROUP BY name",
 		"CREATE TABLE t (id DECIMAL(18,0) PRIMARY KEY DEFAULT AI(), n STRING NOT NULL)",
 		"CREATE INDEX i ON t (n)",
 		"INSERT INTO t (id, n) VALUES (UUID(), 'x')",
@@ -98,6 +111,13 @@ func FuzzParse(f *testing.F) {
 		"SELECT metadata.0.0.0 FROM t",
 		"SELECT metadata.tags.99999999999999999999 FROM t",
 		"SELECT 1 + .5",
+		"INSERT INTO t SELECT a, b FROM u",
+		"INSERT INTO t (a, b) SELECT a, b FROM u WHERE a > 1 RETURNING a",
+		"INSERT INTO t WITH c AS (SELECT a FROM u) SELECT a FROM c",
+		"INSERT INTO t SELECT a FROM u UNION SELECT a FROM v",
+		"INSERT INTO t SELECT 1, 'x'",
+		"INSERT INTO t SELECT",
+		"INSERT INTO t VALUES",
 		"'",
 		"/*",
 		"SELECT",
@@ -138,6 +158,41 @@ func FuzzParse(f *testing.F) {
 		}
 		if diag != nil || dstmt == nil {
 			t.Fatalf("ParseDiag: clean parse but diag=%v stmt=%v for %q", diag, dstmt, src)
+		}
+
+		// Nothing the parser accepts may nest deeper than every later stage
+		// can walk: an unbounded tree is an unbounded goroutine stack, which
+		// takes the whole process down rather than failing one statement.
+		if ast.ExceedsDepth(stmt, ast.MaxNestingDepth) {
+			t.Fatalf("accepted a statement nested past ast.MaxNestingDepth for %q", src)
+		}
+
+		// An INSERT has exactly one source. Rows and Query are mutually
+		// exclusive: a statement carrying both would have a source the later
+		// stages disagree about, and one carrying neither would write an
+		// unspecified row.
+		if ins, ok := stmt.(ast.Insert); ok {
+			if (len(ins.Rows) == 0) == (ins.Query == nil) {
+				t.Fatalf("INSERT with %d value rows and query=%v for %q", len(ins.Rows), ins.Query != nil, src)
+			}
+		}
+
+		// A CREATE TABLE never carries both shapes: a written column list, or
+		// a query whose output supplies the columns. Both at once would leave
+		// the binder choosing between two schemas. A query source also always
+		// names its key, since a query's output carries none and there is
+		// nothing else to cluster the table on.
+		//
+		// Note the converse is deliberately not asserted: `CREATE TABLE t
+		// (PRIMARY KEY (c))` parses to neither shape, which the binder rejects
+		// as a table with no columns. That laxity predates the query form.
+		if ct, ok := stmt.(ast.CreateTable); ok {
+			if ct.Query != nil && len(ct.Columns) > 0 {
+				t.Fatalf("CREATE TABLE with both %d columns and a query source for %q", len(ct.Columns), src)
+			}
+			if ct.Query != nil && len(ct.PK) == 0 {
+				t.Fatalf("CREATE TABLE ... AS with no PRIMARY KEY for %q", src)
+			}
 		}
 	})
 }

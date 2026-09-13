@@ -145,9 +145,13 @@ any application uses. The Manager:
 - connects to `nextsqld` at a configured address (`--server-addr`), with the
   configured TLS material (`--tls-ca`, optional mTLS `--tls-client-cert` /
   `--tls-client-key`), or `--insecure` on loopback only — identical rules to
-  `nextsql` server-mode commands (`internal/cli.ServerConfig`);
+  `nextsql` server-mode commands (`internal/cli.ServerConfig`). That target
+  is the implicit **`default` connection profile**; an operator-owned
+  `--profiles` file may declare further `nextsqld` servers (§5.1), each
+  under the same TLS rules. The browser picks a profile by ID and can never
+  name an address or a file;
 - performs each request **as the logged-in operator's own NSQL user**, so
-  server-side RBAC, realm/database isolation, audit, and redaction apply unchanged.
+  server-side RBAC, database isolation, audit, and redaction apply unchanged.
   The Manager has no ambient authority and no service account;
 - reads operational state from the `system.*` schema and the `SHOW` aliases;
 - issues management actions as ordinary SQL / driver calls (`CLUSTER …`,
@@ -163,11 +167,16 @@ session ends.
 ## 3. Session and authentication model
 
 1. **Login** — `POST /api/v1/session` with `{user, password, database?,
-   realm?}`. The Manager opens a driver connection to `nextsqld` with those
-   credentials. Success ⇒ a new session; failure ⇒ the driver's error is
-   surfaced verbatim (401 for auth failure, 502 for unreachable server).
+   profile?}`. The Manager opens a driver connection to the chosen profile's
+   `nextsqld` (the default profile when `profile` is omitted; an unknown ID
+   is a 400 before any network I/O) with those credentials. Success ⇒ a new
+   session; failure ⇒ the driver's error is surfaced verbatim (401 for auth
+   failure, 502 for unreachable server). A non-empty `realm` is refused (400):
+   multi-realm hosting was removed (log #244), and ignoring an explicit target
+   would connect the operator somewhere they did not choose.
 2. **Session record** (in memory only): a 256-bit random id, the operator's
-   user / database / realm, the live `*nextsql.Conn`, `createdAt`,
+   user / database / connection-profile ID (fixed for the session's life),
+   the live `*nextsql.Conn`, `createdAt`,
    `lastSeen`, a per-session mutex (a `Conn` is not safe for concurrent
    queries), and a random CSRF token.
 3. **Cookie** — `nsm_session=<id>`, `HttpOnly`, `SameSite=Strict`, `Path=/`,
@@ -194,6 +203,17 @@ session ends.
    connections.
 7. **Logout** — `DELETE /api/v1/session` closes the connection and drops the
    record.
+8. **Switch server** — `POST /api/v1/session/switch` (authenticated + CSRF)
+   with `{profile, user, password | use_saved_password, save_password?}`. A
+   switch is a fresh sign-in, never a re-point of the existing session: the
+   new connection is authenticated first, and only on success does the store
+   atomically replace the old session with a **new** one (new id, new CSRF
+   token, new cookie) — the principal changed, so nothing the browser held
+   for the old one stays valid. A failed switch leaves the current session
+   exactly as it was. A switch is refused (409) while a Studio query is
+   running, rather than silently cancelling it. Operations and Studio both
+   follow, because they share the session; the SPA re-keys its whole shell on
+   the new session.
 
 Passwords are never logged, never written to disk, and never stored beyond
 the live driver connection they opened. The request logger records only
@@ -205,9 +225,13 @@ method, path, status, duration, and the authenticated user (once known).
 GET    /                     the embedded SPA shell
 GET    /assets/*             embedded static assets (long-cache, immutable)
 GET    /healthz              liveness — no auth, no data, just "ok"
-POST   /api/v1/session       login       → {user, database, realm, csrf_token}
-GET    /api/v1/session       whoami      → {authenticated, user, database, realm}
+GET    /api/v1/profiles      pre-auth profile list → {default, profiles:[{id, name, environment?}]}
+POST   /api/v1/session       login       → {authenticated, user, database, profile, csrf_token}
+GET    /api/v1/session       whoami      → same shape
 DELETE /api/v1/session       logout
+GET    /api/v1/session/profiles           → {current, profiles:[{id, name, environment?, address, user?, database?, tls, mtls}]}
+POST   /api/v1/session/switch             server switch → a NEW session (same shape as login)
+POST   /api/v1/session/credential/forget  forget the caller's own saved password → 204
 GET    /api/v1/overview      Overview read-model (slice M1)
 GET    /api/v1/databases     Databases & Storage read-model (slice M2)
 GET    /api/v1/activity      Connections & Activity read-model (slice M3)
@@ -241,7 +265,10 @@ later; MVP is flags only):
 |---|---|---|
 | `--listen` | `127.0.0.1:7220` | Manager HTTP listener. A non-loopback address requires `--tls-cert` / `--tls-key`. |
 | `--tls-cert` / `--tls-key` | — | TLS for the Manager listener itself. |
-| `--server-addr` | `127.0.0.1:7210` | `nextsqld` address. |
+| `--server-addr` | `127.0.0.1:7210` | `nextsqld` address of the `default` connection profile. |
+| `--server-name` | `Default server` | Display name of the `default` profile. |
+| `--server-environment` | — | Environment of the `default` profile: `development` / `test` / `staging` / `production`. |
+| `--profiles` | — | Connection-profile file declaring further `nextsqld` servers (§5.1). |
 | `--tls-ca` | — | PEM CA / server cert for the `nextsqld` connection. |
 | `--tls-server-name` | address host | TLS SNI / verification name for `nextsqld`. |
 | `--tls-client-cert` / `--tls-client-key` | — | mTLS to `nextsqld`. |
@@ -251,6 +278,74 @@ later; MVP is flags only):
 | `--session-lifetime` | 12h | Session absolute expiry. |
 | `--log-level` | info | `debug`/`info`/`warn`/`error`. |
 | `--grant-port-80` | false | Linux only: run `setcap cap_net_bind_service=+ep` on this installed binary so a later `--listen 127.0.0.1:80` doesn't need root, then exit. Opt-in — the default listener is unaffected and needs no such grant. Typically run once via `sudo`, since only root can add file capabilities. |
+
+### 5.1 Connection profiles
+
+A connection profile is one `nextsqld` server a session may sign in or switch
+to. The `default` profile is built from the flags above; any others come from
+the JSON file named by `--profiles` (`internal/admin/profile`):
+
+```json
+{
+  "version": 1,
+  "profiles": [
+    {"id": "staging", "name": "Staging", "environment": "staging",
+     "address": "db.staging.internal:7210", "tls_ca": "certs/staging-ca.pem",
+     "tls_server_name": "db.staging.internal", "user": "app"},
+    {"id": "prod", "name": "Production", "environment": "production",
+     "address": "db.prod.internal:7210", "tls_ca": "/etc/nextsql/prod-ca.pem",
+     "tls_client_cert": "/etc/nextsql/admin.pem", "tls_client_key": "/etc/nextsql/admin.key"}
+  ]
+}
+```
+
+- **Who decides the targets.** The file, not the browser. The Admin listener
+  may be served to remote browsers over TLS, so letting a web client name an
+  address (or a CA / key path) would turn Admin into a pivot into its own
+  network and a local-file oracle. The browser only ever sends a profile ID.
+- **Format.** Versioned (`"version": 1`; any other version is refused, not
+  half-read) and strict: an unknown key is an error, so a misspelled
+  `tls_ca` or a `password` someone hoped Admin would read fails at startup.
+  `id` is `[a-z0-9][a-z0-9_-]{0,62}`, `default` is reserved, IDs are unique,
+  at most 32 profiles, 64 KiB. `environment` is one of the four labels
+  above. `user` and `database` are sign-in hints only. Relative TLS paths
+  resolve against the file's own directory. There is no secret field.
+- **TLS.** The same rules as the flags: `tls_ca` is required unless
+  `insecure` is set, `insecure` is loopback-only and cannot be combined with
+  TLS settings, and `tls_client_cert`/`tls_client_key` go together. Every
+  profile's TLS material is loaded once at startup (so an unreadable CA fails
+  immediately) and re-read on each connection (so a rotated certificate
+  takes effect without a restart).
+- **File permissions.** The file decides where operators' passwords are
+  sent, so on Unix it must be a regular file owned by the Admin user (or
+  root) and not group/world-writable — the rule OpenSSH applies to its client
+  config. `nextsql-admin` does not build for native Windows (log #290); under
+  WSL 2 the Unix rule applies.
+- **What each side may see.** The pre-auth list (`GET /api/v1/profiles`)
+  carries IDs, names, and environments only — never an address, user hint, or
+  path. The authenticated list adds each address and TLS posture, so an
+  operator can see where a password would go before typing it, but still
+  never a local file path.
+- **Environment.** A profile-declared environment is authoritative in Studio:
+  a `production` profile always shows the standing banner and starts in the
+  read-only safety mode, and the viewer cannot relabel it. The topbar shows
+  the environment on every view.
+- **Saved passwords (optional).** On a switch the operator may ask Admin to
+  keep the typed password in the operating system's credential store
+  (`internal/admin/credential`: Secret Service / Keychain / Credential
+  Manager; no file fallback). The keyring account is derived from the
+  *origin* principal (the address, TLS server name, and user the saving
+  session is signed in as) **and** the target (address, TLS server name,
+  user, database): a saved password is a delegation — "whoever can
+  authenticate as origin may also sign in as target" — not a secret any
+  signed-in operator may spend. Another operator signed in to the same Admin
+  derives a different account and cannot use it; a profile relabelled to
+  point somewhere else derives a different account and cannot retrieve it.
+  A saved password is never usable at pre-auth sign-in. One the server
+  rejects is deleted and the operator is told so;
+  `POST /api/v1/session/credential/forget` deletes the caller's own. The
+  password is written only after it has been verified by a successful
+  sign-in.
 
 ## 6. MVP decomposition
 

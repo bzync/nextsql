@@ -268,6 +268,8 @@ func advisories(info sysinfo.Info, cfg config.Config, rec Recommendation, adminU
 		w = append(w, msg)
 	case "overlay":
 		w = append(w, "data volume filesystem is overlay (typical of a container's writable layer): use a mounted volume so data outlives the container")
+	case "9p", "drvfs":
+		w = append(w, "data volume filesystem is "+info.Filesystem+" (a Windows drive mounted into WSL, such as /mnt/c): fsync and file locking there are not a durability boundary — keep --data-dir and the key files on the WSL 2 Linux filesystem")
 	}
 	if info.DiskFreeBytes > 0 {
 		needed := rec.BufferBytes * 4

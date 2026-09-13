@@ -1,7 +1,7 @@
 # PHP driver
 
-PHP 8.1+ (requires `ext-openssl`). MIT, versioned independently of the engine
-(package `0.1.1`).
+PHP 8.1+ (requires `ext-openssl`). MIT. Package version **0.0.1**, matching
+the engine.
 
 ```bash
 composer require bzync/nextsql
@@ -41,7 +41,7 @@ $conn = NextSQL\Client::connect([
 
 For `--require-client-key`, pass `'key' => $clientRoot` as a 32-byte string. Never put keys or passwords in a URL.
 
-Follower-read routing uses `NextSQL\Cluster::connect`. See [High availability](/docs/ha). `database` may name the deployment database; `realm` is reserved and must remain empty.
+Follower-read routing uses `NextSQL\Cluster::connect`. See [High availability](/docs/ha). `database` may name the deployment database.
 
 ## Client-encrypted fields
 

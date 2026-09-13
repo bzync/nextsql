@@ -14,7 +14,7 @@ A data file `foo.db` owns a sibling directory `foo.db.wal/`:
 
 | Name | Role |
 |---|---|
-| `control` | Durable checkpoint / LSN / wrapped WAL DEK |
+| `control` | Durable checkpoint / LSN / wrapped WAL DEK; version `1` (full page images only) or `2` (may contain page deltas, see below) |
 | `wal-<16 hex>.seg` | Encrypted record segments |
 
 Control is replaced atomically (`control.tmp` → `control` → directory `fsync`).
@@ -70,8 +70,9 @@ A torn tail (short read, bad header CRC, or AEAD failure after the last durable 
 | 10 | AllocState | next, freelist head, freelist count |
 | 11 | Undo | undo id `u64`, kind `u8`, `u16 klen`, key |
 | 12 | Change | versioned key-only logical SQL row change (`NSCD` v1) |
+| 13 | PageDelta | changed byte ranges of a page against its previous logged state (page delta v1, below); only in a control-version-2 log |
 
-Redo uses `PageImage`, `TreeMeta`, `AllocState`, and `Checkpoint`. After redo, recovery applies UNDO for transactions with no commit or abort (`docs/mvcc.md`). Logical insert/update/delete records are durable physical-tree history. `Change` records are ignored by redo and consumed by CDC only after the matching durable `Commit`.
+Redo uses `PageImage`, `PageDelta`, `TreeMeta`, `AllocState`, and `Checkpoint`. After redo, recovery applies UNDO for transactions that never committed, including ones whose rollback was logged (`docs/mvcc.md`). Logical insert/update/delete records are durable physical-tree history. `Change` records are ignored by redo and consumed by CDC only after the matching durable `Commit`.
 
 ### Logical CDC change (`NSCD` v1)
 
@@ -117,6 +118,47 @@ Default size is 128 MiB. Header is 64 bytes: magic, version, segment id, start L
 ## Group commit
 
 `Append` only buffers. `Flush(lsn)` is the durability boundary: one writer writes the buffer, `fdatasync`s the segment (Linux; full `fsync` elsewhere), then wakes waiters. New segment files and the control file still use `fsync` so the directory entry is durable. `Commit` does not return success until `Flush` of the commit record succeeds.
+
+The write and the `fdatasync` run **without** the log mutex, and a
+non-replicated commit waits for them **without** the engine mutex (log #287).
+Commits that arrive while one flush is in the kernel append their records and
+are made durable together by the next flush. Before this, both mutexes were
+held across the fsync, so no other transaction could even append until it
+finished: N concurrent commits paid N fsyncs, and single-row insert throughput
+stayed at ~700/s from 1 to 64 connections. Measured in-process on ext4 with
+64 connections: 5,018 inserts/s at ~7 commits per 1.7 ms flush. That figure
+depends heavily on the host's I/O load.
+
+Exactly one flush owns the segment write at a time. Rotation, `Close` and
+`ClipTo` reach the segment through `flushLocked` and wait for it; `CrashClose`
+waits explicitly. A commit keeps its place in `Engine.writers` (unacknowledged,
+invisible, still holding its locks, counted as active by a checkpoint) until
+its commit record is durable, and becomes visible only afterwards. A rollback
+attempted in that window is refused, because the commit record may already be
+on stable storage. A waiter on a log that closes underneath it fails with
+`unavailable` instead of waiting forever. The replicated commit path is
+unchanged: it still serializes whole commits across the Raft round trip.
+
+### Structure modifications are logged as system transactions
+
+A B+tree split or merge takes effect as soon as it happens: other
+transactions route through the new page and write into it, and rollback never
+reverts it. Its redo used to be only the page images the splitting transaction
+logged at its own commit. If that transaction never committed, a committed
+transaction could make durable an image that pointed to, or held rows in, a
+page whose own image was never logged. After a crash that page was unreadable
+and committed rows were lost. The new concurrent-commit power-loss test
+reproduced this in about one round in three, and it predates group commit.
+
+Now, when a page-writing operation that allocated or dropped a page completes
+successfully, `Engine.LeaveOp` logs every page it dirtied as its own committed
+system transaction: `Begin`, page images, `AllocState`, `Commit`. This is the
+standard nested-top-action approach. It does not fsync: WAL order puts it ahead
+of any commit that can depend on it. The images may carry other transactions'
+uncommitted row versions, which recovery's undo and MVCC visibility handle as
+for any shared page. A failed operation logs nothing. If the append itself
+fails, the pages stay pending: `AllowFlush` refuses to write them and the next
+commit logs them first or refuses to commit.
 
 `Engine.Kill` / `Log.CrashClose` discard the unsynced tail (truncate to the last synced offset) to simulate power loss.
 
@@ -179,6 +221,90 @@ of `test-pr`, `test-production`, `test-chaos` and `test-nightly`). Each test
 there asserts that its fault actually fired, so a path that later moves off the
 seam fails the suite instead of silently passing.
 
+## Page deltas
+
+Redo is physical, and a commit used to log a full 16 KiB image of every page
+it dirtied. A single-row insert wrote about 18 KB of WAL, and under sustained
+concurrent writes that write amplification, not the CPU, bounded throughput.
+Compressing the images was rejected: compression before encryption makes
+ciphertext length depend on page content.
+
+A commit now logs a `PageDelta` record instead of a full image whenever a safe
+base exists: only the byte ranges that differ from the page's previous logged
+state. Body, version 1:
+
+| Size | Field |
+|---|---|
+| 1 | Version (`1`) |
+| 8 | Base LSN: the record whose page state this delta applies to |
+| 32 | SHA-256 of the base page with its LSN (bytes 16..24) and checksum (40..44) fields zeroed |
+| 2 | Run count |
+| … | Runs, sorted and non-overlapping: `u16 offset`, `u16 length`, bytes |
+
+The LSN and checksum fields are excluded from the diff and the digest because
+they change independently of the content. Runs separated by fewer than 8
+unchanged bytes are merged. A delta larger than half a page is not worth a
+base, so that page logs a full image. The decoder is strict (sorted runs,
+exact length, no trailing bytes) and fuzzed (`FuzzDecodePageDelta`).
+
+**When a base is safe.** The engine keeps an LRU cache of each page's most
+recent logged state (half the buffer pool's frame count, at least 16). A delta
+is encoded against an entry only if all of these hold, under the engine lock
+at append time:
+
+- the entry is the page's most recent record, and the page being logged
+  carries that record's LSN;
+- the record will be replayed. The entry settles only once its transaction's
+  commit record is appended (for a replicated commit, once the hold is
+  released as committed), or once it is a committed system transaction;
+- the record is at or after the last checkpoint's redo boundary, so recovery
+  scans it;
+- the page has not been changed without logging since. A rollback changes
+  pages without logging them, so it drops the entries for every page it
+  touched.
+
+An evicted or ineligible page logs a full image, which starts a new chain.
+
+**Replay fails closed.** Recovery skips a delta whose page is already at or
+past its LSN. Otherwise it applies the delta only if the page is at exactly the
+base LSN *and* matches the base digest. Anything else is a `corruption` error
+naming the page and both LSNs. A wrong base never produces a plausible wrong
+page. Live page repair (`recovery.RepairPage`) rebuilds a page by chaining
+committed images and deltas from the WAL; a delta whose base does not match
+breaks the chain rather than extending it.
+
+**The version gate.** A release that predates page deltas would read type 13
+as a torn tail. It checks the control version and refuses a log at `2`, so a
+page delta may only exist in a log whose control file is at `2`:
+
+- `wal.Append` refuses a `PageDelta` on a version-1 log;
+- a follower installing replicated records moves its own control file to `2`
+  before the first delta reaches a segment;
+- recovery moves a version-1 log that contains a delta to `2` before replaying
+  anything. A point-in-time restore can produce that pairing from a base
+  backup taken before the source moved to `2`.
+
+`wal_page_deltas` (`auto` default, `on`, `off`) chooses the mode:
+
+| Value | New database | Existing version-1 log | Existing version-2 log |
+|---|---|---|---|
+| `auto` | created at `2`, logs deltas | stays at `1`, full images; still opens with the release that created it | logs deltas |
+| `on` | created at `2`, logs deltas | moved to `2` on open (one way) | logs deltas |
+| `off` | — (`nextsql init` always uses `auto`) | full images | full images; stays at `2`, still replays its deltas |
+
+Nothing moves a log back to `1`. A database that must stay openable by an
+older release keeps its version-1 log under `auto`; `tests/upgrade` asserts
+that replaying a retained v0.0.1 fixture does not change its on-disk version.
+
+**Measured effect.** In the storage test (`TestPageDeltasAreWrittenAndRecovered`),
+2,000 single-key commits logged about 2,000 deltas averaging 106 bytes, where
+each would otherwise have been a 16,384-byte image. Over the wire, a default
+`nextsqld` doing single-row inserts writes 2.3–2.6 KB to disk per insert with
+deltas and 18.2–19 KB with `wal_page_deltas=off`. That counts every byte the
+process writes: WAL, undo, and data-file page flushes. Details, including why
+the throughput figures from that host are not a sustained-load claim, are in
+`TODO.md` log #289.
+
 ## Checkpoints
 
 1. Flush committed dirty pages and `fsync` the data file.
@@ -187,6 +313,25 @@ seam fails the suite instead of silently passing.
 4. Offer every segment, including the current one, to an optional `Archiver` (PITR hook). Segments are not deleted. The live segment may be re-archived after later appends.
 
 An interrupted checkpoint leaves the previous control file in place. Recovery still starts from the last installed redo LSN.
+
+**The redo boundary is fuzzy.** A page dirtied by a still-running transaction
+cannot be flushed (no-steal), and a committed change to that page can sit in
+the WAL below the log's end. The boundary is therefore the minimum of:
+
+- the log's end when the flush began;
+- the oldest logged change not yet stamped onto its buffer frame;
+- the oldest dirty frame's first logged LSN (`recLSN`);
+- the `Begin` record of the oldest transaction still running.
+
+The last term exists because recovery finds transactions to undo by scanning
+for `Begin` records from the boundary, and an id it never sees defaults to
+committed. A committed image of a shared page can carry a running
+transaction's row versions. With a boundary past that `Begin`, a transaction
+that never committed came back after a crash as committed, with no undo.
+Before this fix, a checkpoint taken while a transaction held a dirty page could
+lose an acknowledged commit.
+`tests/crash/checkpoint_redo_test.go` pins each term; each test fails with its
+term removed.
 
 `nextsqld` installs a checkpoint every `checkpoint_interval_ms` (default
 `300000`, five minutes). This bounds ordinary crash redo to the WAL suffix
@@ -250,9 +395,9 @@ On `Open`:
 
 1. Scan WAL from the redo LSN. Truncate a torn tail.
 2. Analysis: transactions with a `Commit` record are committed.
-3. Redo committed `PageImage` records when `page.LSN < record.LSN` (or the page is missing / torn).
+3. Redo committed `PageImage` records when `page.LSN < record.LSN` (or the page is missing / torn), and committed `PageDelta` records under the base check above.
 4. Apply the latest committed `TreeMeta` and `AllocState` to the superblock.
-5. Apply UNDO for transactions that began and never committed or aborted (`docs/mvcc.md`).
+5. Apply UNDO for transactions that never committed: those still open at the crash, and those with an `Abort` record (`recovery.NotCommittedUntil`). Both are registered as aborted with the transaction manager, which otherwise defaults an unknown id to committed. UNDO only reverses versions still carrying the transaction's id, so an aborted transaction whose rollback had already finished is a no-op. Without this, a rollback that had not yet reached the data file came back committed: half a transfer (`tests/crash/rollback_delta_test.go`).
 6. Resume LSNs after the last complete record.
 
 The scanner uses sealed segment boundaries to skip a retained segment whose

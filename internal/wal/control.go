@@ -15,13 +15,21 @@ const (
 	// ControlMagic is ASCII 'N','S','W','C'.
 	ControlMagic uint32 = 0x4357534E
 
-	controlVersion    = 1
-	controlHeaderSize = 104
-	controlName       = "control"
-	controlTmpName    = "control.tmp"
+	// controlVersionFullImages is the original control format. A log at this
+	// version writes only full page images, so every release can read it.
+	controlVersionFullImages = 1
+	// controlVersionPageDeltas marks a log that may contain RecPageDelta
+	// records. The layout is unchanged; the version is the gate: a release
+	// that predates page deltas refuses a control file it does not know
+	// instead of reaching a record type it would treat as a torn tail.
+	controlVersionPageDeltas = 2
+	controlHeaderSize        = 104
+	controlName              = "control"
+	controlTmpName           = "control.tmp"
 )
 
 type controlFile struct {
+	Version       uint16
 	NextLSN       format.LSN
 	DurableLSN    format.LSN
 	Checkpoint    format.LSN
@@ -37,7 +45,11 @@ func encodeControl(c controlFile) []byte {
 	wrapLen := len(c.WrappedWALDEK)
 	buf := make([]byte, controlHeaderSize+wrapLen)
 	encoding.PutU32(buf, 0, ControlMagic)
-	encoding.PutU16(buf, 4, controlVersion)
+	ver := c.Version
+	if ver == 0 {
+		ver = controlVersionFullImages
+	}
+	encoding.PutU16(buf, 4, ver)
 	copy(buf[8:24], c.Identity.Database[:])
 	copy(buf[24:40], c.Identity.File[:])
 	encoding.PutU64(buf, 40, uint64(c.NextLSN))
@@ -60,7 +72,8 @@ func decodeControl(buf []byte) (controlFile, error) {
 	if encoding.U32(buf, 0) != ControlMagic {
 		return controlFile{}, nerr.New(nerr.InvalidFormat, "wal.decodeControl", "bad control magic")
 	}
-	if encoding.U16(buf, 4) != controlVersion {
+	ver := encoding.U16(buf, 4)
+	if ver != controlVersionFullImages && ver != controlVersionPageDeltas {
 		return controlFile{}, nerr.New(nerr.InvalidFormat, "wal.decodeControl", "unsupported control version")
 	}
 	if err := checksum.Verify(buf[:controlHeaderSize], 100); err != nil {
@@ -71,6 +84,7 @@ func decodeControl(buf []byte) (controlFile, error) {
 		return controlFile{}, nerr.New(nerr.InvalidFormat, "wal.decodeControl", "truncated wrapped WAL DEK")
 	}
 	c := controlFile{
+		Version:       ver,
 		NextLSN:       format.LSN(encoding.U64(buf, 40)),
 		DurableLSN:    format.LSN(encoding.U64(buf, 48)),
 		Checkpoint:    format.LSN(encoding.U64(buf, 56)),

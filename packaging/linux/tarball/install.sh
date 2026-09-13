@@ -109,7 +109,7 @@ CONFIG_EXISTED=0
 # permission/availability bug, not a convenience trade worth making here, so
 # --system installs keep exactly today's tested manual-instructions path
 # (with a one-line pointer to nextsql-admin as a same-user alternative).
-# See docs/design-installer-gui.md M4 for the follow-up.
+# GUI follow-up is nextsql-admin Setup mode.
 LAUNCH_GUI=0
 if [ "$HAVE_GUI" -eq 1 ] && [ "$NO_GUI" -eq 0 ] && [ "$CONFIG_EXISTED" -eq 0 ] \
 	&& [ "$MODE" = user ] && [ -t 0 ]; then

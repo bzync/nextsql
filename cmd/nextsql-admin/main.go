@@ -8,7 +8,7 @@
 // Operations mode (an installation exists — operator NSQL-credential
 // sessions against a running nextsqld, performing every operation as that
 // operator's own user so server-side RBAC applies). See
-// docs/design-admin.md.
+// docs/web/content/docs/admin.md.
 //
 // Usage:
 //

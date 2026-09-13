@@ -76,5 +76,4 @@ subtype are per-column declarations (`GEOMETRY(Polygon, 4326)`). Out-of-range
 SRID arguments fail closed.
 
 3D and a full ellipsoidal geodesic-to-polyline remain out of scope.
-Engine notes: [`docs/geo.md`](https://github.com/bzync/nextsql/blob/main/docs/geo.md),
-[`docs/design-spatial.md`](https://github.com/bzync/nextsql/blob/main/docs/design-spatial.md).
+Engine notes: [`docs/geo.md`](https://github.com/bzync/nextsql/blob/master/docs/geo.md).

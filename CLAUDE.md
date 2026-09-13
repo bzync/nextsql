@@ -22,8 +22,7 @@ This repo is doc-driven; these files are the actual authority, not just backgrou
 | `PROJECT.md` | Intended finished-product end-state. Wins for intended scope, not current status. |
 | `AGENTS.md` | Repository-agent entrypoint; condensed version of the rules below. |
 | `ARCHITECTURE.md` | Structural design reference (expanded version of the Architecture section below). |
-| `ROADMAP.md` | Simplified, non-authoritative roadmap derived from `TODO.md`. |
-| `docs/*.md` | Per-subsystem implementation details (see table near the end) — authoritative for implementation-specific technical facts. |
+| `docs/*.md` | Per-subsystem implementation details — authoritative for implementation-specific technical facts. |
 
 If these disagree, `TODO.md` wins for status/sequencing, `SKILLS.md` wins for engineering
 behavior, `PROJECT.md` wins for intended scope. Do not silently reconcile contradictions —
@@ -153,8 +152,7 @@ whole deployment. What remains is the versioned encrypted deployment registry
 (`nextsql.instance`, its own external root, exclusive deployment lock, `nextsql registry
 adopt`, offline legacy-`TENANT` migration). Its on-disk format is unchanged, and
 `nextsqld` fails closed against a registry holding more than one database rather than
-silently half-serving it. `docs/design-multidatabase-dbaas.md` is withdrawn design
-history.
+silently half-serving it.
 
 ## Repository layout
 

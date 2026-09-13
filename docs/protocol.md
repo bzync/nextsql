@@ -5,7 +5,7 @@ randomized `NSCE1.` or deterministic `NSCE2.` ciphertext through the existing
 `STRING` value encoding; logical type and encryption mode are catalog metadata
 (`NSCT` v13).
 
-`STRUCT` / `ARRAY` / `MAP` values (`docs/design-collections.md`) travel as a
+`STRUCT` / `ARRAY` / `MAP` values travel as a
 self-describing recursive type descriptor after the fixed value header
 (depth-bounded, re-validated on decode), then a nested payload — no NSQL
 version bump (a scalar value's header is byte-identical to before). A

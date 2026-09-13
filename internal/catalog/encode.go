@@ -192,7 +192,7 @@ func EncodeTable(t *Table) ([]byte, error) {
 	// v12: per column, a recursive collection descriptor (STRUCT / ARRAY /
 	// MAP). A leading 0 byte marks a non-collection column and carries no
 	// further bytes; a leading 1 byte is followed by the full recursive Type
-	// (docs/design-collections.md).
+	// (collection types).
 	for _, col := range t.Columns {
 		if !types.IsCollection(col.Type.Kind) {
 			buf = append(buf, 0)

@@ -30,3 +30,5 @@ __pycache__/
 .codeql-*
 /installers/
 /docs/web/data/releases.github.json
+/docs/web/AGENTS.md
+/docs/web/CLAUDE.md

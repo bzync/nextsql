@@ -478,9 +478,7 @@ directly, in every mode.
 
 ```text
 PROJECT.md      product end-state
-TODO.md         implementation/status truth
 TODO.md         implementation status, sequencing, dependencies, and gates
-ROADMAP.md      simplified non-authoritative sequence
 SKILLS.md       engineering contract
 AGENTS.md       repository-agent instructions
 ARCHITECTURE.md structural design

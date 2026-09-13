@@ -103,7 +103,7 @@ type Config struct {
 	// BackupDir, when set, is the directory the server writes backups into
 	// (one timestamped subdirectory per `BACKUP DATABASE`) and lists /
 	// verifies from (`system.backups`, `VERIFY BACKUP`). The NextSQL Manager
-	// drives all three (`docs/design-manager.md` M5). Unset disables those
+	// drives all three (Operations-mode backups). Unset disables those
 	// operations — there is nowhere for the server to put a backup, and a
 	// driver-only client must never name a server filesystem path itself.
 	BackupDir string

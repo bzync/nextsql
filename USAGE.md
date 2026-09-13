@@ -152,8 +152,7 @@ nextsql-admin                   # opens a token-authenticated loopback wizard (S
 
 The GUI currently covers welcome, paths/dry-run validation, resource preset,
 administrator, summary, install, and completion. It is not yet bundled as the
-default OS-package entry point. See [`docs/install.md`](docs/install.md) and
-[`docs/design-admin-setup.md`](docs/design-admin-setup.md).
+default OS-package entry point. See [`docs/install.md`](docs/install.md).
 
 ### Build from source
 
@@ -769,8 +768,7 @@ MultiPolygon, and GeometryCollection; WKT/EWKB/GeoJSON conversion, bounded
 predicates/overlay, and all seven driver codecs are implemented. 3D/M,
 curves, raster, arbitrary PROJ transforms, a true R-tree, aggregate
 `ST_Collect`/`ST_Extent`, and full spheroidal overlay/distance-to-polyline
-remain out of scope. Details: [`docs/geo.md`](docs/geo.md) and
-[`docs/design-spatial.md`](docs/design-spatial.md).
+remain out of scope. Details: [`docs/geo.md`](docs/geo.md).
 
 ---
 
@@ -2176,7 +2174,6 @@ return an empty/not-attached view for those process-wide sources.
 |---|---|
 | [PROJECT.md](PROJECT.md) | Intended final NextSQL product/end-state |
 | [TODO.md](TODO.md) | Current implementation status, open gates, measurements |
-| [ROADMAP.md](ROADMAP.md) | Simplified, non-authoritative roadmap derived from `TODO.md` |
 | [SKILLS.md](SKILLS.md) | Engineering and agent operating contract |
 | [AGENTS.md](AGENTS.md) | Repository agent entrypoint |
 | [README.md](README.md) | Product overview and quick start |

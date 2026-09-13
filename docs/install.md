@@ -1,7 +1,6 @@
 # Installation and first-run setup (Phase 28)
 
-Phase 28/29 cover NextSQL Admin, one application with three modes (see
-`docs/design-admin.md`):
+Phase 28/29 cover NextSQL Admin, one application with three modes:
 
 ```text
 Setup mode       → install / upgrade / repair / uninstall            (Phase 28)
@@ -398,10 +397,9 @@ The `nextsql lifecycle` backbone (`detect` / `preflight` / `backup-config` /
 cluster node through the per-node rolling procedure (`--cluster-node`
 acknowledgment; `rolling_upgrade` guidance in the `--json` output), and
 transactional rollback of installer-created files is done for `nextsql
-setup`. The **Operations-mode MVP (all nine M1–M9 slices) is complete** —
-see `docs/design-admin-operations.md`. What remains in Phase 28: the **Setup
-mode GUI** (`nextsql-admin` / `internal/admin/setup`,
-`docs/design-admin-setup.md`) — M1 (serving backbone + a working welcome →
+setup`. The **Operations-mode MVP (all nine M1–M9 slices) is complete**.
+What remains in Phase 28: the **Setup
+mode GUI** (`nextsql-admin` / `internal/admin/setup`) — M1 (serving backbone + a working welcome →
 location → resources → administrator → summary → install → completion flow,
 driving `nextsql setup` as a subprocess), **M3 (advanced options — skip-init,
 custom buffer pages, remote listen address + TLS)**, and **M6 (an optional

@@ -1424,7 +1424,7 @@ Native geospatial support has two families that sit side by side:
 line-length, pairwise `INTERSECTS`/`DISJOINT`, polygon area/perimeter,
 centroid/envelope, and geometry inspection.
 
-**General OGC types** (`docs/design-spatial.md`) — `GEOMETRY` (planar) and
+**General OGC types** — `GEOMETRY` (planar) and
 `GEOGRAPHY` (geodetic) with an explicit per-column SRID + subtype
 declaration (`GEOMETRY(Point, 3857)`), the OGC Simple Features common
 subset of `ST_*` functions, EWKB/EWKT/WKB/GeoJSON serialization, and a
@@ -2955,9 +2955,6 @@ PROJECT.md
 
 TODO.md
 → What is implemented, open, blocked, deferred, or production-gated.
-
-ROADMAP.md
-→ Simplified, non-authoritative sequence derived from TODO.md.
 
 SKILLS.md
 → How an AI coding agent must behave while working on NextSQL.

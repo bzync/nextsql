@@ -991,7 +991,7 @@ The system must degrade through queueing/rejection/cancellation rather than OOM 
 # 16. P28 Skill — NextSQL Admin: Setup + Operations modes
 
 NextSQL Admin is one product, one binary (`nextsql-admin`), three modes (Setup,
-Operations, Studio — see `docs/design-admin.md`). Keep the modes' responsibilities
+Operations, Studio). Keep the modes' responsibilities
 clear even though they share one process/shell.
 
 Current state: the `nextsql setup`/`nextsql lifecycle` automation backbone and

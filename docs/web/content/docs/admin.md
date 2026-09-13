@@ -77,4 +77,4 @@ Studio is in progress on the same Operations session. Current surfaces include:
 
 Studio is not a generic SQL client. It uses official NextSQL interfaces only. NextSQL Intelligence / RAG is **not in the product**.
 
-Engine notes: [`docs/design-admin.md`](https://github.com/bzync/nextsql/blob/main/docs/design-admin.md), [`docs/design-admin-setup.md`](https://github.com/bzync/nextsql/blob/main/docs/design-admin-setup.md), [`docs/design-admin-operations.md`](https://github.com/bzync/nextsql/blob/main/docs/design-admin-operations.md), [`docs/design-admin-studio.md`](https://github.com/bzync/nextsql/blob/main/docs/design-admin-studio.md).
+Engine notes: [`docs/install.md`](https://github.com/bzync/nextsql/blob/master/docs/install.md).

@@ -48,7 +48,6 @@ Before non-trivial work, read:
 AGENTS.md
 SKILLS.md
 TODO.md
-ROADMAP.md
 PROJECT.md
 ARCHITECTURE.md
 ```
@@ -298,10 +297,8 @@ Use local ignored files for developer secrets.
 Change the correct document:
 
 ```text
-TODO.md         status
-PROJECT.md      intended product scope
 TODO.md         status, sequencing, dependencies, and gates
-ROADMAP.md      simplified non-authoritative roadmap
+PROJECT.md      intended product scope
 SKILLS.md       engineering contract
 ARCHITECTURE.md architecture
 USAGE.md        shipped user-facing behavior

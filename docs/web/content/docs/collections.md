@@ -74,4 +74,4 @@ SELECT key, value FROM UNNEST(MAP('dark', TRUE)) AS f(key, value);
 SELECT tags[1] FROM docs;
 ```
 
-Engine note: [`docs/design-collections.md`](https://github.com/bzync/nextsql/blob/main/docs/design-collections.md).
+Engine note: [`docs/sql.md`](https://github.com/bzync/nextsql/blob/master/docs/sql.md).

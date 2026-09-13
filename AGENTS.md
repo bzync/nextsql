@@ -14,7 +14,6 @@ Before changing code, read and follow:
 PROJECT.md
 TODO.md
 SKILLS.md
-ROADMAP.md
 ```
 
 Use them as follows:
@@ -29,9 +28,6 @@ TODO.md
 SKILLS.md
 → Engineering rules, safety constraints, architecture discipline,
   verification requirements, and agent operating contract.
-
-ROADMAP.md
-→ Simplified, human-readable, non-authoritative roadmap derived from TODO.md.
 ```
 
 If these files disagree:
@@ -40,8 +36,7 @@ If these files disagree:
 2. `SKILLS.md` wins for **engineering behavior, safety, architecture discipline, and verification requirements**.
 3. `PROJECT.md` wins for **intended final product scope**.
 4. `TODO.md` controls **sequencing and dependency order**.
-5. `ROADMAP.md` summarizes that sequence but is not a second status database.
-6. Detailed `docs/*` and measured tests/benchmarks are authoritative for implementation-specific technical facts.
+5. Detailed `docs/*` and measured tests/benchmarks are authoritative for implementation-specific technical facts.
 
 Do not silently reconcile contradictions. Fix the documentation or report the conflict.
 
@@ -67,9 +62,8 @@ P25      complete — Security 2.0; exit gate closed 2026-09-02, security review
 P26      complete — System catalog / introspection 2.0; exit gate closed 2026-09-02
 P27      complete — Operational maturity + workload governance; exit gate closed 2026-09-03
 P28      in progress — NextSQL Admin: Setup + Operations modes (2026-09-05: Installer +
-         Manager + Studio merged into one product, one binary nextsql-admin — see
-         docs/design-admin.md). Operations-mode MVP (all nine M1–M9 slices) is COMPLETE
-         (docs/design-admin-operations.md). Setup mode's implemented wizard,
+         Manager + Studio merged into one product, one binary nextsql-admin).
+         Operations-mode MVP (all nine M1–M9 slices) is COMPLETE. Setup mode's implemented wizard,
          packaging integration, service flow, and accessibility baseline are verified;
          Linux .tar.gz/.run/.deb/.rpm and silent/offline/upgrade/repair paths are
          live-verified. Recovery-key export/verification is implemented for both
@@ -102,7 +96,7 @@ session closed at credential expiry; `identity_source` `token` / `mtls+token`).
 Config: `token_verify_keyset` / `token_revocations` / `token_audience` /
 `token_identity_source_hint`.
 
-P25 external IdP: OIDC design is accepted (`docs/design-oidc-external-idp.md`) —
+P25 external IdP: OIDC is accepted —
 a brokered token exchange that validates an OIDC token against a cached JWKS and
 mints an `NSSC1.` credential (SQL auth path unchanged / offline), plus an `NSIP`
 identity policy whose group→role mapping is intersected with real RBAC (no
@@ -149,7 +143,7 @@ RBAC-filtered — see `docs/system-catalog.md`) — and all nine planned `SHOW`
 convenience aliases. P27 Operational maturity + workload governance closed
 2026-09-03. **P28 NextSQL Admin (Setup + Operations modes) is the current
 release gate**: Operations mode's MVP is complete; Setup mode
-(`docs/design-admin-setup.md`) has its standalone M1 flow implemented and
+has its standalone M1 flow implemented and
 targeted-tested. Packaging integration, recovery-key export/verification,
 accessibility validation, and silent/offline install coverage are implemented;
 remaining macOS execution tests are environment-blocked; native Windows is
@@ -446,7 +440,7 @@ When changing behavior:
 - update `TODO.md` status only when implementation + tests + docs + exit requirements justify it;
 - update `PROJECT.md` only when intended product scope changes;
 - update `SKILLS.md` only when the engineering/agent contract intentionally changes;
-- update `TODO.md` when sequencing/dependencies change and derive `ROADMAP.md` from it.
+- update `TODO.md` when sequencing/dependencies change.
 
 Do not mark design hooks as shipped functionality.
 

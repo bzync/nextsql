@@ -462,8 +462,7 @@ handshake; the default is `disabled`.
 
 ## External identity providers (OIDC)
 
-The accepted design is in `docs/design-oidc-external-idp.md` (2026-08-31): a
-standalone or embedded authentication broker runs the OIDC flow, validates the
+A standalone or embedded authentication broker runs the OIDC flow, validates the
 IdP token against a cached JWKS, and mints an ordinary `NSSC1.` short-lived
 credential (above), so `nextsqld`'s authentication path is unchanged and never
 calls the IdP.
@@ -706,7 +705,7 @@ fail-closed controls and remain off by default.
 | Token signing-key rotation | yes | yes | yes | yes — `NSTK` keyset, current/retired, overlap; `TestTokenKeyRotationOverlap`, `TestTokenKeysetReloadLastKnownGood` |
 | Token revocation | yes | yes | yes | yes — `NSTR` token-id + principal-cutoff, `SIGHUP` reload; `TestRevokeByTokenID`, `TestRevokePrincipalCutoff`, `TestShortLivedCredentialRevoked` |
 | Token audit | yes | yes | yes | yes — `identity_source` `token`/`mtls+token`; `token.reload` security setting event |
-| OIDC design | yes | n/a | n/a | accepted design `docs/design-oidc-external-idp.md` (brokered token exchange → `NSSC1.`; `NSIP` no-escalation mapping) |
+| OIDC design | yes | n/a | n/a | accepted (brokered token exchange → `NSSC1.`; `NSIP` no-escalation mapping) |
 | OIDC implementation | yes | yes | yes | yes — standalone and embedded brokers validate ID tokens, client-credentials JWTs, and optionally RFC 7662 opaque tokens before minting `NSSC1.`; opaque introspection is bounded, redirect-free, and secret-file-backed. Opt-in JIT is principal-count/role-boundary bounded and cannot silently grant administrative roles. Authorization Code/PKCE, key-derived audit labels, live ACL intersection, TLS/listener, replay, functional/race/adversarial/config/audit, introspection, and JIT tests cover the surface |
 | IdP-to-NextSQL principal mapping | yes | yes | yes | yes — `NSIP` issuer-scoped subject rules + transforms + login-charset check, consumed by the broker; `internal/auth/identitypolicy_test.go`, `FuzzDecodeIdentityPolicy`, `FuzzMapClaims`, `TestExchangeHappyPathMintsVerifiableCredential` |
 | External auth remains behind RBAC | yes | yes | yes | yes — every server enforces `ACL.AllowedScoped`; embedded mode also checks the live native user and direct/transitive ACL membership before minting, with empty intersection denial and immediate revocation behavior (`TestExchangeRBACIntersection`, `TestEmbeddedAuthBrokerUsesLiveNativeMembership`) |

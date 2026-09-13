@@ -161,7 +161,7 @@ Official drivers are in the repo tree under `drivers/` and match engine **0.0.1*
 | Go | `go get github.com/bzync/nextsql/drivers/go@v0.0.1` |
 | Node.js 18+ | `npm i @bzync/nextsql@0.0.1` |
 | Bun | `drivers/bun` (repo tree) |
-| PHP 8.1+ | `composer require bzync/nextsql:dev-master` |
+| PHP 8.1+ | `composer require bzync/nextsql` |
 | Python 3.10+ | `pip install bzync-nextsql==0.0.1` |
 | Ruby 3.0+ | `gem install bzync-nextsql -v 0.0.1` |
 

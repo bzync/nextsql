@@ -7,7 +7,7 @@ Official drivers speak the native **NSQL v1** protocol. **Do not put keys or pas
 | Go | `go get github.com/bzync/nextsql/drivers/go@v0.0.1` | `nextsql.Open(nextsql.Config{…})` |
 | Node.js 18+ | `npm i @bzync/nextsql@0.0.1` | `connect({ address, user, password, tls })` |
 | Bun | [`drivers/bun`](https://github.com/bzync/nextsql/tree/master/drivers/bun) (repo tree) | same shape as Node |
-| PHP 8.1+ | `composer require bzync/nextsql:dev-master` | `NextSQL\Client::connect([…])` |
+| PHP 8.1+ | `composer require bzync/nextsql` | `NextSQL\Client::connect([…])` |
 | Python 3.10+ | `pip install bzync-nextsql==0.0.1` | `nextsql.connect(nextsql.Config(…))` |
 | Ruby 3.0+ | `gem install bzync-nextsql -v 0.0.1` | `NextSQL.connect(NextSQL::Config.new(…))` |
 

@@ -6,9 +6,8 @@ require (
 	github.com/hashicorp/go-hclog v1.6.3
 	github.com/hashicorp/raft v1.7.3
 	github.com/hashicorp/raft-boltdb/v2 v2.3.1
-	golang.org/x/crypto v0.56.0
+	github.com/zalando/go-keyring v0.2.8
 	golang.org/x/sys v0.47.0
-	gopkg.in/yaml.v3 v3.0.1
 )
 
 require (
@@ -23,6 +22,5 @@ require (
 	github.com/hashicorp/golang-lru v0.5.0 // indirect
 	github.com/mattn/go-colorable v0.1.12 // indirect
 	github.com/mattn/go-isatty v0.0.14 // indirect
-	github.com/zalando/go-keyring v0.2.8 // indirect
 	go.etcd.io/bbolt v1.3.5 // indirect
 )

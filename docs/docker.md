@@ -9,7 +9,10 @@ The published image is a static Go runtime (`FROM scratch`): `nextsql`,
 `nextsqld`, and a small PID-1 wrapper (`nextsql-entrypoint`). There is no
 shell, package manager, or libc userland. `docker exec`/`podman exec` can
 still run `/usr/local/bin/nextsql` (see "Verifying the cluster" below); they
-cannot run `sh`.
+cannot run `sh`. The image binaries do not record the `golang.org/x/crypto`
+module (GO-2026-5932 has no fix version and matches that whole module,
+including unused `openpgp`). Argon2id and OCSP use in-tree copies of the
+packages this tree actually called.
 
 ## Prebuilt image
 

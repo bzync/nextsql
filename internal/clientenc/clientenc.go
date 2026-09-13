@@ -7,16 +7,15 @@ import (
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/hkdf"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
-	"io"
 	"strings"
 
 	"github.com/bzync/nextsql/internal/nerr"
 	"github.com/bzync/nextsql/internal/sql/types"
-	"golang.org/x/crypto/hkdf"
 )
 
 const (
@@ -415,8 +414,10 @@ func newGCM(key [KeySize]byte) (cipher.AEAD, error) {
 // AES-256-GCM key even when an application deliberately reuses a field-key id.
 func deterministicKey(material [KeySize]byte) ([KeySize]byte, error) {
 	var out [KeySize]byte
-	if _, err := io.ReadFull(hkdf.New(sha256.New, material[:], nil, []byte(deterministicKeyInfo)), out[:]); err != nil {
+	derived, err := hkdf.Key(sha256.New, material[:], nil, deterministicKeyInfo, KeySize)
+	if err != nil {
 		return out, nerr.Wrap(nerr.Crypto, "clientenc", "derive deterministic field key", err)
 	}
+	copy(out[:], derived)
 	return out, nil
 }

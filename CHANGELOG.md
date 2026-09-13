@@ -80,6 +80,10 @@ scanning, instead of loading the whole table into memory.
 - `nextsql setup --profile production` writes fail-closed operational defaults.
 - NextSQL Admin (`nextsql-admin`): Setup, Operations, and Studio on loopback.
   It is a protocol client — it never reads database files or bypasses RBAC.
+- Published binaries do not record `golang.org/x/crypto`, so Docker Scout no
+  longer reports GO-2026-5932 (unmaintained `openpgp`; no fix version exists).
+  Argon2id and OCSP use copies of the v0.56.0 packages this tree already
+  called. `NSCE2.` HKDF uses the standard library `crypto/hkdf`.
 
 ### Install and platforms
 

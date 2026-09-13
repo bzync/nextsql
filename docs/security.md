@@ -628,7 +628,7 @@ from `ENCRYPTED CLIENT` field keys and from short-lived credentials. Two
 algorithms coexist in one versioned (`NSAU` v2) container, distinguished per
 record by an explicit algorithm byte:
 
-- **Argon2id** (`golang.org/x/crypto/argon2`) — every new record (`Upsert`)
+- **Argon2id** (`internal/xcrypto/argon2`, a copy of `golang.org/x/crypto/argon2` v0.56.0) — every new record (`Upsert`)
   and every transparently upgraded legacy record. Parameters: time cost 1,
   memory cost 64 MiB, parallelism 4, 32-byte output — the package
   documentation's recommended values. Verification allocates the full 64 MiB
@@ -719,7 +719,7 @@ fail-closed controls and remain off by default.
 | Field wrong-key/tamper behavior | yes | yes | yes | yes — GCM and SIV context/type/revocation tests + `FuzzInspect` |
 | Field backup/restore/PITR | yes | yes | yes | yes — `TestEncryptedClientPITRRestoresExactCiphertextAtTarget`: base backup + archived WAL restore preserves exact pre-target `NSCE1` and `NSCE2`, excludes later writes, and retains v13 mode metadata |
 | Field replication/failover | yes | yes | yes | yes — `TestHAEncryptedClientCiphertextSurvivesLeaderFailover`: three-voter cluster confirms identical `NSCE1`/`NSCE2` on every replica, no lost acknowledged ciphertext across leader loss, and correct post-failover replication + decrypt |
-| Argon2id migration evaluation | yes | yes | yes | yes — `golang.org/x/crypto/argon2`, time 1 / memory 64 MiB / parallelism 4; every new record uses it |
+| Argon2id migration evaluation | yes | yes | yes | yes — `internal/xcrypto/argon2` (copy of `golang.org/x/crypto/argon2` v0.56.0), time 1 / memory 64 MiB / parallelism 4; every new record uses it |
 | Per-record password-hash versions | yes | yes | yes | yes — `NSAU` v2 adds a per-record algorithm byte (PBKDF2 or Argon2id); `TestNewRecordsAreArgon2idFromCreation` |
 | PBKDF2 backward compatibility | yes | yes | yes | yes — `NSAU` v1 files still decode; `Encode` always writes v2; `TestV1FormatDecodesAndVerifies` |
 | Transparent login rehash | yes | yes | yes | yes — a successful verify against a legacy record re-hashes with Argon2id and persists; a failed verify never rehashes; `TestTransparentRehashUpgradesToArgon2id` |

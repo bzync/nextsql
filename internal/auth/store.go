@@ -12,11 +12,10 @@ import (
 	"strings"
 	"sync"
 
-	"golang.org/x/crypto/argon2"
-
 	"github.com/bzync/nextsql/internal/encoding"
 	"github.com/bzync/nextsql/internal/hosting"
 	"github.com/bzync/nextsql/internal/nerr"
+	"github.com/bzync/nextsql/internal/xcrypto/argon2"
 )
 
 const (
@@ -37,8 +36,8 @@ const (
 	algoPBKDF2   byte = 0
 	algoArgon2id byte = 1
 
-	// Argon2id defaults for new/rehashed records, per the golang.org/x/crypto/
-	// argon2 package documentation's recommended parameters.
+	// Argon2id defaults for new/rehashed records, per the argon2 package
+	// documentation's recommended parameters.
 	argon2Time      uint32 = 1
 	argon2MemoryKiB uint32 = 64 * 1024
 	argon2Threads   uint8  = 4

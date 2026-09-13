@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"golang.org/x/crypto/ocsp"
+	"github.com/bzync/nextsql/internal/xcrypto/ocsp"
 )
 
 func generateTestCA(t *testing.T) (*x509.Certificate, *ecdsa.PrivateKey) {

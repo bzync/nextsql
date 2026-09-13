@@ -11,9 +11,8 @@ import (
 	"sync"
 	"time"
 
-	"golang.org/x/crypto/ocsp"
-
 	"github.com/bzync/nextsql/internal/nerr"
+	"github.com/bzync/nextsql/internal/xcrypto/ocsp"
 )
 
 // OCSPMode controls whether and how OCSP status is verified.

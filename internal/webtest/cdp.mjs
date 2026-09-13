@@ -40,7 +40,7 @@ export async function launchChrome(url, { width = 1280, height = 900 } = {}) {
     `--user-data-dir=${profile}`,
     `--window-size=${width},${height}`,
     url,
-  ], { stdio: ["ignore", "ignore", "pipe"] });
+  ], { stdio: ["ignore", "ignore", "pipe"], detached: true });
   child.stderr.on("data", (chunk) => {
     if (stderr.join("").length < 8000) stderr.push(String(chunk));
   });
@@ -166,13 +166,40 @@ export async function launchChrome(url, { width = 1280, height = 900 } = {}) {
     }),
     clearDeviceMetrics: () => send("Emulation.clearDeviceMetricsOverride"),
     async close() {
-      socket.close();
-      child.kill("SIGTERM");
-      await Promise.race([
-        new Promise((resolve) => child.once("exit", resolve)),
-        delay(2_000).then(() => child.kill("SIGKILL")),
-      ]);
-      rmSync(profile, { recursive: true, force: true });
+      try {
+        socket.close();
+      } catch {
+        // The debugger socket may already be closed.
+      }
+      const killTree = (signal) => {
+        try {
+          process.kill(-child.pid, signal);
+        } catch {
+          child.kill(signal);
+        }
+      };
+      const exited =
+        child.exitCode !== null || child.signalCode !== null
+          ? Promise.resolve()
+          : new Promise((resolve) => child.once("exit", resolve));
+      killTree("SIGTERM");
+      await Promise.race([exited, delay(2_000)]);
+      if (child.exitCode === null && child.signalCode === null) {
+        killTree("SIGKILL");
+        await Promise.race([exited, delay(2_000)]);
+      }
+      let lastErr;
+      for (let attempt = 0; attempt < 8; attempt++) {
+        try {
+          rmSync(profile, { recursive: true, force: true });
+          return;
+        } catch (err) {
+          lastErr = err;
+          if (err.code !== "ENOTEMPTY" && err.code !== "EBUSY") throw err;
+          await delay(100 * (attempt + 1));
+        }
+      }
+      throw lastErr;
     },
   };
 }

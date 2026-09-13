@@ -57,4 +57,4 @@ Without an index, `SEARCH` still runs over the heap (or a sargable `WHERE` path)
 | Highlight marker | 32 runes |
 | Snippet width | 16–4096 Unicode code points (default 160) |
 
-Engine note: [`docs/fulltext.md`](https://github.com/bzync/nextsql/blob/main/docs/fulltext.md).
+Engine note: [`docs/fulltext.md`](https://github.com/bzync/nextsql/blob/master/docs/fulltext.md).

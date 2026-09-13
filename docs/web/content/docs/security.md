@@ -96,7 +96,7 @@ window; the revocation set (`NSTR`) revokes a single token id or every
 credential for a principal issued before a cutoff; `SIGHUP` reloads both. Manage
 everything with `nextsql token` (`keygen`, `export-public`, `mint`, `revoke`,
 `rotate`, `retire`, `verify`). Auth audit records `identity_source` `token` or
-`mtls+token`. Engine note: [`docs/security.md`](https://github.com/bzync/nextsql/blob/main/docs/security.md).
+`mtls+token`. Engine note: [`docs/security.md`](https://github.com/bzync/nextsql/blob/master/docs/security.md).
 
 ## External identity (OIDC)
 
@@ -146,4 +146,4 @@ fails closed; an administrator may access it only to migrate each former tenant
 into a separately provisioned database. New CDC/task/schedule records do not
 carry row-tenant authorization state.
 
-Session audit is a JSON-lines file (mode `0600`). See [TLS](/docs/tls) for the wire and client-held keys. Engine note: [`docs/security.md`](https://github.com/bzync/nextsql/blob/main/docs/security.md).
+Session audit is a JSON-lines file (mode `0600`). See [TLS](/docs/tls) for the wire and client-held keys. Engine note: [`docs/security.md`](https://github.com/bzync/nextsql/blob/master/docs/security.md).

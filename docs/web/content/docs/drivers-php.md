@@ -4,7 +4,7 @@ PHP 8.1+ (requires `ext-openssl`). MIT. Package version **0.0.1**, matching
 the engine.
 
 ```bash
-composer require bzync/nextsql
+composer require bzync/nextsql:dev-master
 ```
 
 The Composer package is `bzync/nextsql`, namespace `NextSQL\`. Source:

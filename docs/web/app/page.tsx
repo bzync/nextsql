@@ -269,7 +269,7 @@ function Architecture() {
     "SQL parser → binder / catalog → planner → cost optimizer",
     "Vectorized executor: relational · JSON · vector · full-text · geo · collections",
     "MVCC + row/range locks + UNDO",
-    "REDO WAL (group commit, fsync)",
+    "REDO WAL (group commit, page deltas, fsync)",
     "Buffer manager → AES-256-GCM sealed pages",
   ];
   return (
@@ -311,8 +311,8 @@ function Drivers() {
     { runtime: "Node.js 18+", path: "npm i @bzync/nextsql", open: "connect({ address, user, password, tls })" },
     { runtime: "Bun", path: "drivers/bun (repo)", open: "same shape as Node" },
     { runtime: "PHP 8.1+", path: "composer require bzync/nextsql", open: "NextSQL\\Client::connect([…])" },
-    { runtime: "Python 3.10+", path: "pip install bzync-nextsql", open: "nextsql.connect(nextsql.Config(…))" },
-    { runtime: "Ruby 3.0+", path: "gem install bzync-nextsql", open: "NextSQL.connect(NextSQL::Config.new(…))" },
+    { runtime: "Python 3.10+", path: "pip install bzync-nextsql==0.0.1", open: "nextsql.connect(nextsql.Config(…))" },
+    { runtime: "Ruby 3.0+", path: "gem install bzync-nextsql -v 0.0.1", open: "NextSQL.connect(NextSQL::Config.new(…))" },
   ];
   return (
     <section className="border-b border-line">
@@ -359,14 +359,15 @@ function Drivers() {
 }
 
 function QuickStart() {
-  const steps = `go install github.com/bzync/nextsql/cmd/nextsql@latest
-go install github.com/bzync/nextsql/cmd/nextsqld@latest
+  const steps = `go install github.com/bzync/nextsql/cmd/nextsql@v0.0.1
+go install github.com/bzync/nextsql/cmd/nextsqld@v0.0.1
 
 printf 'secret\\n' > /tmp/nextsql.pw && chmod 600 /tmp/nextsql.pw
 
 nextsql init --data-dir /var/lib/nextsql \\
   --key-file /etc/nextsql/root.key \\
-  --user app --password-file /tmp/nextsql.pw
+  --user app --password-file /tmp/nextsql.pw \\
+  --database app
 
 nextsqld --data-dir /var/lib/nextsql \\
   --key-file /etc/nextsql/root.key \\
@@ -410,16 +411,19 @@ function Status() {
       <div className="mx-auto max-w-6xl px-4 py-12 sm:px-5 sm:py-16 lg:py-20">
         <p className="kicker">Status</p>
         <h2 className="mt-3 max-w-2xl text-[1.7rem] font-semibold tracking-[-0.025em] sm:text-[2rem]">
-          The database is built. Run it on your machine.
+          0.0.1 is a public preview. Run it on your machine.
         </h2>
         <p className="mt-4 max-w-2xl text-sm leading-6 text-muted">
-          Storage, WAL, MVCC, SQL, optimizer, protocol, JSON, full-text, vectors,
-          hybrid plans, workflows, CDC, partitioning, security 2.0, backup/PITR/export,
-          and Raft HA ship in{" "}
+          One encrypted ACID engine for SQL, JSON, full-text, vectors, and geo —
+          with WAL, MVCC, hybrid plans, workflows, CDC, partitioning, backup/PITR,
+          and Raft HA in{" "}
           <code className="rounded bg-bg-hover px-1 font-mono text-[12px]">nextsql</code> and{" "}
           <code className="rounded bg-bg-hover px-1 font-mono text-[12px]">nextsqld</code>.
-          NextSQL Admin covers Setup and Operations; Studio M1–M3 is implemented and its MVP gate remains open.
-          Install the binaries, initialize a data directory, and start serving NSQL.
+          Linux packages and Docker are on Downloads. On Windows, run those Linux
+          packages inside WSL 2. Treat the release as an engine under measurement
+          until you have run{" "}
+          <code className="rounded bg-bg-hover px-1 font-mono text-[12px]">nextsql-bench --slo</code>{" "}
+          on your hardware.
         </p>
         <div className="mt-8 flex flex-wrap gap-2">
           <Link href="/docs/quick-start" className="btn-cta btn-cta-sm">

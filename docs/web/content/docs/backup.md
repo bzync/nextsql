@@ -79,4 +79,4 @@ The single newest backup is never pruned, even past the policy window.
 Pair this with `wal_retention_ms` (`docs/wal.md` "Retention") so archived
 WAL history still covers back to the oldest backup you keep.
 
-Engine note: [`docs/backup.md`](https://github.com/bzync/nextsql/blob/main/docs/backup.md).
+Engine note: [`docs/backup.md`](https://github.com/bzync/nextsql/blob/master/docs/backup.md).

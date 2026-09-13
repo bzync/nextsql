@@ -31,7 +31,7 @@ The same work can be done without the GUI:
 ```bash
 nextsql setup --data-dir /var/lib/nextsql --key-file /etc/nextsql/root.key \
   --profile production --preset balanced --user app --password-file /tmp/nextsql.pw \
-  --recovery-key-out /etc/nextsql/recovery.key
+  --database app --recovery-key-out /etc/nextsql/recovery.key
 nextsql lifecycle detect --data-dir /var/lib/nextsql --json
 nextsql lifecycle upgrade --data-dir /var/lib/nextsql --key-file /etc/nextsql/root.key
 ```
@@ -62,7 +62,7 @@ The file, not the browser, decides which servers Admin may reach: the sign-in pa
 
 ## Studio mode
 
-Studio is in progress on the same Operations session. Current surfaces include:
+Studio is on the same Operations session. Surfaces include:
 
 - authenticated SQL editor with bounded streaming typed results, copy/export, session-scoped lock-wait cancel, tabs/scripts/history/find, crash recovery for unsaved tabs, and layout persistence without credentials
 - catalog-aware table/column IntelliSense (no keyword completion), misspelled `FROM`/`JOIN` table-name suggestions, indexed JSON-path completion, and vector-aware `NEAREST` / `USING` completion

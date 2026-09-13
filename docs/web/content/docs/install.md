@@ -62,7 +62,8 @@ macOS packages are not a supported path.
 ```bash
 printf 'secret\n' > /tmp/nextsql.pw && chmod 600 /tmp/nextsql.pw
 nextsql setup --data-dir /var/lib/nextsql --key-file /etc/nextsql/root.key \
-  --profile production --preset balanced --user app --password-file /tmp/nextsql.pw
+  --profile production --preset balanced --user app --password-file /tmp/nextsql.pw \
+  --database app
 sudo systemctl enable --now nextsql
 ```
 
@@ -79,7 +80,7 @@ sudo systemctl enable --now nextsql
 
 Linux `.tar.gz` / `.run` / `.deb` and silent/offline/upgrade/repair paths are live-verified. `nextsql setup --recovery-key-out FILE` exports verified recovery keys for both the database and deployment-registry keystores (`FILE.instance` by default); it is rejected with `--skip-init`. Store both exports offline and separately from the root keys. Setup mode offers the same export by default and requires confirmation that both files were copied offline before completion. macOS packaged execution remains unverified; native Windows is not supported (use WSL 2).
 
-Keep the root unlock key **off** the data volume in production. A production install with `--key-file` inside `--data-dir` fails closed. Details: [`packaging/README.md`](https://github.com/bzync/nextsql/blob/main/packaging/README.md).
+Keep the root unlock key **off** the data volume in production. A production install with `--key-file` inside `--data-dir` fails closed. Details: [`packaging/README.md`](https://github.com/bzync/nextsql/blob/master/packaging/README.md).
 
 ## Docker
 
@@ -95,14 +96,14 @@ See [Docker](/docs/docker).
 
 ## Install with Go
 
-Requires **Go 1.22+** so `go install` can fetch and compile the engine onto your `PATH`.
+Requires **Go 1.26+** so `go install` can fetch and compile the engine onto your `PATH`.
 
 ```bash
-go install github.com/bzync/nextsql/cmd/nextsql@latest
-go install github.com/bzync/nextsql/cmd/nextsqld@latest
-go install github.com/bzync/nextsql/cmd/nextsql-bench@latest
-go install github.com/bzync/nextsql/cmd/nextsql-auth-broker@latest
-go install github.com/bzync/nextsql/cmd/nextsql-admin@latest
+go install github.com/bzync/nextsql/cmd/nextsql@v0.0.1
+go install github.com/bzync/nextsql/cmd/nextsqld@v0.0.1
+go install github.com/bzync/nextsql/cmd/nextsql-bench@v0.0.1
+go install github.com/bzync/nextsql/cmd/nextsql-auth-broker@v0.0.1
+go install github.com/bzync/nextsql/cmd/nextsql-admin@v0.0.1
 ```
 
 Confirm:
@@ -153,17 +154,16 @@ containers and source control.
 
 ## Drivers
 
-Official drivers are also in the repo tree under `drivers/` and are versioned
-independently of the engine.
+Official drivers are in the repo tree under `drivers/` and match engine **0.0.1**.
 
 | Runtime | Install |
 |---|---|
-| Go | `go get github.com/bzync/nextsql/drivers/go` |
-| Node.js 18+ | `npm i @bzync/nextsql` |
+| Go | `go get github.com/bzync/nextsql/drivers/go@v0.0.1` |
+| Node.js 18+ | `npm i @bzync/nextsql@0.0.1` |
 | Bun | `drivers/bun` (repo tree) |
-| PHP 8.1+ | `composer require bzync/nextsql` |
-| Python 3.10+ | `pip install bzync-nextsql` |
-| Ruby 3.0+ | `gem install bzync-nextsql` |
+| PHP 8.1+ | `composer require bzync/nextsql:dev-master` |
+| Python 3.10+ | `pip install bzync-nextsql==0.0.1` |
+| Ruby 3.0+ | `gem install bzync-nextsql -v 0.0.1` |
 
 See [Drivers](/docs/drivers).
 
@@ -187,7 +187,7 @@ OS packages (`.deb`, `.rpm`, `.tar.gz`, `.run`):
 ./scripts/build-installers.sh
 ```
 
-Artifacts land in `installers/`. See [`packaging/README.md`](https://github.com/bzync/nextsql/blob/main/packaging/README.md).
+Artifacts land in `installers/`. See [`packaging/README.md`](https://github.com/bzync/nextsql/blob/master/packaging/README.md).
 
 ```bash
 go test ./...

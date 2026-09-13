@@ -18,7 +18,7 @@ nextsqld --data-dir DIR --key-file FILE [--instance-key-file FILE]
 
 `--data-dir` is required (flag or config). `--key-file` is required unless `--require-client-key` is set. For a deployment initialized with `nextsql.instance`, `--instance-key-file` defaults to `KEY-FILE.instance`; client-key mode must set it explicitly.
 
-The hosting fields can also come from process environment, `.env.local`,
+The data-directory and unlock-key fields can also come from process environment, `.env.local`,
 `.env`, or `--env-file`: `NEXTSQL_DATA_DIR`, `NEXTSQL_KEY_FILE`,
 `NEXTSQL_INSTANCE_KEY_FILE`, `NEXTSQL_BUFFER_PAGES`, `NEXTSQL_ADDR` (listen),
 `NEXTSQL_SERVER_USER`, and `NEXTSQL_SERVER_PASSWORD_FILE` (preferred) or
@@ -138,7 +138,7 @@ The separate `nextsql-auth-broker` config supports
 `access_token_audience=RESOURCE` inside an `[idp "name"]` section. Setting it
 enables OAuth2 client-credentials exchange only for asymmetric JWT access
 tokens with that exact resource audience and the section's exact `client_id`
-binding. Opaque-token introspection is not implemented.
+binding. RFC 7662 opaque-token introspection is opt-in on the broker and off by default.
 
 `auth_broker_listen` enables the embedded broker for a single-node/non-HA
 server on a separate listener. `auth_broker_config` selects the same broker

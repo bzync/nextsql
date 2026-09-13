@@ -38,4 +38,4 @@ These fail closed:
 
 JSON cannot be a foreign-key column. Path indexes cannot be `UNIQUE` full-text or vector indexes.
 
-Engine note: [`docs/json.md`](https://github.com/bzync/nextsql/blob/main/docs/json.md).
+Engine note: [`docs/json.md`](https://github.com/bzync/nextsql/blob/master/docs/json.md).

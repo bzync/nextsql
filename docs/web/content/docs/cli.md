@@ -98,7 +98,7 @@ discovered HTTPS IdP token endpoint and is never stored with the broker-minted
 credential. The broker profile must configure `access_token_audience`, and the
 JWT must carry that resource audience plus an exact `client_id` or `azp`
 binding. Expired workload credentials renew non-interactively from the same
-secret file. Opaque-token introspection is not implemented.
+secret file. RFC 7662 opaque-token introspection is opt-in on the broker and off by default.
 
 `--out` for backup and export must not already exist. The tool writes a temporary directory, verifies, then publishes atomically.
 
@@ -118,8 +118,9 @@ enforced.
 `nextsql init` creates an encrypted/versioned deployment registry and a
 separate external registry root. `--instance-key-file` defaults to
 `KEY-FILE.instance`; keep both roots off the data volume. `--database` names
-the deployment's one database and defaults to `default`. Each deployment
-serves exactly one database.
+(and creates) the deployment's one database; omit it and the command provisions
+only the administrator — `nextsqld` then refuses to start until a later init
+names a database. Each deployment serves exactly one database.
 
 `nextsql setup --recovery-key-out FILE` creates and verifies recovery exports
 for both keystores during a first install; the registry export defaults to
@@ -164,9 +165,9 @@ index growth) fails with `storage cap exceeded` while `DELETE` / `ROLLBACK` /
 in-place `UPDATE` still work. `nextsql registry show` prints the registry,
 including a cap recorded by an earlier release.
 
-## Initialization configuration (`init`, `hosting adopt`, and `nextsqld`)
+## Initialization configuration (`init`, `registry adopt`, and `nextsqld`)
 
-Hosting commands use the same dotenv discovery and priority as client
+Init, setup, registry, and `nextsqld` use the same dotenv discovery and priority as client
 commands. For `nextsqld`, field priority is explicit flags > non-empty process
 environment > `.env.local` > `.env` > `--config` > built-in defaults.
 

@@ -28,4 +28,4 @@ LIMIT 20;
 
 Hybrid results are reciprocal-rank fused, then truncated to `LIMIT` (or re-sorted when `ORDER BY` is present).
 
-Engine note: [`docs/optimizer.md`](https://github.com/bzync/nextsql/blob/main/docs/optimizer.md).
+Engine note: [`docs/optimizer.md`](https://github.com/bzync/nextsql/blob/master/docs/optimizer.md).

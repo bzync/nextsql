@@ -20,4 +20,4 @@ An export is not valid until the built-in import-test succeeds (`verified` marke
 
 Use physical [backup](/docs/backup) when you need page-level restore or PITR. Use export when you want a portable snapshot of committed rows.
 
-Engine note: [`docs/export.md`](https://github.com/bzync/nextsql/blob/main/docs/export.md).
+Engine note: [`docs/export.md`](https://github.com/bzync/nextsql/blob/master/docs/export.md).

@@ -67,10 +67,10 @@ Every read runs in one mode (session default `STRONG`):
 - **`BOUNDED`** — served from a member within `MAX STALENESS` of the leader, or rejected. With no explicit bound it uses the cluster's healthy-contact window, five times its configured `raft_heartbeat_ms`. Cheap (no quorum round trip); no cross-node read-your-writes.
 - **`STALE`** — served from any member's applied state, unbounded lag. Always a consistent committed prefix, never relabelled `STRONG`.
 
-Every official driver ships a cluster routing client (`OpenCluster` / `connectCluster` / `NextSQL\Cluster::connect`) that sends eligible reads to a healthy follower and everything else to the leader. `nextsql-bench --readscale` measures the barrier cost and leader read-offload. Full argument: [`docs/ha.md`](https://github.com/bzync/nextsql/blob/main/docs/ha.md) "Consistency model and sign-off".
+Every official driver ships a cluster routing client (`OpenCluster` / `connectCluster` / `NextSQL\Cluster::connect`) that sends eligible reads to a healthy follower and everything else to the leader. `nextsql-bench --readscale` measures the barrier cost and leader read-offload. Full argument: [`docs/ha.md`](https://github.com/bzync/nextsql/blob/master/docs/ha.md) "Consistency model and sign-off".
 
 Replica repair has two proven paths: a lagging follower that reconnects, and a wiped replica restored with `nextsql backup` / `restore` (same identity and keys) then rejoined with `AddVoter`. Raft logs are ciphertext (replication DEK). HA is not a substitute for backups.
 
 On Raft, connect migrators and writers to the **leader**.
 
-Engine note: [`docs/ha.md`](https://github.com/bzync/nextsql/blob/main/docs/ha.md).
+Engine note: [`docs/ha.md`](https://github.com/bzync/nextsql/blob/master/docs/ha.md).

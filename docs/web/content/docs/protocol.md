@@ -1,6 +1,6 @@
 # Wire protocol
 
-Versioned NextSQL framing spoken by `nextsqld` and the official drivers. Local SQL execution is unchanged. This page is the application contract; the on-the-wire layout lives in [`docs/protocol.md`](https://github.com/bzync/nextsql/blob/main/docs/protocol.md).
+Versioned NextSQL framing spoken by `nextsqld` and the official drivers. Local SQL execution is unchanged. This page is the application contract; the on-the-wire layout lives in [`docs/protocol.md`](https://github.com/bzync/nextsql/blob/master/docs/protocol.md).
 
 ## Frame layout
 

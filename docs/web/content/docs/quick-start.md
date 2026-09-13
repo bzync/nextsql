@@ -61,7 +61,7 @@ NEXTSQL_SERVER_USER=app
 NEXTSQL_SERVER_PASSWORD_FILE=/tmp/nextsql.pw
 ```
 
-Run `nextsql init --env-file /run/nextsql/hosting.env`. Explicit flags override
+Run `nextsql init --env-file /run/nextsql/nextsql.env`. Explicit flags override
 the file. Values are paths/names, never raw key bytes.
 
 Existing pre-registry deployments must not be reinitialized. Stop `nextsqld`

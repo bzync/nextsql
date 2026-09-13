@@ -114,4 +114,4 @@ podman volume create nextsql-data
 podman volume create nextsql-keys
 ```
 
-Engine note: [`docs/docker.md`](https://github.com/bzync/nextsql/blob/main/docs/docker.md).
+Engine note: [`docs/docker.md`](https://github.com/bzync/nextsql/blob/master/docs/docker.md).

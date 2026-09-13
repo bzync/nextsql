@@ -6,7 +6,7 @@ Pipeline: SQL → lexer → parser → binder / catalog → logical plan → rew
 
 - One statement per request. A trailing `;` is optional. Extra tokens after the statement are a syntax error.
 - Unquoted identifiers fold to lowercase. Quoted `"Ident"` is preserved.
-- Reserved words include `FOREIGN`, `REFERENCES`, `CONSTRAINT`, `CASCADE`, `RESTRICT`, `ACTION`, `MATCH`, `ALTER`, `ADD`, `RENAME`, `ORDER`, `ASC`, `DESC`, `IF`, `EXISTS`, `WITH`, `OVER`, `UPSERT`, and `RETURNING`. Quote them (`"foreign"`) to use them as identifiers. `PARTITION`, `ROWS`, `RANGE`, `UNBOUNDED`, `PRECEDING`, `FOLLOWING`, `CURRENT`, `ROW`, `EXCLUDED`, and `INCLUDE` are contextual.
+- Reserved words include `FOREIGN`, `REFERENCES`, `CONSTRAINT`, `CASCADE`, `RESTRICT`, `ACTION`, `MATCH`, `ALTER`, `ADD`, `RENAME`, `ORDER`, `ASC`, `DESC`, `IF`, `EXISTS`, `WITH`, `OVER`, `UPSERT`, `LIKE`, `RETURNING`, `VIEW`, `SAVEPOINT`, and `CHECK`. Quote them (`"foreign"`) to use them as identifiers. `PARTITION`, `ROWS`, `RANGE`, `UNBOUNDED`, `PRECEDING`, `FOLLOWING`, `CURRENT`, `ROW`, `EXCLUDED`, `INCLUDE`, and `CAST` are contextual.
 - Parameters are `$1`, `$2`, … (1-based). The CLI `-c` flag does not bind parameters; use a driver.
 - `NULL` is typed. Compare with `IS NULL` / `IS NOT NULL`.
 - Table names that start with `nsql_` are reserved. The exception is `CREATE TABLE nsql_schema_migrations` with the exact history DDL used by [migrations](/docs/migrate).
@@ -112,7 +112,7 @@ The source is an ordinary `SELECT`, set operation or `WITH`, bound and optimized
 explicit transaction. `AFTER` resumes after an unsigned decimal commit LSN.
 See [Change streams](/docs/cdc).
 
-`ALTER TABLE` supports `ADD [COLUMN]`, `DROP [COLUMN]`, `RENAME [COLUMN] … TO`, `RENAME TO`, `ADD CONSTRAINT` / `ADD FOREIGN KEY`, and `DROP CONSTRAINT`. Adding a `NOT NULL` column to a non-empty table requires a `DEFAULT`. A `PRIMARY KEY` column cannot be dropped.
+`ALTER TABLE` supports `ADD [COLUMN]`, `DROP [COLUMN]`, `ALTER [COLUMN] SET/DROP NOT NULL`, `ALTER [COLUMN] SET/DROP DEFAULT`, `RENAME [COLUMN] … TO`, `RENAME TO`, `ADD CONSTRAINT` / `ADD FOREIGN KEY` / `ADD CHECK`, and `DROP CONSTRAINT`. Adding a `NOT NULL` column to a non-empty table requires a `DEFAULT`. A `PRIMARY KEY` column cannot be dropped. An explicit `NULL` in `INSERT` is stored as `NULL`; a column default applies only when the statement omits the column.
 
 ## ORDER BY
 

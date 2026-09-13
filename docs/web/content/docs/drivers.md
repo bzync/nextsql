@@ -4,12 +4,12 @@ Official drivers speak the native **NSQL v1** protocol. **Do not put keys or pas
 
 | Runtime | Install | Open |
 |---|---|---|
-| Go | `go get github.com/bzync/nextsql/drivers/go` | `nextsql.Open(nextsql.Config{…})` |
-| Node.js 18+ | `npm i @bzync/nextsql` | `connect({ address, user, password, tls })` |
+| Go | `go get github.com/bzync/nextsql/drivers/go@v0.0.1` | `nextsql.Open(nextsql.Config{…})` |
+| Node.js 18+ | `npm i @bzync/nextsql@0.0.1` | `connect({ address, user, password, tls })` |
 | Bun | [`drivers/bun`](https://github.com/bzync/nextsql/tree/master/drivers/bun) (repo tree) | same shape as Node |
-| PHP 8.1+ | `composer require bzync/nextsql` | `NextSQL\Client::connect([…])` |
-| Python 3.10+ | `pip install bzync-nextsql` | `nextsql.connect(nextsql.Config(…))` |
-| Ruby 3.0+ | `gem install bzync-nextsql` | `NextSQL.connect(NextSQL::Config.new(…))` |
+| PHP 8.1+ | `composer require bzync/nextsql:dev-master` | `NextSQL\Client::connect([…])` |
+| Python 3.10+ | `pip install bzync-nextsql==0.0.1` | `nextsql.connect(nextsql.Config(…))` |
+| Ruby 3.0+ | `gem install bzync-nextsql -v 0.0.1` | `NextSQL.connect(NextSQL::Config.new(…))` |
 
 Shared TypeScript types: [`drivers/js/types.d.ts`](https://github.com/bzync/nextsql/blob/master/drivers/js/types.d.ts) (bundled into `@bzync/nextsql`).
 
@@ -25,7 +25,7 @@ Every official driver also ships a cluster client (`OpenCluster` / `connectClust
 
 `database` on the connect config names the deployment's database on Hello; an empty name accepts whatever the deployment serves.
 
-All six drivers encode the scalar type expansion (`BLOB`, integers, floats, `DATE`/`TIME`/`TIMESTAMP`/`INTERVAL`, `CHAR`/`VARCHAR`, `ENUM`) and collections (`STRUCT`/`ARRAY`/`MAP`). Field-encryption helpers exist in Go/Node/Bun/PHP only.
+All six official drivers encode the scalar types (`BOOL`, `BLOB`, integers, floats, `DATE`/`TIME`/`TIMESTAMP`/`INTERVAL`, `CHAR`/`VARCHAR`, `ENUM`) and collections (`STRUCT`/`ARRAY`/`MAP`). Field-encryption helpers exist in Go, Node, Bun, and PHP only.
 
 ## Language guides
 
@@ -35,4 +35,4 @@ All six drivers encode the scalar type expansion (`BLOB`, integers, floats, `DAT
 - [Python](/docs/drivers-python)
 - [Ruby](/docs/drivers-ruby)
 
-Engine note: [`docs/protocol.md`](https://github.com/bzync/nextsql/blob/main/docs/protocol.md).
+Engine note: [`docs/protocol.md`](https://github.com/bzync/nextsql/blob/master/docs/protocol.md).

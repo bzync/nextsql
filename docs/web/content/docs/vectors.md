@@ -98,7 +98,7 @@ shrinks 3.2 → 2.2 → 1.7 MiB across the element types with negligible recall 
 row builds an order of magnitude smaller index ~10× faster than HNSW, trading
 recall at a partial probe ratio. The `SPARSE` row (2000 × 4096-d, 24 non-zeros)
 keeps 282 KiB of NSSV payload (a dense F32 of the same ambient dim would be
-32 MiB) with recall@10/@100 1.000 at 0.53 ms p50. The dated review is [`docs/vector.md`](https://github.com/bzync/nextsql/blob/main/docs/vector.md).
+32 MiB) with recall@10/@100 1.000 at 0.53 ms p50. The dated review is [`docs/vector.md`](https://github.com/bzync/nextsql/blob/master/docs/vector.md).
 
 ## Compressed neighbour lists
 
@@ -197,4 +197,4 @@ each retriever and reciprocal-rank fuses them (`EXPLAIN`:
 - Query dimension must match the column
 - IVF / IVF-PQ `LISTS` ≤ 65 536, IVF-PQ `SUBSPACES` ≤ 128
 
-Engine note: [`docs/vector.md`](https://github.com/bzync/nextsql/blob/main/docs/vector.md).
+Engine note: [`docs/vector.md`](https://github.com/bzync/nextsql/blob/master/docs/vector.md).

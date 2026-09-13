@@ -1,6 +1,6 @@
 # Collections
 
-`STRUCT`, `ARRAY`, and `MAP` are first-class column types (Collections track C1–C3, landed). They share the clustered B+Tree, WAL, MVCC, and encryption path with every other type. They are **not** JSON — JSON stays binary `NSJB` with path extract. All seven official drivers encode them.
+`STRUCT`, `ARRAY`, and `MAP` are first-class column types. They share the clustered B+Tree, WAL, MVCC, and encryption path with every other type. They are **not** JSON — JSON stays binary `NSJB` with path extract. All six official drivers encode them.
 
 They are not `ENCRYPTED CLIENT`-eligible and not foreign-key columns. Nesting is bounded at depth 8.
 

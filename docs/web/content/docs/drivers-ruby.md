@@ -4,7 +4,7 @@ Ruby 3.0+ (stdlib only — `socket`, `openssl`, `bigdecimal`, `json`; no
 gem dependencies). MIT. Gem version **0.0.1**, matching the engine.
 
 ```bash
-gem install bzync-nextsql
+gem install bzync-nextsql -v 0.0.1
 ```
 
 The gem is `bzync-nextsql`; you load it with `require "nextsql"`. Source:

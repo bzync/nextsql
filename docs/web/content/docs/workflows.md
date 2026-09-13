@@ -87,4 +87,4 @@ CANCEL TASK 's/00000007/1787616000000000000';
 
 Inspect live state with `system.workflows`, `system.tasks`, `system.triggers`, and `system.schedules`. See [System catalog](/docs/system-catalog).
 
-Engine note: [`docs/workflows.md`](https://github.com/bzync/nextsql/blob/main/docs/workflows.md).
+Engine note: [`docs/workflows.md`](https://github.com/bzync/nextsql/blob/master/docs/workflows.md).

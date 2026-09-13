@@ -103,7 +103,7 @@ selected partition has a matching versioned sketch; otherwise they fall back
 to the global table distribution. Local samples cap at 4,096 rows and each
 encrypted catalog record caps at 64 entries per sketch class and 15 KiB total.
 
-See the repository's [`docs/partitioning.md`](https://github.com/bzync/nextsql/blob/main/docs/partitioning.md)
+See the repository's [`docs/partitioning.md`](https://github.com/bzync/nextsql/blob/master/docs/partitioning.md)
 for exact DDL, RBAC, recovery, and lifecycle limits.
 
 ## Foreign keys

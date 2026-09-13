@@ -14,7 +14,7 @@ Native wire protocol → TLS 1.3 → authn → RBAC
               ├── full-text    inverted index, BM25, analyzers
               └── geo          WGS84 shapes + GEOMETRY / GEOGRAPHY
         → MVCC + row/range locks + UNDO
-        → REDO WAL (group commit, fsync)
+        → REDO WAL (group commit, page deltas, fsync)
         → buffer manager
         → AES-256-GCM sealed pages
 ```
@@ -47,10 +47,10 @@ cmd/nextsql               CLI
 cmd/nextsql-bench         official benchmark tool
 cmd/nextsql-auth-broker   OIDC broker
 cmd/nextsql-admin         Setup / Operations / Studio
-internal/                 engine (storage, WAL, MVCC, SQL, crypto, HA, hosting, …)
+internal/                 engine (storage, WAL, MVCC, SQL, crypto, HA, registry, …)
 drivers/                  Go, Node, Bun, PHP, Python, Ruby + shared JS codec
 tests/                    integration, crash, HA
 docs/                     format and operations notes
 ```
 
-Format notes in the repository: [storage](https://github.com/bzync/nextsql/blob/main/docs/storage-format.md), [B+Tree](https://github.com/bzync/nextsql/blob/main/docs/btree.md), [WAL](https://github.com/bzync/nextsql/blob/main/docs/wal.md), [MVCC](https://github.com/bzync/nextsql/blob/main/docs/mvcc.md), [optimizer](https://github.com/bzync/nextsql/blob/main/docs/optimizer.md), [execution](https://github.com/bzync/nextsql/blob/main/docs/execution.md).
+Format notes in the repository: [storage](https://github.com/bzync/nextsql/blob/master/docs/storage-format.md), [B+Tree](https://github.com/bzync/nextsql/blob/master/docs/btree.md), [WAL](https://github.com/bzync/nextsql/blob/master/docs/wal.md), [MVCC](https://github.com/bzync/nextsql/blob/master/docs/mvcc.md), [optimizer](https://github.com/bzync/nextsql/blob/master/docs/optimizer.md), [execution](https://github.com/bzync/nextsql/blob/master/docs/execution.md).

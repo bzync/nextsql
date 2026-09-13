@@ -6,7 +6,7 @@
       "status": "published",
       "channel": "preview",
       "latest": true,
-      "releasedAt": "2026-09-13T00:00:00Z",
+      "releasedAt": "2026-09-13T15:01:50Z",
       "summary": "The first public release of NextSQL: one encrypted ACID engine for SQL, JSON, vectors, full-text, and geo, with official drivers at 0.0.1.",
       "highlights": [
         "One WAL, one MVCC, and one optimizer for SQL, JSON, vectors, full-text, and geo",
@@ -48,7 +48,7 @@
           "id": "c6",
           "kind": "added",
           "area": "Geo",
-          "text": "WGS84 POINT, BOX, and LINESTRING types."
+          "text": "WGS84 POINT, BOX, LINESTRING, and POLYGON, plus GEOMETRY and GEOGRAPHY."
         },
         {
           "id": "c7",
@@ -66,7 +66,7 @@
           "id": "c9",
           "kind": "added",
           "area": "CLI",
-          "text": "nextsql init/serve/migrate and nextsqld with --key-file off the data volume."
+          "text": "nextsql init/setup/exec/migrate and nextsqld with --key-file off the data volume."
         },
         {
           "id": "c10",
@@ -93,8 +93,8 @@
           "kind": "run",
           "platform": "linux-amd64",
           "filename": "nextsql-0.0.1-linux-amd64.run",
-          "size": 21794189,
-          "sha256": "174a540faeffa3f34aca1e93a246978046e153ec70ec9ec2c6b29325238d0fef",
+          "size": 22202268,
+          "sha256": "9da97101927b44f65f113d605c43b50ed49d16ac9e611776e6cc8635cf545326",
           "url": "https://github.com/bzync/nextsql/releases/download/v0.0.1/nextsql-0.0.1-linux-amd64.run"
         },
         {
@@ -102,8 +102,8 @@
           "kind": "archive",
           "platform": "linux-amd64",
           "filename": "nextsql-0.0.1-linux-amd64.tar.gz",
-          "size": 21791130,
-          "sha256": "372d1ac04e00b408d8f7daed207a9968e4d6692efefdb4ad31a7ce439193c1e5",
+          "size": 22202067,
+          "sha256": "1495cb2f787a1b1c05f2f8fafff43b43e741860d1bb2c64e0cfda3f6607d6e69",
           "url": "https://github.com/bzync/nextsql/releases/download/v0.0.1/nextsql-0.0.1-linux-amd64.tar.gz"
         },
         {
@@ -111,8 +111,8 @@
           "kind": "deb",
           "platform": "linux-amd64",
           "filename": "nextsql_0.0.1_amd64.deb",
-          "size": 18233040,
-          "sha256": "f938b8d6b0acd0efe90019a983da48b78213b030736a6ce5e532aa9ac05bd34b",
+          "size": 18567702,
+          "sha256": "d8a2b4c0d13fdac01fa56f7b5e5bed89585140cdb75d7d954d428fe18a5f3f23",
           "url": "https://github.com/bzync/nextsql/releases/download/v0.0.1/nextsql_0.0.1_amd64.deb"
         }
       ]

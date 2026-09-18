@@ -7,7 +7,6 @@ import (
 
 	"github.com/bzync/nextsql/internal/catalog"
 	"github.com/bzync/nextsql/internal/sql/types"
-	"github.com/bzync/nextsql/internal/version"
 )
 
 // Version is the system schema version for machine consumers.
@@ -494,6 +493,11 @@ func List() []string {
 // Columns: name, status, description, since_version
 func Capabilities() [][]types.Value {
 	// status values: supported, experimental, unsupported, deprecated
+	//
+	// since_version is the release a capability first shipped in, so it is a
+	// literal. It must never be version.String: that floats with whatever
+	// build is running and would relabel every existing capability as having
+	// appeared in the current release the moment the version is bumped.
 	rows := [][]types.Value{
 		rowCap("backup", "supported", "encrypted backup and restore", "0.1.0"),
 		rowCap("btree", "supported", "clustered B+Tree with MVCC", "0.1.0"),
@@ -501,7 +505,7 @@ func Capabilities() [][]types.Value {
 		rowCap("covering_indexes", "supported", "INCLUDE covering indexes", "0.1.0"),
 		rowCap("distinct", "supported", "SELECT DISTINCT", "0.1.0"),
 		rowCap("encryption", "supported", "AES-256-GCM envelope", "0.1.0"),
-		rowCap("field_encryption_client", "supported", "server-opaque randomized NSCE1 and opt-in deterministic NSCE2 ENCRYPTED CLIENT fields; Go, Node.js/TypeScript, Bun, and PHP helpers", version.String),
+		rowCap("field_encryption_client", "supported", "server-opaque randomized NSCE1 and opt-in deterministic NSCE2 ENCRYPTED CLIENT fields; Go, Node.js/TypeScript, Bun, and PHP helpers", "0.0.1"),
 		rowCap("expression_indexes", "supported", "expression indexes", "0.1.0"),
 		rowCap("foreign_keys", "supported", "FOREIGN KEY constraints", "0.1.0"),
 		rowCap("checks", "supported", "CHECK constraints", "0.1.0"),
@@ -523,33 +527,33 @@ func Capabilities() [][]types.Value {
 		rowCap("schedules", "supported", "SCHEDULE every/at/cron", "0.1.0"),
 		rowCap("set_operations", "supported", "UNION/INTERSECT/EXCEPT", "0.1.0"),
 		rowCap("subqueries", "supported", "scalar, IN, EXISTS subqueries", "0.1.0"),
-		rowCap("system_catalog", "supported", fmt.Sprintf("virtual system schema v%d", SchemaVersion), version.String),
-		rowCap(fmt.Sprintf("system_schema_v%d", SchemaVersion), "supported", fmt.Sprintf("stable system table column contract v%d", SchemaVersion), version.String),
-		rowCap("system_show_aliases", "supported", "SHOW aliases backed by canonical system views", version.String),
+		rowCap("system_catalog", "supported", fmt.Sprintf("virtual system schema v%d", SchemaVersion), "0.0.1"),
+		rowCap(fmt.Sprintf("system_schema_v%d", SchemaVersion), "supported", fmt.Sprintf("stable system table column contract v%d", SchemaVersion), "0.0.1"),
+		rowCap("system_show_aliases", "supported", "SHOW aliases backed by canonical system views", "0.0.1"),
 		rowCap("tasks", "supported", "durable TASK execution", "0.1.0"),
 		rowCap("transactions", "supported", "BEGIN/COMMIT/ROLLBACK", "0.1.0"),
 		rowCap("triggers", "supported", "TRIGGER RUN WORKFLOW", "0.1.0"),
 		rowCap("upsert", "supported", "UPSERT with RETURNING", "0.1.0"),
 		rowCap("vector", "supported", "VECTOR<F32,N> / VECTOR<F16,N> / VECTOR<I8,N> / BITVECTOR<N>, bounded algebra, and NEAREST", "0.1.0"),
-		rowCap("vector_ivf", "supported", "CREATE VECTOR INDEX ... USING IVF WITH (LISTS=n[,PROBES=m])", version.String),
-		rowCap("vector_ivfpq", "supported", "CREATE VECTOR INDEX ... USING IVFPQ WITH (LISTS=n,SUBSPACES=m[,PROBES=p])", version.String),
-		rowCap("vector_sparse", "supported", "SPARSEVECTOR<N> inverted-index sparse retrieval and dense+sparse+BM25 fusion", version.String),
-		rowCap("quantized_vector_index", "supported", "CREATE VECTOR INDEX ... WITH (QUANTIZATION = 'F16'|'I8') on HNSW with full-precision re-rank", version.String),
+		rowCap("vector_ivf", "supported", "CREATE VECTOR INDEX ... USING IVF WITH (LISTS=n[,PROBES=m])", "0.0.1"),
+		rowCap("vector_ivfpq", "supported", "CREATE VECTOR INDEX ... USING IVFPQ WITH (LISTS=n,SUBSPACES=m[,PROBES=p])", "0.0.1"),
+		rowCap("vector_sparse", "supported", "SPARSEVECTOR<N> inverted-index sparse retrieval and dense+sparse+BM25 fusion", "0.0.1"),
+		rowCap("quantized_vector_index", "supported", "CREATE VECTOR INDEX ... WITH (QUANTIZATION = 'F16'|'I8') on HNSW with full-precision re-rank", "0.0.1"),
 		rowCap("window_functions", "supported", "ROW_NUMBER/RANK/LAG etc", "0.1.0"),
 		rowCap("workflows", "supported", "CREATE/RUN WORKFLOW", "0.1.0"),
 		rowCap("cte", "supported", "WITH and WITH RECURSIVE", "0.1.0"),
 		rowCap("partitions_range", "supported", "RANGE partitioning", "0.1.0"),
 		rowCap("partitions_hash", "supported", "HASH partitioning", "0.1.0"),
 		rowCap("partitions_list", "supported", "LIST partitioning", "0.1.0"),
-		rowCap("follower_reads", "supported", "STRONG, BOUNDED, and STALE routing in the server and official drivers; replica health in system.replica_health", version.String),
-		rowCap("rebuild_index_online", "supported", "REBUILD INDEX ONLINE — non-partitioned B+Tree/UNIQUE/JSON-path/spatial indexes; vector/full-text/partitioned indexes still use the blocking REBUILD INDEX", version.String),
-		rowCap("mtls", "supported", "mutual TLS service identity; SIGHUP trust bundle/CRL rotation forces reauthentication", version.String),
-		rowCap("token_credentials", "supported", "signed short-lived NSSC1 credentials with rotatable keysets and revocation (nextsql token)", version.String),
-		rowCap("oidc_broker", "supported", "external IdP (OIDC) token-exchange broker minting NSSC1 credentials; nextsql login (Authorization Code/PKCE, client-credentials)", version.String),
-		rowCap("audit_chain", "supported", "tamper-evident NSAC hash-chain audit log with optional NSAK Ed25519 signing and verification (nextsql audit)", version.String),
-		rowCap("storage_caps", "supported", "hosting realm/database storage caps enforced on the write path", version.String),
-		rowCap("quotas_view", "supported", "advisory system.quotas surfacing of hosting storage caps with connected-database usage/percent/over-cap", version.String),
-		rowCap("resource_groups", "supported", "CREATE/ALTER/DROP RESOURCE GROUP workload governance; SET/RESET RESOURCE GROUP joins a session; MAX_CONCURRENCY/MEMORY/WORKERS and PRIORITY admission ordering are enforced", version.String),
+		rowCap("follower_reads", "supported", "STRONG, BOUNDED, and STALE routing in the server and official drivers; replica health in system.replica_health", "0.0.1"),
+		rowCap("rebuild_index_online", "supported", "REBUILD INDEX ONLINE — non-partitioned B+Tree/UNIQUE/JSON-path/spatial indexes; vector/full-text/partitioned indexes still use the blocking REBUILD INDEX", "0.0.1"),
+		rowCap("mtls", "supported", "mutual TLS service identity; SIGHUP trust bundle/CRL rotation forces reauthentication", "0.0.1"),
+		rowCap("token_credentials", "supported", "signed short-lived NSSC1 credentials with rotatable keysets and revocation (nextsql token)", "0.0.1"),
+		rowCap("oidc_broker", "supported", "external IdP (OIDC) token-exchange broker minting NSSC1 credentials; nextsql login (Authorization Code/PKCE, client-credentials)", "0.0.1"),
+		rowCap("audit_chain", "supported", "tamper-evident NSAC hash-chain audit log with optional NSAK Ed25519 signing and verification (nextsql audit)", "0.0.1"),
+		rowCap("storage_caps", "supported", "hosting realm/database storage caps enforced on the write path", "0.0.1"),
+		rowCap("quotas_view", "supported", "advisory system.quotas surfacing of hosting storage caps with connected-database usage/percent/over-cap", "0.0.1"),
+		rowCap("resource_groups", "supported", "CREATE/ALTER/DROP RESOURCE GROUP workload governance; SET/RESET RESOURCE GROUP joins a session; MAX_CONCURRENCY/MEMORY/WORKERS and PRIORITY admission ordering are enforced", "0.0.1"),
 	}
 	// Ensure deterministic order already sorted by name; sort to guarantee.
 	sort.Slice(rows, func(i, j int) bool {

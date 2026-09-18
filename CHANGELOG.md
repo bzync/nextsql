@@ -2,10 +2,10 @@
 
 All notable changes to NextSQL are recorded here.
 
-The first public release is **0.0.1**. It is a preview: the engine is complete
-enough to install, query, and operate, and it is still under measurement.
-Before you rely on it, run `nextsql-bench --slo` and the crash, recovery, and
-HA suites on your hardware.
+The current release is **0.0.2**; **0.0.1** was the first public one. Both are
+previews: the engine is complete enough to install, query, and operate, and it
+is still under measurement. Before you rely on it, run `nextsql-bench --slo`
+and the crash, recovery, and HA suites on your hardware.
 
 Versioning follows [semver](https://semver.org/) for the engine tag (`vX.Y.Z`)
 and the official driver packages. Do not reuse a published version for
@@ -13,7 +13,7 @@ different bits.
 
 ---
 
-## [Unreleased]
+## [0.0.2] — 2026-09-19
 
 ### Fixed
 
@@ -33,6 +33,12 @@ different bits.
   reports a torn tail as unverified. `nextsql audit verify --json` gains an
   additive `torn_tail` boolean (every existing key is unchanged) so the two
   cases can be told apart. See `docs/security.md` "Interrupted final writes".
+- **`system.capabilities.since_version` reported the running build's version**
+  for 17 capabilities (mTLS, token credentials, the OIDC broker, the audit
+  chain, follower reads, `REBUILD INDEX … ONLINE`, the vector index families
+  and others) instead of the release they shipped in, so bumping the engine
+  version would have relabelled all of them. They are pinned to `0.0.1`, where
+  they shipped.
 
 ### Added
 
@@ -193,5 +199,6 @@ A change is recorded here when it is implemented, tested, and documented — not
 when it is only designed. Internal sequencing lives in `TODO.md`. Intended
 product scope lives in `PROJECT.md`.
 
-[Unreleased]: https://github.com/bzync/nextsql/compare/v0.0.1...HEAD
+[Unreleased]: https://github.com/bzync/nextsql/compare/v0.0.2...HEAD
+[0.0.2]: https://github.com/bzync/nextsql/releases/tag/v0.0.2
 [0.0.1]: https://github.com/bzync/nextsql/releases/tag/v0.0.1

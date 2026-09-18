@@ -2066,6 +2066,9 @@ func (s *Session) systemMetricsRows() ([][]types.Value, error) {
 	f("encryption", "crypto_time_pct", snap.EncryptPct, "ratio_pct")
 
 	i("storage", "wal_bytes_written", snap.WALBytes, "bytes")
+	i("storage", "wal_on_disk_bytes", snap.WALOnDiskBytes, "bytes")
+	i("storage", "wal_segments", snap.WALSegments, "count")
+	i("storage", "wal_trimmed_segments", snap.WALTrimmedSegments, "count")
 	u("storage", "disk_total_bytes", snap.DiskTotalBytes, "bytes")
 	u("storage", "disk_free_bytes", snap.DiskFreeBytes, "bytes")
 	i("storage", "disk_watermark_warns", snap.DiskWatermarkWarns, "count")

@@ -13,6 +13,45 @@ different bits.
 
 ---
 
+## [Unreleased]
+
+### Fixed
+
+- **`nextsqld` could not start again after an interrupted write to its own
+  audit chain.** A half-written final line in `nextsql.audit` failed
+  verification, and startup refused the whole file over it — under a
+  container supervisor, an unbounded restart loop that took every dependent
+  service down with it. A record is `fsync`ed before the chain head advances,
+  so a torn final record was never acknowledged and can be dropped: startup
+  now quarantines its bytes to a mode-`0600` `nextsql.audit.torn-<timestamp>`
+  sibling, truncates only that record, and writes an `audit.torn_tail.repair`
+  entry into the chain recording the offset, byte count and SHA-256 of what
+  was removed. A final record whose newline alone was lost is repaired by
+  appending the terminator, dropping nothing. Every other kind of damage — a
+  sequence gap, a `prev_hash`/`hash` mismatch, a bad signature, anything on an
+  earlier line — still refuses to start, and `nextsql audit verify` still
+  reports a torn tail as unverified. `nextsql audit verify --json` gains an
+  additive `torn_tail` boolean (every existing key is unchanged) so the two
+  cases can be told apart. See `docs/security.md` "Interrupted final writes".
+
+### Added
+
+- **`wal_max_retained_mb` / `--wal-max-retained-mb`** bounds the WAL directory
+  on a deployment that does not archive. Previously the only production prune
+  path required `wal_archive`, so a single node that did not want PITR had
+  nothing that ever reclaimed a WAL segment and the directory grew for the
+  life of the instance. The cap is applied after each successful periodic
+  checkpoint and during `MAINTAIN DATABASE`, removes only segments already
+  below the redo LSN and every CDC retention pin — so it can be exceeded
+  rather than delete history that is still needed — and is mutually exclusive
+  with `wal_archive`. See `docs/wal.md` "Retention".
+- **`wal_on_disk_bytes`, `wal_segments`, `wal_trimmed_segments`** in
+  `system.metrics`. `wal_bytes_written` is cumulative and only rises; these
+  report what the volume is actually holding, which is what shows an
+  unconfigured deployment's WAL growing without bound.
+
+---
+
 ## [0.0.1] — 2026-09-13
 
 First public release.

@@ -116,6 +116,20 @@ type Config struct {
 	// WalArchive: pruning without an archiver would destroy the only copy
 	// of that history, so retention is a no-op until one is configured.
 	WalRetentionMS int
+	// WalMaxRetainedMB, when positive, bounds the WAL directory's on-disk
+	// size for a deployment that does not archive. Without it the only
+	// production prune path needs WalArchive, so a single node that does
+	// not want PITR has nothing that ever reclaims a WAL segment and the
+	// directory grows for as long as the instance runs. nextsqld applies
+	// the cap after each successful periodic checkpoint, and MAINTAIN
+	// DATABASE applies it too. Only segments already below the redo LSN and
+	// every active CDC pin are removed, so the cap can be exceeded and is
+	// never met by deleting history that is still needed. 0 (the default)
+	// retains every segment, matching the engine's prior behaviour.
+	// Mutually exclusive with WalArchive, where retained segments may be
+	// the only copy until the archiver has taken them and WalRetentionMS is
+	// the policy that governs them.
+	WalMaxRetainedMB int
 	// CheckpointIntervalMS is the periodic nextsqld checkpoint cadence. It
 	// bounds the WAL suffix a crash must redo; 0 deliberately disables the
 	// scheduler for a controlled/manual-checkpoint deployment. It does not
@@ -482,6 +496,12 @@ func loadFrom(r io.Reader) (Config, error) {
 				return Config{}, err
 			}
 			cfg.WalRetentionMS = n
+		case "wal_max_retained_mb":
+			n, err := limitValue("wal_max_retained_mb", v)
+			if err != nil {
+				return Config{}, err
+			}
+			cfg.WalMaxRetainedMB = n
 		case "checkpoint_interval_ms":
 			n, err := limitValue("checkpoint_interval_ms", v)
 			if err != nil {
@@ -798,6 +818,7 @@ func (c Config) Marshal() []byte {
 	str("wal_archive", c.WalArchive)
 	str("backup_dir", c.BackupDir)
 	num("wal_retention_ms", c.WalRetentionMS)
+	num("wal_max_retained_mb", c.WalMaxRetainedMB)
 	num("checkpoint_interval_ms", c.CheckpointIntervalMS)
 
 	num("disk_watermark_check_ms", c.DiskWatermarkCheckMS)
@@ -907,7 +928,7 @@ var settableKeys = func() map[string]bool {
 		TokenKeyset: "x", TokenRevocations: "x", TokenAudience: "x",
 		TokenIdentitySourceHints: map[uint32]string{1: "x"},
 		AuthBrokerConfig:         "x", AuthBrokerListen: "x",
-		AuditFile: "x", AuditSigningKeyset: "x", WalArchive: "x", BackupDir: "x", WalRetentionMS: 1, CheckpointIntervalMS: 1,
+		AuditFile: "x", AuditSigningKeyset: "x", WalArchive: "x", BackupDir: "x", WalRetentionMS: 1, WalMaxRetainedMB: 1, CheckpointIntervalMS: 1,
 		DiskWatermarkCheckMS: 1, DiskWatermarkWarnPercent: 1, DiskWatermarkRejectPercent: 1,
 		ReplicaLagCheckMS: 1, ReplicaLagWarnEntries: 1,
 		MaxInflight: 1, MaxOpenDatabases: 1, MaxTotalBufferPages: 1, TaskWorkers: 1, MaxConcurrentPasswordHashes: 1,
@@ -1112,6 +1133,13 @@ func DiffState(running, file Config) []EntryState {
 }
 
 func (c Config) Validate() error {
+	// A size cap must not be able to delete a segment the archiver has not
+	// taken yet: there, the local copy is the only copy. Refusing the pair
+	// outright is clearer than letting every trim fail at run time.
+	if c.WalMaxRetainedMB > 0 && c.WalArchive != "" {
+		return nerr.New(nerr.InvalidArgument, "config.Validate",
+			"wal_max_retained_mb and wal_archive are mutually exclusive; an archiving deployment prunes with wal_retention_ms")
+	}
 	// Every operational limit is checked against the same catalog Load uses,
 	// so a programmatically built Config cannot carry a value a configuration
 	// file would have been rejected for. Zero is treated here as "unset —
@@ -1329,6 +1357,8 @@ func (c Config) limitValue(key string) (int, bool) {
 		return c.TransactionTimeoutMS, true
 	case "wal_retention_ms":
 		return c.WalRetentionMS, true
+	case "wal_max_retained_mb":
+		return c.WalMaxRetainedMB, true
 	}
 	return 0, false
 }

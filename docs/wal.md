@@ -345,7 +345,31 @@ unsafe checkpoint.
 
 ### Retention
 
-Production pruning is disabled by default. `DB.SetWALRetentionHorizon(lsn)`
+**Nothing prunes the WAL until retention is configured.** A freshly
+initialized deployment retains every segment it ever writes, including
+`wal-0000000000000001.seg`, for as long as the instance runs. That is the
+default, and it is deliberate — but it means WAL growth is unbounded until an
+operator chooses one of the two policies below. `wal_on_disk_bytes` and
+`wal_segments` (`system.metrics`) report what the volume is actually holding;
+`wal_bytes_written` counts bytes ever appended and only ever rises, so it
+cannot answer this question.
+
+Pick one:
+
+| | `wal_archive` + `wal_retention_ms` | `wal_max_retained_mb` |
+|---|---|---|
+| For | PITR deployments | single nodes that do not want PITR |
+| Prunes when | scheduled `MAINTAIN DATABASE` | after each periodic checkpoint, and during `MAINTAIN DATABASE` |
+| Keeps | history newer than the time policy | up to the byte cap |
+| Archive | required; a segment is archived immediately before deletion | must not be configured |
+
+The two are mutually exclusive and `config.Validate` refuses the pair: where
+an archiver is configured the local segment may be the only copy until the
+archiver has taken it, and a size cap has no way to know that.
+
+#### PITR retention (`wal_archive` + `wal_retention_ms`)
+
+`DB.SetWALRetentionHorizon(lsn)`
 sets the oldest PITR point local cleanup may pass; zero disables pruning. During
 `MAINTAIN DATABASE`, a closed segment is removable only when its successor
 starts no later than both the installed redo LSN and the configured PITR
@@ -359,7 +383,7 @@ page-image repair, which scans local WAL from LSN 1. If corruption needs an
 older archived image, restore the archived WAL before repair. Deployments that
 prioritize maximum local repair history should leave the horizon unset.
 
-#### Automatic time-based retention (`wal_retention_ms`)
+##### Automatic time-based retention (`wal_retention_ms`)
 
 `DB.SetWALRetentionHorizon` is a raw, point-in-time LSN setter — by itself
 it is a manual mechanism, not a policy. `nextsqld`'s `wal_retention_ms`
@@ -383,6 +407,41 @@ TABLE`/`INDEX`, which remains a manual or externally-scheduled operation
 automatic background maintenance scheduler. A `wal_retention_ms` policy
 without a scheduled `MAINTAIN DATABASE` alongside it keeps the horizon
 current but prunes nothing.
+
+#### Size-capped retention (`wal_max_retained_mb`)
+
+For a deployment that does not archive, `wal_max_retained_mb` bounds the WAL
+directory directly. `nextsqld` applies it after each successful periodic
+checkpoint — a checkpoint is precisely what makes older segments obsolete, so
+it is the moment they can be reclaimed — and `MAINTAIN DATABASE` applies it
+too. Unlike the PITR policy it therefore needs no external scheduler.
+
+`wal.Log.TrimToCap` removes closed segments oldest first until the retained
+total is at or below the cap, and stops at the first segment it may not
+remove. A segment is removable only when its successor starts no later than
+both the installed redo LSN and every active CDC retention pin — the same
+condition `PruneArchivedBefore` applies. **The cap can therefore be exceeded,
+and that is the correct outcome**: a workload that pins WAL faster than a
+checkpoint releases it keeps its history, and the operator sees
+`wal_on_disk_bytes` rise, rather than the engine deleting records it still
+needs. `wal_trimmed_segments` counts what the cap has actually reclaimed, so
+a cap that is configured but never able to reclaim anything is visible as a
+flat counter beside a rising footprint.
+
+The floor is 256 MiB (two default segments): a cap that cannot hold the
+segment being written plus one closed one could never be satisfied. The
+active segment is never a candidate. 0, the default, retains every segment.
+
+The same caveat as the PITR policy applies — pruning local history reduces
+what live page-image repair can scan. A deployment that prioritizes maximum
+local repair history should leave the cap unset and watch the footprint
+metrics instead.
+
+```bash
+nextsqld --wal-max-retained-mb 4096 ...
+# or nextsql.conf:
+#   wal_max_retained_mb=4096
+```
 
 ## Recovery
 

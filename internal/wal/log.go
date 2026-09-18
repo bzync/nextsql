@@ -1034,6 +1034,137 @@ func (l *Log) DiscardCheckpointedSegments() error {
 	return nil
 }
 
+// OnDiskFootprint reports the WAL directory's current byte size and segment
+// count. It is deliberately a lock-free snapshot: the active segment grows
+// underneath it, so the total trails a concurrent commit by at most one
+// group-commit flush, and reporting a number never blocks one. Callers that
+// need an exact figure must quiesce writes themselves.
+//
+// wal_bytes_written counts bytes ever appended and only ever rises; this is
+// what is actually on the volume right now, which is the number a deployment
+// has to watch, because WAL retention has to be configured before it is
+// bounded (see TrimToCap).
+func (l *Log) OnDiskFootprint() (int64, int, error) {
+	if l == nil {
+		return 0, 0, nil
+	}
+	ids, err := listSegments(l.dir)
+	if err != nil {
+		return 0, 0, err
+	}
+	var total int64
+	for _, id := range ids {
+		info, err := os.Stat(filepath.Join(l.dir, segmentName(id)))
+		if err != nil {
+			if os.IsNotExist(err) {
+				// Pruned between the listing and the stat.
+				continue
+			}
+			return 0, 0, nerr.Wrap(nerr.IO, "wal.OnDiskFootprint", "stat segment", err)
+		}
+		total += info.Size()
+	}
+	return total, len(ids), nil
+}
+
+// TrimToCap bounds the WAL's on-disk footprint for a deployment that does not
+// archive. Without it the only production prune path is PruneArchivedBefore,
+// which fails closed without an archiver, so a single node that does not want
+// PITR has no way to stop the WAL growing for as long as it runs.
+//
+// It removes closed segments oldest first until the retained total is at or
+// below capBytes, and it stops at the first segment it may not remove. A
+// segment is removable only when its successor starts no later than both the
+// installed redo LSN and every active CDC retention pin — the same condition
+// PruneArchivedBefore applies — so the cap never costs recoverability.
+// Exceeding the cap is therefore a possible and correct outcome: a workload
+// that pins WAL faster than a checkpoint releases it keeps its history and
+// the operator sees the footprint metric rise, rather than the engine
+// deleting records it still needs.
+//
+// An archiving deployment is refused outright. There, local segments are the
+// only copy until the archiver has taken them, and a size cap has no way to
+// know that — retention there is PruneArchivedBefore's job, driven by the
+// PITR horizon. capBytes <= 0 disables trimming entirely, which is the
+// default and matches the engine's prior behaviour exactly.
+//
+// Returns the number of segments removed and the retained size afterwards.
+func (l *Log) TrimToCap(capBytes int64, budget *maintenance.Budget) (int, int64, error) {
+	if l == nil || capBytes <= 0 {
+		return 0, 0, nil
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.archiver != nil {
+		return 0, 0, nerr.New(nerr.InvalidArgument, "wal.TrimToCap",
+			"an archived WAL is pruned by PITR retention, not by a size cap")
+	}
+	// No durable checkpoint yet means nothing is known to be replayed, so
+	// there is nothing safe to drop. Not an error: the next checkpoint makes
+	// this useful.
+	if l.checkpoint == 0 || l.redoLSN == 0 || l.seg == nil {
+		return 0, 0, nil
+	}
+	ids, err := listSegments(l.dir)
+	if err != nil {
+		return 0, 0, err
+	}
+	sizes := make([]int64, len(ids))
+	var total int64
+	for i, id := range ids {
+		info, err := os.Stat(filepath.Join(l.dir, segmentName(id)))
+		if err != nil {
+			return 0, 0, nerr.Wrap(nerr.IO, "wal.TrimToCap", "stat segment", err)
+		}
+		sizes[i] = info.Size()
+		total += info.Size()
+	}
+	if total <= capBytes {
+		return 0, total, nil
+	}
+
+	horizon := l.retentionHorizonLocked(l.redoLSN)
+	removed := 0
+	for i := 0; i < len(ids)-1 && total > capBytes; i++ {
+		if ids[i] >= l.segID {
+			// The active segment, and anything at or past it, is never a
+			// candidate however far over the cap the directory is.
+			break
+		}
+		if err := budget.Check(); err != nil {
+			return removed, total, err
+		}
+		next, hdr, _, err := openSegment(l.dir, ids[i+1], l.ident)
+		if err != nil {
+			return removed, total, err
+		}
+		if err := next.Close(); err != nil {
+			return removed, total, nerr.Wrap(nerr.IO, "wal.TrimToCap", "close successor segment", err)
+		}
+		if hdr.StartLSN > horizon {
+			// Still required for recovery or pinned by a subscriber. Start
+			// LSNs rise with segment id, so no later segment can be
+			// removable either — stop rather than reopen every one of them.
+			break
+		}
+		units := (sizes[i] + format.LogicalPageSize - 1) / format.LogicalPageSize
+		if err := budget.ConsumeIO(units); err != nil {
+			return removed, total, err
+		}
+		if err := os.Remove(filepath.Join(l.dir, segmentName(ids[i]))); err != nil && !os.IsNotExist(err) {
+			return removed, total, nerr.Wrap(nerr.IO, "wal.TrimToCap", "remove segment", err)
+		}
+		total -= sizes[i]
+		removed++
+	}
+	if removed > 0 {
+		if err := diskio.SyncDir(l.dir); err != nil {
+			return removed, total, err
+		}
+	}
+	return removed, total, nil
+}
+
 // PruneArchivedBefore removes closed segments ending before both the installed
 // redo point, oldest PITR horizon, and every active CDC retention pin. Every
 // candidate must be successfully offered to the archiver immediately before

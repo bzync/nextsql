@@ -82,7 +82,13 @@ unreachable; it never automatically frees a suspected orphan.
 - queries, errors, commits, rollbacks, admitted, rejected, canceled, rows
 - p50 / p95 / p99 / p99.9
 - page AEAD seal/open time and bytes (encryption overhead)
-- WAL bytes flushed this process
+- WAL bytes flushed this process (`wal_bytes_written`, cumulative)
+- WAL bytes and segment count currently on the volume (`wal_on_disk_bytes`,
+  `wal_segments`), plus segments reclaimed by the size cap
+  (`wal_trimmed_segments`). The first two are the ones to alert on: nothing
+  prunes the WAL until retention is configured, so on a deployment that sets
+  neither policy in `docs/wal.md` "Retention" they rise for the life of the
+  instance. `wal_bytes_written` cannot show this — it only ever rises
 - isolated / repaired page counts (detect → isolate → recover)
 - `fk_checks`, `fk_violations`, `fk_cascade_rows`, `fk_cascade_reject` (no keys or payloads)
 - index rebuild attempts, failures, rows scanned, entries produced, and total duration
@@ -419,7 +425,7 @@ remote drain) — on a cluster, only the leader accepting writes matters for
 write traffic; a tripped follower still blocks its own local write
 attempts. It is a last-resort backstop against actually running out of disk
 mid-write, not a substitute for capacity planning or WAL/backup retention
-policies (see [WAL retention](wal.md#automatic-time-based-retention-wal_retention_ms)
+policies (see [WAL retention](wal.md#retention)
 and `nextsql backup prune`) — configure those first so this trips rarely if
 ever. Current disk usage and cumulative warn/reject counters are exposed via
 the metrics registry (`internal/metrics.Snapshot.DiskTotalBytes`/

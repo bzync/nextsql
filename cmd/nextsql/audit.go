@@ -181,6 +181,7 @@ func auditVerify(args []string) error {
 			"signatures_checked": report.SignaturesChecked,
 			"first_bad_line":     report.FirstBadLine,
 			"problem":            report.Problem,
+			"torn_tail":          report.TornTail,
 		})
 	}
 
@@ -196,6 +197,14 @@ func auditVerify(args []string) error {
 		return nil
 	}
 	fmt.Printf("result:             FAILED at line %d: %s\n", report.FirstBadLine, report.Problem)
+	if report.TornTail {
+		// Distinguishing this from real damage is the difference between
+		// "nextsqld repairs this by itself on the next start" and "do not
+		// start it until you know what happened".
+		fmt.Println("                    the damage is confined to an unacknowledged final record")
+		fmt.Println("                    (an interrupted write); nextsqld repairs this on its next")
+		fmt.Println("                    start, quarantining the bytes — see docs/security.md")
+	}
 	return nerr.New(nerr.InvalidFormat, "nextsql audit verify", "audit chain verification failed")
 }
 

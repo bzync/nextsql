@@ -56,6 +56,10 @@ type Registry struct {
 	cdcLagLSN           atomic.Uint64
 	replOrphans         atomic.Int64
 
+	walOnDiskBytes     atomic.Int64
+	walSegments        atomic.Int64
+	walTrimmedSegments atomic.Int64
+
 	diskTotalBytes      atomic.Uint64
 	diskFreeBytes       atomic.Uint64
 	diskWatermarkWarn   atomic.Int64
@@ -117,6 +121,9 @@ type Snapshot struct {
 	CDCErrors            int64
 	CDCLagLSN            uint64
 	ReplicationOrphans   int64
+	WALOnDiskBytes       int64
+	WALSegments          int64
+	WALTrimmedSegments   int64
 	DiskTotalBytes       uint64
 	DiskFreeBytes        uint64
 	DiskWatermarkWarns   int64
@@ -234,6 +241,27 @@ func (r *Registry) AddWAL(n int64) {
 func (r *Registry) AddReplicationOrphan() {
 	if r != nil {
 		r.replOrphans.Add(1)
+	}
+}
+
+// SetWALFootprint records the WAL directory's most recent on-disk size and
+// segment count. Unlike wal_bytes_written, which only ever rises, this is
+// what the volume is holding now — the number that tells an operator whether
+// WAL retention is actually bounded on this deployment.
+func (r *Registry) SetWALFootprint(bytes int64, segments int) {
+	if r == nil {
+		return
+	}
+	r.walOnDiskBytes.Store(bytes)
+	r.walSegments.Store(int64(segments))
+}
+
+// AddWALTrimmedSegments counts segments reclaimed by the wal_max_retained_mb
+// size cap, so a cap that is configured but never able to reclaim anything is
+// visible as a flat counter beside a rising footprint.
+func (r *Registry) AddWALTrimmedSegments(n int) {
+	if r != nil && n > 0 {
+		r.walTrimmedSegments.Add(int64(n))
 	}
 }
 
@@ -430,6 +458,9 @@ func (r *Registry) Snapshot() Snapshot {
 		CDCErrors:            r.cdcErrors.Load(),
 		CDCLagLSN:            r.cdcLagLSN.Load(),
 		ReplicationOrphans:   r.replOrphans.Load(),
+		WALOnDiskBytes:       r.walOnDiskBytes.Load(),
+		WALSegments:          r.walSegments.Load(),
+		WALTrimmedSegments:   r.walTrimmedSegments.Load(),
 		DiskTotalBytes:       r.diskTotalBytes.Load(),
 		DiskFreeBytes:        r.diskFreeBytes.Load(),
 		DiskWatermarkWarns:   r.diskWatermarkWarn.Load(),

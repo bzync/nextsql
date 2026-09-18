@@ -1047,6 +1047,8 @@ func setLimitForTest(c *Config, key string, v int) bool {
 		c.TransactionTimeoutMS = v
 	case "wal_retention_ms":
 		c.WalRetentionMS = v
+	case "wal_max_retained_mb":
+		c.WalMaxRetainedMB = v
 	default:
 		return false
 	}
@@ -1106,5 +1108,44 @@ func TestWALPageDeltasKey(t *testing.T) {
 	cfg.WALPageDeltas = "maybe"
 	if err := cfg.Validate(); err == nil {
 		t.Fatal("wal_page_deltas=maybe accepted")
+	}
+}
+
+// A size cap must never be able to delete a segment the archiver has not
+// taken yet, so the pair is refused at configuration time rather than
+// failing every trim at run time.
+func TestWalSizeCapAndArchiveAreMutuallyExclusive(t *testing.T) {
+	c := Default()
+	c.DataDir = "d"
+	c.KeyFile = "k"
+	c.WalMaxRetainedMB = 512
+	c.WalArchive = "/var/lib/nextsql/archive"
+	if err := c.Validate(); err == nil {
+		t.Fatal("wal_max_retained_mb alongside wal_archive must be refused")
+	}
+
+	c.WalArchive = ""
+	if err := c.Validate(); err != nil {
+		t.Fatalf("a size cap on its own must be accepted: %v", err)
+	}
+
+	c.WalMaxRetainedMB = 0
+	c.WalArchive = "/var/lib/nextsql/archive"
+	if err := c.Validate(); err != nil {
+		t.Fatalf("an archive on its own must be accepted: %v", err)
+	}
+
+	// Both paths agree: the file parser refuses the same pair.
+	path := filepath.Join(t.TempDir(), "both.conf")
+	body := "data_dir=d\nkey_file=k\nwal_archive=/a\nwal_max_retained_mb=512\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err == nil {
+		err = cfg.Validate()
+	}
+	if err == nil {
+		t.Fatal("the file path must refuse the pair too")
 	}
 }

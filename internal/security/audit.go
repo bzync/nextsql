@@ -79,6 +79,10 @@ const (
 	// audit public keyset. Its presence prevents stripping the first
 	// signature from silently moving the start of the signed segment.
 	ActionAuditSigningEnabled = "audit.signing.enabled"
+	// ActionAuditTornTailRepair records that startup dropped or terminated a
+	// final record left incomplete by an interrupted write. The repair is
+	// itself part of the chain, so a file that was repaired says so.
+	ActionAuditTornTailRepair = "audit.torn_tail.repair"
 
 	auditChainVersion = 1
 	auditChainDomain  = "NSAC\x01"

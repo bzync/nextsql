@@ -1392,7 +1392,7 @@ nextsqld --data-dir DIR --key-file FILE [--instance-key-file FILE]
          [--user NAME --password-file FILE]
          [--auth-file FILE] [--audit-file FILE]
          [--buffer-pages N] [--log-level debug|info|warn|error]
-         [--wal-archive DIR]
+         [--wal-archive DIR] [--wal-max-retained-mb N]
          [--node-id ID --raft-bind ADDR --raft-join id=addr,... [--raft-bootstrap]]
          [--raft-heartbeat-ms N] [--raft-election-ms N] [--raft-leader-lease-ms N] [--raft-commit-timeout-ms N]
 ```
@@ -1422,6 +1422,10 @@ auth_broker_listen=
 require_client_key=false
 audit_file=
 wal_archive=/var/lib/nextsql-wal
+# Bound the WAL directory without a PITR archive (mutually exclusive with
+# wal_archive). 0, the default, retains every segment for the life of the
+# instance — see docs/wal.md "Retention".
+wal_max_retained_mb=0
 max_inflight_queries=32
 max_query_queue=128
 query_queue_wait_ms=5000

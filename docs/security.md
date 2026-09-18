@@ -356,8 +356,9 @@ sig/key_id    = optional Ed25519 signature over hash and its NSAK key id
 The canonical event JSON includes `chain_version` and the redacted event
 fields, but clears `seq`, `prev_hash`, `hash`, `sig`, and `key_id`. Caller-set
 chain fields are discarded. Lines are capped at 1 MiB. Verification streams
-one line at a time; startup verifies the retained chain before append, rejects
-an incomplete final line, and refuses a symlink, non-regular file, or a file
+one line at a time; startup verifies the retained chain before append, repairs
+an interrupted final write (see "Interrupted final writes") and refuses every
+other unverified chain, and refuses a symlink, non-regular file, or a file
 readable by group/others. Each successful append is synced before the in-memory
 head advances.
 
@@ -394,6 +395,57 @@ nextsql audit retire --keyset /secure/nextsql-audit.nsak --key-id 1
 Keyed verification requires a signed transition and validates every signature
 after it. Unkeyed verification checks only internal chain consistency. A
 legacy-only file is reported as readable, not as tamper-evident.
+
+### Interrupted final writes
+
+Each record is appended with one write followed by an `fsync`, and the
+in-memory chain head advances only after that `fsync` returns. A record whose
+bytes are torn on disk is therefore a record whose `fsync` never completed: it
+was never acknowledged to the caller that asked for it, and no earlier record
+is affected. Startup repairs exactly that case, and only that case, before
+opening the chain — the same argument `internal/wal` and `internal/undo`
+already use to truncate their own torn tails rather than refuse to open.
+
+Two shapes qualify, both confined to the final line:
+
+- **the final line does not parse and every line before it verifies.** Its
+  bytes are copied to a mode-`0600` `nextsql.audit.torn-<UTC timestamp>`
+  sibling and `fsync`ed, and only then removed. Nothing is destroyed;
+- **the whole file including the final line verifies, but the line has no
+  newline.** The record is intact and chain-valid, only its terminator is
+  missing, so the terminator is appended and nothing is dropped. Left alone,
+  the next append would concatenate onto that line.
+
+Any other damage — a failure on an earlier line, a sequence gap, a `prev_hash`
+or `hash` mismatch, a bad signature — is left untouched and `nextsqld` still
+refuses to start, naming the first bad line.
+
+`nextsql audit verify` reports a torn tail as **unverified** exactly as
+before; the classification says the damage is confined to an unacknowledged
+record, not that the file is sound. `--json` gains a `torn_tail` boolean
+beside the existing keys, so an operator can tell "`nextsqld` repairs this on
+its next start" apart from "do not start it until you know what happened":
+
+```json
+{"chained":92150,"lines":92151,"first_bad_line":92151,
+ "problem":"malformed JSON line","verified":false,"torn_tail":true}
+```
+
+A repair is recorded in the chain itself, as an `audit.torn_tail.repair`
+record whose object carries the offset, the byte count, the SHA-256 of the
+quarantined bytes and the retained line count, so a file that was repaired
+says so. When a signing keyset is configured the record falls inside the
+signed segment. It is also logged at `WARN`.
+
+Removing whole trailing records *including* the last newline is
+byte-for-byte indistinguishable from an append whose terminator never reached
+disk. Repair resolves that ambiguity the only way that is safe: it appends the
+terminator and drops nothing. Suffix removal is therefore neither concealed
+nor worsened — detecting it still requires the external WORM checkpoint below.
+
+Before this, a single interrupted append made the daemon permanently
+unstartable, and under a container supervisor that is an unbounded restart
+loop taking every dependent service down with it.
 
 Threat boundary:
 

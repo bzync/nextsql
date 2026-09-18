@@ -48,6 +48,7 @@ controlled rejection, never OOM.
 | statement_timeout_ms | time | ms | subsystem default | [1, 86400000] | - | bounds one statement's wall time so a pathological query cannot hold a worker forever |
 | task_workers | concurrency | count | 0 | 0 or [1, 4096] | leave the scheduler default | the bounded background pool for scheduled tasks and maintenance |
 | transaction_timeout_ms | time | ms | 0 | 0 or [1, 86400000] | no transaction timeout | bounds a whole transaction, which holds locks and pins a snapshot for its lifetime |
+| wal_max_retained_mb | storage | MiB | 0 | 0 or [256, 1048576] | retain every WAL segment | bounds the WAL directory on a deployment with no archive, where no other setting prunes it; only segments already below the redo LSN and every CDC pin are removed, so recoverability is never traded for the cap |
 | wal_retention_ms | storage | ms | 0 | 0 or [1, 31536000000] | retain WAL history indefinitely | how long checkpointed WAL is kept for PITR and page repair; pruning is a no-op until an archiver is configured |
 
 ## Structural and format limits

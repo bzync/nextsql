@@ -74,6 +74,7 @@ func run() error {
 	auditFile := fs.String("audit-file", "", "audit log path (default: DATA-DIR/nextsql.audit)")
 	auditSigningKeyset := fs.String("audit-signing-keyset", "", "NSAK Ed25519 keyset used to sign new audit records")
 	walArchive := fs.String("wal-archive", "", "encrypted WAL archive directory for PITR")
+	walMaxRetainedMB := fs.Int("wal-max-retained-mb", 0, "bound the WAL directory to this many MiB (0: retain every segment; not usable with --wal-archive)")
 	nodeID := fs.String("node-id", "", "Raft node id (required with --raft-bind)")
 	raftBind := fs.String("raft-bind", "", "Raft bind address (enables HA)")
 	raftJoin := fs.String("raft-join", "", "Raft peers as id=addr,id=addr (min 3 voters)")
@@ -161,6 +162,9 @@ func run() error {
 	}
 	if set["wal-archive"] {
 		cfg.WalArchive = *walArchive
+	}
+	if set["wal-max-retained-mb"] {
+		cfg.WalMaxRetainedMB = *walMaxRetainedMB
 	}
 	if set["node-id"] {
 		cfg.NodeID = *nodeID
@@ -351,6 +355,22 @@ func run() error {
 		return nerr.New(nerr.InvalidArgument, "nextsqld", "no users configured; pass --user/--password-file or set NEXTSQL_SERVER_USER with its password")
 	}
 
+	// A record is fsynced before Log.Record advances its chain head, so a
+	// torn final record is one that was never acknowledged. Repairing it
+	// here — quarantining the bytes, never dropping anything earlier —
+	// keeps an interrupted write from making the daemon permanently
+	// unstartable. Damage of any other shape is left for OpenAudit below to
+	// refuse. See docs/security.md "Interrupted final writes".
+	tornRepair, err := security.RepairAuditTornTail(cfg.AuditPath())
+	if err != nil {
+		return err
+	}
+	if tornRepair != nil {
+		log.Warn("audit chain: repaired an interrupted final write",
+			"kind", tornRepair.Kind, "offset", tornRepair.Offset,
+			"dropped_bytes", tornRepair.DroppedBytes, "quarantine", tornRepair.Quarantine,
+			"retained_lines", tornRepair.RetainedLines)
+	}
 	audit, err := security.OpenAudit(cfg.AuditPath())
 	if err != nil {
 		return err
@@ -378,6 +398,16 @@ func run() error {
 			}
 		}
 		if err := audit.SetSigningKeys(auditSigningKeys); err != nil {
+			return err
+		}
+	}
+	if tornRepair != nil {
+		// Recorded after the signer is attached so the repair record falls
+		// inside the signed segment whenever signing is configured.
+		if err := audit.RecordChecked(security.Event{
+			Actor: "system", Action: security.ActionAuditTornTailRepair,
+			Object: tornRepair.Summary(), Outcome: "success",
+		}); err != nil {
 			return err
 		}
 	}
@@ -1256,6 +1286,9 @@ func applyOps(db *executor.DB, cfg config.Config) {
 		MaxQueue:    cfg.MaxQueryQueue,
 		QueueWait:   time.Duration(cfg.QueueWaitMS) * time.Millisecond,
 	}))
+	// Config is in MiB so the whole range fits a 32-bit int; the engine
+	// works in bytes.
+	db.SetWALSizeCap(int64(cfg.WalMaxRetainedMB) << 20)
 }
 
 func installArchiver(db *executor.DB, keys crypto.KeyProvider, dir string) error {
@@ -1301,7 +1334,10 @@ func startDatabaseBackground(ctx context.Context, db *executor.DB, cfg config.Co
 // startCheckpointController periodically installs a durable recovery
 // boundary for one open database. Checkpoint itself flushes committed pages,
 // writes the checkpoint record/control file, and preserves WAL history for
-// PITR and page repair; this controller never prunes WAL. It intentionally
+// PITR and page repair. After a successful checkpoint the controller applies
+// the wal_max_retained_mb size cap, if one is configured, and refreshes the
+// WAL footprint gauges either way; with no cap it still prunes nothing. It
+// intentionally
 // does not checkpoint immediately after open: recovery has already made the
 // database consistent, and an idle open should not create housekeeping WAL.
 //
@@ -1329,6 +1365,22 @@ func startCheckpointController(ctx context.Context, db *executor.DB, intervalMS 
 					// The next bounded tick retries, while the error remains
 					// operator-visible.
 					log.Warn("checkpoint failed; WAL recovery window remains unbounded until a later checkpoint succeeds", "error", err)
+					continue
+				}
+				// A checkpoint is what makes older segments obsolete, so it
+				// is the moment a size cap can actually reclaim them.
+				// Without this the cap would only apply during a manual
+				// MAINTAIN DATABASE, which is the gap that let a
+				// non-archiving deployment grow its WAL without bound.
+				if trimmed, err := db.TrimWAL(); err != nil {
+					// Another maintenance pass holding the budget is the
+					// ordinary case; the next tick retries either way.
+					log.Warn("wal size cap: trim failed; retained WAL may exceed wal_max_retained_mb", "error", err)
+				} else if trimmed > 0 {
+					log.Info("wal size cap: reclaimed checkpointed segments", "segments", trimmed)
+				}
+				if err := db.ObserveWALFootprint(); err != nil {
+					log.Warn("wal size cap: could not measure the WAL directory", "error", err)
 				}
 			}
 		}

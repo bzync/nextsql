@@ -169,6 +169,7 @@ type DB struct {
 	taskCancels    map[string]context.CancelFunc
 	idempotencyMu  sync.Mutex
 	walRetention   atomic.Uint64
+	walSizeCap     atomic.Int64
 
 	// sessMu/sessions/nextSessID back system.sessions, system.active_queries,
 	// and system.transactions: a process-local, node-local registry of live
@@ -451,7 +452,88 @@ func (db *DB) cleanupDeadVersions(limit int, budget *maintenance.Budget) (int, e
 			return n, err
 		}
 	}
+	if err := db.trimWALLocked(budget); err != nil {
+		return n, err
+	}
 	return n, nil
+}
+
+// trimWALLocked applies the configured WAL size cap under an existing
+// maintenance budget. The two WAL retention policies are mutually exclusive
+// by configuration (config.Validate), so at most one of them does anything
+// here.
+func (db *DB) trimWALLocked(budget *maintenance.Budget) error {
+	capBytes := db.walSizeCap.Load()
+	if capBytes <= 0 || db.Eng == nil || db.Eng.WAL == nil {
+		return nil
+	}
+	trimmed, _, err := db.Eng.WAL.TrimToCap(capBytes, budget)
+	db.observeWALTrim(trimmed)
+	return err
+}
+
+// observeWALTrim records what a trim reclaimed and refreshes the footprint
+// gauges from the directory, so the size and the segment count always come
+// from the same walk and stay consistent with each other.
+func (db *DB) observeWALTrim(trimmed int) {
+	if db.metrics == nil {
+		return
+	}
+	db.metrics.AddWALTrimmedSegments(trimmed)
+	_ = db.ObserveWALFootprint()
+}
+
+// SetWALSizeCap bounds the WAL directory's on-disk size for a deployment that
+// does not archive, in bytes. Zero (the default) retains every segment, which
+// is the engine's historical behaviour: without this, the only production
+// prune path requires a WAL archiver, so a non-PITR deployment had nothing
+// that ever reclaimed a segment. See wal.Log.TrimToCap for what the cap will
+// and will not delete.
+func (db *DB) SetWALSizeCap(bytes int64) {
+	if db != nil {
+		db.walSizeCap.Store(bytes)
+	}
+}
+
+// WALSizeCap reports the configured cap in bytes; zero means retain every
+// segment.
+func (db *DB) WALSizeCap() int64 {
+	if db == nil {
+		return 0
+	}
+	return db.walSizeCap.Load()
+}
+
+// TrimWAL applies the configured size cap outside a MAINTAIN pass, for
+// nextsqld's checkpoint controller: a checkpoint is exactly what makes older
+// segments obsolete, so it is the natural moment to reclaim them. It takes
+// its own maintenance budget and yields to any pass already running, which
+// the next checkpoint tick retries. Returns the number of segments removed.
+func (db *DB) TrimWAL() (int, error) {
+	if db == nil || db.Eng == nil || db.Eng.WAL == nil || db.walSizeCap.Load() <= 0 {
+		return 0, nil
+	}
+	return db.maint.RunBudgeted("wal_trim", "database", func(budget *maintenance.Budget) (int, error) {
+		capBytes := db.walSizeCap.Load()
+		trimmed, _, err := db.Eng.WAL.TrimToCap(capBytes, budget)
+		db.observeWALTrim(trimmed)
+		return trimmed, err
+	})
+}
+
+// ObserveWALFootprint refreshes the WAL on-disk size and segment-count
+// gauges without pruning anything. A deployment with no cap configured still
+// needs the number: it is the one that shows the WAL growing without bound.
+func (db *DB) ObserveWALFootprint() error {
+	if db == nil || db.Eng == nil || db.Eng.WAL == nil || db.metrics == nil {
+		return nil
+	}
+	bytes, segments, err := db.Eng.WAL.OnDiskFootprint()
+	if err != nil {
+		return err
+	}
+	db.metrics.SetWALFootprint(bytes, segments)
+	return nil
 }
 
 // CleanupTableDeadVersions is CleanupDeadVersions scoped to one table's heap,

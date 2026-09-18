@@ -59,6 +59,7 @@ const (
 	UnitCount   Unit = "count"
 	UnitMillis  Unit = "ms"
 	UnitEntries Unit = "entries"
+	UnitMiB     Unit = "MiB"
 )
 
 // Spec is one configurable limit.
@@ -132,6 +133,13 @@ const (
 	// maxSockets bounds per-connection state: every accepted connection
 	// carries a session, buffers and file descriptors.
 	maxSockets = 1 << 20
+
+	// The cap is expressed in MiB, not bytes, so the whole range stays
+	// inside a 32-bit int on the 386/arm builds packaging produces. The
+	// floor is two default segments: a cap that cannot hold the segment
+	// being written plus one closed one could never be satisfied.
+	minWalRetainedMB = 256
+	maxWalRetainedMB = 1 << 20
 	// minRaftTimingMS floors every Raft interval. hashicorp/raft's own
 	// minimum is 5 ms; this is deliberately higher because a heartbeat
 	// shorter than a plausible scheduler delay makes a healthy node
@@ -330,6 +338,11 @@ var catalog = []Spec{
 		Key: "wal_retention_ms", Class: ClassStorage, Unit: UnitMillis,
 		Min: 1, Max: maxYear, ZeroMeans: "retain WAL history indefinitely",
 		Why: "how long checkpointed WAL is kept for PITR and page repair; pruning is a no-op until an archiver is configured",
+	},
+	{
+		Key: "wal_max_retained_mb", Class: ClassStorage, Unit: UnitMiB,
+		Min: minWalRetainedMB, Max: maxWalRetainedMB, ZeroMeans: "retain every WAL segment",
+		Why: "bounds the WAL directory on a deployment with no archive, where no other setting prunes it; only segments already below the redo LSN and every CDC pin are removed, so recoverability is never traded for the cap",
 	},
 }
 

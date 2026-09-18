@@ -35,6 +35,28 @@ type VerifyReport struct {
 	Verified     bool
 	FirstBadLine int
 	Problem      string
+
+	// TornTail classifies the one damage shape an append-only file can
+	// suffer from an interrupted write rather than from tampering: the
+	// final line does not parse and every line before it verifies. It is
+	// deliberately narrow. Any failure on an earlier line, and any
+	// final-line failure that is not a parse failure (a sequence gap, a
+	// prev_hash or hash mismatch, a bad signature) leaves it false,
+	// because those are not shapes a partial write can produce.
+	// TornTailOffset is the byte offset the unparseable line starts at —
+	// the only offset it is safe to truncate to. Verified stays false
+	// either way: a torn tail is still an unverified file, this only says
+	// the damage is confined to a record that was never acknowledged.
+	TornTail       bool
+	TornTailOffset int64
+
+	// TailUnterminated reports that the last non-blank line carries no
+	// newline. With TornTail that is the ordinary case. On its own — the
+	// whole file including the last line verifies, only the terminator is
+	// missing — it is the other half of the same interrupted write: the
+	// record reached disk but its terminator did not, so appending to the
+	// file would concatenate the next record onto it.
+	TailUnterminated bool
 }
 
 type auditVerifyState struct {
@@ -143,6 +165,32 @@ func (r *eventRing) ordered() []Event {
 	return out
 }
 
+// lineOffsets wraps bufio.ScanLines so each line's start offset and whether
+// it was newline-terminated travel with it. Both are needed to tell an
+// interrupted write apart from tampering and to repair it: the offset is the
+// only byte position it is safe to truncate to, and an unterminated final
+// line is itself a torn write even when its JSON parses. The wrapper keeps
+// bufio.Scanner's 1 MiB line cap, so a file whose tail is one enormous
+// unterminated run is rejected by the scanner rather than classified here.
+type lineOffsets struct {
+	consumed   int64
+	start      int64
+	terminated bool
+}
+
+func (o *lineOffsets) split(data []byte, atEOF bool) (int, []byte, error) {
+	advance, token, err := bufio.ScanLines(data, atEOF)
+	// ScanLines only returns advance > 0 together with a token, and returns
+	// (0, nil, nil) whenever it needs more data, so this accumulates exactly
+	// once per line however many times the scanner refills.
+	if advance > 0 {
+		o.start = o.consumed
+		o.consumed += int64(advance)
+		o.terminated = data[advance-1] == '\n'
+	}
+	return advance, token, err
+}
+
 func verifyAuditScanner(f *os.File, verifiers *AuditKeyset, maxEvents int) (VerifyReport, auditVerifyState, []Event, error) {
 	var report VerifyReport
 	report.SignaturesChecked = verifiers != nil
@@ -161,19 +209,25 @@ func verifyAuditScanner(f *os.File, verifiers *AuditKeyset, maxEvents int) (Veri
 		}
 	}
 
+	var off lineOffsets
+	tornLine, tornOffset, tailUnterminated := 0, int64(0), false
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 64<<10), maxAuditLineBytes)
+	scanner.Split(off.split)
 	for scanner.Scan() {
+		lineStart, lineTerminated := off.start, off.terminated
 		line := bytes.TrimSpace(scanner.Bytes())
 		if len(line) == 0 {
 			continue
 		}
 		lineNo++
 		report.Lines++
+		tailUnterminated = !lineTerminated
 
 		var ev Event
 		if err := json.Unmarshal(line, &ev); err != nil {
 			fail(lineNo, "malformed JSON line")
+			tornLine, tornOffset = lineNo, lineStart
 			continue
 		}
 		// Retained regardless of what the checks below find: an operator
@@ -256,6 +310,17 @@ func verifyAuditScanner(f *os.File, verifiers *AuditKeyset, maxEvents int) (Veri
 	}
 	if err := scanner.Err(); err != nil {
 		return report, state, nil, nerr.Wrap(nerr.InvalidFormat, "security.VerifyFile", "audit line exceeds limit or could not be read", err)
+	}
+	// A torn tail is the last line failing to parse with nothing wrong
+	// before it. Requiring FirstBadLine to be that same line is what keeps
+	// this from firing on a file that is damaged earlier and merely happens
+	// to end badly too, and requiring it to be the parse failure is what
+	// keeps it from firing on a final line that parses but does not belong
+	// to the chain — an edit, not an interrupted write.
+	report.TailUnterminated = tailUnterminated
+	report.TornTail = tornLine != 0 && tornLine == lineNo && report.FirstBadLine == tornLine
+	if report.TornTail {
+		report.TornTailOffset = tornOffset
 	}
 	if verifiers != nil && !signingRequired {
 		badLine := lineNo

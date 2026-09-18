@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -130,4 +132,91 @@ func TestAuditVerifyLegacyFileCLI(t *testing.T) {
 
 func itoa(id uint32) string {
 	return strconv.FormatUint(uint64(id), 10)
+}
+
+// The JSON report must keep the keys operators already parse and additionally
+// classify a torn tail, so "nextsqld repairs this on its next start" can be
+// told apart from "do not start it until you know what happened".
+func TestAuditVerifyCLIReportsATornTail(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "audit.log")
+	l, err := security.OpenAudit(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 4; i++ {
+		l.Record(security.Event{Actor: "app", Action: security.ActionAuthSuccess, Outcome: "success"})
+	}
+	if err := l.Close(); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	decode := func(t *testing.T, path string) map[string]any {
+		t.Helper()
+		stdout := os.Stdout
+		r, w, err := os.Pipe()
+		if err != nil {
+			t.Fatal(err)
+		}
+		os.Stdout = w
+		verr := auditVerify([]string{"--file", path, "--json"})
+		w.Close()
+		os.Stdout = stdout
+		var out bytes.Buffer
+		if _, err := out.ReadFrom(r); err != nil {
+			t.Fatal(err)
+		}
+		_ = verr
+		var got map[string]any
+		if err := json.Unmarshal(out.Bytes(), &got); err != nil {
+			t.Fatalf("--json did not emit one JSON object: %v (%q)", err, out.String())
+		}
+		return got
+	}
+
+	// A clean file: every key an operator already parses is still present.
+	clean := decode(t, logPath)
+	for _, k := range []string{
+		"file", "verified", "lines", "legacy", "chained", "signed",
+		"signing_started", "signatures_checked", "first_bad_line", "problem",
+	} {
+		if _, ok := clean[k]; !ok {
+			t.Fatalf("--json dropped the %q key", k)
+		}
+	}
+	if clean["verified"] != true || clean["torn_tail"] != false {
+		t.Fatalf("clean file reported %v", clean)
+	}
+
+	// A torn tail: unverified, as before, but now classified.
+	tornPath := filepath.Join(dir, "torn.log")
+	if err := os.WriteFile(tornPath, raw[:len(raw)-18], 0o600); err != nil {
+		t.Fatal(err)
+	}
+	torn := decode(t, tornPath)
+	if torn["verified"] != false {
+		t.Fatal("a torn tail must still report verified=false")
+	}
+	if torn["problem"] != "malformed JSON line" {
+		t.Fatalf("problem = %v, want the malformed-line message", torn["problem"])
+	}
+	if torn["torn_tail"] != true {
+		t.Fatalf("torn tail was not classified: %v", torn)
+	}
+
+	// Real mid-chain damage must not be classified as repairable.
+	lines := bytes.Split(bytes.TrimRight(raw, "\n"), []byte("\n"))
+	lines[1] = bytes.Replace(lines[1], []byte(`"success"`), []byte(`"failure"`), 1)
+	badPath := filepath.Join(dir, "tampered-mid.log")
+	if err := os.WriteFile(badPath, append(bytes.Join(lines, []byte("\n")), '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	bad := decode(t, badPath)
+	if bad["verified"] != false || bad["torn_tail"] != false {
+		t.Fatalf("mid-chain tampering must not be classified as a torn tail: %v", bad)
+	}
 }

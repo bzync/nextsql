@@ -2,7 +2,7 @@
 
 All notable changes to NextSQL are recorded here.
 
-The current release is **0.0.2**; **0.0.1** was the first public one. Both are
+The current release is **0.0.3**; **0.0.1** was the first public one. All are
 previews: the engine is complete enough to install, query, and operate, and it
 is still under measurement. Before you rely on it, run `nextsql-bench --slo`
 and the crash, recovery, and HA suites on your hardware.
@@ -13,7 +13,7 @@ different bits.
 
 ---
 
-## [Unreleased]
+## [0.0.3] — 2026-09-20
 
 ### Fixed
 
@@ -251,6 +251,7 @@ A change is recorded here when it is implemented, tested, and documented — not
 when it is only designed. Internal sequencing lives in `TODO.md`. Intended
 product scope lives in `PROJECT.md`.
 
-[Unreleased]: https://github.com/bzync/nextsql/compare/v0.0.2...HEAD
+[Unreleased]: https://github.com/bzync/nextsql/compare/v0.0.3...HEAD
+[0.0.3]: https://github.com/bzync/nextsql/releases/tag/v0.0.3
 [0.0.2]: https://github.com/bzync/nextsql/releases/tag/v0.0.2
 [0.0.1]: https://github.com/bzync/nextsql/releases/tag/v0.0.1

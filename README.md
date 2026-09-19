@@ -4,7 +4,7 @@ NextSQL is a high-performance, encrypted-by-default multimodel database written 
 
 It is a new database — not a wrapper, fork, or compatibility layer for PostgreSQL, MySQL, MongoDB, or Elasticsearch. It has its own 16 KiB page storage engine, SQL dialect, binary wire protocol (NSQL v1), and first-party drivers.
 
-The current release is **0.0.1** (preview). Linux packages are on [GitHub Releases](https://github.com/bzync/nextsql/releases/tag/v0.0.1). On Windows, run them inside [WSL 2](docs/install.md#windows-wsl-2).
+The current release is **0.0.3** (preview). Linux packages are on [GitHub Releases](https://github.com/bzync/nextsql/releases/tag/v0.0.3). On Windows, run them inside [WSL 2](docs/install.md#windows-wsl-2).
 
 ---
 
@@ -58,7 +58,7 @@ go install github.com/bzync/nextsql/cmd/nextsql@latest
 go install github.com/bzync/nextsql/cmd/nextsqld@latest
 ```
 
-Pre-built Linux installers (`.deb`, `.tar.gz`, `.run`) are on the [v0.0.1 release](https://github.com/bzync/nextsql/releases/tag/v0.0.1). Native Windows is not supported; on Windows, run NextSQL inside [WSL 2](docs/install.md#windows-wsl-2).
+Pre-built Linux installers (`.deb`, `.tar.gz`, `.run`) are on the [v0.0.3 release](https://github.com/bzync/nextsql/releases/tag/v0.0.3). Native Windows is not supported; on Windows, run NextSQL inside [WSL 2](docs/install.md#windows-wsl-2).
 
 ### 2. Initialize and Run
 
@@ -80,7 +80,7 @@ nextsql exec --addr 127.0.0.1:7210 --user app --password-file /tmp/nextsql.pw --
 ## Documentation
 
 - **[Usage manual](USAGE.md)** — install, SQL, drivers, backups, and operations
-- **[Changelog](CHANGELOG.md)** — what shipped in 0.0.1
+- **[Changelog](CHANGELOG.md)** — what shipped in 0.0.3
 - **[Support](SUPPORT.md)** and **[Security](SECURITY.md)**
 - **[docs/](docs/)** — storage, WAL, MVCC, optimizer, security, and HA
 - Product site: [nextsql.bzync.com](https://nextsql.bzync.com)

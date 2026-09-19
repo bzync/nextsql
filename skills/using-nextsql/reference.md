@@ -1,7 +1,7 @@
 # NSQL reference
 
 Companion to `SKILL.md`. Authoritative source is `docs/sql.md` and the
-per-model docs; this is a working summary for the current release (**0.0.2**).
+per-model docs; this is a working summary for the current release (**0.0.3**).
 
 ## Types
 
@@ -155,7 +155,7 @@ Common ones in application code:
 | Workflow body statements / nested depth | 256 / 8 |
 | Wire result / default result rows | 64 MiB / 1 000 000 |
 
-## Not in 0.0.2
+## Not in 0.0.3
 
 - Outer `JOIN` with `SEARCH` / `NEAREST` (inner join is fine when the rank
   column is on the `FROM` table).

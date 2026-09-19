@@ -21,7 +21,8 @@ import (
 // engine keeps a rolled-back transaction's pages unflushable until undo ends
 // and discards their delta bases. This test drives that path hard: concurrent
 // transfers that conflict and roll back constantly, deliberate rollbacks, and
-// a checkpoint mid-stream, then power loss. Recovery must neither fail closed
+// a checkpoint mid-stream, then power loss (unsynced WAL and undo bytes are
+// discarded). Recovery must neither fail closed
 // on a delta nor lose or invent money: every committed transfer moved money,
 // every rolled-back one did not, so the total is exact.
 func TestRollbacksWithPageDeltasSurvivePowerLoss(t *testing.T) {
@@ -41,6 +42,7 @@ func rollbackDeltaRound(t *testing.T, seed int64) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "nextsql.db")
 	keys := testKeys(t)
+	dropUnsyncedUndo := trackUndoSync(t, path)
 	db, err := executor.Create(path, keys, 128)
 	if err != nil {
 		t.Fatal(err)
@@ -116,6 +118,7 @@ func rollbackDeltaRound(t *testing.T, seed int64) {
 	db.Eng.Kill() // power loss mid-stream
 	stop.Store(true)
 	wg.Wait()
+	dropUnsyncedUndo() // undo writes that never reached stable storage
 	if commits.Load() == 0 || rollbacks.Load() == 0 {
 		t.Fatalf("load did not exercise both paths: %d commits, %d rollbacks", commits.Load(), rollbacks.Load())
 	}

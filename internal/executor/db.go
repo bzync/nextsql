@@ -1104,6 +1104,13 @@ type WriteGate interface {
 	AllowWrite() error
 }
 
+// LeaderReadyWaiter is implemented by a gate whose newly elected leader must
+// first apply the previous term's entries. Sessions wait on it before taking
+// their apply guard; see replication.Cluster.AwaitLeaderReady.
+type LeaderReadyWaiter interface {
+	AwaitLeaderReady()
+}
+
 // ReadGate rejects a strongly consistent read when this process cannot prove
 // it is still the Raft leader. A nil gate (single-node deployment) permits the
 // read. The gate installed by AttachCluster satisfies both interfaces.

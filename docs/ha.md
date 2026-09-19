@@ -40,6 +40,16 @@ covered node-failure model (loss of the leader, or any minority). If
 Raft cannot identify a leader, writes are rejected (`unavailable`).
 There is no split-brain write path.
 
+A newly elected leader accepts writes only once it has applied every entry
+committed before its term (a Raft `Barrier`, `Cluster.watchLeadership`). Its
+WAL assigns LSNs from what it has applied, and its apply of a predecessor's
+entry needs the executor's apply guard exclusively while a local commit holds
+it shared and waits on Raft; admitting writes earlier deadlocked the two. A
+statement that arrives in that window waits for it, bounded by the apply
+timeout, before taking the guard; past the bound it fails `unavailable` and a
+retry succeeds. Membership changes (`AddVoter`, `RemoveServer`) are Raft
+configuration entries and are only leader-gated.
+
 Followers apply the same physical WAL records (page images, tree meta,
 allocator state). SQL is not re-executed, so `UUID()` / `NOW()` / `AI()` stay
 deterministic across replicas. Foreign-key `CASCADE` / `SET NULL` /
@@ -130,10 +140,15 @@ leader's.
 A `STRONG` read runs only after `Cluster.StrongReadBarrier`
 (`internal/replication/read.go`), which requires all of:
 
-1. **This node is the Raft leader.** Raft's election safety and leader
-   completeness guarantee that a leader's log contains every entry that was
-   committed in any previous term. So the leader's applied state is a superset
-   of every acknowledged write.
+1. **This node is the Raft leader, and has applied its predecessors'
+   entries.** Raft's election safety and leader completeness guarantee that a
+   leader's *log* contains every entry committed in any previous term, but not
+   that its FSM has *applied* them: a follower can win an election with
+   committed entries still queued for apply. On winning, `watchLeadership`
+   issues a Raft `Barrier`, which returns once every earlier entry is applied,
+   and records the term. Until then the barrier refuses `STRONG` reads and
+   `AllowWrite` refuses writes (`unavailable`, retryable). So the leader's
+   applied state is a superset of every acknowledged write.
 2. **Leadership is still held, confirmed by a quorum round trip.**
    `raft.VerifyLeader` exchanges a heartbeat with a majority and succeeds only
    if that majority still recognises this node as leader in the current term.
@@ -216,6 +231,7 @@ mode:
 | `STALE` is a distinct opt-in mode, never the default, never relabelled | `TestHAThreeNodeQuorumCommit`, `TestReadConsistencyModes` |
 | `STRONG` session keeps read-your-writes + monotonic reads across a leader failover | `TestFollowerReadFailoverSessionGuarantee` |
 | No acknowledged quorum commit lost on leader kill | `TestHAKillLeader` |
+| A new leader refuses writes and `STRONG` reads until it has applied the previous term's entries | `TestNewLeaderRefusesWritesUntilPriorTermIsApplied` |
 | Read-barrier cost isolated and measured | `nextsql-bench --readscale`, `TestReadScaleBench` |
 
 ### Sign-off

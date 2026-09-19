@@ -394,6 +394,9 @@ func open(path string, keys crypto.KeyProvider, bufferPages int, id format.Ident
 		_ = fm.Close()
 		return nil, err
 	}
+	// No WAL byte that can carry a row version may reach disk before the
+	// undo record that reverses it (undo.Log.Sync).
+	lg.SetBeforeWrite(ul.Sync)
 	if !create {
 		open, aborted, uerr := recovery.NotCommittedUntil(lg, opt.UntilLSN)
 		if uerr != nil {
@@ -917,8 +920,11 @@ func (e *Engine) logStructure(ownOp, pageWriteHeld bool) error {
 	e.mu.Unlock()
 	slices.Sort(ids)
 
+	// As in flushDirtyImages, pageMu stays read-held until the images are
+	// appended, so no page changes between its copy and its LSN.
 	if !pageWriteHeld {
 		e.pageMu.RLock()
+		defer e.pageMu.RUnlock()
 	}
 	kept := ids[:0]
 	images := make([][]byte, 0, len(ids))
@@ -929,9 +935,6 @@ func (e *Engine) logStructure(ownOp, pageWriteHeld bool) error {
 		}
 		kept = append(kept, id)
 		images = append(images, data)
-	}
-	if !pageWriteHeld {
-		e.pageMu.RUnlock()
 	}
 	ids = kept
 
@@ -2007,6 +2010,20 @@ func (e *Engine) OnDirty(id format.PageID, data []byte) (format.LSN, error) {
 // stamped with its record's LSN and retained as the base. It returns each
 // page's LSN, the last LSN appended and the first. Called with e.mu held.
 func (e *Engine) appendPageStatesLocked(txnID format.TxnID, prev format.LSN, ids []format.PageID, images [][]byte, settled bool) (lsns []format.LSN, last, first format.LSN, err error) {
+	// An image carries every row version on its page, including other
+	// transactions' uncommitted ones, and only their undo records hold the
+	// values those versions replaced. Every such record was appended before
+	// its page was changed (btree logs undo first), so before the image was
+	// copied; write them out before the image enters the log. The commit
+	// path's earlier Undo.Flush runs before the copy, leaving a window for
+	// another transaction's write, and a split's images had no flush at all:
+	// after a crash redo installed the version and undo could not reverse it
+	// (tests/crash TestPageImageDoesNotOutrunTheUndoItCarries).
+	if e.Undo != nil {
+		if err := e.Undo.Flush(); err != nil {
+			return nil, 0, 0, err
+		}
+	}
 	lsns = make([]format.LSN, len(ids))
 	var fullIDs []format.PageID
 	var fullImages [][]byte
@@ -2059,6 +2076,13 @@ func (e *Engine) flushDirtyImages(txn *Txn, pageWriteHeld bool) error {
 	}
 	slices.Sort(ids)
 	e.mu.Unlock()
+	// pageMu stays read-held from the copy until the images are appended.
+	// Released in between, another transaction could change a page, copy
+	// it and append its newer image first; this older copy then landed at
+	// the higher LSN, and recovery, replaying in LSN order, ended on it --
+	// committed rows lost (tests/crash TestConcurrentCommitsSurvivePowerLoss,
+	// which a slower WAL flush made fail about one round in five).
+	// Lock order is pageMu, then mu.
 	if !pageWriteHeld {
 		e.pageMu.RLock()
 	}
@@ -2074,11 +2098,11 @@ func (e *Engine) flushDirtyImages(txn *Txn, pageWriteHeld bool) error {
 		}
 		images[i] = data
 	}
+	e.mu.Lock()
+	lsns, last, first, err := e.appendPageStatesLocked(txn.id, txn.prev, ids, images, false)
 	if !pageWriteHeld {
 		e.pageMu.RUnlock()
 	}
-	e.mu.Lock()
-	lsns, last, first, err := e.appendPageStatesLocked(txn.id, txn.prev, ids, images, false)
 	if err != nil {
 		return err
 	}

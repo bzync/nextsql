@@ -25,12 +25,29 @@ import (
 func TestConcurrentCommitsSurvivePowerLoss(t *testing.T) {
 	for round := 0; round < 6; round++ {
 		t.Run(fmt.Sprintf("round-%d", round), func(t *testing.T) {
-			concurrentCommitCrashRound(t, 32, time.Duration(300+round*250)*time.Millisecond)
+			concurrentCommitCrashRound(t, 32, time.Duration(300+round*250)*time.Millisecond, false)
 		})
 	}
 }
 
-func concurrentCommitCrashRound(t *testing.T, sessions int, runFor time.Duration) {
+// The same with a slow WAL flush. A commit copied its dirty pages, released
+// pageMu, and appended the copies only once it had the engine mutex again; in
+// between, another transaction could change a page, copy it and append its
+// newer image first. The older copy then took the higher LSN and recovery,
+// replaying in LSN order, ended on it: hundreds of acknowledged rows lost,
+// their leaves orphaned from the tree. Anything that slows a flush widens that
+// window -- the undo fsync before each WAL write did, and so does a slow disk.
+// With a 1 ms delay this failed about one run in five before the images were
+// appended under the same pageMu hold as their copy.
+func TestConcurrentCommitsSurvivePowerLossWithSlowFlush(t *testing.T) {
+	for round := 0; round < 6; round++ {
+		t.Run(fmt.Sprintf("round-%d", round), func(t *testing.T) {
+			concurrentCommitCrashRound(t, 32, time.Duration(300+round*250)*time.Millisecond, true)
+		})
+	}
+}
+
+func concurrentCommitCrashRound(t *testing.T, sessions int, runFor time.Duration, slowFlush bool) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "nextsql.db")
 	dek, err := crypto.GenerateDEK(1)
@@ -44,6 +61,13 @@ func concurrentCommitCrashRound(t *testing.T, sessions int, runFor time.Duration
 	db, err := executor.Create(path, keys, 256)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if slowFlush {
+		undoLog := db.Eng.Undo
+		db.Eng.WAL.SetBeforeWrite(func() error {
+			time.Sleep(time.Millisecond)
+			return undoLog.Sync()
+		})
 	}
 	setup := db.Session()
 	for _, q := range []string{

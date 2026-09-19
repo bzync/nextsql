@@ -97,6 +97,14 @@ type Cluster struct {
 	// Node-local, like maintenance mode: not Raft-replicated, so a clean
 	// node elected leader afterward is unaffected.
 	replSuspect atomic.Bool
+
+	// readyTerm is the Raft term in which this node, as leader, has applied
+	// every entry committed before its leadership began (watchLeadership).
+	// AllowWrite refuses writes until it equals the current term.
+	readyTerm atomic.Uint64
+	stop      chan struct{}
+	stopOnce  sync.Once
+	watchDone chan struct{}
 }
 
 // ReportReplicationOrphan records that a local commit on this node could
@@ -234,20 +242,71 @@ func Open(cfg Config, applier Applier) (*Cluster, error) {
 	cfg.Stable = stable
 	cfg.Snaps = snaps
 	c := &Cluster{
-		cfg:   cfg,
-		raft:  r,
-		fsm:   f,
-		dek:   dek,
-		keys:  cfg.Keys,
-		trans: trans,
+		cfg:       cfg,
+		raft:      r,
+		fsm:       f,
+		dek:       dek,
+		keys:      cfg.Keys,
+		trans:     trans,
+		stop:      make(chan struct{}),
+		watchDone: make(chan struct{}),
 	}
+	go c.watchLeadership()
 	if cfg.Bootstrap {
 		if err := c.bootstrap(); err != nil {
-			_ = r.Shutdown().Error()
+			_ = c.Shutdown()
 			return nil, err
 		}
 	}
 	return c, nil
+}
+
+// watchLeadership makes each new leadership term writable only once this node
+// has applied every entry committed before it.
+//
+// A newly elected leader can still hold committed entries from the previous
+// leader that its FSM has not applied. Its own writes get LSNs from a local
+// WAL that has not seen those entries, and the FSM's apply of them takes the
+// executor's applyMu exclusively -- while a local commit holds it shared and
+// waits for Raft to apply its own entry, which is queued behind them. That
+// deadlocked commit and apply against each other forever. A Barrier returns
+// once every preceding entry has been applied, so writes open only after it.
+//
+// One goroutine per Cluster, ended by Shutdown. LeaderCh never blocks Raft: it
+// keeps only the latest value, which is all this needs, because AllowWrite
+// also compares terms and a missed flip only leaves writes refused.
+func (c *Cluster) watchLeadership() {
+	defer close(c.watchDone)
+	leaderCh := c.raft.LeaderCh()
+	for {
+		select {
+		case <-c.stop:
+			return
+		case isLeader := <-leaderCh:
+			if !isLeader {
+				continue
+			}
+		}
+		for c.raft.State() == raft.Leader {
+			term := c.raft.CurrentTerm()
+			if c.readyTerm.Load() == term {
+				break
+			}
+			err := c.raft.Barrier(c.cfg.ApplyTimeout).Error()
+			if err == nil && c.raft.State() == raft.Leader && c.raft.CurrentTerm() == term {
+				c.readyTerm.Store(term)
+				break
+			}
+			if err == raft.ErrRaftShutdown {
+				return
+			}
+			select {
+			case <-c.stop:
+				return
+			case <-time.After(10 * time.Millisecond):
+			}
+		}
+	}
 }
 
 func (c *Cluster) bootstrap() error {
@@ -377,13 +436,52 @@ func isRetryableApplyErr(err error) bool {
 // AllowWrite rejects writes when this node is not the leader or no
 // leader can be identified (no split brain).
 func (c *Cluster) AllowWrite() error {
+	if err := c.requireLeader("replication.AllowWrite"); err != nil {
+		return err
+	}
+	if !c.leaderReady() {
+		return nerr.New(nerr.Unavailable, "replication.AllowWrite", "new leader is still applying entries from the previous term; retry")
+	}
+	return nil
+}
+
+// leaderReady reports whether this node, as leader, has applied every entry
+// committed before its current term (watchLeadership).
+func (c *Cluster) leaderReady() bool {
+	return c.readyTerm.Load() == c.raft.CurrentTerm()
+}
+
+// AwaitLeaderReady waits, at most the apply timeout, while this node is a
+// leader that has not yet applied the previous term's entries. It returns at
+// once on a follower or a ready leader. The executor calls it before a
+// statement takes its apply guard: a write admitted in that window would fail
+// with a retryable error, and waiting after taking the guard would hold up the
+// very apply being waited for.
+func (c *Cluster) AwaitLeaderReady() {
 	if c == nil || c.raft == nil {
-		return nerr.New(nerr.Unavailable, "replication.AllowWrite", "cluster is closed")
+		return
+	}
+	deadline := time.Now().Add(c.cfg.ApplyTimeout)
+	for c.raft.State() == raft.Leader && !c.leaderReady() && time.Now().Before(deadline) {
+		select {
+		case <-c.stop:
+			return
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+}
+
+// requireLeader is AllowWrite without the applied-state requirement, for
+// membership changes: those are Raft configuration entries, not WAL batches,
+// and do not touch the FSM.
+func (c *Cluster) requireLeader(op string) error {
+	if c == nil || c.raft == nil {
+		return nerr.New(nerr.Unavailable, op, "cluster is closed")
 	}
 	if c.raft.State() == raft.Leader {
 		return nil
 	}
-	return c.notLeader("replication.AllowWrite")
+	return c.notLeader(op)
 }
 
 func (c *Cluster) notLeader(op string) error {
@@ -431,7 +529,7 @@ func (c *Cluster) WaitForLeader(d time.Duration) (string, error) {
 
 // AddVoter adds a voting member. Used for replica repair and rolling join.
 func (c *Cluster) AddVoter(id, addr string) error {
-	if err := c.AllowWrite(); err != nil {
+	if err := c.requireLeader("replication.AddVoter"); err != nil {
 		return err
 	}
 	f := c.raft.AddVoter(raft.ServerID(id), raft.ServerAddress(addr), 0, c.cfg.ApplyTimeout)
@@ -443,7 +541,7 @@ func (c *Cluster) AddVoter(id, addr string) error {
 
 // RemoveServer drops a member. Used for rolling maintenance.
 func (c *Cluster) RemoveServer(id string) error {
-	if err := c.AllowWrite(); err != nil {
+	if err := c.requireLeader("replication.RemoveServer"); err != nil {
 		return err
 	}
 	f := c.raft.RemoveServer(raft.ServerID(id), 0, c.cfg.ApplyTimeout)
@@ -547,7 +645,12 @@ func (c *Cluster) Shutdown() error {
 		return nil
 	}
 	f := c.raft.Shutdown()
-	if err := f.Error(); err != nil {
+	err := f.Error()
+	if c.stop != nil {
+		c.stopOnce.Do(func() { close(c.stop) })
+		<-c.watchDone
+	}
+	if err != nil {
 		return nerr.Wrap(nerr.Internal, "replication.Shutdown", "shutdown", err)
 	}
 	return nil

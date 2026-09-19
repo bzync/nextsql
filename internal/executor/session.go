@@ -941,6 +941,9 @@ func (s *Session) execAdmitted(ctx context.Context, sql string, params []Param) 
 		}, nil
 	}
 	if s != nil && s.db != nil && !s.txnGuard {
+		if w, ok := s.db.gate.(LeaderReadyWaiter); ok {
+			w.AwaitLeaderReady()
+		}
 		s.acquireTxnGuard()
 		defer func() {
 			// Autocommit and non-transaction statements release here if they

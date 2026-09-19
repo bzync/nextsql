@@ -63,6 +63,11 @@ func (c *Cluster) StrongReadBarrier() error {
 	if c.raft.State() != raft.Leader {
 		return c.notLeader("replication.StrongReadBarrier")
 	}
+	// A leader that has not applied the previous term's committed entries
+	// would answer from state older than writes already acknowledged.
+	if !c.leaderReady() {
+		return nerr.New(nerr.Unavailable, "replication.StrongReadBarrier", "new leader is still applying entries from the previous term; retry")
+	}
 	if err := c.raft.VerifyLeader().Error(); err != nil {
 		return nerr.Wrap(nerr.Unavailable, "replication.StrongReadBarrier", "leadership not verified", err)
 	}

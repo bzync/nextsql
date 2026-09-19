@@ -16,8 +16,6 @@ on:
 
 permissions:
   contents: write
-  pages: write
-  id-token: write
 
 concurrency:
   group: release-installers-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
@@ -130,11 +128,20 @@ jobs:
           )
           gh release create "$RELEASE_TAG" "${assets[@]}" "${flags[@]}"
 
+  # The github-pages environment only deploys from master, so a Pages deploy
+  # run in this tag's context is rejected ("Tag ... is not allowed to deploy to
+  # github-pages due to environment protection rules"). Dispatch the docs
+  # workflow on master instead; its build syncs the Downloads catalog from the
+  # Release just published. A GITHUB_TOKEN-created Release does not fire
+  # docs-pages' own `release: published` trigger, so this dispatch is the path.
   deploy-docs:
     needs: publish
-    uses: ./.github/workflows/docs-pages.yml
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
     permissions:
-      contents: read
-      pages: write
-      id-token: write
-    secrets: inherit
+      actions: write
+    steps:
+      - name: Rebuild the docs site from master
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run docs-pages.yml --repo "$GITHUB_REPOSITORY" --ref master

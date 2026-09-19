@@ -99,6 +99,9 @@ type Log struct {
 
 	segmentSize int64
 	crash       *Injector
+	// beforeWrite runs before any record is written to a segment; see
+	// SetBeforeWrite.
+	beforeWrite func() error
 	archiver    Archiver
 	// ctrlVersion is the control file version; controlVersionPageDeltas
 	// permits page delta records.
@@ -389,6 +392,19 @@ func (l *Log) InstallRecords(recs []Record) error {
 		}
 	}
 	return l.flushLocked()
+}
+
+// SetBeforeWrite installs fn to run before any record is written to a
+// segment. The engine installs the undo log's Sync: a page image can carry
+// another transaction's uncommitted row version, and recovery replays a
+// committed image found on disk whether or not its fsync returned, so the undo
+// record that reverses the version must be durable before the image's bytes
+// are written at all. fn runs without l.mu, once per write; an error fails
+// the flush with nothing written. Pass nil to remove it.
+func (l *Log) SetBeforeWrite(fn func() error) {
+	l.mu.Lock()
+	l.beforeWrite = fn
+	l.mu.Unlock()
 }
 
 func (l *Log) SetCrash(c *Injector) {
@@ -763,11 +779,20 @@ func (l *Log) flushLocked() error {
 	if err := l.hit(PointBeforeWALWrite); err != nil {
 		return err
 	}
-	seg, off, crash := l.seg, l.segOff, l.crash
+	seg, off, crash, before := l.seg, l.segOff, l.crash, l.beforeWrite
 	buf := l.buf[:toFlush:toFlush]
 	l.flushing = true
 	l.mu.Unlock()
 
+	if before != nil {
+		if err := before(); err != nil {
+			// Nothing was written: the buffer and offset are unchanged.
+			l.mu.Lock()
+			l.flushing = false
+			l.cv.Broadcast()
+			return err
+		}
+	}
 	n, err := diskio.WriteAt(seg, buf, off)
 	if n < len(buf) && err == nil {
 		err = io.ErrShortWrite

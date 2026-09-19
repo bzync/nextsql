@@ -3,6 +3,7 @@ package replication
 import (
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -28,9 +29,15 @@ const raftConverge = 30 * time.Second
 type recordApplier struct {
 	mu   sync.Mutex
 	recs []wal.Record
+	// hold, when set, blocks ApplyRecords until it is closed -- standing in
+	// for an executor whose applyMu is held by a running transaction.
+	hold atomic.Pointer[chan struct{}]
 }
 
 func (a *recordApplier) ApplyRecords(recs []wal.Record) error {
+	if h := a.hold.Load(); h != nil {
+		<-*h
+	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.recs = append(a.recs, recs...)
@@ -300,6 +307,99 @@ func TestRaftKillLeaderElection(t *testing.T) {
 	if newLead == lead {
 		t.Fatal("dead leader still selected")
 	}
+}
+
+// A new leader must not accept writes until its FSM has applied every entry
+// committed under the previous leader. Before, AllowWrite admitted a write the
+// moment the node won the election; the executor's commit then held applyMu
+// shared while waiting on Raft, and Raft's apply of the old entry queued ahead
+// of it needed applyMu exclusively, so both waited forever
+// (TestWorkflowReplicatesAndSurvivesRaftFailover hung the nightly gate for
+// 45 minutes). The same leader must not serve a STRONG read from that older
+// state. Remove the leaderReady check from AllowWrite and this fails.
+func TestNewLeaderRefusesWritesUntilPriorTermIsApplied(t *testing.T) {
+	cls, trans, _, apps := startRaft(t, 3)
+	lead := raftLeader(t, cls)
+	if err := lead.AllowWrite(); err != nil {
+		waitWritable(t, lead)
+	}
+	hold := make(chan struct{})
+	released := false
+	release := func() {
+		if !released {
+			released = true
+			close(hold)
+		}
+	}
+	t.Cleanup(release)
+	for i, c := range cls {
+		if c != lead {
+			apps[i].hold.Store(&hold)
+		}
+	}
+	// Committed once both followers append it; their FSMs block applying it.
+	if err := lead.Replicate([]wal.Record{
+		{Type: wal.RecBegin, LSN: 1, TxnID: 1},
+		{Type: wal.RecCommit, LSN: 2, TxnID: 1, PrevLSN: 1},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := lead.Shutdown(); err != nil {
+		t.Fatal(err)
+	}
+	var rest []*Cluster
+	for i, c := range cls {
+		if c == lead {
+			trans[i].DisconnectAll()
+			continue
+		}
+		rest = append(rest, c)
+	}
+	newLead := raftLeader(t, rest)
+	for end := time.Now().Add(300 * time.Millisecond); time.Now().Before(end); time.Sleep(10 * time.Millisecond) {
+		err := newLead.AllowWrite()
+		if err == nil {
+			t.Fatal("new leader accepted a write before applying the previous term's entries")
+		}
+		if !nerr.HasCode(err, nerr.Unavailable) {
+			t.Fatalf("AllowWrite = %v, want Unavailable", err)
+		}
+	}
+	// Nor serve a STRONG read from that older state.
+	if err := newLead.StrongReadBarrier(); err == nil || !nerr.HasCode(err, nerr.Unavailable) {
+		t.Fatalf("StrongReadBarrier on a leader behind its predecessor = %v, want Unavailable", err)
+	}
+	// AwaitLeaderReady is bounded by the apply timeout.
+	start := time.Now()
+	newLead.AwaitLeaderReady()
+	if waited := time.Since(start); waited < 2*time.Second || waited > 10*time.Second {
+		t.Fatalf("AwaitLeaderReady returned after %s, want about the 3s apply timeout", waited)
+	}
+	// Membership changes do not wait on the FSM.
+	if err := newLead.requireLeader("test"); err != nil {
+		t.Fatalf("requireLeader on the new leader: %v", err)
+	}
+	release()
+	waitWritable(t, newLead)
+	start = time.Now()
+	newLead.AwaitLeaderReady()
+	if waited := time.Since(start); waited > time.Second {
+		t.Fatalf("AwaitLeaderReady on a ready leader waited %s", waited)
+	}
+	if err := newLead.StrongReadBarrier(); err != nil {
+		t.Fatalf("StrongReadBarrier on a ready leader: %v", err)
+	}
+}
+
+func waitWritable(t *testing.T, c *Cluster) {
+	t.Helper()
+	var err error
+	for end := time.Now().Add(raftConverge); time.Now().Before(end); time.Sleep(10 * time.Millisecond) {
+		if err = c.AllowWrite(); err == nil {
+			return
+		}
+	}
+	t.Fatalf("leader never became writable: %v", err)
 }
 
 func TestRaftPartitionNoSplitBrainWrite(t *testing.T) {

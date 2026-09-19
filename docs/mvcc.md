@@ -103,18 +103,43 @@ document-length, and statistics records use the same eligibility and cleanup pat
 ## Recovery
 
 1. REDO committed `PageImage` / tree / allocator records (Phase 3).
-2. Apply UNDO for transactions that began and never committed or aborted.
+2. Apply UNDO for transactions that never committed: those still open at the crash and those with an `Abort` record (`recovery.NotCommittedUntil`, `docs/wal.md`).
 
 ### UNDO durability
 
-`undo.Log.Flush` writes its buffer without an `fsync` of its own, and that is
-deliberate, not an omission: the WAL is the durability authority, and undo
-state for any transaction that matters at recovery time is re-derivable from
-redo plus the undo records the log rewrites on the paths that *do* carry a
-barrier — `Vacuum` and the control file, both of which `fsync` through
-`diskio.Sync` and fail closed. A commit is never acknowledged on the strength
-of an undo write. The asymmetry with the WAL is intentional; see
-`docs/wal.md`.
+Undo state is **not** re-derivable from redo. A logged page image -- a
+commit's, or the system transaction that logs a split -- carries every row
+version on its page, including other transactions' uncommitted ones, and only
+their undo records hold the values those versions replaced. If redo installs
+such an image and the undo record is gone, recovery cannot put the old value
+back.
+
+Two rules keep that from happening:
+
+1. **Written before the image is logged.** Btree appends a version's undo
+   record before it changes the page, and `Engine.appendPageStatesLocked`
+   writes the undo buffer after the images are copied and before they are
+   appended to the WAL (`tests/crash`
+   `TestPageImageDoesNotOutrunTheUndoItCarries`).
+2. **Durable before the WAL writes.** The WAL runs `undo.Log.Sync` before it
+   writes any record to a segment (`wal.Log.SetBeforeWrite`). It must precede
+   the write, not merely the WAL `fsync`: recovery replays a committed image
+   found on disk whether or not its `fsync` returned, and writeback can put WAL
+   bytes on disk at any time. `Sync` fsyncs only when unsynced undo bytes
+   exist, and runs without the log's mutex so appends continue
+   (`TestPageImageDoesNotOutrunTheUndoItCarriesAcrossPowerLoss`).
+
+A failed undo write or `fsync` latches, as the WAL's barriers do: every later
+`Sync`, and so every WAL write, fails until restart. `undo.Open` cuts a torn
+tail — a partial record left by power loss — before appending; previously new
+records landed past the point replay stops and were lost on the next open.
+
+**Cost.** Roughly one extra `fsync` per commit group: measured p50 on ext4,
+single-connection update 2.45 → 3.6 ms and insert 1.26 → 2.4 ms, 16
+connections 2.4–2.5 → 4.6 ms (`TODO.md` log #301). Carrying the replaced
+version in the WAL's `Undo` record would let WAL order alone provide this,
+and would also give followers the undo they currently lack
+(`docs/production/GAPS.md`).
 
 In-process rollback applies the transaction's undo chain, then restores pages that only that transaction dirtied.
 

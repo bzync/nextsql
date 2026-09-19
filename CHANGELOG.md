@@ -13,6 +13,52 @@ different bits.
 
 ---
 
+## [Unreleased]
+
+### Fixed
+
+- **A crash could lose hundreds of acknowledged commits at once.** A commit
+  copied its changed pages and wrote the copies to the WAL a moment later; in
+  between, another transaction could change the same page and log its newer
+  copy first. Recovery replays in log order, so it ended on the older copy:
+  rows another transaction had committed were lost, together with any rows a
+  B+Tree split had moved to new pages. It needed a flush slow enough to open
+  the window, so it rarely showed on fast disks. A commit now logs its copies
+  before any page can change again.
+- **A crash could lose or change a committed row.** A logged page image carries
+  every row version on its page, including other transactions' uncommitted
+  ones, and undo records were buffered in memory. A commit could copy a page
+  just after another transaction changed it, and a B+Tree split logged pages
+  without writing the buffer at all, so after a crash redo installed a version
+  whose undo record never reached disk: a committed row went missing, or a
+  rolled-back transfer came back half applied. Undo records are now written
+  before any image that carries their versions enters the WAL, and made
+  durable before the WAL writes it: the WAL now fsyncs the undo log first
+  whenever it holds unsynced records, so the guarantee holds across power
+  loss, not only a process crash. This costs roughly one extra `fsync` per
+  commit group (measured p50 on ext4: single-connection update 2.45 → 3.6 ms,
+  16 connections 2.4 → 4.6 ms). A failed undo write or `fsync` now stops
+  further commits until restart, as a failed WAL `fsync` already did.
+- **Undo records appended after a power loss could be lost.** A partial record
+  left at the end of the undo log was skipped on open but not removed, so new
+  records were written past the point the next open stops reading. Open now
+  cuts the partial record first.
+- **A new Raft leader could deadlock its first write.** A follower elected with
+  committed entries still waiting to be applied accepted writes at once; the
+  write held the executor's apply guard while waiting on Raft, and Raft's apply
+  of the earlier entry needed that guard exclusively. A new leader now accepts
+  writes, and serves `STRONG` reads, only after a Raft barrier confirms it has
+  applied everything committed before its term. A statement arriving in that
+  window waits for it, bounded by the apply timeout, then fails `unavailable`
+  and can be retried.
+
+### Known issues
+
+- **Followers can serve a leader's uncommitted or rolled-back row versions**,
+  and a failover in that window can make them committed. A follower installs
+  the leader's page images without the undo records for the uncommitted
+  versions they carry. See `docs/production/GAPS.md`.
+
 ## [0.0.2] — 2026-09-19
 
 ### Fixed

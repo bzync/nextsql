@@ -53,6 +53,17 @@ type Log struct {
 	recs      map[format.UndoID]Record
 	byTxn     map[format.TxnID]format.UndoID
 	wbuf      []byte
+
+	// syncMu serializes Sync's fsync, which runs without mu so appends
+	// continue meanwhile, against anything that closes or replaces file.
+	// Lock order: syncMu, then mu.
+	syncMu sync.Mutex
+	// written counts bytes written to file; synced is the count a
+	// completed fsync covered.
+	written uint64
+	synced  uint64
+	// syncErr latches a failed write or fsync; see Sync.
+	syncErr error
 }
 
 func Create(dir string, pageKeys crypto.KeyProvider, ident format.Identity) (*Log, error) {
@@ -166,6 +177,8 @@ func (l *Log) Close() error {
 	if l == nil {
 		return nil
 	}
+	l.syncMu.Lock()
+	defer l.syncMu.Unlock()
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.file == nil {
@@ -187,6 +200,8 @@ func (l *Log) CrashClose() {
 	if l == nil {
 		return
 	}
+	l.syncMu.Lock()
+	defer l.syncMu.Unlock()
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.file != nil {
@@ -325,8 +340,13 @@ func (l *Log) VacuumBudgeted(budget *maintenance.Budget) error {
 	if l == nil {
 		return nil
 	}
+	l.syncMu.Lock()
+	defer l.syncMu.Unlock()
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if l.syncErr != nil {
+		return l.syncErr
+	}
 	if l.file == nil {
 		return nerr.New(nerr.Internal, "undo.Vacuum", "log is closed")
 	}
@@ -398,11 +418,17 @@ func (l *Log) VacuumBudgeted(budget *maintenance.Budget) error {
 	if err != nil {
 		return nerr.Wrap(nerr.IO, "undo.Vacuum", "reopen log", err)
 	}
-	return diskio.SyncDir(l.dir)
+	if err := diskio.SyncDir(l.dir); err != nil {
+		return err
+	}
+	// The rewritten log was synced before the rename.
+	l.synced = l.written
+	return nil
 }
 
-// Flush writes buffered UNDO records. Commit must flush before the
-// commit record so version chains survive recovery.
+// Flush writes buffered UNDO records to the file, without an fsync. The engine
+// calls it before a page image enters the WAL; Sync makes the records durable
+// before the WAL writes that image to disk.
 func (l *Log) Flush() error {
 	if l == nil {
 		return nil
@@ -413,20 +439,119 @@ func (l *Log) Flush() error {
 }
 
 func (l *Log) flushBufLocked() error {
+	if l.syncErr != nil {
+		return l.syncErr
+	}
 	if l.file == nil || len(l.wbuf) == 0 {
 		return nil
 	}
-	if _, err := l.file.Write(l.wbuf); err != nil {
-		return nerr.Wrap(nerr.IO, "undo.Flush", "write", err)
+	n, err := diskio.Write(l.file, l.wbuf)
+	l.written += uint64(n)
+	if err != nil {
+		wrapped := nerr.Wrap(nerr.IO, "undo.Flush", "write", err)
+		if n > 0 {
+			// A torn record now sits at the file's end; appending after
+			// it would put every later record past the point replay
+			// stops. Latch.
+			l.syncErr = wrapped
+		}
+		return wrapped
 	}
 	l.wbuf = l.wbuf[:0]
 	return nil
 }
 
+// Sync makes every undo record appended so far durable. The WAL runs it
+// before writing any record to a segment (wal.Log.SetBeforeWrite), because a
+// logged page image carries every version on its page, including other
+// transactions' uncommitted ones, and only their undo records hold the values
+// those versions replaced. Recovery replays a committed image found on disk
+// whether or not its fsync returned, so the undo must be durable before the
+// WAL bytes are even written, not merely before they are synced.
+//
+// It fsyncs only when bytes were written since the last sync, and without mu,
+// so appends continue meanwhile. A failed write or fsync latches, as the WAL
+// does (docs/wal.md "Failed durability barriers latch"): a later fsync would
+// not cover what the failed one lost, so no image may be written after it.
+func (l *Log) Sync() error {
+	if l == nil {
+		return nil
+	}
+	l.syncMu.Lock()
+	defer l.syncMu.Unlock()
+	l.mu.Lock()
+	if l.file == nil {
+		defer l.mu.Unlock()
+		if l.syncErr != nil {
+			return l.syncErr
+		}
+		if len(l.wbuf) > 0 || l.written > l.synced {
+			return nerr.New(nerr.Internal, "undo.Sync", "log is closed")
+		}
+		return nil
+	}
+	if err := l.flushBufLocked(); err != nil {
+		l.mu.Unlock()
+		return err
+	}
+	target, f := l.written, l.file
+	clean := target <= l.synced
+	l.mu.Unlock()
+	if clean {
+		return nil
+	}
+	err := diskio.DataSync(f)
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if err != nil {
+		l.syncErr = nerr.Wrap(nerr.IO, "undo.Sync", "fdatasync", err)
+		return l.syncErr
+	}
+	if target > l.synced {
+		l.synced = target
+	}
+	return nil
+}
+
+// replay loads every record up to the first that does not read back whole,
+// then cuts the file there and leaves it positioned for appends.
+//
+// A record that does not read back whole is a torn tail: undo writes are not
+// synced until the WAL needs them, so power loss can leave a partial record at
+// the end. Replay has always stopped there. Leaving those bytes in place was
+// wrong: appends went wherever the read had stopped, inside or after the torn
+// record, so the next replay stopped at the same point and every record
+// written since was lost (TestOpenCutsATornTailSoLaterRecordsSurvive).
 func (l *Log) replay() error {
 	if _, err := l.file.Seek(0, io.SeekStart); err != nil {
 		return nerr.Wrap(nerr.IO, "undo.Open", "seek", err)
 	}
+	var end int64
+	if err := l.replayRecords(&end); err != nil {
+		return err
+	}
+	st, err := l.file.Stat()
+	if err != nil {
+		return nerr.Wrap(nerr.IO, "undo.Open", "stat", err)
+	}
+	if st.Size() > end {
+		if err := l.file.Truncate(end); err != nil {
+			return nerr.Wrap(nerr.IO, "undo.Open", "truncate torn tail", err)
+		}
+		if err := diskio.Sync(l.file); err != nil {
+			return nerr.Wrap(nerr.IO, "undo.Open", "sync torn-tail truncation", err)
+		}
+	}
+	if _, err := l.file.Seek(end, io.SeekStart); err != nil {
+		return nerr.Wrap(nerr.IO, "undo.Open", "seek", err)
+	}
+	l.written, l.synced = uint64(end), uint64(end)
+	return nil
+}
+
+// replayRecords reads records from the file's current position, advancing
+// *end past each one that reads back whole.
+func (l *Log) replayRecords(end *int64) error {
 	hdr := make([]byte, HeaderSize)
 	for {
 		if _, err := io.ReadFull(l.file, hdr); err != nil {
@@ -467,6 +592,7 @@ func (l *Log) replay() error {
 		if id >= l.nextID {
 			l.nextID = id + 1
 		}
+		*end += int64(HeaderSize + ctLen)
 	}
 }
 

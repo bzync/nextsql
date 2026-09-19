@@ -139,6 +139,21 @@ on stable storage. A waiter on a log that closes underneath it fails with
 `unavailable` instead of waiting forever. The replicated commit path is
 unchanged: it still serializes whole commits across the Raft round trip.
 
+### Images reach the log in the order of the page states they copy
+
+Recovery replays a page's images in LSN order and ends on the last, so a
+page's images must carry LSNs in the order of the states they copied. A commit
+copies its dirty pages under `pageMu` held for reading, which excludes page
+writers, and keeps that hold until the images are appended
+(`flushDirtyImages`; `logStructure` likewise). It used to release `pageMu`
+after copying and append only once it had the engine mutex again. In between,
+another transaction could change a page, copy it and append its newer image
+first; the older copy then took the higher LSN and recovery ended on it,
+losing acknowledged rows and orphaning the leaves a split had created. It
+predates group commit and page deltas; a slower flush exposed it, because
+waiting longer for the engine mutex widened the window
+(`tests/crash` `TestConcurrentCommitsSurvivePowerLossWithSlowFlush`, log #301).
+
 ### Structure modifications are logged as system transactions
 
 A B+tree split or merge takes effect as soon as it happens: other
@@ -184,6 +199,12 @@ A write that consumed **no** bytes does not latch: the buffer is intact at an
 unchanged offset, so a transient `ENOSPC` an operator clears can still make
 progress. A partial write does latch, because the segment then carries a torn
 record that a later write cannot repair in place.
+
+The undo log's barrier latches too. The WAL runs `undo.Log.Sync` before
+writing any record to a segment (`SetBeforeWrite`), because a logged page
+image can carry an uncommitted version that only its undo record can reverse
+(`docs/mvcc.md` "UNDO durability"). A failed undo write or `fsync` fails that
+flush with nothing written, and every later one, until restart.
 
 Page and allocator syncs do not latch — they are re-derivable by redo, and the
 WAL is the durability authority.

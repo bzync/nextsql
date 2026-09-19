@@ -166,8 +166,10 @@ version exactly matches `internal/version.String`. The
 3. builds and verifies the Linux amd64 artifacts in
    runner-temporary storage;
 4. publishes those artifacts and `SHA256SUMS` to GitHub Releases; and
-5. invokes the Pages workflow to rebuild the Downloads catalog from the
-   published GitHub metadata.
+5. dispatches the Pages workflow on `master` to rebuild the Downloads
+   catalog from the published GitHub metadata (the `github-pages`
+   environment only deploys from `master`, so it cannot run in the tag's
+   context).
 
 Use the manual workflow dispatch only to package an existing tag that does not
 already have a release. Re-cutting released bits requires a new version and tag.

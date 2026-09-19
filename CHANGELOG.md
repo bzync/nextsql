@@ -17,6 +17,12 @@ different bits.
 
 ### Fixed
 
+- **`ANALYZE` failed on wide partitioned tables** with `record exceeds page
+  capacity`. Each partition's local statistics were trimmed to a 15 KiB cap,
+  but a catalog record holds only about 8 KiB, so a partitioned table with
+  many long text values could not be analyzed at all. The earlier fix covered
+  only the table-wide statistics. Local statistics are now trimmed to the real
+  record limit; the dropped columns fall back to the table-wide statistics.
 - **A crash could lose hundreds of acknowledged commits at once.** A commit
   copied its changed pages and wrote the copies to the WAL a moment later; in
   between, another transaction could change the same page and log its newer

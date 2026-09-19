@@ -13,6 +13,7 @@ import (
 	"github.com/bzync/nextsql/internal/nerr"
 	"github.com/bzync/nextsql/internal/security"
 	"github.com/bzync/nextsql/internal/sql/types"
+	"github.com/bzync/nextsql/internal/storage/btree"
 	"github.com/bzync/nextsql/internal/wal"
 )
 
@@ -223,8 +224,37 @@ func TestPartitionStatsByteBoundTrimsLowestPriorityColumns(t *testing.T) {
 	if bounded.Columns[0].Ord != 0 {
 		t.Fatalf("priority prefix was not preserved: %+v", bounded.Columns)
 	}
-	if raw, err := catalog.EncodePartitionStats(1, [32]byte{}, bounded); err != nil || len(raw) > catalog.MaxPartitionStatsBytes {
-		t.Fatalf("bounded partition statistics do not encode: bytes=%d err=%v", len(raw), err)
+	limit := btree.MaxTxnValueSize(len(catalog.PartitionStatsKey(1, part.ID)))
+	if raw, err := catalog.EncodePartitionStats(1, [32]byte{}, bounded); err != nil || len(raw) > limit {
+		t.Fatalf("bounded partition statistics do not fit a catalog record: bytes=%d limit=%d err=%v", len(raw), limit, err)
+	}
+}
+
+// A partition sketch between the storable record size (~8 KiB) and the NSPS
+// decoder cap (15 KiB) used to pass bounding and then fail the catalog write.
+func TestAnalyzeWidePartitionedTable(t *testing.T) {
+	db := testDB(t)
+	s := db.Session()
+	cols := []string{"id STRING", "k STRING NOT NULL"}
+	vals := []string{"'1'", "'a'"}
+	for i := 0; i < 25; i++ {
+		cols = append(cols, fmt.Sprintf("c%d STRING", i))
+		vals = append(vals, "'"+strings.Repeat("x", 250)+"'")
+	}
+	execOK(t, s, `CREATE TABLE wide (`+strings.Join(cols, ", ")+`, PRIMARY KEY (k, id)) PARTITION BY RANGE (k) (PARTITION p0 VALUES LESS THAN ('m'), PARTITION p1 VALUES LESS THAN MAXVALUE)`)
+	execOK(t, s, `INSERT INTO wide VALUES (`+strings.Join(vals, ", ")+`)`)
+	execOK(t, s, `ANALYZE wide`)
+	st, ok := db.Cat.Stats("wide")
+	if !ok || st.Rows != 1 || len(st.Partitions) != 2 {
+		t.Fatalf("wide table statistics: ok=%v stats=%+v", ok, st)
+	}
+	for _, part := range st.Partitions {
+		if part.Rows == 0 {
+			continue
+		}
+		if len(part.Columns) == 0 || len(part.Columns) >= len(cols) {
+			t.Fatalf("partition %d sketch width %d, want trimmed but non-empty", part.ID, len(part.Columns))
+		}
 	}
 }
 

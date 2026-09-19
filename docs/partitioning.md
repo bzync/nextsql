@@ -372,8 +372,10 @@ vacuous — a healthy fraction of the generated cases must actually prune.
 `NSST` v3 descriptor and writes a separate compact `NSPS` v1 record for each
 physical member. `NSPS` is keyed by immutable table/partition IDs and contains
 bounded local column NULL/NDV/min/max/correlation, index selectivity, and vector
-population sketches. Each record caps every sketch class at 64 and the total at
-15 KiB; routing, indexed, and vector columns take priority, histograms/MCVs remain global, and
+population sketches. Each record caps every sketch class at 64, and ANALYZE
+trims it (lowest-priority sketches first) until it fits one catalog record
+(`btree.MaxTxnValueSize`, about 8 KiB); the decoder rejects anything over
+15 KiB. Routing, indexed, and vector columns take priority, histograms/MCVs remain global, and
 local sampling is capped at 4,096 rows. The optimizer sums exact counts and
 merges local sketches only when every pruned stable ID is covered. Missing or
 stale identities/sketches fall back to global `NSST`, preventing partition DDL

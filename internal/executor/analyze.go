@@ -565,9 +565,16 @@ func (s *Session) finishPartitionStats(tab *catalog.Table, id uint32, a *analyze
 // boundPartitionStats keeps validate-all-before-mutation memory below the
 // per-record catalog limit. It preserves the deterministic priority prefix and
 // converges in logarithmic steps for adversarial wide/value-heavy schemas.
+//
+// The limit is the catalog tree's transactional value size, not the NSPS
+// decoder cap (MaxPartitionStatsBytes, 15 KiB): a record between the two
+// encodes but cannot be stored, so ANALYZE of a wide partitioned table failed
+// with "record exceeds page capacity". The snapshot digest is fixed-size, so
+// bounding with a zero digest matches the persisted length.
 func boundPartitionStats(tableID uint32, out catalog.PartitionStats) catalog.PartitionStats {
+	limit := btree.MaxTxnValueSize(len(catalog.PartitionStatsKey(tableID, out.ID)))
 	for attempts := 0; attempts < 24; attempts++ {
-		if _, err := catalog.EncodePartitionStats(tableID, [32]byte{}, out); err == nil {
+		if raw, err := catalog.EncodePartitionStats(tableID, [32]byte{}, out); err == nil && len(raw) <= limit {
 			return out
 		}
 		switch {

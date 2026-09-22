@@ -905,11 +905,11 @@ func maintenanceActionSQL(op, target, scope string, online bool) (string, error)
 }
 
 // handleMaintenanceAction issues one M7 maintenance statement on the
-// operator's own connection. The 30s context matches the Server's own
-// http.Server.WriteTimeout ceiling (server.go) — a REBUILD INDEX or MAINTAIN
-// pass expected to run longer than that (a very large table/index) needs
-// `nextsql exec` today, not the Manager; ANALYZE/MAINTAIN's own 10,000-
-// tombstone-per-statement cap keeps the common case well under it.
+// operator's own connection. The 30s context cancels the statement and
+// returns an error; it does not close the session or the browser
+// connection. A REBUILD INDEX or MAINTAIN pass expected to run longer than
+// that (a very large table/index) needs `nextsql exec`; ANALYZE/MAINTAIN's
+// own 10,000-tombstone-per-statement cap keeps the common case well under it.
 func (s *Server) handleMaintenanceAction(w http.ResponseWriter, r *http.Request, sess *session) {
 	var req maintenanceActionRequest
 	if err := json.NewDecoder(io.LimitReader(r.Body, maxActionBody)).Decode(&req); err != nil {

@@ -7,7 +7,6 @@ import {
   ListItem,
   Modal,
   ModalBody,
-  ModalFooter,
   ModalHeader,
   ModalTitle,
   Spinner,
@@ -17,6 +16,7 @@ import {
 import type { Security } from "../ops/api";
 import { AuditVerifyCard } from "../ops/AuditVerifyCard";
 import { ResultTable } from "../ops/ResultTable";
+import { ViewerDialogFooter } from "../shared/dialog";
 
 // Studio's Audit viewer is a read-only projection of the exact live,
 // admin-only audit_verify/audit_log data Operations Security already reads.
@@ -83,12 +83,7 @@ export function AuditExplorer({
           ) : null}
         </Stack>
       </ModalBody>
-      <ModalFooter>
-        <Button variant="outline" onClick={onClose}>Close</Button>
-        <Button variant="primary" onClick={onRefresh} disabled={loading}>
-          {loading && data ? "Refreshing…" : "Refresh"}
-        </Button>
-      </ModalFooter>
+      <ViewerDialogFooter onClose={onClose} onRefresh={onRefresh} loading={loading} />
     </Modal>
   );
 }

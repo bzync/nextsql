@@ -9,6 +9,7 @@ import {
   CardTitle,
   ConfirmDialog,
   CodeBlock,
+  EmptyState,
   Inline,
   InlineCode,
   Input,
@@ -27,6 +28,7 @@ import { useReadModel } from "../useReadModel";
 import { ViewFrame } from "./ViewFrame";
 import { Section } from "./Section";
 import { Icon } from "../../shared/icons";
+import { TableFilter } from "../../shared/TableFilter";
 
 // Backups is the M5 view: system.backups (the verified backups in the node's
 // configured backup_dir) plus BACKUP DATABASE and VERIFY BACKUP, both gated
@@ -173,43 +175,31 @@ export function Backups({ onUnauthorized }: { onUnauthorized: () => void }) {
 
           <Section title="Backups" icon="archive">
             {rows.length === 0 ? (
-              <Text variant="muted" size="sm">
-                {backupDirUnset
-                  ? "No backups — this server has no backup_dir configured (see above)."
-                  : "No backups yet on this server."}
-              </Text>
+              <EmptyState
+                size="sm"
+                density="compact"
+                icon={<Icon name="archive" />}
+                title={backupDirUnset ? "No backups" : "No backups yet"}
+                description={
+                  backupDirUnset
+                    ? "This server has no backup_dir configured (see above)."
+                    : "Back up this server to create the first one."
+                }
+              />
             ) : (
               <div className="nsm-table-container">
                 {rows.length > 5 ? (
                   <div className="nsm-table-toolbar">
                     <Inline gap="sm" align="center" justify="between" wrap>
-                      <div className="nsm-table-search">
-                        <Icon name="search" size={13} className="nsm-table-search-icon" />
-                        <input
-                          type="search"
-                          value={search}
-                          onChange={(e) => {
-                            setSearch(e.target.value);
-                            setPage(1);
-                          }}
-                          placeholder="Search backups…"
-                          className="nsm-table-search-input"
-                          aria-label="Filter backups"
-                        />
-                        {search ? (
-                          <button
-                            type="button"
-                            onClick={() => {
-                              setSearch("");
-                              setPage(1);
-                            }}
-                            className="nsm-table-search-clear"
-                            aria-label="Clear filter"
-                          >
-                            ×
-                          </button>
-                        ) : null}
-                      </div>
+                      <TableFilter
+                        value={search}
+                        onChange={(next) => {
+                          setSearch(next);
+                          setPage(1);
+                        }}
+                        placeholder="Search backups…"
+                        label="Filter backups"
+                      />
                       {search ? (
                         <Badge variant="muted" size="sm">
                           {filteredRows.length} of {rows.length} matched

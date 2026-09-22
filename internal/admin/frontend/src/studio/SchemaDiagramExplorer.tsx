@@ -8,7 +8,6 @@ import {
   ListItem,
   Modal,
   ModalBody,
-  ModalFooter,
   ModalHeader,
   ModalTitle,
   Spinner,
@@ -17,6 +16,7 @@ import {
   Text,
 } from "@bzync/rui";
 import type { StudioSchemaGraph } from "../ops/api";
+import { ViewerDialogFooter } from "../shared/dialog";
 import {
   buildSchemaGraph,
   layoutSchemaGraph,
@@ -172,12 +172,7 @@ export function SchemaDiagramExplorer({
           ) : null}
         </Stack>
       </ModalBody>
-      <ModalFooter>
-        <Button variant="outline" onClick={onClose}>Close</Button>
-        <Button variant="primary" onClick={onRefresh} disabled={loading}>
-          {loading && data ? "Refreshing…" : "Refresh"}
-        </Button>
-      </ModalFooter>
+      <ViewerDialogFooter onClose={onClose} onRefresh={onRefresh} loading={loading} />
     </Modal>
   );
 }

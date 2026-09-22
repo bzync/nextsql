@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { usePathname } from "next/navigation";
+import { Button } from "@bzync/rui";
 
 function escapeRegex(str: string): string {
   return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -308,41 +309,47 @@ export function SearchHighlighter() {
         {activeIndex + 1} of {totalMatches}
       </span>
       <div className="flex items-center gap-0.5 border-l border-line pl-1.5">
-        <button
+        <Button
           type="button"
+          variant="ghost"
+          size="icon"
+          className="size-5"
           onClick={() => scrollToMatch(activeIndex - 1, marksRef.current)}
           disabled={totalMatches <= 1}
           aria-label="Previous match (Shift+Enter)"
           title="Previous match (Shift+Enter)"
-          className="flex h-5 w-5 items-center justify-center rounded hover:bg-bg-hover text-muted hover:text-ink disabled:opacity-30 transition-colors"
         >
           <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
             <path d="m18 15-6-6-6 6" />
           </svg>
-        </button>
-        <button
+        </Button>
+        <Button
           type="button"
+          variant="ghost"
+          size="icon"
+          className="size-5"
           onClick={() => scrollToMatch(activeIndex + 1, marksRef.current)}
           disabled={totalMatches <= 1}
           aria-label="Next match (Enter)"
           title="Next match (Enter)"
-          className="flex h-5 w-5 items-center justify-center rounded hover:bg-bg-hover text-muted hover:text-ink disabled:opacity-30 transition-colors"
         >
           <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
             <path d="m6 9 6 6 6-6" />
           </svg>
-        </button>
-        <button
+        </Button>
+        <Button
           type="button"
+          variant="ghost"
+          size="icon"
+          className="ml-1 size-5"
           onClick={handleClear}
           aria-label="Clear highlights (Esc)"
           title="Clear highlights (Esc)"
-          className="ml-1 flex h-5 w-5 items-center justify-center rounded hover:bg-bg-hover text-muted hover:text-ink transition-colors"
         >
           <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
             <path d="M18 6 6 18M6 6l12 12" />
           </svg>
-        </button>
+        </Button>
       </div>
     </div>
   );

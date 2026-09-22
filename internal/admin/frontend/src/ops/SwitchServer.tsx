@@ -17,6 +17,7 @@ import {
   Text,
 } from "@bzync/rui";
 import { ApiError, api, type SessionProfile, type Whoami } from "./api";
+import { EnvironmentBadge } from "../shared/status";
 
 // Switch the whole Admin session — Operations and Studio — to another
 // nextsqld server declared as a connection profile, or to the same server as
@@ -191,11 +192,7 @@ export function SwitchServer({
                   <Badge variant={target.tls ? "success" : "warning"} size="sm">
                     {target.tls ? (target.mtls ? "TLS 1.3 + client certificate" : "TLS 1.3") : "plaintext (loopback)"}
                   </Badge>
-                  {target.environment ? (
-                    <Badge variant={target.environment === "production" ? "warning" : "muted"} size="sm">
-                      {target.environment}
-                    </Badge>
-                  ) : null}
+                  {target.environment ? <EnvironmentBadge environment={target.environment} /> : null}
                   {target.database ? <Badge variant="muted" size="sm" className="font-mono">db:{target.database}</Badge> : null}
                 </Inline>
               ) : null}

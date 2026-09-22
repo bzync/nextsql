@@ -14,6 +14,7 @@ import {
   TableHead,
   TableHeader,
   TableRow,
+  EmptyState,
   Text,
 } from "@bzync/rui";
 import { api, ApiError, type ResultSet } from "../api";
@@ -21,6 +22,7 @@ import { useReadModel } from "../useReadModel";
 import { ViewFrame } from "./ViewFrame";
 import { Section } from "./Section";
 import { Icon } from "../../shared/icons";
+import { TableFilter } from "../../shared/TableFilter";
 
 // Configuration is the M8 view: the running config.Config (system.config)
 // with, per key, its value in the running process, its value in the node's
@@ -123,40 +125,26 @@ export function Configuration({ onUnauthorized }: { onUnauthorized: () => void }
 
           <Section title="Running configuration" icon="sliders">
             {rows.length === 0 ? (
-              <Text variant="muted" size="sm">
-                No process-level configuration attached (embedded/CLI use).
-              </Text>
+              <EmptyState
+                size="sm"
+                density="compact"
+                icon={<Icon name="sliders" />}
+                title="No process-level configuration"
+                description="This process was started without a config file (embedded or CLI use)."
+              />
             ) : (
               <div className="nsm-table-container">
                 <div className="nsm-table-toolbar">
                   <Inline gap="sm" align="center" justify="between" wrap>
-                    <div className="nsm-table-search">
-                      <Icon name="search" size={13} className="nsm-table-search-icon" />
-                      <input
-                        type="search"
-                        value={search}
-                        onChange={(e) => {
-                          setSearch(e.target.value);
-                          setPage(1);
-                        }}
-                        placeholder="Search settings…"
-                        className="nsm-table-search-input"
-                        aria-label="Filter configuration settings"
-                      />
-                      {search ? (
-                        <button
-                          type="button"
-                          onClick={() => {
-                            setSearch("");
-                            setPage(1);
-                          }}
-                          className="nsm-table-search-clear"
-                          aria-label="Clear filter"
-                        >
-                          ×
-                        </button>
-                      ) : null}
-                    </div>
+                    <TableFilter
+                      value={search}
+                      onChange={(next) => {
+                        setSearch(next);
+                        setPage(1);
+                      }}
+                      placeholder="Search settings…"
+                      label="Filter configuration settings"
+                    />
                     {search ? (
                       <Badge variant="muted" size="sm">
                         {filteredRows.length} of {rows.length} matched

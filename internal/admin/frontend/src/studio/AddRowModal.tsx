@@ -2,6 +2,7 @@ import { useState, type FormEvent } from "react";
 import {
   Badge,
   Button,
+  Checkbox,
   Inline,
   Input,
   Modal,
@@ -73,23 +74,17 @@ export function AddRowModal({
                         </Text>
                         <Badge variant="info">{type}</Badge>
                       </Inline>
-                      <label>
-                        <Inline gap="xs" align="center">
-                          <input
-                            type="checkbox"
-                            checked={isNull}
-                            onChange={(e) =>
-                              setNullFlags((prev) => ({
-                                ...prev,
-                                [col]: e.target.checked,
-                              }))
-                            }
-                          />
-                          <Text size="xs" variant="muted">
-                            NULL
-                          </Text>
-                        </Inline>
-                      </label>
+                      <Checkbox
+                        label="NULL"
+                        size="sm"
+                        checked={isNull}
+                        onChange={(e) =>
+                          setNullFlags((prev) => ({
+                            ...prev,
+                            [col]: e.target.checked,
+                          }))
+                        }
+                      />
                     </Inline>
                     {!isNull ? (
                       <Input

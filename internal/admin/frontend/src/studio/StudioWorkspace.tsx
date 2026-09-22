@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
 import {
   Alert,
   Badge,
@@ -14,6 +14,7 @@ import {
   Heading,
   Inline,
   Input,
+  DropdownMenu,
   Popover,
   PopoverContent,
   Select,
@@ -23,6 +24,7 @@ import {
 } from "@bzync/rui";
 import { SqlCodeEditor } from "./SqlCodeEditor";
 import { Icon, type IconName } from "../shared/icons";
+import { ConnectionBadge, EnvironmentBadge } from "../shared/status";
 import {
   ApiError,
   api,
@@ -243,6 +245,12 @@ type StudioTab = {
   title: string;
   sql: string;
   result: StudioResultSet | null;
+  // resultSQL is the statement that produced `result`, which is not always
+  // `sql`: Run Selection executes only the highlight, and the editor can be
+  // edited after the rows arrive. The data grid writes back to this
+  // statement's table. Using the live buffer would UPDATE a different table
+  // with the displayed rows' primary keys.
+  resultSQL: string | null;
   queryError: string | null;
   ranSelection: boolean;
   script: ScriptStatementResult[] | null;
@@ -259,7 +267,7 @@ const MAX_STUDIO_TABS = 8;
 
 function newTab(id: string, title: string, sql: string): StudioTab {
   return {
-    id, title, sql, result: null, queryError: null, ranSelection: false,
+    id, title, sql, result: null, resultSQL: null, queryError: null, ranSelection: false,
     script: null, scriptSelected: null, resultContext: null, planBaseline: null,
     paramValues: {},
   };
@@ -450,7 +458,6 @@ export function StudioWorkspace({
   const [hasSelection, setHasSelection] = useState(false);
   const [history, setHistory] = useState<StudioHistoryEntry[]>([]);
   const [historyOpen, setHistoryOpen] = useState(false);
-  const [moreOpen, setMoreOpen] = useState(false);
   const [grantBuilderOpen, setGrantBuilderOpen] = useState(false);
   const [grantPrefill, setGrantPrefill] = useState<GrantBuilderState | null>(null);
   const [fullTextExplorerOpen, setFullTextExplorerOpen] = useState(false);
@@ -518,7 +525,7 @@ export function StudioWorkspace({
 
   const activeTab = tabs.find((t) => t.id === activeTabId) ?? tabs[0];
   const sql = activeTab.sql;
-  const { result, queryError, ranSelection, script, scriptSelected, resultContext } = activeTab;
+  const { result, resultSQL, queryError, ranSelection, script, scriptSelected, resultContext } = activeTab;
   const selectedScriptRow = script && scriptSelected !== null ? script[scriptSelected] : null;
   const otherTabRunning = running && runningTabId !== activeTabId;
   const runningTab = tabs.find((t) => t.id === runningTabId);
@@ -782,6 +789,16 @@ export function StudioWorkspace({
     return () => document.removeEventListener("selectionchange", update);
   }, []);
 
+  // A controlled textarea can move its caret when React applies a new value
+  // without a selectionchange event. Read it back after commit so completion
+  // (NEAREST / JSON paths) sees the caret the editor is actually using.
+  useLayoutEffect(() => {
+    const textarea = editorHost.current?.querySelector("textarea");
+    if (!textarea) return;
+    const next = textarea.selectionEnd;
+    setCursorPos((prev) => (prev === next ? prev : next));
+  });
+
   // Switching tabs swaps the single mounted editor's bound text without a
   // native selection event; any stale selection from the previous tab no
   // longer means anything, so treat every tab switch as starting unselected,
@@ -974,9 +991,9 @@ export function StudioWorkspace({
 
   // Editable data grid & transactional changes
   const editableTable = useMemo(() => {
-    if (!result || !sql) return null;
-    return detectEditableTable(sql, catalogTableNames);
-  }, [result, sql, catalogTableNames]);
+    if (!result || !resultSQL) return null;
+    return detectEditableTable(resultSQL, catalogTableNames);
+  }, [result, resultSQL, catalogTableNames]);
 
   const [editableDetail, setEditableDetail] = useState<StudioTableDetail | null>(null);
 
@@ -1253,50 +1270,46 @@ export function StudioWorkspace({
   const geoSupported = useMemo(() => capabilityAvailable(bootstrap, "geo"), [bootstrap]);
 
   const moreGroups = useMemo(() => {
-    const run = (action: () => void) => {
-      setMoreOpen(false);
-      action();
-    };
     const groups: { label: string; items: { label: string; icon: IconName; disabled?: boolean; title?: string; run: () => void }[] }[] = [
       {
         label: "Search",
         items: [
-          { label: "Full-text…", icon: "search", disabled: !fullTextSupported, title: fullTextSupported ? "Build a native SEARCH query" : "This server does not report fulltext support", run: () => run(() => setFullTextExplorerOpen(true)) },
-          { label: "Vector…", icon: "layers", disabled: !vectorSupported, title: vectorSupported ? "Build a native NEAREST query" : "This server does not report vector support", run: () => run(() => setVectorExplorerOpen(true)) },
-          { label: "Hybrid…", icon: "network", disabled: !hybridSupported, title: hybridSupported ? "Build a native structured filter + SEARCH + NEAREST query" : "This server does not report both fulltext and vector support", run: () => run(() => setHybridExplorerOpen(true)) },
-          { label: "Geo…", icon: "map-pin", disabled: !geoSupported, title: geoSupported ? "Build a native DWITHIN/WITHIN query over a POINT column" : "This server does not report geo support", run: () => run(() => setGeoExplorerOpen(true)) },
+          { label: "Full-text…", icon: "search", disabled: !fullTextSupported, title: fullTextSupported ? "Build a native SEARCH query" : "This server does not report fulltext support", run: () => setFullTextExplorerOpen(true) },
+          { label: "Vector…", icon: "layers", disabled: !vectorSupported, title: vectorSupported ? "Build a native NEAREST query" : "This server does not report vector support", run: () => setVectorExplorerOpen(true) },
+          { label: "Hybrid…", icon: "network", disabled: !hybridSupported, title: hybridSupported ? "Build a native structured filter + SEARCH + NEAREST query" : "This server does not report both fulltext and vector support", run: () => setHybridExplorerOpen(true) },
+          { label: "Geo…", icon: "map-pin", disabled: !geoSupported, title: geoSupported ? "Build a native DWITHIN/WITHIN query over a POINT column" : "This server does not report geo support", run: () => setGeoExplorerOpen(true) },
         ],
       },
       {
         label: "Security",
         items: [
-          { label: "Grant / Revoke…", icon: "key", run: () => run(openGrantBuilder) },
-          { label: "Users & roles…", icon: "users", run: () => run(openSecurityExplorer) },
-          { label: "Audit…", icon: "shield", run: () => run(openAuditExplorer) },
+          { label: "Grant / Revoke…", icon: "key", run: openGrantBuilder },
+          { label: "Users & roles…", icon: "users", run: openSecurityExplorer },
+          { label: "Audit…", icon: "shield", run: openAuditExplorer },
         ],
       },
       {
         label: "Operations",
         items: [
-          { label: "Transactions & locks…", icon: "lock", run: () => run(openActivityExplorer) },
-          { label: "Workflows & CDC…", icon: "activity", run: () => run(openWorkflowExplorer) },
-          { label: "Migrations…", icon: "clock", run: () => run(openMigrationExplorer) },
+          { label: "Transactions & locks…", icon: "lock", run: openActivityExplorer },
+          { label: "Workflows & CDC…", icon: "activity", run: openWorkflowExplorer },
+          { label: "Migrations…", icon: "clock", run: openMigrationExplorer },
         ],
       },
       {
         label: "Schema",
         items: [
-          { label: "Schema diagram…", icon: "network", run: () => run(openSchemaDiagram) },
-          { label: "Design schema…", icon: "table", run: () => run(() => { setSchemaDesignerMode("table"); setSchemaDesignerOpen(true); }) },
+          { label: "Schema diagram…", icon: "network", run: openSchemaDiagram },
+          { label: "Design schema…", icon: "table", run: () => { setSchemaDesignerMode("table"); setSchemaDesignerOpen(true); } },
         ],
       },
       {
         label: "Data",
         items: [
-          { label: "Generate data…", icon: "plus", run: () => run(() => setDataGeneratorOpen(true)) },
-          { label: "Import data…", icon: "download", run: () => run(() => setImportOpen(true)) },
-          { label: "Import vector dataset…", icon: "download", run: () => run(() => setVectorImportOpen(true)) },
-          { label: "Parameterized DML…", icon: "file", run: () => run(() => setDmlBuilderOpen(true)) },
+          { label: "Generate data…", icon: "plus", run: () => setDataGeneratorOpen(true) },
+          { label: "Import data…", icon: "download", run: () => setImportOpen(true) },
+          { label: "Import vector dataset…", icon: "download", run: () => setVectorImportOpen(true) },
+          { label: "Parameterized DML…", icon: "file", run: () => setDmlBuilderOpen(true) },
         ],
       },
     ];
@@ -1404,6 +1417,7 @@ export function StudioWorkspace({
     updateTab(tabId, {
       queryError: null,
       result: null,
+      resultSQL: target,
       ranSelection: isSelection,
       script: null,
       scriptSelected: null,
@@ -1511,7 +1525,10 @@ export function StudioWorkspace({
   const commitStagedChanges = useCallback(async (_fullSQL: string, statements: string[]) => {
     if (running || !statements || statements.length === 0) return;
     const tabId = activeTabId;
-    const currentSQL = sql;
+    // Refresh the statement whose rows were edited. The editor buffer may
+    // already say something else; re-running that would not show whether
+    // these writes landed.
+    const refreshSQL = resultSQL && resultSQL.trim() ? resultSQL : sql;
     const id = queryID();
     setRunning(true);
     setRunningTabId(tabId);
@@ -1530,8 +1547,8 @@ export function StudioWorkspace({
       setRunning(false);
       setRunningTabId(null);
     }
-    void executeQuery(tabId, currentSQL, false);
-  }, [activeTabId, executeQuery, running, sql]);
+    void executeQuery(tabId, refreshSQL, false);
+  }, [activeTabId, executeQuery, resultSQL, running, sql]);
 
   const loadFromHistory = useCallback((entry: StudioHistoryEntry) => {
     setSQL(entry.sql);
@@ -1608,6 +1625,7 @@ export function StudioWorkspace({
     updateTab(tabId, {
       queryError: null,
       result: null,
+      resultSQL: null,
       script: statements.map((s) => ({ sql: s, status: "pending" as const })),
       scriptSelected: null,
       resultContext: null,
@@ -2071,13 +2089,16 @@ export function StudioWorkspace({
 
       <div className="nss-toolbar" aria-label="Studio connection context">
         <Inline gap="sm" align="center" wrap>
-          {serverConnection && !serverConnection.connected ? (
-            <Badge variant="error" dot>Disconnected</Badge>
-          ) : connectionChecking && !serverConnection ? (
-            <Badge variant="muted" dot>Checking…</Badge>
-          ) : (
-            <Badge variant="success" dot>Connected</Badge>
-          )}
+          <ConnectionBadge
+            state={
+              serverConnection && !serverConnection.connected
+                ? "disconnected"
+                : connectionChecking && !serverConnection
+                  ? "checking"
+                  : "connected"
+            }
+            title={serverConnection && !serverConnection.connected ? "nextsqld unreachable" : undefined}
+          />
           {who.profile?.name ? (
             <Text size="sm" weight="medium" title={`Connection profile ${who.profile.id}`}>{who.profile.name}</Text>
           ) : null}
@@ -2091,7 +2112,7 @@ export function StudioWorkspace({
             <Badge variant="muted">{bootstrap.capabilities.rows.length} capabilities</Badge>
           ) : null}
           {environment && environment !== "production" ? (
-            <Badge variant="muted">{environment}</Badge>
+            <EnvironmentBadge environment={environment} size="md" />
           ) : null}
           {environment === "production" && readOnlyMode ? (
             <Badge variant="warning">read-only</Badge>
@@ -2403,41 +2424,24 @@ export function StudioWorkspace({
               </div>
               <div className="nss-toolbar-sep" aria-hidden="true" />
               <div className="nss-action-group">
-                <Popover
-                  open={moreOpen}
-                  onOpenChange={setMoreOpen}
+                <DropdownMenu
                   ariaLabel="More Studio tools"
-                  side="bottom"
                   align="end"
-                  wrapperClassName="nss-more"
-                  className="nss-more-panel"
                   trigger={
                     <Button variant="outline" size="sm" icon={<Icon name="more" size={14} />} aria-label="More Studio tools" title="More tools">
                       More
                     </Button>
                   }
-                >
-                  <PopoverContent className="nss-more-menu">
-                    {moreGroups.map((group) => (
-                      <div key={group.label} className="nss-more-group">
-                        <p className="nss-more-group-label">{group.label}</p>
-                        {group.items.map((item) => (
-                          <button
-                            key={item.label}
-                            type="button"
-                            className="nss-more-item"
-                            disabled={item.disabled}
-                            title={item.title}
-                            onClick={item.run}
-                          >
-                            <Icon name={item.icon} size={14} />
-                            <span>{item.label}</span>
-                          </button>
-                        ))}
-                      </div>
-                    ))}
-                  </PopoverContent>
-                </Popover>
+                  items={moreGroups.map((group) => ({
+                    group: group.label,
+                    items: group.items.map((item) => ({
+                      label: item.disabled && item.title ? `${item.label.replace(/…$/, "")} — ${item.title}` : item.label,
+                      icon: <Icon name={item.icon} size={14} />,
+                      disabled: item.disabled,
+                      onClick: item.run,
+                    })),
+                  }))}
+                />
               </div>
               <div className="nss-toolbar-sep" aria-hidden="true" />
               <div className="nss-action-group">

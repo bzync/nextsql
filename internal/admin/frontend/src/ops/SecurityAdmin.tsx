@@ -289,6 +289,7 @@ function DialogFrame({
   onSubmit,
   submitLabel,
   submitDisabled,
+  destructive = false,
   busy,
   error,
   children,
@@ -298,6 +299,7 @@ function DialogFrame({
   onSubmit: (e: FormEvent) => void;
   submitLabel: string;
   submitDisabled?: boolean;
+  destructive?: boolean;
   busy: boolean;
   error: string | null;
   children: ReactNode;
@@ -316,8 +318,15 @@ function DialogFrame({
         </ModalBody>
         <ModalFooter>
           <Button variant="ghost" size="sm" type="button" onClick={onClose} disabled={busy}>Cancel</Button>
-          <Button variant="primary" size="sm" type="submit" disabled={busy || submitDisabled}>
-            {busy ? "Working…" : submitLabel}
+          <Button
+            variant={destructive ? "destructive" : "primary"}
+            size="sm"
+            type="submit"
+            loading={busy}
+            disabled={submitDisabled}
+            aria-label={busy ? `${submitLabel}, working` : undefined}
+          >
+            {submitLabel}
           </Button>
         </ModalFooter>
       </form>
@@ -448,6 +457,7 @@ function DropDialog({
       busy={busy}
       error={error}
       submitLabel={title}
+      destructive
       submitDisabled={!name || !confirmed}
       onSubmit={(e) => {
         e.preventDefault();
@@ -499,6 +509,7 @@ function RoleMembershipDialog({
       busy={busy}
       error={error}
       submitLabel={granting ? "Grant role" : "Revoke role"}
+      destructive={!granting}
       submitDisabled={!ok}
       onSubmit={(e) => {
         e.preventDefault();
@@ -596,6 +607,7 @@ function GrantDialog({
       busy={busy}
       error={error}
       submitLabel={granting ? "Grant" : "Revoke"}
+      destructive={!granting}
       submitDisabled={!ok}
       onSubmit={(e) => {
         e.preventDefault();

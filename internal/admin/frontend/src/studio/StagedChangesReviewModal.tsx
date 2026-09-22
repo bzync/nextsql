@@ -3,6 +3,7 @@ import {
   Alert,
   Badge,
   Button,
+  CopyButton,
   Heading,
   Inline,
   Modal,
@@ -10,7 +11,6 @@ import {
   ModalFooter,
   ModalHeader,
   ModalTitle,
-  Spinner,
   Stack,
   Text,
 } from "@bzync/rui";
@@ -18,7 +18,6 @@ import {
   buildStagedChangeSQL,
   stagedChangesCount,
   stagedChangesSummary,
-  writeClipboard,
   type StagedChanges,
 } from "./resultTools";
 
@@ -45,23 +44,11 @@ export function StagedChangesReviewModal({
 }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [copyStatus, setCopyStatus] = useState<string | null>(null);
 
   const built = useMemo(() => buildStagedChangeSQL(changes), [changes]);
   const count = useMemo(() => stagedChangesCount(changes), [changes]);
 
   if (!open) return null;
-
-  const handleCopy = async () => {
-    if (!built.sql) return;
-    try {
-      await writeClipboard(built.sql);
-      setCopyStatus("Copied transaction SQL.");
-      setTimeout(() => setCopyStatus(null), 2500);
-    } catch {
-      setCopyStatus("Could not copy SQL.");
-    }
-  };
 
   const handleCommit = async () => {
     if (!built.sql || built.statements.length === 0 || busy) return;
@@ -228,9 +215,7 @@ export function StagedChangesReviewModal({
                   Transactional SQL script preview
                 </Heading>
                 <Inline gap="xs">
-                  <Button variant="outline" size="sm" onClick={handleCopy}>
-                    Copy SQL
-                  </Button>
+                  <CopyButton value={built.sql} label="Copy SQL" size="sm" />
                   {onOpenInEditor ? (
                     <Button variant="outline" size="sm" onClick={handleOpenEditor}>
                       Open in editor
@@ -245,11 +230,6 @@ export function StagedChangesReviewModal({
               >
                 {built.sql}
               </pre>
-              {copyStatus ? (
-                <Text size="xs" variant="muted" role="status">
-                  {copyStatus}
-                </Text>
-              ) : null}
             </Stack>
           ) : null}
         </Stack>
@@ -263,16 +243,11 @@ export function StagedChangesReviewModal({
           size="sm"
           type="button"
           onClick={handleCommit}
-          disabled={busy || !built.sql || count === 0}
+          loading={busy}
+          disabled={!built.sql || count === 0}
+          aria-label={busy ? "Committing changes" : undefined}
         >
-          {busy ? (
-            <Inline gap="xs" align="center">
-              <Spinner size="xs" />
-              <span>Committing…</span>
-            </Inline>
-          ) : (
-            `Commit ${count} change${count === 1 ? "" : "s"}`
-          )}
+          {`Commit ${count} change${count === 1 ? "" : "s"}`}
         </Button>
       </ModalFooter>
     </Modal>

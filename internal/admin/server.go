@@ -27,7 +27,7 @@ type Server struct {
 	setupApp *setup.Server // non-nil only when mode == ModeSetup
 	opsApp   *ops.Server   // non-nil only when mode == ModeOperate
 
-	mux *http.ServeMux
+	mux  *http.ServeMux
 	http *http.Server
 	ln   net.Listener
 	tls  bool
@@ -84,7 +84,14 @@ func New(cfg Config, opt Options) (*Server, error) {
 	}
 	s.routes()
 
-	writeTimeout := 30 * time.Second
+	// Operations mode does not put a clock on the response. A signed-in
+	// request — a long backup, a maintenance pass, a Studio stream — must
+	// be able to finish without this process closing the browser connection.
+	// The session still ends only on logout, server switch, or shutdown.
+	// Header and idle limits stay: unread headers cannot hold a socket, and
+	// a keep-alive connection with no request is closed so the next request
+	// opens a new one. Setup mode keeps a write bound around its subprocess.
+	writeTimeout := time.Duration(0)
 	if mode == ModeSetup {
 		writeTimeout = s.setupApp.RunTimeout() + 30*time.Second
 	}

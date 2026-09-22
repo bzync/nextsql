@@ -72,40 +72,11 @@ body {
   outline-offset: 2px;
 }
 
-/* Shared icon-only theme picker (shared/ThemeSelect.tsx). */
+/* ThemeSelect sits in the top bar; the control itself is a ToggleGroup. */
 .nsa-theme-toggle {
-  display: inline-flex;
-  align-items: center;
-  gap: 2px;
-  padding: 2px;
+  flex: none;
   border: 1px solid var(--color-border);
-  border-radius: var(--nsa-radius);
-  background: var(--color-surface-muted, var(--color-surface));
-}
-.nsa-theme-button {
-  display: inline-flex;
-  width: 32px;
-  height: 32px;
-  align-items: center;
-  justify-content: center;
-  border: 1px solid transparent;
-  border-radius: calc(var(--nsa-radius) - 2px);
-  background: transparent;
-  color: var(--color-muted-foreground, var(--color-foreground-muted));
-  cursor: pointer;
-}
-.nsa-theme-button:hover {
-  background: var(--color-surface-raised, var(--color-surface));
-  color: var(--color-foreground);
-}
-.nsa-theme-button[aria-pressed="true"] {
-  border-color: var(--color-accent-500);
-  background: var(--color-accent-100);
-  color: var(--color-accent-700);
-}
-.dark .nsa-theme-button[aria-pressed="true"] {
-  background: color-mix(in srgb, var(--color-accent-500) 22%, transparent);
-  color: var(--color-accent-300);
+  border-radius: var(--radius-lg);
 }
 
 .nsa-identity {
@@ -294,7 +265,7 @@ span.text-xs.font-mono.text-slate-400 {
 }
 
 @media (forced-colors: active) {
-  .nsa-skip:focus, .nsa-theme-button:focus-visible {
+  .nsa-skip:focus, .nsa-theme-toggle :focus-visible {
     outline-color: Highlight;
   }
 }

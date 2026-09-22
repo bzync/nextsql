@@ -116,8 +116,9 @@ func (s *session) touch() {
 // sweeper evicted the session mid-action and the operator was logged out the
 // moment their backup returned.
 //
-// The absolute session lifetime is deliberately *not* held off this way — it
-// is a security bound, not an activity measure.
+// A positive --session-lifetime is deliberately *not* held off this way. It
+// is an optional bound, not an activity measure. The default lifetime is
+// zero, which means the session lasts until logout.
 func (s *session) beginRequest() {
 	s.stateMu.Lock()
 	s.inFlight++
@@ -137,8 +138,15 @@ func (s *session) endRequest() {
 func (s *session) expired(now time.Time, idle, lifetime time.Duration) bool {
 	s.stateMu.Lock()
 	defer s.stateMu.Unlock()
-	if now.Sub(s.createdAt) > lifetime {
+	// A non-positive bound is off. Zero is the default: the session ends
+	// when the operator logs out, switches server, or this process stops,
+	// not because a clock ran out. A positive lifetime is checked first and
+	// is not extended by an in-flight request.
+	if lifetime > 0 && now.Sub(s.createdAt) > lifetime {
 		return true
+	}
+	if idle <= 0 {
+		return false
 	}
 	return s.inFlight == 0 && now.Sub(s.lastSeen) > idle
 }
@@ -458,17 +466,53 @@ func (st *sessionStore) len() int {
 	return len(st.byID)
 }
 
+// connKeepaliveInterval is how often a signed-in session touches its nextsqld
+// socket. nextsqld closes a connection that sends nothing for its idle
+// timeout (60s unless the operator set idle_timeout_ms). This ping is well
+// inside that default, so the driver connection stays up for the whole
+// Admin session. It does not refresh the session's own idle clock: an
+// explicit --idle-timeout still measures the operator, not this ping.
+const connKeepaliveInterval = 20 * time.Second
+
 func (st *sessionStore) sweepLoop() {
-	t := time.NewTicker(time.Minute)
-	defer t.Stop()
+	sweep := time.NewTicker(time.Minute)
+	keep := time.NewTicker(connKeepaliveInterval)
+	defer sweep.Stop()
+	defer keep.Stop()
 	for {
 		select {
 		case <-st.stop:
 			return
-		case <-t.C:
+		case <-sweep.C:
 			st.sweep()
+		case <-keep.C:
+			st.keepalive()
 		}
 	}
+}
+
+// keepalive sends one bounded ping on every live session. A failure leaves
+// the session in place: a database that is down is not a logout. The next
+// operator request reports the socket; only logout, switch, or process
+// shutdown closes the session.
+func (st *sessionStore) keepalive() {
+	st.mu.Lock()
+	sessions := make([]*session, 0, len(st.byID))
+	for _, s := range st.byID {
+		sessions = append(sessions, s)
+	}
+	st.mu.Unlock()
+	var wg sync.WaitGroup
+	for _, s := range sessions {
+		wg.Add(1)
+		go func(s *session) {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			_ = s.ping(ctx)
+			cancel()
+		}(s)
+	}
+	wg.Wait()
 }
 
 func (st *sessionStore) sweep() {

@@ -2230,6 +2230,23 @@ try {
     assert.equal(tools.detectEditableTable("SELECT a.id, u.name FROM articles a JOIN users u ON a.author_id = u.id", tables), null);
     assert.equal(tools.detectEditableTable("SELECT * FROM articles UNION SELECT * FROM users", tables), null);
     assert.equal(tools.detectEditableTable("UPDATE articles SET title = 'x'", tables), null);
+    // A comma join is still two tables. The first name must not become the write target.
+    assert.equal(tools.detectEditableTable("SELECT * FROM articles, users", tables), null);
+    assert.equal(tools.detectEditableTable("SELECT * FROM articles a, users u WHERE a.id = u.id", tables), null);
+    // The write target is the top-level FROM, not a FROM inside a scalar subquery.
+    assert.equal(
+      tools.detectEditableTable("SELECT (SELECT id FROM users WHERE id = 1) AS id FROM articles", tables),
+      "articles",
+    );
+    // JOIN inside a string literal is data, not a join.
+    assert.equal(tools.detectEditableTable("SELECT * FROM articles WHERE title = 'JOIN'", tables), "articles");
+    // A quoted name is unescaped. "a""b" is the table a"b, not the table a.
+    assert.equal(tools.detectEditableTable('SELECT * FROM "a""b"', ["a", 'a"b']), 'a"b');
+    assert.equal(tools.detectEditableTable('SELECT * FROM "a""b"', ["a", "articles"]), null);
+    // A second statement is not a simple table read.
+    assert.equal(tools.detectEditableTable("SELECT * FROM articles; SELECT * FROM users", tables), null);
+    // A derived table has no single base table to update.
+    assert.equal(tools.detectEditableTable("SELECT * FROM (SELECT * FROM articles) s", tables), null);
 
     // isResultEditable
     const sampleResult = {
@@ -2247,11 +2264,16 @@ try {
     // makeRowKey & extractRowPK
     const pkVals = tools.extractRowPK(["1", "First post", "10"], sampleResult.columns, ["id"]);
     assert.deepEqual(pkVals, { id: "1" });
-    assert.equal(tools.makeRowKey(pkVals), "id=1");
+    assert.equal(tools.makeRowKey(pkVals), JSON.stringify([["id", "1"]]));
 
     const compositePKVals = tools.extractRowPK(["100", "200", "5"], ["user_id", "item_id", "qty"], ["item_id", "user_id"]);
     assert.deepEqual(compositePKVals, { item_id: "200", user_id: "100" });
-    assert.equal(tools.makeRowKey(compositePKVals), "item_id=200|user_id=100");
+    assert.equal(tools.makeRowKey(compositePKVals), JSON.stringify([["item_id", "200"], ["user_id", "100"]]));
+    // Values that contain the old separator must not collapse into one staged row.
+    assert.notEqual(
+      tools.makeRowKey({ a: "1|b=X", b: "Y" }),
+      tools.makeRowKey({ a: "1", b: "X|b=Y" }),
+    );
 
     // formatCellSQLLiteral
     assert.equal(tools.formatCellSQLLiteral(null, "STRING"), "NULL");

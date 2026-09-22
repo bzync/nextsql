@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Alert,
-  Badge,
   Button,
   CodeBlock,
   CopyButton,
@@ -18,6 +17,7 @@ import {
   Text,
 } from "@bzync/rui";
 import type { StudioTableDetail } from "../ops/api";
+import { IndexHealthBadge } from "../shared/status";
 import {
   MAX_FULLTEXT_EXPLORER_QUERY_CHARS,
   MAX_FULLTEXT_EXPLORER_ROWS,
@@ -200,9 +200,7 @@ export function FullTextExplorer({
               />
               {selectedIndex ? (
                 <Inline gap="sm" align="center" wrap>
-                  <Badge variant={selectedIndex.usable && selectedIndex.status.toLowerCase() === "valid" ? "success" : "warning"}>
-                    {selectedIndex.status}
-                  </Badge>
+                  <IndexHealthBadge status={selectedIndex.status} usable={selectedIndex.usable} />
                   <Text size="xs" variant="muted">
                     Candidate index: {selectedIndex.name}. The optimizer remains authoritative; use EXPLAIN to verify the chosen access path.
                   </Text>

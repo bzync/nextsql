@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Alert,
-  Badge,
   Button,
   CodeBlock,
   CopyButton,
@@ -18,6 +17,7 @@ import {
   Text,
   Textarea,
 } from "@bzync/rui";
+import { IndexHealthBadge } from "../shared/status";
 import type { StudioTableDetail } from "../ops/api";
 import {
   MAX_VECTOR_EXPLORER_TOPK,
@@ -189,9 +189,7 @@ export function VectorExplorer({
                 />
                 {matchedIndex ? (
                   <Inline gap="sm" align="center" wrap>
-                    <Badge variant={matchedIndex.usable && matchedIndex.status.toLowerCase() === "valid" ? "success" : "warning"}>
-                      {matchedIndex.status}
-                    </Badge>
+                    <IndexHealthBadge status={matchedIndex.status} usable={matchedIndex.usable} />
                     <Text size="xs" variant="muted">
                       Candidate index: {matchedIndex.name}. NextSQL reports every vector index (HNSW/IVF/IVFPQ/SPARSE) the same
                       way; use EXPLAIN to verify the chosen access path and algorithm.

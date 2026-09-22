@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type UIEvent } from "react";
-import { Badge, Button, EmptyState, Inline, Text } from "@bzync/rui";
+import { Badge, Button, Checkbox, EmptyState, Inline, Text } from "@bzync/rui";
+import { SegmentedControl } from "../shared/SegmentedControl";
 import type { StudioResultSet } from "../ops/api";
 import { CellInspector, type InspectedCell, type JSONExplorerContext } from "./CellInspector";
 import { EditCellModal } from "./EditCellModal";
@@ -533,46 +534,21 @@ export function ResultGrid({
       ) : null}
       {explainNodes && explainNodes.length ? (
         <>
-          <Inline gap="xs" align="center" role="group" aria-label="EXPLAIN view">
-            <Button
-              variant={view === "plan" ? "primary" : "outline"}
-              size="sm"
-              aria-pressed={view === "plan"}
-              onClick={() => setView("plan")}
-            >
-              Plan
-            </Button>
-            <Button
-              variant={view === "table" ? "primary" : "outline"}
-              size="sm"
-              aria-pressed={view === "table"}
-              onClick={() => setView("table")}
-            >
-              Table
-            </Button>
-            {explainAnalyzed(explainNodes) ? (
-              <Button
-                variant={view === "profile" ? "primary" : "outline"}
-                size="sm"
-                aria-pressed={view === "profile"}
-                onClick={profileCurrentPlan}
-                disabled={disabled}
-              >
-                Profile
-              </Button>
-            ) : null}
-            {planBaseline ? (
-              <Button
-                variant={view === "compare" ? "primary" : "outline"}
-                size="sm"
-                aria-pressed={view === "compare"}
-                onClick={compareCurrentPlan}
-                disabled={disabled}
-              >
-                Compare
-              </Button>
-            ) : null}
-          </Inline>
+          <SegmentedControl
+            label="EXPLAIN view"
+            value={view}
+            onChange={(next) => {
+              if (next === "profile") profileCurrentPlan();
+              else if (next === "compare") compareCurrentPlan();
+              else setView(next);
+            }}
+            options={[
+              { value: "plan", label: "Plan" },
+              { value: "table", label: "Table" },
+              ...(explainAnalyzed(explainNodes) ? [{ value: "profile" as const, label: "Profile" }] : []),
+              ...(planBaseline ? [{ value: "compare" as const, label: "Compare" }] : []),
+            ]}
+          />
           {onPinPlan ? (
             <Inline gap="xs" align="center" role="group" aria-label="Plan comparison actions">
               <Button variant="outline" size="sm" onClick={pinCurrentPlan} disabled={disabled}>
@@ -623,16 +599,12 @@ export function ResultGrid({
           <tr>
             {tools ? (
               <th scope="col" className="nss-select-column">
-                <input
-                  type="checkbox"
+                <Checkbox
+                  size="sm"
                   aria-label="Select all rows"
                   disabled={disabled || result.rows.length === 0}
                   checked={result.rows.length > 0 && selectedRows.size === result.rows.length}
-                  ref={(el) => {
-                    if (el) {
-                      el.indeterminate = selectedRows.size > 0 && selectedRows.size < result.rows.length;
-                    }
-                  }}
+                  indeterminate={selectedRows.size > 0 && selectedRows.size < result.rows.length}
                   onChange={toggleSelectAll}
                 />
               </th>
@@ -673,8 +645,8 @@ export function ResultGrid({
             >
               {tools ? (
                 <td className="nss-select-column">
-                  <input
-                    type="checkbox"
+                  <Checkbox
+                    size="sm"
                     checked={selectedRows.has(absoluteIndex)}
                     disabled={disabled}
                     onChange={(e) => {

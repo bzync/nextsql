@@ -2,7 +2,7 @@
 
 All notable changes to NextSQL are recorded here.
 
-The current release is **0.0.3**; **0.0.1** was the first public one. All are
+The current release is **0.0.4**; **0.0.1** was the first public one. All are
 previews: the engine is complete enough to install, query, and operate, and it
 is still under measurement. Before you rely on it, run `nextsql-bench --slo`
 and the crash, recovery, and HA suites on your hardware.
@@ -12,6 +12,35 @@ and the official driver packages. Do not reuse a published version for
 different bits.
 
 ---
+
+## [0.0.4] — 2026-09-22
+
+### Fixed
+
+- **NextSQL Admin dropped a signed-in operator without a logout.** The session
+  ended after 15 minutes without a click, or 12 hours after sign-in, and the
+  connection to `nextsqld` was closed after about a minute with no traffic.
+  The session and that connection now stay up until the operator logs out,
+  switches server, or Admin stops. Operations mode also no longer closes the
+  browser connection when a response takes longer than 30 seconds, so a
+  backup or other long request can finish. `--idle-timeout` and
+  `--session-lifetime` still apply when set to a positive duration; `0` (the
+  default) sets neither.
+- **NextSQL Admin printed an entire HTML application shell when an API request
+  was misrouted.** The shared JSON client and the Studio query stream now ask
+  explicitly for their media type and validate `Content-Type` before reading
+  the body. An upstream Next.js or other web-app fallback is rejected with a
+  short instruction to route `/api/v1/*` to `nextsql-admin`, rather than
+  retaining and rendering the document as the table-inspector or query error.
+  Structured JSON errors and 401 session handling are unchanged.
+- **Studio's data grid could update the wrong table.** Editability followed
+  the live editor buffer, so a ran selection, or a buffer edited after the
+  rows arrived, wrote the displayed primary keys into whichever table the
+  buffer's first `FROM` named. The grid now writes back only to the statement
+  that produced the rows. A comma-join, a `FROM` inside a subquery, a second
+  statement, and a quoted name cut at an embedded quote are not treated as a
+  single-table result. Staged row identity no longer collides when a
+  primary-key value contains `|`.
 
 ## [0.0.3] — 2026-09-20
 
@@ -251,7 +280,8 @@ A change is recorded here when it is implemented, tested, and documented — not
 when it is only designed. Internal sequencing lives in `TODO.md`. Intended
 product scope lives in `PROJECT.md`.
 
-[Unreleased]: https://github.com/bzync/nextsql/compare/v0.0.3...HEAD
+[Unreleased]: https://github.com/bzync/nextsql/compare/v0.0.4...HEAD
+[0.0.4]: https://github.com/bzync/nextsql/releases/tag/v0.0.4
 [0.0.3]: https://github.com/bzync/nextsql/releases/tag/v0.0.3
 [0.0.2]: https://github.com/bzync/nextsql/releases/tag/v0.0.2
 [0.0.1]: https://github.com/bzync/nextsql/releases/tag/v0.0.1

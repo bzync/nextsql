@@ -64,8 +64,8 @@ func run() error {
 	serverEnv := fs.String("server-environment", "", "Operations mode: environment of the --server-addr profile: development | test | staging | production")
 	profilesFile := fs.String("profiles", "", "Operations mode: connection-profile file (JSON, version 1) declaring further nextsqld servers operators may sign in or switch to; must not be group/world-writable")
 	maxSessions := fs.Int("max-sessions", 16, "Operations mode: maximum concurrent operator sessions")
-	idleTimeout := fs.Duration("idle-timeout", 15*time.Minute, "Operations mode: session idle expiry")
-	sessionLifetime := fs.Duration("session-lifetime", 12*time.Hour, "Operations mode: session absolute expiry")
+	idleTimeout := fs.Duration("idle-timeout", 0, "Operations mode: sign out after this much inactivity; 0 keeps the session until logout")
+	sessionLifetime := fs.Duration("session-lifetime", 0, "Operations mode: sign out this long after sign-in; 0 keeps the session until logout")
 
 	logLevel := fs.String("log-level", "info", "log level: debug | info | warn | error")
 	showVersion := fs.Bool("version", false, "print version and exit")

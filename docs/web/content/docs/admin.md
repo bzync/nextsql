@@ -22,6 +22,26 @@ nextsql-admin
 
 Keep Admin on loopback. It is not a remote management plane.
 
+### HTTP routing
+
+Open the URL printed by `nextsql-admin` (Operations mode defaults to
+`http://127.0.0.1:7220/`). Its frontend and JSON API deliberately share one
+origin: every `/api/v1/*` request must reach the same `nextsql-admin` process.
+If a local reverse proxy is used, proxy the whole `/api/v1/` subtree; never let
+unmatched API paths fall through to a website or single-page-app rewrite.
+
+This check should return JSON, not HTML:
+
+```bash
+curl -i http://127.0.0.1:7220/api/v1/mode
+```
+
+The expected media type is `application/json` and the body identifies `setup`
+or `operate`. An HTML response (for example a Next.js document) means the
+browser is pointed at the wrong origin or the proxy route is incomplete.
+Admin's JSON client and Studio's query stream both refuse that document:
+the error names the `/api/v1/` route and does not display the HTML.
+
 ## Setup mode
 
 Covers welcome, paths and dry-run validation, resource preset, administrator, summary, install, and completion. The GUI defaults to **Production** (`--profile production`): skip-init is disabled and an administrator is required. The CLI default remains `developer` so `--skip-init` scripts keep working. On a first install, recovery-key export is enabled by default for both keystores; Finish remains disabled until the operator confirms both exported files were copied offline. The wizard passes paths to `nextsql setup` and never handles key material itself. Linux `.tar.gz` / `.run` / `.deb` / `.rpm` and silent/offline/upgrade/repair paths are live-verified. macOS packaged execution remains environment-blocked. Native Windows is not supported; use WSL 2.
@@ -40,7 +60,7 @@ See [Install](/docs/install) and [Command line](/docs/cli).
 
 ## Operations mode
 
-It talks to `nextsqld` over NSQL with the operator's credentials. Server-enforced RBAC still applies: a user without `ADMIN` does not get a security dashboard by visiting Admin. Surfaces include overview, storage, connections and activity, cluster, backup, configuration, and audit — all from `system.*` and the official CLI, never by opening data-directory files. The Databases view expands the deployment's database into its tables. Backup and verification controls keep their in-flight state visible and disable conflicting actions; a request in flight keeps an Operations session from expiring by idleness, while its absolute lifetime remains enforced.
+It talks to `nextsqld` over NSQL with the operator's credentials. Server-enforced RBAC still applies: a user without `ADMIN` does not get a security dashboard by visiting Admin. Surfaces include overview, storage, connections and activity, cluster, backup, configuration, and audit — all from `system.*` and the official CLI, never by opening data-directory files. The Databases view expands the deployment's database into its tables. Backup and verification controls keep their in-flight state visible and disable conflicting actions. A signed-in session and its connection to `nextsqld` stay up until the operator logs out, switches server, or Admin stops. A request that is still running is not cut off by an HTTP write deadline. `--idle-timeout` and `--session-lifetime` are optional bounds; `0`, the default, sets neither. A request in flight still does not count as idle when a bound is set, and a positive `--session-lifetime` is not extended by that request.
 
 ### Connection profiles
 

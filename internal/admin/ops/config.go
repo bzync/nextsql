@@ -26,10 +26,11 @@ import (
 // Defaults for Operations mode's session policy. The listener itself
 // (address/TLS) is owned by the parent internal/admin package, not here.
 const (
-	DefaultServerAddr      = "127.0.0.1:7210"
-	DefaultMaxSessions     = 16
-	DefaultIdleTimeout     = 15 * time.Minute
-	DefaultSessionLifetime = 12 * time.Hour
+	DefaultServerAddr  = "127.0.0.1:7210"
+	DefaultMaxSessions = 16
+	// A zero idle timeout or session lifetime means the operator stays signed
+	// in until they log out (or switch server, or this process stops). Those
+	// are the defaults. A positive value is an optional bound.
 
 	sessionCookie = "nsm_session"
 	csrfHeader    = "X-NSM-CSRF"
@@ -78,12 +79,8 @@ func (c Config) withDefaults() Config {
 	if c.MaxSessions <= 0 {
 		c.MaxSessions = DefaultMaxSessions
 	}
-	if c.IdleTimeout <= 0 {
-		c.IdleTimeout = DefaultIdleTimeout
-	}
-	if c.SessionLifetime <= 0 {
-		c.SessionLifetime = DefaultSessionLifetime
-	}
+	// Zero is the default and means "until logout". Do not replace it with
+	// a positive bound. A negative value is rejected in validate.
 	if c.LogLevel == "" {
 		c.LogLevel = "info"
 	}
@@ -117,7 +114,11 @@ func (c Config) validate() error {
 	if err := c.validateProfiles(); err != nil {
 		return err
 	}
-	if c.SessionLifetime < c.IdleTimeout {
+	if c.IdleTimeout < 0 || c.SessionLifetime < 0 {
+		return nerr.New(nerr.InvalidArgument, "ops.Config",
+			"--idle-timeout and --session-lifetime must not be negative; 0 keeps the session until logout")
+	}
+	if c.SessionLifetime > 0 && c.IdleTimeout > c.SessionLifetime {
 		return nerr.New(nerr.InvalidArgument, "ops.Config",
 			"--session-lifetime must not be shorter than --idle-timeout")
 	}

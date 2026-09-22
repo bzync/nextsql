@@ -7,7 +7,6 @@ import {
   ListItem,
   Modal,
   ModalBody,
-  ModalFooter,
   ModalHeader,
   ModalTitle,
   Spinner,
@@ -17,6 +16,7 @@ import {
 } from "@bzync/rui";
 import type { StudioMigrationHistory } from "../ops/api";
 import { ResultTable } from "../ops/ResultTable";
+import { ViewerDialogFooter } from "../shared/dialog";
 
 // Schema-migration history explorer (Developer operations): a read-only view of
 // the database's reserved nsql_schema_migrations table, fetched through the
@@ -145,12 +145,7 @@ export function MigrationExplorer({
           ) : null}
         </Stack>
       </ModalBody>
-      <ModalFooter>
-        <Button variant="outline" onClick={onClose}>Close</Button>
-        <Button variant="primary" onClick={onRefresh} disabled={loading}>
-          {loading && data ? "Refreshing…" : "Refresh"}
-        </Button>
-      </ModalFooter>
+      <ViewerDialogFooter onClose={onClose} onRefresh={onRefresh} loading={loading} />
     </Modal>
   );
 }

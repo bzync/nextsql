@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent } from "react";
 import {
   Alert,
-  Badge,
   Button,
   CodeBlock,
   CopyButton,
@@ -18,6 +17,7 @@ import {
   Text,
 } from "@bzync/rui";
 import type { StudioTableDetail } from "../ops/api";
+import { IndexHealthBadge } from "../shared/status";
 import {
   MAX_GEO_EXPLORER_LIMIT,
   MAX_GEO_EXPLORER_POLYGON_VERTICES,
@@ -361,9 +361,7 @@ export function GeoExplorer({
                 />
                 {matchedIndex ? (
                   <Inline gap="sm" align="center" wrap>
-                    <Badge variant={matchedIndex.usable && matchedIndex.status.toLowerCase() === "valid" ? "success" : "warning"}>
-                      {matchedIndex.status}
-                    </Badge>
+                    <IndexHealthBadge status={matchedIndex.status} usable={matchedIndex.usable} />
                     <Text size="xs" variant="muted">Candidate spatial index: {matchedIndex.name}.</Text>
                   </Inline>
                 ) : (

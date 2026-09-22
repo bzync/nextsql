@@ -1,4 +1,4 @@
-import { useTheme } from "@bzync/rui";
+import { ToggleGroup, ToggleGroupItem, useTheme } from "@bzync/rui";
 import { Icon } from "./icons";
 
 const THEME_OPTIONS = [
@@ -7,26 +7,40 @@ const THEME_OPTIONS = [
   { value: "dark", label: "Use dark theme", icon: "moon" },
 ] as const;
 
-// Theme choice is deliberately a three-state icon group: unlike a two-state
-// sun/moon toggle, it can return the operator to following the OS preference.
+type ThemeChoice = (typeof THEME_OPTIONS)[number]["value"];
+
+function isThemeChoice(value: string): value is ThemeChoice {
+  return THEME_OPTIONS.some((option) => option.value === value);
+}
+
+// Theme choice is a three-state group: unlike a two-state sun/moon toggle,
+// it can return the operator to following the OS preference.
 export function ThemeSelect() {
   const { theme, setTheme } = useTheme();
 
   return (
-    <div className="nsa-theme-toggle" role="group" aria-label="Color theme">
+    <ToggleGroup
+      className="nsa-theme-toggle"
+      type="single"
+      size="icon"
+      variant="outline"
+      value={theme}
+      aria-label="Color theme"
+      onValueChange={(next) => {
+        if (isThemeChoice(next)) setTheme(next);
+      }}
+    >
       {THEME_OPTIONS.map((option) => (
-        <button
+        <ToggleGroupItem
           key={option.value}
-          type="button"
+          value={option.value}
           className="nsa-theme-button"
           aria-label={option.label}
           title={option.label}
-          aria-pressed={theme === option.value}
-          onClick={() => setTheme(option.value)}
         >
           <Icon name={option.icon} size={16} />
-        </button>
+        </ToggleGroupItem>
       ))}
-    </div>
+    </ToggleGroup>
   );
 }

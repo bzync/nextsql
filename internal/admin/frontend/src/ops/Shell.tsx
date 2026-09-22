@@ -17,7 +17,6 @@ import {
   PageHeader,
   ScrollArea,
   Separator,
-  StatusDot,
   Tabs,
   TabsContent,
   TabsList,
@@ -35,6 +34,7 @@ import { useUserPreferences } from "./userPreferences";
 import { Mark, Wordmark } from "../shared/Brand";
 import { Icon, type IconName } from "../shared/icons";
 import { ThemeSelect } from "../shared/ThemeSelect";
+import { ConnectionBadge, EnvironmentBadge } from "../shared/status";
 import { useHashRoute } from "../shared/router";
 import { StudioWorkspace } from "../studio/StudioWorkspace";
 import { Overview } from "./views/Overview";
@@ -229,8 +229,8 @@ export function Shell({
               )}
             </div>
             <div className="nsm-sidebar-search-wrap">
-              <button
-                type="button"
+              <Button
+                unstyled
                 className="nsm-sidebar-search-trigger"
                 onClick={() => setSearchOpen(true)}
                 aria-label="Search NextSQL Admin (Ctrl+K)"
@@ -239,7 +239,7 @@ export function Shell({
                 <Icon name="search" size={14} />
                 {!sidebarCollapsed ? <span>Search…</span> : null}
                 {!sidebarCollapsed ? <Kbd keys={["Ctrl", "K"]} size="sm" /> : null}
-              </button>
+              </Button>
             </div>
             <ScrollArea className="nsm-sidebar-nav" orientation="vertical" keyboardNavigable={false}>
               <nav aria-label="Operations">
@@ -273,8 +273,8 @@ export function Shell({
               </nav>
             </ScrollArea>
             <div className="nsm-sidebar-footer">
-              <button
-                type="button"
+              <Button
+                unstyled
                 className="nsm-sidebar-user-btn"
                 onClick={() => setSettingsOpen(true)}
                 title={`Signed in as ${who.user}. Click to open User Settings`}
@@ -287,7 +287,7 @@ export function Shell({
                     <span className="nsm-sidebar-user-sub font-mono">{serverName}{who.database ? ` · ${who.database}` : ""}</span>
                   </div>
                 ) : null}
-              </button>
+              </Button>
             </div>
           </aside>
           <AppShellBody className="nsm-body">
@@ -305,8 +305,8 @@ export function Shell({
                   {view.label}
                 </TopbarTitle>
               </Inline>
-              <button
-                type="button"
+              <Button
+                unstyled
                 className="nsm-topbar-search"
                 onClick={() => setSearchOpen(true)}
                 aria-label="Search NextSQL Admin (Ctrl+K)"
@@ -314,21 +314,17 @@ export function Shell({
                 <Icon name="search" size={14} />
                 <span>Search…</span>
                 <Kbd keys={["Ctrl", "K"]} size="sm" className="nsm-search-kbd" />
-              </button>
+              </Button>
               <Inline gap="sm" align="center" wrap={false}>
                 {serverConnection && !serverConnection.connected ? (
-                  <StatusDot status="offline" label="nextsqld unreachable" />
+                  <ConnectionBadge state="disconnected" title="nextsqld unreachable" />
                 ) : null}
                 <span className="nsm-topbar-server" title={who.profile?.address ? `${serverName} — ${who.profile.address}` : serverName}>
                   <Badge variant="muted" size="sm" className="font-mono nsm-topbar-server-name">{serverName}</Badge>
-                  {serverEnvironment ? (
-                    <Badge variant={serverEnvironment === "production" ? "warning" : "muted"} size="sm">
-                      {serverEnvironment}
-                    </Badge>
-                  ) : null}
+                  {serverEnvironment ? <EnvironmentBadge environment={serverEnvironment} /> : null}
                 </span>
-                <button
-                  type="button"
+                <Button
+                  unstyled
                   className="nsm-topbar-profile-btn"
                   onClick={() => setSettingsOpen(true)}
                   title={`Signed in as ${who.user}. Click to open User Settings`}
@@ -339,7 +335,7 @@ export function Shell({
                   <Badge variant="muted" size="sm" className="hidden xl:inline-flex font-mono">
                     {who.database || "default"}
                   </Badge>
-                </button>
+                </Button>
                 <ThemeSelect />
               </Inline>
             </Topbar>

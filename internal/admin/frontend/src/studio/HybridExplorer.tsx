@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Alert,
-  Badge,
   Button,
   CodeBlock,
   CopyButton,
@@ -19,6 +18,7 @@ import {
   Textarea,
 } from "@bzync/rui";
 import type { StudioTableDetail } from "../ops/api";
+import { IndexHealthBadge } from "../shared/status";
 import {
   MAX_FULLTEXT_EXPLORER_QUERY_CHARS,
   MAX_VECTOR_EXPLORER_TOPK,
@@ -325,9 +325,7 @@ export function HybridExplorer({
                   />
                   {matchedVectorIndex ? (
                     <Inline gap="sm" align="center" wrap>
-                      <Badge variant={matchedVectorIndex.usable && matchedVectorIndex.status.toLowerCase() === "valid" ? "success" : "warning"}>
-                        {matchedVectorIndex.status}
-                      </Badge>
+                      <IndexHealthBadge status={matchedVectorIndex.status} usable={matchedVectorIndex.usable} />
                       <Text size="xs" variant="muted">Candidate index: {matchedVectorIndex.name}.</Text>
                     </Inline>
                   ) : null}

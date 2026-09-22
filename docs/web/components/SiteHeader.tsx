@@ -52,15 +52,17 @@ export function SiteHeader({
     <header className="portal-topbar sticky top-0 z-50 border-b pt-[env(safe-area-inset-top)]">
       <div className="mx-auto flex h-14 max-w-6xl items-center justify-between gap-2 px-4 sm:gap-6 sm:px-5">
         <div className="flex min-w-0 items-center gap-1.5">
-          <button
+          <Button
             type="button"
+            variant="ghost"
+            size="icon"
+            className="shrink-0 lg:hidden"
             onClick={openMenu}
-            className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-md text-muted transition-colors hover:bg-bg-hover hover:text-foreground lg:hidden"
             aria-label="Open menu"
             aria-expanded={menuOpen}
           >
             <MenuIcon />
-          </button>
+          </Button>
           <Logo />
         </div>
         <nav className="flex items-center gap-0.5 text-[13px] sm:gap-1">
@@ -75,25 +77,29 @@ export function SiteHeader({
           </div>
           {onSearch ? (
             <>
-              <button
+              <Button
                 type="button"
+                variant="ghost"
+                size="icon"
+                className="md:hidden"
                 onClick={onSearch}
-                className="inline-flex h-10 w-10 items-center justify-center rounded-md text-muted transition-colors hover:bg-bg-hover hover:text-foreground md:hidden"
                 aria-label="Search documentation"
                 aria-keyshortcuts="Control+K Meta+K /"
               >
                 <SearchIcon />
-              </button>
-              <button
+              </Button>
+              <Button
                 type="button"
+                variant="outline"
+                size="sm"
+                className="ml-1 hidden w-[12.5rem] justify-start font-normal md:inline-flex"
                 onClick={onSearch}
-                className="ml-1 hidden h-8 w-[12.5rem] items-center gap-2 rounded-md border border-line bg-bg-elev px-2.5 text-[12.5px] text-muted transition-colors hover:border-line-strong hover:text-foreground md:inline-flex"
                 aria-label="Search documentation"
                 aria-keyshortcuts="Control+K Meta+K /"
               >
                 <span className="flex-1 text-left">Search docs</span>
                 <Kbd keys={["⌘/Ctrl", "K"]} />
-              </button>
+              </Button>
             </>
           ) : null}
           <ThemeToggle />
@@ -109,14 +115,15 @@ export function SiteHeader({
       <div className="fixed inset-0 z-[60] bg-bg pt-[env(safe-area-inset-top)] lg:hidden">
         <div className="flex h-14 items-center justify-between border-b border-line px-4">
           <Logo />
-          <button
+          <Button
             type="button"
+            variant="ghost"
+            size="icon"
             onClick={() => setOpen(false)}
-            className="inline-flex h-10 w-10 items-center justify-center rounded-md text-muted hover:bg-bg-hover hover:text-foreground"
             aria-label="Close menu"
           >
             <CloseIcon />
-          </button>
+          </Button>
         </div>
         <nav className="flex flex-col px-3 py-4">
           {[

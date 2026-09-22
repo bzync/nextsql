@@ -23,9 +23,9 @@ assert.ok(appJs.includes("Monitor Auto-Refresh Interval"), "Bundle must contain 
 // Test 2: Verify @bzync/rui Pagination component is integrated
 assert.ok(appJs.includes("aria-label\":\"Pagination\"") || appJs.includes("aria-label:\"Pagination\""), "Bundle must contain Pagination component markup");
 assert.ok(appJs.includes("nsm-table-container"), "Bundle must include nsm-table-container");
-assert.ok(appJs.includes("nsm-table-search-input"), "Bundle must include nsm-table-search-input");
+assert.ok(appJs.includes("Filter rows in table"), "Bundle must include the shared table filter");
 assert.ok(appJs.includes("nsm-th-sortable"), "Bundle must include sortable table header classes");
-assert.ok(appJs.includes("nsm-page-size-selector"), "Bundle must include page size selector");
+assert.ok(appJs.includes("Rows per page"), "Bundle must include the page size control");
 
 // Test 3: Verify sidebar icons and group headers
 assert.ok(appJs.includes("nsm-nav-group-icon"), "Sidebar must include group icons");
@@ -36,7 +36,7 @@ assert.ok(appJs.includes("nsm-topbar-profile-btn"), "Topbar must include interac
 assert.ok(appCss.includes(".nsm-table-container"), "CSS must define .nsm-table-container");
 assert.ok(appCss.includes(".nsm-th-sortable"), "CSS must define .nsm-th-sortable");
 assert.ok(appCss.includes(".nsm-table-footer"), "CSS must define .nsm-table-footer");
-assert.ok(appCss.includes(".nsm-page-size-btn"), "CSS must define .nsm-page-size-btn");
+assert.ok(appCss.includes(".nsm-table-search"), "CSS must define .nsm-table-search");
 assert.ok(appCss.includes(".nsm-topbar-profile-btn"), "CSS must define .nsm-topbar-profile-btn");
 assert.ok(appCss.includes(".nsm-sidebar-user-btn"), "CSS must define .nsm-sidebar-user-btn");
 

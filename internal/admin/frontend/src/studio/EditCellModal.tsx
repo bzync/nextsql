@@ -2,6 +2,7 @@ import { useEffect, useState, type FormEvent } from "react";
 import {
   Badge,
   Button,
+  Checkbox,
   Inline,
   Input,
   Modal,
@@ -11,6 +12,7 @@ import {
   ModalTitle,
   Stack,
   Text,
+  Textarea,
 } from "@bzync/rui";
 
 export function EditCellModal({
@@ -84,29 +86,27 @@ export function EditCellModal({
             )}
 
             <Stack gap="xs">
-              <label>
-                <Inline gap="xs" align="center">
-                  <input
-                    type="checkbox"
-                    checked={isNull}
-                    onChange={(e) => {
-                      setIsNull(e.target.checked);
-                      if (e.target.checked) setValue("");
-                    }}
-                  />
-                  <Text size="sm">Set value to NULL</Text>
-                </Inline>
-              </label>
+              <Checkbox
+                label="Set value to NULL"
+                size="sm"
+                checked={isNull}
+                onChange={(e) => {
+                  setIsNull(e.target.checked);
+                  if (e.target.checked) setValue("");
+                }}
+              />
 
               {!isNull ? (
                 isJSON ? (
-                  <textarea
+                  <Textarea
                     className="nss-cell-textarea"
+                    size="sm"
                     rows={4}
                     value={value}
                     onChange={(e) => setValue(e.target.value)}
                     autoFocus
                     placeholder="Enter JSON value…"
+                    aria-label="JSON value"
                   />
                 ) : (
                   <Input

@@ -2,7 +2,7 @@
 // (/api/v1). CSRF token is kept in memory only and sent on state-changing
 // calls.
 
-import { ApiError, jsonRequest } from "../shared/apiClient";
+import { ApiError, jsonRequest, misdirectedResponseError, readAPIError, responseMediaType } from "../shared/apiClient";
 export { ApiError };
 
 export type ResultSet = {
@@ -396,7 +396,10 @@ function streamRows(value: unknown): (string | null)[][] {
 // the server's row/byte ceilings so a compromised or version-skewed Admin
 // cannot grow client memory without limit.
 async function studioQueryStream(body: StudioQueryRequest, handlers: StudioStreamHandlers): Promise<StudioStreamComplete> {
-  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  const headers: Record<string, string> = {
+    Accept: "application/x-ndjson, application/json",
+    "Content-Type": "application/json",
+  };
   if (csrf) headers["X-NSM-CSRF"] = csrf;
   const response = await fetch("/api/v1/studio/query/stream", {
     method: "POST",
@@ -404,23 +407,18 @@ async function studioQueryStream(body: StudioQueryRequest, handlers: StudioStrea
     body: JSON.stringify(body),
     credentials: "same-origin",
   });
-  if (!response.ok) {
-    const text = await response.text();
-    let message = response.statusText || `HTTP ${response.status}`;
-    try {
-      const parsed = JSON.parse(text) as { error?: unknown };
-      if (typeof parsed.error === "string" && parsed.error) message = parsed.error;
-    } catch {
-      if (text) message = text;
-    }
-    throw new ApiError(message, response.status);
-  }
+  if (!response.ok) throw await readAPIError(response);
   if (!response.body) throw new ApiError("Studio stream response has no body", 502);
 
-  const contentType = response.headers.get("Content-Type")?.split(";", 1)[0].trim().toLowerCase();
+  const contentType = responseMediaType(response);
   if (contentType !== "application/x-ndjson") {
     await response.body.cancel();
-    throw new ApiError("Studio stream response has an unexpected content type", 502);
+    // application/json here is a real Admin error that arrived with the
+    // wrong success status. Any other type is another application's document.
+    if (contentType === "application/json") {
+      throw new ApiError("Studio stream response has an unexpected content type", 502);
+    }
+    throw misdirectedResponseError(response, "NDJSON");
   }
 
   const reader = response.body.getReader();

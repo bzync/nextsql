@@ -1362,23 +1362,23 @@ async function testOperateMode() {
       })()`);
       assert.equal(opened, true, `More Studio tools should be available for ${label}`);
       await browser.waitFor(
-        'document.querySelector(\'[role=dialog][aria-label="More Studio tools"] button\') !== null',
+        'document.querySelector(\'[role=menu][aria-label="More Studio tools"] button\') !== null',
         "the More menu items to mount",
       );
       const buttons = await browser.evaluate(
-        '[...document.querySelectorAll(\'[role=dialog][aria-label="More Studio tools"] button\')].map((el) => el.textContent.trim())',
+        '[...document.querySelectorAll(\'[role=menu][aria-label="More Studio tools"] button\')].map((el) => el.textContent.trim())',
       );
       const index = buttons.indexOf(label);
       if (index === -1) return false;
       const clicked = await browser.evaluate(`(() => {
-        const items = document.querySelectorAll('[role=dialog][aria-label="More Studio tools"] button');
+        const items = document.querySelectorAll('[role=menu][aria-label="More Studio tools"] button');
         const item = items[${index}];
         item?.click();
         return Boolean(item);
       })()`);
       if (clicked) {
         await browser.waitFor(
-          'document.querySelector(\'[role=dialog][aria-label="More Studio tools"]\') === null',
+          'document.querySelector(\'[role=menu][aria-label="More Studio tools"]\') === null',
           "the More menu to close after choosing " + label,
         );
       }
@@ -1784,11 +1784,11 @@ async function testOperateMode() {
     })()`);
 
     assert.equal(await clickByAriaLabel("More Studio tools"), true, "the More Studio tools control should be available");
-    await browser.waitFor(`document.querySelector('[role=dialog][aria-label="More Studio tools"]')`, "the More Studio tools menu");
-    assert.equal(await browser.evaluate(`[...document.querySelectorAll('[role=dialog][aria-label="More Studio tools"] button')].some((item) => item.textContent.trim() === "Full-text…")`), true, "explorers should live in the More menu");
+    await browser.waitFor(`document.querySelector('[role=menu][aria-label="More Studio tools"]')`, "the More Studio tools menu");
+    assert.equal(await browser.evaluate(`[...document.querySelectorAll('[role=menu][aria-label="More Studio tools"] button')].some((item) => item.textContent.trim() === "Full-text…")`), true, "explorers should live in the More menu");
     await runAxe(browser, axe.source, "Studio more tools menu");
     await clickByAriaLabel("More Studio tools");
-    await browser.waitFor(`document.querySelector('[role=dialog][aria-label="More Studio tools"]') === null`, "the More menu to close");
+    await browser.waitFor(`document.querySelector('[role=menu][aria-label="More Studio tools"]') === null`, "the More menu to close");
 
     // Full-text Explorer: derives the table, eligible fields, and candidate
     // index from the authorized Studio catalog; generates/copies native SQL

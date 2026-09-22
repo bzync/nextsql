@@ -223,7 +223,7 @@ export function GrantBuilder({
         </Stack>
       </ModalBody>
       <ModalFooter>
-        <Button variant="outline" onClick={handleClose}>Cancel</Button>
+        <Button variant="ghost" onClick={handleClose}>Cancel</Button>
         <Button variant="primary" onClick={handleInsert} disabled={!built.sql}>
           Insert into editor
         </Button>

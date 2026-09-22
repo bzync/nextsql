@@ -12,7 +12,7 @@ import {
   kindLabel,
   platformLabel,
 } from "@/lib/release-model";
-import { Button } from "@bzync/rui";
+import { Alert, Button, ToggleGroup, ToggleGroupItem } from "@bzync/rui";
 
 const subscribeBrowser = () => () => {};
 
@@ -48,31 +48,31 @@ export function PlatformDownloads({ release }: { release: Release }) {
   return (
     <div className="space-y-4">
       {onWindows && (
-        <p className="rounded-md border border-line px-4 py-3 text-sm text-muted">
+        <Alert variant="info" title="Windows">
           NextSQL does not run natively on Windows. Install a WSL 2 distribution and use the Linux x64 packages inside it —
           see{" "}
           <Link href="/docs/install#windows-wsl-2" className="underline">
             Windows (WSL 2)
           </Link>
           .
-        </p>
+        </Alert>
       )}
-      <div className="flex flex-wrap gap-2">
+      <ToggleGroup
+        type="single"
+        size="sm"
+        variant="outline"
+        value={platform}
+        aria-label="Package platform"
+        onValueChange={(next) => {
+          if (next) setSelectedPlatform(next as Platform);
+        }}
+      >
         {PLATFORMS.filter((item) => release.artifacts.some((artifact) => artifact.platform === item)).map((item) => (
-          <button
-            key={item}
-            type="button"
-            onClick={() => setSelectedPlatform(item)}
-            className={
-              item === platform
-                ? "rounded-md bg-bg-hover px-3 py-1.5 text-sm font-medium"
-                : "rounded-md px-3 py-1.5 text-sm text-muted hover:bg-bg-hover"
-            }
-          >
+          <ToggleGroupItem key={item} value={item}>
             {platformLabel(item)}
-          </button>
+          </ToggleGroupItem>
         ))}
-      </div>
+      </ToggleGroup>
       <ul className="space-y-2">
         {(matching.length ? matching : release.artifacts).map((artifact) => (
           <ArtifactRow key={artifact.id} version={release.version} artifact={artifact} />

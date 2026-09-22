@@ -22,6 +22,7 @@ import {
   Text,
 } from "@bzync/rui";
 import { Icon } from "../shared/icons";
+import { EnvironmentBadge } from "../shared/status";
 import { ThemeSelect } from "../shared/ThemeSelect";
 import type { Whoami } from "./api";
 import { useUserPreferences } from "./userPreferences";
@@ -126,9 +127,7 @@ export function UserSettingsModal({
                         <span className="inline-flex flex-wrap items-center gap-1.5 font-medium">
                           <span>{who.profile?.name ?? "nextsqld"}</span>
                           {who.profile?.environment ? (
-                            <Badge variant={who.profile.environment === "production" ? "warning" : "muted"} size="sm">
-                              {who.profile.environment}
-                            </Badge>
+                            <EnvironmentBadge environment={who.profile.environment} />
                           ) : null}
                         </span>
                         {who.profile?.address ? (

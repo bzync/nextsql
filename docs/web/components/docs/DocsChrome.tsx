@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useEffect, useState } from "react";
-import { useCommand } from "@bzync/rui";
+import { Button, useCommand } from "@bzync/rui";
 import { SiteHeader } from "@/components/SiteHeader";
 import { SearchHighlighter } from "@/components/docs/SearchHighlighter";
 import { docsNav, docHref } from "@/lib/nav";
@@ -66,14 +66,15 @@ export function DocsChrome({ children }: { children: React.ReactNode }) {
           <div className="absolute inset-y-0 left-0 flex w-[min(88vw,20rem)] flex-col border-r border-line bg-bg pt-[env(safe-area-inset-top)] pb-[env(safe-area-inset-bottom)]">
             <div className="flex h-14 items-center justify-between px-4">
               <span className="text-sm font-semibold">Docs</span>
-              <button
+              <Button
                 type="button"
+                variant="ghost"
+                size="icon"
                 onClick={() => setMenu(false)}
-                className="inline-flex h-10 w-10 items-center justify-center rounded-md text-muted hover:bg-bg-hover hover:text-foreground"
                 aria-label="Close menu"
               >
                 <CloseIcon />
-              </button>
+              </Button>
             </div>
             <div className="flex-1 overflow-auto overscroll-contain px-2 pb-6">
               <Sidebar pathname={pathname} onNavigate={() => setMenu(false)} />

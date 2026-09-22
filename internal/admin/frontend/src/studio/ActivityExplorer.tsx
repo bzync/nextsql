@@ -7,7 +7,6 @@ import {
   ListItem,
   Modal,
   ModalBody,
-  ModalFooter,
   ModalHeader,
   ModalTitle,
   Spinner,
@@ -17,6 +16,7 @@ import {
 } from "@bzync/rui";
 import type { Activity } from "../ops/api";
 import { ResultTable } from "../ops/ResultTable";
+import { ViewerDialogFooter } from "../shared/dialog";
 
 // Transaction console / Lock explorer (Developer operations scope): a
 // read-only view over the same system.sessions/system.active_queries/
@@ -109,12 +109,7 @@ export function ActivityExplorer({
           ) : null}
         </Stack>
       </ModalBody>
-      <ModalFooter>
-        <Button variant="outline" onClick={onClose}>Close</Button>
-        <Button variant="primary" onClick={onRefresh} disabled={loading}>
-          {loading && data ? "Refreshing…" : "Refresh"}
-        </Button>
-      </ModalFooter>
+      <ViewerDialogFooter onClose={onClose} onRefresh={onRefresh} loading={loading} />
     </Modal>
   );
 }

@@ -8,7 +8,6 @@ import {
   ListItem,
   Modal,
   ModalBody,
-  ModalFooter,
   ModalHeader,
   ModalTitle,
   Select,
@@ -18,6 +17,7 @@ import {
   Text,
 } from "@bzync/rui";
 import type { ResultSet, StudioWorkflowOverview } from "../ops/api";
+import { ViewerDialogFooter } from "../shared/dialog";
 import { ResultTable } from "../ops/ResultTable";
 import { WorkflowRelationships } from "./WorkflowRelationships";
 
@@ -188,12 +188,7 @@ export function WorkflowExplorer({
           ) : null}
         </Stack>
       </ModalBody>
-      <ModalFooter>
-        <Button variant="outline" onClick={onClose}>Close</Button>
-        <Button variant="primary" onClick={onRefresh} disabled={loading}>
-          {loading && data ? "Refreshing…" : "Refresh"}
-        </Button>
-      </ModalFooter>
+      <ViewerDialogFooter onClose={onClose} onRefresh={onRefresh} loading={loading} />
     </Modal>
   );
 }

@@ -73,6 +73,12 @@ func TestNewOperateModeExplicit(t *testing.T) {
 	if srv.Done() != nil {
 		t.Fatal("Done() should be nil (never closes) in Operations mode")
 	}
+	if srv.http.WriteTimeout != 0 {
+		t.Fatalf("Operations WriteTimeout = %s, want no response deadline", srv.http.WriteTimeout)
+	}
+	if srv.http.ReadHeaderTimeout <= 0 {
+		t.Fatal("Operations mode should still bound unread request headers")
+	}
 }
 
 func TestNewSetupModeExplicit(t *testing.T) {
@@ -91,6 +97,9 @@ func TestNewSetupModeExplicit(t *testing.T) {
 	}
 	if srv.Done() == nil {
 		t.Fatal("Done() should be non-nil in Setup mode")
+	}
+	if srv.http.WriteTimeout <= 0 {
+		t.Fatal("Setup mode should keep a write bound around its subprocess")
 	}
 }
 

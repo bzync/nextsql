@@ -25,6 +25,8 @@ import { ViewFrame } from "./ViewFrame";
 import { Section } from "./Section";
 import type { ResultSet } from "../api";
 import { Icon, type IconName } from "../../shared/icons";
+import { SegmentedControl } from "../../shared/SegmentedControl";
+import { TableFilter } from "../../shared/TableFilter";
 
 const CATEGORY_META: Record<string, { label: string; icon: IconName; desc: string }> = {
   throughput: { label: "Throughput", icon: "activity", desc: "Query, transaction, and statement rates" },
@@ -133,48 +135,24 @@ function ServerLogPanel({ log }: { log: ResultSet }) {
       <div className="nsm-table-toolbar">
         <Inline gap="sm" align="center" justify="between" wrap>
           <Inline gap="xs" align="center">
-            <div className="nsm-table-search">
-              <Icon name="search" size={13} className="nsm-table-search-icon" />
-              <input
-                type="search"
-                value={search}
-                onChange={(e) => {
-                  setSearch(e.target.value);
-                  setPage(1);
-                }}
-                placeholder="Search server log…"
-                className="nsm-table-search-input"
-                aria-label="Filter server log"
-              />
-              {search ? (
-                <button
-                  type="button"
-                  onClick={() => {
-                    setSearch("");
-                    setPage(1);
-                  }}
-                  className="nsm-table-search-clear"
-                  aria-label="Clear filter"
-                >
-                  ×
-                </button>
-              ) : null}
-            </div>
-            <Inline gap="xs" align="center">
-              {["ALL", "ERROR", "WARN", "INFO"].map((lvl) => (
-                <button
-                  key={lvl}
-                  type="button"
-                  onClick={() => {
-                    setLevelFilter(lvl);
-                    setPage(1);
-                  }}
-                  className={`nsm-page-size-btn${levelFilter === lvl ? " nsm-page-size-btn--active" : ""}`}
-                >
-                  {lvl}
-                </button>
-              ))}
-            </Inline>
+            <TableFilter
+              value={search}
+              onChange={(next) => {
+                setSearch(next);
+                setPage(1);
+              }}
+              placeholder="Search server log…"
+              label="Filter server log"
+            />
+            <SegmentedControl
+              label="Log level"
+              value={levelFilter}
+              onChange={(next) => {
+                setLevelFilter(next);
+                setPage(1);
+              }}
+              options={["ALL", "ERROR", "WARN", "INFO"].map((lvl) => ({ value: lvl, label: lvl }))}
+            />
           </Inline>
 
           <span className="text-xs text-muted-foreground">

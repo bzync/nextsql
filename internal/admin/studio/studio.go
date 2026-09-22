@@ -49,8 +49,10 @@ const (
 	// script submission can be, not query concurrency.
 	MaxScriptStatements = 200
 
-	// Leave five seconds inside Admin's 30-second HTTP write deadline so a
-	// timeout can be canceled, drained, and returned as a structured error.
+	// QueryTimeout bounds one Studio statement. It cancels that statement and
+	// returns an error; it does not sign the operator out or close the
+	// session. The Operations HTTP server has no write deadline, so this
+	// bound is not there to beat one.
 	QueryTimeout = 25 * time.Second
 )
 

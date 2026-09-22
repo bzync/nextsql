@@ -3523,7 +3523,7 @@ export function mergeSavedQueries(
     const differs =
       entry.sql !== existing.sql ||
       entry.name !== existing.name ||
-      entry.tags.join(" ") !== existing.tags.join(" ");
+      entry.tags.join("\u0000") !== existing.tags.join("\u0000");
     if (differs && entry.updatedAt >= existing.updatedAt) {
       byId.set(entry.id, entry);
       updated += 1;
@@ -5615,22 +5615,192 @@ export function tableColumnTypesRecord(detail: StudioTableDetail | null | undefi
   return map;
 }
 
-export function detectEditableTable(sql: string, catalogTables: string[]): string | null {
-  if (!sql) return null;
-  const trimmed = sql.trim();
-  if (!/^SELECT\b/i.test(trimmed)) return null;
-  if (/\b(?:JOIN|UNION)\b/i.test(trimmed)) return null;
+// Clause and join words that can follow a table reference. They are not
+// aliases. JOIN/UNION/EXCEPT/INTERSECT anywhere at parenthesis depth 0 make
+// the result unsafe to write back to a single table.
+const TABLE_REF_STOP = new Set([
+  "where", "group", "order", "limit", "offset", "having", "window", "fetch",
+  "for", "using", "nearest", "search", "qualify",
+  "join", "union", "except", "intersect",
+  "inner", "left", "right", "full", "cross", "natural",
+]);
 
-  const match = /\bFROM\s+(?:"([^"]+)"|([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?))/i.exec(trimmed);
-  if (!match) return null;
-  const raw = match[1] ?? match[2];
-  if (!raw) return null;
-  const clean = raw.trim();
-  if (clean.toLowerCase().startsWith("system.") || clean.toLowerCase().startsWith("nsql_")) {
-    return null;
+type SQLToken = { kind: "ident" | "comma" | "dot" | "lparen" | "rparen" | "semi" | "other"; text: string };
+
+// scanSQLTokens splits a statement enough to find its top-level FROM target.
+// Strings, quoted identifiers (`""` is one embedded quote), and comments are
+// real tokens or skipped, so a word inside a literal cannot look like JOIN
+// and a quoted name cannot be cut at its first quote. An unterminated
+// comment, string, or identifier fails closed (null).
+function scanSQLTokens(sql: string): SQLToken[] | null {
+  const tokens: SQLToken[] = [];
+  let i = 0;
+  while (i < sql.length) {
+    const c = sql[i];
+    if (c === " " || c === "\t" || c === "\n" || c === "\r" || c === "\f") {
+      i += 1;
+      continue;
+    }
+    if (c === "-" && sql[i + 1] === "-") {
+      i += 2;
+      while (i < sql.length && sql[i] !== "\n") i += 1;
+      continue;
+    }
+    if (c === "/" && sql[i + 1] === "*") {
+      const end = sql.indexOf("*/", i + 2);
+      if (end < 0) return null;
+      i = end + 2;
+      continue;
+    }
+    if (c === "'") {
+      i += 1;
+      let closed = false;
+      while (i < sql.length) {
+        if (sql[i] === "'") {
+          if (sql[i + 1] === "'") {
+            i += 2;
+            continue;
+          }
+          i += 1;
+          closed = true;
+          break;
+        }
+        i += 1;
+      }
+      if (!closed) return null;
+      tokens.push({ kind: "other", text: "" });
+      continue;
+    }
+    if (c === '"') {
+      i += 1;
+      let text = "";
+      let closed = false;
+      while (i < sql.length) {
+        if (sql[i] === '"') {
+          if (sql[i + 1] === '"') {
+            text += '"';
+            i += 2;
+            continue;
+          }
+          i += 1;
+          closed = true;
+          break;
+        }
+        text += sql[i];
+        i += 1;
+      }
+      if (!closed || text.length === 0) return null;
+      tokens.push({ kind: "ident", text });
+      continue;
+    }
+    if (c === ",") {
+      tokens.push({ kind: "comma", text: "," });
+      i += 1;
+      continue;
+    }
+    if (c === ".") {
+      tokens.push({ kind: "dot", text: "." });
+      i += 1;
+      continue;
+    }
+    if (c === "(") {
+      tokens.push({ kind: "lparen", text: "(" });
+      i += 1;
+      continue;
+    }
+    if (c === ")") {
+      tokens.push({ kind: "rparen", text: ")" });
+      i += 1;
+      continue;
+    }
+    if (c === ";") {
+      tokens.push({ kind: "semi", text: ";" });
+      i += 1;
+      continue;
+    }
+    if (/[A-Za-z_]/.test(c)) {
+      const start = i;
+      i += 1;
+      while (i < sql.length && /[A-Za-z0-9_]/.test(sql[i])) i += 1;
+      tokens.push({ kind: "ident", text: sql.slice(start, i) });
+      continue;
+    }
+    tokens.push({ kind: "other", text: c });
+    i += 1;
   }
-  const found = catalogTables.find((t) => t.toLowerCase() === clean.toLowerCase());
-  return found ?? null;
+  return tokens;
+}
+
+// readTableRef reads the identifier at tokens[index], including one
+// schema qualifier, then skips a trailing alias (`t` or `AS t`). A qualified
+// name is returned as `schema.table` so the catalog lookup (unqualified
+// names) misses it rather than editing whichever table shares the schema's
+// name. The returned index is the first token after the reference.
+function readTableRef(tokens: SQLToken[], index: number): { name: string; next: number } | null {
+  const first = tokens[index];
+  if (!first || first.kind !== "ident") return null;
+  let name = first.text;
+  let next = index + 1;
+  if (tokens[next]?.kind === "dot") {
+    const second = tokens[next + 1];
+    if (!second || second.kind !== "ident") return null;
+    name = `${name}.${second.text}`;
+    next += 2;
+  }
+  const alias = tokens[next];
+  if (alias?.kind === "ident") {
+    const word = alias.text.toLowerCase();
+    if (word === "as") {
+      next += 1;
+      if (tokens[next]?.kind === "ident") next += 1;
+    } else if (!TABLE_REF_STOP.has(word)) {
+      next += 1;
+    }
+  }
+  return { name, next };
+}
+
+export function detectEditableTable(sql: string, catalogTables: string[]): string | null {
+  if (!sql || !sql.trim()) return null;
+  const tokens = scanSQLTokens(sql);
+  if (!tokens || tokens.length === 0) return null;
+  if (tokens[0].kind !== "ident" || tokens[0].text.toLowerCase() !== "select") return null;
+
+  let depth = 0;
+  let table: string | null = null;
+  let joined = false;
+  for (let i = 0; i < tokens.length; i += 1) {
+    const tok = tokens[i];
+    if (tok.kind === "lparen") {
+      depth += 1;
+      continue;
+    }
+    if (tok.kind === "rparen") {
+      depth = Math.max(0, depth - 1);
+      continue;
+    }
+    if (tok.kind === "semi") {
+      if (tokens.slice(i + 1).some((item) => item.kind !== "semi")) return null;
+      break;
+    }
+    if (depth !== 0 || tok.kind !== "ident") continue;
+    const word = tok.text.toLowerCase();
+    if (word === "join" || word === "union" || word === "except" || word === "intersect") {
+      joined = true;
+      continue;
+    }
+    if (word !== "from" || table !== null) continue;
+    const ref = readTableRef(tokens, i + 1);
+    if (!ref) return null;
+    if (tokens[ref.next]?.kind === "comma") return null;
+    table = ref.name;
+    i = ref.next - 1;
+  }
+  if (!table || joined) return null;
+  const clean = table.trim();
+  const lower = clean.toLowerCase();
+  if (lower.startsWith("system.") || lower.startsWith("nsql_")) return null;
+  return catalogTables.find((name) => name.toLowerCase() === lower) ?? null;
 }
 
 export function isResultEditable(
@@ -5669,7 +5839,12 @@ export function extractRowPK(
 
 export function makeRowKey(pkValues: Record<string, string | null>): string {
   const keys = Object.keys(pkValues).sort();
-  return keys.map((k) => `${k}=${pkValues[k] ?? "NULL"}`).join("|");
+  // Length-free text (`a=1|b=2`) collides when a primary-key value itself
+  // contains the separator: a=("1|b=X", "Y") and a=("1", "X|b=Y") encode the
+  // same string, so two different rows share one staged change and the WHERE
+  // clause is built from the wrong key. JSON encoding of the sorted pairs is
+  // unambiguous for every string the server can return.
+  return JSON.stringify(keys.map((k) => [k, pkValues[k]]));
 }
 
 export function formatCellSQLLiteral(value: string | null, type: string): string {

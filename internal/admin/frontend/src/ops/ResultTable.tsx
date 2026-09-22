@@ -15,6 +15,8 @@ import {
 } from "@bzync/rui";
 import type { ResultSet } from "./api";
 import { Icon } from "../shared/icons";
+import { SegmentedControl } from "../shared/SegmentedControl";
+import { TableFilter } from "../shared/TableFilter";
 import { useUserPreferences } from "./userPreferences";
 
 export interface ResultTableProps {
@@ -131,33 +133,15 @@ export function ResultTable({
         <div className="nsm-table-toolbar">
           <Inline gap="sm" align="center" justify="between" wrap>
             {showSearch && totalRawRows > 5 ? (
-              <div className="nsm-table-search">
-                <Icon name="search" size={13} className="nsm-table-search-icon" />
-                <input
-                  type="search"
-                  value={searchQuery}
-                  onChange={(e) => {
-                    setSearchQuery(e.target.value);
-                    setPage(1);
-                  }}
-                  placeholder="Filter rows…"
-                  className="nsm-table-search-input"
-                  aria-label="Filter rows in table"
-                />
-                {searchQuery ? (
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setSearchQuery("");
-                      setPage(1);
-                    }}
-                    className="nsm-table-search-clear"
-                    aria-label="Clear filter"
-                  >
-                    ×
-                  </button>
-                ) : null}
-              </div>
+              <TableFilter
+                value={searchQuery}
+                onChange={(next) => {
+                  setSearchQuery(next);
+                  setPage(1);
+                }}
+                placeholder="Filter rows…"
+                label="Filter rows in table"
+              />
             ) : <div />}
 
             <Inline gap="xs" align="center">
@@ -259,22 +243,15 @@ export function ResultTable({
             {filteredRows.length > 10 ? (
               <div className="nsm-page-size-selector">
                 <span className="text-xs text-muted-foreground mr-1.5">Per page:</span>
-                <Inline gap="xs" align="center">
-                  {pageSizeOptions.map((opt) => (
-                    <button
-                      key={opt}
-                      type="button"
-                      className={`nsm-page-size-btn${pageSize === opt ? " nsm-page-size-btn--active" : ""}`}
-                      onClick={() => {
-                        setPageSize(opt);
-                        setPage(1);
-                      }}
-                      aria-label={`${opt} rows per page`}
-                    >
-                      {opt}
-                    </button>
-                  ))}
-                </Inline>
+                <SegmentedControl
+                  label="Rows per page"
+                  value={String(pageSize)}
+                  onChange={(next) => {
+                    setPageSize(Number(next));
+                    setPage(1);
+                  }}
+                  options={pageSizeOptions.map((opt) => ({ value: String(opt), label: String(opt) }))}
+                />
               </div>
             ) : null}
           </Inline>

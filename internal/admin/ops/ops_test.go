@@ -555,6 +555,49 @@ func TestSessionStoreBounded(t *testing.T) {
 	}
 }
 
+func TestSessionWithoutTimeoutsLastsUntilRemoved(t *testing.T) {
+	st := newSessionStore(4, 0, 0)
+	defer st.close()
+	sess, err := st.create(nil, "a", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Far in the past, and a keepalive against a nil connection must not
+	// count as logout.
+	sess.stateMu.Lock()
+	sess.createdAt = time.Now().Add(-48 * time.Hour)
+	sess.lastSeen = sess.createdAt
+	sess.stateMu.Unlock()
+	st.keepalive()
+	st.sweep()
+	if st.get(sess.id) == nil {
+		t.Fatal("session with no idle or lifetime bound was closed")
+	}
+
+	bounded := &session{createdAt: time.Now().Add(-48 * time.Hour), lastSeen: time.Now().Add(-48 * time.Hour)}
+	if bounded.expired(time.Now(), 0, 0) {
+		t.Fatal("zero bounds expired a session")
+	}
+	if !bounded.expired(time.Now(), time.Minute, 0) {
+		t.Fatal("a positive idle timeout did not expire an idle session")
+	}
+	if !bounded.expired(time.Now(), 0, time.Hour) {
+		t.Fatal("a positive lifetime did not expire an old session")
+	}
+}
+
+func TestConfigRejectsNegativeSessionBounds(t *testing.T) {
+	_, err := New(Config{
+		ServerAddr:      "127.0.0.1:7210",
+		InsecureServer:  true,
+		IdleTimeout:     -time.Second,
+		SessionLifetime: 0,
+	}, Options{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	if !nerr.HasCode(err, nerr.InvalidArgument) {
+		t.Fatalf("negative idle timeout: got %v", err)
+	}
+}
+
 func TestSessionStoreExpiry(t *testing.T) {
 	st := newSessionStore(4, time.Millisecond, time.Hour)
 	defer st.close()

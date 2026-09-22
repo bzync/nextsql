@@ -13,8 +13,8 @@
     "lint": "eslint"
   },
   "dependencies": {
-    "@bzync/rui": "^0.0.9",
-    "framer-motion": "^13.2.0",
+    "@bzync/rui": "^0.0.10",
+    "framer-motion": "^13.4.0",
     "next": "16.3.5",
     "react": "19.3.0",
     "react-dom": "19.3.0"

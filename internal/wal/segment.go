@@ -111,7 +111,7 @@ func listSegments(dir string) ([]uint64, error) {
 	return ids, nil
 }
 
-func createSegment(dir string, h segmentHeader, _ int64) (*os.File, error) {
+func createSegment(dir string, h segmentHeader, size int64) (*os.File, error) {
 	path := filepath.Join(dir, segmentName(h.ID))
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
@@ -121,6 +121,9 @@ func createSegment(dir string, h segmentHeader, _ int64) (*os.File, error) {
 		_ = f.Close()
 		_ = os.Remove(path)
 		return nil, err
+	}
+	if size > SegmentHeaderSize {
+		_ = diskio.Preallocate(f, size)
 	}
 	if err := diskio.Sync(f); err != nil {
 		_ = f.Close()

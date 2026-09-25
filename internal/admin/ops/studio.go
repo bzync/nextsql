@@ -381,6 +381,8 @@ func (s *Server) handleStudioQueryStream(w http.ResponseWriter, r *http.Request,
 		writeError(w, studioErrorStatus(err), userError(err))
 		return
 	}
+	// The status is already committed, so a cancel after streaming started can
+	// only be reported in the terminal frame.
 	_ = emit(studio.StreamFrame{
 		Type:      "error",
 		Error:     userError(err),
@@ -497,15 +499,31 @@ func studioDecodeErrorStatus(err error) int {
 	return http.StatusBadRequest
 }
 
+// studioErrorStatus maps an engine error to the status the editor reports.
+// The default is 502 because anything unrecognized is, from Admin's side, an
+// upstream problem — so every code the *operator's own statement* can provoke
+// has to be listed here. A constraint the statement violated is the operator's
+// result, not a failure of the server that reported it, and rendering it as
+// "502 Bad Gateway" sends them to check infrastructure over a duplicate INSERT.
 func studioErrorStatus(err error) int {
 	switch {
 	case nerr.HasCode(err, nerr.Unauthorized), nerr.HasCode(err, nerr.Forbidden):
 		return http.StatusForbidden
-	case nerr.HasCode(err, nerr.InvalidArgument), nerr.HasCode(err, nerr.Syntax):
+	case nerr.HasCode(err, nerr.InvalidArgument), nerr.HasCode(err, nerr.Syntax),
+		nerr.HasCode(err, nerr.InvalidFormat):
 		return http.StatusBadRequest
 	case nerr.HasCode(err, nerr.NotFound):
 		return http.StatusNotFound
-	case nerr.HasCode(err, nerr.Conflict), nerr.HasCode(err, nerr.Deadlock), nerr.HasCode(err, nerr.Serialization):
+	// Constraint violations: the statement conflicts with data that is already
+	// there, which is exactly what 409 means.
+	case nerr.HasCode(err, nerr.Conflict), nerr.HasCode(err, nerr.Deadlock),
+		nerr.HasCode(err, nerr.Serialization), nerr.HasCode(err, nerr.AlreadyExists),
+		nerr.HasCode(err, nerr.ForeignKey):
+		return http.StatusConflict
+	// Unavailable is a server state the operator can act on (no leader, a
+	// feature not configured), not a broken gateway — and 409 is what every
+	// other action handler here already returns for it.
+	case nerr.HasCode(err, nerr.Unavailable):
 		return http.StatusConflict
 	case nerr.HasCode(err, nerr.Exhausted):
 		return http.StatusRequestEntityTooLarge

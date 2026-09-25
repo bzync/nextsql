@@ -37,12 +37,22 @@ func applyOne(fm *file.Manager, rec Record) error {
 		}
 		return err
 	}
+	neu, changed, err := ApplyOnePage(raw, rec)
+	if err != nil || !changed {
+		return err
+	}
+	return fm.WriteLogical(rec.PageID, neu)
+}
+
+// ApplyOnePage reverses one undo record on a logical leaf page byte slice,
+// returning the modified page and whether any slot was changed.
+func ApplyOnePage(raw []byte, rec Record) ([]byte, bool, error) {
 	p, err := page.Parse(raw)
 	if err != nil {
-		return nil
+		return nil, false, nil
 	}
 	if p.Type() != format.PageTypeBTreeLeaf && p.Type() != format.PageTypeSlotted {
-		return nil
+		return nil, false, nil
 	}
 	changed := false
 	n := p.SlotCount()
@@ -57,13 +67,13 @@ func applyOne(fm *file.Manager, rec Record) error {
 		}
 		ver, has, err := row.Decode(v)
 		if err != nil {
-			return err
+			return nil, false, err
 		}
 		switch rec.Kind {
 		case KindInsert:
 			if !has || ver.Xmin == rec.Txn {
 				if err := p.Delete(uint16(i)); err != nil {
-					return err
+					return nil, false, err
 				}
 				changed = true
 			}
@@ -78,7 +88,7 @@ func applyOne(fm *file.Manager, rec Record) error {
 					neu = rec.Old.Payload
 				}
 				if err := replaceLeafValue(p, uint16(i), k, neu); err != nil {
-					return err
+					return nil, false, err
 				}
 				changed = true
 			}
@@ -86,11 +96,12 @@ func applyOne(fm *file.Manager, rec Record) error {
 		break
 	}
 	if !changed {
-		return nil
+		return raw, false, nil
 	}
 	p.Finalize()
-	return fm.WriteLogical(rec.PageID, p.Bytes())
+	return p.Bytes(), true, nil
 }
+
 
 func decodeLeafKV(rec []byte) (key, value []byte, ok bool) {
 	if len(rec) < 4 {

@@ -710,7 +710,7 @@ func Parallel(pool *scheduler.Pool, budget *scheduler.Budget, groups []int, spec
 			return nil
 		}
 	}
-	if err := pool.Run(budget.Context(), workers, tasks); err != nil {
+	if err := scheduler.RunTracked(pool, budget, workers, tasks); err != nil {
 		return nil, err
 	}
 	root := local[0]

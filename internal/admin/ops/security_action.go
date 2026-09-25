@@ -52,10 +52,13 @@ type securityActionRequest struct {
 	// create_user only. Never logged and never echoed back in an error.
 	Password string `json:"password"`
 
-	// grant_role / revoke_role
+	// grant_role / revoke_role: the role being granted or revoked. Its
+	// recipient is Grantee, below — not Name.
 	Role string `json:"role"`
 
-	// grant / revoke
+	// Grantee is the recipient for grant / revoke *and* for
+	// grant_role / revoke_role; Name is only ever the object being created
+	// or dropped.
 	Grantee       string   `json:"grantee"`
 	AllPrivileges bool     `json:"all_privileges"`
 	Privileges    []string `json:"privileges"`

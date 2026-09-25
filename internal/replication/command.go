@@ -23,6 +23,10 @@ const (
 	// pages behind the leader's. It rejects the batch version instead, and
 	// stops applying. Batches without a delta stay byte-identical to version 1.
 	VersionPageDeltas uint16 = 2
+	// VersionUndo is written for a batch that carries a RecUndo record with
+	// row versions, so a follower on an older release refuses the batch
+	// rather than skipping the record and serving uncommitted versions.
+	VersionUndo uint16 = 3
 
 	cmdHeaderSize = 4 + 2 + 2 + 4 // magic, version, kind, count
 
@@ -72,7 +76,7 @@ func DecodeCommand(keys crypto.KeyProvider, data []byte) ([]wal.Record, error) {
 		return nil, nerr.New(nerr.InvalidFormat, "replication.DecodeCommand", "bad magic")
 	}
 	ver := encoding.U16(data, 4)
-	if ver != CurrentVersion && ver != VersionPageDeltas {
+	if ver != CurrentVersion && ver != VersionPageDeltas && ver != VersionUndo {
 		return nil, nerr.New(nerr.InvalidFormat, "replication.DecodeCommand", "unsupported command version")
 	}
 	suite := format.CipherSuite(encoding.U16(data, 6))
@@ -97,15 +101,28 @@ func DecodeCommand(keys crypto.KeyProvider, data []byte) ([]wal.Record, error) {
 	return unmarshalBatch(ver, plain)
 }
 
-// batchVersion is VersionPageDeltas exactly when recs holds a page delta.
+// batchVersion is VersionUndo when recs holds an undo record, VersionPageDeltas
+// when recs holds a page delta without undo, and CurrentVersion otherwise.
 func batchVersion(recs []wal.Record) uint16 {
+	hasDelta := false
+	hasUndo := false
 	for _, r := range recs {
-		if r.Type == wal.RecPageDelta {
-			return VersionPageDeltas
+		if r.Type == wal.RecUndo {
+			hasUndo = true
 		}
+		if r.Type == wal.RecPageDelta {
+			hasDelta = true
+		}
+	}
+	if hasUndo {
+		return VersionUndo
+	}
+	if hasDelta {
+		return VersionPageDeltas
 	}
 	return CurrentVersion
 }
+
 
 func marshalBatch(ver uint16, recs []wal.Record) []byte {
 	n := cmdHeaderSize

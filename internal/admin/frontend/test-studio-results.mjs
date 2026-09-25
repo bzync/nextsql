@@ -795,6 +795,183 @@ try {
     assert.equal("overflow" in state.cache, true);
   }
 
+  // Qualifier context tests (dot completion: alias.col, table.col, system.table)
+  assert.deepEqual(tools.currentQualifierContext("SELECT o.", 9), {
+    qualifier: "o",
+    typed: "",
+    start: 9,
+    end: 9,
+  });
+  assert.deepEqual(tools.currentQualifierContext("SELECT o.st", 11), {
+    qualifier: "o",
+    typed: "st",
+    start: 9,
+    end: 11,
+  });
+  assert.deepEqual(tools.currentQualifierContext("SELECT orders.status", 20), {
+    qualifier: "orders",
+    typed: "status",
+    start: 14,
+    end: 20,
+  });
+  assert.deepEqual(tools.currentQualifierContext("SELECT system.", 14), {
+    qualifier: "system",
+    typed: "",
+    start: 14,
+    end: 14,
+  });
+  assert.equal(tools.currentQualifierContext("SELECT 1.5", 10), null, "numbers must not trigger qualifier context");
+  assert.equal(tools.currentQualifierContext("SELECT ..", 9), null, "double dot must not trigger qualifier context");
+  assert.equal(tools.currentQualifierContext("SELECT a..b", 11), null);
+
+  // Table alias extraction (FROM, JOIN, UPDATE, INTO)
+  {
+    const sql = "SELECT o.id, c.name FROM orders o JOIN customers c ON o.cust_id = c.id";
+    const aliases = tools.extractTableAliases(sql, ["orders", "customers"]);
+    assert.equal(aliases.get("o"), "orders");
+    assert.equal(aliases.get("c"), "customers");
+    assert.equal(aliases.get("orders"), "orders");
+    assert.equal(aliases.get("customers"), "customers");
+  }
+  {
+    const sql = "UPDATE users AS u SET name = 'admin' WHERE u.id = 1";
+    const aliases = tools.extractTableAliases(sql, ["users"]);
+    assert.equal(aliases.get("u"), "users");
+    assert.equal(aliases.get("users"), "users");
+  }
+  {
+    const sql = "INSERT INTO audit_log AS al (event) VALUES ('test')";
+    const aliases = tools.extractTableAliases(sql, ["audit_log"]);
+    assert.equal(aliases.get("al"), "audit_log");
+  }
+
+  // Qualified suggestions ranking
+  {
+    const aliasMap = new Map([["o", "orders"], ["orders", "orders"]]);
+    const cache = { orders: ["created_at", "id", "status", "total"] };
+    const colTypes = { orders: { id: "INT64", status: "STRING" } };
+    const jsonPaths = { orders: ["metadata.priority"] };
+
+    const suggestions = tools.rankQualifiedSuggestions("o", "st", aliasMap, cache, jsonPaths, colTypes);
+    assert.equal(suggestions.length, 1);
+    assert.equal(suggestions[0].kind, "column");
+    assert.equal(suggestions[0].insertText, "status");
+    assert.equal(suggestions[0].label, "status — orders · STRING");
+
+    const systemSuggestions = tools.rankQualifiedSuggestions("system", "ta", new Map(), cache);
+    assert.ok(systemSuggestions.some((s) => s.label === "system.tables" && s.insertText === "tables"));
+
+    const jsonSuggestions = tools.rankQualifiedSuggestions("o", "meta", aliasMap, cache, jsonPaths);
+    assert.ok(jsonSuggestions.some((s) => s.kind === "json-path" && s.insertText === "metadata.priority"));
+  }
+
+  // Clause context detection
+  assert.equal(tools.detectSQLClauseContext("SELECT * FROM ", 14), "table");
+  assert.equal(tools.detectSQLClauseContext("SELECT * FROM orders JOIN ", 26), "table");
+  assert.equal(tools.detectSQLClauseContext("INSERT INTO ", 12), "table");
+  assert.equal(tools.detectSQLClauseContext("UPDATE users ", 13), "table");
+  assert.equal(tools.detectSQLClauseContext("SELECT ", 7), "column");
+  assert.equal(tools.detectSQLClauseContext("SELECT * FROM orders WHERE ", 27), "column");
+  assert.equal(tools.detectSQLClauseContext("UPDATE users SET ", 17), "column");
+  assert.equal(tools.detectSQLClauseContext("SELECT * FROM orders GROUP BY ", 30), "column");
+  assert.equal(tools.detectSQLClauseContext("", 0), "general");
+
+  // Enhanced rankSQLSuggestions with keywords and clauseContext
+  {
+    const kwSuggestions = tools.rankSQLSuggestions("SEL", ["users"], [], {}, 10, { includeKeywords: true, clauseContext: "general" });
+    assert.ok(kwSuggestions.some((s) => s.kind === "keyword" && s.insertText === "SELECT"));
+
+    const fnSuggestions = tools.rankSQLSuggestions("COU", ["users"], [], {}, 10, { includeKeywords: true, clauseContext: "column" });
+    assert.ok(fnSuggestions.some((s) => s.kind === "function" && s.insertText === "COUNT()"));
+
+    const typeSuggestions = tools.rankSQLSuggestions("INT64", ["users"], [], {}, 10, { includeKeywords: true, clauseContext: "general" });
+    assert.ok(typeSuggestions.some((s) => s.kind === "type" && s.insertText === "INT64"));
+  }
+
+  // extractTableRelationMetadata and relational suggestions
+  {
+    const mockDetail = {
+      name: "orders",
+      columns: {
+        columns: ["column_name", "type", "is_primary"],
+        rows: [
+          ["id", "INT64", "true"],
+          ["customer_id", "INT64", "false"],
+          ["total", "FLOAT64", "false"],
+        ],
+      },
+      foreign_keys: {
+        columns: ["constraint_name", "column_name", "ref_table", "ref_column"],
+        rows: [
+          ["fk_orders_customer", "customer_id", "customers", "id"],
+        ],
+      },
+      referencing_keys: {
+        columns: ["constraint_name", "table_name", "column_name", "ref_column"],
+        rows: [
+          ["fk_items_order", "order_items", "order_id", "id"],
+        ],
+      },
+    };
+
+    const relationMeta = tools.extractTableRelationMetadata(mockDetail);
+    assert.deepEqual(relationMeta.pks, ["id"]);
+    assert.equal(relationMeta.foreignKeys.length, 1);
+    assert.equal(relationMeta.foreignKeys[0].column, "customer_id");
+    assert.equal(relationMeta.foreignKeys[0].refTable, "customers");
+    assert.equal(relationMeta.foreignKeys[0].refColumn, "id");
+    assert.equal(relationMeta.referencingKeys.length, 1);
+    assert.equal(relationMeta.referencingKeys[0].referencingTable, "order_items");
+    assert.equal(relationMeta.referencingKeys[0].referencingColumn, "order_id");
+
+    const aliasMap = new Map([["o", "orders"], ["orders", "orders"]]);
+    const cache = { orders: ["customer_id", "id", "total"] };
+    const colTypes = { orders: { id: "INT64", customer_id: "INT64", total: "FLOAT64" } };
+    const relCache = { orders: relationMeta };
+
+    // Qualified suggestions with PK & FK
+    const pkSuggestions = tools.rankQualifiedSuggestions("o", "i", aliasMap, cache, undefined, colTypes, relCache);
+    assert.equal(pkSuggestions.length, 1);
+    assert.equal(pkSuggestions[0].kind, "pk");
+    assert.ok(pkSuggestions[0].label.includes("[PK] id — orders"));
+
+    const fkSuggestions = tools.rankQualifiedSuggestions("o", "cu", aliasMap, cache, undefined, colTypes, relCache);
+    assert.equal(fkSuggestions.length, 1);
+    assert.equal(fkSuggestions[0].kind, "fk");
+    assert.ok(fkSuggestions[0].label.includes("[FK -> customers.id] customer_id — orders"));
+
+    // Relational JOIN suggestions in table clause context
+    const joinSuggestions = tools.rankSQLSuggestions("", ["customers", "orders"], ["orders"], cache, 10, {
+      includeKeywords: true,
+      clauseContext: "table",
+      relations: relCache,
+      tableAliases: aliasMap,
+    });
+    assert.ok(
+      joinSuggestions.some((s) => s.kind === "join" && s.insertText === "customers ON o.customer_id = customers.id"),
+      "should suggest outgoing FK JOIN condition",
+    );
+    assert.ok(
+      joinSuggestions.some((s) => s.kind === "join" && s.insertText === "order_items ON order_items.order_id = o.id"),
+      "should suggest incoming referencing key JOIN condition",
+    );
+
+    // Relational ON condition suggestions in column clause context
+    const condSuggestions = tools.rankSQLSuggestions("", ["customers", "orders"], ["orders", "customers"], cache, 10, {
+      includeKeywords: true,
+      clauseContext: "column",
+      relations: {
+        orders: relationMeta,
+        customers: { pks: ["id"], foreignKeys: [], referencingKeys: [] },
+      },
+      tableAliases: new Map([["orders", "orders"], ["customers", "customers"]]),
+    });
+    assert.ok(
+      condSuggestions.some((s) => s.kind === "join-condition" && s.insertText === "orders.customer_id = customers.id"),
+      "should suggest relational join condition in column context",
+    );
+  }
+
   // Deterministic misspelled table-name suggestions.
   assert.equal(tools.levenshteinDistance("orders", "orders"), 0);
   assert.equal(tools.levenshteinDistance("orders", "order"), 1, "one deletion");
@@ -860,6 +1037,171 @@ try {
       tools.applyTableNameFix("SELECT * FROM ordrs JOIN ordrs ON 1=1", twice[0]),
       "SELECT * FROM orders JOIN orders ON 1=1",
     );
+  }
+
+  // Common Table Expressions (CTE) extraction & table suggestion integration.
+  {
+    const singleCTE = tools.extractCommonTableExpressions("WITH cte1 AS (SELECT 1) SELECT * FROM cte1");
+    assert.ok(singleCTE.has("cte1"), "extracts single WITH CTE");
+    const multiCTE = tools.extractCommonTableExpressions("WITH RECURSIVE c1 AS (SELECT 1), c2 AS (SELECT 2) SELECT * FROM c1, c2");
+    assert.ok(multiCTE.has("c1") && multiCTE.has("c2"), "extracts recursive and comma-separated CTEs");
+
+    // A table name that matches a defined CTE is not flagged as an unknown table
+    const cteQuery = "WITH ordrs AS (SELECT 1) SELECT * FROM ordrs";
+    assert.deepEqual(
+      tools.suggestTableNameFixes(cteQuery, tableCatalog, false),
+      [],
+      "a defined CTE name is never flagged as an unknown catalog table",
+    );
+
+    // UPDATE and INSERT INTO table targets are recognized for typo fixes
+    const updateFixes = tools.suggestTableNameFixes("UPDATE ordrs SET status = 'active'", tableCatalog, false);
+    assert.equal(updateFixes.length, 1);
+    assert.equal(updateFixes[0].badName, "ordrs");
+    assert.equal(updateFixes[0].suggestion, "orders");
+
+    const insertFixes = tools.suggestTableNameFixes("INSERT INTO ordrs VALUES (1, 2)", tableCatalog, false);
+    assert.equal(insertFixes.length, 1);
+    assert.equal(insertFixes[0].badName, "ordrs");
+    assert.equal(insertFixes[0].suggestion, "orders");
+  }
+
+  // Column name suggestions and binder diagnostics.
+  {
+    const columnCache = {
+      orders: ["id", "user_id", "total", "status", "created_at"],
+      users: ["id", "username", "email", "created_at"],
+    };
+
+    // Unqualified column typo on single referenced table
+    const colFixes = tools.suggestColumnNameFixes(
+      "SELECT usr_id, statuss FROM orders WHERE total > 10",
+      ["orders"],
+      columnCache,
+    );
+    assert.equal(colFixes.length, 2);
+    assert.equal(colFixes[0].badName, "usr_id");
+    assert.equal(colFixes[0].suggestion, "user_id");
+    assert.equal(colFixes[1].badName, "statuss");
+    assert.equal(colFixes[1].suggestion, "status");
+
+    // Multiple occurrences of bad column name
+    const multiOcc = tools.suggestColumnNameFixes(
+      "SELECT usr_id FROM orders WHERE usr_id > 5 ORDER BY usr_id",
+      ["orders"],
+      columnCache,
+    );
+    assert.equal(multiOcc.length, 1);
+    assert.equal(multiOcc[0].badName, "usr_id");
+    assert.equal(multiOcc[0].occurrences.length, 3, "records all 3 occurrences");
+    assert.equal(
+      tools.applyColumnNameFix("SELECT usr_id FROM orders WHERE usr_id > 5 ORDER BY usr_id", multiOcc[0]),
+      "SELECT user_id FROM orders WHERE user_id > 5 ORDER BY user_id",
+    );
+
+    // Table-qualified and alias-qualified column references
+    const aliasFixes = tools.suggestColumnNameFixes(
+      "SELECT o.usr_id, u.emal FROM orders o JOIN users u ON o.usr_id = u.id",
+      ["orders", "users"],
+      columnCache,
+    );
+    assert.equal(aliasFixes.length, 2);
+    const orderFix = aliasFixes.find((f) => f.tableName === "orders");
+    const userFix = aliasFixes.find((f) => f.tableName === "users");
+    assert.ok(orderFix && orderFix.badName === "usr_id" && orderFix.suggestion === "user_id");
+    assert.ok(userFix && userFix.badName === "emal" && userFix.suggestion === "email");
+
+    // Exact columns are not flagged
+    assert.deepEqual(
+      tools.suggestColumnNameFixes("SELECT user_id, status FROM orders", ["orders"], columnCache),
+      [],
+      "exact column names are never flagged",
+    );
+
+    // Distant name gets no suggestion
+    assert.deepEqual(
+      tools.suggestColumnNameFixes("SELECT zzzzzzzzzz FROM orders", ["orders"], columnCache),
+      [],
+      "distant column name gets no suggestion",
+    );
+
+    // Tie between two equidistant columns is not guessed
+    const tieCache = { items: ["name", "game"] };
+    assert.deepEqual(
+      tools.suggestColumnNameFixes("SELECT fame FROM items", ["items"], tieCache),
+      [],
+      "tied equidistant columns are never resolved by guessing",
+    );
+
+    // Empty or unloaded cache returns no fixes
+    assert.deepEqual(
+      tools.suggestColumnNameFixes("SELECT usr_id FROM orders", ["orders"], {}),
+      [],
+      "unloaded cache returns empty fixes without error",
+    );
+  }
+
+  // Server binder error parser & identifier span finder.
+  {
+    assert.deepEqual(
+      tools.parseBinderErrorMessage("nextsql execution error: unknown table: ordrs"),
+      { kind: "unknown-table", name: "ordrs" },
+    );
+    assert.deepEqual(
+      tools.parseBinderErrorMessage("nextsql execution error: unknown column: usr_id"),
+      { kind: "unknown-column", context: undefined, name: "usr_id" },
+    );
+    assert.deepEqual(
+      tools.parseBinderErrorMessage("unknown column in GROUP BY: bad_col"),
+      { kind: "unknown-column", context: "GROUP BY", name: "bad_col" },
+    );
+    assert.equal(
+      tools.parseBinderErrorMessage("nextsql syntax error: unexpected token"),
+      null,
+      "non-binder error returns null",
+    );
+
+    // Identifier span finder
+    const spans = tools.findIdentifierSpansInSQL("SELECT usr_id FROM orders WHERE usr_id > 5", "usr_id");
+    assert.equal(spans.length, 2);
+    assert.equal(spans[0].start, 7);
+    assert.equal(spans[0].end, 13);
+    assert.equal(spans[0].line, 1);
+    assert.equal(spans[0].column, 8);
+    assert.equal(spans[1].start, 32);
+    assert.equal(spans[1].end, 38);
+
+    // Does not match substrings of longer identifiers
+    const noSubMatch = tools.findIdentifierSpansInSQL("SELECT usr_id_full FROM orders", "usr_id");
+    assert.equal(noSubMatch.length, 0, "does not match substring of longer identifier");
+  }
+
+  // Comprehensive computeBinderDiagnostics.
+  {
+    const columnCache = {
+      orders: ["id", "user_id", "status"],
+    };
+    const badSQL = "SELECT usr_id FROM ordrs WHERE statuss = 'ok'";
+    const diags = tools.computeBinderDiagnostics(badSQL, tableCatalog, columnCache, false);
+    assert.equal(diags.length, 3, "reports unknown table and two unknown columns");
+
+    const tableDiag = diags.find((d) => d.kind === "unknown-table");
+    assert.ok(tableDiag);
+    assert.equal(tableDiag.badName, "ordrs");
+    assert.equal(tableDiag.suggestion, "orders");
+    assert.equal(tableDiag.line, 1);
+
+    const usrIdDiag = diags.find((d) => d.badName === "usr_id");
+    assert.ok(usrIdDiag);
+    assert.equal(usrIdDiag.suggestion, "user_id");
+
+    const statusDiag = diags.find((d) => d.badName === "statuss");
+    assert.ok(statusDiag);
+    assert.equal(statusDiag.suggestion, "status");
+
+    // When tables are truncated, table diagnostics are suppressed
+    const truncatedDiags = tools.computeBinderDiagnostics(badSQL, tableCatalog, columnCache, true);
+    assert.ok(truncatedDiags.every((d) => d.kind !== "unknown-table"), "table diagnostics suppressed under truncation");
   }
 
   // JSON-path completion where metadata is known.
@@ -1679,6 +2021,162 @@ try {
   }
 
   {
+    // Streaming bulk import: parseBulkImportText and buildBulkImportBatches.
+    const columnsResult = (rows) => ({
+      columns: ["table_name", "column_name", "ordinal", "type", "not_null", "is_primary", "default_value"],
+      column_types: ["STRING", "STRING", "DECIMAL", "STRING", "BOOL", "BOOL", "STRING"],
+      rows,
+      elapsed_ms: 1,
+      truncated: false,
+    });
+    const detail = {
+      name: "customers",
+      columns: columnsResult([
+        ["customers", "id", "1", "INT64", "true", "true", null],
+        ["customers", "name", "2", "STRING", "true", "false", null],
+        ["customers", "balance", "3", "DECIMAL", "false", "false", "0"],
+        ["customers", "active", "4", "BOOL", "false", "false", "true"],
+        ["customers", "profile", "5", "JSON", "false", "false", null],
+        ["customers", "vector", "6", "VECTOR<F32,3>", "false", "false", null],
+      ]),
+    };
+    const cols = tools.dataGenColumns(detail);
+    const supportedCols = cols.filter((c) => c.supported);
+
+    // 1. Delimited CSV parsing & batching
+    const csvLines = ["id,name,balance,active,profile"];
+    for (let i = 1; i <= 600; i++) {
+      csvLines.push(`${i},Customer ${i},${(i * 1.5).toFixed(2)},${i % 2 === 0 ? "true" : "false"},{"tier":${i}}`);
+    }
+    const parsedCsv = tools.parseBulkImportText(csvLines.join("\n"), "csv");
+    assert.equal(parsedCsv.error, null);
+    assert.equal(parsedCsv.totalRows, 600);
+    assert.equal(parsedCsv.fields.length, 5);
+
+    const plan = tools.buildBulkImportBatches({
+      table: "customers",
+      columns: supportedCols,
+      mapping: { id: "id", name: "name", balance: "balance", active: "active", profile: "profile" },
+      parsed: parsedCsv,
+      emptyAsNull: true,
+      batchSize: 250,
+    });
+    assert.equal(plan.error, null);
+    assert.equal(plan.totalRows, 600);
+    assert.equal(plan.totalBatches, 3);
+    assert.equal(plan.batches[0].rowCount, 250);
+    assert.equal(plan.batches[0].startRow, 1);
+    assert.equal(plan.batches[0].endRow, 250);
+    assert.match(plan.batches[0].sql, /^INSERT INTO "customers" \("id", "name", "balance", "active", "profile"\) VALUES/);
+    assert.equal(plan.batches[1].rowCount, 250);
+    assert.equal(plan.batches[1].startRow, 251);
+    assert.equal(plan.batches[1].endRow, 500);
+    assert.equal(plan.batches[2].rowCount, 100);
+    assert.equal(plan.batches[2].startRow, 501);
+    assert.equal(plan.batches[2].endRow, 600);
+
+    // 2. Large statement byte bounds splitting
+    const bigRowCsv = ["id,name"];
+    const longString = "x".repeat(10000);
+    for (let i = 1; i <= 100; i++) bigRowCsv.push(`${i},${longString}`);
+    const bigParsed = tools.parseBulkImportText(bigRowCsv.join("\n"), "csv");
+    // With maxBatchBytes=50_000, 100 rows * 10KB = ~1MB must be split into multiple batches even with batchSize=100
+    const splitPlan = tools.buildBulkImportBatches({
+      table: "customers",
+      columns: supportedCols,
+      mapping: { id: "id", name: "name" },
+      parsed: bigParsed,
+      emptyAsNull: true,
+      batchSize: 100,
+      maxBatchBytes: 50_000,
+    });
+    assert.equal(splitPlan.error, null);
+    assert.equal(splitPlan.totalRows, 100);
+    assert.ok(splitPlan.totalBatches > 1, "large tuples should trigger statement byte size splits");
+
+    // 3. Type validation before execution
+    const badInt = tools.parseBulkImportText("id,name\nnot_an_int,Alice\n", "csv");
+    const badIntPlan = tools.buildBulkImportBatches({
+      table: "customers",
+      columns: supportedCols,
+      mapping: { id: "id", name: "name" },
+      parsed: badInt,
+      emptyAsNull: true,
+    });
+    assert.match(badIntPlan.error, /Row 1: "not_an_int" is not an integer for column "id"/);
+
+    const badBool = tools.parseBulkImportText("id,name,active\n1,Alice,maybe\n", "csv");
+    const badBoolPlan = tools.buildBulkImportBatches({
+      table: "customers",
+      columns: supportedCols,
+      mapping: { id: "id", name: "name", active: "active" },
+      parsed: badBool,
+      emptyAsNull: true,
+    });
+    assert.match(badBoolPlan.error, /Row 1: "maybe" is not a boolean for column "active"/);
+
+    const badJson = tools.parseBulkImportText('id,name,profile\n1,Alice,{bad json}\n', "csv");
+    const badJsonPlan = tools.buildBulkImportBatches({
+      table: "customers",
+      columns: supportedCols,
+      mapping: { id: "id", name: "name", profile: "profile" },
+      parsed: badJson,
+      emptyAsNull: true,
+    });
+    assert.match(badJsonPlan.error, /Row 1: column "profile" expects JSON/);
+
+    // 4. NOT NULL unmapped or empty without default
+    const unmappedPlan = tools.buildBulkImportBatches({
+      table: "customers",
+      columns: supportedCols,
+      mapping: { id: "id" }, // "name" is NOT NULL and unmapped
+      parsed: tools.parseBulkImportText("id\n1\n", "csv"),
+      emptyAsNull: true,
+    });
+    assert.match(unmappedPlan.error, /Column "name" is NOT NULL and has no default — map a field to it/);
+
+    // 5. Unsupported column kind (e.g. VECTOR)
+    const unsupportedPlan = tools.buildBulkImportBatches({
+      table: "customers",
+      columns: cols, // includes unsupported VECTOR column
+      mapping: { id: "id", name: "name", vec: "vector" },
+      parsed: tools.parseBulkImportText("id,name,vec\n1,Alice,[1,2,3]\n", "csv"),
+      emptyAsNull: true,
+    });
+    assert.match(unsupportedPlan.error, /cannot be imported from a text value/);
+
+    // 6. JSON array and NDJSON formats
+    const jsonArr = tools.parseBulkImportText('[{"id":10,"name":"A"},{"id":20,"name":"B"}]', "json");
+    assert.equal(jsonArr.totalRows, 2);
+    const jsonPlan = tools.buildBulkImportBatches({
+      table: "customers",
+      columns: supportedCols,
+      mapping: { id: "id", name: "name" },
+      parsed: jsonArr,
+      emptyAsNull: true,
+    });
+    assert.equal(jsonPlan.error, null);
+    assert.equal(jsonPlan.totalRows, 2);
+
+    const ndjson = tools.parseBulkImportText('{"id":100,"name":"X"}\n{"id":200,"name":"Y"}\n', "ndjson");
+    assert.equal(ndjson.totalRows, 2);
+    const ndjsonPlan = tools.buildBulkImportBatches({
+      table: "customers",
+      columns: supportedCols,
+      mapping: { id: "id", name: "name" },
+      parsed: ndjson,
+      emptyAsNull: true,
+    });
+    assert.equal(ndjsonPlan.error, null);
+    assert.equal(ndjsonPlan.totalRows, 2);
+
+    // 7. Throughput formatter
+    assert.equal(tools.formatThroughput(1000, 2000), "500.0 rows/sec");
+    assert.equal(tools.formatThroughput(10000, 2000), "5,000 rows/sec");
+    assert.equal(tools.formatThroughput(0, 100), "0 rows/sec");
+  }
+
+  {
     // Vector dataset import → bounded INSERT-script builder for embeddings.
     const columnsResult = (rows) => ({
       columns: ["table_name", "column_name", "ordinal", "type", "not_null", "is_primary", "default_value"],
@@ -2373,6 +2871,326 @@ try {
     // Empty changes
     const emptyBuilt = tools.buildStagedChangeSQL(tools.createEmptyStagedChanges("articles", ["id"]));
     assert.match(emptyBuilt.error, /No staged changes/);
+  }
+
+  // Recent connections history tests
+  {
+    assert.deepEqual(tools.parseRecentConnections(null), []);
+    assert.deepEqual(tools.parseRecentConnections(""), []);
+    assert.deepEqual(tools.parseRecentConnections("invalid-json"), []);
+    assert.deepEqual(tools.parseRecentConnections("{}"), []);
+
+    const initial = [
+      {
+        profileId: "prod",
+        name: "Production Primary",
+        address: "10.0.0.1:7210",
+        database: "production",
+        user: "admin",
+        environment: "production",
+        connectedAt: "2026-09-20T10:00:00Z",
+      },
+    ];
+
+    const serialized = tools.serializeRecentConnections(initial);
+    assert.ok(typeof serialized === "string");
+    const parsed = tools.parseRecentConnections(serialized);
+    assert.equal(parsed.length, 1);
+    assert.equal(parsed[0].profileId, "prod");
+    assert.equal(parsed[0].environment, "production");
+    assert.equal(parsed[0].user, "admin");
+
+    // Adding a new connection prepends it
+    let recents = tools.recordRecentConnection(parsed, {
+      profileId: "staging",
+      name: "Staging Replica",
+      address: "10.0.0.2:7210",
+      database: "staging",
+      user: "dev",
+      environment: "staging",
+      connectedAt: "2026-09-21T12:00:00Z",
+    });
+    assert.equal(recents.length, 2);
+    assert.equal(recents[0].profileId, "staging");
+    assert.equal(recents[1].profileId, "prod");
+
+    // Deduplication by profileId + user + database moves it to the front with updated time
+    recents = tools.recordRecentConnection(recents, {
+      profileId: "prod",
+      name: "Production Primary",
+      address: "10.0.0.1:7210",
+      database: "production",
+      user: "admin",
+      environment: "production",
+      connectedAt: "2026-09-22T08:00:00Z",
+    });
+    assert.equal(recents.length, 2);
+    assert.equal(recents[0].profileId, "prod");
+    assert.equal(recents[0].connectedAt, "2026-09-22T08:00:00Z");
+    assert.equal(recents[1].profileId, "staging");
+
+    // Bounding at MAX_RECENT_CONNECTIONS (10)
+    for (let i = 0; i < 15; i++) {
+      recents = tools.recordRecentConnection(recents, {
+        profileId: `node-${i}`,
+        name: `Server ${i}`,
+        database: "db",
+        user: `user-${i}`,
+        connectedAt: "2026-09-23T00:00:00Z",
+      });
+    }
+    assert.equal(recents.length, tools.MAX_RECENT_CONNECTIONS);
+    assert.equal(recents[0].profileId, "node-14");
+
+    // Removal
+    recents = tools.removeRecentConnection(recents, "node-14", "user-14", "db");
+    assert.equal(recents.length, tools.MAX_RECENT_CONNECTIONS - 1);
+    assert.equal(recents[0].profileId, "node-13");
+
+    // Malformed entries ignored
+    const malformed = JSON.stringify([
+      { profileId: "ok", name: "Valid", database: "db", user: "u", connectedAt: "2026-09-01T00:00:00Z" },
+      { missing: "fields" },
+      null,
+      "string",
+    ]);
+    const parsedMalformed = tools.parseRecentConnections(malformed);
+    assert.equal(parsedMalformed.length, 1);
+    assert.equal(parsedMalformed[0].profileId, "ok");
+
+    // Relative time formatting
+    assert.equal(tools.formatRelativeTime("invalid"), "");
+    assert.equal(tools.formatRelativeTime(new Date().toISOString()), "just now");
+    assert.ok(tools.formatRelativeTime(new Date(Date.now() - 120000).toISOString()).includes("m ago"));
+  }
+
+  // Schema Diff & Migration Generator tests
+  {
+    // parseCreateTableDDL tests
+    const sampleDDL = `CREATE TABLE users (
+      id INT64 PRIMARY KEY,
+      username STRING NOT NULL,
+      email STRING DEFAULT '',
+      bio TEXT,
+      score DECIMAL(10, 2) DEFAULT 0.0,
+      embedding VECTOR<F32, 128>,
+      CONSTRAINT fk_users_org FOREIGN KEY (org_id) REFERENCES organizations (id) ON DELETE CASCADE
+    );`;
+
+    const parsed = tools.parseCreateTableDDL(sampleDDL);
+    assert.ok(parsed, "DDL should parse");
+    assert.equal(parsed.name, "users");
+    assert.equal(parsed.columns.length, 6);
+    assert.equal(parsed.columns[0].name, "id");
+    assert.equal(parsed.columns[0].isPrimary, true);
+    assert.equal(parsed.columns[0].notNull, true);
+    assert.equal(parsed.columns[1].name, "username");
+    assert.equal(parsed.columns[1].notNull, true);
+    assert.equal(parsed.columns[2].name, "email");
+    assert.equal(parsed.columns[2].defaultValue, "''");
+    assert.equal(parsed.columns[5].name, "embedding");
+    assert.equal(parsed.columns[5].type, "VECTOR<F32, 128>");
+    assert.equal(parsed.foreignKeys.length, 1);
+    assert.equal(parsed.foreignKeys[0].constraintName, "fk_users_org");
+    assert.equal(parsed.foreignKeys[0].columnName, "org_id");
+    assert.equal(parsed.foreignKeys[0].refTable, "organizations");
+    assert.equal(parsed.foreignKeys[0].refColumn, "id");
+    assert.equal(parsed.foreignKeys[0].onDelete, "CASCADE");
+
+    // Invalid DDL returns null
+    assert.equal(tools.parseCreateTableDDL("SELECT * FROM users"), null);
+    assert.equal(tools.parseCreateTableDDL(""), null);
+
+    // extractTableSchema tests
+    const mockDetail = {
+      name: "accounts",
+      columns: {
+        columns: ["column_name", "ordinal", "type", "not_null", "is_primary", "default_value"],
+        rows: [
+          ["id", "1", "INT64", "true", "true", null],
+          ["name", "2", "STRING", "true", "false", null],
+          ["balance", "3", "DECIMAL(12, 2)", "false", "false", "0.00"],
+        ],
+      },
+      indexes: {
+        columns: ["index_name", "kind", "is_unique", "columns", "include_columns", "predicate", "status"],
+        rows: [
+          ["PRIMARY", "btree", "true", "id", "", "", "ready"],
+          ["idx_acc_name", "btree", "false", "name", "", "", "ready"],
+        ],
+      },
+      foreign_keys: {
+        columns: ["constraint_name", "column_name", "ref_table", "ref_column", "on_delete", "on_update"],
+        rows: [
+          ["fk_acc_parent", "parent_id", "accounts", "id", "RESTRICT", "RESTRICT"],
+        ],
+      },
+    };
+
+    const extracted = tools.extractTableSchema(mockDetail);
+    assert.ok(extracted);
+    assert.equal(extracted.name, "accounts");
+    assert.equal(extracted.columns.length, 3);
+    assert.equal(extracted.columns[0].name, "id");
+    assert.equal(extracted.columns[0].isPrimary, true);
+    assert.equal(extracted.columns[2].name, "balance");
+    assert.equal(extracted.columns[2].defaultValue, "0.00");
+    assert.equal(extracted.indexes.length, 2);
+    assert.equal(extracted.foreignKeys.length, 1);
+
+    // computeTableSchemaDiff - identical schemas
+    const identicalDiff = tools.computeTableSchemaDiff(extracted, extracted);
+    assert.equal(identicalDiff.identical, true);
+    assert.equal(identicalDiff.counts.totalChanges, 0);
+
+    // computeTableSchemaDiff - differences
+    const targetSchema = {
+      name: "accounts",
+      columns: [
+        { name: "id", type: "INT64", ordinal: 1, notNull: true, isPrimary: true, defaultValue: null },
+        { name: "name", type: "VARCHAR(100)", ordinal: 2, notNull: false, isPrimary: false, defaultValue: null }, // Altered: type & notNull
+        { name: "created_at", type: "TIMESTAMPTZ", ordinal: 3, notNull: true, isPrimary: false, defaultValue: "NOW()" }, // Added
+      ],
+      indexes: [
+        { name: "idx_acc_created", kind: "btree", isUnique: false, columns: ["created_at"], includeColumns: [], predicate: null, status: "ready" }, // Added
+      ],
+      foreignKeys: [
+        { constraintName: "fk_acc_parent", columnName: "parent_id", refTable: "accounts", refColumn: "id", onDelete: "CASCADE", onUpdate: "RESTRICT" }, // Altered: onDelete
+        { constraintName: "fk_acc_audit", columnName: "audit_id", refTable: "audit_log", refColumn: "id", onDelete: "RESTRICT", onUpdate: "RESTRICT" }, // Added
+      ],
+    };
+
+    const diff = tools.computeTableSchemaDiff(extracted, targetSchema);
+    assert.equal(diff.identical, false);
+    assert.equal(diff.counts.columnsAdded, 1); // created_at
+    assert.equal(diff.counts.columnsDropped, 1); // balance
+    assert.equal(diff.counts.columnsAltered, 1); // name
+    assert.equal(diff.counts.indexesAdded, 1); // idx_acc_created
+    assert.equal(diff.counts.indexesDropped, 1); // idx_acc_name
+    assert.equal(diff.counts.foreignKeysAdded, 1); // fk_acc_audit
+    assert.equal(diff.counts.foreignKeysAltered, 1); // fk_acc_parent
+
+    // buildSchemaDiffMigrationSQL - safe mode (includeDrops: false)
+    const safeSQL = tools.buildSchemaDiffMigrationSQL(diff, { includeDrops: false });
+    assert.equal(safeSQL.error, null);
+    assert.ok(safeSQL.sql.includes('ALTER TABLE "accounts" ADD COLUMN "created_at" TIMESTAMPTZ DEFAULT NOW() NOT NULL;'));
+    assert.ok(safeSQL.sql.includes('ALTER TABLE "accounts" ALTER COLUMN "name" DROP NOT NULL;'));
+    assert.ok(safeSQL.sql.includes('CREATE INDEX "idx_acc_created" ON "accounts" ("created_at");'));
+    assert.ok(safeSQL.sql.includes('ALTER TABLE "accounts" ADD CONSTRAINT "fk_acc_audit" FOREIGN KEY ("audit_id") REFERENCES "audit_log" ("id");'));
+    // Dropped items should be commented out by default
+    assert.ok(safeSQL.sql.includes('-- ALTER TABLE "accounts" DROP COLUMN "balance";'));
+    assert.ok(safeSQL.sql.includes('-- DROP INDEX "idx_acc_name";'));
+
+    // buildSchemaDiffMigrationSQL - destructive mode (includeDrops: true)
+    const destrSQL = tools.buildSchemaDiffMigrationSQL(diff, { includeDrops: true });
+    assert.equal(destrSQL.error, null);
+    assert.ok(destrSQL.sql.includes('ALTER TABLE "accounts" DROP COLUMN "balance";'));
+    assert.ok(destrSQL.sql.includes('DROP INDEX "idx_acc_name";'));
+  }
+
+  // Benchmark Result Viewer & Comparison tests
+  {
+    // Duration parsing & formatting
+    assert.equal(tools.parseDurationToMicroseconds("45µs"), 45);
+    assert.equal(tools.parseDurationToMicroseconds("120us"), 120);
+    assert.equal(tools.parseDurationToMicroseconds("1.5ms"), 1500);
+    assert.equal(tools.parseDurationToMicroseconds("2s"), 2000000);
+    assert.equal(tools.parseDurationToMicroseconds(45), 45);
+    assert.equal(tools.parseDurationToMicroseconds(50000000), 50000); // 50ms in ns -> µs
+    assert.equal(tools.formatMicroseconds(0.5), "500ns");
+    assert.equal(tools.formatMicroseconds(45.2), "45.2µs");
+    assert.equal(tools.formatMicroseconds(1500), "1.50ms");
+    assert.equal(tools.formatMicroseconds(2000000), "2.00s");
+    assert.equal(tools.formatDeltaPct(15.2), "+15.2%");
+    assert.equal(tools.formatDeltaPct(-8.4), "-8.4%");
+
+    // parseBenchmarkReport - sample baseline & candidate
+    assert.ok(tools.SAMPLE_BENCH_BASELINE.items.length >= 5);
+    assert.ok(tools.SAMPLE_BENCH_CANDIDATE.items.length >= 5);
+
+    // parseBenchmarkReport - JSON parsing
+    const rawGoJSON = JSON.stringify({
+      version: "nextsql-bench-report-v1",
+      suite: "slo",
+      Hardware: {
+        GOOS: "linux",
+        GOARCH: "amd64",
+        NumCPU: 16,
+        CPU: "AMD EPYC",
+        Encryption: "AES-256-GCM",
+        Durability: "WAL + fsync",
+      },
+      Reports: [
+        {
+          Workload: "point",
+          Ops: 100000,
+          QPS: 50000,
+          P50: "15µs",
+          P95: "35µs",
+          P99: "75µs",
+          Allocs: 100000,
+          WALBytes: 0,
+        },
+        {
+          Workload: "vector",
+          Ops: 20000,
+          QPS: 10000,
+          P50: "60µs",
+          P99: "180µs",
+          RecallAt10: 0.98,
+          RecallAt100: 0.995,
+        },
+      ],
+    });
+
+    const parsed = tools.parseBenchmarkReport(rawGoJSON);
+    assert.equal(parsed.error, null);
+    assert.ok(parsed.report);
+    assert.equal(parsed.report.items.length, 2);
+    assert.equal(parsed.report.items[0].name, "point");
+    assert.equal(parsed.report.items[0].qps, 50000);
+    assert.equal(parsed.report.items[0].p50_us, 15);
+    assert.equal(parsed.report.items[0].p99_us, 75);
+    assert.equal(parsed.report.items[1].name, "vector");
+    assert.equal(parsed.report.items[1].recall_at_10, 0.98);
+    assert.equal(parsed.report.items[1].has_recall, true);
+    assert.equal(parsed.report.hardware.num_cpu, 16);
+    assert.equal(parsed.report.hardware.cpu, "AMD EPYC");
+
+    // Invalid JSON handling
+    const malformed = tools.parseBenchmarkReport("{ not valid json");
+    assert.ok(malformed.error);
+    assert.equal(malformed.report, null);
+
+    const empty = tools.parseBenchmarkReport("");
+    assert.ok(empty.error);
+
+    // compareBenchmarkRuns
+    const comp = tools.compareBenchmarkRuns(tools.SAMPLE_BENCH_BASELINE, tools.SAMPLE_BENCH_CANDIDATE);
+    assert.equal(comp.items.length, 5);
+    // PointLookup candidate QPS 95000 vs baseline 82000 (+15.8% improvement)
+    const pointComp = comp.items.find((it) => it.name === "PointLookup");
+    assert.ok(pointComp);
+    assert.equal(pointComp.status, "improved");
+    assert.ok(pointComp.qpsDeltaPct > 15);
+    assert.ok(pointComp.p99DeltaPct < -20); // 48µs vs 65µs -> -26.1% (improvement)
+
+    // VectorHNSW_Nearest candidate recall 0.985 vs baseline 0.982 (+0.003)
+    const vecComp = comp.items.find((it) => it.name === "VectorHNSW_Nearest");
+    assert.ok(vecComp);
+    assert.equal(vecComp.status, "improved");
+    assert.ok(vecComp.recallDelta > 0);
+
+    // Summary counts
+    assert.ok(comp.summary.improvements > 0);
+    assert.equal(comp.summary.regressions, 0);
+
+    // generateBenchmarkComparisonMarkdown
+    const md = tools.generateBenchmarkComparisonMarkdown(tools.SAMPLE_BENCH_BASELINE, tools.SAMPLE_BENCH_CANDIDATE, comp);
+    assert.ok(md.includes("# NextSQL Benchmark Run Comparison"));
+    assert.ok(md.includes("PointLookup"));
+    assert.ok(md.includes("VectorHNSW_Nearest"));
+    assert.ok(md.includes("🟢 Improved"));
   }
 
   console.log("Studio result helper tests passed");

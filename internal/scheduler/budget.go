@@ -106,6 +106,15 @@ type Budget struct {
 	start  time.Time
 	ctx    context.Context
 	cancel context.CancelFunc
+
+	// fanOut is the widest parallel step actually run since the last
+	// ResetFanOut, and workNS the summed elapsed time of those steps' tasks.
+	// EXPLAIN used to report Limits.Workers here — the configured ceiling,
+	// not a measurement, so a serial COUNT(*) fast path still claimed the
+	// full limit — and copied wall time into the cpu column. These are what
+	// actually happened.
+	fanOut int
+	workNS int64
 }
 
 // NewBudget starts a query budget. Time=0 means no deadline.
@@ -131,6 +140,61 @@ func (b *Budget) Context() context.Context {
 		return context.Background()
 	}
 	return b.ctx
+}
+
+// ResetFanOut clears the measured parallelism so the next traced operator
+// reports its own fan-out rather than one inherited from an earlier operator
+// in the same statement.
+func (b *Budget) ResetFanOut() {
+	if b == nil {
+		return
+	}
+	b.mu.Lock()
+	b.fanOut, b.workNS = 0, 0
+	b.mu.Unlock()
+}
+
+// NoteFanOut records that a parallel step ran on n goroutines for a summed
+// work time of d. The widest step wins, because EXPLAIN reports one number
+// per operator and the widest is what the operator was capable of using.
+func (b *Budget) NoteFanOut(n int, d time.Duration) {
+	if b == nil || n < 1 {
+		return
+	}
+	b.mu.Lock()
+	if n > b.fanOut {
+		b.fanOut = n
+	}
+	if d > 0 {
+		b.workNS += d.Nanoseconds()
+	}
+	b.mu.Unlock()
+}
+
+// FanOut is the measured parallelism since the last reset: 1 when nothing
+// fanned out, which is the truthful answer for a serial path.
+func (b *Budget) FanOut() int {
+	if b == nil {
+		return 1
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.fanOut < 1 {
+		return 1
+	}
+	return b.fanOut
+}
+
+// WorkNS is the summed elapsed time of the parallel tasks run since the last
+// reset, or 0 when nothing fanned out. It is real work time across workers,
+// not wall time, so it exceeds wall time on a genuinely parallel step.
+func (b *Budget) WorkNS() int64 {
+	if b == nil {
+		return 0
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.workNS
 }
 
 func (b *Budget) Workers() int {
@@ -205,9 +269,14 @@ func (b *Budget) Check() error {
 	}
 	if err := b.ctx.Err(); err != nil {
 		if err == context.DeadlineExceeded {
+			// A time budget is a resource, so exhausting it is Exhausted.
 			return nerr.New(nerr.Exhausted, "scheduler.Budget", "execution time budget exceeded")
 		}
-		return nerr.New(nerr.Exhausted, "scheduler.Budget", "query cancelled")
+		// Cancellation is not resource exhaustion. scheduler.Admission and
+		// internal/protocol already report it as Canceled; these two sites
+		// were the outliers, and reporting them as Exhausted made a deliberate
+		// cancel indistinguishable from a memory or time bound.
+		return nerr.New(nerr.Canceled, "scheduler.Budget", "query cancelled")
 	}
 	return nil
 }

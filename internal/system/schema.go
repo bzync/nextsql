@@ -20,7 +20,17 @@ import (
 // system.foreign_keys, system.table_ddl, system.triggers and
 // system.schedules (Phase 29 Studio) are new read-only views, not column
 // changes to existing ones, so they do not bump the version.
-const SchemaVersion = 4
+//
+// v5: three existing tables changed column shape, which is exactly what this
+// constant tracks — system.storage gained free_pages, system.table_stats
+// gained analyzed_rows, and system.index_stats gained index_kind and
+// entry_count. A SELECT * against any of the three returns more columns than
+// it did on v4.
+const SchemaVersion = 5
+
+// SchemaVersionSince is the release system_schema_v<SchemaVersion> first
+// shipped in.
+const SchemaVersionSince = "0.0.1"
 
 // SchemaName is the virtual schema name.
 const SchemaName = "system"
@@ -111,6 +121,7 @@ func init() {
 		{Name: "engine", Type: types.String()},
 		{Name: "page_size", Type: dec(10, 0)},
 		{Name: "page_count", Type: dec(20, 0)},
+		{Name: "free_pages", Type: dec(20, 0)},
 		{Name: "file_size", Type: dec(20, 0)},
 		{Name: "wal_lsn", Type: dec(20, 0)},
 		{Name: "encryption", Type: types.String()},
@@ -311,14 +322,24 @@ func init() {
 		{Name: "mode", Type: types.String()},
 		{Name: "granted", Type: types.Bool()},
 	})
+	// row_count is what the statement can see right now; analyzed_rows is the
+	// planner's last ANALYZE snapshot, NULL until ANALYZE has ever run. The
+	// two together are the only way an operator can see that the planner is
+	// costing plans against a stale table.
 	register("table_stats", []catalog.Column{
 		{Name: "table_name", Type: types.String()},
 		{Name: "row_count", Type: dec(20, 0)},
+		{Name: "analyzed_rows", Type: dec(20, 0)},
 		{Name: "updated_at", Type: types.String()},
 	})
+	// entry_count is the index's own live size, so a partial index reports
+	// what it actually holds. It is NULL for an index whose entries are not
+	// one-per-row (full-text postings, a vector graph) — see index_kind.
 	register("index_stats", []catalog.Column{
 		{Name: "table_name", Type: types.String()},
 		{Name: "index_name", Type: types.String()},
+		{Name: "index_kind", Type: types.String()},
+		{Name: "entry_count", Type: dec(20, 0)},
 		{Name: "row_count", Type: dec(20, 0)},
 	})
 	register("workflows", []catalog.Column{
@@ -528,7 +549,7 @@ func Capabilities() [][]types.Value {
 		rowCap("set_operations", "supported", "UNION/INTERSECT/EXCEPT", "0.1.0"),
 		rowCap("subqueries", "supported", "scalar, IN, EXISTS subqueries", "0.1.0"),
 		rowCap("system_catalog", "supported", fmt.Sprintf("virtual system schema v%d", SchemaVersion), "0.0.1"),
-		rowCap(fmt.Sprintf("system_schema_v%d", SchemaVersion), "supported", fmt.Sprintf("stable system table column contract v%d", SchemaVersion), "0.0.1"),
+		rowCap(fmt.Sprintf("system_schema_v%d", SchemaVersion), "supported", fmt.Sprintf("stable system table column contract v%d", SchemaVersion), SchemaVersionSince),
 		rowCap("system_show_aliases", "supported", "SHOW aliases backed by canonical system views", "0.0.1"),
 		rowCap("tasks", "supported", "durable TASK execution", "0.1.0"),
 		rowCap("transactions", "supported", "BEGIN/COMMIT/ROLLBACK", "0.1.0"),

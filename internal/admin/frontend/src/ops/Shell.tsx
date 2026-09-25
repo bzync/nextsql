@@ -162,7 +162,11 @@ export function Shell({
     };
   }, []);
   const canSwitch = profileCount > 1;
-  const openSwitch = useCallback(() => setSwitchOpen(true), []);
+  const [switchProfileId, setSwitchProfileId] = useState<string | undefined>(undefined);
+  const openSwitch = useCallback((profileId?: string) => {
+    setSwitchProfileId(typeof profileId === "string" ? profileId : undefined);
+    setSwitchOpen(true);
+  }, []);
   // A switch that succeeded but could not save the password (or did save it)
   // says so once, on the new session's first render.
   const [switchNotice, setSwitchNotice] = useState<{ variant: "warning" | "success"; text: string } | null>(() =>
@@ -366,7 +370,7 @@ export function Shell({
                   actions={(
                     <Inline gap="sm">
                       {canSwitch ? (
-                        <Button variant="ghost" size="sm" icon={<Icon name="plug" size={14} />} onClick={openSwitch}>Switch server</Button>
+                        <Button variant="ghost" size="sm" icon={<Icon name="plug" size={14} />} onClick={() => openSwitch()}>Switch server</Button>
                       ) : null}
                       <Button variant="ghost" size="sm" icon={<Icon name="refresh" size={14} />} onClick={refresh}>Refresh</Button>
                       <Button variant="ghost" size="sm" icon={<Icon name="settings" size={14} />} onClick={() => setSettingsOpen(true)}>Settings</Button>
@@ -442,9 +446,14 @@ export function Shell({
       {switchOpen ? (
         <SwitchServer
           who={who}
-          onClose={() => setSwitchOpen(false)}
+          initialProfileId={switchProfileId}
+          onClose={() => {
+            setSwitchOpen(false);
+            setSwitchProfileId(undefined);
+          }}
           onSwitched={(next) => {
             setSwitchOpen(false);
+            setSwitchProfileId(undefined);
             onSwitched(next);
           }}
           onUnauthorized={onUnauthorized}

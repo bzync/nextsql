@@ -11,6 +11,7 @@ import (
 	"github.com/bzync/nextsql/internal/crypto"
 	"github.com/bzync/nextsql/internal/encoding"
 	"github.com/bzync/nextsql/internal/maintenance"
+	"github.com/bzync/nextsql/internal/metrics"
 	"github.com/bzync/nextsql/internal/nerr"
 	"github.com/bzync/nextsql/internal/storage/format"
 	diskio "github.com/bzync/nextsql/internal/storage/io"
@@ -282,14 +283,59 @@ func Open(dir string, pageKeys crypto.KeyProvider, ident format.Identity, opt Op
 	if err != nil {
 		return nil, err
 	}
+	writeOff, err := findSegmentWriteOffset(f, size)
+	if err != nil {
+		_ = f.Close()
+		return nil, err
+	}
 	l.seg = f
 	l.segID = hdr.ID
-	l.segOff = size
-	l.syncOff = size
+	l.segOff = writeOff
+	l.syncOff = writeOff
 	if last > l.nextSeg {
 		l.nextSeg = last
 	}
 	return l, nil
+}
+
+// findSegmentWriteOffset locates the byte offset in an active segment where valid records
+// end and unwritten preallocated zeros (or EOF) begin. If a torn or corrupt header
+// is encountered, it stops at the torn record offset so recovery / ScanFrom can inspect
+// or truncate it.
+func findSegmentWriteOffset(f *os.File, size int64) (int64, error) {
+	off := int64(SegmentHeaderSize)
+	for off < size {
+		if size-off < HeaderSize {
+			rem := make([]byte, size-off)
+			if err := diskio.ReadFullAt(f, rem, off); err != nil {
+				return off, err
+			}
+			if isAllZero(rem) {
+				return off, nil
+			}
+			// Non-zero trailing bytes smaller than a header: torn write.
+			return off, nil
+		}
+		hdrBuf := make([]byte, HeaderSize)
+		if err := diskio.ReadFullAt(f, hdrBuf, off); err != nil {
+			return off, err
+		}
+		if isZeroHeader(hdrBuf) {
+			return off, nil
+		}
+		ph, err := parseHeader(hdrBuf)
+		if err != nil {
+			// Torn header or corrupt record.
+			return off, nil
+		}
+		need := int64(HeaderSize + ph.CTLen)
+		if off+need > size {
+			// Truncated record body at tail.
+			return off, nil
+		}
+		off += need
+	}
+	return off, nil
 }
 
 func DirFor(dbPath string) string { return dbPath + ".wal" }
@@ -624,49 +670,78 @@ func (l *Log) appendLocked(rec Record) (format.LSN, error) {
 
 // AppendHeld appends rec (typically a transaction's CommitRec) but keeps it
 // out of the durable prefix flushLocked will write until ReleaseHold
-// resolves it — so a caller can replicate rec (and whatever it depends on)
-// to Raft quorum before deciding whether it ever becomes durable. Only one
-// record may be held at a time; callers must serialize appends through
-// Engine.replMu the same way commitAndReplicate already does.
+// resolves it. Single-record wrapper around AppendHeldBatch.
 func (l *Log) AppendHeld(rec Record) (format.LSN, error) {
+	lsns, err := l.AppendHeldBatch([]Record{rec})
+	if err != nil {
+		return 0, err
+	}
+	return lsns[0], nil
+}
+
+// AppendHeldBatch appends a batch of records (e.g. CommitRecs for a batched
+// replication proposal) into the held buffer region, keeping all of them out
+// of the durable prefix flushLocked will write until ReleaseHold resolves
+// them together. Only one held batch may be active at a time.
+func (l *Log) AppendHeldBatch(recs []Record) ([]format.LSN, error) {
+	if len(recs) == 0 {
+		return nil, nil
+	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.durabilityErr != nil {
-		return 0, l.durabilityErr
+		return nil, l.durabilityErr
 	}
 	if l.held {
-		return 0, nerr.New(nerr.Internal, "wal.AppendHeld", "a record is already held")
+		return nil, nerr.New(nerr.Internal, "wal.AppendHeld", "a record is already held")
 	}
 	if l.seg == nil {
-		return 0, nerr.New(nerr.Internal, "wal.AppendHeld", "log is closed")
+		return nil, nerr.New(nerr.Internal, "wal.AppendHeld", "log is closed")
 	}
-	lsn := l.nextLSN
-	rec.LSN = lsn
-	payload := encodePayload(rec)
-	gen, err := l.nextNonceLocked()
-	if err != nil {
-		return 0, err
+
+	type physRec struct {
+		lsn  format.LSN
+		phys []byte
 	}
-	phys, err := encodePhysical(l.dek, lsn, gen, payload)
-	if err != nil {
-		return 0, err
+	prepared := make([]physRec, len(recs))
+	totalPhysLen := 0
+	for i, rec := range recs {
+		lsn := l.nextLSN
+		rec.LSN = lsn
+		payload := encodePayload(rec)
+		gen, err := l.nextNonceLocked()
+		if err != nil {
+			return nil, err
+		}
+		phys, err := encodePhysical(l.dek, lsn, gen, payload)
+		if err != nil {
+			return nil, err
+		}
+		prepared[i] = physRec{lsn: lsn, phys: phys}
+		totalPhysLen += len(phys)
+		l.nextLSN = lsn + 1
 	}
-	if l.segOff+int64(len(l.buf))+int64(len(phys)) > l.segmentSize && (l.segOff > SegmentHeaderSize || len(l.buf) > 0) {
+
+	if l.segOff+int64(len(l.buf))+int64(totalPhysLen) > l.segmentSize && (l.segOff > SegmentHeaderSize || len(l.buf) > 0) {
 		if err := l.rotateLocked(); err != nil {
-			return 0, err
+			return nil, err
 		}
 	}
+
 	prevLast := l.bufLast
 	offset := len(l.buf)
-	l.buf = append(l.buf, phys...)
-	l.bufLast = lsn
-	l.nextLSN = lsn + 1
+	lsns := make([]format.LSN, len(prepared))
+	for i, pr := range prepared {
+		l.buf = append(l.buf, pr.phys...)
+		lsns[i] = pr.lsn
+	}
+	l.bufLast = lsns[len(lsns)-1]
 	l.held = true
 	l.heldOffset = offset
-	l.heldLen = len(phys)
-	l.heldLSN = lsn
+	l.heldLen = totalPhysLen
+	l.heldLSN = lsns[len(lsns)-1]
 	l.heldPrevLast = prevLast
-	return lsn, nil
+	return lsns, nil
 }
 
 // ReleaseHold resolves the record previously appended via AppendHeld. If
@@ -794,6 +869,14 @@ func (l *Log) flushLocked() error {
 		}
 	}
 	n, err := diskio.WriteAt(seg, buf, off)
+	// Count what actually reached the segment, including the prefix of a
+	// short or failed write — those bytes are on the volume either way, and
+	// wal_bytes_written is the "ever appended" figure an operator compares
+	// against the on-disk footprint to see whether retention is reclaiming
+	// anything.
+	if n > 0 {
+		metrics.Default().AddWAL(int64(n))
+	}
 	if n < len(buf) && err == nil {
 		err = io.ErrShortWrite
 	}
@@ -1315,6 +1398,9 @@ func (l *Log) ClipTo(until format.LSN) error {
 				_ = f.Close()
 				return err
 			}
+			if isZeroHeader(hdrBuf) {
+				break
+			}
 			ph, err := parseHeader(hdrBuf)
 			if err != nil {
 				break
@@ -1356,10 +1442,15 @@ func (l *Log) ClipTo(until format.LSN) error {
 	if err != nil {
 		return err
 	}
+	writeOff, err := findSegmentWriteOffset(f, size)
+	if err != nil {
+		_ = f.Close()
+		return err
+	}
 	l.seg = f
 	l.segID = lastID
-	l.segOff = size
-	l.syncOff = size
+	l.segOff = writeOff
+	l.syncOff = writeOff
 	if lastID >= l.nextSeg {
 		l.nextSeg = lastID + 1
 	}
@@ -1453,6 +1544,14 @@ func (l *Log) scanLocked(start format.LSN, maxRecords, maxBytes int) ([]Record, 
 		off := int64(SegmentHeaderSize)
 		for off < size {
 			if size-off < HeaderSize {
+				rem := make([]byte, size-off)
+				if err := diskio.ReadFullAt(f, rem, off); err != nil {
+					_ = f.Close()
+					return nil, 0, err
+				}
+				if isAllZero(rem) {
+					break
+				}
 				if err := truncateSeg(f, off); err != nil {
 					_ = f.Close()
 					return nil, 0, err
@@ -1463,6 +1562,9 @@ func (l *Log) scanLocked(start format.LSN, maxRecords, maxBytes int) ([]Record, 
 			if err := diskio.ReadFullAt(f, hdrBuf, off); err != nil {
 				_ = f.Close()
 				return nil, 0, err
+			}
+			if isZeroHeader(hdrBuf) {
+				break
 			}
 			ph, err := parseHeader(hdrBuf)
 			if err != nil {
@@ -1506,6 +1608,10 @@ func (l *Log) scanLocked(start format.LSN, maxRecords, maxBytes int) ([]Record, 
 			}
 			last = rec.LSN
 			_ = hdr
+		}
+		if maxRecords == 0 && maxBytes == 0 && id == l.segID {
+			l.segOff = off
+			l.syncOff = off
 		}
 		_ = f.Close()
 	}
@@ -1621,29 +1727,80 @@ func CheckpointRec(txn format.TxnID, prev format.LSN, body CheckpointBody) Recor
 	return Record{Type: RecCheckpoint, TxnID: txn, PrevLSN: prev, Body: encodeCheckpoint(body)}
 }
 
-func UndoRec(txn format.TxnID, prev format.LSN, id format.UndoID, kind uint8, page format.PageID, key []byte) Record {
-	return Record{Type: RecUndo, TxnID: txn, PrevLSN: prev, PageID: page, Body: encodeUndoBody(id, kind, key)}
+type UndoBody struct {
+	ID         format.UndoID
+	Prev       format.UndoID
+	Kind       uint8
+	OldXmin    format.TxnID
+	OldXmax    format.TxnID
+	OldUndo    format.UndoID
+	Key        []byte
+	OldPayload []byte
 }
 
-func encodeUndoBody(id format.UndoID, kind uint8, key []byte) []byte {
-	buf := make([]byte, 11+len(key))
-	encoding.PutU64(buf, 0, uint64(id))
-	buf[8] = kind
-	encoding.PutU16(buf, 9, uint16(len(key)))
-	copy(buf[11:], key)
+func UndoRec(txn format.TxnID, prev format.LSN, ub UndoBody, page format.PageID) Record {
+	return Record{
+		Type:    RecUndo,
+		Flags:   UndoFlagV2,
+		TxnID:   txn,
+		PrevLSN: prev,
+		PageID:  page,
+		Body:    EncodeUndoBody(ub),
+	}
+}
+
+func EncodeUndoBody(ub UndoBody) []byte {
+	buf := make([]byte, 48+len(ub.Key)+len(ub.OldPayload))
+	buf[0] = 2 // version 2
+	encoding.PutU64(buf, 1, uint64(ub.ID))
+	encoding.PutU64(buf, 9, uint64(ub.Prev))
+	buf[17] = ub.Kind
+	encoding.PutU64(buf, 18, uint64(ub.OldXmin))
+	encoding.PutU64(buf, 26, uint64(ub.OldXmax))
+	encoding.PutU64(buf, 34, uint64(ub.OldUndo))
+	encoding.PutU16(buf, 42, uint16(len(ub.Key)))
+	encoding.PutU32(buf, 44, uint32(len(ub.OldPayload)))
+	copy(buf[48:], ub.Key)
+	copy(buf[48+len(ub.Key):], ub.OldPayload)
 	return buf
 }
 
-func DecodeUndoBody(body []byte) (format.UndoID, uint8, []byte, error) {
+func DecodeUndoBody(body []byte) (UndoBody, error) {
 	if len(body) < 11 {
-		return 0, 0, nil, nerr.New(nerr.InvalidFormat, "wal.DecodeUndoBody", "truncated undo body")
+		return UndoBody{}, nerr.New(nerr.InvalidFormat, "wal.DecodeUndoBody", "truncated undo body")
 	}
+	if body[0] == 2 {
+		if len(body) < 48 {
+			return UndoBody{}, nerr.New(nerr.InvalidFormat, "wal.DecodeUndoBody", "truncated v2 undo body")
+		}
+		klen := int(encoding.U16(body, 42))
+		plen := int(encoding.U32(body, 44))
+		if uint64(48)+uint64(klen)+uint64(plen) != uint64(len(body)) {
+			return UndoBody{}, nerr.New(nerr.InvalidFormat, "wal.DecodeUndoBody", "invalid v2 undo body length")
+		}
+		return UndoBody{
+			ID:         format.UndoID(encoding.U64(body, 1)),
+			Prev:       format.UndoID(encoding.U64(body, 9)),
+			Kind:       body[17],
+			OldXmin:    format.TxnID(encoding.U64(body, 18)),
+			OldXmax:    format.TxnID(encoding.U64(body, 26)),
+			OldUndo:    format.UndoID(encoding.U64(body, 34)),
+			Key:        append([]byte(nil), body[48:48+klen]...),
+			OldPayload: append([]byte(nil), body[48+klen:]...),
+		}, nil
+	}
+	// Fall back to legacy V1 format (11 + len(key))
 	klen := int(encoding.U16(body, 9))
 	if 11+klen != len(body) {
-		return 0, 0, nil, nerr.New(nerr.InvalidFormat, "wal.DecodeUndoBody", "invalid undo body length")
+		return UndoBody{}, nerr.New(nerr.InvalidFormat, "wal.DecodeUndoBody", "invalid undo body length")
 	}
-	return format.UndoID(encoding.U64(body, 0)), body[8], append([]byte(nil), body[11:]...), nil
+	return UndoBody{
+		ID:   format.UndoID(encoding.U64(body, 0)),
+		Kind: body[8],
+		Key:  append([]byte(nil), body[11:]...),
+	}, nil
 }
+
 
 func DecodeTreeMeta(body []byte) (format.PageID, uint16, error) { return decodeTreeMeta(body) }
 func DecodeAllocState(body []byte) (format.PageID, format.PageID, uint64, error) {

@@ -396,7 +396,10 @@ func TestWorkflowCancellationAndDistinctLimit(t *testing.T) {
 	execOK(t, s, `CREATE WORKFLOW put(id STRING) AS BEGIN INSERT INTO sink (id) VALUES ($id); END`)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, err := s.ExecContext(ctx, `RUN WORKFLOW put('cancelled')`, nil); !nerr.HasCode(err, nerr.Exhausted) {
+	// Cancellation reports nerr.Canceled, not nerr.Exhausted: a cancelled
+	// statement did not exhaust a resource, and scheduler.Admission and
+	// internal/protocol have always reported it this way.
+	if _, err := s.ExecContext(ctx, `RUN WORKFLOW put('cancelled')`, nil); !nerr.HasCode(err, nerr.Canceled) {
 		t.Fatalf("expected cancellation: %v", err)
 	}
 	if rows := execOK(t, s, `SELECT id FROM sink`).Rows; len(rows) != 0 {

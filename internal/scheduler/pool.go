@@ -4,6 +4,7 @@ import (
 	"context"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/bzync/nextsql/internal/nerr"
 )
@@ -97,9 +98,49 @@ func (p *Pool) Run(ctx context.Context, workers int, tasks []func() error) error
 			if err == context.DeadlineExceeded {
 				return nerr.New(nerr.Exhausted, "scheduler.Pool", "execution time budget exceeded")
 			}
-			return nerr.New(nerr.Exhausted, "scheduler.Pool", "query cancelled")
+			// See scheduler.Budget.Check: cancellation is Canceled, not
+			// Exhausted.
+			return nerr.New(nerr.Canceled, "scheduler.Pool", "query cancelled")
 		}
 		return nerr.New(nerr.Internal, "scheduler.Pool", "incomplete work")
 	}
 	return nil
+}
+
+// RunTracked runs tasks like Run and records on the budget the fan-out that
+// was actually used and the summed time its tasks spent working. Run clamps
+// the requested worker count to the number of tasks, so the caller's request
+// is a ceiling, not a measurement — recording it here is what lets EXPLAIN
+// report parallelism it observed instead of the configured limit.
+func RunTracked(p *Pool, b *Budget, workers int, tasks []func() error) error {
+	if len(tasks) == 0 {
+		return nil
+	}
+	if workers < 1 {
+		workers = 1
+	}
+	if workers > len(tasks) {
+		workers = len(tasks)
+	}
+	// Each task is timed individually and the results summed. Multiplying
+	// wall time by the worker count would be an estimate, not a measurement:
+	// it assumes every worker was busy for the whole span, which is exactly
+	// the kind of plausible-looking fabrication this replaces.
+	var workNS atomic.Int64
+	timed := make([]func() error, len(tasks))
+	for i := range tasks {
+		task := tasks[i]
+		timed[i] = func() error {
+			started := time.Now()
+			err := task()
+			workNS.Add(time.Since(started).Nanoseconds())
+			return err
+		}
+	}
+	err := p.Run(b.Context(), workers, timed)
+	// Recorded even on failure: the workers spent the time either way, and an
+	// EXPLAIN ANALYZE of a statement that failed part-way should still show
+	// where it went.
+	b.NoteFanOut(workers, time.Duration(workNS.Load()))
+	return err
 }

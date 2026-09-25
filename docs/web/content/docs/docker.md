@@ -7,10 +7,10 @@ The image runs `nextsqld` as the unprivileged `nextsql` user (uid 10001). Databa
 Multi-arch images (`linux/amd64`, `linux/arm64`) are published to [Docker Hub](https://hub.docker.com/r/bzynchub/nextsql). Only a release tag push (`v*.*.*`) publishes an image — there are no `sha-<short>` or `edge` tags. Every published tag is **write-once** (immutable), so there is no moving `latest` pointer. Pin an explicit version:
 
 ```bash
-docker pull bzynchub/nextsql:0.0.4
+docker pull bzynchub/nextsql:0.0.5
 ```
 
-The Compose files below build locally (`build: .`). To run the published image instead, replace `build: .` with `image: bzynchub/nextsql:0.0.4`.
+The Compose files below build locally (`build: .`). To run the published image instead, replace `build: .` with `image: bzynchub/nextsql:0.0.5`.
 
 ## Single node
 
@@ -60,7 +60,7 @@ docker run -d --name nextsql -p 7210:7210 \
   -e NEXTSQL_SERVER_PASSWORD_FILE=/run/bootstrap/app-password \
   -e NEXTSQL_TLS_CERT=/run/tls/server.crt -e NEXTSQL_TLS_KEY=/run/tls/server.key \
   -e NEXTSQL_PROFILE=production \
-  bzynchub/nextsql:0.0.4
+  bzynchub/nextsql:0.0.5
 ```
 
 ## First-start initialization

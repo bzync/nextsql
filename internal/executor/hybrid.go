@@ -27,6 +27,9 @@ type hybridHit struct {
 }
 
 func (s *Session) execCandidates(n planner.Candidates) ([][]types.Value, error) {
+	// Measure this operator's own fan-out rather than inheriting one from an
+	// earlier parallel step in the same statement.
+	s.budget().ResetFanOut()
 	var (
 		rows [][]types.Value
 		err  error
@@ -68,7 +71,7 @@ func (s *Session) execCandidates(n planner.Candidates) ([][]types.Value, error) 
 	if s.trace != nil {
 		if node := optimizer.Find(s.trace, "Candidates"); node != nil {
 			node.ActRows = int64(len(rows))
-			node.Workers = s.workers()
+			node.Workers = s.budget().FanOut()
 		}
 	}
 	return rows, nil

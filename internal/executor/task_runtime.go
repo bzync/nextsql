@@ -132,25 +132,30 @@ func (r *TaskRuntime) coordinate() {
 	}
 }
 
+// cycle materialises anything newly due, then runs as much of the queue as
+// there is worker capacity for.
+//
+// Dispatch deliberately happens *outside* the worker slots. Turning a due
+// schedule into a task row only writes catalog rows that a later claim picks
+// up — it needs no worker — and gating it on capacity meant a runtime sharing
+// a saturated pool could not advance its own schedules at all. With a small
+// pool and more than one runtime that starved indefinitely rather than
+// transiently, because the slot was held across the claim/dispatch
+// transactions and slot acquisition had no wait queue to make the sharing
+// fair. Only claiming needs a slot: a claim takes a lease, so claiming more
+// than can be run would sit on leases with nothing to run them.
 func (r *TaskRuntime) cycle() {
-	available := 0
-	for available < r.config.Batch {
-		select {
-		case <-r.ctx.Done():
-			r.pool.releaseSlots(available)
-			return
-		case <-r.pool.slots:
-			available++
-		default:
-			goto claimedSlots
+	now := r.config.Now()
+	if _, err := r.db.DispatchDueSchedules(r.ctx, now, r.config.Batch); err != nil {
+		if !nerr.HasCode(err, nerr.Unavailable) && !nerr.HasCode(err, nerr.Canceled) {
+			r.report(err)
 		}
 	}
 
-claimedSlots:
+	available := r.acquireSlots()
 	if available == 0 {
 		return
 	}
-	now := r.config.Now()
 	claims, err := r.db.ClaimDueTasks(r.ctx, now, available)
 	if err != nil {
 		r.pool.releaseSlots(available)
@@ -158,23 +163,6 @@ claimedSlots:
 			r.report(err)
 		}
 		return
-	}
-	remaining := available - len(claims)
-	if remaining > 0 {
-		if _, err := r.db.DispatchDueSchedules(r.ctx, now, remaining); err != nil {
-			if !nerr.HasCode(err, nerr.Unavailable) && !nerr.HasCode(err, nerr.Canceled) {
-				r.report(err)
-			}
-		} else {
-			more, claimErr := r.db.ClaimDueTasks(r.ctx, now, remaining)
-			if claimErr != nil {
-				if !nerr.HasCode(claimErr, nerr.Unavailable) && !nerr.HasCode(claimErr, nerr.Canceled) {
-					r.report(claimErr)
-				}
-			} else {
-				claims = append(claims, more...)
-			}
-		}
 	}
 	r.pool.releaseSlots(available - len(claims))
 	for i, claim := range claims {
@@ -200,6 +188,38 @@ claimedSlots:
 		case r.pool.jobs <- job:
 		}
 	}
+}
+
+// acquireSlots takes up to Batch worker slots, waiting at most one poll
+// interval for the first. The wait matters: a non-blocking receive has no
+// wait queue, so runtimes sharing a pool raced for a free slot and one could
+// lose every time, while a receive that blocks joins the channel's FIFO queue
+// and the sharing becomes fair. The wait is bounded so a genuinely saturated
+// pool still just means "nothing to start this tick" rather than stalling the
+// coordinator.
+func (r *TaskRuntime) acquireSlots() int {
+	timer := time.NewTimer(r.config.PollInterval)
+	defer timer.Stop()
+	select {
+	case <-r.ctx.Done():
+		return 0
+	case <-r.pool.slots:
+	case <-timer.C:
+		return 0
+	}
+	available := 1
+	for available < r.config.Batch {
+		select {
+		case <-r.ctx.Done():
+			r.pool.releaseSlots(available)
+			return 0
+		case <-r.pool.slots:
+			available++
+		default:
+			return available
+		}
+	}
+	return available
 }
 
 func (r *TaskRuntime) report(err error) {

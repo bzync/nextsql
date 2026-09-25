@@ -39,11 +39,13 @@ export function SwitchServer({
   onClose,
   onSwitched,
   onUnauthorized,
+  initialProfileId,
 }: {
   who: Whoami;
   onClose: () => void;
   onSwitched: (next: Whoami) => void;
   onUnauthorized: () => void;
+  initialProfileId?: string;
 }) {
   const formId = useId();
   const passwordRef = useRef<HTMLInputElement>(null);
@@ -65,11 +67,12 @@ export function SwitchServer({
       .then((list) => {
         if (stopped) return;
         setProfiles(list.profiles);
-        // Default to the first server this session is not already on.
-        const first = list.profiles.find((p) => p.id !== list.current) ?? list.profiles[0];
-        if (first) {
-          setProfileId(first.id);
-          setUser(first.user || who.user);
+        // Default to initialProfileId if requested, or the first server not already active.
+        const requested = initialProfileId ? list.profiles.find((p) => p.id === initialProfileId) : undefined;
+        const targetProf = requested ?? (list.profiles.find((p) => p.id !== list.current) ?? list.profiles[0]);
+        if (targetProf) {
+          setProfileId(targetProf.id);
+          setUser(targetProf.user || who.user);
         }
       })
       .catch((err: unknown) => {

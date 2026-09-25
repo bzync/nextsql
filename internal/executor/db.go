@@ -1562,6 +1562,21 @@ func (db *DB) ApplyRecords(recs []wal.Record) error {
 	return db.reloadCatalog()
 }
 
+// SettlePredecessorTransactions is called when this node is promoted to leader
+// to settle and abort any uncommitted transactions left by prior leaders.
+func (db *DB) SettlePredecessorTransactions() error {
+	if db == nil || db.Eng == nil {
+		return nil
+	}
+	db.applyMu.Lock()
+	defer db.applyMu.Unlock()
+	if err := db.Eng.SettlePredecessorTransactions(); err != nil {
+		return err
+	}
+	return db.reloadCatalog()
+}
+
+
 func (db *DB) reloadCatalog() error {
 	var tables []*catalog.Table
 	start := catalog.TableKey("")

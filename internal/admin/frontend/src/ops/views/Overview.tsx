@@ -1,6 +1,7 @@
-import { Badge, Inline, Stat, Tabs, TabsContent, TabsList, TabsTrigger } from "@bzync/rui";
+import { Badge, Inline, Stat, Tabs, TabsContent, TabsList, TabsTrigger, Text } from "@bzync/rui";
 import { api } from "../api";
 import { useReadModel } from "../useReadModel";
+import { describeStorage, summarizeStorage } from "../stats";
 import { ResultTable } from "../ResultTable";
 import { ViewFrame } from "./ViewFrame";
 import { StatGrid } from "./Section";
@@ -44,6 +45,11 @@ export function Overview({ onUnauthorized }: { onUnauthorized: () => void }) {
             </TabsList>
 
             <TabsContent value="storage">
+              {describeStorage(summarizeStorage(data.storage)) ? (
+                <Text size="sm" variant="muted" className="mb-3">
+                  {describeStorage(summarizeStorage(data.storage))}
+                </Text>
+              ) : null}
               <ResultTable result={data.storage} label="Storage" />
             </TabsContent>
             <TabsContent value="replication">

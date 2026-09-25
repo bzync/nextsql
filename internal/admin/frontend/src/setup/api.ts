@@ -32,6 +32,23 @@ export type ServiceStatus = {
   active: boolean;
 };
 
+export type FirewallStatus = {
+  supported: boolean;
+  elevated: boolean;
+  detected: string;
+  active: boolean;
+  port: number;
+  ruleCommand: string;
+  sudoCommand: string;
+};
+
+export type FirewallOutcome = {
+  applied: boolean;
+  tool?: string;
+  command?: string;
+  error?: string;
+};
+
 // Params mirrors internal/installgui.Params field-for-field (json tags must
 // match exactly — the server decodes with DisallowUnknownFields, so sending
 // any extra key is a 400, not a silently-ignored one).
@@ -52,6 +69,7 @@ export type Params = {
   recoveryKeyOut: string;
   instanceRecoveryKeyOut: string;
   enableService: boolean;
+  enableFirewall: boolean;
 };
 
 export function defaultParams(): Params {
@@ -75,6 +93,7 @@ export function defaultParams(): Params {
     recoveryKeyOut: "",
     instanceRecoveryKeyOut: "",
     enableService: false,
+    enableFirewall: false,
   };
 }
 
@@ -152,6 +171,7 @@ export type RunResult = {
   result?: PlanResult;
   error?: string;
   service?: ServiceOutcome;
+  firewall?: FirewallOutcome;
 };
 
 export type LifecycleDetect = {
@@ -171,6 +191,8 @@ function request<T>(method: string, path: string, body?: unknown): Promise<T> {
 export const api = {
   hello: () => request<Hello>("GET", "/api/v1/hello"),
   service: () => request<ServiceStatus>("GET", "/api/v1/service"),
+  firewall: (port?: number) =>
+    request<FirewallStatus>("GET", "/api/v1/firewall" + (port ? "?port=" + encodeURIComponent(port) : "")),
   plan: (p: Params) => request<RunResult>("POST", "/api/v1/plan", p),
   install: (p: Params) => request<RunResult>("POST", "/api/v1/install", p),
   lifecycleDetect: (dataDir: string, config: string) =>

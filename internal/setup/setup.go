@@ -222,7 +222,7 @@ func BuildPlan(p Params) (Plan, error) {
 		cfg.DeploymentProfile = config.ProfileDeveloper
 	}
 
-	loopback := isLoopbackAddr(cfg.ListenAddr)
+	loopback := IsLoopbackAddr(cfg.ListenAddr)
 	hasTLS := cfg.TLSCert != "" && cfg.TLSKey != ""
 	if !loopback && !hasTLS {
 		return Plan{}, ErrInsecureRemote
@@ -302,10 +302,10 @@ func advisories(info sysinfo.Info, cfg config.Config, rec Recommendation, adminU
 	return w
 }
 
-// isLoopbackAddr reports whether host:port binds only to the loopback
+// IsLoopbackAddr reports whether host:port binds only to the loopback
 // interface. A bare port, an empty host, or "0.0.0.0"/"::" all count as
 // non-loopback (they expose every interface).
-func isLoopbackAddr(addr string) bool {
+func IsLoopbackAddr(addr string) bool {
 	host, _, err := net.SplitHostPort(addr)
 	if err != nil {
 		host = addr

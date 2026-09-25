@@ -136,6 +136,16 @@ EXPLAIN ANALYZE SELECT …
 
 Result columns: `operator`, `estimates`, `actuals`, `time`, `cpu`, `memory`, `disk`, `cache`, `spill`, `workers`, `index`.
 
+`workers` is the parallelism the operator actually used, measured — not the
+`Limits.Workers` ceiling. A serial fast path (a plain `COUNT(*)`, a small
+join, an HNSW lookup) reports `1`. `cpu` is the summed time the operator's
+tasks spent working, so it exceeds `time` when a step genuinely ran in
+parallel and equals it when the step was serial; `cpu`/`time` is the
+parallelism actually achieved. Both are `0`/`1` for an operator that records
+no timing of its own — only the plan root and the access operators
+(`SeqScan`, `IndexScan`, `Nearest`, …) currently time themselves, so an
+intermediate node such as `HashJoin` shows `0ns` rather than its own span.
+
 Join operators: `HashJoin`, `MergeJoin`, `CrossJoin`, `LeftJoin` (`LEFT [OUTER] JOIN`, hash or merge), `HashSemiJoin` (flattened `EXISTS`/`IN`), and `HashAntiJoin` (flattened `NOT EXISTS` / null-safe `NOT IN`). Hash join is costed as build-right plus probe-left, so reordering prefers a smaller right input. Merge is linear in both inputs when both sides are already ordered on the keys. Estimated rows for `LeftJoin` are `max(left, inner-estimate)`. Semi-join estimates are at most the left input; anti-join estimates are left minus the matching semi estimate.
 
 CTE operators: `With` wraps remaining materialized CTEs; `Materialize` is the CTE body computed once; `CTEScan` reads that result; `RecursiveCTE` is the working-table iteration for `WITH RECURSIVE`. Inlined CTEs do not appear as separate operators.

@@ -7,7 +7,7 @@
   "scripts": {
     "build": "node build.mjs",
     "typecheck": "tsc --noEmit",
-    "test:studio": "node test-api-client.mjs && node test-studio-results.mjs && node test-sql-editor.mjs",
+    "test:studio": "node test-api-client.mjs && node test-studio-results.mjs && node test-sql-editor.mjs && node test-ops-stats.mjs",
     "test:setup": "node test-setup-errors.mjs",
     "test:revision": "node test-admin-ui-revision.mjs",
     "test:a11y": "npm run build && node test-accessibility.mjs"

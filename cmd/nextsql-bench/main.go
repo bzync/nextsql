@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
@@ -17,6 +18,29 @@ import (
 	"github.com/bzync/nextsql/internal/storage/page"
 	"github.com/bzync/nextsql/internal/version"
 )
+
+type benchJSONSuite struct {
+	Version     string         `json:"version"`
+	Suite       string         `json:"suite"`
+	GeneratedAt string         `json:"generated_at"`
+	Title       string         `json:"title,omitempty"`
+	Hardware    bench.Hardware `json:"hardware"`
+	Reports     any            `json:"reports"`
+}
+
+func outputJSON(suite string, title string, hw bench.Hardware, reports any) error {
+	out := benchJSONSuite{
+		Version:     "nextsql-bench-report-v1",
+		Suite:       suite,
+		GeneratedAt: time.Now().UTC().Format(time.RFC3339),
+		Title:       title,
+		Hardware:    hw,
+		Reports:     reports,
+	}
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	return enc.Encode(out)
+}
 
 func main() {
 	quick := flag.Bool("quick", false, "shorter benchmark time")
@@ -44,6 +68,7 @@ func main() {
 	prod := flag.Bool("production", false, "target production environment profile")
 	allowProdBench := flag.Bool("allow-production-benchmark", false, "allow running heavy or destructive benchmarks on production")
 	cfgPath := flag.String("config", "", "path to nextsql.conf")
+	jsonOut := flag.Bool("json", false, "output benchmark results in structured JSON format")
 	flag.Parse()
 	if *quick {
 		testing.Init()
@@ -137,42 +162,44 @@ func main() {
 		}
 	}
 
-	fmt.Printf("nextsql-bench %s (encryption + WAL + fsync enabled)\n", version.String)
+	if !*jsonOut {
+		fmt.Printf("nextsql-bench %s (encryption + WAL + fsync enabled)\n", version.String)
+	}
 	if *slo {
-		if err := runSLOBenches(*duration, *conc, *sloMax, *sloVec, *sloVecQueries, *sloBuffers, *quick, *sloNoDML); err != nil {
+		if err := runSLOBenches(*duration, *conc, *sloMax, *sloVec, *sloVecQueries, *sloBuffers, *quick, *sloNoDML, *jsonOut); err != nil {
 			fatal(err)
 		}
 		return
 	}
 	if *partition {
-		if err := runPartitionBenches(*duration, *partitionRows); err != nil {
+		if err := runPartitionBenches(*duration, *partitionRows, *jsonOut); err != nil {
 			fatal(err)
 		}
 		return
 	}
 	if *readScale {
-		if err := runReadScaleBenches(*duration, *readScaleRows, *readScaleReaders); err != nil {
+		if err := runReadScaleBenches(*duration, *readScaleRows, *readScaleReaders, *jsonOut); err != nil {
 			fatal(err)
 		}
 		return
 	}
 	if *vecQuant {
-		if err := runVectorQuantBenches(*vecQuantRows, *vecQuantDim, *vecQuantSparseDim, *vecQuantSparseNNZ, *vecQuantQueries); err != nil {
+		if err := runVectorQuantBenches(*vecQuantRows, *vecQuantDim, *vecQuantSparseDim, *vecQuantSparseNNZ, *vecQuantQueries, *jsonOut); err != nil {
 			fatal(err)
 		}
 		return
 	}
-	if *workload == "all" || *workload == "page" {
+	if (*workload == "all" || *workload == "page") && !*jsonOut {
 		runPageBenches()
 	}
 	if *workload != "page" {
-		if err := runSQLBenches(*workload, *duration, *rows, *conc); err != nil {
+		if err := runSQLBenches(*workload, *duration, *rows, *conc, *jsonOut); err != nil {
 			fatal(err)
 		}
 	}
 }
 
-func runSLOBenches(d time.Duration, conc, maxRows, vecs, vectorQueries, bufferPages int, quick, skipDML bool) error {
+func runSLOBenches(d time.Duration, conc, maxRows, vecs, vectorQueries, bufferPages int, quick, skipDML, jsonOut bool) error {
 	dir, err := os.MkdirTemp("", "nextsql-bench-slo-")
 	if err != nil {
 		return err
@@ -213,6 +240,9 @@ func runSLOBenches(d time.Duration, conc, maxRows, vecs, vectorQueries, bufferPa
 	if err != nil {
 		return err
 	}
+	if jsonOut {
+		return outputJSON("slo", fmt.Sprintf("NextSQL %s Official SLO Suite", version.String), suite.Hardware, suite.Reports)
+	}
 	hw := suite.Hardware
 	fmt.Printf("\nSLO suite  cpu=%s  ram=%s  fs=%s  os=%s/%s  cpus=%d  buffers=%d\n",
 		hw.CPU, hw.RAM, hw.Filesystem, hw.GOOS, hw.GOARCH, hw.NumCPU, hw.BufferPages)
@@ -249,7 +279,7 @@ func runSLOBenches(d time.Duration, conc, maxRows, vecs, vectorQueries, bufferPa
 	return nil
 }
 
-func runSQLBenches(name string, d time.Duration, rows, conc int) error {
+func runSQLBenches(name string, d time.Duration, rows, conc int, jsonOut bool) error {
 	dir, err := os.MkdirTemp("", "nextsql-bench-sql-")
 	if err != nil {
 		return err
@@ -262,6 +292,13 @@ func runSQLBenches(name string, d time.Duration, rows, conc int) error {
 	reps, err := bench.Run(opt)
 	if err != nil {
 		return err
+	}
+	if jsonOut {
+		var hw bench.Hardware
+		if len(reps) > 0 {
+			hw = reps[0].Hardware
+		}
+		return outputJSON("sql", fmt.Sprintf("NextSQL %s SQL Workloads", version.String), hw, reps)
 	}
 	if len(reps) == 0 {
 		return nil
@@ -281,7 +318,7 @@ func runSQLBenches(name string, d time.Duration, rows, conc int) error {
 	return nil
 }
 
-func runPartitionBenches(d time.Duration, rows int) error {
+func runPartitionBenches(d time.Duration, rows int, jsonOut bool) error {
 	dir, err := os.MkdirTemp("", "nextsql-bench-partition-")
 	if err != nil {
 		return err
@@ -290,6 +327,9 @@ func runPartitionBenches(d time.Duration, rows int) error {
 	suite, err := bench.RunPartition(bench.PartitionOptions{Dir: dir, BufferPages: 512, Duration: d, Rows: rows})
 	if err != nil {
 		return err
+	}
+	if jsonOut {
+		return outputJSON("partition", fmt.Sprintf("NextSQL %s Partition Pruning Suite", version.String), suite.Hardware, suite.Reports)
 	}
 	hw := suite.Hardware
 	fmt.Printf("\nPartition pruning  os=%s arch=%s cpus=%d  %s  %s  rows/table=%d\n",
@@ -309,7 +349,7 @@ func runPartitionBenches(d time.Duration, rows int) error {
 	return nil
 }
 
-func runReadScaleBenches(d time.Duration, rows, readers int) error {
+func runReadScaleBenches(d time.Duration, rows, readers int, jsonOut bool) error {
 	dir, err := os.MkdirTemp("", "nextsql-bench-readscale-")
 	if err != nil {
 		return err
@@ -327,6 +367,9 @@ func runReadScaleBenches(d time.Duration, rows, readers int) error {
 	})
 	if err != nil {
 		return err
+	}
+	if jsonOut {
+		return outputJSON("readscale", fmt.Sprintf("NextSQL %s Follower Read Scaling Suite", version.String), suite.Hardware, suite.Reports)
 	}
 	hw := suite.Hardware
 	fmt.Printf("\nFollower-read scaling  os=%s arch=%s cpus=%d gomaxprocs=%d  %s  %s  rows=%d readers/node=%d\n",
@@ -347,7 +390,7 @@ func runReadScaleBenches(d time.Duration, rows, readers int) error {
 	return nil
 }
 
-func runVectorQuantBenches(rows, dim, sparseDim, sparseNNZ, queries int) error {
+func runVectorQuantBenches(rows, dim, sparseDim, sparseNNZ, queries int, jsonOut bool) error {
 	dir, err := os.MkdirTemp("", "nextsql-bench-vecquant-")
 	if err != nil {
 		return err
@@ -366,6 +409,9 @@ func runVectorQuantBenches(rows, dim, sparseDim, sparseNNZ, queries int) error {
 	})
 	if err != nil {
 		return err
+	}
+	if jsonOut {
+		return outputJSON("vecquant", fmt.Sprintf("NextSQL %s Quantised Vector Suite", version.String), suite.Hardware, suite.Reports)
 	}
 	hw := suite.Hardware
 	fmt.Printf("\nQuantised vectors  os=%s arch=%s cpus=%d  %s  %s\n",

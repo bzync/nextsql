@@ -61,29 +61,31 @@ P24      complete — Full-text Search 2.0; exit gate closed 2026-08-31
 P25      complete — Security 2.0; exit gate closed 2026-09-02, security review sign-off in docs/security.md
 P26      complete — System catalog / introspection 2.0; exit gate closed 2026-09-02
 P27      complete — Operational maturity + workload governance; exit gate closed 2026-09-03
-P28      in progress — NextSQL Admin: Setup + Operations modes (2026-09-05: Installer +
+P28      complete — NextSQL Admin: Setup + Operations modes (2026-09-05: Installer +
          Manager + Studio merged into one product, one binary nextsql-admin).
          Operations-mode MVP (all nine M1–M9 slices) is COMPLETE. Setup mode's implemented wizard,
-         packaging integration, service flow, and accessibility baseline are verified;
-         Linux .tar.gz/.run/.deb/.rpm and silent/offline/upgrade/repair paths are
-         live-verified. Recovery-key export/verification is implemented for both
-         keystores; macOS execution remains environment-blocked. Native Windows is
-         out of scope (log #290): Windows hosts run NextSQL under WSL 2.
-P29      in progress — Studio M1–M3, five native explorers, Users/Roles,
-         Transaction/Lock, Audit, bounded per-tab plan comparison plus
-         ANALYZE-only profiler, catalog-aware table/column IntelliSense
-         (no keyword completion), and deterministic misspelled FROM/JOIN
-         table-name suggestions implemented; MVP gate open
+         packaging integration, service flow, firewall assistant, multi-step staged progress,
+         and accessibility baseline are verified; Linux .tar.gz/.run/.deb/.rpm and silent/offline/
+         upgrade/repair paths are live-verified; exit gate closed 2026-09-24 (log #327).
+         Recovery-key export/verification is implemented for both keystores; macOS execution remains
+         environment-blocked. Native Windows is out of scope (log #290): Windows hosts run NextSQL under WSL 2.
+P29      complete — NextSQL Studio (Studio mode of NextSQL Admin): professional
+         database IDE in unified nextsql-admin binary; connection manager with
+         profiles and OS keyring delegation, lazy schema tree, editable data
+         grid with transactional staging, EXPLAIN/ANALYZE trees, plan comparison,
+         profiler, native explorers, schema diff, streaming bulk import, benchmark
+         viewer, catalog-aware IntelliSense, inline parser and binder diagnostics
+         with quick-fix rewrites; MVP exit gate closed (logs #146–#221, #269, #270, #322–#326)
 ```
 
-P28 is the current release gate — specifically the GUI installer, the only
-open piece of its exit gate. Prioritize:
+All core engine, security, operational, and admin tooling phases (P0–P29) are
+complete with exit gates verified. Prioritize:
 
 ```text
 1. Audit designed vs implemented vs tested vs production-gated status for
    whatever surface is being extended, the way P25's audit table did.
 2. Fix any correctness regression first.
-3. Close a phase only when its exit gate is green.
+3. Keep all phase exit gates green.
 ```
 
 P25 Security 2.0 is complete (exit gate closed 2026-09-02): mTLS / service identity / certificate + trust rotation /
@@ -141,10 +143,10 @@ tables — `system.sessions`/`system.active_queries`/`system.transactions`/
 `system.change_streams`/`system.locks` (node-local, in-memory,
 RBAC-filtered — see `docs/system-catalog.md`) — and all nine planned `SHOW`
 convenience aliases. P27 Operational maturity + workload governance closed
-2026-09-03. **P28 NextSQL Admin (Setup + Operations modes) is the current
-release gate**: Operations mode's MVP is complete; Setup mode
-has its standalone M1 flow implemented and
-targeted-tested. Packaging integration, recovery-key export/verification,
+2026-09-03. **P28 NextSQL Admin (Setup + Operations modes) exit gate closed
+2026-09-24 (log #327)**: Operations mode's MVP is complete; Setup mode
+has its wizard, firewall assistant, and multi-step staged progress implemented and
+verified. Packaging integration, recovery-key export/verification,
 accessibility validation, and silent/offline install coverage are implemented;
 remaining macOS execution tests are environment-blocked; native Windows is
 out of scope (log #290), with WSL 2 the supported path on Windows hosts.
@@ -450,14 +452,14 @@ Do not convert targets into claims without measured evidence.
 
 # 14. Current Product Direction
 
-Remaining phases are:
+All phases P0–P29 are complete:
 
 ```text
-P28 NextSQL Admin — Setup + Operations modes  — in progress (Setup-mode GUI M1 landed; installer gate open)
-P29 NextSQL Admin — Studio mode                — in progress (M1–M3, focused native/developer-operations slices, bounded plan comparison/ANALYZE profiler, catalog-aware IntelliSense, and misspelled table-name suggestions landed; MVP gate open)
+P28 NextSQL Admin — Setup + Operations modes  — complete (exit gate closed 2026-09-24; log #327)
+P29 NextSQL Admin — Studio mode                — complete (MVP exit gate closed, follow-on binder diagnostics complete; logs #146–#221, #269, #270, #322–#326)
 ```
 
-P0–P27 are complete. P16's terminal 100M B+Tree soak remains a documented
+P0–P29 are complete. P16's terminal 100M B+Tree soak remains a documented
 standalone measurement outside the gate. P17 online rebuild is shipped for
 the proven non-partitioned B+Tree-family scope; vector, full-text, and
 partitioned indexes deliberately retain the blocking fallback.

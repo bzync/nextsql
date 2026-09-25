@@ -95,6 +95,13 @@ type Params struct {
 	// action the server takes on top, and its outcome (or failure) never
 	// changes whether the database install itself succeeded.
 	EnableService bool `json:"enableService"`
+
+	// EnableFirewall requests that, after a successful (non-dry-run) install
+	// with a non-loopback listen address, the server also configures the
+	// host firewall (ufw or firewalld) to allow traffic on the database port.
+	// Like EnableService, this is a best-effort post-install action and its
+	// outcome never changes whether the database install itself succeeded.
+	EnableFirewall bool `json:"enableFirewall"`
 }
 
 // Validate rejects obviously-unusable input before a subprocess is spent on

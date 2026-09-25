@@ -241,3 +241,125 @@ func TestRotateBlockedByHold(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// TestAppendHeldBatchCommit verifies that a batch of records held together
+// stays out of the durable prefix until ReleaseHold(true) resolves them,
+// after which Flush makes all of them durable together.
+func TestAppendHeldBatchCommit(t *testing.T) {
+	keys, id := testIdent(t)
+	lg, err := Create(filepath.Join(t.TempDir(), "wal"), keys, id, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lg.Close()
+
+	t1 := lg.AllocTxn()
+	t2 := lg.AllocTxn()
+	t3 := lg.AllocTxn()
+	if _, err := lg.Append(BeginRec(t1)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := lg.Append(BeginRec(t2)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := lg.Append(BeginRec(t3)); err != nil {
+		t.Fatal(err)
+	}
+
+	recs := []Record{
+		CommitRec(t1, 1),
+		CommitRec(t2, 2),
+		CommitRec(t3, 3),
+	}
+	lsns, err := lg.AppendHeldBatch(recs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(lsns) != 3 {
+		t.Fatalf("expected 3 lsns, got %d", len(lsns))
+	}
+
+	firstHeld := lsns[0]
+	lastHeld := lsns[len(lsns)-1]
+
+	// Flush up to firstHeld - 1 must not make any held record durable
+	if err := lg.Flush(firstHeld - 1); err != nil {
+		t.Fatal(err)
+	}
+	if lg.DurableLSN() >= firstHeld {
+		t.Fatalf("held batch became durable early: durable=%d firstHeld=%d", lg.DurableLSN(), firstHeld)
+	}
+
+	if err := lg.ReleaseHold(true); err != nil {
+		t.Fatal(err)
+	}
+	if err := lg.Flush(lastHeld); err != nil {
+		t.Fatal(err)
+	}
+	if lg.DurableLSN() < lastHeld {
+		t.Fatalf("durable=%d want>=%d", lg.DurableLSN(), lastHeld)
+	}
+}
+
+// TestAppendHeldBatchDiscard verifies that ReleaseHold(false) on a held batch
+// cleanly splices out all records in the batch without affecting surrounding
+// records.
+func TestAppendHeldBatchDiscard(t *testing.T) {
+	keys, id := testIdent(t)
+	lg, err := Create(filepath.Join(t.TempDir(), "wal"), keys, id, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lg.Close()
+
+	t1 := lg.AllocTxn()
+	t2 := lg.AllocTxn()
+	if _, err := lg.Append(BeginRec(t1)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := lg.Append(BeginRec(t2)); err != nil {
+		t.Fatal(err)
+	}
+
+	heldLSNs, err := lg.AppendHeldBatch([]Record{
+		CommitRec(t1, 1),
+		CommitRec(t2, 2),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Another transaction writes after the held batch
+	t3 := lg.AllocTxn()
+	if _, err := lg.Append(BeginRec(t3)); err != nil {
+		t.Fatal(err)
+	}
+	t3Commit, err := lg.Append(CommitRec(t3, heldLSNs[1]+1))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Discard the batch
+	if err := lg.ReleaseHold(false); err != nil {
+		t.Fatal(err)
+	}
+	if err := lg.Flush(t3Commit); err != nil {
+		t.Fatal(err)
+	}
+	if lg.DurableLSN() < t3Commit {
+		t.Fatalf("durable=%d want>=%d", lg.DurableLSN(), t3Commit)
+	}
+
+	// Scan to verify the held batch was spliced out
+	scanned, _, err := lg.ScanFrom(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range scanned {
+		for _, h := range heldLSNs {
+			if r.LSN == h {
+				t.Fatalf("discarded held record LSN %d was found in durable scan", h)
+			}
+		}
+	}
+}

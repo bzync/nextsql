@@ -1235,6 +1235,186 @@ func TestAdminSwitchesBetweenServerProfiles(t *testing.T) {
 	}
 }
 
+func TestAdminDatabasesAndMaintenanceRowCounts(t *testing.T) {
+	addr, tlsCfg := startTLSServer(t)
+	conn := openApp(t, addr, tlsCfg)
+	ctx := context.Background()
+	if _, err := conn.Exec(ctx, `CREATE TABLE stats_rows (id STRING PRIMARY KEY, n STRING NOT NULL)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Exec(ctx, `INSERT INTO stats_rows (id, n) VALUES ('a','1'), ('b','2')`); err != nil {
+		t.Fatal(err)
+	}
+
+	base := startManager(t, addr)
+	c := mustClient(t)
+	res, body := doJSON(t, c, "POST", base+"/api/v1/session", "", map[string]any{
+		"user": "app", "password": "s3cret", "database": "production",
+	})
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("login: want 200, got %d (%v)", res.StatusCode, body)
+	}
+
+	res, databases := doJSON(t, c, "GET", base+"/api/v1/databases", "", nil)
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("databases: want 200, got %d (%v)", res.StatusCode, databases)
+	}
+	stats, _ := databases["table_stats"].(map[string]any)
+	if got := statsRowCount(t, stats, "stats_rows"); got != "2" {
+		t.Fatalf("databases table_stats row_count = %q, warnings=%v body=%v", got, databases["warnings"], stats)
+	}
+
+	res, maintenance := doJSON(t, c, "GET", base+"/api/v1/maintenance", "", nil)
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("maintenance: want 200, got %d (%v)", res.StatusCode, maintenance)
+	}
+	stats, _ = maintenance["table_stats"].(map[string]any)
+	if got := statsRowCount(t, stats, "stats_rows"); got != "2" {
+		t.Fatalf("maintenance table_stats row_count = %q, warnings=%v body=%v", got, maintenance["warnings"], stats)
+	}
+}
+
+func statsRowCount(t *testing.T, rs map[string]any, table string) string {
+	t.Helper()
+	return statsCell(t, rs, "table_name", table, "row_count")
+}
+
+// statsCell reads one column of the first row of rs whose keyCol equals key.
+// A NULL cell reads back as "NULL" so a test can tell it apart from a zero.
+func statsCell(t *testing.T, rs map[string]any, keyCol, key, wantCol string) string {
+	t.Helper()
+	cols, _ := rs["columns"].([]any)
+	rows, _ := rs["rows"].([]any)
+	keyIdx, valIdx := -1, -1
+	for i, col := range cols {
+		switch name, _ := col.(string); name {
+		case keyCol:
+			keyIdx = i
+		case wantCol:
+			valIdx = i
+		}
+	}
+	if keyIdx < 0 || valIdx < 0 {
+		t.Fatalf("columns %v have no %q/%q", cols, keyCol, wantCol)
+	}
+	for _, raw := range rows {
+		row, _ := raw.([]any)
+		if name, _ := row[keyIdx].(string); name != key {
+			continue
+		}
+		if row[valIdx] == nil {
+			return "NULL"
+		}
+		return fmt.Sprint(row[valIdx])
+	}
+	t.Fatalf("%s %q missing from %v", keyCol, key, rows)
+	return ""
+}
+
+// TestAdminStatisticsAreAccurateOverTheAPI drives the two read-models an
+// operator actually reads statistics from, and pins the three figures that
+// were previously wrong or missing: a live row count with no ANALYZE ever
+// run, the planner snapshot beside it, and a partial index reporting what it
+// holds rather than what its table holds.
+func TestAdminStatisticsAreAccurateOverTheAPI(t *testing.T) {
+	addr, tlsCfg := startTLSServer(t)
+	conn := openApp(t, addr, tlsCfg)
+	ctx := context.Background()
+	for _, stmt := range []string{
+		`CREATE TABLE acct (id STRING PRIMARY KEY, tier INT64 NOT NULL, bio TEXT)`,
+		`CREATE INDEX ix_tier ON acct (tier)`,
+		`CREATE INDEX ix_vip ON acct (tier) WHERE tier > 2`,
+		`CREATE FULLTEXT INDEX ix_bio ON acct (bio)`,
+		`INSERT INTO acct (id, tier, bio) VALUES ('a',1,'one'),('b',2,'two'),('c',3,'three'),('d',4,'four')`,
+	} {
+		if _, err := conn.Exec(ctx, stmt); err != nil {
+			t.Fatalf("%s: %v", stmt, err)
+		}
+	}
+
+	base := startManager(t, addr)
+	c := mustClient(t)
+	res, body := doJSON(t, c, "POST", base+"/api/v1/session", "", map[string]any{
+		"user": "app", "password": "s3cret", "database": "production",
+	})
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("login: want 200, got %d (%v)", res.StatusCode, body)
+	}
+	csrf, _ := body["csrf_token"].(string)
+	if csrf == "" {
+		t.Fatal("no csrf_token in login response")
+	}
+
+	res, m := doJSON(t, c, "GET", base+"/api/v1/maintenance", "", nil)
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("maintenance: want 200, got %d (%v)", res.StatusCode, m)
+	}
+	tableStats, _ := m["table_stats"].(map[string]any)
+	indexStats, _ := m["index_stats"].(map[string]any)
+
+	// Four rows are visible even though ANALYZE has never run, and the
+	// planner's snapshot is reported as absent rather than as zero.
+	if got := statsCell(t, tableStats, "table_name", "acct", "row_count"); got != "4" {
+		t.Errorf("row_count before ANALYZE = %q, want 4", got)
+	}
+	if got := statsCell(t, tableStats, "table_name", "acct", "analyzed_rows"); got != "NULL" {
+		t.Errorf("analyzed_rows before ANALYZE = %q, want NULL", got)
+	}
+
+	// The partial index covers tier > 2, which is two of the four rows.
+	for _, tc := range []struct{ index, kind, entries string }{
+		{"ix_tier", "BTREE", "4"},
+		{"ix_vip", "PARTIAL", "2"},
+		{"ix_bio", "FULLTEXT", "NULL"},
+	} {
+		if got := statsCell(t, indexStats, "index_name", tc.index, "index_kind"); got != tc.kind {
+			t.Errorf("%s index_kind = %q, want %q", tc.index, got, tc.kind)
+		}
+		if got := statsCell(t, indexStats, "index_name", tc.index, "entry_count"); got != tc.entries {
+			t.Errorf("%s entry_count = %q, want %q", tc.index, got, tc.entries)
+		}
+		if got := statsCell(t, indexStats, "index_name", tc.index, "row_count"); got != "4" {
+			t.Errorf("%s row_count = %q, want 4", tc.index, got)
+		}
+	}
+
+	// ANALYZE through the Admin action, then the snapshot matches; a further
+	// write drifts it again, which is the signal the Maintenance view shows.
+	res, actBody := doJSON(t, c, "POST", base+"/api/v1/maintenance/action", csrf, map[string]any{
+		"op": "analyze", "target": "acct",
+	})
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("analyze: want 200, got %d (%v)", res.StatusCode, actBody)
+	}
+	res, m = doJSON(t, c, "GET", base+"/api/v1/maintenance", "", nil)
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("maintenance after analyze: %d", res.StatusCode)
+	}
+	tableStats, _ = m["table_stats"].(map[string]any)
+	if got := statsCell(t, tableStats, "table_name", "acct", "analyzed_rows"); got != "4" {
+		t.Errorf("analyzed_rows after ANALYZE = %q, want 4", got)
+	}
+
+	if _, err := conn.Exec(ctx, `INSERT INTO acct (id, tier, bio) VALUES ('e',5,'five')`); err != nil {
+		t.Fatal(err)
+	}
+	res, m = doJSON(t, c, "GET", base+"/api/v1/maintenance", "", nil)
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("maintenance after insert: %d", res.StatusCode)
+	}
+	tableStats, _ = m["table_stats"].(map[string]any)
+	indexStats, _ = m["index_stats"].(map[string]any)
+	if live := statsCell(t, tableStats, "table_name", "acct", "row_count"); live != "5" {
+		t.Errorf("row_count after insert = %q, want 5", live)
+	}
+	if analyzed := statsCell(t, tableStats, "table_name", "acct", "analyzed_rows"); analyzed != "4" {
+		t.Errorf("analyzed_rows after insert = %q, want the stale 4", analyzed)
+	}
+	if got := statsCell(t, indexStats, "index_name", "ix_vip", "entry_count"); got != "3" {
+		t.Errorf("partial index entry_count after insert = %q, want 3", got)
+	}
+}
+
 func TestAdminOpsServerUnreachable(t *testing.T) {
 	// Point the Manager at a dead address; login should be a clean 502.
 	base := startManagerInsecure(t, "127.0.0.1:1")

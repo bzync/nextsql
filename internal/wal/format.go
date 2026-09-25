@@ -48,6 +48,12 @@ const (
 	RecPageDelta RecType = 13
 )
 
+const (
+	// UndoFlagV2 is set on RecUndo records that carry full version undo info.
+	UndoFlagV2 uint16 = 1
+)
+
+
 func (t RecType) String() string {
 	switch t {
 	case RecBegin:
@@ -227,6 +233,27 @@ func parseHeader(hdr []byte) (physicalHeader, error) {
 		return physicalHeader{}, nerr.New(nerr.InvalidFormat, "wal.parseHeader", "invalid ciphertext length")
 	}
 	return h, nil
+}
+
+func isZeroHeader(hdr []byte) bool {
+	if len(hdr) < HeaderSize {
+		return false
+	}
+	for i := 0; i < HeaderSize; i++ {
+		if hdr[i] != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+func isAllZero(b []byte) bool {
+	for _, v := range b {
+		if v != 0 {
+			return false
+		}
+	}
+	return true
 }
 
 func decodePhysical(keys crypto.KeyProvider, hdr, ct []byte) (Record, error) {

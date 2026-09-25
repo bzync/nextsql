@@ -24,7 +24,7 @@ ARG TARGETOS TARGETARCH
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
     set -eux; \
-    for cmd in nextsql nextsqld nextsql-entrypoint; do \
+    for cmd in nextsql nextsqld nextsql-admin nextsql-entrypoint; do \
       GOOS="$TARGETOS" GOARCH="$TARGETARCH" \
         go build -trimpath -buildvcs=false -ldflags='-s -w -buildid=' \
           -o "/out/$cmd" "./cmd/$cmd"; \
@@ -61,6 +61,7 @@ COPY --from=build --chown=10001:10001 /out/empty/. /run/tls/
 COPY --from=build --chown=10001:10001 /out/empty/. /seed/
 COPY --from=build /out/nextsql /usr/local/bin/nextsql
 COPY --from=build /out/nextsqld /usr/local/bin/nextsqld
+COPY --from=build /out/nextsql-admin /usr/local/bin/nextsql-admin
 COPY --from=build /out/nextsql-entrypoint /usr/local/bin/nextsql-entrypoint
 
 ENV NEXTSQL_DATA_DIR=/var/lib/nextsql \
@@ -68,7 +69,7 @@ ENV NEXTSQL_DATA_DIR=/var/lib/nextsql \
     NEXTSQL_LISTEN=0.0.0.0:7210
 
 VOLUME ["/var/lib/nextsql", "/run/secrets", "/seed"]
-EXPOSE 7210
+EXPOSE 7210 7220
 USER 10001:10001
 STOPSIGNAL SIGTERM
 ENTRYPOINT ["/usr/local/bin/nextsql-entrypoint"]

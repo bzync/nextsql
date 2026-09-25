@@ -2,39 +2,39 @@
 
 Install the NextSQL **binaries**, then initialize a data directory.
 
-Published packages, checksums, and a feature comparison are on [Downloads](/download). Direct files: [GitHub release v0.0.4](https://github.com/bzync/nextsql/releases/tag/v0.0.4). For a container, see [Docker](/docs/docker). For the GUI, see [Admin](/docs/admin).
+Published packages, checksums, and a feature comparison are on [Downloads](/download). Direct files: [GitHub release v0.0.5](https://github.com/bzync/nextsql/releases/tag/v0.0.5). For a container, see [Docker](/docs/docker). For the GUI, see [Admin](/docs/admin).
 
 The packages copy `nextsql`, `nextsqld`, `nextsql-bench`, and `nextsql-admin` plus a default config. They do **not** create a data directory, write a root unlock key, or start the server.
 
 ## Linux x64
 
-Verify the file against [SHA256SUMS](https://github.com/bzync/nextsql/releases/download/v0.0.4/SHA256SUMS) before you run it.
+Verify the file against [SHA256SUMS](https://github.com/bzync/nextsql/releases/download/v0.0.5/SHA256SUMS) before you run it.
 
 ### Debian / Ubuntu (`.deb`)
 
 ```bash
-curl -fsSL -O https://github.com/bzync/nextsql/releases/download/v0.0.4/nextsql_0.0.4_amd64.deb
-curl -fsSL -O https://github.com/bzync/nextsql/releases/download/v0.0.4/SHA256SUMS
+curl -fsSL -O https://github.com/bzync/nextsql/releases/download/v0.0.5/nextsql_0.0.5_amd64.deb
+curl -fsSL -O https://github.com/bzync/nextsql/releases/download/v0.0.5/SHA256SUMS
 sha256sum -c --ignore-missing SHA256SUMS
-sudo dpkg -i nextsql_0.0.4_amd64.deb
+sudo dpkg -i nextsql_0.0.5_amd64.deb
 ```
 
 ### Self-extracting installer (`.run`)
 
 ```bash
-curl -fsSL -O https://github.com/bzync/nextsql/releases/download/v0.0.4/nextsql-0.0.4-linux-amd64.run
-curl -fsSL -O https://github.com/bzync/nextsql/releases/download/v0.0.4/SHA256SUMS
+curl -fsSL -O https://github.com/bzync/nextsql/releases/download/v0.0.5/nextsql-0.0.5-linux-amd64.run
+curl -fsSL -O https://github.com/bzync/nextsql/releases/download/v0.0.5/SHA256SUMS
 sha256sum -c --ignore-missing SHA256SUMS
-chmod +x nextsql-0.0.4-linux-amd64.run
-sudo ./nextsql-0.0.4-linux-amd64.run
+chmod +x nextsql-0.0.5-linux-amd64.run
+sudo ./nextsql-0.0.5-linux-amd64.run
 ```
 
 ### Portable tarball
 
 ```bash
-curl -fsSL -O https://github.com/bzync/nextsql/releases/download/v0.0.4/nextsql-0.0.4-linux-amd64.tar.gz
-tar -xzf nextsql-0.0.4-linux-amd64.tar.gz
-sudo ./nextsql-0.0.4-linux-amd64/install.sh
+curl -fsSL -O https://github.com/bzync/nextsql/releases/download/v0.0.5/nextsql-0.0.5-linux-amd64.tar.gz
+tar -xzf nextsql-0.0.5-linux-amd64.tar.gz
+sudo ./nextsql-0.0.5-linux-amd64/install.sh
 ```
 
 `install.sh` defaults to system-wide (`/usr/local`) as root, or `--user` (`~/.local`) otherwise. The systemd unit is installed but **not** enabled.
@@ -89,7 +89,7 @@ only from a tagged release. Every tag is immutable — pin an explicit version,
 there is no `latest`, `edge`, or per-commit tag:
 
 ```bash
-docker pull bzynchub/nextsql:0.0.4
+docker pull bzynchub/nextsql:0.0.5
 ```
 
 See [Docker](/docs/docker).
@@ -99,18 +99,18 @@ See [Docker](/docs/docker).
 Requires **Go 1.26+** so `go install` can fetch and compile the engine onto your `PATH`.
 
 ```bash
-go install github.com/bzync/nextsql/cmd/nextsql@v0.0.4
-go install github.com/bzync/nextsql/cmd/nextsqld@v0.0.4
-go install github.com/bzync/nextsql/cmd/nextsql-bench@v0.0.4
-go install github.com/bzync/nextsql/cmd/nextsql-auth-broker@v0.0.4
-go install github.com/bzync/nextsql/cmd/nextsql-admin@v0.0.4
+go install github.com/bzync/nextsql/cmd/nextsql@v0.0.5
+go install github.com/bzync/nextsql/cmd/nextsqld@v0.0.5
+go install github.com/bzync/nextsql/cmd/nextsql-bench@v0.0.5
+go install github.com/bzync/nextsql/cmd/nextsql-auth-broker@v0.0.5
+go install github.com/bzync/nextsql/cmd/nextsql-admin@v0.0.5
 ```
 
 Confirm:
 
 ```bash
 nextsql version
-# nextsql 0.0.4
+# nextsql 0.0.5
 ```
 
 `nextsql` is the CLI. `nextsqld` is the server. `nextsql-bench` is optional (official measurements with encryption, WAL, and fsync on). `nextsql-auth-broker` is the optional OIDC broker. `nextsql-admin` is the loopback Admin UI.
@@ -159,7 +159,7 @@ are independent of the engine version.
 
 | Runtime | Install |
 |---|---|
-| Go | `go get github.com/bzync/nextsql/drivers/go@v0.0.4` |
+| Go | `go get github.com/bzync/nextsql/drivers/go@v0.0.5` |
 | Node.js 18+ | `npm i @bzync/nextsql@0.0.1` |
 | Bun | `drivers/bun` (repo tree) |
 | PHP 8.1+ | `composer require bzync/nextsql` |

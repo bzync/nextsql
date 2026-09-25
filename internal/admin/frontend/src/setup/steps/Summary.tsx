@@ -1,6 +1,7 @@
 import { Alert, Button, Card, CardBody, DescriptionDetails, DescriptionItem, DescriptionList, DescriptionTerm } from "@bzync/rui";
 import type { Params, RunResult } from "../api";
 import { StepHeader } from "../components/StepHeader";
+import { extractPort, looksNonLoopback } from "../util";
 
 export function Summary({
   params, lastPlan, onBack, onInstall,
@@ -75,6 +76,16 @@ export function Summary({
             <DescriptionTerm>Listen address</DescriptionTerm>
             <DescriptionDetails>{params.listenAddr || "127.0.0.1:7210 (default)"}{params.tlsCert ? " (TLS)" : ""}</DescriptionDetails>
           </DescriptionItem>
+          {looksNonLoopback(params.listenAddr) ? (
+            <DescriptionItem>
+              <DescriptionTerm>Firewall rule</DescriptionTerm>
+              <DescriptionDetails>
+                {params.enableFirewall
+                  ? `Yes — will allow incoming TCP port ${extractPort(params.listenAddr)}`
+                  : "No — manual configuration required for external access"}
+              </DescriptionDetails>
+            </DescriptionItem>
+          ) : null}
           {!params.skipInit ? (
             <DescriptionItem>
               <DescriptionTerm>Start at boot</DescriptionTerm>

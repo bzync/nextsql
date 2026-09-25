@@ -90,7 +90,10 @@ Breaking changes require explicit versioning.
 The wire frame version remains NSQL v1. Realm selection, read-consistency,
 node-status, CDC, and idempotent-query support are additive v1 frames or
 trailing fields and are capability-gated. The virtual `system` schema has its
-own column-contract capability, currently `system_schema_v4`.
+own column-contract capability, currently `system_schema_v5` — v5 added
+`free_pages` to `system.storage`, `analyzed_rows` to `system.table_stats`, and
+`index_kind`/`entry_count` to `system.index_stats`, so a `SELECT *` against any
+of the three returns more columns than on v4.
 
 ---
 

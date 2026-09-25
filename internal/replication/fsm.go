@@ -47,6 +47,17 @@ func (f *fsm) LastLSN() format.LSN {
 	return f.lastLSN
 }
 
+func (f *fsm) settlePredecessorTransactions() error {
+	f.mu.Lock()
+	applier := f.applier
+	f.mu.Unlock()
+	if s, ok := applier.(interface{ SettlePredecessorTransactions() error }); ok {
+		return s.SettlePredecessorTransactions()
+	}
+	return nil
+}
+
+
 func (f *fsm) Apply(l *raft.Log) interface{} {
 	if l == nil || l.Type != raft.LogCommand {
 		return nil

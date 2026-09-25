@@ -24,6 +24,9 @@ func nearestMetric(explicit string, colType types.Type) (nsvec.Metric, error) {
 }
 
 func (s *Session) searchNearest(n planner.Nearest) ([][]types.Value, error) {
+	// Measure this operator's own fan-out rather than inheriting one from an
+	// earlier parallel step in the same statement.
+	s.budget().ResetFanOut()
 	var colType types.Type
 	if n.Table != nil && n.Column >= 0 && n.Column < len(n.Table.Columns) {
 		colType = n.Table.Columns[n.Column].Type
@@ -54,13 +57,16 @@ func (s *Session) searchNearest(n planner.Nearest) ([][]types.Value, error) {
 	if s.trace != nil {
 		if node := optimizer.Find(s.trace, "Nearest"); node != nil {
 			node.ActRows = int64(len(rows))
-			node.Workers = s.workers()
+			node.Workers = s.budget().FanOut()
 		}
 	}
 	return rows, nil
 }
 
 func (s *Session) searchNearestSparse(n planner.Nearest, colType types.Type) ([][]types.Value, error) {
+	// Measure this operator's own fan-out rather than inheriting one from an
+	// earlier parallel step in the same statement.
+	s.budget().ResetFanOut()
 	q, err := s.nearestSparseQuery(n)
 	if err != nil {
 		return nil, err
@@ -95,7 +101,7 @@ func (s *Session) searchNearestSparse(n planner.Nearest, colType types.Type) ([]
 	if s.trace != nil {
 		if node := optimizer.Find(s.trace, "Nearest"); node != nil {
 			node.ActRows = int64(len(rows))
-			node.Workers = s.workers()
+			node.Workers = s.budget().FanOut()
 		}
 	}
 	return rows, nil

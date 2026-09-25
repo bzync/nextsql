@@ -6,6 +6,7 @@ import (
 	"github.com/bzync/nextsql/internal/catalog"
 	"github.com/bzync/nextsql/internal/fulltext"
 	"github.com/bzync/nextsql/internal/nerr"
+	"github.com/bzync/nextsql/internal/scheduler"
 	"github.com/bzync/nextsql/internal/security"
 	"github.com/bzync/nextsql/internal/sql/ast"
 	"github.com/bzync/nextsql/internal/sql/binder"
@@ -584,7 +585,7 @@ func (s *Session) buildIndex(tab *catalog.Table, idx catalog.Index, progress *re
 						return err
 					}
 				}
-				if err := s.pool().Run(s.budget().Context(), w, tasks); err != nil {
+				if err := scheduler.RunTracked(s.pool(), s.budget(), w, tasks); err != nil {
 					return catalog.Index{}, err
 				}
 				for _, part := range parts {

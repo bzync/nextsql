@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -232,6 +233,58 @@ func TestServerServiceEndpoint(t *testing.T) {
 	// only thing worth asserting on the body here is that decoding
 	// succeeded into the real shape — the actual field values are
 	// host-dependent (DetectService's own tests cover the logic).
+}
+
+func TestServerFirewallEndpoint(t *testing.T) {
+	s, hs := newTestHTTPServer(t, "")
+	req, _ := http.NewRequest("GET", hs.URL+"/api/v1/firewall?port=7210", nil)
+	req.Header.Set(tokenHeader, s.Token())
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("GET /api/v1/firewall: got %d, body %s", resp.StatusCode, body)
+	}
+	var fw FirewallStatus
+	if err := json.NewDecoder(resp.Body).Decode(&fw); err != nil {
+		t.Fatal(err)
+	}
+	if fw.Port != 7210 {
+		t.Errorf("got Port=%d, want 7210", fw.Port)
+	}
+}
+
+func TestServerInstallWithFirewallNonElevated(t *testing.T) {
+	s, hs := newTestHTTPServer(t, `
+printf '{"ok":true,"dry_run":false,"initialized":true,"config_path":"/d/nextsql.conf","health":{"ok":true}}'
+`)
+	body := bytes.NewBufferString(`{"dataDir":"/d","keyFile":"/k","preset":"balanced","listenAddr":"0.0.0.0:7210","enableFirewall":true}`)
+	req, _ := http.NewRequest("POST", hs.URL+"/api/v1/install", body)
+	req.Header.Set(tokenHeader, s.Token())
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var install runResult
+	if err := json.NewDecoder(resp.Body).Decode(&install); err != nil {
+		t.Fatal(err)
+	}
+	if !install.OK {
+		t.Fatalf("database install must still succeed regardless of firewall outcome: %+v", install)
+	}
+	if install.Firewall == nil {
+		t.Fatal("expected non-nil firewall outcome when enableFirewall was requested")
+	}
+	// In non-root test environment, applied should be false with an error or unprivileged command explanation
+	if runtime.GOOS == "linux" {
+		if install.Firewall.Applied {
+			t.Errorf("did not expect firewall to be applied without root elevation: %+v", install.Firewall)
+		}
+	}
 }
 
 // TestServerInstallSkipsServiceWithoutUnit exercises the full

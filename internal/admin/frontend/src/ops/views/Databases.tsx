@@ -2,6 +2,7 @@ import { useMemo, useState } from "react";
 import { Badge, Inline, Tabs, TabsContent, TabsList, TabsTrigger, Text } from "@bzync/rui";
 import { api, type ResultSet, type Whoami } from "../api";
 import { useReadModel } from "../useReadModel";
+import { describeStorage, summarizeStorage } from "../stats";
 import { ResultTable } from "../ResultTable";
 import { ViewFrame } from "./ViewFrame";
 import { Icon } from "../../shared/icons";
@@ -52,9 +53,21 @@ export function Databases({ who, onUnauthorized }: { who: Whoami; onUnauthorized
               />
             </TabsContent>
             <TabsContent value="stats">
-              <ResultTable result={data.table_stats} empty="No statistics collected yet" label="Table statistics" />
+              <Text size="sm" variant="muted" className="mb-3">
+                Row count is the number of rows visible right now, the same figure as COUNT(*).
+                Analyzed rows is the planner's last ANALYZE snapshot; when the two differ, run
+                ANALYZE from Maintenance.
+              </Text>
+              <ResultTable result={data.table_stats} empty="No tables" label="Table statistics" />
             </TabsContent>
             <TabsContent value="storage">
+              {describeStorage(summarizeStorage(data.storage)) ? (
+                <Text size="sm" variant="muted" className="mb-3">
+                  {describeStorage(summarizeStorage(data.storage))}. Live pages are the allocator's
+                  high-water mark minus its freelist; a deployment that preallocates holds more file
+                  than that on disk.
+                </Text>
+              ) : null}
               <ResultTable result={data.storage} label="Storage" />
             </TabsContent>
           </Tabs>
@@ -180,6 +193,13 @@ export function buildTree(databases: ResultSet, connectedDatabase: string): DbNo
       capBytes: 0,
       connected: true,
     });
+  }
+  // A deployment serves one database. The sign-in database label is optional
+  // and is not a second name, so the registry row is this session's database
+  // even when the two strings differ. Otherwise the tree hides its tables
+  // behind "sign in with <registry name>".
+  if (dbs.length === 1) {
+    dbs[0].connected = true;
   }
   return dbs;
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -817,4 +818,373 @@ func nodesAllFollowersHealthy(nodes []*node) (string, bool) {
 		}
 	}
 	return "", true
+}
+
+// TestHAConcurrentWritersBatchQuorum proves that multiple concurrent writers
+// committing to the Raft leader have their commit proposals batched and
+// replicated across quorum, with all rows committed and visible across replicas.
+func TestHAConcurrentWritersBatchQuorum(t *testing.T) {
+	nodes := cluster3(t)
+	lead := leader(t, nodes)
+	if _, err := lead.db.Session().Exec(`CREATE TABLE t (id INT64 PRIMARY KEY, val STRING)`); err != nil {
+		t.Fatal(err)
+	}
+	waitAll(t, nodes, uint64(lead.cluster.AppliedLSN()))
+
+	const workers = 16
+	const rowsPerWorker = 10
+	var wg sync.WaitGroup
+	errCh := make(chan error, workers*rowsPerWorker)
+
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			sess := lead.db.Session()
+			for i := 0; i < rowsPerWorker; i++ {
+				id := workerID*1000 + i
+				_, err := sess.Exec(fmt.Sprintf(`INSERT INTO t (id, val) VALUES (%d, 'val-%d')`, id, id))
+				if err != nil {
+					errCh <- fmt.Errorf("worker %d row %d: %w", workerID, i, err)
+					return
+				}
+			}
+		}(w)
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Fatal(err)
+	}
+
+	waitAll(t, nodes, uint64(lead.cluster.AppliedLSN()))
+
+	// Verify all rows exist on the leader
+	res, err := lead.db.Session().Exec(`SELECT id FROM t`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Rows) != workers*rowsPerWorker {
+		t.Fatalf("leader row count = %d, want %d", len(res.Rows), workers*rowsPerWorker)
+	}
+
+	// Verify all rows exist on every follower via STALE read
+	for _, n := range nodes {
+		if n == lead {
+			continue
+		}
+		fres, err := staleSession(t, n).Exec(`SELECT id FROM t`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(fres.Rows) != workers*rowsPerWorker {
+			t.Fatalf("follower %s row count = %d, want %d", n.id, len(fres.Rows), workers*rowsPerWorker)
+		}
+	}
+}
+
+// TestHAConcurrentWritersLeaderKill verifies that killing the leader during
+// active concurrent batched commit proposals results in surviving replicas electing
+// a new leader with zero loss of acknowledged transactions.
+func TestHAConcurrentWritersLeaderKill(t *testing.T) {
+	nodes := cluster3(t)
+	lead := leader(t, nodes)
+	if _, err := lead.db.Session().Exec(`CREATE TABLE t (id INT64 PRIMARY KEY, val STRING)`); err != nil {
+		t.Fatal(err)
+	}
+	waitAll(t, nodes, uint64(lead.cluster.AppliedLSN()))
+
+	const workers = 8
+	var (
+		ackMu sync.Mutex
+		acked = make(map[int64]struct{})
+		stop  = make(chan struct{})
+		wg    sync.WaitGroup
+	)
+
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			sess := lead.db.Session()
+			counter := 0
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				id := int64(workerID*100000 + counter)
+				counter++
+				_, err := sess.Exec(fmt.Sprintf(`INSERT INTO t (id, val) VALUES (%d, 'val')`, id))
+				if err == nil {
+					ackMu.Lock()
+					acked[id] = struct{}{}
+					ackMu.Unlock()
+				}
+				time.Sleep(5 * time.Millisecond)
+			}
+		}(w)
+	}
+
+	// Wait for writers to accumulate acknowledged commits
+	for {
+		ackMu.Lock()
+		count := len(acked)
+		ackMu.Unlock()
+		if count >= 30 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Kill leader mid-flight
+	_ = lead.cluster.Shutdown()
+	lead.trans.DisconnectAll()
+	lead.cluster = nil
+
+	// Stop workers
+	close(stop)
+	wg.Wait()
+
+	ackMu.Lock()
+	ackedCopy := make(map[int64]struct{}, len(acked))
+	for k, v := range acked {
+		ackedCopy[k] = v
+	}
+	ackMu.Unlock()
+
+	var rest []*node
+	for _, n := range nodes {
+		if n.cluster != nil {
+			rest = append(rest, n)
+		}
+	}
+	if _, err := rest[0].cluster.WaitForLeader(4 * time.Second); err != nil {
+		t.Fatal(err)
+	}
+	cur := leader(t, rest)
+	if cur == nil {
+		t.Fatal("no new leader elected after kill")
+	}
+
+	// Settle predecessor transactions and verify strong reads work on new leader
+	deadline := time.Now().Add(5 * time.Second)
+	var rows [][]types.Value
+	for time.Now().Before(deadline) {
+		res, err := cur.db.Session().Exec(`SELECT id FROM t`)
+		if err == nil {
+			rows = res.Rows
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	foundIDs := make(map[int64]struct{}, len(rows))
+	for _, r := range rows {
+		foundIDs[r[0].Int] = struct{}{}
+	}
+
+	// Assert: EVERY single acknowledged row MUST be present on the new leader!
+	for id := range ackedCopy {
+		if _, ok := foundIDs[id]; !ok {
+			t.Fatalf("acknowledged write id=%d missing on newly-elected leader", id)
+		}
+	}
+
+	// Verify new leader can accept new writes
+	if _, err := cur.db.Session().Exec(`INSERT INTO t (id, val) VALUES (99999999, 'post-kill')`); err != nil {
+		t.Fatalf("new leader write failed: %v", err)
+	}
+}
+
+// TestHAConcurrentWritersPartition verifies that partitioning a node away
+// from the quorum cleanly isolates the minority (rejecting concurrent writes
+// without corrupting local state) while the majority continues committing
+// concurrent batches.
+func TestHAConcurrentWritersPartition(t *testing.T) {
+	nodes := cluster3(t)
+	lead := leader(t, nodes)
+	if _, err := lead.db.Session().Exec(`CREATE TABLE t (id INT64 PRIMARY KEY, val STRING)`); err != nil {
+		t.Fatal(err)
+	}
+	waitAll(t, nodes, uint64(lead.cluster.AppliedLSN()))
+
+	iso := nodes[0]
+	majNodes := []*node{nodes[1], nodes[2]}
+	iso.trans.Disconnect(nodes[1].addr)
+	iso.trans.Disconnect(nodes[2].addr)
+	nodes[1].trans.Disconnect(iso.addr)
+	nodes[2].trans.Disconnect(iso.addr)
+
+	deadline := time.Now().Add(4 * time.Second)
+	var majLead *node
+	for time.Now().Before(deadline) {
+		for _, n := range majNodes {
+			if n.cluster.IsLeader() {
+				majLead = n
+				break
+			}
+		}
+		if majLead != nil {
+			if _, err := majLead.db.Session().Exec(`INSERT INTO t (id, val) VALUES (0, 'init')`); err == nil {
+				break
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if majLead == nil {
+		t.Fatal("majority did not elect a leader")
+	}
+
+	// Concurrent writes on majority leader must succeed
+	const writers = 8
+	var wg sync.WaitGroup
+	majErrs := make([]error, writers)
+	for w := 0; w < writers; w++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			_, err := majLead.db.Session().Exec(fmt.Sprintf(`INSERT INTO t (id, val) VALUES (%d, 'majority')`, 100+idx))
+			majErrs[idx] = err
+		}(w)
+	}
+	wg.Wait()
+
+	for i, err := range majErrs {
+		if err != nil {
+			t.Fatalf("writer %d on majority leader failed: %v", i, err)
+		}
+	}
+
+	// Concurrent writes on isolated node must all be refused
+	isoErrs := make([]error, writers)
+	for w := 0; w < writers; w++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			_, err := iso.db.Session().Exec(fmt.Sprintf(`INSERT INTO t (id, val) VALUES (%d, 'isolated')`, 200+idx))
+			isoErrs[idx] = err
+		}(w)
+	}
+	wg.Wait()
+
+	for i, err := range isoErrs {
+		if err == nil {
+			t.Fatalf("writer %d on isolated node succeeded, want failure", i)
+		}
+	}
+
+	// Verify majority nodes have the writes
+	res, err := majLead.db.Session().Exec(`SELECT id FROM t WHERE val = 'majority'`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Rows) != writers {
+		t.Fatalf("majority count = %d, want %d", len(res.Rows), writers)
+	}
+}
+
+// TestHAConcurrentWritersLeaderTransfer verifies that a planned leadership transfer
+// while concurrent writers are actively proposing batched commits completes
+// without any loss of acknowledged transactions.
+func TestHAConcurrentWritersLeaderTransfer(t *testing.T) {
+	nodes := cluster3(t)
+	lead := leader(t, nodes)
+	before := lead.id
+	if _, err := lead.db.Session().Exec(`CREATE TABLE t (id INT64 PRIMARY KEY, val STRING)`); err != nil {
+		t.Fatal(err)
+	}
+	waitAll(t, nodes, uint64(lead.cluster.AppliedLSN()))
+
+	const workers = 8
+	var (
+		ackMu sync.Mutex
+		acked = make(map[int64]struct{})
+		stop  = make(chan struct{})
+		wg    sync.WaitGroup
+	)
+
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			sess := lead.db.Session()
+			counter := 0
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				id := int64(workerID*100000 + counter)
+				counter++
+				_, err := sess.Exec(fmt.Sprintf(`INSERT INTO t (id, val) VALUES (%d, 'transfer')`, id))
+				if err == nil {
+					ackMu.Lock()
+					acked[id] = struct{}{}
+					ackMu.Unlock()
+				}
+				time.Sleep(5 * time.Millisecond)
+			}
+		}(w)
+	}
+
+	// Let writers start committing batches
+	for {
+		ackMu.Lock()
+		count := len(acked)
+		ackMu.Unlock()
+		if count >= 20 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Trigger transfer leadership
+	if _, err := lead.db.Session().Exec(`CLUSTER TRANSFER LEADER`); err != nil {
+		t.Fatalf("transfer leader failed: %v", err)
+	}
+
+	// Stop writers
+	close(stop)
+	wg.Wait()
+
+	ackMu.Lock()
+	ackedCopy := make(map[int64]struct{}, len(acked))
+	for k, v := range acked {
+		ackedCopy[k] = v
+	}
+	ackMu.Unlock()
+
+	// Wait for leadership to move to another voter
+	deadline := time.Now().Add(4 * time.Second)
+	var after *node
+	for time.Now().Before(deadline) {
+		if n := live(nodes); n != nil && n.id != before {
+			after = n
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if after == nil {
+		t.Fatal("leadership did not move to another voter")
+	}
+
+	waitAll(t, nodes, uint64(after.cluster.AppliedLSN()))
+
+	// Verify all acknowledged rows are present on the new leader
+	res, err := after.db.Session().Exec(`SELECT id FROM t`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := make(map[int64]struct{}, len(res.Rows))
+	for _, r := range res.Rows {
+		found[r[0].Int] = struct{}{}
+	}
+	for id := range ackedCopy {
+		if _, ok := found[id]; !ok {
+			t.Fatalf("acknowledged write id=%d missing on new leader after transfer", id)
+		}
+	}
 }

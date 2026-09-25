@@ -42,7 +42,7 @@ SELECT CASE WHEN COUNT(*) > 100 THEN 'large' ELSE 'small' END FROM system.column
 ```
 
 `system.capabilities` carries the current `internal/system.SchemaVersion`
-(currently 4) as the supported capability name `system_schema_v4`, so machine
+(currently 5) as the supported capability name `system_schema_v5`, so machine
 consumers can detect column-contract changes without parsing prose. The
 `system_show_aliases` row advertises the convenience syntax separately. Bump
 `SchemaVersion` only when a `system.*` table's columns change shape.
@@ -64,10 +64,10 @@ Raft/replication layer) and are visible to any connected user unless noted.
 | `system.checks` | `table_name, constraint_name, predicate` | One row per `CHECK` constraint, ordered by table then constraint name. `predicate` is the stored predicate rendered back to SQL. Filtered by `SELECT` on the constrained table — same rule as `system.foreign_keys`. |
 | `system.triggers` | `name, owner, timing, event, table_name, workflow, arg_count` | One row per row trigger. `timing` is `BEFORE` or `AFTER`; `event` is `INSERT`, `UPDATE`, or `DELETE`. Filtered by `SELECT` on the table the trigger fires on, the same rule as `system.foreign_keys`; this intentionally exposes the invoked workflow name as a dependency of that visible table, but not the workflow body. |
 | `system.schedules` | `name, owner, kind, spec, workflow, enabled, next_fire, last_fire` | One row per schedule. `kind` is `AT`, `EVERY`, or `CRON`; `spec` is UTC RFC 3339, Go duration text, or the stored cron expression respectively. `next_fire`/`last_fire` are typed `TIMESTAMPTZ` values and are `NULL` until known. Filtered by visibility of the invoked workflow (`EXECUTE` on that workflow, database-scoped `SELECT`, or admin), the same rule as `system.workflows`. |
-| `system.table_stats` | `table_name, row_count, updated_at` | Same table-visibility filter. |
-| `system.index_stats` | `table_name, index_name, row_count` | Same table-visibility filter. |
+| `system.table_stats` | `table_name, row_count, analyzed_rows, updated_at` | Same table-visibility filter. `row_count` is the number of rows visible to this statement, the same figure as `COUNT(*)` on that table. `analyzed_rows` is the planner's last `ANALYZE` snapshot for the same table, and is `NULL` until `ANALYZE` has ever run; the planner costs every plan from that figure, so `row_count <> analyzed_rows` is exactly the condition under which `ANALYZE` is warranted. `updated_at` is empty — the stats record carries no timestamp, so when the snapshot was taken is not recoverable; compare the two counts instead. A `WHERE table_name = '…'` equality (including under `AND`) counts only that table. |
+| `system.index_stats` | `table_name, index_name, index_kind, entry_count, row_count` | Same table-visibility filter. `entry_count` is the number of entries the index itself holds under this statement's snapshot, so a partial index reports strictly fewer than its table's rows; for a partitioned table it is the sum over the partition-local index trees. It is `NULL` when the index's entries are not one per row — a `FULLTEXT` index keys terms and a `VECTOR` index keys graph nodes, and counting either would yield a number a reader would misread as a row count — and also `NULL` when a tree the sum needs is not open (a partition that does not carry this logical index, a tree mid-rebuild), so an incomplete total reads as unknown rather than as a short count, and the rest of the view still renders. `index_kind` is `BTREE`, `UNIQUE`, `PARTIAL`, `UNIQUE PARTIAL`, `SPATIAL`, `SPATIAL PARTIAL`, `FULLTEXT`, or `VECTOR`, and says which case applies. `row_count` is the owning table's visible row count, repeated on each of its index rows. |
 | `system.partitions` | see `docs/partitioning.md` | Same table-visibility filter. |
-| `system.storage` | `database, engine, page_size, page_count, file_size, wal_lsn, encryption` | Always visible. `database` is the logical served name (`default` for unnamed embedded use), never a filesystem path. Never exposes key material; `wal_lsn` is redacted to 0. |
+| `system.storage` | `database, engine, page_size, page_count, free_pages, file_size, wal_lsn, encryption` | Always visible. `database` is the logical served name (`default` for unnamed embedded use), never a filesystem path. `page_count` is the allocator's high-water mark — every page this database has taken — and `free_pages` how many of those its freelist can hand back, so live pages are the difference. `file_size` is the database file's real size on disk, measured by `stat`, and is `NULL` if that measurement fails rather than falling back to a figure derived from the page count; a deployment that preallocates (`prealloc_ahead_pages`) holds far more disk than the high-water mark implies, so the two are not interchangeable. Never exposes key material; `wal_lsn` is redacted to 0. |
 | `system.replication` / `system.raft` | `node_id, state, leader_id, leader_addr, voters, applied_lsn, has_leader, maintenance_mode` | Always visible. `leader_addr` is always `[redacted]` — network addresses are never exposed over SQL. `system.raft` is an alias for `system.replication`. `maintenance_mode` reflects this node's own local `CLUSTER MAINTENANCE ENABLE`/`DISABLE` state — see `docs/ops.md` "Maintenance mode"; it is not Raft-replicated, so it can legitimately differ between nodes. |
 | `system.replica_health` | `node_id, role, has_leader, applied_lsn, commit_index, applied_index, apply_backlog, last_contact_ms, healthy` | Always visible. See `docs/ha.md` "Replica lag and follower health". |
 | `system.workflows` | `name, owner, param_count, statement_count` | See `docs/workflows.md`. |
@@ -230,8 +230,9 @@ views report.
 These definition views were added after P26 closed, for official-interface
 Studio inspection. They are virtual query-time projections of the existing
 catalog: no persistent, WAL, recovery, Raft, wire, or driver format changes.
-Adding whole views does not change an existing view's columns, so
-`SchemaVersion` remains 3.
+Adding whole views does not change an existing view's columns, so they did
+not bump `SchemaVersion` (which has since moved to 5 for column changes to
+`system.storage`, `system.table_stats`, and `system.index_stats`).
 
 | Surface | Designed | Implemented | Tested | Production-gated | Evidence / remaining work |
 |---|---:|---:|---:|---:|---|

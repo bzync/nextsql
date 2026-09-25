@@ -157,7 +157,12 @@ func (r *Registry) ObserveQuery(d time.Duration, err error) {
 	r.queries.Add(1)
 	if err != nil {
 		r.errors.Add(1)
-		if nerr.HasCode(err, nerr.Canceled) || nerr.HasCode(err, nerr.Exhausted) {
+		// Only an actual cancellation counts here. This used to admit
+		// nerr.Exhausted too, because scheduler.Budget/Pool reported a
+		// cancelled statement with that code; now that they report
+		// nerr.Canceled, admitting Exhausted would count a genuine memory or
+		// time bound as a cancellation.
+		if nerr.HasCode(err, nerr.Canceled) {
 			r.canceled.Add(1)
 		}
 	}

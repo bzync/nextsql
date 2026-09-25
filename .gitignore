@@ -2,6 +2,7 @@
 /nextsql
 /nextsqld
 /nextsql-bench
+/nextsql-admin
 /.bench-*
 /.test-*
 /.bench-tmp

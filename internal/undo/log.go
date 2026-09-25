@@ -233,6 +233,32 @@ func (l *Log) Append(r Record) (format.UndoID, error) {
 	return id, nil
 }
 
+// InstallReplicated stores an undo record from a quorum-replicated WAL batch.
+// The record is indexed in memory for version-chain walks and written to the
+// local undo log.
+func (l *Log) InstallReplicated(r Record) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.file == nil {
+		return nerr.New(nerr.Internal, "undo.InstallReplicated", "log is closed")
+	}
+	if _, ok := l.recs[r.ID]; ok {
+		return nil
+	}
+	if r.ID >= l.nextID {
+		l.nextID = r.ID + 1
+	}
+	if err := l.writeRecordLocked(r); err != nil {
+		return err
+	}
+	l.recs[r.ID] = copyRec(r)
+	if curHead := l.byTxn[r.Txn]; r.ID > curHead {
+		l.byTxn[r.Txn] = r.ID
+	}
+	return nil
+}
+
+
 func (l *Log) Get(id format.UndoID) (Record, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()

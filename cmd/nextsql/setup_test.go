@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -739,5 +740,45 @@ func TestSetupRecoveryKeyRequiresADatabase(t *testing.T) {
 	}
 	if _, statErr := os.Stat(recovery); !os.IsNotExist(statErr) {
 		t.Fatal("a refused setup must not write key material")
+	}
+}
+
+func TestSetupFirewallFlagDryRun(t *testing.T) {
+	dataDir := filepath.Join(t.TempDir(), "data")
+	keyDir := t.TempDir()
+	keyFile := filepath.Join(keyDir, "root.key")
+	certFile := filepath.Join(keyDir, "cert.pem")
+	certKey := filepath.Join(keyDir, "key.pem")
+	if err := os.WriteFile(certFile, []byte("fake cert"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(certKey, []byte("fake key"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	args := []string{
+		"--data-dir", dataDir,
+		"--key-file", keyFile,
+		"--preset", "custom",
+		"--buffer-pages", "8",
+		"--listen", "0.0.0.0:7210",
+		"--tls-cert", certFile,
+		"--tls-key", certKey,
+		"--firewall",
+		"--dry-run",
+		"--json",
+	}
+	out, err := captureStdout(func() error { return setupCmd(args) })
+	if err != nil {
+		t.Fatalf("setup dry-run failed: %v", err)
+	}
+	var res setupResult
+	if err := json.Unmarshal([]byte(out), &res); err != nil {
+		t.Fatalf("failed to decode setupResult: %v, output: %s", err, out)
+	}
+	if runtime.GOOS == "linux" {
+		if res.FirewallCommand == "" {
+			t.Errorf("expected non-empty FirewallCommand on Linux with --firewall: %+v", res)
+		}
 	}
 }

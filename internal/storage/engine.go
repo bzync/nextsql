@@ -63,9 +63,12 @@ type Engine struct {
 	crash   *wal.Injector
 	closed  bool
 
-	repl    Replicator
-	replMu  sync.Mutex
-	replLSN format.LSN
+	repl            Replicator
+	replMu          sync.Mutex
+	replLSN         format.LSN
+	replOpen        map[format.TxnID]struct{}
+	replQueue       []*replCommitReq
+	replBatchActive bool
 
 	// openNextLSN is WAL.NextLSN() as of the moment this Engine finished
 	// opening (after any redo), never modified afterward. Checkpoint uses it
@@ -453,6 +456,7 @@ func open(path string, keys crypto.KeyProvider, bufferPages int, id format.Ident
 		Undo:         ul,
 		TM:           txn.NewManager(lg.NextTxn()),
 		writers:      make(map[format.TxnID]*Txn),
+		replOpen:     make(map[format.TxnID]struct{}),
 		iso:          iso,
 		budget:       opt.Budget,
 		budgetFrames: bufferPages,
@@ -732,6 +736,10 @@ func (e *Engine) Close() error {
 		return nil
 	}
 	e.closed = true
+	for _, req := range e.replQueue {
+		req.done <- nerr.New(nerr.Unavailable, "storage.Close", "engine is closed")
+	}
+	e.replQueue = nil
 	active := e.txn
 	e.mu.Unlock()
 	if active != nil {
@@ -1110,41 +1118,227 @@ func (e *Engine) CommitTxn(t *Txn) error {
 	return e.commitAndReplicate(t)
 }
 
+type replCommitReq struct {
+	txn  *Txn
+	done chan error
+}
+
+type preparedReplTxn struct {
+	req       *replCommitReq
+	commitRec wal.Record
+}
+
 func (e *Engine) commitAndReplicate(t *Txn) error {
 	e.mu.Lock()
 	needRepl := e.repl != nil
-	e.mu.Unlock()
 	if !needRepl {
+		e.mu.Unlock()
 		return e.commitUnreplicated(t)
 	}
-	e.replMu.Lock()
-	defer e.replMu.Unlock()
-	e.mu.Lock()
-	recs, lsn, preReplLSN, err := e.prepareCommitLocked(t, false, true)
-	repl := e.repl
-	e.mu.Unlock()
-	if err != nil {
-		return err
+	if e.closed {
+		e.mu.Unlock()
+		return nerr.New(nerr.Unavailable, "storage.commitAndReplicate", "engine is closed")
 	}
+
+	req := &replCommitReq{
+		txn:  t,
+		done: make(chan error, 1),
+	}
+	e.replQueue = append(e.replQueue, req)
+	if e.replBatchActive {
+		e.mu.Unlock()
+		return <-req.done
+	}
+	e.replBatchActive = true
+	e.mu.Unlock()
+
+	for {
+		e.replMu.Lock()
+		e.mu.Lock()
+		if len(e.replQueue) == 0 {
+			e.replBatchActive = false
+			e.mu.Unlock()
+			e.replMu.Unlock()
+			break
+		}
+		const maxReplBatchSize = 64
+		n := len(e.replQueue)
+		if n > maxReplBatchSize {
+			n = maxReplBatchSize
+		}
+		batch := e.replQueue[:n]
+		e.replQueue = e.replQueue[n:]
+		e.mu.Unlock()
+
+		e.executeReplBatch(batch)
+		e.replMu.Unlock()
+	}
+
+	return <-req.done
+}
+
+func (e *Engine) executeReplBatch(batch []*replCommitReq) {
+	if len(batch) == 0 {
+		return
+	}
+
+	var prepared []*preparedReplTxn
+
+	e.mu.Lock()
+	repl := e.repl
+	preReplLSN := e.replLSN
+
+	for _, req := range batch {
+		t := req.txn
+		if err := e.appendCommitBodyLocked(t, false); err != nil {
+			req.done <- err
+			continue
+		}
+		t.durableWait = true
+		commitRec := wal.CommitRec(t.id, t.prev)
+		prepared = append(prepared, &preparedReplTxn{
+			req:       req,
+			commitRec: commitRec,
+		})
+	}
+
+	if len(prepared) == 0 {
+		e.mu.Unlock()
+		return
+	}
+
+	lastBodyLSN := e.WAL.NextLSN() - 1
+	if err := e.WAL.Flush(lastBodyLSN); err != nil {
+		e.mu.Unlock()
+		for _, p := range prepared {
+			p.req.txn.durableWait = false
+			p.req.done <- err
+		}
+		return
+	}
+
+	commitRecs := make([]wal.Record, len(prepared))
+	for i, p := range prepared {
+		commitRecs[i] = p.commitRec
+	}
+	commitLSNs, err := e.WAL.AppendHeldBatch(commitRecs)
+	if err != nil {
+		e.mu.Unlock()
+		for _, p := range prepared {
+			p.req.txn.durableWait = false
+			p.req.done <- err
+		}
+		return
+	}
+	for i, p := range prepared {
+		p.req.txn.prev = commitLSNs[i]
+		p.commitRec.LSN = commitLSNs[i]
+	}
+	lastCommitLSN := commitLSNs[len(commitLSNs)-1]
+
+	_ = e.hitLocked(wal.PointAfterCommitRecordHeld)
+
+	recs, err := e.takeReplLocked()
+	if err != nil {
+		_ = e.WAL.ReleaseHold(false)
+		e.replLSN = preReplLSN
+		e.mu.Unlock()
+		for _, p := range prepared {
+			p.req.txn.durableWait = false
+			p.req.done <- err
+		}
+		return
+	}
+	for _, p := range prepared {
+		recs = append(recs, p.commitRec)
+	}
+	e.mu.Unlock()
 
 	rerr := repl.Replicate(recs)
 	if rerr == nil {
 		e.mu.Lock()
-		ferr := e.finishCommitOK(t, lsn)
+		if ferr := e.Alloc.Flush(); ferr != nil {
+			_ = e.WAL.ReleaseHold(true)
+			e.mu.Unlock()
+			for _, p := range prepared {
+				p.req.txn.durableWait = false
+				p.req.done <- ferr
+			}
+			return
+		}
+		if err := e.WAL.ReleaseHold(true); err != nil {
+			e.mu.Unlock()
+			for _, p := range prepared {
+				p.req.txn.durableWait = false
+				p.req.done <- err
+			}
+			return
+		}
+		for _, p := range prepared {
+			e.pageLog.settle(p.req.txn.id, p.req.txn.loggedPages)
+		}
+		if lastCommitLSN > e.replLSN {
+			e.replLSN = lastCommitLSN
+		}
+		_ = e.hitLocked(wal.PointAfterCommitRecordBeforeSync)
+		if ferr := e.WAL.Flush(lastCommitLSN); ferr != nil {
+			e.mu.Unlock()
+			for _, p := range prepared {
+				p.req.txn.durableWait = false
+				p.req.done <- ferr
+			}
+			return
+		}
+		for _, p := range prepared {
+			p.req.txn.durableWait = false
+			e.completeCommitLocked(p.req.txn)
+		}
 		e.mu.Unlock()
-		return ferr
+
+		for _, p := range prepared {
+			p.req.done <- nil
+		}
+		return
 	}
+
 	if np, ok := rerr.(NotProposedError); ok && np.NotProposed() {
 		// The entry never reached Raft at all (this node was not the
-		// leader when Replicate was called) — the held CommitRec is still
+		// leader when Replicate was called) — the held CommitRecs are still
 		// unflushed and t's writes are neither visible nor lock-released,
 		// so it's safe to discard: no acknowledged write is lost, and now
 		// no local orphan is left behind either.
-		if ferr := e.finishCommitDiscarded(t, preReplLSN); ferr != nil {
-			return ferr
+		e.mu.Lock()
+		_ = e.WAL.ReleaseHold(false)
+		_ = e.hitLocked(wal.PointAfterHoldReleaseDiscardBeforeAbortAppend)
+		for _, p := range prepared {
+			t := p.req.txn
+			if e.txn == t {
+				e.txn = nil
+			}
+			if e.opTxn == t {
+				e.opTxn = nil
+			}
 		}
-		return rerr
+		e.replLSN = preReplLSN
+		e.mu.Unlock()
+
+		for _, p := range prepared {
+			t := p.req.txn
+			_ = e.undoTxnLogical(t)
+			e.retireRolledBack(t)
+			t.durableWait = false
+			_, _ = e.WAL.Append(wal.AbortRec(t.id, t.prev))
+			if e.TM != nil {
+				e.TM.Abort(t.id)
+			}
+		}
+		_ = e.Alloc.Reload()
+		for _, p := range prepared {
+			p.req.done <- rerr
+		}
+		return
 	}
+
 	// Ambiguous/in-doubt failure (Replicate was actually proposed to Raft
 	// but the quorum wait itself failed — see isRetryableApplyErr):
 	// discarding here would be worse than today's known orphan, because
@@ -1160,16 +1354,53 @@ func (e *Engine) commitAndReplicate(t *Txn) error {
 	// "Local commit precedes replication acknowledgment", for the full
 	// writeup of why this residual case can't be closed by this fix.
 	e.mu.Lock()
-	ferr := e.finishCommitOK(t, lsn)
-	e.mu.Unlock()
-	if ferr != nil {
-		return ferr
+	if ferr := e.Alloc.Flush(); ferr != nil {
+		_ = e.WAL.ReleaseHold(true)
+		e.mu.Unlock()
+		for _, p := range prepared {
+			p.req.txn.durableWait = false
+			p.req.done <- ferr
+		}
+		return
 	}
-	metrics.Default().AddReplicationOrphan()
+	if err := e.WAL.ReleaseHold(true); err != nil {
+		e.mu.Unlock()
+		for _, p := range prepared {
+			p.req.txn.durableWait = false
+			p.req.done <- err
+		}
+		return
+	}
+	for _, p := range prepared {
+		e.pageLog.settle(p.req.txn.id, p.req.txn.loggedPages)
+	}
+	if lastCommitLSN > e.replLSN {
+		e.replLSN = lastCommitLSN
+	}
+	_ = e.hitLocked(wal.PointAfterCommitRecordBeforeSync)
+	if ferr := e.WAL.Flush(lastCommitLSN); ferr != nil {
+		e.mu.Unlock()
+		for _, p := range prepared {
+			p.req.txn.durableWait = false
+			p.req.done <- ferr
+		}
+		return
+	}
+	for _, p := range prepared {
+		p.req.txn.durableWait = false
+		e.completeCommitLocked(p.req.txn)
+	}
+	e.mu.Unlock()
+
+	for range prepared {
+		metrics.Default().AddReplicationOrphan()
+	}
 	if reporter, ok := repl.(ReplicationOrphanReporter); ok {
 		reporter.ReportReplicationOrphan()
 	}
-	return rerr
+	for _, p := range prepared {
+		p.req.done <- rerr
+	}
 }
 
 // takeReplLocked returns every WAL record since the last call (tracked by
@@ -1562,7 +1793,8 @@ func (e *Engine) RollbackTxn(txn *Txn) error {
 	_ = e.undoTxnLogical(txn)
 	e.retireRolledBack(txn)
 
-	if _, err := e.WAL.Append(wal.AbortRec(txn.id, txn.prev)); err != nil {
+	abortLSN, err := e.WAL.Append(wal.AbortRec(txn.id, txn.prev))
+	if err != nil {
 		if e.TM != nil {
 			e.TM.Abort(txn.id)
 		}
@@ -1572,6 +1804,18 @@ func (e *Engine) RollbackTxn(txn *Txn) error {
 		e.TM.Abort(txn.id)
 	}
 	_ = e.Alloc.Reload()
+	if e.repl != nil {
+		e.replMu.Lock()
+		e.mu.Lock()
+		_ = e.WAL.Flush(abortLSN)
+		recs, err := e.takeReplLocked()
+		repl := e.repl
+		e.mu.Unlock()
+		if err == nil && len(recs) > 0 && repl != nil {
+			_ = repl.Replicate(recs)
+		}
+		e.replMu.Unlock()
+	}
 	return e.CrashAt(wal.PointAfterRollback)
 }
 
@@ -2161,12 +2405,17 @@ func (e *Engine) LogUndo(target UndoTarget, kind undo.Kind, pageID format.PageID
 	}
 	t.lastUndo = id
 	t.liveTargets = append(t.liveTargets, target)
-	// Fresh inserts are undone from the UNDO file / in-memory chain.
-	// A second WAL RecUndo doubles AEAD work and is not required for redo.
-	if kind == undo.KindInsert {
-		return id, nil
+	ub := wal.UndoBody{
+		ID:         id,
+		Prev:       rec.Prev,
+		Kind:       uint8(kind),
+		OldXmin:    old.Xmin,
+		OldXmax:    old.Xmax,
+		OldUndo:    old.Undo,
+		Key:        key,
+		OldPayload: old.Payload,
 	}
-	lsn, err := e.WAL.Append(wal.UndoRec(t.id, t.prev, id, uint8(kind), pageID, key))
+	lsn, err := e.WAL.Append(wal.UndoRec(t.id, t.prev, ub, pageID))
 	if err != nil {
 		return 0, err
 	}
@@ -2193,13 +2442,53 @@ func (e *Engine) ApplyReplicated(recs []wal.Record) error {
 		return err
 	}
 	committed := make(map[format.TxnID]struct{})
+	aborted := make(map[format.TxnID]struct{})
+	begun := make(map[format.TxnID]struct{})
 	var maxTxn format.TxnID
 	for _, r := range recs {
 		if r.TxnID > maxTxn {
 			maxTxn = r.TxnID
 		}
-		if r.Type == wal.RecCommit {
+		switch r.Type {
+		case wal.RecBegin:
+			begun[r.TxnID] = struct{}{}
+		case wal.RecCommit:
 			committed[r.TxnID] = struct{}{}
+			delete(aborted, r.TxnID)
+		case wal.RecAbort:
+			aborted[r.TxnID] = struct{}{}
+			delete(committed, r.TxnID)
+		case wal.RecUndo:
+			if e.Undo != nil {
+				ub, err := wal.DecodeUndoBody(r.Body)
+				if err == nil {
+					rec := undo.Record{
+						ID:     ub.ID,
+						Txn:    r.TxnID,
+						Prev:   ub.Prev,
+						Kind:   undo.Kind(ub.Kind),
+						PageID: r.PageID,
+						Key:    ub.Key,
+						Old: row.Version{
+							Xmin:    ub.OldXmin,
+							Xmax:    ub.OldXmax,
+							Undo:    ub.OldUndo,
+							Payload: ub.OldPayload,
+						},
+					}
+					_ = e.Undo.InstallReplicated(rec)
+				}
+			}
+		}
+	}
+	for _, r := range recs {
+		if r.Type == wal.RecAbort {
+			delete(e.replOpen, r.TxnID)
+			if e.Undo != nil {
+				for _, urec := range e.Undo.Chain(e.Undo.Head(r.TxnID)) {
+					_ = e.ApplyUndoOnBuffer(urec)
+				}
+			}
 		}
 	}
 	var (
@@ -2267,14 +2556,38 @@ func (e *Engine) ApplyReplicated(recs []wal.Record) error {
 			return err
 		}
 	}
+	if e.replOpen == nil {
+		e.replOpen = make(map[format.TxnID]struct{})
+	}
+	for id := range begun {
+		if _, ok := committed[id]; !ok {
+			if _, ok := aborted[id]; !ok {
+				e.replOpen[id] = struct{}{}
+			}
+		}
+	}
+	for id := range committed {
+		delete(e.replOpen, id)
+	}
+	for id := range aborted {
+		delete(e.replOpen, id)
+	}
 	e.WAL.AdvanceAfterRecovery(last+1, maxTxn+1)
 	if e.TM != nil {
-		ids := make([]format.TxnID, 0, len(committed))
+		cids := make([]format.TxnID, 0, len(committed))
 		for id := range committed {
-			ids = append(ids, id)
+			cids = append(cids, id)
 		}
-		e.TM.Recover(e.WAL.NextTxn(), ids, nil)
+		aids := make([]format.TxnID, 0, len(aborted))
+		for id := range aborted {
+			aids = append(aids, id)
+		}
+		e.TM.Recover(e.WAL.NextTxn(), cids, aids)
+		for id := range e.replOpen {
+			e.TM.NoteInProgress(id)
+		}
 	}
+
 	if last > e.replLSN {
 		e.replLSN = last
 	}
@@ -2309,4 +2622,77 @@ func (e *Engine) applyReplicatedDelta(r wal.Record) error {
 			"page %d is at LSN %d; the delta at LSN %d needs base LSN %d", r.PageID, page.LSNOf(cur), r.LSN, d.BaseLSN), err)
 	}
 	return e.Buffer.Replace(r.PageID, cur)
+}
+
+// ApplyUndoOnBuffer applies an undo record to a buffer pool frame (or data file),
+// reverting the change made to that logical leaf page.
+func (e *Engine) ApplyUndoOnBuffer(rec undo.Record) error {
+	if rec.PageID == 0 {
+		return nil
+	}
+	cur, ok := e.Buffer.CopyPageInto(rec.PageID, nil)
+	if !ok {
+		var err error
+		cur, err = e.File.ReadLogical(rec.PageID)
+		if err != nil {
+			if nerr.HasCode(err, nerr.NotFound) || nerr.HasCode(err, nerr.InvalidFormat) {
+				return nil
+			}
+			return err
+		}
+	}
+	neu, changed, err := undo.ApplyOnePage(cur, rec)
+	if err != nil || !changed {
+		return err
+	}
+	return e.Buffer.Replace(rec.PageID, neu)
+}
+
+// SettlePredecessorTransactions settles any transactions that were left in-progress
+// by predecessor leaders (in replOpen) when this node is promoted to leader.
+// It rolls back each unfinished transaction's changes, marks them aborted in TM,
+// logs Abort records to the WAL, and clears replOpen.
+func (e *Engine) SettlePredecessorTransactions() error {
+	e.replMu.Lock()
+	defer e.replMu.Unlock()
+	e.mu.Lock()
+	if len(e.replOpen) == 0 {
+		e.mu.Unlock()
+		return nil
+	}
+	var lastAbort format.LSN
+	for tid := range e.replOpen {
+		if e.Undo != nil {
+			for _, rec := range e.Undo.Chain(e.Undo.Head(tid)) {
+				_ = e.ApplyUndoOnBuffer(rec)
+			}
+		}
+		if e.TM != nil {
+			e.TM.Abort(tid)
+		}
+		if e.WAL != nil {
+			lsn, err := e.WAL.Append(wal.AbortRec(tid, 0))
+			if err == nil {
+				lastAbort = lsn
+			}
+		}
+		delete(e.replOpen, tid)
+	}
+	if lastAbort != 0 && e.WAL != nil {
+		_ = e.WAL.Flush(lastAbort)
+	}
+	repl := e.repl
+	var recs []wal.Record
+	if repl != nil {
+		var err error
+		recs, err = e.takeReplLocked()
+		if err != nil {
+			recs = nil
+		}
+	}
+	e.mu.Unlock()
+	if repl != nil && len(recs) > 0 {
+		_ = repl.Replicate(recs)
+	}
+	return nil
 }

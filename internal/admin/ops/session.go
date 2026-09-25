@@ -242,11 +242,36 @@ func (s *session) studioQuery(ctx context.Context, queryID, sql string, params [
 	started := time.Now()
 	rows, err := s.conn.Query(queryCtx, sql, params...)
 	if err != nil {
-		return studio.ResultSet{}, err
+		return studio.ResultSet{}, studioCancelError(queryCtx, err)
 	}
 	out, err := studio.Collect(queryCtx, rows, cancel)
 	out.ElapsedMS = time.Since(started).Milliseconds()
-	return out, err
+	return out, studioCancelError(queryCtx, err)
+}
+
+// studioCancelError gives a statement that ended with its own context the
+// message and code that describe what actually happened. The engine now
+// reports a cancelled statement as nerr.Canceled (scheduler.Budget/Pool were
+// corrected to match scheduler.Admission and internal/protocol), so this is
+// no longer load-bearing for the status code — but it still owns the wording,
+// and it still distinguishes a cancel from Studio's own deadline, which the
+// engine reports as an exhausted time budget.
+//
+// queryCtx is the authority: Admin created it and owns the cancel func the
+// Cancel route calls, and that route cancels only this child, never the
+// handler's request context, so the handler cannot observe it.
+func studioCancelError(queryCtx context.Context, err error) error {
+	if err == nil {
+		return nil
+	}
+	switch queryCtx.Err() {
+	case context.Canceled:
+		return nerr.New(nerr.Canceled, "ops.session.studioQuery", "query canceled")
+	case context.DeadlineExceeded:
+		return nerr.New(nerr.Canceled, "ops.session.studioQuery",
+			"query exceeded the "+studio.QueryTimeout.String()+" Studio statement limit and was canceled")
+	}
+	return err
 }
 
 // studioStreamQuery is the progressive counterpart to studioQuery. It keeps
@@ -273,9 +298,9 @@ func (s *session) studioStreamQuery(ctx context.Context, queryID, sql string, pa
 
 	rows, err := s.conn.Query(queryCtx, sql, params...)
 	if err != nil {
-		return err
+		return studioCancelError(queryCtx, err)
 	}
-	return studio.Stream(queryCtx, rows, cancel, emit)
+	return studioCancelError(queryCtx, studio.Stream(queryCtx, rows, cancel, emit))
 }
 
 func (s *session) beginStudioQuery(queryID string, cancel context.CancelFunc) error {

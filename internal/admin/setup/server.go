@@ -127,6 +127,7 @@ func (s *Server) AuthenticateShellRequest(w http.ResponseWriter, r *http.Request
 func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/v1/hello", s.authed(s.handleHello))
 	s.mux.HandleFunc("GET /api/v1/service", s.authed(s.handleService))
+	s.mux.HandleFunc("GET /api/v1/firewall", s.authed(s.handleFirewall))
 	s.mux.HandleFunc("GET /api/v1/browse", s.authed(s.handleBrowse))
 	s.mux.HandleFunc("POST /api/v1/lifecycle/detect", s.authed(s.handleLifecycleDetect))
 	s.mux.HandleFunc("POST /api/v1/plan", s.authed(s.handlePlan))
@@ -226,6 +227,14 @@ func (s *Server) handleService(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, DetectService(r.Context()))
 }
 
+// handleFirewall is read-only — DetectFirewall inspects the host's firewall
+// tools (ufw, firewalld, nftables, iptables) for a target port.
+func (s *Server) handleFirewall(w http.ResponseWriter, r *http.Request) {
+	portStr := r.URL.Query().Get("port")
+	port := ParsePort(portStr, 7210)
+	writeJSON(w, http.StatusOK, DetectFirewall(r.Context(), port))
+}
+
 func (s *Server) handlePlan(w http.ResponseWriter, r *http.Request) {
 	s.handleRun(w, r, true)
 }
@@ -254,10 +263,54 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request, dryRun bool) 
 		return
 	}
 	result := s.run.run(r.Context(), p, dryRun)
-	if !dryRun && result.OK && p.EnableService {
-		result.Service = s.maybeEnableService(r.Context(), result.Result)
+	if !dryRun && result.OK {
+		if p.EnableService {
+			result.Service = s.maybeEnableService(r.Context(), result.Result)
+		}
+		if p.EnableFirewall {
+			result.Firewall = s.maybeApplyFirewall(r.Context(), p.ListenAddr)
+		}
 	}
 	writeJSON(w, http.StatusOK, result)
+}
+
+func (s *Server) maybeApplyFirewall(ctx context.Context, listenAddr string) *FirewallOutcome {
+	port := ParsePort(listenAddr, 7210)
+	fw := DetectFirewall(ctx, port)
+	if !fw.Supported {
+		return &FirewallOutcome{
+			Applied: false,
+			Error:   "firewall management is supported on Linux only",
+		}
+	}
+	if fw.Detected == "none" {
+		return &FirewallOutcome{
+			Applied: false,
+			Error:   "no supported firewall tool (ufw, firewalld, nftables, iptables) detected on host",
+		}
+	}
+	if !fw.Elevated {
+		return &FirewallOutcome{
+			Applied: false,
+			Tool:    fw.Detected,
+			Command: fw.SudoCommand,
+			Error:   "root elevation required to apply firewall rules automatically",
+		}
+	}
+	cmdStr, err := ApplyFirewall(ctx, fw.Detected, port)
+	if err != nil {
+		return &FirewallOutcome{
+			Applied: false,
+			Tool:    fw.Detected,
+			Command: cmdStr,
+			Error:   err.Error(),
+		}
+	}
+	return &FirewallOutcome{
+		Applied: true,
+		Tool:    fw.Detected,
+		Command: cmdStr,
+	}
 }
 
 // setupResultForService is the handful of `nextsql setup --json` fields

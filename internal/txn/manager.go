@@ -103,6 +103,20 @@ func (m *Manager) Recover(next format.TxnID, committed, aborted []format.TxnID) 
 	}
 }
 
+// NoteInProgress records that a transaction has begun on a replica but has
+// not yet committed or aborted, so row-visibility checks correctly treat its
+// versions as uncommitted and walk undo chains to earlier committed versions.
+func (m *Manager) NoteInProgress(id format.TxnID) {
+	if m == nil || id == 0 {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.status[id]; !ok {
+		m.status[id] = StatusInProgress
+	}
+}
+
 // Attach registers an already-allocated WAL transaction id.
 func (m *Manager) Attach(id format.TxnID, iso Isolation) *Handle {
 	m.mu.Lock()

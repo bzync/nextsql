@@ -294,6 +294,9 @@ func (c *Cluster) watchLeadership() {
 			}
 			err := c.raft.Barrier(c.cfg.ApplyTimeout).Error()
 			if err == nil && c.raft.State() == raft.Leader && c.raft.CurrentTerm() == term {
+				if c.fsm != nil {
+					_ = c.fsm.settlePredecessorTransactions()
+				}
 				c.readyTerm.Store(term)
 				break
 			}

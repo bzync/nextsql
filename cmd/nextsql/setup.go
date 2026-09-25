@@ -6,9 +6,12 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -57,6 +60,7 @@ func setupCmd(args []string) error {
 	keepFailed := fs.Bool("keep-failed", false, "on failure, leave a partial install in place instead of rolling it back")
 	recoveryKeyOut := fs.String("recovery-key-out", "", "also generate a recovery key (a second, independent unlock key for the same database) and write it here; must not exist")
 	instanceRecoveryKeyOut := fs.String("instance-recovery-key-out", "", "recovery key for the deployment-registry keystore (default RECOVERY-KEY-OUT.instance)")
+	firewall := fs.Bool("firewall", false, "configure host firewall (ufw or firewalld) to allow the listen port if elevated, or advise the command")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -195,6 +199,10 @@ func setupCmd(args []string) error {
 	}
 
 	if *dryRun {
+		if *firewall && !setup.IsLoopbackAddr(plan.ListenAddr) {
+			cmdStr, _ := handleCLIFirewall(plan.ListenAddr, true)
+			result.FirewallCommand = cmdStr
+		}
 		result.Plan = "dry-run: nothing was created, written, or initialized"
 		return emitSetup(result, *jsonOut)
 	}
@@ -318,7 +326,68 @@ func setupCmd(args []string) error {
 		}
 	}
 
+	if *firewall && !setup.IsLoopbackAddr(plan.ListenAddr) {
+		cmdStr, applied := handleCLIFirewall(plan.ListenAddr, false)
+		result.FirewallCommand = cmdStr
+		result.FirewallApplied = applied
+	}
+
 	return emitSetup(result, *jsonOut)
+}
+
+func handleCLIFirewall(listenAddr string, dryRun bool) (string, bool) {
+	port := 7210
+	if _, pStr, err := net.SplitHostPort(listenAddr); err == nil {
+		if p, err := strconv.Atoi(pStr); err == nil && p > 0 && p <= 65535 {
+			port = p
+		}
+	}
+	if runtime.GOOS != "linux" {
+		return "", false
+	}
+	isRoot := (os.Geteuid() == 0)
+	// Check ufw
+	if _, err := exec.LookPath("ufw"); err == nil {
+		cmdStr := fmt.Sprintf("ufw allow %d/tcp comment 'NextSQL database'", port)
+		if isRoot && !dryRun {
+			if err := exec.Command("ufw", "allow", fmt.Sprintf("%d/tcp", port), "comment", "NextSQL database").Run(); err == nil {
+				return cmdStr, true
+			}
+		}
+		return "sudo " + cmdStr, false
+	}
+	// Check firewall-cmd
+	if _, err := exec.LookPath("firewall-cmd"); err == nil {
+		cmdStr := fmt.Sprintf("firewall-cmd --permanent --add-port=%d/tcp && firewall-cmd --reload", port)
+		if isRoot && !dryRun {
+			if err := exec.Command("firewall-cmd", "--permanent", fmt.Sprintf("--add-port=%d/tcp", port)).Run(); err == nil {
+				_ = exec.Command("firewall-cmd", "--reload").Run()
+				return cmdStr, true
+			}
+		}
+		return "sudo " + cmdStr, false
+	}
+	// Check nftables
+	if _, err := exec.LookPath("nft"); err == nil {
+		cmdStr := fmt.Sprintf("nft add rule inet filter input tcp dport %d accept", port)
+		if isRoot && !dryRun {
+			if err := exec.Command("nft", "add", "rule", "inet", "filter", "input", "tcp", "dport", strconv.Itoa(port), "accept").Run(); err == nil {
+				return cmdStr, true
+			}
+		}
+		return "sudo " + cmdStr, false
+	}
+	// Check iptables
+	if _, err := exec.LookPath("iptables"); err == nil {
+		cmdStr := fmt.Sprintf("iptables -A INPUT -p tcp --dport %d -j ACCEPT", port)
+		if isRoot && !dryRun {
+			if err := exec.Command("iptables", "-A", "INPUT", "-p", "tcp", "--dport", strconv.Itoa(port), "-j", "ACCEPT").Run(); err == nil {
+				return cmdStr, true
+			}
+		}
+		return "sudo " + cmdStr, false
+	}
+	return "", false
 }
 
 // installArtifactPaths is every filesystem path `nextsql init` may create for
@@ -424,8 +493,10 @@ type setupResult struct {
 	Warnings     []string     `json:"warnings"`
 	DryRun       bool         `json:"dry_run"`
 	Plan         string       `json:"plan,omitempty"`
-	RolledBack   []string     `json:"rolled_back,omitempty"`
-	RollbackKept []string     `json:"rollback_kept,omitempty"`
+	RolledBack      []string     `json:"rolled_back,omitempty"`
+	RollbackKept    []string     `json:"rollback_kept,omitempty"`
+	FirewallCommand string       `json:"firewall_command,omitempty"`
+	FirewallApplied bool         `json:"firewall_applied,omitempty"`
 }
 
 // statExists reports whether path names an existing filesystem entry. It
@@ -758,6 +829,13 @@ func emitSetup(r setupResult, jsonOut bool) error {
 	fmt.Fprintf(w, "  config        %s\n", r.ConfigPath)
 	if r.AdminUser != "" {
 		fmt.Fprintf(w, "  admin user    %s\n", r.AdminUser)
+	}
+	if r.FirewallCommand != "" {
+		status := "manual"
+		if r.FirewallApplied {
+			status = "applied"
+		}
+		fmt.Fprintf(w, "  firewall      %s (%s)\n", r.FirewallCommand, status)
 	}
 	if len(r.Warnings) > 0 {
 		fmt.Fprintf(w, "\nwarnings\n")

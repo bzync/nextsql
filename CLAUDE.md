@@ -188,10 +188,10 @@ Key `docs/*.md`: `sql.md` (dialect/catalog), `optimizer.md`, `execution.md`, `js
 `mvcc.md`, `protocol.md`, `security.md`, `backup.md`, `export.md`, `ops.md` (metrics/
 admission/SLOs), `ha.md`, `system-catalog.md`, `partitioning.md`, `cdc.md`, `workflows.md`
 (WORKFLOW/TRIGGER/SCHEDULE/TASK), `client-encryption.md`, `standards.md`, `install.md`
-(P28 installer/automation surface — `nextsql setup`, lifecycle), `design-admin.md` (P28/29
-NextSQL Admin umbrella — one binary, Setup/Operations/Studio modes; see also
-`design-admin-setup.md` and `design-admin-operations.md` for per-mode implementation
-history).
+(P28 installer/automation surface — `nextsql setup`, lifecycle). NextSQL Admin
+(P28/29 — one binary, Setup/Operations/Studio modes) has **no** `docs/*.md` of its
+own: the `design-admin*.md` papers were deleted in `36d83e0`, so `TODO.md`'s log
+entries and the package comments under `internal/admin/` are its only design record.
 
 ## Engineering contract (from `AGENTS.md` / `SKILLS.md`)
 

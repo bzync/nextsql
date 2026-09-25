@@ -196,3 +196,19 @@ export function looksNonLoopback(addr: string): boolean {
   if (host === "127.0.0.1" || host.indexOf("127.") === 0 || host === "::1") return false;
   return true;
 }
+
+// extractPort parses a TCP port number from a host:port or :port string,
+// returning defaultPort if not present or out of range.
+export function extractPort(addr: string, defaultPort = 7210): number {
+  if (!addr) return defaultPort;
+  const m = addr.match(/:(\d+)$/);
+  if (m) {
+    const p = parseInt(m[1], 10);
+    if (p > 0 && p <= 65535) return p;
+  }
+  const bare = parseInt(addr, 10);
+  if (!isNaN(bare) && bare > 0 && bare <= 65535 && String(bare) === addr.trim()) {
+    return bare;
+  }
+  return defaultPort;
+}

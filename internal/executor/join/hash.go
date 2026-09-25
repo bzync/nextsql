@@ -723,7 +723,7 @@ func ParallelHash(pool *scheduler.Pool, b *scheduler.Budget, left, right [][]typ
 			return nil
 		}
 	}
-	if err := pool.Run(b.Context(), n, tasks); err != nil {
+	if err := scheduler.RunTracked(pool, b, n, tasks); err != nil {
 		return nil, err
 	}
 	var all [][]types.Value

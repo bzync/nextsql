@@ -32,7 +32,14 @@ const CATEGORY_META: Record<string, { label: string; icon: IconName; desc: strin
   throughput: { label: "Throughput", icon: "activity", desc: "Query, transaction, and statement rates" },
   latency: { label: "Latency", icon: "clock", desc: "Execution and commit timings" },
   encryption: { label: "Encryption", icon: "lock", desc: "Storage envelope and field-level crypto" },
-  storage: { label: "Storage", icon: "hard-drive", desc: "Buffer pool, page cache, and disk usage" },
+  storage: {
+    label: "Storage",
+    icon: "hard-drive",
+    // The disk gauges are sampled by an opt-in monitor and the WAL footprint
+    // on checkpoint, so a fresh or unconfigured node legitimately reads 0.
+    // Saying so keeps a zero from looking like a broken reading.
+    desc: "WAL footprint and disk usage. WAL gauges refresh on checkpoint; disk_total_bytes and disk_free_bytes stay 0 until disk_watermark_check_ms is set",
+  },
   replication: { label: "Replication", icon: "network", desc: "Raft consensus, replica health, and lag" },
   maintenance: { label: "Maintenance", icon: "wrench", desc: "Storage reclamation and statistics rebuilds" },
   cdc: { label: "CDC", icon: "layers", desc: "Change data capture pipeline & stream status" },

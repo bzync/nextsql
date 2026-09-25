@@ -1,9 +1,10 @@
+import { useEffect, useState } from "react";
 import { Alert, Button, Card, CardBody, Checkbox, Divider, Inline, Input, NumberInput, Radio, RadioGroup, Stack, Text } from "@bzync/rui";
-import type { Params, RunResult, ServiceStatus } from "../api";
+import { api, type FirewallStatus, type Params, type RunResult, type ServiceStatus } from "../api";
 import { PathField } from "../components/PathField";
 import { SetupErrorAlert } from "../components/SetupErrorAlert";
 import { StepHeader } from "../components/StepHeader";
-import { humanBytes, looksNonLoopback } from "../util";
+import { extractPort, humanBytes, looksNonLoopback } from "../util";
 
 const PRESETS: Array<[Params["preset"], string, string]> = [
   ["conservative", "Conservative", "~10% of RAM for the buffer pool — leaves headroom for other services on this machine."],
@@ -16,6 +17,105 @@ const PROFILES: Array<[Params["profile"], string, string]> = [
   ["production", "Production (recommended)", "Live-server defaults: disk watermarks, drain and statement timeouts, and a fail-closed preflight. Requires an administrator account. Unlock key must stay off the data volume."],
   ["developer", "Developer", "Loopback-friendly local defaults. Skip-init and a missing administrator are allowed. Do not expose this listener on a network."],
 ];
+
+function FirewallOption({
+  params, patch,
+}: {
+  params: Params;
+  patch: (p: Partial<Params>) => void;
+}) {
+  const [status, setStatus] = useState<FirewallStatus | null>(null);
+  const [checked, setChecked] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const port = extractPort(params.listenAddr);
+
+  useEffect(() => {
+    let cancelled = false;
+    api.firewall(port).then((st) => {
+      if (!cancelled) {
+        setStatus(st);
+        setChecked(true);
+      }
+    }).catch(() => {
+      if (!cancelled) {
+        setStatus({
+          supported: false,
+          elevated: false,
+          detected: "none",
+          active: false,
+          port,
+          ruleCommand: "",
+          sudoCommand: "",
+        });
+        setChecked(true);
+      }
+    });
+    return () => { cancelled = true; };
+  }, [port]);
+
+  const copyCommand = (cmd: string) => {
+    if (navigator?.clipboard?.writeText) {
+      navigator.clipboard.writeText(cmd).then(() => {
+        setCopied(true);
+        setTimeout(() => setCopied(false), 2000);
+      }).catch(() => {});
+    }
+  };
+
+  if (!checked) {
+    return <Text variant="muted" size="sm">Checking host firewall configuration…</Text>;
+  }
+
+  if (!status || !status.supported || status.detected === "none") {
+    return (
+      <Text variant="muted" size="sm">
+        No active Linux firewall detected (ufw, firewalld, nftables, iptables). If a network or cloud firewall is present, ensure incoming TCP port {port} is permitted.
+      </Text>
+    );
+  }
+
+  if (status.elevated) {
+    return (
+      <Stack gap="xs">
+        <Checkbox
+          id="enableFirewall"
+          label={`Open incoming TCP port ${port} in ${status.detected} during installation`}
+          checked={params.enableFirewall}
+          onChange={(e) => patch({ enableFirewall: e.target.checked })}
+        />
+        <Text variant="muted" size="sm">
+          Runs: <code>{status.ruleCommand}</code> upon successful database initialization.
+        </Text>
+      </Stack>
+    );
+  }
+
+  return (
+    <Stack gap="xs">
+      <Checkbox
+        id="enableFirewall"
+        label={`Open incoming TCP port ${port} in ${status.detected}`}
+        checked={false}
+        disabled={true}
+      />
+      <Alert variant="warning">
+        <Stack gap="xs">
+          <Text size="sm">
+            Automatic firewall configuration requires root privileges. Because setup is running as a standard user, open port {port} manually after install:
+          </Text>
+          <Inline gap="xs" align="center" style={{ flexWrap: "wrap" }}>
+            <code style={{ fontFamily: "var(--font-mono, monospace)", fontSize: "12px", background: "var(--color-surface, rgba(0,0,0,0.06))", padding: "4px 8px", borderRadius: 4 }}>
+              {status.sudoCommand}
+            </code>
+            <Button size="sm" variant="outline" onClick={() => copyCommand(status.sudoCommand)}>
+              {copied ? "Copied!" : "Copy"}
+            </Button>
+          </Inline>
+        </Stack>
+      </Alert>
+    </Stack>
+  );
+}
 
 // ServiceOption renders the "start at boot" checkbox. It stays disabled with
 // an explaining reason in every state except "a matching, already-installed
@@ -209,7 +309,13 @@ export function Resources({
               checked={showNetwork}
               aria-expanded={showNetwork}
               aria-controls="network-settings"
-              onChange={(e) => setShowNetwork(e.target.checked)}
+              onChange={(e) => {
+                const next = e.target.checked;
+                setShowNetwork(next);
+                if (!next && params.enableFirewall) {
+                  patch({ enableFirewall: false });
+                }
+              }}
             />
             {showNetwork ? (
               <Stack id="network-settings" gap="sm" style={{ marginLeft: 28 }}>
@@ -238,6 +344,8 @@ export function Resources({
                     — nextsql setup refuses otherwise and writes nothing.
                   </Alert>
                 ) : null}
+                <Divider label="Firewall" spacing="sm" />
+                <FirewallOption params={params} patch={patch} />
               </Stack>
             ) : null}
           </Stack>

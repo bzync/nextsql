@@ -109,7 +109,29 @@ func TestRollingUpgradeDrainWithLeaderTransferNoTransactionLoss(t *testing.T) {
 			return
 		}
 	}()
-	time.Sleep(50 * time.Millisecond) // let the writer get going before the sequence starts
+	// Wait for the writer to actually land a write rather than assuming a
+	// fixed interval is enough for it to get there. A bare 50ms sleep was not
+	// always enough under CPU contention (the whole package set running in
+	// parallel) for this goroutine to open a connection and commit through
+	// Raft, and the sequence below then ended with attempted == 0 — a
+	// scheduling artifact reported as a rolling-upgrade failure. Waiting on
+	// the writer's own progress is also closer to the intent: the disruption
+	// should start against a writer that is demonstrably running.
+	writerReady := time.Now().Add(20 * time.Second)
+	for {
+		mu.Lock()
+		landed := succeeded
+		mu.Unlock()
+		if landed > 0 {
+			break
+		}
+		if time.Now().After(writerReady) {
+			close(stop)
+			wg.Wait()
+			t.Fatal("background writer landed no writes before the rolling-upgrade sequence")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
 
 	// Step 1: transfer leadership away from the node about to be rolled.
 	admin, err := nextsql.OpenContext(ctx, nextsql.Config{
@@ -244,7 +266,12 @@ func TestRollingUpgradeDrainWithLeaderTransferNoTransactionLoss(t *testing.T) {
 	if err := sess.SetReadConsistency(replication.ReadStale); err != nil {
 		t.Fatal(err)
 	}
-	waitDeadline := time.Now().Add(10 * time.Second)
+	// Generous because this is a poll loop, not a sleep: it returns the
+	// instant the node converges, so the bound costs nothing in the passing
+	// case and only decides how much fsync contention from a concurrently
+	// running suite the catch-up is allowed to absorb. At 10s a rejoining
+	// follower was seen at 2 of 5 rows under the full package set.
+	waitDeadline := time.Now().Add(60 * time.Second)
 	poll := 0
 	for {
 		// Vary the SQL text each attempt so this always bypasses the

@@ -41,6 +41,9 @@ type runResult struct {
 	// handling. Its own failure never flips OK to false: the database
 	// install this follows has already succeeded independently of it.
 	Service *serviceOutcome `json:"service,omitempty"`
+	// Firewall is set only after a real (non-dry-run) install where the
+	// operator requested firewall configuration for a remote listener.
+	Firewall *FirewallOutcome `json:"firewall,omitempty"`
 }
 
 // serviceOutcome is the result of the best-effort `systemctl enable --now`

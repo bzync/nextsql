@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { Alert, AuthBackdrop, Link, List, ListItem, Stepper, Text, type StepperStep } from "@bzync/rui";
-import { api, ApiError, defaultParams, type Hello, type Params, type PlanResult, type RunResult, type ServiceOutcome, type ServiceStatus } from "./api";
+import { api, ApiError, defaultParams, type FirewallOutcome, type Hello, type Params, type PlanResult, type RunResult, type ServiceOutcome, type ServiceStatus } from "./api";
 import { Wordmark } from "../shared/Brand";
 import { ThemeSelect } from "../shared/ThemeSelect";
 import { StepHeader } from "./components/StepHeader";
@@ -38,6 +38,7 @@ export function App() {
   const [planError, setPlanError] = useState<string | null>(null);
   const [installResult, setInstallResult] = useState<PlanResult | null>(null);
   const [installService, setInstallService] = useState<ServiceOutcome | null>(null);
+  const [installFirewall, setInstallFirewall] = useState<FirewallOutcome | null>(null);
   const [installError, setInstallError] = useState<string | null>(null);
   const [installing, setInstalling] = useState(false);
   const [finished, setFinished] = useState(false);
@@ -87,6 +88,7 @@ export function App() {
       if (res.ok) {
         setInstallResult(res.result ?? null);
         setInstallService(res.service ?? null);
+        setInstallFirewall(res.firewall ?? null);
       } else {
         setInstallError(res.error || "unknown error");
       }
@@ -150,12 +152,13 @@ export function App() {
     );
   } else {
     body = installing
-      ? <InstallProgress />
+      ? <InstallProgress params={params} />
       : (
         <Completion
           params={params}
           result={installResult}
           service={installService}
+          firewall={installFirewall}
           error={installError}
           finished={finished}
           onBackToSummary={() => setStep(4)}

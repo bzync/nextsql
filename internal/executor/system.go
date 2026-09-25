@@ -2,6 +2,7 @@ package executor
 
 import (
 	"fmt"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -16,6 +17,7 @@ import (
 	"github.com/bzync/nextsql/internal/sql/ast"
 	"github.com/bzync/nextsql/internal/sql/binder"
 	"github.com/bzync/nextsql/internal/sql/types"
+	"github.com/bzync/nextsql/internal/storage/btree"
 	"github.com/bzync/nextsql/internal/storage/format"
 	"github.com/bzync/nextsql/internal/system"
 	"github.com/bzync/nextsql/internal/txn"
@@ -49,7 +51,7 @@ func (s *Session) execSystemSelect(sel ast.Select) (*Result, error) {
 	// Capabilities and storage/replication are visible to any connected user.
 	// Tables/columns/indexes are filtered rows below.
 
-	raw, err := s.systemRows(name, schema)
+	raw, err := s.systemRows(name, schema, sel.Where)
 	if err != nil {
 		return nil, err
 	}
@@ -572,7 +574,7 @@ func systemArgTypeOr(e ast.Expr, schema *catalog.Table, fallback types.Type) typ
 	return fallback
 }
 
-func (s *Session) systemRows(name string, schema *catalog.Table) ([][]types.Value, error) {
+func (s *Session) systemRows(name string, schema *catalog.Table, where ast.Expr) ([][]types.Value, error) {
 	switch name {
 	case "system.capabilities":
 		return system.Capabilities(), nil
@@ -607,9 +609,9 @@ func (s *Session) systemRows(name string, schema *catalog.Table) ([][]types.Valu
 	case "system.partitions":
 		return s.systemPartitionsRows()
 	case "system.table_stats":
-		return s.systemTableStatsRows()
+		return s.systemTableStatsRows(where)
 	case "system.index_stats":
-		return s.systemIndexStatsRows()
+		return s.systemIndexStatsRows(where)
 	case "system.sessions":
 		return s.systemSessionsRows()
 	case "system.active_queries":
@@ -1088,25 +1090,37 @@ func (s *Session) systemStorageRows() ([][]types.Value, error) {
 	}
 	// Redacted: do not expose keys, only high-level status
 	enc := "enabled"
-	pageSize := types.DecimalValue(types.DecimalFromInt64(int64(format.LogicalPageSize)), types.Type{Kind: types.KindDecimal, Precision: 10, Scale: 0})
-	var pageCount, fileSize, walLSN types.Value
-	// Use catalog count as proxy for page count to keep deterministic
-	pc := int64(0)
-	if s.db != nil && s.db.Cat != nil {
-		pc = int64(len(s.db.Cat.List())*2 + 1)
+	pageSize := sysDec(int64(format.LogicalPageSize), 10)
+	// page_count is the allocator's high-water mark — the pages this database
+	// has ever taken — and free_pages how many of those its freelist can hand
+	// back. file_size is the file's real size on disk, which a preallocating
+	// deployment grows well ahead of the high-water mark; reporting a figure
+	// derived from the page count instead would understate the disk an
+	// operator is actually paying for by orders of magnitude.
+	pageCount := types.Null(sysDecType())
+	freePages := types.Null(sysDecType())
+	fileSize := types.Null(sysDecType())
+	if s.db != nil && s.db.Eng != nil && s.db.Eng.File != nil {
+		next, _, freeCount := s.db.Eng.File.AllocState()
+		pageCount = sysDecU(uint64(next))
+		freePages = sysDecU(freeCount)
+		if fi, err := os.Stat(s.db.Eng.File.Path()); err == nil {
+			if sz := fi.Size(); sz >= 0 {
+				fileSize = sysDecU(uint64(sz))
+			}
+		}
+		// A stat failure leaves file_size NULL rather than substituting a
+		// derived number: "not measurable right now" beats a confident wrong
+		// figure an operator would size a disk against.
 	}
-	pageCount = types.DecimalValue(types.DecimalFromInt64(pc), types.Type{Kind: types.KindDecimal, Precision: 20, Scale: 0})
-	fileSize = types.DecimalValue(types.DecimalFromInt64(pc*int64(format.PhysicalPageSize)), types.Type{Kind: types.KindDecimal, Precision: 20, Scale: 0})
-	walLSN = types.DecimalValue(types.DecimalFromInt64(0), types.Type{Kind: types.KindDecimal, Precision: 20, Scale: 0})
-	// Try to get actual WAL LSN if available
-	if s.db != nil && s.db.Eng != nil && s.db.Eng.WAL != nil {
-		// WAL LSN not directly exposed; keep 0 redacted
-	}
+	// wal_lsn stays 0: it is deliberately redacted, not unknown.
+	walLSN := sysDec(0, 20)
 	row := []types.Value{
 		types.StringValue(dbName),
 		types.StringValue("nextsql"),
 		pageSize,
 		pageCount,
+		freePages,
 		fileSize,
 		walLSN,
 		types.StringValue(enc),
@@ -1116,6 +1130,107 @@ func (s *Session) systemStorageRows() ([][]types.Value, error) {
 
 func sysDec(v int64, prec uint16) types.Value {
 	return types.DecimalValue(types.DecimalFromInt64(v), types.Type{Kind: types.KindDecimal, Precision: prec, Scale: 0})
+}
+
+func sysDecType() types.Type {
+	return types.Type{Kind: types.KindDecimal, Precision: 20, Scale: 0}
+}
+
+func sysDecU(v uint64) types.Value {
+	return types.DecimalValue(types.DecimalFromUint64(v), sysDecType())
+}
+
+// indexKindName labels the physical structure behind an index, so a reader
+// knows why entry_count is or is not one-per-row.
+func indexKindName(idx catalog.Index) string {
+	switch {
+	case idx.Fulltext:
+		return "FULLTEXT"
+	case idx.Vector:
+		return "VECTOR"
+	case idx.Spatial:
+		if idx.Predicate != nil {
+			return "SPATIAL PARTIAL"
+		}
+		return "SPATIAL"
+	case idx.Predicate != nil && idx.Unique:
+		return "UNIQUE PARTIAL"
+	case idx.Predicate != nil:
+		return "PARTIAL"
+	case idx.Unique:
+		return "UNIQUE"
+	default:
+		return "BTREE"
+	}
+}
+
+// indexEntriesAreRows reports whether the index tree holds exactly one entry
+// per indexed row, which is what makes a count of it meaningful. A full-text
+// index keys terms and a vector index keys graph nodes; counting either
+// yields a number that is not a row count, so those report NULL instead of a
+// figure a reader would misread as one.
+func indexEntriesAreRows(idx catalog.Index) bool {
+	return !idx.Fulltext && !idx.Vector
+}
+
+// visibleIndexEntryCount counts the entries an index actually holds under the
+// statement's snapshot. For a partial index that is strictly fewer than the
+// table's rows, which is the number an operator needs when judging whether
+// the index covers the queries they care about.
+//
+// The second result reports whether the count is known. An index tree that is
+// not open — a partition that does not carry this logical index, a tree being
+// swapped by a rebuild — makes the total incomplete rather than zero, so it
+// reports unknown and the column reads NULL. A statistics view degrades to
+// "not available" instead of failing the whole read-model, which would take
+// out every other figure on the page with it.
+func (s *Session) visibleIndexEntryCount(tab *catalog.Table, idx catalog.Index) (uint64, bool, error) {
+	if s == nil || s.x == nil || tab == nil {
+		return 0, false, nerr.New(nerr.Internal, "executor.visibleIndexEntryCount", "no snapshot for index count")
+	}
+	if err := s.budget().Check(); err != nil {
+		return 0, false, err
+	}
+	count := func(tree *btree.Tree) (int64, error) {
+		if err := s.budget().Check(); err != nil {
+			return 0, err
+		}
+		return s.x.use(tree).Count(nil, nil)
+	}
+	var total int64
+	if tab.Partitioning != nil {
+		// A partitioned table has no global index root; each partition owns
+		// its own tree, so the logical index size is their sum.
+		for _, part := range tab.Partitioning.Partitions {
+			tree, err := s.partitionIndex(tab, part.ID, idx)
+			if err != nil {
+				if nerr.HasCode(err, nerr.NotFound) {
+					return 0, false, nil
+				}
+				return 0, false, err
+			}
+			n, err := count(tree)
+			if err != nil {
+				return 0, false, err
+			}
+			total += n
+		}
+	} else {
+		tree, err := s.indexOf(tab, idx)
+		if err != nil {
+			if nerr.HasCode(err, nerr.NotFound) {
+				return 0, false, nil
+			}
+			return 0, false, err
+		}
+		if total, err = count(tree); err != nil {
+			return 0, false, err
+		}
+	}
+	if total < 0 {
+		return 0, false, nerr.New(nerr.Internal, "executor.visibleIndexEntryCount", "negative index entry count")
+	}
+	return uint64(total), true, nil
 }
 
 func (s *Session) systemReplicationRows() ([][]types.Value, error) {
@@ -1477,50 +1592,84 @@ func (s *Session) systemPartitionsRows() ([][]types.Value, error) {
 	return out, nil
 }
 
-func (s *Session) systemTableStatsRows() ([][]types.Value, error) {
+func (s *Session) systemTableStatsRows(where ast.Expr) (out [][]types.Value, err error) {
 	if s.db == nil || s.db.Cat == nil {
 		return [][]types.Value{}, nil
 	}
-	// Use stats from catalog if available; otherwise empty
-	var out [][]types.Value
+	only, hasOnly := equalityLiteral(where, "table_name")
+	lease, err := s.beginStatsRead()
+	if err != nil {
+		return nil, err
+	}
+	defer func() { s.finishStatsRead(lease, err) }()
 	for _, t := range s.db.Cat.List() {
+		if hasOnly && t.Name != only {
+			continue
+		}
 		if !s.canSeeTable(t.Name) {
 			continue
 		}
-		// Try lookup stats
-		st, _ := s.db.Cat.Stats(t.Name)
-		cnt := int64(0)
-		if st != nil {
-			cnt = int64(st.Rows)
+		// Visible rows, the same figure as COUNT(*). ANALYZE snapshots stay
+		// in the catalog for the planner and are reported beside it, so a
+		// stale snapshot is visible rather than silently costing plans.
+		n, cerr := s.visibleRowCount(t)
+		if cerr != nil {
+			return nil, cerr
 		}
-		row := []types.Value{
+		analyzed := types.Null(sysDecType())
+		if st, ok := s.db.Cat.Stats(t.Name); ok && st != nil {
+			analyzed = sysDecU(st.Rows)
+		}
+		out = append(out, []types.Value{
 			types.StringValue(t.Name),
-			types.DecimalValue(types.DecimalFromInt64(cnt), types.Type{Kind: types.KindDecimal, Precision: 20, Scale: 0}),
+			sysDecU(n),
+			analyzed,
 			types.StringValue(""),
-		}
-		out = append(out, row)
+		})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i][0].Str < out[j][0].Str })
 	return out, nil
 }
 
-func (s *Session) systemIndexStatsRows() ([][]types.Value, error) {
+func (s *Session) systemIndexStatsRows(where ast.Expr) (out [][]types.Value, err error) {
 	if s.db == nil || s.db.Cat == nil {
 		return [][]types.Value{}, nil
 	}
-	var out [][]types.Value
+	only, hasOnly := equalityLiteral(where, "table_name")
+	lease, err := s.beginStatsRead()
+	if err != nil {
+		return nil, err
+	}
+	defer func() { s.finishStatsRead(lease, err) }()
 	for _, t := range s.db.Cat.List() {
-		if !s.canSeeTable(t.Name) {
+		if hasOnly && t.Name != only {
 			continue
 		}
+		if !s.canSeeTable(t.Name) || len(t.Indexes) == 0 {
+			continue
+		}
+		n, cerr := s.visibleRowCount(t)
+		if cerr != nil {
+			return nil, cerr
+		}
 		for _, idx := range t.Indexes {
-			// stats not tracked per index; placeholder 0
-			row := []types.Value{
+			entries := types.Null(sysDecType())
+			if indexEntriesAreRows(idx) {
+				c, known, cerr := s.visibleIndexEntryCount(t, idx)
+				if cerr != nil {
+					return nil, cerr
+				}
+				if known {
+					entries = sysDecU(c)
+				}
+			}
+			out = append(out, []types.Value{
 				types.StringValue(t.Name),
 				types.StringValue(idx.Name),
-				types.DecimalValue(types.DecimalFromInt64(0), types.Type{Kind: types.KindDecimal, Precision: 20, Scale: 0}),
-			}
-			out = append(out, row)
+				types.StringValue(indexKindName(idx)),
+				entries,
+				sysDecU(n),
+			})
 		}
 	}
 	sort.Slice(out, func(i, j int) bool {
@@ -1530,6 +1679,144 @@ func (s *Session) systemIndexStatsRows() ([][]types.Value, error) {
 		return out[i][0].Str < out[j][0].Str
 	})
 	return out, nil
+}
+
+// beginStatsRead opens a snapshot read when the statement is not already
+// inside a transaction, so a visible-row count can attach heaps. The caller
+// finishes it with finishStatsRead. An existing transaction is left untouched.
+func (s *Session) beginStatsRead() (bool, error) {
+	if s == nil || s.x != nil {
+		return false, nil
+	}
+	// startRead releases the transaction guard when BeginRead fails. This
+	// statement already holds that guard, so take it back for Exec's defer.
+	held := s.txnGuard
+	if err := s.startRead(txn.SnapshotIsolation); err != nil {
+		if held && !s.txnGuard {
+			s.acquireTxnGuard()
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+// finishStatsRead ends a read opened by beginStatsRead. It does not release
+// the statement's transaction guard or record a user commit: the caller of
+// Exec still owns that guard, and this read is not a user COMMIT.
+func (s *Session) finishStatsRead(owned bool, failed error) {
+	if !owned || s == nil || s.x == nil {
+		return
+	}
+	if failed != nil || !s.x.readOnly {
+		_ = s.x.rollback()
+	} else {
+		_ = s.x.commit()
+	}
+	s.x = nil
+	s.clearTxnActive()
+	s.clearSavepoints()
+	s.overlay = nil
+	s.workflowOverlay = nil
+	s.viewOverlay = nil
+	s.triggerOverlay = nil
+	s.scheduleOverlay = nil
+	s.resourceGroupOverlay = nil
+	s.pending = nil
+	s.dirtyHNSW = false
+	s.pendingHNSW = nil
+	s.dirtyIVF = false
+	s.pendingIVF = nil
+}
+
+// visibleRowCount is the number of rows COUNT(*) would see for tab.
+// It checks the query budget between partitions and does not charge I/O
+// per row: one statistics read covers every visible table, and the
+// statement time budget is what stops a runaway scan.
+func (s *Session) visibleRowCount(tab *catalog.Table) (uint64, error) {
+	if s == nil || s.x == nil || tab == nil {
+		return 0, nerr.New(nerr.Internal, "executor.visibleRowCount", "no snapshot for row count")
+	}
+	if err := s.budget().Check(); err != nil {
+		return 0, err
+	}
+	if tab.Partitioning != nil {
+		var total int64
+		for _, part := range tab.Partitioning.Partitions {
+			if err := s.budget().Check(); err != nil {
+				return 0, err
+			}
+			heap, err := s.partitionHeap(tab, part.ID)
+			if err != nil {
+				return 0, err
+			}
+			n, err := s.x.use(heap).Count(nil, nil)
+			if err != nil {
+				return 0, err
+			}
+			total += n
+		}
+		if total < 0 {
+			return 0, nerr.New(nerr.Internal, "executor.visibleRowCount", "negative row count")
+		}
+		return uint64(total), nil
+	}
+	heap, err := s.heapOf(tab)
+	if err != nil {
+		return 0, err
+	}
+	// Do not use the process-local live-row cache. It starts at 0 when the
+	// table is created in this process and stays 0 across any write path that
+	// does not adjust it, which made every statistics row look empty.
+	n, err := s.x.use(heap).Count(nil, nil)
+	if err != nil {
+		return 0, err
+	}
+	if n < 0 {
+		return 0, nerr.New(nerr.Internal, "executor.visibleRowCount", "negative row count")
+	}
+	return uint64(n), nil
+}
+
+// equalityLiteral reports the string literal compared with column, including
+// a comparison nested under AND. OR is not folded: both sides can match.
+func equalityLiteral(where ast.Expr, column string) (string, bool) {
+	b, ok := where.(ast.Binary)
+	if !ok {
+		return "", false
+	}
+	if b.Op == "AND" {
+		if v, ok := equalityLiteral(b.Left, column); ok {
+			return v, true
+		}
+		return equalityLiteral(b.Right, column)
+	}
+	if b.Op != "=" {
+		return "", false
+	}
+	id, lit, ok := binaryIdentLiteral(b)
+	if !ok || !strings.EqualFold(id.Name, column) || lit.Value.Null {
+		return "", false
+	}
+	switch lit.Value.Typ.Kind {
+	case types.KindString, types.KindText, types.KindChar, types.KindVarchar:
+		return lit.Value.Str, true
+	default:
+		return "", false
+	}
+}
+
+func binaryIdentLiteral(b ast.Binary) (ast.Ident, ast.Literal, bool) {
+	if id, ok := b.Left.(ast.Ident); ok {
+		if lit, ok := b.Right.(ast.Literal); ok {
+			return id, lit, true
+		}
+	}
+	if id, ok := b.Right.(ast.Ident); ok {
+		if lit, ok := b.Left.(ast.Literal); ok {
+			return id, lit, true
+		}
+	}
+	return ast.Ident{}, ast.Literal{}, false
 }
 
 // systemSessionsRows lists sessions registered by DB.RegisterSession — i.e.

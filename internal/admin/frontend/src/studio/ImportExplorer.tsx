@@ -41,6 +41,7 @@ const PREVIEW_LINE_LIMIT = 160;
 export function ImportExplorer({
   onClose,
   onInsert,
+  onSwitchToStreamingImport,
   tables,
   initialTable,
   initialDetail,
@@ -48,6 +49,7 @@ export function ImportExplorer({
 }: {
   onClose: () => void;
   onInsert: (sql: string) => void;
+  onSwitchToStreamingImport?: () => void;
   tables: string[];
   initialTable: string | null;
   initialDetail: StudioTableDetail | null;
@@ -166,6 +168,9 @@ export function ImportExplorer({
             Parses a pasted or loaded document, maps its fields to the target table's authorized columns, and
             builds INSERT statements that replace the active editor tab — it never runs anything here. Integer
             and boolean cells are checked against the column type; a bad value is reported, not guessed.
+            {onSwitchToStreamingImport ? (
+              <> Need to import large files directly? <Button variant="link" size="sm" onClick={() => { onClose(); onSwitchToStreamingImport(); }}>Switch to Streaming bulk import…</Button></>
+            ) : null}
           </Text>
 
           {tables.length === 0 ? (

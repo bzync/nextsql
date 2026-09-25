@@ -1009,9 +1009,16 @@ func (s *Session) execAdmitted(ctx context.Context, sql string, params []Param) 
 	}
 	if sel, ok := s.isSystemSelect(stmt); ok {
 		// System catalog is authoritative and tenant-aware; bypass normal binder.
-		if s.InTxn() {
-			// Allow system reads inside transaction as read-only.
-		}
+		// A fresh budget bounds system.table_stats, which counts live rows.
+		// The ordinary plan path below never runs for these statements, so
+		// without this the counter would reuse whatever budget() last created.
+		s.qbudget = scheduler.NewBudget(ctx, s.limitsOrDefault())
+		defer func() {
+			if s.qbudget != nil {
+				s.qbudget.Close()
+				s.qbudget = nil
+			}
+		}()
 		res, err := s.execSystemSelect(sel)
 		s.auditRecord(workflowAuditAction(stmt), sqlObject(stmt), err)
 		return res, err

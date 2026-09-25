@@ -3,6 +3,7 @@ package executor
 import (
 	"github.com/bzync/nextsql/internal/catalog"
 	"github.com/bzync/nextsql/internal/executor/join"
+	"github.com/bzync/nextsql/internal/scheduler"
 	"github.com/bzync/nextsql/internal/sql/ast"
 	"github.com/bzync/nextsql/internal/sql/optimizer"
 	"github.com/bzync/nextsql/internal/sql/planner"
@@ -228,7 +229,7 @@ func (s *Session) tryPartitionWiseJoin(n planner.Join) ([][]types.Value, error, 
 			i := i
 			tasks[i] = func() error { return runPair(i) }
 		}
-		if err := s.pool().Run(s.budget().Context(), w, tasks); err != nil {
+		if err := scheduler.RunTracked(s.pool(), s.budget(), w, tasks); err != nil {
 			return nil, err, true
 		}
 	} else {

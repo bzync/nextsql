@@ -31,6 +31,7 @@ import {
   type Activity,
   type Security,
   type ServerConnection,
+  type SessionProfile,
   type StudioAnalysis,
   type StudioDiagnostic,
   type StudioBootstrap,
@@ -43,6 +44,8 @@ import {
   type StudioWorkflowOverview,
   type Whoami,
 } from "../ops/api";
+import { ConnectionExplorer } from "./ConnectionExplorer";
+import { RecentConnectionsModal } from "./RecentConnectionsModal";
 import { GrantBuilder } from "./GrantBuilder";
 import { FullTextExplorer } from "./FullTextExplorer";
 import { VectorExplorer } from "./VectorExplorer";
@@ -56,9 +59,12 @@ import { MigrationExplorer } from "./MigrationExplorer";
 import { SchemaDiagramExplorer } from "./SchemaDiagramExplorer";
 import { DataGeneratorExplorer } from "./DataGeneratorExplorer";
 import { ImportExplorer } from "./ImportExplorer";
+import { StreamingImportExplorer } from "./StreamingImportExplorer";
 import { VectorImportExplorer } from "./VectorImportExplorer";
 import { DMLBuilderExplorer } from "./DMLBuilderExplorer";
 import { SchemaDesignerExplorer, type SchemaDesignerMode } from "./SchemaDesignerExplorer";
+import { SchemaDiffExplorer } from "./SchemaDiffExplorer";
+import { BenchmarkViewer } from "./BenchmarkViewer";
 import { ObjectSearch } from "./ObjectSearch";
 import { CommandPalette, type StudioCommand } from "./CommandPalette";
 import { SavedQueries } from "./SavedQueries";
@@ -72,10 +78,13 @@ import {
   MAX_INSPECTOR_WIDTH,
   MIN_EXPLORER_WIDTH,
   MIN_INSPECTOR_WIDTH,
+  applyColumnNameFix,
   applyTableNameFix,
   currentJSONPathRange,
   currentNearestContext,
+  currentQualifierContext,
   currentWordRange,
+  detectSQLClauseContext,
   editorDraftStorageKey,
   detectEditableTable,
   editorDraftsWorthRestoring,
@@ -83,13 +92,16 @@ import {
   connectionScope,
   extractQueryParams,
   extractReferencedTables,
+  extractTableAliases,
   findAllMatches,
+  findIdentifierSpansInSQL,
   formatSQL,
   grantStateFromRow,
   isStudioEnvironment,
   jsonPathIndexPaths,
   layoutStorageKey,
   namesFromResult,
+  parseBinderErrorMessage,
   parseStudioLayout,
   queryResultSummary,
   resetStudioLayout,
@@ -102,10 +114,16 @@ import {
   downloadSavedQueries,
   mergeSavedQueries,
   MAX_SAVED_QUERY_IMPORT_BYTES,
+  MAX_SQL_SUGGESTIONS,
   MAX_TABLE_CONSTRAINT_ROWS,
+  RECENT_CONNECTIONS_STORAGE_KEY,
+  parseRecentConnections,
+  recordRecentConnection,
+  serializeRecentConnections,
   rankJSONPathSuggestions,
   rankNearestColumnSuggestions,
   rankNearestMetricSuggestions,
+  rankQualifiedSuggestions,
   rankSQLSuggestions,
   removeSavedQuery,
   replaceAllMatches,
@@ -115,18 +133,22 @@ import {
   serializeStudioLayout,
   stepLayoutWidth,
   upsertSavedQuery,
+  suggestColumnNameFixes,
   suggestTableNameFixes,
   tableColumnTypesRecord,
   tableConstraintsResult,
   tablePKColumns,
   vectorColumnsFromResult,
   withCachedTableLoading,
+  extractTableRelationMetadata,
+  type ColumnNameFix,
   type FindMatch,
   type ExplainPlanSnapshot,
   type FullTextResultContext,
   type GrantBuilderState,
   type HybridResultContext,
   type RankResultContext,
+  type RecentConnection,
   type SQLSuggestion,
   type SavedQuery,
   type StudioEnvironment,
@@ -134,6 +156,7 @@ import {
   type TableJSONPathCache,
   type TableNameFix,
   type TableVectorCache,
+  type TableRelationsCache,
 } from "./resultTools";
 
 const DEFAULT_SQL = "SELECT * FROM system.capabilities ORDER BY name";
@@ -195,6 +218,61 @@ function queryID(): string {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function getBadgeVariant(kind: SQLSuggestion["kind"]): "default" | "success" | "warning" | "error" | "info" | "muted" {
+  switch (kind) {
+    case "table":
+      return "info";
+    case "pk":
+      return "success";
+    case "fk":
+      return "warning";
+    case "join":
+    case "join-condition":
+      return "info";
+    case "vector-column":
+      return "info";
+    case "vector-metric":
+    case "keyword":
+    case "function":
+      return "default";
+    case "type":
+    case "json-path":
+    case "column":
+    default:
+      return "muted";
+  }
+}
+
+function getBadgeLabel(kind: SQLSuggestion["kind"]): string {
+  switch (kind) {
+    case "table":
+      return "Table";
+    case "pk":
+      return "PK";
+    case "fk":
+      return "FK";
+    case "join":
+      return "Join";
+    case "join-condition":
+      return "FK Join";
+    case "vector-column":
+      return "Vector";
+    case "vector-metric":
+      return "Metric";
+    case "keyword":
+      return "Keyword";
+    case "function":
+      return "Function";
+    case "type":
+      return "Type";
+    case "json-path":
+      return "JSON";
+    case "column":
+    default:
+      return "Column";
+  }
 }
 
 // Query history is an in-memory, per-session record only: it is never
@@ -370,7 +448,7 @@ export function StudioWorkspace({
   // Opens the Shell's "Switch server" dialog; absent when this Admin has only
   // one connection profile. A switch issues a new session, which remounts
   // this workspace against the new server.
-  onRequestSwitchServer?: () => void;
+  onRequestSwitchServer?: (profileId?: string) => void;
   serverConnection: ServerConnection | null;
   connectionChecking: boolean;
   onRetryConnection: () => void;
@@ -452,6 +530,61 @@ export function StudioWorkspace({
   const [checkingSQL, setCheckingSQL] = useState(false);
   const [environment, setEnvironmentState] = useState<StudioEnvironment | null>(null);
   const [readOnlyMode, setReadOnlyMode] = useState(false);
+  const [explorerTab, setExplorerTab] = useState<"database" | "connections">("database");
+  const [connectionsModalOpen, setConnectionsModalOpen] = useState(false);
+  const [sessionProfilesList, setSessionProfilesList] = useState<SessionProfile[]>([]);
+  const [recentConnections, setRecentConnections] = useState<RecentConnection[]>(() => {
+    try {
+      return parseRecentConnections(window.localStorage.getItem(RECENT_CONNECTIONS_STORAGE_KEY));
+    } catch {
+      return [];
+    }
+  });
+
+  useEffect(() => {
+    let active = true;
+    void api.sessionProfiles().then(
+      (resp) => {
+        if (active && resp?.profiles) {
+          setSessionProfilesList(resp.profiles);
+        }
+      },
+      () => {
+        /* best effort */
+      },
+    );
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!who?.profile) return;
+    try {
+      const existing = parseRecentConnections(window.localStorage.getItem(RECENT_CONNECTIONS_STORAGE_KEY));
+      const updated = recordRecentConnection(existing, {
+        profileId: who.profile.id,
+        name: who.profile.name,
+        address: who.profile.address || serverConnection?.server_addr || "",
+        database: who.database || "",
+        user: who.user || "",
+        environment: who.profile.environment ?? (environment ?? undefined),
+      });
+      window.localStorage.setItem(RECENT_CONNECTIONS_STORAGE_KEY, serializeRecentConnections(updated));
+      setRecentConnections(updated);
+    } catch {
+      /* best effort */
+    }
+  }, [who.profile?.id, who.profile?.name, who.profile?.address, who.profile?.environment, who.database, who.user, serverConnection?.server_addr, environment]);
+
+  const clearRecentConnections = useCallback(() => {
+    try {
+      window.localStorage.removeItem(RECENT_CONNECTIONS_STORAGE_KEY);
+    } catch {
+      /* best effort */
+    }
+    setRecentConnections([]);
+  }, []);
   const [pendingRun, setPendingRun] = useState<{ analysis: StudioAnalysis; sql: string; isSelection: boolean; tabId: string; blockedReadOnly: boolean; params?: StudioQueryParam[] } | null>(null);
   const [pendingScript, setPendingScript] = useState<{ tabId: string; statements: string[]; flagged: { index: number; reasons: string[] }[] } | null>(null);
   const [splittingScript, setSplittingScript] = useState(false);
@@ -485,10 +618,13 @@ export function StudioWorkspace({
   const [objectSearchOpen, setObjectSearchOpen] = useState(false);
   const [dataGeneratorOpen, setDataGeneratorOpen] = useState(false);
   const [importOpen, setImportOpen] = useState(false);
+  const [streamingImportOpen, setStreamingImportOpen] = useState(false);
   const [vectorImportOpen, setVectorImportOpen] = useState(false);
   const [dmlBuilderOpen, setDmlBuilderOpen] = useState(false);
   const [schemaDesignerOpen, setSchemaDesignerOpen] = useState(false);
   const [schemaDesignerMode, setSchemaDesignerMode] = useState<SchemaDesignerMode>("table");
+  const [schemaDiffOpen, setSchemaDiffOpen] = useState(false);
+  const [benchmarkViewerOpen, setBenchmarkViewerOpen] = useState(false);
   const [schemaDiagramOpen, setSchemaDiagramOpen] = useState(false);
   const [schemaGraph, setSchemaGraph] = useState<StudioSchemaGraph | null>(null);
   const [schemaGraphLoading, setSchemaGraphLoading] = useState(false);
@@ -508,6 +644,8 @@ export function StudioWorkspace({
   const [tableColumnsCache, setTableColumnsCache] = useState<TableColumnsCache>({});
   const [tableJSONPathCache, setTableJSONPathCache] = useState<TableJSONPathCache>({});
   const [tableVectorCache, setTableVectorCache] = useState<TableVectorCache>({});
+  const [tableColumnTypesCache, setTableColumnTypesCache] = useState<Record<string, Record<string, string>>>({});
+  const [tableRelationsCache, setTableRelationsCache] = useState<TableRelationsCache>({});
   const tableFetchOrder = useRef<string[]>([]);
   const findInputRef = useRef<HTMLInputElement>(null);
   const activeQuery = useRef<string | null>(null);
@@ -816,6 +954,8 @@ export function StudioWorkspace({
   // no eager/speculative catalog reads.
   const catalogTableNames = useMemo(() => tableNames(bootstrap), [bootstrap]);
   const referencedTables = useMemo(() => extractReferencedTables(sql), [sql]);
+  const tableAliases = useMemo(() => extractTableAliases(sql, referencedTables), [sql, referencedTables]);
+  const clauseContext = useMemo(() => detectSQLClauseContext(sql, cursorPos), [sql, cursorPos]);
   // Positional placeholders ($1..$N) referenced by the active buffer. When
   // non-empty the editor shows a bind panel; the values feed the Run request.
   const queryParamNumbers = useMemo(() => extractQueryParams(sql), [sql]);
@@ -850,6 +990,12 @@ export function StudioWorkspace({
   );
   const suggestWordRange = useMemo(() => currentWordRange(sql, cursorPos), [sql, cursorPos]);
   const suggestPrefix = sql.slice(suggestWordRange.start, cursorPos);
+  const qualifierContext = useMemo(() => currentQualifierContext(sql, cursorPos), [sql, cursorPos]);
+  const isTableQualifier = useMemo(() => {
+    if (!qualifierContext) return false;
+    const q = qualifierContext.qualifier.toLowerCase();
+    return q === "system" || tableAliases.has(q) || catalogTableNames.some((t) => t.toLowerCase() === q);
+  }, [qualifierContext, tableAliases, catalogTableNames]);
   // When the caret sits inside a dotted path (`metadata.tags`), completion
   // switches to the known indexed JSON paths on the referenced tables — the
   // only JSON structure NextSQL exposes metadata for — instead of the plain
@@ -858,6 +1004,17 @@ export function StudioWorkspace({
   const nearestContext = useMemo(() => currentNearestContext(sql, cursorPos), [sql, cursorPos]);
   const suggestions = useMemo(() => {
     if (!suggestOpen) return [];
+    if (isTableQualifier && qualifierContext) {
+      return rankQualifiedSuggestions(
+        qualifierContext.qualifier,
+        qualifierContext.typed,
+        tableAliases,
+        tableColumnsCache,
+        tableJSONPathCache,
+        tableColumnTypesCache,
+        tableRelationsCache,
+      );
+    }
     if (jsonPathContext) {
       return rankJSONPathSuggestions(jsonPathContext.typed, referencedTables, tableJSONPathCache);
     }
@@ -867,12 +1024,34 @@ export function StudioWorkspace({
     if (nearestContext?.slot === "metric") {
       return rankNearestMetricSuggestions(nearestContext.typed, nearestContext.column, referencedTables, tableVectorCache);
     }
-    return rankSQLSuggestions(suggestPrefix, catalogTableNames, referencedTables, tableColumnsCache);
-  }, [suggestOpen, jsonPathContext, nearestContext, suggestPrefix, catalogTableNames, referencedTables, tableColumnsCache, tableJSONPathCache, tableVectorCache]);
+    return rankSQLSuggestions(suggestPrefix, catalogTableNames, referencedTables, tableColumnsCache, MAX_SQL_SUGGESTIONS, {
+      clauseContext,
+      columnTypes: tableColumnTypesCache,
+      relations: tableRelationsCache,
+      tableAliases,
+      includeKeywords: true,
+    });
+  }, [
+    suggestOpen,
+    isTableQualifier,
+    jsonPathContext,
+    nearestContext,
+    qualifierContext,
+    suggestPrefix,
+    catalogTableNames,
+    referencedTables,
+    tableAliases,
+    tableColumnsCache,
+    tableJSONPathCache,
+    tableVectorCache,
+    clauseContext,
+    tableColumnTypesCache,
+    tableRelationsCache,
+  ]);
 
   useEffect(() => {
     setActiveSuggestionIndex(0);
-  }, [suggestOpen, suggestPrefix, jsonPathContext?.typed, nearestContext?.slot, nearestContext?.typed]);
+  }, [suggestOpen, suggestPrefix, qualifierContext?.qualifier, qualifierContext?.typed, jsonPathContext?.typed, nearestContext?.slot, nearestContext?.typed]);
 
   // RUI's CodeEditor has no completion/overlay primitive and no way to pass
   // through arbitrary aria-* props, so the ARIA 1.2 combobox-with-listbox-
@@ -897,10 +1076,23 @@ export function StudioWorkspace({
 
   useEffect(() => {
     if (!suggestOpen) return;
+    const optionElem = document.getElementById(`studio-suggest-option-${activeSuggestionIndex}`);
+    optionElem?.scrollIntoView({ block: "nearest" });
+  }, [suggestOpen, activeSuggestionIndex]);
+
+  useEffect(() => {
+    if (!suggestOpen) return;
     let cache = tableColumnsCache;
     let order = tableFetchOrder.current;
     const toFetch: string[] = [];
-    for (const table of referencedTables) {
+    const tablesToCheck = new Set(referencedTables);
+    if (qualifierContext) {
+      const resolved = tableAliases.get(qualifierContext.qualifier.toLowerCase()) ?? qualifierContext.qualifier;
+      if (catalogTableNames.includes(resolved)) {
+        tablesToCheck.add(resolved);
+      }
+    }
+    for (const table of tablesToCheck) {
       if (table in cache) continue;
       const next = withCachedTableLoading(cache, order, table);
       cache = next.cache;
@@ -916,13 +1108,15 @@ export function StudioWorkspace({
           setTableColumnsCache((prev) => (table in prev ? { ...prev, [table]: namesFromResult(data.columns, "column_name") } : prev));
           setTableJSONPathCache((prev) => ({ ...prev, [table]: jsonPathIndexPaths(data.indexes) }));
           setTableVectorCache((prev) => ({ ...prev, [table]: vectorColumnsFromResult(data.columns) }));
+          setTableColumnTypesCache((prev) => ({ ...prev, [table]: tableColumnTypesRecord(data) }));
+          setTableRelationsCache((prev) => ({ ...prev, [table]: extractTableRelationMetadata(data) }));
         })
         .catch(() => {
           if (!mounted.current) return;
           setTableColumnsCache((prev) => (table in prev ? { ...prev, [table]: "error" } : prev));
         });
     }
-  }, [suggestOpen, referencedTables, tableColumnsCache]);
+  }, [suggestOpen, referencedTables, qualifierContext, tableAliases, catalogTableNames, tableColumnsCache]);
 
   // Deterministic misspelled-table-name suggestions (see resultTools.ts's
   // "Deterministic misspelled table-name suggestions" section for the full
@@ -937,6 +1131,30 @@ export function StudioWorkspace({
   const applyFix = useCallback((fix: TableNameFix) => {
     setSQL(applyTableNameFix(sql, fix));
   }, [sql, setSQL]);
+
+  // Deterministic column-name suggestions from live catalog columns.
+  const columnFixes = useMemo(
+    () => suggestColumnNameFixes(sql, referencedTables, tableColumnsCache),
+    [sql, referencedTables, tableColumnsCache],
+  );
+
+  const applyColFix = useCallback((fix: ColumnNameFix) => {
+    setSQL(applyColumnNameFix(sql, fix));
+  }, [sql, setSQL]);
+
+  // jumpToSpan moves the real textarea caret to a character span [start, end]
+  // and selects the token so the operator sees the offending identifier.
+  const jumpToSpan = useCallback((start: number, end: number) => {
+    const textarea = editorHost.current?.querySelector("textarea");
+    if (!textarea) return;
+    const s = Math.max(0, Math.min(start, textarea.value.length));
+    const e = Math.max(s, Math.min(end, textarea.value.length));
+    requestAnimationFrame(() => {
+      textarea.focus();
+      textarea.setSelectionRange(s, e);
+      setCursorPos(s);
+    });
+  }, []);
 
   // Live parse diagnostics: a debounced round trip to the server's own
   // grammar (POST /studio/query/diagnostics — no connection, no query slot)
@@ -978,16 +1196,8 @@ export function StudioWorkspace({
   // indexing) and selects the token there so the operator sees where the
   // parser stopped.
   const jumpToDiagnostic = useCallback((diag: StudioDiagnostic) => {
-    const textarea = editorHost.current?.querySelector("textarea");
-    if (!textarea) return;
-    const start = Math.max(0, Math.min(diag.offset, textarea.value.length));
-    const end = Math.min(textarea.value.length, start + 1);
-    requestAnimationFrame(() => {
-      textarea.focus();
-      textarea.setSelectionRange(start, end);
-      setCursorPos(start);
-    });
-  }, []);
+    jumpToSpan(diag.offset, diag.offset + 1);
+  }, [jumpToSpan]);
 
   // Editable data grid & transactional changes
   const editableTable = useMemo(() => {
@@ -1049,11 +1259,16 @@ export function StudioWorkspace({
     const range =
       suggestion.kind === "json-path"
         ? currentJSONPathRange(sql, cursorPos) ?? currentWordRange(sql, cursorPos)
-        : currentWordRange(sql, cursorPos);
+        : isTableQualifier && qualifierContext
+          ? { start: qualifierContext.start, end: qualifierContext.end }
+          : currentWordRange(sql, cursorPos);
     const nextValue = sql.slice(0, range.start) + suggestion.insertText + sql.slice(range.end);
     setSQL(nextValue);
     setSuggestOpen(false);
-    const cursor = range.start + suggestion.insertText.length;
+    const isParensFunc = suggestion.kind === "function" && suggestion.insertText.endsWith("()");
+    const cursor = isParensFunc
+      ? range.start + suggestion.insertText.length - 1
+      : range.start + suggestion.insertText.length;
     if (textarea) {
       requestAnimationFrame(() => {
         textarea.focus();
@@ -1061,7 +1276,7 @@ export function StudioWorkspace({
         setCursorPos(cursor);
       });
     }
-  }, [sql, cursorPos]);
+  }, [sql, cursorPos, isTableQualifier, qualifierContext]);
 
   // Both the GRANT/REVOKE builder's grantee/role suggestions and the Users &
   // roles explorer read the same admin-only system.users/system.roles/
@@ -1294,12 +1509,14 @@ export function StudioWorkspace({
           { label: "Transactions & locks…", icon: "lock", run: openActivityExplorer },
           { label: "Workflows & CDC…", icon: "activity", run: openWorkflowExplorer },
           { label: "Migrations…", icon: "clock", run: openMigrationExplorer },
+          { label: "Benchmark viewer…", icon: "activity", run: () => setBenchmarkViewerOpen(true) },
         ],
       },
       {
         label: "Schema",
         items: [
           { label: "Schema diagram…", icon: "network", run: openSchemaDiagram },
+          { label: "Schema diff…", icon: "layers", run: () => setSchemaDiffOpen(true) },
           { label: "Design schema…", icon: "table", run: () => { setSchemaDesignerMode("table"); setSchemaDesignerOpen(true); } },
         ],
       },
@@ -1308,6 +1525,7 @@ export function StudioWorkspace({
         items: [
           { label: "Generate data…", icon: "plus", run: () => setDataGeneratorOpen(true) },
           { label: "Import data…", icon: "download", run: () => setImportOpen(true) },
+          { label: "Streaming bulk import…", icon: "download", run: () => setStreamingImportOpen(true) },
           { label: "Import vector dataset…", icon: "download", run: () => setVectorImportOpen(true) },
           { label: "Parameterized DML…", icon: "file", run: () => setDmlBuilderOpen(true) },
         ],
@@ -1882,6 +2100,14 @@ export function StudioWorkspace({
       event.preventDefault();
       event.stopPropagation();
       openSuggest();
+    } else if (event.key === "." && !suggestOpen && !event.ctrlKey && !event.metaKey && !event.altKey) {
+      const textarea = editorHost.current?.querySelector("textarea");
+      const pos = textarea?.selectionEnd ?? cursorPos;
+      if (pos > 0 && /[A-Za-z0-9_]/.test(sql[pos - 1])) {
+        window.setTimeout(() => {
+          if (mounted.current) setSuggestOpen(true);
+        }, 50);
+      }
     } else if (suggestOpen) {
       if (event.key === "Escape") {
         event.preventDefault();
@@ -1974,14 +2200,16 @@ export function StudioWorkspace({
       { id: "run", label: "Run query", hint: "Ctrl+Enter", keywords: "execute sql", disabled: busy || (!hasSelection && !sql.trim()), run: () => void requestRun() },
       { id: "run-script", label: "Run script", keywords: "execute all statements", disabled: busy || hasSelection || !sql.trim(), run: () => void requestRunScript() },
       { id: "cancel", label: "Cancel running query", keywords: "stop abort", disabled: !running || cancelRequested, run: () => void cancelQuery() },
-      { id: "suggest", label: "Suggest table / column names", hint: "Ctrl+Space", keywords: "autocomplete intellisense", run: openSuggest },
+      { id: "suggest", label: "SQL suggestions & autocompletion…", hint: "Ctrl+Space", keywords: "autocomplete intellisense functions keywords relations tables columns", run: openSuggest },
       { id: "format-sql", label: "Format SQL", hint: "Shift+Alt+F", keywords: "reflow pretty print indent beautify tidy", disabled: !sql.trim(), run: formatBuffer },
       { id: "saved", label: "Saved queries…", keywords: "snippets folders tags", run: () => setSavedOpen(true) },
       { id: "search-objects", label: "Search objects…", keywords: "find table workflow", run: openObjectSearch },
       { id: "switch-server", label: "Switch server…", keywords: "connection profile server reconnect environment staging production", disabled: !onRequestSwitchServer, run: () => onRequestSwitchServer?.() },
       { id: "schema-diagram", label: "Schema diagram…", keywords: "er foreign keys relationships", run: () => setSchemaDiagramOpen(true) },
+      { id: "schema-diff", label: "Schema diff…", keywords: "compare drift migration ddl alter diff", run: () => setSchemaDiffOpen(true) },
       { id: "data-generator", label: "Generate development data…", keywords: "seed rows insert synthetic fixture mock sample", run: () => setDataGeneratorOpen(true) },
       { id: "import-data", label: "Import CSV / JSON data…", keywords: "load file tsv ndjson insert upload", run: () => setImportOpen(true) },
+      { id: "streaming-bulk-import", label: "Streaming bulk import…", keywords: "streaming bulk import csv json ndjson tsv upload execute direct database", run: () => setStreamingImportOpen(true) },
       { id: "import-vector-dataset", label: "Import vector dataset…", keywords: "embedding vector bitvector sparsevector ndjson load insert ann", run: () => setVectorImportOpen(true) },
       { id: "dml-builder", label: "Parameterized INSERT / UPDATE / DELETE…", keywords: "dml template placeholder $1 bind statement write", run: () => setDmlBuilderOpen(true) },
       { id: "design-table", label: "Design table…", keywords: "create table schema ddl columns primary key foreign key", run: () => { setSchemaDesignerMode("table"); setSchemaDesignerOpen(true); } },
@@ -1996,6 +2224,9 @@ export function StudioWorkspace({
       { id: "explorer-audit", label: "Open Audit log", keywords: "verify trail", run: openAuditExplorer },
       { id: "explorer-workflows", label: "Open Workflows, tasks & change streams", keywords: "trigger schedule cdc", run: openWorkflowExplorer },
       { id: "explorer-migrations", label: "Open Schema migration history", keywords: "migrate version dirty schema lifecycle", run: openMigrationExplorer },
+      { id: "benchmark-viewer", label: "Benchmark viewer & run comparison…", keywords: "benchmark bench slo latency qps throughput compare nextsql-bench regression", run: () => setBenchmarkViewerOpen(true) },
+      { id: "connections-home", label: "Connections & recent projects…", keywords: "recents profiles history workspace switch", run: () => setConnectionsModalOpen(true) },
+      { id: "toggle-connection-explorer", label: explorerTab === "connections" ? "Switch to Database explorer" : "Switch to Connection explorer", keywords: "sidebar connections profiles", run: () => { setExplorerVisible(true); setExplorerTab((t) => (t === "connections" ? "database" : "connections")); } },
       { id: "toggle-explorer", label: explorerVisible ? "Hide database explorer" : "Show database explorer", keywords: "layout pane sidebar", run: () => setExplorerVisible((v) => !v) },
       { id: "toggle-inspector", label: inspectorVisible ? "Hide inspector" : "Show inspector", keywords: "layout pane details", run: () => setInspectorVisible((v) => !v) },
       { id: "reset-layout", label: "Reset layout", keywords: "panes widths default", run: resetLayout },
@@ -2004,7 +2235,7 @@ export function StudioWorkspace({
     running, checkingSQL, splittingScript, hasSelection, sql, cancelRequested,
     addTab, requestRun, requestRunScript, cancelQuery, openSuggest, formatBuffer, openObjectSearch,
     openSecurityExplorer, openActivityExplorer, openAuditExplorer, openWorkflowExplorer,
-    openMigrationExplorer, explorerVisible, inspectorVisible, resetLayout, onRequestSwitchServer,
+    openMigrationExplorer, explorerVisible, explorerTab, inspectorVisible, resetLayout, onRequestSwitchServer,
   ]);
 
   useEffect(() => {
@@ -2123,8 +2354,9 @@ export function StudioWorkspace({
         </Inline>
         <Inline gap="sm" align="center" wrap>
           {onRequestSwitchServer ? (
-            <Button variant="outline" size="sm" icon={<Icon name="plug" size={14} />} onClick={onRequestSwitchServer}>Switch server…</Button>
+            <Button variant="outline" size="sm" icon={<Icon name="plug" size={14} />} onClick={() => onRequestSwitchServer()}>Switch server…</Button>
           ) : null}
+          <Button variant="outline" size="sm" icon={<Icon name="network" size={14} />} onClick={() => setConnectionsModalOpen(true)} title="Recent connections and project tools">Connections…</Button>
           <Select
             id="studio-read-consistency"
             label="Read consistency"
@@ -2210,36 +2442,68 @@ export function StudioWorkspace({
           <CardHeader className="nss-explorer-header">
             <CardTitle as="h2">
               <Inline gap="xs" align="center" wrap={false}>
-                <Icon name="database" size={16} />
-                Database explorer
+                <Icon name={explorerTab === "connections" ? "plug" : "database"} size={16} />
+                {explorerTab === "connections" ? "Connection explorer" : "Database explorer"}
               </Inline>
             </CardTitle>
             <Inline gap="xs" align="center" wrap>
-              <Button variant="ghost" size="sm" icon={<Icon name="terminal" size={14} />} onClick={() => setPaletteOpen(true)} title="Command palette (Ctrl/Cmd+K)">Commands</Button>
-              <Button variant="outline" size="sm" icon={<Icon name="search" size={14} />} onClick={openObjectSearch}>Search objects…</Button>
+              <Button
+                variant={explorerTab === "connections" ? "primary" : "ghost"}
+                size="sm"
+                icon={<Icon name={explorerTab === "connections" ? "database" : "plug"} size={14} />}
+                onClick={() => setExplorerTab((prev) => (prev === "connections" ? "database" : "connections"))}
+                title={explorerTab === "connections" ? "Switch to Database explorer" : "Switch to Connection explorer"}
+              >
+                {explorerTab === "connections" ? "Tables" : "Connections"}
+              </Button>
+              {explorerTab === "database" ? (
+                <>
+                  <Button variant="ghost" size="sm" icon={<Icon name="terminal" size={14} />} onClick={() => setPaletteOpen(true)} title="Command palette (Ctrl/Cmd+K)">Commands</Button>
+                  <Button variant="outline" size="sm" icon={<Icon name="search" size={14} />} onClick={openObjectSearch}>Search objects…</Button>
+                </>
+              ) : null}
               <Button variant="ghost" size="sm" onClick={() => setExplorerVisible(false)}>Hide explorer</Button>
             </Inline>
           </CardHeader>
           <CardBody className="nss-explorer-body">
-            <Input
-              id="studio-table-filter"
-              label="Filter tables"
-              size="sm"
-              value={filter}
-              onChange={(event) => setFilter(event.currentTarget.value)}
-              placeholder="Table name"
-            />
-            <SchemaTree
-              tables={visibleTables}
-              totalTables={allTables.length}
-              filterActive={filter.trim().length > 0}
-              tablesTruncated={Boolean(bootstrap?.tables_truncated)}
-              loadingTables={loadingBootstrap}
-              selectedTable={selectedTable}
-              onSelectTable={selectTable}
-              loadTable={loadFullTextTable}
-              loadWorkflows={loadWorkflowOverview}
-            />
+            {explorerTab === "connections" && who.profile ? (
+              <ConnectionExplorer
+                currentProfile={who.profile}
+                allProfiles={sessionProfilesList.length > 0 ? sessionProfilesList : [who.profile]}
+                user={who.user}
+                database={who.database}
+                readConsistency={readMode}
+                onRequestSwitchServer={onRequestSwitchServer}
+                recentConnections={recentConnections}
+                onSelectRecent={(recent) => {
+                  if (onRequestSwitchServer) onRequestSwitchServer(recent.profileId);
+                }}
+                onClearRecents={clearRecentConnections}
+                onOpenHome={() => setConnectionsModalOpen(true)}
+              />
+            ) : (
+              <>
+                <Input
+                  id="studio-table-filter"
+                  label="Filter tables"
+                  size="sm"
+                  value={filter}
+                  onChange={(event) => setFilter(event.currentTarget.value)}
+                  placeholder="Table name"
+                />
+                <SchemaTree
+                  tables={visibleTables}
+                  totalTables={allTables.length}
+                  filterActive={filter.trim().length > 0}
+                  tablesTruncated={Boolean(bootstrap?.tables_truncated)}
+                  loadingTables={loadingBootstrap}
+                  selectedTable={selectedTable}
+                  onSelectTable={selectTable}
+                  loadTable={loadFullTextTable}
+                  loadWorkflows={loadWorkflowOverview}
+                />
+              </>
+            )}
           </CardBody>
         </Card>
         ) : null}
@@ -2287,27 +2551,31 @@ export function StudioWorkspace({
                 ariaLabel="SQL suggestions"
                 side="bottom"
                 align="start"
-                trigger={<Button variant="outline" size="sm" icon={<Icon name="search" size={14} />} onClick={openSuggest}>Suggest</Button>}
+                trigger={<Button variant="outline" size="sm" icon={<Icon name="search" size={14} />} onClick={openSuggest} title="SQL suggestions & autocompletion (Ctrl+Space)">Suggest</Button>}
               >
                 <PopoverContent className="nss-suggest-panel">
                   <Stack gap="sm">
                     <Text size="sm" weight="medium">
-                      {jsonPathContext
-                        ? "Indexed JSON paths"
-                        : nearestContext?.slot === "column"
-                          ? "Vector columns"
-                          : nearestContext?.slot === "metric"
-                            ? "Vector metrics"
-                            : "SQL suggestions"}
+                      {isTableQualifier && qualifierContext
+                        ? `Columns for ${tableAliases.get(qualifierContext.qualifier.toLowerCase()) ?? qualifierContext.qualifier}`
+                        : jsonPathContext
+                          ? "Indexed JSON paths"
+                          : nearestContext?.slot === "column"
+                            ? "Vector columns"
+                            : nearestContext?.slot === "metric"
+                              ? "Vector metrics"
+                              : "SQL suggestions"}
                     </Text>
                     <Text size="xs" variant="muted">
-                      {jsonPathContext
-                        ? "Native JSON paths that a referenced table has an index on — the only JSON structure the server exposes metadata for."
-                        : nearestContext?.slot === "column"
-                          ? "VECTOR / BITVECTOR / SPARSEVECTOR columns on a referenced table — the only vector metadata the catalog exposes for completion."
-                          : nearestContext?.slot === "metric"
-                            ? "Metrics the NEAREST column's declared type actually accepts. There is no per-element vector metadata to complete inside TO (…)."
-                            : "Catalog table and column names only — no keywords. Ctrl+Space reopens; type to filter, Up/Down/Enter/Esc work without leaving the editor."}
+                      {isTableQualifier && qualifierContext
+                        ? `Columns belonging to ${tableAliases.get(qualifierContext.qualifier.toLowerCase()) ?? qualifierContext.qualifier} (${qualifierContext.qualifier}). Type to filter, Enter to insert.`
+                        : jsonPathContext
+                          ? "Native JSON paths that a referenced table has an index on — the only JSON structure the server exposes metadata for."
+                          : nearestContext?.slot === "column"
+                            ? "VECTOR / BITVECTOR / SPARSEVECTOR columns on a referenced table — the only vector metadata the catalog exposes for completion."
+                            : nearestContext?.slot === "metric"
+                              ? "Metrics the NEAREST column's declared type actually accepts. There is no per-element vector metadata to complete inside TO (…)."
+                              : "Catalog tables, columns, relations, functions, and SQL syntax. Ctrl+Space reopens; type to filter, Up/Down/Enter/Esc work without leaving the editor."}
                     </Text>
                     <ul id="studio-suggest-listbox" role="listbox" aria-label="SQL suggestions" className="nss-suggest-list">
                       {suggestions.length === 0 ? (
@@ -2322,23 +2590,23 @@ export function StudioWorkspace({
                             className={`nss-suggest-option${index === activeSuggestionIndex ? " nss-suggest-option-active" : ""}`}
                             onClick={() => acceptSuggestion(suggestion)}
                           >
-                            <Badge variant={suggestion.kind === "table" ? "info" : "muted"} size="sm">
-                              {suggestion.kind === "table"
-                                ? "Table"
-                                : suggestion.kind === "json-path"
-                                  ? "JSON path"
-                                  : suggestion.kind === "vector-column"
-                                    ? "Vector"
-                                    : suggestion.kind === "vector-metric"
-                                      ? "Metric"
-                                      : "Column"}
-                            </Badge>
-                            <span>{suggestion.label}</span>
+                            <div className="nss-suggest-item">
+                              <div className="nss-suggest-main">
+                                <Badge variant={getBadgeVariant(suggestion.kind)} size="sm">
+                                  {getBadgeLabel(suggestion.kind)}
+                                </Badge>
+                                <span className="nss-suggest-label">{suggestion.label}</span>
+                              </div>
+                              {suggestion.detail ? (
+                                <span className="nss-suggest-detail">{suggestion.detail}</span>
+                              ) : null}
+                            </div>
                           </li>
                         ))
                       )}
                     </ul>
-                    {referencedTables.some((table) => tableColumnsCache[table] === "loading") ? (
+                    {referencedTables.some((table) => tableColumnsCache[table] === "loading") ||
+                    (qualifierContext && tableColumnsCache[tableAliases.get(qualifierContext.qualifier.toLowerCase()) ?? qualifierContext.qualifier] === "loading") ? (
                       <Text size="xs" variant="muted">
                         {jsonPathContext
                           ? "Loading index metadata…"
@@ -2592,7 +2860,41 @@ export function StudioWorkspace({
                       <Text as="span" size="sm">
                         {`"${fix.badName}" doesn't match any table you can see.`}
                       </Text>
+                      {fix.occurrences.length > 0 ? (
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          onClick={() => jumpToSpan(fix.occurrences[0].start, fix.occurrences[0].end)}
+                        >
+                          Go to error
+                        </Button>
+                      ) : null}
                       <Button variant="outline" size="sm" onClick={() => applyFix(fix)}>
+                        {`Use "${fix.suggestion}" instead`}
+                      </Button>
+                    </Inline>
+                  </Alert>
+                ))}
+              </div>
+            ) : null}
+            {columnFixes.length > 0 ? (
+              <div className="nss-column-fixes" aria-live="polite">
+                {columnFixes.map((fix) => (
+                  <Alert key={`${fix.tableName}-${fix.badName}`} variant="warning" title="Column not found">
+                    <Inline gap="sm" align="center" wrap>
+                      <Text as="span" size="sm">
+                        {`"${fix.badName}" doesn't match any column on "${fix.tableName}".`}
+                      </Text>
+                      {fix.occurrences.length > 0 ? (
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          onClick={() => jumpToSpan(fix.occurrences[0].start, fix.occurrences[0].end)}
+                        >
+                          Go to error
+                        </Button>
+                      ) : null}
+                      <Button variant="outline" size="sm" onClick={() => applyColFix(fix)}>
                         {`Use "${fix.suggestion}" instead`}
                       </Button>
                     </Inline>
@@ -2746,11 +3048,54 @@ export function StudioWorkspace({
                     <Text size="sm" variant="muted">Ready</Text>
                   )}
                 </div>
-                {queryError ? (
-                  <Alert variant={queryError === "Query canceled." ? "info" : "error"} title={queryError === "Query canceled." ? "Query canceled" : "Query failed"} role="alert">
-                    {queryError}
-                  </Alert>
-                ) : null}
+                {queryError ? (() => {
+                  const parsedBinderErr = parseBinderErrorMessage(queryError);
+                  const spans = parsedBinderErr ? findIdentifierSpansInSQL(activeTab.sql, parsedBinderErr.name) : [];
+                  let suggestion: string | null = null;
+                  if (parsedBinderErr?.kind === "unknown-table") {
+                    const fix = suggestTableNameFixes(activeTab.sql, catalogTableNames, false).find((f) => f.badName.toLowerCase() === parsedBinderErr.name.toLowerCase());
+                    suggestion = fix?.suggestion ?? null;
+                  } else if (parsedBinderErr?.kind === "unknown-column") {
+                    const fix = columnFixes.find((f) => f.badName.toLowerCase() === parsedBinderErr.name.toLowerCase());
+                    suggestion = fix?.suggestion ?? null;
+                  }
+                  return (
+                    <Alert
+                      variant={queryError === "Query canceled." ? "info" : "error"}
+                      title={queryError === "Query canceled." ? "Query canceled" : "Query failed"}
+                      role="alert"
+                    >
+                      <Inline gap="sm" align="center" wrap>
+                        <Text as="span">{queryError}</Text>
+                        {spans.length > 0 ? (
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            onClick={() => jumpToSpan(spans[0].start, spans[0].end)}
+                          >
+                            {`Go to "${parsedBinderErr!.name}"`}
+                          </Button>
+                        ) : null}
+                        {suggestion && spans.length > 0 ? (
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            onClick={() => {
+                              let updated = activeTab.sql;
+                              for (const sp of [...spans].sort((a, b) => b.start - a.start)) {
+                                updated = updated.slice(0, sp.start) + suggestion + updated.slice(sp.end);
+                              }
+                              setSQL(updated);
+                              updateTab(activeTab.id, { queryError: null });
+                            }}
+                          >
+                            {`Use "${suggestion}" instead`}
+                          </Button>
+                        ) : null}
+                      </Inline>
+                    </Alert>
+                  );
+                })() : null}
                 {result?.truncated ? (
                   <Alert variant="warning" title="Result preview truncated">
                     Studio canceled and closed the result stream after its 5,000-row or 8 MiB preview limit.
@@ -2905,6 +3250,12 @@ export function StudioWorkspace({
                   <Heading id="studio-statistics-title" as="h3" size="xs">Statistics</Heading>
                   {(detail.table_stats?.rows?.length ?? 0) > 0 || (detail.index_stats?.rows?.length ?? 0) > 0 ? (
                     <Stack gap="sm">
+                      <Text size="xs" variant="muted">
+                        Row count is the rows visible right now; analyzed rows is the planner's last
+                        ANALYZE snapshot. Index entry count is what the index itself holds, so a
+                        partial index reports fewer entries than the table has rows, and a full-text
+                        or vector index reports none.
+                      </Text>
                       {(detail.table_stats?.rows?.length ?? 0) > 0 ? (
                         <ResultGrid result={detail.table_stats} label={`${detail.name} table statistics`} />
                       ) : null}
@@ -2914,7 +3265,7 @@ export function StudioWorkspace({
                     </Stack>
                   ) : (
                     <Text size="sm" variant="muted">
-                      No statistics recorded yet. Run ANALYZE on this table to populate row-count estimates.
+                      No row count is available for this table.
                     </Text>
                   )}
                 </section>
@@ -3150,10 +3501,28 @@ export function StudioWorkspace({
         <ImportExplorer
           onClose={() => setImportOpen(false)}
           onInsert={setSQL}
+          onSwitchToStreamingImport={() => setStreamingImportOpen(true)}
           tables={allTables}
           initialTable={selectedTable}
           initialDetail={detail}
           loadTable={loadFullTextTable}
+        />
+      ) : null}
+      {streamingImportOpen ? (
+        <StreamingImportExplorer
+          onClose={() => setStreamingImportOpen(false)}
+          onSuccess={(tableName) => {
+            void loadFullTextTable(tableName);
+            if (selectedTable === tableName) {
+              void executeQuery(activeTabId, `SELECT * FROM ${tableName} LIMIT 50;`, false);
+            }
+          }}
+          tables={allTables}
+          initialTable={selectedTable}
+          initialDetail={detail}
+          loadTable={loadFullTextTable}
+          readOnly={readOnlyMode}
+          isProduction={who.profile?.environment === "production"}
         />
       ) : null}
       {vectorImportOpen ? (
@@ -3185,6 +3554,50 @@ export function StudioWorkspace({
           initialDetail={detail}
           loadTable={loadFullTextTable}
           initialMode={schemaDesignerMode}
+        />
+      ) : null}
+      {schemaDiffOpen ? (
+        <SchemaDiffExplorer
+          onClose={() => setSchemaDiffOpen(false)}
+          onInsert={setSQL}
+          tables={allTables}
+          initialTable={selectedTable}
+          initialDetail={detail}
+          loadTable={loadFullTextTable}
+        />
+      ) : null}
+      {benchmarkViewerOpen ? (
+        <BenchmarkViewer
+          onClose={() => setBenchmarkViewerOpen(false)}
+        />
+      ) : null}
+      {connectionsModalOpen && who.profile ? (
+        <RecentConnectionsModal
+          open={connectionsModalOpen}
+          onClose={() => setConnectionsModalOpen(false)}
+          currentProfile={who.profile}
+          allProfiles={sessionProfilesList.length > 0 ? sessionProfilesList : [who.profile]}
+          user={who.user}
+          database={who.database}
+          tableCount={allTables.length}
+          savedQueriesCount={savedQueries.length}
+          hasDrafts={tabs.length > 1 || Boolean(tabs[0]?.sql && tabs[0]?.sql !== DEFAULT_SQL)}
+          recentConnections={recentConnections}
+          onClearRecents={clearRecentConnections}
+          onRequestSwitchServer={onRequestSwitchServer}
+          onNewTab={addTab}
+          onOpenSavedQueries={() => setSavedOpen(true)}
+          onOpenSearchObjects={openObjectSearch}
+          onOpenSchemaDesigner={() => {
+            setSchemaDesignerMode("table");
+            setSchemaDesignerOpen(true);
+          }}
+          onOpenImport={() => setImportOpen(true)}
+          onOpenStreamingImport={() => setStreamingImportOpen(true)}
+          onOpenSchemaDiagram={() => setSchemaDiagramOpen(true)}
+          onOpenDataGenerator={() => setDataGeneratorOpen(true)}
+          onOpenSchemaDiff={() => setSchemaDiffOpen(true)}
+          onOpenBenchmarkViewer={() => setBenchmarkViewerOpen(true)}
         />
       ) : null}
     </Stack>

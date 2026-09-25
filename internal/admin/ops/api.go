@@ -965,24 +965,82 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 // writeBundleError renders a failed required-query from a read-model bundle.
 // An authorization failure is the operator's own RBAC, surfaced honestly.
 func writeBundleError(w http.ResponseWriter, err error) {
+	status := http.StatusBadGateway
+	if nerr.HasCode(err, nerr.Unauthorized) {
+		status = http.StatusForbidden
+	}
+	// A dead connection is not a fact about the table the bundle happened to
+	// be reading when it noticed; naming one would send an operator looking
+	// at the wrong thing.
+	if isTransportFailure(err) {
+		writeError(w, status, unreachableMessage)
+		return
+	}
 	source := "system.*"
 	var be *bundleError
 	if errors.As(err, &be) {
 		source = "system." + be.source
 	}
-	status := http.StatusBadGateway
-	if nerr.HasCode(err, nerr.Unauthorized) {
-		status = http.StatusForbidden
-	}
 	writeError(w, status, "querying "+source+": "+userError(err))
 }
 
+// unreachableMessage is what an operator is told when the nextsqld
+// connection failed at the transport. The underlying error names an internal
+// framing routine and carries both ends of the TCP connection; neither is
+// actionable, and the ephemeral local port is not something Admin ever means
+// to publish. The connection's own address stays available on
+// GET /api/v1/connection, which reports it deliberately.
+const unreachableMessage = "cannot reach nextsqld: the database server closed this connection or is not responding. Check that it is running, then sign in again or switch servers."
+
+// transportOps are the nerr operations that can only fail on the wire
+// between Admin and nextsqld. The error code alone cannot carry this
+// distinction: a server-side disk fault also arrives as nerr.IO, and
+// collapsing that into "cannot reach nextsqld" would point the operator at
+// the wrong subsystem.
+var transportOps = map[string]bool{
+	"protocol.ReadFrame":  true,
+	"protocol.WriteFrame": true,
+	"nextsql.Open":        true,
+	"nextsql.OpenCluster": true,
+}
+
+// isTransportFailure walks the nerr chain because the framing error is
+// wrapped by the driver call that noticed it.
+func isTransportFailure(err error) bool {
+	for err != nil {
+		var ne *nerr.Error
+		if !errors.As(err, &ne) {
+			return false
+		}
+		if transportOps[ne.Op] {
+			return true
+		}
+		err = ne.Err
+	}
+	return false
+}
+
+// socketPair matches the "tcp 127.0.0.1:44496->127.0.0.1:7310" shape Go's
+// net package puts in an OpError. Redacting it is defense in depth for the
+// paths that legitimately report a non-transport error whose cause still
+// happens to carry a socket, and matches how this deployment handles
+// addresses everywhere else it reports them (system.replication.leader_addr
+// is "[redacted]").
+var socketPair = regexp.MustCompile(`\btcp[46]?\s+\S+:\d+->\S+:\d+`)
+
+func redactSockets(s string) string {
+	return socketPair.ReplaceAllString(s, "tcp [redacted]")
+}
+
 func userError(err error) string {
+	if isTransportFailure(err) {
+		return unreachableMessage
+	}
 	var ne *nerr.Error
 	if errors.As(err, &ne) {
-		return ne.Error()
+		return redactSockets(ne.Error())
 	}
-	return err.Error()
+	return redactSockets(err.Error())
 }
 
 func loginErrorStatus(err error) (int, string) {

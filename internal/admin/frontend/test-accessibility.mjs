@@ -125,6 +125,17 @@ async function testSetupMode() {
     if (url.pathname === "/api/v1/service") {
       return json(response, 200, { supported: false, scope: "", unitFound: false, configPath: "", enabled: false, active: false });
     }
+    if (url.pathname === "/api/v1/firewall") {
+      return json(response, 200, {
+        supported: true,
+        elevated: false,
+        detected: "ufw",
+        active: true,
+        port: 7210,
+        ruleCommand: "ufw allow 7210/tcp",
+        sudoCommand: "sudo ufw allow 7210/tcp",
+      });
+    }
     json(response, 404, { error: "not found" });
   }, async (browser) => {
     await browser.waitFor("document.getElementById('installer-step-title')?.textContent === 'NextSQL Setup'", "the Setup welcome view");
@@ -169,6 +180,17 @@ async function testSetupRecoveryKeyFlow() {
     }
     if (url.pathname === "/api/v1/service") {
       return json(response, 200, { supported: false, scope: "", unitFound: false, configPath: "", enabled: false, active: false });
+    }
+    if (url.pathname === "/api/v1/firewall") {
+      return json(response, 200, {
+        supported: true,
+        elevated: false,
+        detected: "ufw",
+        active: true,
+        port: 7210,
+        ruleCommand: "ufw allow 7210/tcp",
+        sudoCommand: "sudo ufw allow 7210/tcp",
+      });
     }
     // A real listing, because an empty one puts @bzync/rui's Autocomplete
     // into its "no matches" empty row, whose own markup fails axe (a
@@ -453,18 +475,18 @@ async function testOperateMode() {
     elapsed_ms: 1,
   };
   const studioTableStats = {
-    columns: ["table_name", "row_count", "updated_at"],
-    column_types: ["STRING", "INT64", "TIMESTAMPTZ"],
-    rows: [["articles", "1284", "2026-09-05T09:00:00Z"]],
+    columns: ["table_name", "row_count", "analyzed_rows", "updated_at"],
+    column_types: ["STRING", "DECIMAL", "DECIMAL", "STRING"],
+    rows: [["articles", "1284", "1200", ""]],
     truncated: false,
     elapsed_ms: 1,
   };
   const studioIndexStats = {
-    columns: ["table_name", "index_name", "row_count"],
-    column_types: ["STRING", "STRING", "INT64"],
+    columns: ["table_name", "index_name", "index_kind", "entry_count", "row_count"],
+    column_types: ["STRING", "STRING", "STRING", "DECIMAL", "DECIMAL"],
     rows: [
-      ["articles", "PRIMARY", "1284"],
-      ["articles", "ix_articles_text", "1284"],
+      ["articles", "PRIMARY", "BTREE", "1284", "1284"],
+      ["articles", "ix_articles_text", "FULLTEXT", null, "1284"],
     ],
     truncated: false,
     elapsed_ms: 1,
@@ -2244,6 +2266,26 @@ async function testOperateMode() {
     assert.equal(await clickDialogButton("Close"), true, "Close should dismiss the Schema relationships explorer");
     await browser.waitFor("document.querySelector('[role=dialog]') === null", "the Schema relationships explorer to close");
 
+    // Schema Diff: compares table schemas, inspects drift, and generates
+    // non-destructive migration DDL for review.
+    assert.equal(await clickMoreItem("Schema diff…"), true, "the Schema diff control should be available");
+    await browser.waitFor("document.querySelector('[role=dialog] h2')?.textContent.includes('Schema Diff')", "the schema diff explorer to open");
+    await browser.waitFor("document.querySelector('[role=dialog] .nss-diff-summary-bar') !== null", "the diff summary to render");
+    await runAxe(browser, axe.source, "Studio Schema Diff Explorer");
+    assert.equal(await clickDialogButton("Close"), true, "Close should dismiss the Schema Diff explorer");
+    await browser.waitFor("document.querySelector('[role=dialog]') === null", "the Schema Diff explorer to close");
+
+    // Benchmark Viewer: nextsql-bench results viewer and run comparison
+    assert.equal(await clickMoreItem("Benchmark viewer…"), true, "the Benchmark viewer control should be available");
+    await browser.waitFor("document.querySelector('[role=dialog] h2')?.textContent.includes('Benchmark')", "the benchmark viewer to open");
+    await browser.waitFor("document.querySelector('[role=dialog] .nss-bench-summary-bar') !== null", "the benchmark summary to render");
+    await runAxe(browser, axe.source, "Studio Benchmark Viewer (comparison mode)");
+    assert.equal(await clickDialogButton("Single Run View"), true, "switching to single run view should succeed");
+    await browser.waitFor("document.querySelector('[role=dialog] .nss-bench-hw-grid') !== null", "the hardware details to render in single run view");
+    await runAxe(browser, axe.source, "Studio Benchmark Viewer (single run view)");
+    assert.equal(await clickDialogButton("Close"), true, "Close should dismiss the Benchmark viewer");
+    await browser.waitFor("document.querySelector('[role=dialog]') === null", "the Benchmark viewer to close");
+
     // Data generator: builds INSERT statements of synthetic rows from the
     // authorized column metadata and loads them into the editor. It never
     // executes anything; a NOT NULL column with no default cannot be skipped;
@@ -2296,6 +2338,21 @@ async function testOperateMode() {
       "Insert should replace the active tab with the INSERT script built from the CSV",
     );
     assert.equal(streamCalls, callsBeforeImport, "importing must not execute anything");
+
+    // Streaming bulk import: streams chunked batches into the target table
+    // with pre-validation, accessible progress bar, and transactional rollback.
+    assert.equal(await clickMoreItem("Streaming bulk import…"), true, "the Streaming bulk import control should be available");
+    await browser.waitFor("document.querySelector('[role=dialog] h2')?.textContent === 'Streaming bulk import'", "the streaming bulk import modal to open");
+    await browser.evaluate(`(() => {
+      const el = document.getElementById('bulk-import-source');
+      const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set;
+      setter.call(el, 'id,title,body\\n1,First post,Hello world\\n2,Second post,More text');
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+    })()`);
+    await browser.waitFor("document.querySelector('[role=dialog]')?.textContent.includes('Ready to stream 2 rows across 1 batches')", "the ready status to render");
+    await runAxe(browser, axe.source, "Studio streaming bulk import (ready)");
+    assert.equal(await clickDialogButton("Cancel"), true, "the streaming import modal should close on Cancel");
+    await browser.waitFor("document.querySelector('[role=dialog]') === null", "the streaming bulk import modal to close");
 
     // Parameterized DML: builds a positional-parameter ($1..$N) INSERT /
     // UPDATE / DELETE template for the table from authorized column metadata
@@ -2745,6 +2802,21 @@ async function testOperateMode() {
     );
     await browser.waitFor("document.body.textContent.includes('No saved queries yet.')", "the saved query list to empty after delete");
     await browser.press("Escape");
+
+    // Connection explorer: toggle in the explorer header switches the sidebar
+    // between the schema tree and active connection / recent profile details.
+    assert.equal(await clickButton("Connections"), true, "the Connections toggle in the explorer header should be clickable");
+    await browser.waitFor("document.body.textContent.includes('Connection explorer')", "the connection explorer to mount");
+    await runAxe(browser, axe.source, "Studio Connection Explorer");
+    assert.equal(await clickButton("Tables"), true, "the Tables toggle in the explorer header should be clickable");
+    await browser.waitFor("document.body.textContent.includes('Database explorer')", "the database explorer to restore");
+
+    // Recent connections & project tools modal: opened via the toolbar button.
+    assert.equal(await clickButtonStartingWith("Connections"), true, "the Connections… toolbar button should be clickable");
+    await browser.waitFor("document.body.textContent.includes('Connections & Recent Projects')", "the recent connections modal to open");
+    await runAxe(browser, axe.source, "Studio Recent Connections and Projects modal");
+    assert.equal(await clickDialogButton("Close"), true, "the Close button in the modal should close it");
+    await browser.waitFor("document.body.textContent.includes('Connections & Recent Projects') === false", "the recent connections modal to close");
 
     // Crash recovery: the editor buffer is mirrored to localStorage and
     // rehydrated on reload, with a dismissable "restored" notice.

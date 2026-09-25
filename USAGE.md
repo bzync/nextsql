@@ -1,13 +1,13 @@
 # NextSQL usage manual
 
-Operator and application guide for **NextSQL 0.0.4**.
+Operator and application guide for **NextSQL 0.0.5**.
 
 NextSQL is a native, encrypted-by-default multimodel database. It is not
 PostgreSQL, MySQL, MongoDB, Elasticsearch, or a vector-store compatibility
 layer. It has its own storage format, SQL dialect, wire protocol (NSQL v1),
 and official drivers.
 
-0.0.4 is a preview. Before you rely on it, run `nextsql-bench --slo` and the
+0.0.5 is a preview. Before you rely on it, run `nextsql-bench --slo` and the
 crash, recovery, security, and HA suites on your hardware.
 
 Internal design notes live in [`docs/`](docs/). The product site is
@@ -2165,7 +2165,7 @@ for filtering, ordering, or pagination. Full reference:
 Additional admin-only operational tables back the completed Manager MVP:
 `system.users`, `roles`, `grants`, `tls`, `key_versions`, `audit_verify`,
 `audit_log`, `config`, `metrics`, `server_log`, and `backups`. The current
-column-contract capability is `system_schema_v4`. Process-level sources such
+column-contract capability is `system_schema_v5`. Process-level sources such
 as TLS/config/log/metrics/backups are still attached only to the primary DB in
 multi-database hosting mode; a secondary manager-opened database may therefore
 return an empty/not-attached view for those process-wide sources.

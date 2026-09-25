@@ -3,6 +3,8 @@ package executor
 import (
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -68,7 +70,7 @@ func TestSystemCapabilities(t *testing.T) {
 	for _, r := range res.Rows {
 		caps[r[0].Str] = r
 	}
-	for _, name := range []string{"partitions_range", "partitions_hash", "partitions_list", "system_schema_v4", "system_show_aliases"} {
+	for _, name := range []string{"partitions_range", "partitions_hash", "partitions_list", "system_schema_v5", "system_show_aliases"} {
 		row, ok := caps[name]
 		if !ok || row[1].Str != "supported" {
 			t.Fatalf("capability %q = %v, want supported", name, row)
@@ -174,11 +176,17 @@ func TestSystemTablesAndColumns(t *testing.T) {
 	if len(res.Rows) != 1 {
 		t.Fatal("storage")
 	}
-	if res.Columns[6] != "encryption" {
+	encAt := -1
+	for i, c := range res.Columns {
+		if c == "encryption" {
+			encAt = i
+		}
+	}
+	if encAt < 0 {
 		t.Fatalf("enc col %v", res.Columns)
 	}
-	if res.Rows[0][6].Str != "enabled" {
-		t.Fatalf("enc val %q", res.Rows[0][6].Str)
+	if res.Rows[0][encAt].Str != "enabled" {
+		t.Fatalf("enc val %q", res.Rows[0][encAt].Str)
 	}
 	if res.Rows[0][0].Str != "default" || contains(res.Rows[0][0].Str, dir) {
 		t.Fatalf("database name leaked storage path: %q", res.Rows[0][0].Str)
@@ -249,7 +257,7 @@ func TestSystemShowAliases(t *testing.T) {
 		{`SHOW TRANSACTIONS`, `SELECT * FROM system.transactions`, []string{"txn_id", "user", "isolation", "state"}},
 		{`SHOW LOCKS`, `SELECT * FROM system.locks`, []string{"lock_id", "table_name", "mode", "granted"}},
 		{`SHOW CLUSTER`, `SELECT * FROM system.replication`, []string{"node_id", "state", "leader_id", "leader_addr", "voters", "applied_lsn", "has_leader", "maintenance_mode"}},
-		{`SHOW STORAGE`, `SELECT * FROM system.storage`, []string{"database", "engine", "page_size", "page_count", "file_size", "wal_lsn", "encryption"}},
+		{`SHOW STORAGE`, `SELECT * FROM system.storage`, []string{"database", "engine", "page_size", "page_count", "free_pages", "file_size", "wal_lsn", "encryption"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.show, func(t *testing.T) {
@@ -448,6 +456,317 @@ func TestSystemCatalogRBACRemainingViews(t *testing.T) {
 		if len(aliceRes.Rows) != 0 {
 			t.Fatalf("alice should see no rows in %s, got %v", view, aliceRes.Rows)
 		}
+	}
+}
+
+func TestSystemTableStatsRowCountMatchesVisibleRows(t *testing.T) {
+	db := testDB(t)
+	s := db.Session()
+	execOK(t, s, `CREATE TABLE stats_rows (id STRING PRIMARY KEY, n STRING NOT NULL)`)
+	execOK(t, s, `CREATE INDEX ix_stats_n ON stats_rows (n)`)
+	execOK(t, s, `INSERT INTO stats_rows (id, n) VALUES ('a','1'), ('b','2'), ('c','3')`)
+
+	got := execOK(t, s, `SELECT row_count FROM system.table_stats WHERE table_name = 'stats_rows'`)
+	if len(got.Rows) != 1 || got.Rows[0][0].Dec.String() != "3" {
+		t.Fatalf("row_count after insert = %v", got.Rows)
+	}
+	if s.InTxn() {
+		t.Fatal("statistics read left a transaction open")
+	}
+	idx := execOK(t, s, `SELECT row_count FROM system.index_stats WHERE index_name = 'ix_stats_n'`)
+	if len(idx.Rows) != 1 || idx.Rows[0][0].Dec.String() != "3" {
+		t.Fatalf("index row_count = %v", idx.Rows)
+	}
+
+	execOK(t, s, `ANALYZE stats_rows`)
+	execOK(t, s, `DELETE FROM stats_rows WHERE id = 'b'`)
+	got = execOK(t, s, `SELECT row_count FROM system.table_stats WHERE table_name = 'stats_rows'`)
+	count := execOK(t, s, `SELECT COUNT(*) FROM stats_rows`)
+	if got.Rows[0][0].Dec.String() != "2" || count.Rows[0][0].Dec.String() != got.Rows[0][0].Dec.String() {
+		t.Fatalf("after delete stats=%s count=%s", got.Rows[0][0].Dec.String(), count.Rows[0][0].Dec.String())
+	}
+
+	execOK(t, s, `BEGIN`)
+	execOK(t, s, `INSERT INTO stats_rows (id, n) VALUES ('d','4')`)
+	got = execOK(t, s, `SELECT row_count FROM system.table_stats WHERE table_name = 'stats_rows'`)
+	if !s.InTxn() {
+		t.Fatal("statistics read closed the caller's transaction")
+	}
+	if len(got.Rows) != 1 || got.Rows[0][0].Dec.String() != "3" {
+		t.Fatalf("uncommitted insert not visible in row_count: %v", got.Rows)
+	}
+	execOK(t, s, `ROLLBACK`)
+	got = execOK(t, s, `SELECT row_count FROM system.table_stats WHERE table_name = 'stats_rows'`)
+	if len(got.Rows) != 1 || got.Rows[0][0].Dec.String() != "2" {
+		t.Fatalf("row_count after rollback = %v", got.Rows)
+	}
+}
+
+// TestSystemIndexStatsEntryCountIsTheIndexNotTheTable pins the distinction the
+// old column got wrong: a partial index holds strictly fewer entries than its
+// table has rows, and a full-text or vector index holds entries that are not
+// rows at all, so reporting either as a row count misleads the reader.
+func TestSystemIndexStatsEntryCountIsTheIndexNotTheTable(t *testing.T) {
+	db := testDB(t)
+	s := db.Session()
+	execOK(t, s, `CREATE TABLE idx_kinds (id STRING PRIMARY KEY, n INT64 NOT NULL, body TEXT, v VECTOR<F32,3>, g POINT)`)
+	execOK(t, s, `CREATE INDEX ix_all ON idx_kinds (n)`)
+	execOK(t, s, `CREATE INDEX ix_high ON idx_kinds (n) WHERE n > 5`)
+	execOK(t, s, `CREATE FULLTEXT INDEX ix_body ON idx_kinds (body)`)
+	execOK(t, s, `CREATE VECTOR INDEX ix_v ON idx_kinds (v) USING HNSW`)
+	execOK(t, s, `CREATE SPATIAL INDEX ix_g ON idx_kinds (g)`)
+	for i := 0; i < 10; i++ {
+		execOK(t, s, fmt.Sprintf(
+			`INSERT INTO idx_kinds (id, n, body, v, g) VALUES ('r%d', %d, 'alpha beta %d', (1.0,2.0,%d.0), POINT(%d.0, 1.0))`,
+			i, i, i, i, i))
+	}
+	// Ground truth for the partial index's predicate.
+	above := execOK(t, s, `SELECT COUNT(*) FROM idx_kinds WHERE n > 5`)
+	if above.Rows[0][0].Dec.String() != "4" {
+		t.Fatalf("predicate ground truth = %v, want 4", above.Rows[0][0].Dec.String())
+	}
+
+	rows := execOK(t, s, `SELECT index_name, index_kind, entry_count, row_count FROM system.index_stats WHERE table_name = 'idx_kinds' ORDER BY index_name`)
+	got := map[string][3]string{}
+	for _, r := range rows.Rows {
+		entry := "NULL"
+		if !r[2].Null {
+			entry = r[2].Dec.String()
+		}
+		got[r[0].Str] = [3]string{r[1].Str, entry, r[3].Dec.String()}
+	}
+	want := map[string][3]string{
+		"ix_all":  {"BTREE", "10", "10"},
+		"ix_high": {"PARTIAL", "4", "10"},
+		"ix_body": {"FULLTEXT", "NULL", "10"},
+		"ix_v":    {"VECTOR", "NULL", "10"},
+		"ix_g":    {"SPATIAL", "10", "10"},
+	}
+	for name, w := range want {
+		if got[name] != w {
+			t.Errorf("index %s = kind/entry/row %v, want %v", name, got[name], w)
+		}
+	}
+
+	// A delete that the predicate excludes moves the table but not the index.
+	execOK(t, s, `DELETE FROM idx_kinds WHERE n = 0`)
+	rows = execOK(t, s, `SELECT entry_count, row_count FROM system.index_stats WHERE index_name = 'ix_high'`)
+	if rows.Rows[0][0].Dec.String() != "4" || rows.Rows[0][1].Dec.String() != "9" {
+		t.Fatalf("after excluded delete entry=%s row=%s, want 4 and 9",
+			rows.Rows[0][0].Dec.String(), rows.Rows[0][1].Dec.String())
+	}
+	// A delete the predicate covers moves both.
+	execOK(t, s, `DELETE FROM idx_kinds WHERE n = 9`)
+	rows = execOK(t, s, `SELECT entry_count, row_count FROM system.index_stats WHERE index_name = 'ix_high'`)
+	if rows.Rows[0][0].Dec.String() != "3" || rows.Rows[0][1].Dec.String() != "8" {
+		t.Fatalf("after covered delete entry=%s row=%s, want 3 and 8",
+			rows.Rows[0][0].Dec.String(), rows.Rows[0][1].Dec.String())
+	}
+}
+
+// TestSystemStorageReportsMeasuredFigures pins system.storage to the file it
+// describes. page_count and file_size used to be derived from the number of
+// catalog tables (tables*2+1 pages, and that count times the page size), so a
+// preallocating deployment reported a fraction of the disk it actually held —
+// the figure an operator sizes a volume against.
+func TestSystemStorageReportsMeasuredFigures(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "nextsql.db")
+	db, err := Create(path, testKeys(t), 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	s := db.Session()
+
+	read := func() (pages, free, size uint64) {
+		t.Helper()
+		r := execOK(t, s, `SELECT page_count, free_pages, file_size FROM system.storage`)
+		if len(r.Rows) != 1 {
+			t.Fatalf("system.storage rows = %v", r.Rows)
+		}
+		for i, dst := range []*uint64{&pages, &free, &size} {
+			if r.Rows[0][i].Null {
+				t.Fatalf("column %d is NULL: %v", i, r.Rows[0])
+			}
+			n, perr := strconv.ParseUint(r.Rows[0][i].Dec.String(), 10, 64)
+			if perr != nil {
+				t.Fatalf("column %d = %q: %v", i, r.Rows[0][i].Dec.String(), perr)
+			}
+			*dst = n
+		}
+		return pages, free, size
+	}
+
+	onDisk := func() uint64 {
+		t.Helper()
+		fi, serr := os.Stat(path)
+		if serr != nil {
+			t.Fatal(serr)
+		}
+		return uint64(fi.Size())
+	}
+
+	pages0, _, size0 := read()
+	if size0 != onDisk() {
+		t.Fatalf("file_size = %d, but the file is %d bytes", size0, onDisk())
+	}
+
+	// Adding tables must not be what moves the page count: the old
+	// implementation returned len(tables)*2+1, so four tables read as nine
+	// pages no matter how much data they held.
+	for i := 0; i < 4; i++ {
+		execOK(t, s, fmt.Sprintf(`CREATE TABLE t%d (id STRING PRIMARY KEY, v STRING NOT NULL)`, i))
+	}
+	pages1, _, _ := read()
+	if pages1 == uint64(4*2+1) {
+		t.Fatalf("page_count = %d, which is exactly tables*2+1 — still derived from the catalog", pages1)
+	}
+
+	// Writing real data must grow the high-water mark, and file_size must
+	// keep matching the file.
+	execOK(t, s, `CREATE TABLE bulk (id STRING PRIMARY KEY, v STRING NOT NULL)`)
+	for i := 0; i < 400; i++ {
+		execOK(t, s, fmt.Sprintf(`INSERT INTO bulk (id, v) VALUES ('k%04d', '%s')`, i, strings.Repeat("x", 200)))
+	}
+	pages2, _, size2 := read()
+	if pages2 <= pages1 {
+		t.Fatalf("page_count did not grow with data: %d then %d", pages1, pages2)
+	}
+	if size2 != onDisk() {
+		t.Fatalf("file_size = %d, but the file is %d bytes", size2, onDisk())
+	}
+	if pages2 < pages0 {
+		t.Fatalf("page_count went backwards: %d then %d", pages0, pages2)
+	}
+	// free_pages is reported, and can never exceed the high-water mark.
+	_, free2, _ := read()
+	if free2 > pages2 {
+		t.Fatalf("free_pages %d exceeds page_count %d", free2, pages2)
+	}
+}
+
+// TestSystemIndexStatsOnPartitionedTable covers the path with no global index
+// root: the logical index size is the sum over the partition-local trees, and
+// a partial index still reports only what it holds.
+func TestSystemIndexStatsOnPartitionedTable(t *testing.T) {
+	db := testDB(t)
+	s := db.Session()
+	execOK(t, s, `CREATE TABLE part_rows (
+		region STRING NOT NULL,
+		id STRING NOT NULL,
+		n INT64 NOT NULL,
+		PRIMARY KEY (region, id)
+	) PARTITION BY LIST (region) (
+		PARTITION americas VALUES IN ('us'),
+		PARTITION europe VALUES IN ('eu')
+	)`)
+	execOK(t, s, `CREATE INDEX ix_pn ON part_rows (n)`)
+	execOK(t, s, `CREATE INDEX ix_pn_high ON part_rows (n) WHERE n > 2`)
+	execOK(t, s, `INSERT INTO part_rows (region, id, n) VALUES
+		('us','1',1), ('us','2',3), ('eu','3',4), ('eu','4',2)`)
+
+	// Ground truth: 4 rows overall, 2 of them above the partial predicate,
+	// and both counts straddle the two partitions.
+	total := execOK(t, s, `SELECT COUNT(*) FROM part_rows`)
+	above := execOK(t, s, `SELECT COUNT(*) FROM part_rows WHERE n > 2`)
+	if total.Rows[0][0].Dec.String() != "4" || above.Rows[0][0].Dec.String() != "2" {
+		t.Fatalf("ground truth total=%s above=%s, want 4 and 2",
+			total.Rows[0][0].Dec.String(), above.Rows[0][0].Dec.String())
+	}
+
+	rows := execOK(t, s, `SELECT index_name, index_kind, entry_count, row_count FROM system.index_stats WHERE table_name = 'part_rows' ORDER BY index_name`)
+	got := map[string][3]string{}
+	for _, r := range rows.Rows {
+		entry := "NULL"
+		if !r[2].Null {
+			entry = r[2].Dec.String()
+		}
+		got[r[0].Str] = [3]string{r[1].Str, entry, r[3].Dec.String()}
+	}
+	want := map[string][3]string{
+		"ix_pn":      {"BTREE", "4", "4"},
+		"ix_pn_high": {"PARTIAL", "2", "4"},
+	}
+	for name, w := range want {
+		if got[name] != w {
+			t.Errorf("index %s = kind/entry/row %v, want %v", name, got[name], w)
+		}
+	}
+
+	// The table's own row count sums the partitions too.
+	ts := execOK(t, s, `SELECT row_count FROM system.table_stats WHERE table_name = 'part_rows'`)
+	if ts.Rows[0][0].Dec.String() != "4" {
+		t.Fatalf("partitioned row_count = %v, want 4", ts.Rows[0][0].Dec.String())
+	}
+}
+
+// TestSystemTableStatsAnalyzedRowsTracksPlannerSnapshot covers the signal an
+// operator needs to decide whether ANALYZE is warranted: row_count is live,
+// analyzed_rows is what the planner is actually costing against, and the two
+// diverge exactly when the snapshot has gone stale.
+func TestSystemTableStatsAnalyzedRowsTracksPlannerSnapshot(t *testing.T) {
+	db := testDB(t)
+	s := db.Session()
+	execOK(t, s, `CREATE TABLE drift (id STRING PRIMARY KEY, n STRING NOT NULL)`)
+	execOK(t, s, `INSERT INTO drift (id, n) VALUES ('a','1'), ('b','2')`)
+
+	read := func() (string, string) {
+		t.Helper()
+		r := execOK(t, s, `SELECT row_count, analyzed_rows FROM system.table_stats WHERE table_name = 'drift'`)
+		if len(r.Rows) != 1 {
+			t.Fatalf("table_stats rows = %v", r.Rows)
+		}
+		analyzed := "NULL"
+		if !r.Rows[0][1].Null {
+			analyzed = r.Rows[0][1].Dec.String()
+		}
+		return r.Rows[0][0].Dec.String(), analyzed
+	}
+
+	// ANALYZE has never run: the planner has no snapshot at all.
+	if live, analyzed := read(); live != "2" || analyzed != "NULL" {
+		t.Fatalf("before ANALYZE live=%s analyzed=%s, want 2 and NULL", live, analyzed)
+	}
+	execOK(t, s, `ANALYZE drift`)
+	if live, analyzed := read(); live != "2" || analyzed != "2" {
+		t.Fatalf("after ANALYZE live=%s analyzed=%s, want 2 and 2", live, analyzed)
+	}
+	// Writes drift away from the snapshot without touching it.
+	execOK(t, s, `INSERT INTO drift (id, n) VALUES ('c','3'), ('d','4')`)
+	if live, analyzed := read(); live != "4" || analyzed != "2" {
+		t.Fatalf("drifted live=%s analyzed=%s, want 4 and 2", live, analyzed)
+	}
+	execOK(t, s, `ANALYZE drift`)
+	if live, analyzed := read(); live != "4" || analyzed != "4" {
+		t.Fatalf("re-analyzed live=%s analyzed=%s, want 4 and 4", live, analyzed)
+	}
+}
+
+func TestSystemTableStatsRowCountSurvivesRestartWithoutAnalyze(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "nextsql.db")
+	keys := testKeys(t)
+	db, err := Create(path, keys, 32)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := db.Session()
+	execOK(t, s, `CREATE TABLE stats_rows (id STRING PRIMARY KEY, n STRING NOT NULL)`)
+	execOK(t, s, `INSERT INTO stats_rows (id, n) VALUES ('a','1'), ('b','2'), ('c','3')`)
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err = Open(path, keys, 32)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	s = db.Session()
+	got := execOK(t, s, `SELECT row_count FROM system.table_stats WHERE table_name = 'stats_rows'`)
+	count := execOK(t, s, `SELECT COUNT(*) FROM stats_rows`)
+	if len(got.Rows) != 1 || got.Rows[0][0].Dec.String() != count.Rows[0][0].Dec.String() || got.Rows[0][0].Dec.String() != "3" {
+		t.Fatalf("reopened stats=%v count=%v", got.Rows, count.Rows)
 	}
 }
 

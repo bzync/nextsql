@@ -1,7 +1,7 @@
 # NSQL reference
 
 Companion to `SKILL.md`. Authoritative source is `docs/sql.md` and the
-per-model docs; this is a working summary for the current release (**0.0.4**).
+per-model docs; this is a working summary for the current release (**0.0.5**).
 
 ## Types
 
@@ -155,7 +155,7 @@ Common ones in application code:
 | Workflow body statements / nested depth | 256 / 8 |
 | Wire result / default result rows | 64 MiB / 1 000 000 |
 
-## Not in 0.0.4
+## Not in 0.0.5
 
 - Outer `JOIN` with `SEARCH` / `NEAREST` (inner join is fine when the rank
   column is on the `FROM` table).
@@ -163,8 +163,8 @@ Common ones in application code:
   HNSW works).
 - Partial / expression / JSON-path `UNIQUE` on partitioned tables;
   partitioned-table foreign keys.
-- Searchable or deterministic field-level `ENCRYPTED CLIENT` (randomized
-  `NSCE1.` with Go/JS/PHP helpers exists, labeled experimental).
+- Searchable field-level `ENCRYPTED CLIENT` (randomized `NSCE1.` and
+  deterministic-equality `NSCE2.` with Go/JS/PHP helpers are supported).
 - `ARRAY_AGG` / `MAP_AGG` / `UNNEST`, collection subscript sugar.
 - Multi-primary writes; hosted HA; per-hosted-database backup/PITR addressing.
 

@@ -3,6 +3,7 @@ package executor
 import (
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/bzync/nextsql/internal/catalog"
 	"github.com/bzync/nextsql/internal/executor/aggregate"
@@ -11,6 +12,7 @@ import (
 	"github.com/bzync/nextsql/internal/executor/vector"
 	"github.com/bzync/nextsql/internal/executor/window"
 	"github.com/bzync/nextsql/internal/nerr"
+	"github.com/bzync/nextsql/internal/scheduler"
 	"github.com/bzync/nextsql/internal/sql/ast"
 	"github.com/bzync/nextsql/internal/sql/binder"
 	"github.com/bzync/nextsql/internal/sql/optimizer"
@@ -172,10 +174,15 @@ done:
 			}
 		}
 	} else if agg != nil {
+		// Reset before the operator so the fan-out read back belongs to this
+		// aggregate, not to an earlier parallel step in the same statement.
+		s.budget().ResetFanOut()
+		aggStart := time.Now()
 		rows, err = s.execAggregate(agg, cur)
 		if err != nil {
 			return nil, err
 		}
+		aggElapsed := time.Since(aggStart)
 		if agg.Having != nil {
 			rows, err = s.applyFilter(rows, aggregateResultTable(agg), agg.Having, "Having")
 			if err != nil {
@@ -185,7 +192,17 @@ done:
 		if s.trace != nil {
 			if n := optimizer.Find(s.trace, "Aggregate"); n != nil {
 				n.ActRows = int64(len(rows))
-				n.Workers = s.workers()
+				// Measured, not the configured ceiling: execAggregate has
+				// serial fast paths (a plain COUNT(*) never fans out), which
+				// used to report the full Limits.Workers anyway.
+				n.Workers = s.budget().FanOut()
+				if n.TimeNS == 0 {
+					n.TimeNS = aggElapsed.Nanoseconds()
+				}
+				n.CPUTimeNS = s.budget().WorkNS()
+				if n.CPUTimeNS == 0 {
+					n.CPUTimeNS = n.TimeNS
+				}
 			}
 		}
 	} else {
@@ -303,7 +320,7 @@ done:
 		}
 		s.trace.Spill = s.budget().Disk()
 		if s.trace.Workers == 0 {
-			s.trace.Workers = s.workers()
+			s.trace.Workers = s.budget().FanOut()
 		}
 	}
 	return res, nil
@@ -524,7 +541,7 @@ func (s *Session) parallelProbeCount(htx *btree.Txn, tab *catalog.Table, cols []
 			return err
 		}
 	}
-	if err := s.pool().Run(s.budget().Context(), s.workers(), tasks); err != nil {
+	if err := scheduler.RunTracked(s.pool(), s.budget(), s.workers(), tasks); err != nil {
 		return 0, err
 	}
 	var total int64
@@ -675,7 +692,7 @@ func (s *Session) parallelCount(htx *btree.Txn, splits [][]byte) (int64, error) 
 			return err
 		}
 	}
-	if err := s.pool().Run(s.budget().Context(), s.workers(), tasks); err != nil {
+	if err := scheduler.RunTracked(s.pool(), s.budget(), s.workers(), tasks); err != nil {
 		return 0, err
 	}
 	var total int64
@@ -851,6 +868,9 @@ func (s *Session) streamHeapAggregate(a *planner.Aggregate, tab *catalog.Table) 
 }
 
 func (s *Session) parallelHeapAggregate(a *planner.Aggregate, tab *catalog.Table, htx *btree.Txn, specs []aggregate.Spec, outTy []types.Type, splits [][]byte) ([][]types.Value, error) {
+	// Measure this operator's own fan-out rather than inheriting one from an
+	// earlier parallel step in the same statement.
+	s.budget().ResetFanOut()
 	ranges := splitByteRanges(nil, nil, splits)
 	parts := make([]*aggregate.Hash, len(ranges))
 	acts := make([]int64, len(ranges))
@@ -870,7 +890,7 @@ func (s *Session) parallelHeapAggregate(a *planner.Aggregate, tab *catalog.Table
 			return err
 		}
 	}
-	if err := s.pool().Run(s.budget().Context(), s.workers(), tasks); err != nil {
+	if err := scheduler.RunTracked(s.pool(), s.budget(), s.workers(), tasks); err != nil {
 		for _, h := range parts {
 			if h != nil {
 				h.Close()
@@ -895,7 +915,7 @@ func (s *Session) parallelHeapAggregate(a *planner.Aggregate, tab *catalog.Table
 	if s.trace != nil {
 		if n := optimizer.Find(s.trace, "SeqScan"); n != nil {
 			n.ActRows = act
-			n.Workers = s.workers()
+			n.Workers = s.budget().FanOut()
 		}
 	}
 	raw, err := merged.Finish()
@@ -975,7 +995,7 @@ func (s *Session) partitionWiseHeapAggregate(a *planner.Aggregate, n planner.Seq
 	if w < 1 {
 		w = 1
 	}
-	if err := s.pool().Run(s.budget().Context(), w, tasks); err != nil {
+	if err := scheduler.RunTracked(s.pool(), s.budget(), w, tasks); err != nil {
 		for _, h := range parts {
 			if h != nil {
 				h.Close()
@@ -1524,7 +1544,7 @@ func (s *Session) execJoin(n planner.Join) ([][]types.Value, error) {
 		}
 		if node := optimizer.Find(s.trace, op); node != nil {
 			node.ActRows = int64(len(out))
-			node.Workers = s.workers()
+			node.Workers = s.budget().FanOut()
 		}
 	}
 	return out, nil
@@ -1557,7 +1577,7 @@ func (s *Session) execMarkJoin(n planner.Join, left, right [][]types.Value, sche
 		}
 		if node := optimizer.Find(s.trace, op); node != nil {
 			node.ActRows = int64(len(out))
-			node.Workers = s.workers()
+			node.Workers = s.budget().FanOut()
 		}
 	}
 	return out, nil
@@ -1864,6 +1884,9 @@ func (s *Session) oneRange(htx *btree.Txn, tab *catalog.Table, start, end []byte
 }
 
 func (s *Session) parallelRanges(htx *btree.Txn, tab *catalog.Table, start, end []byte, splits [][]byte, op string, keep rowFilter) ([][]types.Value, error) {
+	// Measure this operator's own fan-out rather than inheriting one from an
+	// earlier parallel step in the same statement.
+	s.budget().ResetFanOut()
 	ranges := make([][2][]byte, 0, len(splits)+1)
 	prev := start
 	for _, k := range splits {
@@ -1911,7 +1934,7 @@ func (s *Session) parallelRanges(htx *btree.Txn, tab *catalog.Table, start, end 
 			return err
 		}
 	}
-	if err := s.pool().Run(s.budget().Context(), s.workers(), tasks); err != nil {
+	if err := scheduler.RunTracked(s.pool(), s.budget(), s.workers(), tasks); err != nil {
 		return nil, err
 	}
 	var all [][]types.Value
@@ -1921,7 +1944,7 @@ func (s *Session) parallelRanges(htx *btree.Txn, tab *catalog.Table, start, end 
 	if s.trace != nil {
 		if n := optimizer.Find(s.trace, op); n != nil {
 			n.ActRows += int64(len(all))
-			n.Workers = s.workers()
+			n.Workers = s.budget().FanOut()
 		}
 	}
 	return all, nil

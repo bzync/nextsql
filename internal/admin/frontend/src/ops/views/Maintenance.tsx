@@ -20,6 +20,7 @@ import {
   Text,
 } from "@bzync/rui";
 import { api, ApiError, type MaintainScope, type ResultSet } from "../api";
+import { describeStaleTables, staleTables } from "../stats";
 import { useReadModel } from "../useReadModel";
 import { ResultTable } from "../ResultTable";
 import { ViewFrame } from "./ViewFrame";
@@ -29,6 +30,7 @@ type PendingAction =
   | { kind: "analyze"; target: string }
   | { kind: "rebuild_index"; target: string; online: boolean }
   | { kind: "maintain"; scope: MaintainScope; target: string };
+
 
 function describeResult(action: PendingAction, res: ResultSet): string {
   const n = res.affected ?? 0;
@@ -276,13 +278,38 @@ export function Maintenance({ onUnauthorized }: { onUnauthorized: () => void }) 
               <ResultTable result={data.tables} empty="No user tables" label="Tables" />
             </TabsContent>
             <TabsContent value="table_stats">
-              <ResultTable result={data.table_stats} empty="No statistics collected yet" label="Table statistics" />
+              <Text size="sm" variant="muted" className="mb-3">
+                Row count is the number of rows visible right now, the same figure as COUNT(*).
+                Analyzed rows is the planner's last ANALYZE snapshot, which is what it costs plans from.
+              </Text>
+              {staleTables(data.table_stats).length > 0 ? (
+                <Alert variant="warning" className="mb-3">
+                  <Stack gap="xs">
+                    <Text size="sm">
+                      The planner's statistics are behind on{" "}
+                      {staleTables(data.table_stats).length} table
+                      {staleTables(data.table_stats).length === 1 ? "" : "s"}. Run ANALYZE so it
+                      stops costing plans against a stale row count.
+                    </Text>
+                    <Text size="xs" variant="muted">
+                      {describeStaleTables(staleTables(data.table_stats))}
+                    </Text>
+                  </Stack>
+                </Alert>
+              ) : null}
+              <ResultTable result={data.table_stats} empty="No tables" label="Table statistics" />
             </TabsContent>
             <TabsContent value="indexes">
               <ResultTable result={data.indexes} empty="No indexes" label="Indexes" />
             </TabsContent>
             <TabsContent value="index_stats">
-              <ResultTable result={data.index_stats} empty="No statistics collected yet" label="Index statistics" />
+              <Text size="sm" variant="muted" className="mb-3">
+                Entry count is what the index itself holds right now, so a partial index reports
+                fewer entries than its table has rows. It is empty for a full-text or vector index,
+                whose entries are terms and graph nodes rather than one per row. Row count is the
+                owning table's visible rows.
+              </Text>
+              <ResultTable result={data.index_stats} empty="No indexes" label="Index statistics" />
             </TabsContent>
           </Tabs>
         </>

@@ -359,8 +359,8 @@ function Drivers() {
 }
 
 function QuickStart() {
-  const steps = `go install github.com/bzync/nextsql/cmd/nextsql@v0.0.1
-go install github.com/bzync/nextsql/cmd/nextsqld@v0.0.1
+  const steps = `go install github.com/bzync/nextsql/cmd/nextsql@v0.0.5
+go install github.com/bzync/nextsql/cmd/nextsqld@v0.0.5
 
 printf 'secret\\n' > /tmp/nextsql.pw && chmod 600 /tmp/nextsql.pw
 
@@ -411,7 +411,7 @@ function Status() {
       <div className="mx-auto max-w-6xl px-4 py-12 sm:px-5 sm:py-16 lg:py-20">
         <p className="kicker">Status</p>
         <h2 className="mt-3 max-w-2xl text-[1.7rem] font-semibold tracking-[-0.025em] sm:text-[2rem]">
-          0.0.1 is a public preview. Run it on your machine.
+          0.0.5 is the current release. Run it on your machine.
         </h2>
         <p className="mt-4 max-w-2xl text-sm leading-6 text-muted">
           One encrypted ACID engine for SQL, JSON, full-text, vectors, and geo —

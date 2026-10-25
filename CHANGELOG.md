@@ -17,9 +17,12 @@ different bits.
 
 ### Security
 
+- Require Go 1.26.10 for source builds and pin the container compiler to Go
+  1.27.3, incorporating the `crypto/x509` fix for CVE-2026-111943 found by the
+  post-merge image scan. CI and native release builds use the module minimum.
 - Remove ambiguous repetition from the Studio SQL-reference generator's Go
   case-label regex (CodeQL #94), with timeout-protected malformed-input tests.
-- Patch the docs site's Next.js and matching ESLint configuration to 16.4.1;
+- Patch the docs site's Next.js and matching ESLint configuration to 16.4.2;
   update sharp, fast-uri, source-map-js, brace-expansion, compression, and Zod.
   A scoped override supplies compression 1.8.2 because serve 14.2.6 pins 1.8.1.
 

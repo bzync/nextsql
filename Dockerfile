@@ -4,9 +4,9 @@
 # the target — CGO is disabled, so this is a pure Go cross-build and avoids
 # emulating the whole toolchain under QEMU for non-native target platforms.
 #
-# The build base is pinned by digest (the tag in the comment is the
-# human-readable equivalent); Dependabot's docker ecosystem bumps both together.
-FROM --platform=$BUILDPLATFORM golang:1.27-bookworm@sha256:5cf287a799e6b94384bad13d16b14904c531f51ba65792237e122ce42b392f61 AS build
+# The build base is pinned to a patched release and its digest;
+# Dependabot's docker ecosystem tracks subsequent release/digest updates.
+FROM --platform=$BUILDPLATFORM golang:1.27.3-bookworm@sha256:972b4110ba0f47539a975c31e52c64765e1ff19f2d74469ae4a595c6676e80a5 AS build
 
 # GOTOOLCHAIN=local: never silently download a toolchain other than the one
 # baked into the pinned image. CGO_ENABLED=0: fully static binaries.

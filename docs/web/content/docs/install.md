@@ -96,7 +96,9 @@ See [Docker](/docs/docker).
 
 ## Install with Go
 
-Requires **Go 1.26+** so `go install` can fetch and compile the engine onto your `PATH`.
+Building the current source requires **Go 1.26.10+** (or Go 1.27.3+ on the
+1.27 release line), including the [`crypto/x509` security fixes](https://go.dev/doc/devel/release#go1.26.10). `go install`
+fetches and compiles the engine onto your `PATH`.
 
 ```bash
 go install github.com/bzync/nextsql/cmd/nextsql@v0.0.5

@@ -14,9 +14,9 @@ export function Overview({ onUnauthorized }: { onUnauthorized: () => void }) {
       {data ? (
         <>
           <StatGrid>
-            <Stat icon={<Icon name="users" />} label="Live sessions" value={String(data.sessions)} />
-            <Stat icon={<Icon name="activity" />} label="Active queries" value={String(data.active_queries)} />
-            <Stat icon={<Icon name="cluster" />} label="Clustered" value={data.clustered ? "Yes" : "No"} />
+            <Stat icon={<Icon name="users" size={16} />} label="Live sessions" value={String(data.sessions)} description="Connected to this node" />
+            <Stat icon={<Icon name="activity" size={16} />} label="Active queries" value={String(data.active_queries)} description="Currently executing" />
+            <Stat icon={<Icon name="cluster" size={16} />} label="Deployment" value={data.clustered ? "Raft cluster" : "Single node"} description="Server-reported topology" />
           </StatGrid>
 
           <Tabs defaultValue="storage" className="mt-4">

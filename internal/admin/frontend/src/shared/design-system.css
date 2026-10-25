@@ -1,0 +1,166 @@
+/* Admin's product theme extends RUI; keep primitive behavior in RUI and
+   visual decisions here. All three modes, including portaled dialogs, use
+   these tokens. Status colors remain semantic; blue denotes interaction. */
+:root {
+  --nsa-space-1: 4px;
+  --nsa-space-2: 8px;
+  --nsa-space-3: 12px;
+  --nsa-space-4: 16px;
+  --nsa-space-5: 24px;
+  --nsa-space-6: 32px;
+  --nsa-control-sm: 32px;
+  --nsa-control-md: 36px;
+  --nsa-radius: 6px;
+  --nsa-sidebar-w: 224px;
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --radius-lg: 6px;
+  --radius-xl: 8px;
+  --radius-2xl: 12px;
+  --color-bg: #f7f8fa;
+  --color-foreground: #20242c;
+  --color-surface: #ffffff;
+  --color-surface-raised: #ffffff;
+  --color-surface-muted: #f4f5f7;
+  --color-muted: #eceef1;
+  --color-muted-foreground: #596170;
+  --color-foreground-muted: var(--color-muted-foreground);
+  --color-border: #dfe2e7;
+  --color-border-strong: #a5acb8;
+  --color-accent-50: #eff5ff;
+  --color-accent-100: #e2ecfd;
+  --color-accent-200: #c6d9fb;
+  --color-accent-300: #abc7fa;
+  --color-accent-400: #8eafff;
+  --color-accent-500: #356ae6;
+  --color-accent-600: #2457d6;
+  --color-accent-700: #204bb6;
+  --color-accent-800: #213f90;
+  --color-accent-900: #20366d;
+  --color-accent-950: #172442;
+  --color-primary: var(--color-accent-600);
+  --color-primary-hover: var(--color-accent-700);
+  --color-focus-ring: var(--color-accent-500);
+  --nsa-selection-bg: #e8effc;
+  --nsa-selection-fg: #204bb6;
+  --shadow-raised: none;
+  --shadow-xs: none;
+}
+
+.dark {
+  --color-bg: #111315;
+  --color-foreground: #edeef0;
+  --color-surface: #191c20;
+  --color-surface-raised: #22262c;
+  --color-surface-muted: #20242a;
+  --color-muted: #292e36;
+  --color-muted-foreground: #a4acb9;
+  --color-border: #30363f;
+  --color-border-strong: #616c7c;
+  --nsa-selection-bg: #23334f;
+  --nsa-selection-fg: #b6ceff;
+  --shadow-raised: none;
+}
+
+body {
+  background: var(--color-bg);
+  color: var(--color-foreground);
+  font-family: var(--font-sans);
+}
+
+/* Primitives: a small shared vocabulary for every screen. Avoid global
+   button/input dimensions: editor tools, checkboxes, and tree controls have
+   deliberate compact sizing, and result density is a user preference. */
+[data-variant="default"] {
+  box-shadow: none;
+}
+[role="dialog"] {
+  border-radius: var(--radius-xl);
+}
+:where(button, input, textarea, select) {
+  font-family: inherit;
+}
+/* RUI's unlayered theme reset uses font:inherit, which overrides its own
+   layered size/weight utilities. Restore those utilities so small buttons
+   and form fields actually use the sizes their components request. */
+:where(.rui-theme, .rtui-theme) :where(button, input, textarea, select) {
+  font-size: revert-layer;
+  font-weight: revert-layer;
+  line-height: revert-layer;
+}
+table {
+  font-family: var(--font-sans);
+}
+:where(button):not(:disabled):focus-visible,
+:where(a):focus-visible,
+:where([role="tabpanel"]):focus-visible {
+  outline: 2px solid var(--color-focus-ring);
+  outline-offset: 2px;
+}
+
+/* RUI tab lists use one treatment in views and dialogs. The active rule
+   and weight identify selection in addition to color. Preserve the native
+   roving focus, arrow navigation, and horizontal overflow behavior. */
+[role="tablist"] {
+  gap: var(--nsa-space-1);
+  border: 0;
+  border-bottom: 1px solid var(--color-border);
+  border-radius: 0;
+  background: transparent;
+  padding: 0;
+}
+[role="tablist"] [role="tab"] {
+  min-height: var(--nsa-control-md);
+  padding: var(--nsa-space-2) var(--nsa-space-3);
+  border-radius: 0;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  background: transparent;
+  color: var(--color-muted-foreground);
+  box-shadow: none;
+  font-size: 13px;
+}
+[role="tablist"] [role="tab"][aria-selected="true"] {
+  border-bottom-color: var(--color-primary);
+  color: var(--color-foreground);
+  font-weight: 600;
+}
+[role="tablist"] [role="tab"] > span[aria-hidden="true"] {
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+.nsa-page-header h1 {
+  font-size: 24px;
+  line-height: 1.3;
+  letter-spacing: -0.035em;
+  font-weight: 600;
+}
+.nsa-page-header {
+  gap: var(--nsa-space-4);
+}
+.nsa-step-header :is(h1, h2) {
+  font-size: 24px;
+  line-height: 1.3;
+  letter-spacing: -0.035em;
+  font-weight: 600;
+}
+.nsa-page-header button {
+  min-height: var(--nsa-control-sm);
+  font-size: 12px;
+}
+.nsa-theme-toggle {
+  border-radius: var(--nsa-radius);
+  background: var(--color-surface);
+}
+
+@media (max-width: 639px) {
+  .nsa-page-header h1 { font-size: 22px; }
+}
+@media (forced-colors: active) {
+  [role="tablist"] [role="tab"][aria-selected="true"] {
+    border-bottom-color: Highlight;
+  }
+}

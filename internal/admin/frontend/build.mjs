@@ -4,6 +4,7 @@
 // here after changing anything under src/; commit the generated ../web/
 // output so `go build ./...` works without a Node toolchain.
 import * as esbuild from "esbuild";
+import "./generate-sql-reference.mjs";
 import { createHash } from "node:crypto";
 import { cpSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";

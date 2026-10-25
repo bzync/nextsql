@@ -142,7 +142,7 @@ export function ResultTable({
                 placeholder="Filter rows…"
                 label="Filter rows in table"
               />
-            ) : <div />}
+            ) : <Text as="span" size="sm" weight="semibold">{label}</Text>}
 
             <Inline gap="xs" align="center">
               {searchQuery ? (

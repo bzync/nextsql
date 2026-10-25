@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type FormEvent, type KeyboardEvent } from "react";
 import {
   Alert,
   Badge,
@@ -23,6 +23,7 @@ import {
   Text,
 } from "@bzync/rui";
 import { SqlCodeEditor } from "./SqlCodeEditor";
+import { annotateSQLSuggestions, canAutoCompleteSQL, commandSQLSuggestions, contextSQLSuggestions, readSQLCapabilities, sqlFeatureNotes, SQL_REFERENCE_SUMMARY, MAX_COMPLETION_CHARS, type SQLFeatureNote } from "./sqlCompletion";
 import { Icon, type IconName } from "../shared/icons";
 import { ConnectionBadge, EnvironmentBadge } from "../shared/status";
 import {
@@ -639,6 +640,7 @@ export function StudioWorkspace({
   const [parseDiags, setParseDiags] = useState<StudioDiagnostic[]>([]);
   const diagSeq = useRef(0);
   const [suggestOpen, setSuggestOpen] = useState(false);
+  const autoSuggestTimer = useRef<number | undefined>(undefined);
   const [cursorPos, setCursorPos] = useState(0);
   const [activeSuggestionIndex, setActiveSuggestionIndex] = useState(0);
   const [tableColumnsCache, setTableColumnsCache] = useState<TableColumnsCache>({});
@@ -953,6 +955,13 @@ export function StudioWorkspace({
   // open, through the same api.studioTable() every explorer already uses —
   // no eager/speculative catalog reads.
   const catalogTableNames = useMemo(() => tableNames(bootstrap), [bootstrap]);
+  const sqlCapabilities = useMemo(() => readSQLCapabilities(bootstrap?.capabilities), [bootstrap]);
+  const [featureNotes, setFeatureNotes] = useState<SQLFeatureNote[]>([]);
+  useEffect(() => {
+    setFeatureNotes([]);
+    const timer = window.setTimeout(() => setFeatureNotes(sqlFeatureNotes(sql, sqlCapabilities)), 250);
+    return () => window.clearTimeout(timer);
+  }, [sql, sqlCapabilities]);
   const referencedTables = useMemo(() => extractReferencedTables(sql), [sql]);
   const tableAliases = useMemo(() => extractTableAliases(sql, referencedTables), [sql, referencedTables]);
   const clauseContext = useMemo(() => detectSQLClauseContext(sql, cursorPos), [sql, cursorPos]);
@@ -1004,8 +1013,13 @@ export function StudioWorkspace({
   const nearestContext = useMemo(() => currentNearestContext(sql, cursorPos), [sql, cursorPos]);
   const suggestions = useMemo(() => {
     if (!suggestOpen) return [];
+    const annotate = (items: SQLSuggestion[]) => annotateSQLSuggestions(items, sqlCapabilities);
+    const commandHeads = commandSQLSuggestions(sql, cursorPos);
+    if (commandHeads) return annotate(commandHeads);
+    const contextItems = contextSQLSuggestions(sql, cursorPos);
+    if (contextItems) return annotate(contextItems);
     if (isTableQualifier && qualifierContext) {
-      return rankQualifiedSuggestions(
+      return annotate(rankQualifiedSuggestions(
         qualifierContext.qualifier,
         qualifierContext.typed,
         tableAliases,
@@ -1013,25 +1027,28 @@ export function StudioWorkspace({
         tableJSONPathCache,
         tableColumnTypesCache,
         tableRelationsCache,
-      );
+      ));
     }
     if (jsonPathContext) {
-      return rankJSONPathSuggestions(jsonPathContext.typed, referencedTables, tableJSONPathCache);
+      return annotate(rankJSONPathSuggestions(jsonPathContext.typed, referencedTables, tableJSONPathCache));
     }
     if (nearestContext?.slot === "column") {
-      return rankNearestColumnSuggestions(nearestContext.typed, referencedTables, tableVectorCache);
+      return annotate(rankNearestColumnSuggestions(nearestContext.typed, referencedTables, tableVectorCache));
     }
     if (nearestContext?.slot === "metric") {
-      return rankNearestMetricSuggestions(nearestContext.typed, nearestContext.column, referencedTables, tableVectorCache);
+      return annotate(rankNearestMetricSuggestions(nearestContext.typed, nearestContext.column, referencedTables, tableVectorCache));
     }
-    return rankSQLSuggestions(suggestPrefix, catalogTableNames, referencedTables, tableColumnsCache, MAX_SQL_SUGGESTIONS, {
+    return annotate(rankSQLSuggestions(suggestPrefix, catalogTableNames, referencedTables, tableColumnsCache, MAX_SQL_SUGGESTIONS, {
       clauseContext,
       columnTypes: tableColumnTypesCache,
       relations: tableRelationsCache,
       tableAliases,
       includeKeywords: true,
-    });
+    }));
   }, [
+    sql,
+    cursorPos,
+    sqlCapabilities,
     suggestOpen,
     isTableQualifier,
     jsonPathContext,
@@ -1077,8 +1094,46 @@ export function StudioWorkspace({
   useEffect(() => {
     if (!suggestOpen) return;
     const optionElem = document.getElementById(`studio-suggest-option-${activeSuggestionIndex}`);
-    optionElem?.scrollIntoView({ block: "nearest" });
+    const list = optionElem?.parentElement;
+    if (!optionElem || !list) return;
+    const optionRect = optionElem.getBoundingClientRect();
+    const listRect = list.getBoundingClientRect();
+    if (optionRect.top < listRect.top) list.scrollTop += optionRect.top - listRect.top;
+    else if (optionRect.bottom > listRect.bottom) list.scrollTop += optionRect.bottom - listRect.bottom;
   }, [suggestOpen, activeSuggestionIndex]);
+
+  // RUI's popover has no collision handling. Keep this non-modal completion
+  // list within the visible workspace without moving the editor's scroll.
+  useLayoutEffect(() => {
+    if (!suggestOpen) return;
+    const popup = editorHost.current?.closest(".nss-editor-card")?.querySelector<HTMLElement>(".nss-suggest-popup");
+    const wrapper = popup?.parentElement;
+    const list = popup?.querySelector<HTMLElement>(".nss-suggest-list");
+    if (!popup || !wrapper || !list) return;
+    const place = () => {
+      const anchor = wrapper.getBoundingClientRect();
+      const main = document.querySelector(".nsm-main")?.getBoundingClientRect();
+      const leftBound = Math.max(16, (main?.left ?? 0) + 16);
+      const topBound = Math.max(16, (main?.top ?? 0) + 8);
+      const rect = popup.getBoundingClientRect();
+      const left = Math.max(leftBound, Math.min(anchor.left, window.innerWidth - rect.width - 16));
+      const nonListHeight = rect.height - list.getBoundingClientRect().height;
+      list.style.maxHeight = `${Math.max(64, Math.min(320, window.innerHeight - topBound - nonListHeight - 16))}px`;
+      const height = popup.getBoundingClientRect().height;
+      const top = Math.max(topBound, Math.min(anchor.bottom + 8, window.innerHeight - height - 16));
+      popup.style.left = `${left - anchor.left}px`;
+      popup.style.right = "auto";
+      popup.style.top = `${top - anchor.top}px`;
+      popup.style.marginTop = "0";
+    };
+    place();
+    window.addEventListener("resize", place);
+    document.addEventListener("scroll", place, true);
+    return () => {
+      window.removeEventListener("resize", place);
+      document.removeEventListener("scroll", place, true);
+    };
+  }, [suggestOpen, suggestions]);
 
   useEffect(() => {
     if (!suggestOpen) return;
@@ -1156,7 +1211,7 @@ export function StudioWorkspace({
     });
   }, []);
 
-  // Live parse diagnostics: a debounced round trip to the server's own
+  // Live parse diagnostics: a debounced round trip to Admin's bundled native
   // grammar (POST /studio/query/diagnostics — no connection, no query slot)
   // reports where each statement in the buffer fails to parse. RUI's
   // CodeEditor has no text-overlay primitive, so this renders as a strip
@@ -1255,9 +1310,12 @@ export function StudioWorkspace({
   }, []);
 
   const acceptSuggestion = useCallback((suggestion: SQLSuggestion) => {
+    if (suggestion.availability === "unsupported") return;
     const textarea = editorHost.current?.querySelector("textarea");
     const range =
-      suggestion.kind === "json-path"
+      suggestion.replaceStart !== undefined && suggestion.replaceEnd !== undefined
+        ? { start: suggestion.replaceStart, end: suggestion.replaceEnd }
+        : suggestion.kind === "json-path"
         ? currentJSONPathRange(sql, cursorPos) ?? currentWordRange(sql, cursorPos)
         : isTableQualifier && qualifierContext
           ? { start: qualifierContext.start, end: qualifierContext.end }
@@ -1277,6 +1335,28 @@ export function StudioWorkspace({
       });
     }
   }, [sql, cursorPos, isTableQualifier, qualifierContext]);
+
+  // Automatic suggestions only follow actual single-character typing. A
+  // pasted script, restored draft, explorer insertion, or composition event
+  // must not unexpectedly capture Enter/Tab. Manual Ctrl+Space remains.
+  const onEditorInput = useCallback((event: FormEvent<HTMLDivElement>) => {
+    window.clearTimeout(autoSuggestTimer.current);
+    const input = event.nativeEvent as InputEvent;
+    const target = event.target;
+    if (!(target instanceof HTMLTextAreaElement) || input.isComposing) return;
+    if (input.inputType !== "insertText" || !input.data || input.data.length > 2) return;
+    const buffer = target.value;
+    const caret = target.selectionEnd;
+    if (buffer.length > MAX_COMPLETION_CHARS || !/[A-Za-z0-9_.]/.test(input.data)) { setSuggestOpen(false); return; }
+    autoSuggestTimer.current = window.setTimeout(() => {
+      if (!mounted.current || document.activeElement !== target || target.value !== buffer) return;
+      if (!canAutoCompleteSQL(buffer, caret)) { setSuggestOpen(false); return; }
+      setCursorPos(caret);
+      setSuggestOpen(true);
+    }, 120);
+  }, []);
+
+  useEffect(() => () => window.clearTimeout(autoSuggestTimer.current), [activeTabId]);
 
   // Both the GRANT/REVOKE builder's grantee/role suggestions and the Users &
   // roles explorer read the same admin-only system.users/system.roles/
@@ -2084,6 +2164,8 @@ export function StudioWorkspace({
   }, [findMatches, replaceQuery, setSQL, sql]);
 
   const onEditorKeyDown = useCallback((event: KeyboardEvent<HTMLDivElement>) => {
+    if (event.nativeEvent.isComposing) return;
+    if (event.key === "Escape") window.clearTimeout(autoSuggestTimer.current);
     if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
       event.preventDefault();
       event.stopPropagation();
@@ -2100,16 +2182,9 @@ export function StudioWorkspace({
       event.preventDefault();
       event.stopPropagation();
       openSuggest();
-    } else if (event.key === "." && !suggestOpen && !event.ctrlKey && !event.metaKey && !event.altKey) {
-      const textarea = editorHost.current?.querySelector("textarea");
-      const pos = textarea?.selectionEnd ?? cursorPos;
-      if (pos > 0 && /[A-Za-z0-9_]/.test(sql[pos - 1])) {
-        window.setTimeout(() => {
-          if (mounted.current) setSuggestOpen(true);
-        }, 50);
-      }
     } else if (suggestOpen) {
       if (event.key === "Escape") {
+        window.clearTimeout(autoSuggestTimer.current);
         event.preventDefault();
         event.stopPropagation();
         setSuggestOpen(false);
@@ -2549,6 +2624,7 @@ export function StudioWorkspace({
                 open={suggestOpen}
                 onOpenChange={(open) => (open ? openSuggest() : setSuggestOpen(false))}
                 ariaLabel="SQL suggestions"
+                className="nss-suggest-popup"
                 side="bottom"
                 align="start"
                 trigger={<Button variant="outline" size="sm" icon={<Icon name="search" size={14} />} onClick={openSuggest} title="SQL suggestions & autocompletion (Ctrl+Space)">Suggest</Button>}
@@ -2577,6 +2653,7 @@ export function StudioWorkspace({
                               ? "Metrics the NEAREST column's declared type actually accepts. There is no per-element vector metadata to complete inside TO (…)."
                               : "Catalog tables, columns, relations, functions, and SQL syntax. Ctrl+Space reopens; type to filter, Up/Down/Enter/Esc work without leaving the editor."}
                     </Text>
+                    <Text size="xs" variant="muted">{SQL_REFERENCE_SUMMARY}. Reference: this Admin build; feature status: connected server. Permissions and options are checked on Run.</Text>
                     <ul id="studio-suggest-listbox" role="listbox" aria-label="SQL suggestions" className="nss-suggest-list">
                       {suggestions.length === 0 ? (
                         <li className="nss-suggest-empty">No matches</li>
@@ -2587,6 +2664,7 @@ export function StudioWorkspace({
                             id={`studio-suggest-option-${index}`}
                             role="option"
                             aria-selected={index === activeSuggestionIndex}
+                            aria-disabled={suggestion.availability === "unsupported" || undefined}
                             className={`nss-suggest-option${index === activeSuggestionIndex ? " nss-suggest-option-active" : ""}`}
                             onClick={() => acceptSuggestion(suggestion)}
                           >
@@ -2595,12 +2673,13 @@ export function StudioWorkspace({
                                 <Badge variant={getBadgeVariant(suggestion.kind)} size="sm">
                                   {getBadgeLabel(suggestion.kind)}
                                 </Badge>
-                                <span className="nss-suggest-label">{suggestion.label}</span>
+                                <span className="nss-suggest-label" title={suggestion.label}>{suggestion.label}</span>
                               </div>
                               {suggestion.detail ? (
-                                <span className="nss-suggest-detail">{suggestion.detail}</span>
+                                <span className="nss-suggest-detail" title={suggestion.detail}>{suggestion.detail}</span>
                               ) : null}
                             </div>
+                            {suggestion.note ? <span className="nss-suggest-note">{suggestion.note}</span> : null}
                           </li>
                         ))
                       )}
@@ -2834,7 +2913,7 @@ export function StudioWorkspace({
                 {`"${runningTab?.title ?? "A tab"}" is running a query — only one query runs at a time.`}
               </Alert>
             ) : null}
-            <div ref={editorHost} onKeyDownCapture={onEditorKeyDown} className="nss-editor-host">
+            <div ref={editorHost} onKeyDownCapture={onEditorKeyDown} onInput={onEditorInput} className="nss-editor-host">
               <SqlCodeEditor
                 value={sql}
                 onChange={setSQL}
@@ -2848,6 +2927,19 @@ export function StudioWorkspace({
               <Text size="xs" variant="muted" role="status" className="nss-format-notice">
                 {formatNotice}
               </Text>
+            ) : null}
+            {sql.length > MAX_COMPLETION_CHARS ? <Text size="xs" variant="muted" role="status">Automatic completion and feature notes are paused for this large buffer. Server validation remains available on Run.</Text> : null}
+            {featureNotes.length > 0 ? (
+              <div className="nss-feature-notes" aria-live="polite" aria-label="NextSQL feature notes">
+                {featureNotes.map((note) => (
+                  <Alert key={`${note.offset}-${note.message}`} variant={note.severity === "info" ? "info" : "warning"} title={note.title}>
+                    <Inline gap="sm" align="center" wrap>
+                      <Text as="span" size="sm">{`Line ${note.line}, column ${note.column}: ${note.message}`}</Text>
+                      <Button variant="outline" size="sm" onClick={() => jumpToSpan(note.offset, note.offset + 1)}>Go to command</Button>
+                    </Inline>
+                  </Alert>
+                ))}
+              </div>
             ) : null}
             {/* aria-live="polite" (not role="alert") deliberately: this recomputes
                 on every keystroke, unlike the explicit-action confirm/error alerts

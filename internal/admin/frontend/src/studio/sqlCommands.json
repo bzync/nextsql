@@ -1,0 +1,369 @@
+[
+  {
+    "label": "SELECT",
+    "sample": "SELECT 1"
+  },
+  {
+    "label": "INSERT INTO",
+    "sample": "INSERT INTO t VALUES (1)"
+  },
+  {
+    "label": "UPDATE",
+    "sample": "UPDATE t SET c = 1"
+  },
+  {
+    "label": "DELETE FROM",
+    "sample": "DELETE FROM t"
+  },
+  {
+    "label": "CREATE TABLE",
+    "sample": "CREATE TABLE t (id INT64 PRIMARY KEY)"
+  },
+  {
+    "label": "ALTER TABLE",
+    "sample": "ALTER TABLE t ADD COLUMN c INT64"
+  },
+  {
+    "label": "DROP TABLE",
+    "sample": "DROP TABLE t"
+  },
+  {
+    "label": "CREATE INDEX",
+    "sample": "CREATE INDEX ix ON t(c)"
+  },
+  {
+    "label": "CREATE UNIQUE INDEX",
+    "sample": "CREATE UNIQUE INDEX ix ON t(c)"
+  },
+  {
+    "label": "DROP INDEX",
+    "sample": "DROP INDEX ix"
+  },
+  {
+    "label": "CREATE USER",
+    "sample": "CREATE USER u IDENTIFIED BY 'password'"
+  },
+  {
+    "label": "DROP USER",
+    "sample": "DROP USER u"
+  },
+  {
+    "label": "CREATE ROLE",
+    "sample": "CREATE ROLE r"
+  },
+  {
+    "label": "DROP ROLE",
+    "sample": "DROP ROLE r"
+  },
+  {
+    "label": "GRANT",
+    "sample": "GRANT SELECT ON TABLE t TO u"
+  },
+  {
+    "label": "REVOKE",
+    "sample": "REVOKE SELECT ON TABLE t FROM u"
+  },
+  {
+    "label": "SET CONFIG",
+    "sample": "SET CONFIG log_level = 'info'"
+  },
+  {
+    "label": "EXPLAIN",
+    "sample": "EXPLAIN SELECT 1"
+  },
+  {
+    "label": "EXPLAIN ANALYZE",
+    "sample": "EXPLAIN ANALYZE SELECT 1"
+  },
+  {
+    "label": "ANALYZE",
+    "sample": "ANALYZE t"
+  },
+  {
+    "label": "CANCEL QUERY",
+    "sample": "CANCEL QUERY 'q'"
+  },
+  {
+    "label": "UPSERT INTO",
+    "sample": "UPSERT INTO t VALUES (1)",
+    "feature": "upsert"
+  },
+  {
+    "label": "WITH",
+    "sample": "WITH c AS (SELECT 1 AS a FROM t) SELECT a FROM c",
+    "feature": "cte"
+  },
+  {
+    "label": "WITH RECURSIVE",
+    "sample": "WITH RECURSIVE c AS (SELECT 1 AS a FROM t) SELECT a FROM c",
+    "feature": "cte"
+  },
+  {
+    "label": "BEGIN",
+    "sample": "BEGIN",
+    "feature": "transactions"
+  },
+  {
+    "label": "BEGIN READ COMMITTED",
+    "sample": "BEGIN READ COMMITTED",
+    "feature": "transactions"
+  },
+  {
+    "label": "BEGIN SNAPSHOT",
+    "sample": "BEGIN SNAPSHOT",
+    "feature": "transactions"
+  },
+  {
+    "label": "BEGIN SERIALIZABLE",
+    "sample": "BEGIN SERIALIZABLE",
+    "feature": "transactions"
+  },
+  {
+    "label": "COMMIT",
+    "sample": "COMMIT",
+    "feature": "transactions"
+  },
+  {
+    "label": "ROLLBACK",
+    "sample": "ROLLBACK",
+    "feature": "transactions"
+  },
+  {
+    "label": "SAVEPOINT",
+    "sample": "SAVEPOINT s",
+    "feature": "transactions"
+  },
+  {
+    "label": "ROLLBACK TO SAVEPOINT",
+    "sample": "ROLLBACK TO SAVEPOINT s",
+    "feature": "transactions"
+  },
+  {
+    "label": "RELEASE SAVEPOINT",
+    "sample": "RELEASE SAVEPOINT s",
+    "feature": "transactions"
+  },
+  {
+    "label": "CREATE VIEW",
+    "sample": "CREATE VIEW v AS SELECT 1 AS a",
+    "feature": "views"
+  },
+  {
+    "label": "CREATE OR REPLACE VIEW",
+    "sample": "CREATE OR REPLACE VIEW v AS SELECT 1 AS a",
+    "feature": "views"
+  },
+  {
+    "label": "DROP VIEW",
+    "sample": "DROP VIEW v",
+    "feature": "views"
+  },
+  {
+    "label": "CREATE FULLTEXT INDEX",
+    "sample": "CREATE FULLTEXT INDEX ix ON t(c)",
+    "feature": "fulltext"
+  },
+  {
+    "label": "CREATE SPATIAL INDEX",
+    "sample": "CREATE SPATIAL INDEX ix ON t(c)",
+    "feature": "geo"
+  },
+  {
+    "label": "CREATE VECTOR INDEX",
+    "sample": "CREATE VECTOR INDEX ix ON t(c) USING HNSW",
+    "feature": "vector"
+  },
+  {
+    "label": "REBUILD INDEX",
+    "sample": "REBUILD INDEX ix",
+    "feature": "maintenance"
+  },
+  {
+    "label": "MAINTAIN DATABASE",
+    "sample": "MAINTAIN DATABASE",
+    "feature": "maintenance"
+  },
+  {
+    "label": "MAINTAIN TABLE",
+    "sample": "MAINTAIN TABLE t",
+    "feature": "maintenance"
+  },
+  {
+    "label": "MAINTAIN INDEX",
+    "sample": "MAINTAIN INDEX ix",
+    "feature": "maintenance"
+  },
+  {
+    "label": "BACKUP DATABASE",
+    "sample": "BACKUP DATABASE",
+    "feature": "backup"
+  },
+  {
+    "label": "VERIFY BACKUP",
+    "sample": "VERIFY BACKUP 'b'",
+    "feature": "backup"
+  },
+  {
+    "label": "RUN WORKFLOW",
+    "sample": "RUN WORKFLOW w()",
+    "feature": "workflows"
+  },
+  {
+    "label": "DROP WORKFLOW",
+    "sample": "DROP WORKFLOW w",
+    "feature": "workflows"
+  },
+  {
+    "label": "DROP TRIGGER",
+    "sample": "DROP TRIGGER tr",
+    "feature": "triggers"
+  },
+  {
+    "label": "DROP SCHEDULE",
+    "sample": "DROP SCHEDULE s",
+    "feature": "schedules"
+  },
+  {
+    "label": "CANCEL TASK",
+    "sample": "CANCEL TASK 'task-id'",
+    "feature": "tasks"
+  },
+  {
+    "label": "SUBSCRIBE TO",
+    "sample": "SUBSCRIBE TO t",
+    "feature": "cdc"
+  },
+  {
+    "label": "SET RESOURCE GROUP",
+    "sample": "SET RESOURCE GROUP g",
+    "feature": "resource_groups"
+  },
+  {
+    "label": "RESET RESOURCE GROUP",
+    "sample": "RESET RESOURCE GROUP",
+    "feature": "resource_groups"
+  },
+  {
+    "label": "CREATE RESOURCE GROUP",
+    "sample": "CREATE RESOURCE GROUP g WITH (MAX_CONCURRENCY = 2)",
+    "feature": "resource_groups"
+  },
+  {
+    "label": "ALTER RESOURCE GROUP",
+    "sample": "ALTER RESOURCE GROUP g WITH (MAX_CONCURRENCY = 2)",
+    "feature": "resource_groups"
+  },
+  {
+    "label": "DROP RESOURCE GROUP",
+    "sample": "DROP RESOURCE GROUP g",
+    "feature": "resource_groups"
+  },
+  {
+    "label": "CLUSTER TRANSFER LEADER",
+    "sample": "CLUSTER TRANSFER LEADER",
+    "feature": "raft"
+  },
+  {
+    "label": "CLUSTER DRAIN",
+    "sample": "CLUSTER DRAIN",
+    "feature": "raft"
+  },
+  {
+    "label": "CLUSTER MAINTENANCE ENABLE",
+    "sample": "CLUSTER MAINTENANCE ENABLE",
+    "feature": "raft"
+  },
+  {
+    "label": "CLUSTER MAINTENANCE DISABLE",
+    "sample": "CLUSTER MAINTENANCE DISABLE",
+    "feature": "raft"
+  },
+  {
+    "label": "CLUSTER RECONCILE CONFIRM",
+    "sample": "CLUSTER RECONCILE CONFIRM",
+    "feature": "raft"
+  },
+  {
+    "label": "SHOW DATABASES",
+    "sample": "SHOW DATABASES",
+    "feature": "system_show_aliases"
+  },
+  {
+    "label": "SHOW TABLES",
+    "sample": "SHOW TABLES",
+    "feature": "system_show_aliases"
+  },
+  {
+    "label": "SHOW INDEXES",
+    "sample": "SHOW INDEXES",
+    "feature": "system_show_aliases"
+  },
+  {
+    "label": "SHOW CONNECTIONS",
+    "sample": "SHOW CONNECTIONS",
+    "feature": "system_show_aliases"
+  },
+  {
+    "label": "SHOW QUERIES",
+    "sample": "SHOW QUERIES",
+    "feature": "system_show_aliases"
+  },
+  {
+    "label": "SHOW TRANSACTIONS",
+    "sample": "SHOW TRANSACTIONS",
+    "feature": "system_show_aliases"
+  },
+  {
+    "label": "SHOW LOCKS",
+    "sample": "SHOW LOCKS",
+    "feature": "system_show_aliases"
+  },
+  {
+    "label": "SHOW CLUSTER",
+    "sample": "SHOW CLUSTER",
+    "feature": "system_show_aliases"
+  },
+  {
+    "label": "SHOW STORAGE",
+    "sample": "SHOW STORAGE",
+    "feature": "system_show_aliases"
+  },
+  {
+    "label": "SHOW TASKS",
+    "sample": "SHOW TASKS",
+    "feature": "tasks"
+  },
+  {
+    "label": "CREATE WORKFLOW",
+    "sample": "CREATE WORKFLOW w() AS BEGIN DELETE FROM t; END",
+    "feature": "workflows",
+    "note": "Workflow bodies contain bounded native DML; invoke with RUN WORKFLOW."
+  },
+  {
+    "label": "ALTER WORKFLOW",
+    "sample": "ALTER WORKFLOW w RENAME TO w2",
+    "feature": "workflows"
+  },
+  {
+    "label": "CREATE TRIGGER",
+    "sample": "CREATE TRIGGER tr AFTER INSERT ON t FOR EACH ROW RUN WORKFLOW w(NEW.id)",
+    "feature": "triggers",
+    "note": "Triggers invoke a workflow; they do not contain a separate procedure body."
+  },
+  {
+    "label": "ALTER TRIGGER",
+    "sample": "ALTER TRIGGER tr RENAME TO tr2",
+    "feature": "triggers"
+  },
+  {
+    "label": "CREATE SCHEDULE",
+    "sample": "CREATE SCHEDULE s EVERY '1h' RUN WORKFLOW w()",
+    "feature": "schedules",
+    "note": "EVERY, AT, or five-field UTC CRON invokes a workflow."
+  },
+  {
+    "label": "ALTER SCHEDULE",
+    "sample": "ALTER SCHEDULE s RENAME TO s2",
+    "feature": "schedules"
+  }
+]

@@ -1,17 +1,20 @@
 /* Studio composes RUI cards, inputs, buttons, editor and tables into a
    bounded development workspace. These rules own only the IDE-like layout
    and overflow behavior; colors and interaction states remain RUI tokens. */
-.nss-workspace { min-width: 0; }
+.nss-workspace {
+  min-width: 0;
+  container: studio / inline-size;
+}
 .nss-toolbar {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 12px;
-  padding: 6px 12px;
-  min-height: 42px;
+  gap: var(--nsa-space-3);
+  padding: var(--nsa-space-2) var(--nsa-space-3);
+  min-height: 48px;
   border: 1px solid var(--color-border);
   border-radius: var(--nsa-radius, 6px);
-  background: var(--color-surface-muted);
+  background: var(--color-surface);
 }
 .nss-toolbar-select {
   width: auto;
@@ -97,6 +100,9 @@
 .nss-explorer,
 .nss-inspector { overflow: hidden; }
 .nss-editor-card { overflow: visible; }
+.nss-explorer,
+.nss-inspector,
+.nss-editor-card { background: var(--color-surface); }
 .nss-editor-header { position: relative; z-index: 4; min-width: 0; }
 .nss-editor-body { min-height: 0; overflow: hidden; }
 .nss-explorer-body,
@@ -109,7 +115,14 @@
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 12px;
+  gap: var(--nsa-space-3);
+  padding: var(--nsa-space-3) var(--nsa-space-4);
+  background: var(--color-surface-muted);
+}
+.nss-editor-header,
+.nss-explorer-header {
+  align-items: stretch;
+  flex-direction: column;
 }
 .nss-object-list {
   max-height: 520px;
@@ -216,7 +229,8 @@
 
 .nss-history-panel { width: 320px; max-width: calc(100vw - 32px); }
 .nss-find-panel { width: 300px; max-width: calc(100vw - 32px); }
-.nss-suggest-panel { width: 500px; max-width: calc(100vw - 32px); }
+.nss-suggest-popup { width: min(520px, calc(100vw - 32px)); }
+.nss-suggest-panel { width: 100%; }
 .nss-suggest-list {
   max-height: 320px;
   margin: 0;
@@ -227,7 +241,8 @@
 .nss-suggest-list li + li { margin-top: 2px; }
 .nss-suggest-option {
   display: flex;
-  align-items: center;
+  align-items: stretch;
+  flex-direction: column;
   gap: 8px;
   width: 100%;
   padding: 6px 8px;
@@ -236,6 +251,16 @@
   font-size: 13px;
   cursor: pointer;
 }
+.nss-suggest-note {
+  display: block;
+  color: var(--color-muted-foreground);
+  font-size: 11px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+.nss-suggest-option[aria-disabled="true"] { cursor: not-allowed; }
+.nss-suggest-option[aria-disabled="true"] .nss-suggest-label { text-decoration: line-through; }
+.nss-feature-notes { display: grid; gap: var(--nsa-space-2); }
 .nss-suggest-option:hover { background: var(--color-surface-muted); }
 .nss-suggest-option-active {
   border-color: var(--color-accent-500);
@@ -251,6 +276,7 @@
 }
 .nss-suggest-main {
   display: flex;
+  flex: 1 1 auto;
   align-items: center;
   gap: 8px;
   min-width: 0;
@@ -268,7 +294,10 @@
   color: var(--color-foreground-muted);
   white-space: nowrap;
   margin-left: auto;
-  flex-shrink: 0;
+  flex-shrink: 1;
+  max-width: 50%;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .nss-suggest-empty {
   padding: 6px 8px;
@@ -993,7 +1022,9 @@
 .nss-inspector-code .overflow-x-auto { overflow-x: visible; }
 .nss-loading { min-height: 48px; }
 
-@media (max-width: 1279px) {
+/* Respond to the workspace's available width, including the Admin rail and
+   stored pane sizes, rather than assuming the whole window is usable. */
+@container studio (max-width: 1279px) {
   .nss-layout { grid-template-columns: var(--nss-explorer-w, 260px) 24px minmax(360px, 1fr); }
   .nss-layout--no-explorer,
   .nss-layout--no-explorer.nss-layout--no-inspector { grid-template-columns: minmax(0, 1fr); }
@@ -1002,7 +1033,7 @@
   .nss-splitter-inspector { display: none; }
 }
 
-@media (max-width: 799px) {
+@container studio (max-width: 799px) {
   .nss-toolbar,
   .nss-result-tools,
   .nss-editor-header,

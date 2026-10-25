@@ -15,6 +15,14 @@ different bits.
 
 ## [Unreleased]
 
+### Added
+
+- Studio opens SQL completion automatically while typing, with native command,
+  function and type inventories checked against the parser/binder. Suggestions
+  use server capabilities to label unavailable, experimental, deprecated or
+  unverified features. Editor notes explain unsupported commands and unknown
+  built-ins; Run remains the server's authoritative validation and RBAC check.
+
 ## [0.0.5] — 2026-09-25
 
 ### Added

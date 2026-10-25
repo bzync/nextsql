@@ -6,7 +6,6 @@ import {
   AppShellMain,
   Avatar,
   Badge,
-  Breadcrumb,
   Button,
   Container,
   IconButton,
@@ -231,19 +230,7 @@ export function Shell({
               ) : (
                 <Wordmark />
               )}
-            </div>
-            <div className="nsm-sidebar-search-wrap">
-              <Button
-                unstyled
-                className="nsm-sidebar-search-trigger"
-                onClick={() => setSearchOpen(true)}
-                aria-label="Search NextSQL Admin (Ctrl+K)"
-                title="Search NextSQL Admin (Ctrl+K)"
-              >
-                <Icon name="search" size={14} />
-                {!sidebarCollapsed ? <span>Search…</span> : null}
-                {!sidebarCollapsed ? <Kbd keys={["Ctrl", "K"]} size="sm" /> : null}
-              </Button>
+              {!sidebarCollapsed ? <span className="nsm-product-label">Admin</span> : null}
             </div>
             <ScrollArea className="nsm-sidebar-nav" orientation="vertical" keyboardNavigable={false}>
               <nav aria-label="Operations">
@@ -291,6 +278,7 @@ export function Shell({
                     <span className="nsm-sidebar-user-sub font-mono">{serverName}{who.database ? ` · ${who.database}` : ""}</span>
                   </div>
                 ) : null}
+                {!sidebarCollapsed ? <Icon name="settings" size={15} className="nsm-sidebar-user-gear" /> : null}
               </Button>
             </div>
           </aside>
@@ -306,7 +294,9 @@ export function Shell({
                   <PanelIcon collapsed={sidebarCollapsed} />
                 </IconButton>
                 <TopbarTitle as="div" className="nsm-topbar-title">
-                  {view.label}
+                  <span className="nsm-topbar-mode">{tab === "studio" ? "Workspace" : "Operations"}</span>
+                  <span className="nsm-topbar-divider" aria-hidden="true">/</span>
+                  <span className="nsm-topbar-current">{view.label}</span>
                 </TopbarTitle>
               </Inline>
               <Button
@@ -316,7 +306,7 @@ export function Shell({
                 aria-label="Search NextSQL Admin (Ctrl+K)"
               >
                 <Icon name="search" size={14} />
-                <span>Search…</span>
+                <span>Search Admin…</span>
                 <Kbd keys={["Ctrl", "K"]} size="sm" className="nsm-search-kbd" />
               </Button>
               <Inline gap="sm" align="center" wrap={false}>
@@ -354,26 +344,15 @@ export function Shell({
             <AppShellMain id="admin-main" scrollable className="nsm-main" aria-label={`${view.label} — NextSQL Admin`}>
               <Container size="full" className="nsm-content">
                 <PageHeader
-                  breadcrumbs={(
-                    <Breadcrumb
-                      className="nsm-breadcrumb"
-                      items={[
-                        { label: "NextSQL Admin" },
-                        { label: tab === "studio" ? "Studio" : "Operations" },
-                        { label: view.label, icon: <Icon name={view.icon} size={14} /> },
-                      ]}
-                    />
-                  )}
-                  eyebrow={tab === "studio" ? "Studio" : "Operations"}
-                  title={<span className="nsm-page-title"><Icon name={view.icon} size={20} />{view.label}</span>}
+                  className="nsa-page-header"
+                  title={view.label}
                   description={view.description}
                   actions={(
                     <Inline gap="sm">
                       {canSwitch ? (
                         <Button variant="ghost" size="sm" icon={<Icon name="plug" size={14} />} onClick={() => openSwitch()}>Switch server</Button>
                       ) : null}
-                      <Button variant="ghost" size="sm" icon={<Icon name="refresh" size={14} />} onClick={refresh}>Refresh</Button>
-                      <Button variant="ghost" size="sm" icon={<Icon name="settings" size={14} />} onClick={() => setSettingsOpen(true)}>Settings</Button>
+                      <Button variant="secondary" size="sm" icon={<Icon name="refresh" size={14} />} onClick={refresh}>Refresh</Button>
                       <Button className="nsm-mobile-signout" variant="outline" size="sm" icon={<Icon name="logout" size={14} />} onClick={onSignOut}>Sign out</Button>
                     </Inline>
                   )}

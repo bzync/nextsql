@@ -60,6 +60,12 @@ See [Install](/docs/install) and [Command line](/docs/cli).
 
 ## Operations mode
 
+Admin shares one design system across Setup, Operations, and Studio: neutral
+light/dark surfaces, consistent controls and tabs, bundled interface/code
+fonts, and visible keyboard focus. Global search is in the topbar. Open account
+settings from the desktop navigation footer or the mobile topbar. The layout
+adapts to smaller windows while keeping server-environment context visible.
+
 It talks to `nextsqld` over NSQL with the operator's credentials. Server-enforced RBAC still applies: a user without `ADMIN` does not get a security dashboard by visiting Admin. Surfaces include overview, storage, connections and activity, cluster, backup, configuration, and audit — all from `system.*` and the official CLI, never by opening data-directory files. The Databases view expands the deployment's database into its tables. Backup and verification controls keep their in-flight state visible and disable conflicting actions. A signed-in session and its connection to `nextsqld` stay up until the operator logs out, switches server, or Admin stops. A request that is still running is not cut off by an HTTP write deadline. `--idle-timeout` and `--session-lifetime` are optional bounds; `0`, the default, sets neither. A request in flight still does not count as idle when a bound is set, and a positive `--session-lifetime` is not extended by that request.
 
 ### Connection profiles
@@ -85,7 +91,7 @@ The file, not the browser, decides which servers Admin may reach: the sign-in pa
 Studio is on the same Operations session. Surfaces include:
 
 - authenticated SQL editor with bounded streaming typed results, copy/export, session-scoped lock-wait cancel, tabs/scripts/history/find, crash recovery for unsaved tabs, and layout persistence without credentials
-- catalog-aware table/column IntelliSense (no keyword completion), misspelled `FROM`/`JOIN` table-name suggestions, indexed JSON-path completion, and vector-aware `NEAREST` / `USING` completion
+- automatic SQL completion for native commands, built-ins and types, with server capability notes and warnings for unavailable commands/functions; catalog-aware table/column, relational JOIN, indexed JSON-path, and vector-aware `NEAREST` / `USING` completion (Ctrl+Space or **Suggest** opens the list explicitly)
 - positional `$1..$N` prepared parameters
 - five dedicated native explorers (JSON, full-text, vector, hybrid, geo), opened from the editor **More** menu
 - Users & roles, live Transactions & locks, verified Audit, Workflows/tasks/change streams, schema-migration history (also under **More**)

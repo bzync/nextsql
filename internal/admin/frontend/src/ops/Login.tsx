@@ -1,5 +1,5 @@
 import { useEffect, useState, type FormEvent } from "react";
-import { Alert, AuthBackdrop, Button, Heading, Input, Select, Stack, Text } from "@bzync/rui";
+import { Alert, Button, Heading, Input, Select, Stack, Text } from "@bzync/rui";
 import { api, ApiError, type ProfileList, type Whoami } from "./api";
 import { profileLabel } from "./SwitchServer";
 import { Wordmark } from "../shared/Brand";
@@ -53,7 +53,6 @@ export function Login({ onSignedIn }: { onSignedIn: (who: Whoami) => void }) {
 
   return (
     <>
-      <AuthBackdrop aria-hidden="true" />
       <main className="nsm-login-page bg-bg text-foreground">
         <div className="nsm-login-shell">
           <aside className="nsm-login-aside">
@@ -61,14 +60,14 @@ export function Login({ onSignedIn }: { onSignedIn: (who: Whoami) => void }) {
               <div className="nsm-login-aside-brand">
                 <Wordmark size="lg" />
               </div>
-              <Text variant="muted">
-                Operator console for this nextsqld. Sign in as your own database
-                user — server-side RBAC applies to everything you do.
-              </Text>
+              <div className="nsm-login-intro">
+                <Heading as="h2" size="lg">Database administration</Heading>
+                <Text variant="muted">Monitor your server, manage access, and work with your data.</Text>
+              </div>
               <ul className="nsm-login-facts">
-                <li><Icon name="lock" size={14} /> Encrypted storage by default</li>
-                <li><Icon name="shield" size={14} /> No engine-file access from this UI</li>
-                <li><Icon name="key" size={14} /> Session cookie + CSRF on every write</li>
+                <li><Icon name="activity" size={16} /> Server operations</li>
+                <li><Icon name="studio" size={16} /> Native SQL workspace</li>
+                <li><Icon name="shield" size={16} /> Database access controls</li>
               </ul>
             </Stack>
           </aside>
@@ -79,8 +78,7 @@ export function Login({ onSignedIn }: { onSignedIn: (who: Whoami) => void }) {
                 <ThemeSelect />
               </div>
               <Text variant="muted">
-                Sign in with NextSQL credentials. The database is optional when
-                the server has a default.
+                Sign in with your database credentials.
               </Text>
               {error ? <Alert variant="error" title="Sign-in failed">{error}</Alert> : null}
               <form onSubmit={submit} autoComplete="off" aria-busy={busy || undefined}>

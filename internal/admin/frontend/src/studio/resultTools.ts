@@ -1,4 +1,5 @@
 import type { StudioResultSet, StudioTableDetail } from "../ops/api";
+import nativeReference from "./sqlReference.generated.json";
 
 export const MAX_RESULT_EXPORT_BYTES = 64 << 20;
 export const MAX_JSON_TREE_NODES = 1_024;
@@ -2110,9 +2111,14 @@ export const NEXTSQL_KEYWORD_SUGGESTIONS: readonly string[] = [
   "NEAREST", "TO", "USING", "HNSW", "COSINE", "L2", "INNER_PRODUCT", "HAMMING",
   "FULLTEXT", "SEARCH", "FOR", "HIGHLIGHT", "SNIPPET",
   "DEFAULT", "PRIMARY KEY", "FOREIGN KEY", "REFERENCES", "CHECK", "CONSTRAINT",
+  "WITH", "WITH RECURSIVE", "INTERSECT", "EXCEPT", "OVER", "PARTITION BY",
+  "ROWS", "RANGE", "UNBOUNDED PRECEDING", "CURRENT ROW", "FOLLOWING", "PRECEDING",
+  "INCLUDE", "ONLINE", "ENCRYPTED CLIENT", "DETERMINISTIC", "FACET", "WEIGHT",
+  "ANALYZER", "QUANTIZATION", "IVF", "IVFPQ", "SPARSE", "PARTITION BY RANGE",
+  "PARTITION BY HASH", "PARTITION BY LIST", "ON DELETE CASCADE", "ON DELETE RESTRICT",
 ];
 
-export const NEXTSQL_FUNCTION_SUGGESTIONS: readonly { name: string; signature: string; detail: string }[] = [
+const CURATED_FUNCTION_SUGGESTIONS: readonly { name: string; signature: string; detail: string }[] = [
   // Aggregates
   { name: "COUNT", signature: "COUNT(*)", detail: "Count rows or non-null values" },
   { name: "SUM", signature: "SUM(expr)", detail: "Sum of numeric values" },
@@ -2148,15 +2154,9 @@ export const NEXTSQL_FUNCTION_SUGGESTIONS: readonly { name: string; signature: s
   // Date & Time
   { name: "NOW", signature: "NOW()", detail: "Current timestamp with timezone" },
   { name: "DATE_TRUNC", signature: "DATE_TRUNC('day', ts)", detail: "Truncate timestamp to specified unit" },
-  { name: "DATE_ADD", signature: "DATE_ADD(ts, '1 day')", detail: "Add interval to timestamp" },
-  { name: "DATE_DIFF", signature: "DATE_DIFF('day', ts1, ts2)", detail: "Difference between timestamps in unit" },
+  { name: "DATE_ADD", signature: "DATE_ADD(ts, amount, 'day')", detail: "Add interval to timestamp" },
+  { name: "DATE_DIFF", signature: "DATE_DIFF(ts1, ts2, 'day')", detail: "Difference between timestamps in unit" },
   { name: "EXTRACT", signature: "EXTRACT('year', ts)", detail: "Extract date or time part from timestamp" },
-  { name: "YEAR", signature: "YEAR(ts)", detail: "Extract year integer from timestamp" },
-  { name: "MONTH", signature: "MONTH(ts)", detail: "Extract month integer (1-12) from timestamp" },
-  { name: "DAY", signature: "DAY(ts)", detail: "Extract day of month (1-31) from timestamp" },
-  { name: "HOUR", signature: "HOUR(ts)", detail: "Extract hour integer (0-23) from timestamp" },
-  { name: "MINUTE", signature: "MINUTE(ts)", detail: "Extract minute integer (0-59) from timestamp" },
-  { name: "SECOND", signature: "SECOND(ts)", detail: "Extract second integer (0-59) from timestamp" },
 
   // JSON functions
   { name: "JSON_GET", signature: "JSON_GET(json, 'path')", detail: "Extract value at JSON path" },
@@ -2166,6 +2166,8 @@ export const NEXTSQL_FUNCTION_SUGGESTIONS: readonly { name: string; signature: s
   { name: "JSON_TYPE", signature: "JSON_TYPE(json)", detail: "Return JSON data type name" },
   { name: "JSON_CONTAINS", signature: "JSON_CONTAINS(json, val)", detail: "Check if JSON contains value" },
 
+  { name: "CAST", signature: "CAST(value AS type)", detail: "Convert a value to a native column type" },
+
   // Conditional / Null handling
   { name: "COALESCE", signature: "COALESCE(val1, val2, ...)", detail: "First non-null expression" },
   { name: "NULLIF", signature: "NULLIF(val1, val2)", detail: "Return null if val1 equals val2" },
@@ -2174,7 +2176,7 @@ export const NEXTSQL_FUNCTION_SUGGESTIONS: readonly { name: string; signature: s
 
   // Vector functions
   { name: "COSINE_DISTANCE", signature: "COSINE_DISTANCE(v1, v2)", detail: "Cosine distance between vectors" },
-  { name: "COSINE", signature: "COSINE(v1, v2)", detail: "Cosine similarity between vectors" },
+  { name: "COSINE", signature: "COSINE(v1, v2)", detail: "Cosine distance between vectors" },
   { name: "L2", signature: "L2(v1, v2)", detail: "Euclidean L2 distance between vectors" },
   { name: "L1", signature: "L1(v1, v2)", detail: "Manhattan L1 distance between vectors" },
   { name: "VECTOR_NORM", signature: "VECTOR_NORM(vec)", detail: "Euclidean magnitude (L2 norm) of vector" },
@@ -2210,56 +2212,23 @@ export const NEXTSQL_FUNCTION_SUGGESTIONS: readonly { name: string; signature: s
   { name: "AI", signature: "AI()", detail: "Auto-incrementing sequence generator (default only)" },
 ];
 
+// Names come from the binder and native spatial registries at build time.
+// Curated signatures are hints; uncurated functions never invent an arity.
+export const NEXTSQL_FUNCTION_SUGGESTIONS = nativeReference.functions.map((name) => {
+  const curated = CURATED_FUNCTION_SUGGESTIONS.find((item) => item.name.toLowerCase() === name);
+  return curated ?? { name: name.toUpperCase(), signature: `${name.toUpperCase()}(…)`, detail: "Native built-in; arguments validated by the server" };
+});
+
 export const NEXTSQL_TYPE_SUGGESTIONS: readonly string[] = [
-  "INT64", "INT32", "INT16", "INT8", "UINT64", "UINT32", "UINT16", "UINT8",
-  "STRING", "TEXT", "BOOL", "FLOAT64", "FLOAT32", "DECIMAL",
-  "TIMESTAMP", "TIMESTAMPTZ", "DATE", "TIME", "INTERVAL",
-  "JSON", "BLOB", "VECTOR<F32, 1536>", "BITVECTOR<256>", "SPARSEVECTOR<1024>",
-  "POINT", "LINESTRING", "POLYGON", "GEOMETRY", "GEOGRAPHY",
+  "UUID", "STRING", "TEXT", "BLOB", "CHAR(4)", "VARCHAR(255)", "ENUM('a', 'b')",
+  "BOOL", "INT8", "INT16", "INT32", "INT64", "UINT8", "UINT16", "UINT32", "UINT64",
+  "FLOAT32", "FLOAT64", "DECIMAL(12,2)", "DATE", "TIME", "TIMESTAMP", "TIMESTAMPTZ", "INTERVAL",
+  "JSON", "STRUCT<value INT64>", "ARRAY<INT64>", "MAP<STRING, INT64>",
+  "VECTOR<F32, 1536>", "VECTOR<F16, 1536>", "VECTOR<I8, 1536>", "BITVECTOR<256>", "SPARSEVECTOR<1024>",
+  "POINT", "BOX", "LINESTRING", "POLYGON", "GEOMETRY", "GEOGRAPHY",
 ];
 
-export const NEXTSQL_SYSTEM_TABLES: readonly string[] = [
-  "system.active_queries",
-  "system.audit_log",
-  "system.audit_verify",
-  "system.backups",
-  "system.capabilities",
-  "system.change_streams",
-  "system.checks",
-  "system.columns",
-  "system.config",
-  "system.databases",
-  "system.foreign_keys",
-  "system.grants",
-  "system.index_stats",
-  "system.indexes",
-  "system.key_versions",
-  "system.locks",
-  "system.metrics",
-  "system.partitions",
-  "system.quotas",
-  "system.raft",
-  "system.realms",
-  "system.referencing_keys",
-  "system.replica_health",
-  "system.replication",
-  "system.resource_groups",
-  "system.roles",
-  "system.schedules",
-  "system.server_log",
-  "system.sessions",
-  "system.storage",
-  "system.table_ddl",
-  "system.table_stats",
-  "system.tables",
-  "system.tasks",
-  "system.tls",
-  "system.transactions",
-  "system.triggers",
-  "system.users",
-  "system.views",
-  "system.workflows",
-];
+export const NEXTSQL_SYSTEM_TABLES: readonly string[] = nativeReference.systemTables;
 
 // extractReferencedTables scans for bare-identifier FROM/JOIN/UPDATE/INTO targets in
 // source order, deduplicated case-sensitively (NextSQL identifiers are
@@ -2383,6 +2352,10 @@ export type SQLSuggestion = {
   insertText: string;
   table?: string;
   detail?: string;
+  availability?: "supported" | "experimental" | "deprecated" | "unsupported" | "unknown";
+  note?: string;
+  replaceStart?: number;
+  replaceEnd?: number;
 };
 
 export type TableForeignKeyInfo = {
@@ -2756,7 +2729,9 @@ export function rankSQLSuggestions(
   };
 
   const pushFunc = (fn: { name: string; signature: string; detail: string }) => {
-    if (out.length >= limit) return;
+    // A one-letter expression prefix belongs to catalog identifiers first.
+    // Built-ins appear on an explicit empty-prefix browse or at two letters.
+    if (out.length >= limit || lowerPrefix.length === 1) return;
     out.push({
       kind: "function",
       label: `${fn.signature} — ${fn.detail}`,
@@ -3161,6 +3136,7 @@ export function tokenizeSQLWithSpans(src: string): SQLSpanToken[] {
       let j = i + 2;
       while (j + 1 < n && !(src[j] === "*" && src[j + 1] === "/")) j++;
       if (j + 1 < n) j += 2;
+      else j = n;
       toks.push({ kind: "block-comment", text: src.slice(i, j), start: i, end: j });
       i = j;
       continue;

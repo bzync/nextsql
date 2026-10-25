@@ -6,13 +6,29 @@
 import axe from "axe-core";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
-import { readFileSync } from "node:fs";
+import { mkdirSync, readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { launchChrome, runAxe } from "../../webtest/cdp.mjs";
+import { launchChrome, runAxe as auditAxe } from "../../webtest/cdp.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const web = resolve(here, "../web");
+// Optional review artifacts from the real bundle and the deterministic
+// fixtures below. No credentials or real customer data are captured.
+const screenshotDir = process.env.NEXTSQL_ADMIN_SCREENSHOTS;
+const previewViews = new Set([
+  "Setup welcome", "Operations login", "Operations overview",
+  "Operations overview dark", "Operations overview mobile", "Studio workspace",
+  "Account settings", "Console preferences",
+  "Studio automatic SQL completion", "Studio unavailable feature completion", "Studio unavailable command warning",
+]);
+async function runAxe(browser, source, label) {
+  await auditAxe(browser, source, label);
+  if (screenshotDir && previewViews.has(label)) {
+    mkdirSync(screenshotDir, { recursive: true });
+    await browser.captureScreenshot({ path: resolve(screenshotDir, `${label.toLowerCase().replaceAll(" ", "-")}.png`) });
+  }
+}
 const assets = {
   "/": ["index.html", "text/html; charset=utf-8"],
   "/assets/app.js": ["app.js", "text/javascript; charset=utf-8"],
@@ -408,6 +424,7 @@ async function testOperateMode() {
       ["fulltext", "supported", "Native SEARCH/HIGHLIGHT/SNIPPET", "0.1.0"],
       ["vector", "supported", "VECTOR<F32,N>/BITVECTOR<N>/SPARSEVECTOR<N>, NEAREST", "0.1.0"],
       ["geo", "supported", "rich POINT/BOX/LINESTRING/POLYGON operations and spatial index", "0.1.0"],
+      ["vector_ivfpq", "unsupported", "IVFPQ is disabled in this fixture", "0.0.1"],
     ],
     truncated: false,
     elapsed_ms: 1,
@@ -954,6 +971,46 @@ async function testOperateMode() {
     await browser.waitFor("document.querySelector('h1')?.textContent === 'Overview'", "the Operations overview");
     await browser.waitFor("document.querySelectorAll('tbody tr').length > 0", "the overview data");
     await runAxe(browser, axe.source, "Operations overview");
+    // Product hierarchy and theme rules are shared across modes. Check the
+    // actual browser cascade, which static bundle assertions cannot cover.
+    const shellDesign = await browser.evaluate(`(() => {
+      const visible = (selector) => [...document.querySelectorAll(selector)].filter((node) => node.getBoundingClientRect().width > 0).length;
+      const refresh = [...document.querySelectorAll('.nsa-page-header button')].find((node) => node.textContent.trim() === 'Refresh');
+      return {
+        searchControls: visible('button[aria-label="Search NextSQL Admin (Ctrl+K)"]'),
+        accountControls: visible('.nsm-sidebar-user-btn, .nsm-topbar-profile-btn'),
+        tableFont: getComputedStyle(document.querySelector('table')).fontFamily,
+        refreshSize: getComputedStyle(refresh).fontSize,
+        headingCount: document.querySelectorAll('h1').length,
+        selectedTabRule: getComputedStyle(document.querySelector('[role="tab"][aria-selected="true"]')).borderBottomWidth,
+      };
+    })()`);
+    assert.equal(shellDesign.searchControls, 1, "one visible global search control");
+    assert.equal(shellDesign.accountControls, 1, "one visible account control");
+    assert.equal(shellDesign.headingCount, 1, "one primary page heading");
+    assert.ok(shellDesign.tableFont.includes("Inter Variable"), "catalog tables share the application typeface");
+    assert.equal(shellDesign.refreshSize, "12px", "compact actions retain their component font size");
+    assert.equal(shellDesign.selectedTabRule, "2px", "selected tabs have a non-color selection cue");
+    await browser.evaluate("document.querySelector('.nsm-sidebar-user-btn').click()");
+    await browser.waitFor("document.querySelector('[role=dialog]')?.textContent.includes('User & Workspace Settings')", "account settings");
+    await runAxe(browser, axe.source, "Account settings");
+    await browser.evaluate(`(() => {
+      const tab = document.querySelector('[role=dialog] [role=tab]');
+      tab.focus();
+      tab.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true, cancelable: true }));
+    })()`);
+    await browser.waitFor("document.querySelector('[role=dialog] [role=tab][aria-selected=true]')?.textContent.includes('Console Preferences')", "keyboard navigation in dialog tabs");
+    await runAxe(browser, axe.source, "Console preferences");
+    await browser.evaluate("document.querySelector('[role=dialog] [aria-label=\"Close dialog\"]').click()");
+    await browser.waitFor("!document.querySelector('[role=dialog]')", "settings dialog to close");
+    await browser.evaluate(`${THEME_BUTTON("dark")}.click()`);
+    await runAxe(browser, axe.source, "Operations overview dark");
+    await browser.emulateDeviceMetrics({ width: 360, height: 800, deviceScaleFactor: 1 });
+    assert.equal(await browser.evaluate("document.documentElement.scrollWidth > innerWidth"), false, "the shell fits a 360px viewport");
+    assert.equal(await browser.evaluate("document.querySelector('.nsm-main').scrollWidth > document.querySelector('.nsm-main').clientWidth"), false, "content fits inside the mobile shell");
+    await runAxe(browser, axe.source, "Operations overview mobile");
+    await browser.clearDeviceMetrics();
+    await browser.evaluate(`${THEME_BUTTON("light")}.click()`);
     assert.equal(await browser.evaluate("document.querySelector('.nsa-skip')?.getAttribute('href')"), "#admin-main");
     assert.equal(await browser.evaluate("document.querySelector('.nsm-sidebar nav')?.getAttribute('aria-label')"), "Operations");
     const sidebarIcons = await browser.evaluate(`(() => {
@@ -1071,6 +1128,7 @@ async function testOperateMode() {
     assert.equal(await browser.evaluate("document.body.textContent.includes('127.0.0.1:7210')"), true, "the toolbar should show the nextsqld the session targets");
     await browser.waitFor("document.body.textContent.includes('Connected')", "Studio live connection status");
     await runAxe(browser, axe.source, "Studio workspace");
+    assert.equal(await browser.evaluate("document.querySelector('.nsm-main').scrollWidth > document.querySelector('.nsm-main').clientWidth"), false, "Studio panes fit the available workspace beside the Admin rail");
     await highDensityCheck(
       browser,
       "Studio workspace",
@@ -2552,6 +2610,53 @@ async function testOperateMode() {
       editor.dispatchEvent(new Event("select", { bubbles: true }));
       return true;
     })()`);
+
+    // Automatic completion follows actual typing without opening Suggest.
+    await setSQL("");
+    await setCursor(0);
+    await browser.insertText("C");
+    await browser.insertText("R");
+    await browser.waitFor('document.querySelector(\'[role=dialog][aria-label="SQL suggestions"] [role=option]\')?.textContent.includes("CREATE")', "automatic native command suggestions after typing");
+    assert.equal(await browser.evaluate(`(() => {
+      const popup = document.querySelector('.nss-suggest-popup').getBoundingClientRect();
+      const main = document.querySelector('.nsm-main');
+      return popup.left >= main.getBoundingClientRect().left && popup.right <= innerWidth && popup.bottom <= innerHeight && main.scrollLeft === 0;
+    })()`), true, "completion stays visible without horizontally scrolling the workspace");
+    assert.equal(await browser.evaluate('document.activeElement === document.querySelector(\'[aria-label="SQL editor"]\')'), true, "automatic completion keeps typing focus in the editor");
+    await runAxe(browser, axe.source, "Studio automatic SQL completion");
+    await editorKeydown({ key: "Escape" });
+    await browser.waitFor('!document.querySelector(\'[role=dialog][aria-label="SQL suggestions"]\')', "automatic suggestions dismiss");
+    await setSQL("-- a comment");
+    await setCursor("-- a comment".length);
+    await browser.insertText(".");
+    await browser.evaluate("new Promise((resolve) => setTimeout(resolve, 250))");
+    assert.equal(await browser.evaluate('!!document.querySelector(\'[role=dialog][aria-label="SQL suggestions"]\')'), false, "typing a dot inside a comment does not open completion");
+
+    await setSQL("CREATE SC");
+    await setCursor("CREATE SC".length);
+    await clickButton("Suggest");
+    await browser.waitFor('document.querySelector(\'[role=dialog][aria-label="SQL suggestions"]\')?.textContent.includes("CREATE SCHEDULE")', "multiword command completion");
+    assert.equal(await clickSuggestOption("CREATE SCHEDULE"), true);
+    await browser.waitFor('document.querySelector(\'[aria-label="SQL editor"]\')?.value === "CREATE SCHEDULE"', "command completion replaces the entire partial head once");
+
+    const indexSQL = "CREATE VECTOR INDEX ix ON articles(embedding) USING IV";
+    await setSQL(indexSQL);
+    await setCursor(indexSQL.length);
+    await clickButton("Suggest");
+    await browser.waitFor('document.querySelector(\'[role=dialog][aria-label="SQL suggestions"] [role=option][aria-disabled=true]\')?.textContent.includes("IVFPQ")', "server-unavailable algorithm is labeled and disabled");
+    assert.equal(await clickSuggestOption("IVFPQ"), true);
+    assert.equal(await browser.evaluate('document.querySelector(\'[aria-label="SQL editor"]\').value'), indexSQL, "an unavailable completion cannot be inserted");
+    await runAxe(browser, axe.source, "Studio unavailable feature completion");
+    await editorKeydown({ key: "Escape" });
+    await browser.waitFor('!document.querySelector(\'[role=dialog][aria-label="SQL suggestions"]\')', "algorithm suggestions dismiss");
+
+    await setSQL("CREATE DATABASE app");
+    await browser.waitFor('document.querySelector(".nss-feature-notes")?.textContent.includes("deployment serves one database")', "native unsupported-command explanation");
+    await runAxe(browser, axe.source, "Studio unavailable command warning");
+    await setSQL("SELECT YEAR(NOW())");
+    await browser.waitFor('document.querySelector(".nss-feature-notes")?.textContent.includes("YEAR() is not a built-in")', "unknown built-in warning");
+    await setSQL("SELECT 'CREATE DATABASE app; YEAR()'");
+    await browser.waitFor('!document.querySelector(".nss-feature-notes")', "SQL-looking string contents do not produce feature warnings");
 
     await setSQL("");
     assert.equal(await clickButton("Suggest"), true, "the Suggest control should open the panel");

@@ -18,7 +18,7 @@ export function StepHeader({
   kicker?: ReactNode;
 }) {
   return (
-    <Stack gap="xs">
+    <Stack gap="xs" className="nsa-step-header">
       {kicker ? <Text className="nsa-kicker">{kicker}</Text> : null}
       <Heading id="installer-step-title" tabIndex={-1} as={level} size={size}>{title}</Heading>
       {description ? <Text variant="muted">{description}</Text> : null}

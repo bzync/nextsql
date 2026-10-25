@@ -39,17 +39,9 @@ body {
   font-feature-settings: "cv05", "ss01", "tnum";
   -webkit-font-smoothing: antialiased;
 }
-#root ul {
+#root ul:not([class]) {
   margin: 4px 0 0;
   padding-left: 18px;
-}
-
-/* Product-level density. RUI's default radii/shadows read as a marketing
-   surface; Admin is an operator console, so flatten chrome without
-   restyling every primitive. */
-:root {
-  --nsa-radius: 6px;
-  --nsa-sidebar-w: 232px;
 }
 
 /* Shared skip-link, used by both the Setup wizard shell and the Operations
@@ -242,12 +234,8 @@ span.text-xs.font-mono.text-slate-400 {
    descendant, nor on unlayered-vs-`@layer` ordering — light comes from `:root`
    and dark from the later, equally specific `.dark`. Dark's #97a3b4 already
    clears AA on every dark surface (lowest 6.14:1) and is unchanged. */
-:root {
-  --color-muted-foreground: #5b6780;
-}
-.dark {
-  --color-muted-foreground: #97a3b4;
-}
+/* The current neutral palette and its light/dark muted-foreground values
+   live in design-system.css, which is the single product token source. */
 
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after {

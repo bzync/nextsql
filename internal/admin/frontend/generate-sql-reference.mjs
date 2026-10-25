@@ -5,6 +5,7 @@ import assert from "node:assert/strict";
 import { readFileSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { goCaseNames as cases } from "./sql-reference-source.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const read = (name) => readFileSync(resolve(here, "../..", name), "utf8");
@@ -14,8 +15,6 @@ const between = (source, start, end) => {
   assert.ok(a >= 0 && b > a, `SQL inventory source seam changed: ${start}`);
   return source.slice(a, b);
 };
-const cases = (source) => [...source.matchAll(/case\s+((?:"[a-z_][a-z_0-9]*"\s*,?\s*)+):/g)]
-  .flatMap((match) => [...match[1].matchAll(/"([a-z_][a-z_0-9]*)"/g)].map((item) => item[1]));
 const binder = read("sql/binder/binder.go");
 const call = between(binder, "case ast.Call:", "case ast.Window:");
 const geo = read("sql/types/geo.go");

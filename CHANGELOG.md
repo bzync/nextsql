@@ -15,6 +15,20 @@ different bits.
 
 ## [Unreleased]
 
+### Security
+
+- Remove ambiguous repetition from the Studio SQL-reference generator's Go
+  case-label regex (CodeQL #94), with timeout-protected malformed-input tests.
+- Patch the docs site's Next.js and matching ESLint configuration to 16.4.1;
+  update sharp, fast-uri, source-map-js, brace-expansion, compression, and Zod.
+  A scoped override supplies compression 1.8.2 because serve 14.2.6 pins 1.8.1.
+
+### Fixed
+
+- Use Node16 module resolution for the CommonJS Node driver TypeScript smoke
+  fixture, correcting the invalid CommonJS/bundler combination that failed
+  the dependency PR production checks.
+
 ### Added
 
 - Studio opens SQL completion automatically while typing, with native command,

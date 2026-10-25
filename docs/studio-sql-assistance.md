@@ -79,6 +79,8 @@ Raft, permission, or driver contract changes are introduced.
 | Editor integration | `StudioWorkspace.tsx` | Chrome tests for automatic popup/focus, whole-command insertion, unavailable algorithm handling, warning display and literal exclusions; existing Studio interaction and accessibility suite. |
 
 `npm run build` refreshes the generated inventory. `npm run test:studio` rejects
-a stale inventory. Run `make test-admin-ui` and `go test ./tests/docs` for the
+a stale inventory and tests malformed Go case-label lists in a timeout-bounded
+subprocess. Label separators are mandatory commas, preventing ambiguous regex
+backtracking in the build-time extractor. Run `make test-admin-ui` and `go test ./tests/docs` for the
 frontend gate and native-reference parity checks. These extend the completed
 P29 gate; they introduce no claim about newly supported engine syntax.

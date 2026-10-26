@@ -123,7 +123,7 @@ build_fixture() { # build_fixture <kind: clean|dirty>
 	: > "$w/expected.jsonl"
 
 	"$nextsql" init --data-dir "$w/data" --key-file "$w/root.key" \
-		--user app --password-file "$w/password" --no-env > "$w/init.log" 2>&1 \
+		--user app --password-file "$w/password" --database default --no-env > "$w/init.log" 2>&1 \
 		|| { cat "$w/init.log" >&2; die "init failed"; }
 
 	start_server "$w"

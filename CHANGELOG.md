@@ -34,6 +34,8 @@ different bits.
 
 ### Fixed
 
+- Create an explicit database when generating retained upgrade fixtures;
+  credential-only initialization otherwise leaves no database to start.
 - Use Node16 module resolution for the CommonJS Node driver TypeScript smoke
   fixture, correcting the invalid CommonJS/bundler combination that failed
   the dependency PR production checks.

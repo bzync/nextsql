@@ -3,10 +3,10 @@
     {
       "version": "0.0.6",
       "title": "Security and Studio updates",
-      "status": "draft",
+      "status": "published",
       "channel": "preview",
-      "latest": false,
-      "releasedAt": "",
+      "latest": true,
+      "releasedAt": "2026-10-26T04:00:55Z",
       "summary": "Fixes malformed date-function calls that could terminate the daemon; adds session panic containment, compiler/dependency security updates, and automatic native SQL completion in Studio.",
       "highlights": [
         "Wrong date-function arity returns invalid_argument; unexpected session panics close the affected connection and run cleanup",
@@ -51,14 +51,42 @@
           "text": "Correct the Node TypeScript smoke-test configuration; Node and Bun runtime packages remain unchanged at 0.0.1."
         }
       ],
-      "artifacts": []
+      "artifacts": [
+        {
+          "id": "nextsql-0.0.6-linux-amd64.run",
+          "kind": "run",
+          "platform": "linux-amd64",
+          "filename": "nextsql-0.0.6-linux-amd64.run",
+          "size": 22543411,
+          "sha256": "7c0357eca893979e2a8d4bdbade732b8b546fa97c6b5ae63e92fb88fe9003789",
+          "url": "https://github.com/bzync/nextsql/releases/download/v0.0.6/nextsql-0.0.6-linux-amd64.run"
+        },
+        {
+          "id": "nextsql-0.0.6-linux-amd64.tar.gz",
+          "kind": "archive",
+          "platform": "linux-amd64",
+          "filename": "nextsql-0.0.6-linux-amd64.tar.gz",
+          "size": 22542885,
+          "sha256": "3e5062633d7edb3b59acc170fc98d125ff1352013c9db07e731e9a4fa4f032ef",
+          "url": "https://github.com/bzync/nextsql/releases/download/v0.0.6/nextsql-0.0.6-linux-amd64.tar.gz"
+        },
+        {
+          "id": "nextsql_0.0.6_amd64.deb",
+          "kind": "deb",
+          "platform": "linux-amd64",
+          "filename": "nextsql_0.0.6_amd64.deb",
+          "size": 18803676,
+          "sha256": "592f0badb7b5f7cb96bcae4a308c3c4dc21c94e34903867a8dd6eca64ce7ea33",
+          "url": "https://github.com/bzync/nextsql/releases/download/v0.0.6/nextsql_0.0.6_amd64.deb"
+        }
+      ]
     },
     {
       "version": "0.0.1",
       "title": "First public preview",
       "status": "published",
       "channel": "preview",
-      "latest": true,
+      "latest": false,
       "releasedAt": "2026-09-13T17:56:35Z",
       "summary": "The first public release of NextSQL: one encrypted ACID engine for SQL, JSON, vectors, full-text, and geo, with official drivers at 0.0.1.",
       "highlights": [

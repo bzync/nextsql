@@ -450,6 +450,15 @@ func acceptCaps(requested uint16) sessionCaps {
 }
 
 func (s *Server) serveConn(ctx context.Context, conn net.Conn) {
+	// Keep this outside the cleanup defers: a statement panic must unwind
+	// query cancellation, transaction abort, registration and admission
+	// accounting, then end this connection rather than the entire daemon.
+	// Do not log the panic value: it may contain SQL, credentials or data.
+	defer func() {
+		if recover() != nil {
+			s.log().Error("session panic; connection closed")
+		}
+	}()
 	defer func() {
 		_ = conn.Close()
 		s.mu.Lock()

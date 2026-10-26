@@ -441,7 +441,14 @@ func (s *Session) evalInSubquery(x ast.InSubquery, tab *catalog.Table, row []typ
 
 func evalDateFn(name string, args []types.Value) (types.Value, bool, error) {
 	switch name {
-	case "extract", "date_trunc", "date_add", "date_diff":
+	case "extract", "date_trunc":
+		if len(args) != 2 {
+			return types.Value{}, true, nerr.New(nerr.InvalidArgument, "executor.eval", name+" takes two arguments")
+		}
+	case "date_add", "date_diff":
+		if len(args) != 3 {
+			return types.Value{}, true, nerr.New(nerr.InvalidArgument, "executor.eval", name+" takes three arguments")
+		}
 	default:
 		return types.Value{}, false, nil
 	}

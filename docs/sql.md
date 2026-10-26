@@ -632,6 +632,11 @@ Date/time functions use UTC and accept units `year`, `month`, `day`, `hour`,
 elapsed durations for smaller units; and `DATE_DIFF(start, end, unit)` returns
 calendar boundary differences for year/month and truncated elapsed differences
 for smaller units. Unknown units and non-integral DATE_ADD amounts fail.
+`EXTRACT` and `DATE_TRUNC` require exactly two arguments; `DATE_ADD` and
+`DATE_DIFF` require exactly three, including when an argument is NULL.
+Wrong arity returns `invalid_argument`. For example, subtract five minutes
+with `DATE_ADD(NOW(), -5, 'minute')`; the two-argument form
+`DATE_ADD(NOW(), INTERVAL '-5 minutes')` is rejected.
 
 An ordinary `ORDER BY` directly below `LIMIT`/`OFFSET` uses a bounded max-heap
 `TopNSort` with capacity `LIMIT + OFFSET`, then applies the offset. Ordered

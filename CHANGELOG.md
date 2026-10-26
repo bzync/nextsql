@@ -17,6 +17,10 @@ different bits.
 
 ### Security
 
+- Reject malformed argument counts for `EXTRACT`, `DATE_TRUNC`, `DATE_ADD`,
+  and `DATE_DIFF` before evaluation, fixing a daemon crash from queries such
+  as `SELECT DATE_ADD(NOW(), INTERVAL '-5 minutes')`. Recover unexpected
+  session panics by closing the affected connection and running cleanup.
 - Require Go 1.26.10 for source builds and pin the container compiler to Go
   1.27.3, incorporating the `crypto/x509` fix for CVE-2026-111943 found by the
   post-merge image scan. CI and native release builds use the module minimum.

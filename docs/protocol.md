@@ -149,6 +149,15 @@ A length field larger than `max_packet` is a protocol error. The implementation 
 | Ready | S→C | empty; session can take the next command |
 | Unlock / UnlockOK | C↔S | client-held root after password auth when the server requires it |
 
+An unexpected recoverable panic in a connection's serving goroutine closes
+that connection and runs session cleanup, including aborting an open
+transaction and releasing its locks and admission slots. The server logs a
+generic error without the panic payload, which may contain sensitive data.
+Other sessions and the listener continue serving. The affected client sees a
+connection failure; it must reconnect, and an interrupted commit has the usual
+uncertain outcome. Ordinary validation errors, including wrong date-function
+arity, return an Error followed by Ready and leave the session usable.
+
 ### Capability negotiation
 
 `Hello.flags` bit 1 (`0x0002`, public error codes) asks the server to include the

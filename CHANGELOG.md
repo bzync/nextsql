@@ -2,7 +2,7 @@
 
 All notable changes to NextSQL are recorded here.
 
-The current release is **0.0.5**; **0.0.1** was the first public one. All are
+The current release is **0.0.6**; **0.0.1** was the first public one. All are
 previews: the engine is complete enough to install, query, and operate, and it
 is still under measurement. Before you rely on it, run `nextsql-bench --slo`
 and the crash, recovery, and HA suites on your hardware.
@@ -14,6 +14,8 @@ different bits.
 ---
 
 ## [Unreleased]
+
+## [0.0.6] — 2026-10-26
 
 ### Security
 

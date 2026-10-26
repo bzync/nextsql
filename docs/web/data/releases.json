@@ -1,6 +1,59 @@
 {
   "releases": [
     {
+      "version": "0.0.6",
+      "title": "Security and Studio updates",
+      "status": "draft",
+      "channel": "preview",
+      "latest": false,
+      "releasedAt": "",
+      "summary": "Fixes malformed date-function calls that could terminate the daemon; adds session panic containment, compiler/dependency security updates, and automatic native SQL completion in Studio.",
+      "highlights": [
+        "Wrong date-function arity returns invalid_argument; unexpected session panics close the affected connection and run cleanup",
+        "Patched Go toolchains, docs dependencies, and SQL-reference extraction",
+        "Consistent Admin presentation and automatic native SQL completion with capability-aware feature notes"
+      ],
+      "changes": [
+        {
+          "id": "date-arity",
+          "kind": "fixed",
+          "area": "SQL",
+          "text": "Validate exact arity for EXTRACT, DATE_TRUNC, DATE_ADD, and DATE_DIFF before indexing or NULL propagation."
+        },
+        {
+          "id": "session-panic",
+          "kind": "fixed",
+          "area": "Security",
+          "text": "Contain recoverable serving-goroutine panics, close the affected connection, and run transaction/session cleanup without logging panic payloads."
+        },
+        {
+          "id": "security-updates",
+          "kind": "fixed",
+          "area": "Security",
+          "text": "Require Go 1.26.10 for native builds, use Go 1.27.3 for containers, and patch docs dependencies and the SQL-reference generator regex."
+        },
+        {
+          "id": "admin-ui",
+          "kind": "changed",
+          "area": "Ops",
+          "text": "Use consistent Admin components across Setup, Operations, and Studio."
+        },
+        {
+          "id": "completion",
+          "kind": "added",
+          "area": "SQL",
+          "text": "Open native SQL completion automatically in Studio and annotate feature availability from the connected server."
+        },
+        {
+          "id": "driver-compat",
+          "kind": "fixed",
+          "area": "Drivers",
+          "text": "Correct the Node TypeScript smoke-test configuration; Node and Bun runtime packages remain unchanged at 0.0.1."
+        }
+      ],
+      "artifacts": []
+    },
+    {
       "version": "0.0.1",
       "title": "First public preview",
       "status": "published",
@@ -78,7 +131,7 @@
           "id": "c11",
           "kind": "added",
           "area": "Engine",
-          "text": "Page-delta WAL redo: a commit logs only the bytes that changed, about 8× less disk writing per insert, without weakening fsync."
+          "text": "Page-delta WAL redo: a commit logs only the bytes that changed, about 8\u00d7 less disk writing per insert, without weakening fsync."
         },
         {
           "id": "c12",

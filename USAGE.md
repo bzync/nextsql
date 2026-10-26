@@ -1,14 +1,19 @@
 # NextSQL usage manual
 
-Operator and application guide for **NextSQL 0.0.5**.
+Operator and application guide for **NextSQL 0.0.6**.
 
 NextSQL is a native, encrypted-by-default multimodel database. It is not
 PostgreSQL, MySQL, MongoDB, Elasticsearch, or a vector-store compatibility
 layer. It has its own storage format, SQL dialect, wire protocol (NSQL v1),
 and official drivers.
 
-0.0.5 is a preview. Before you rely on it, run `nextsql-bench --slo` and the
+0.0.6 is a preview. Before you rely on it, run `nextsql-bench --slo` and the
 crash, recovery, security, and HA suites on your hardware.
+
+Upgrading from 0.0.5 requires replacing and restarting the daemon; updating
+only a CLI or driver does not apply the server crash fix. This patch changes
+no persistent or wire formats. See the [release notes](docs/release-notes/0.0.6.md)
+and [compatibility review](COMPATIBILITY.md#005-to-006).
 
 Internal design notes live in [`docs/`](docs/). The product site is
 [nextsql.bzync.com](https://nextsql.bzync.com).

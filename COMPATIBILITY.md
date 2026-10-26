@@ -133,6 +133,18 @@ A backup is not considered valid until verification and restore testing succeed.
 
 ## 8. Upgrade Policy
 
+### 0.0.5 to 0.0.6
+
+This patch changes no persistent storage, WAL, catalog, backup, or NSQL format.
+It requires no data migration. Stop the daemon, replace the installed binaries,
+and restart; updating a CLI or driver alone does not repair an old running
+daemon. Retain a verified pre-upgrade backup. Rolling maintenance follows the
+existing drain/leader-transfer procedure. Native date-function signatures are
+unchanged: malformed arity now returns `invalid_argument`. Node and Bun driver
+packages remain at 0.0.1. See the [0.0.6 release notes](docs/release-notes/0.0.6.md).
+
+### General policy
+
 Before upgrade:
 
 1. verify backup;

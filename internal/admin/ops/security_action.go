@@ -69,7 +69,7 @@ type securityActionRequest struct {
 }
 
 // quoteSQLString renders a SQL string literal. NextSQL's lexer takes bytes
-// literally between quotes and recognizes only '' as an escape, so doubling
+// literally between quotes and recognizes only ” as an escape, so doubling
 // the quote is the complete and only escaping needed.
 func quoteSQLString(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", "''") + "'"

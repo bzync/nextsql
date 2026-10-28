@@ -1576,7 +1576,6 @@ func (db *DB) SettlePredecessorTransactions() error {
 	return db.reloadCatalog()
 }
 
-
 func (db *DB) reloadCatalog() error {
 	var tables []*catalog.Table
 	start := catalog.TableKey("")

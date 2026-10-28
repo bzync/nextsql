@@ -1,0 +1,55 @@
+# NextSQL Code Ownership
+# https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+
+# Default fallback owner for the entire repository
+* @rayanreynaldo
+
+# Engine Storage, WAL, Recovery, Transactions & Backup
+/internal/storage/   @rayanreynaldo
+/internal/wal/       @rayanreynaldo
+/internal/recovery/  @rayanreynaldo
+/internal/txn/       @rayanreynaldo
+/internal/backup/    @rayanreynaldo
+
+# SQL Parsing, Binder, Optimizer, Catalog & Execution
+/internal/sql/       @rayanreynaldo
+/internal/executor/  @rayanreynaldo
+/internal/catalog/   @rayanreynaldo
+
+# Distributed Consensus, Replication & High Availability
+/internal/replication/ @rayanreynaldo
+/internal/raft/        @rayanreynaldo
+/internal/ha/          @rayanreynaldo
+
+# Protocol, Authentication, Crypto & Security
+/internal/protocol/  @rayanreynaldo
+/internal/auth/      @rayanreynaldo
+/internal/oidc/      @rayanreynaldo
+/internal/security/  @rayanreynaldo
+/internal/crypto/    @rayanreynaldo
+
+# Official Client Drivers
+/drivers/            @rayanreynaldo
+/drivers/go/         @rayanreynaldo
+/drivers/node/       @rayanreynaldo
+/drivers/bun/        @rayanreynaldo
+/drivers/python/     @rayanreynaldo
+/drivers/php/        @rayanreynaldo
+/drivers/ruby/       @rayanreynaldo
+
+# NextSQL Admin & Studio
+/internal/admin/     @rayanreynaldo
+/cmd/nextsql-admin/  @rayanreynaldo
+
+# CLI & Benchmarking Tools
+/cmd/nextsql/        @rayanreynaldo
+/cmd/nextsqld/       @rayanreynaldo
+/cmd/nextsql-bench/  @rayanreynaldo
+
+# Documentation & Web Portal
+/docs/               @rayanreynaldo
+
+# CI/CD Workflows, Packaging & Release Automation
+/.github/            @rayanreynaldo
+/packaging/          @rayanreynaldo
+/scripts/            @rayanreynaldo

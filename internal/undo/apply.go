@@ -102,7 +102,6 @@ func ApplyOnePage(raw []byte, rec Record) ([]byte, bool, error) {
 	return p.Bytes(), true, nil
 }
 
-
 func decodeLeafKV(rec []byte) (key, value []byte, ok bool) {
 	if len(rec) < 4 {
 		return nil, nil, false

@@ -1,0 +1,99 @@
+# NextSQL Git Attributes Configuration
+# Standardizes line endings, diff behavior, binary detection, and Linguist statistics.
+
+# Set default behavior: auto-detect text files and normalize line endings to LF on checkout/commit
+* text=auto eol=lf
+
+# -----------------------------------------------------------------------------
+# Scripts and Shell Files
+# -----------------------------------------------------------------------------
+*.sh text eol=lf
+*.bash text eol=lf
+
+# Windows-specific script formats keep CRLF
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# -----------------------------------------------------------------------------
+# Source Code & Configurations (LF)
+# -----------------------------------------------------------------------------
+*.go text eol=lf diff=golang
+*.js text eol=lf
+*.jsx text eol=lf
+*.ts text eol=lf
+*.tsx text eol=lf
+*.mjs text eol=lf
+*.cjs text eol=lf
+*.py text eol=lf diff=python
+*.php text eol=lf diff=php
+*.rb text eol=lf diff=ruby
+*.json text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.toml text eol=lf
+*.md text eol=lf diff=markdown
+*.css text eol=lf
+*.html text eol=lf
+*.sql text eol=lf
+*.mod text eol=lf
+*.sum text eol=lf
+Makefile text eol=lf
+Dockerfile text eol=lf
+
+# -----------------------------------------------------------------------------
+# Binary Files (never convert line endings or attempt text diffs)
+# -----------------------------------------------------------------------------
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.webp binary
+*.avif binary
+*.woff binary
+*.woff2 binary
+*.eot binary
+*.ttf binary
+*.otf binary
+*.pdf binary
+*.tar.gz binary
+*.tgz binary
+*.deb binary
+*.rpm binary
+*.zip binary
+*.7z binary
+*.wasm binary
+*.so binary
+*.dylib binary
+*.dll binary
+*.exe binary
+*.test binary
+*.db binary
+
+# -----------------------------------------------------------------------------
+# GitHub Linguist Overrides
+# -----------------------------------------------------------------------------
+# Exclude documentation and website markdown from repository code statistics
+docs/** linguist-documentation
+*.md linguist-documentation
+
+# Mark vendor and generated web bundles
+internal/admin/web/** linguist-vendored
+*.min.js linguist-generated
+*.min.css linguist-generated
+package-lock.json linguist-generated
+go.sum linguist-generated
+
+# Mark test fixtures as vendored/fixtures
+tests/upgrade/fixtures/** linguist-vendored
+tests/docs/** linguist-detectable=false
+
+# -----------------------------------------------------------------------------
+# Git Archive Export Ignores (omit repo meta from source tarballs)
+# -----------------------------------------------------------------------------
+.github export-ignore
+.gitignore export-ignore
+.gitattributes export-ignore
+.editorconfig export-ignore
+.bench-results export-ignore

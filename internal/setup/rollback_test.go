@@ -7,7 +7,7 @@ import (
 
 func TestInstallRollbackSkipsPreexisting(t *testing.T) {
 	r := NewInstallRollback()
-	r.Observe("/data", true)  // operator's existing dir
+	r.Observe("/data", true) // operator's existing dir
 	r.Observe("/data/db", false)
 	r.Observe("/key", true) // operator supplied their own key
 

@@ -790,7 +790,6 @@ func (tx *Txn) LastBounded(start, end []byte, fn func(key, value []byte) (bool, 
 	return tx.tree.lastVisibleBounded(start, end, tx.snap(), fn)
 }
 
-
 // Count is Range that only returns the visible row count.
 func (tx *Txn) Count(start, end []byte) (int64, error) {
 	if tx == nil || tx.done {

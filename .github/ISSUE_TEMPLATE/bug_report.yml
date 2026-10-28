@@ -1,0 +1,76 @@
+name: Bug Report
+description: Report a reproducible defect, crash, or unexpected behavior in NextSQL.
+title: "fix: "
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for reporting an issue! Please search existing issues first to avoid duplicates.
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      description: Which part of NextSQL is affected?
+      options:
+        - "Core Engine / Storage / WAL"
+        - "SQL Parser / Planner / Executor"
+        - "Server & Protocol (`nextsqld`)"
+        - "CLI (`nextsql`)"
+        - "NextSQL Admin / Studio (`nextsql-admin`)"
+        - "Go Driver (`drivers/go`)"
+        - "Node.js / Bun Driver (`drivers/node`, `drivers/bun`)"
+        - "Python Driver (`drivers/python`)"
+        - "PHP Driver (`drivers/php`)"
+        - "Ruby Driver (`drivers/ruby`)"
+        - "Packaging / Docker / Helm"
+        - "Documentation"
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: NextSQL Version
+      description: What version of NextSQL are you running? (Run `nextsql version` or `nextsqld version`).
+      placeholder: "v0.0.6 (or git commit hash)"
+    validations:
+      required: true
+  - type: input
+    id: os_arch
+    attributes:
+      label: OS and Architecture
+      description: e.g. Ubuntu 24.04 x86_64, macOS 15.0 ARM64, WSL 2 Windows 11
+      placeholder: "Linux 6.8 x86_64"
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: Description of the Bug
+      description: A clear and concise description of what the bug is.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to Reproduce / Reproduction SQL
+      description: Steps or exact SQL statements / code snippet to reproduce the behavior.
+      placeholder: |
+        1. Start nextsqld with: `...`
+        2. Execute SQL: `...`
+        3. See error: `...`
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected Behavior
+      description: What you expected to happen.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Server Logs / Console Output
+      description: Relevant log output, error messages, or stack traces (strip any sensitive credentials first).
+      render: shell

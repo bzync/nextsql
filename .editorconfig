@@ -1,0 +1,60 @@
+# EditorConfig helps maintain consistent coding styles across various editors and IDEs.
+# https://editorconfig.org
+
+root = true
+
+# Top-level defaults for all files
+[*]
+charset = utf-8
+end_of_line = lf
+indent_style = space
+indent_size = 2
+insert_final_newline = true
+trim_trailing_whitespace = true
+
+# Go source code adheres to standard gofmt rules (tabs, tab width 4)
+[*.go]
+indent_style = tab
+indent_size = 4
+tab_width = 4
+
+# Makefiles require hard tabs
+[Makefile]
+indent_style = tab
+indent_size = 4
+tab_width = 4
+
+# Python follows PEP 8 conventions (4 spaces)
+[*.py]
+indent_style = space
+indent_size = 4
+
+# PHP follows PSR-12 conventions (4 spaces)
+[*.php]
+indent_style = space
+indent_size = 4
+
+# Ruby follows standard 2-space indentation
+[*.rb]
+indent_style = space
+indent_size = 2
+
+# Shell scripts
+[*.sh]
+indent_style = space
+indent_size = 2
+
+# Markdown: preserve trailing whitespace where intentional for soft line breaks
+[*.md]
+trim_trailing_whitespace = false
+max_line_length = off
+
+# JSON, YAML, TOML configurations
+[*.{json,yaml,yml,toml}]
+indent_style = space
+indent_size = 2
+
+# SQL queries and migration fixtures
+[*.sql]
+indent_style = space
+indent_size = 2

@@ -9,7 +9,7 @@ import (
 )
 
 func TestBatchRoundTrip(t *testing.T) {
-	cols := []types.Type{types.String(), types.Type{Kind: types.KindDecimal}}
+	cols := []types.Type{types.String(), {Kind: types.KindDecimal}}
 	b := New(cols, 1024)
 	d, _ := types.ParseDecimal("2.5")
 	if !b.AppendRow([]types.Value{types.StringValue("a"), types.DecimalValue(d, cols[1])}) {
@@ -40,7 +40,7 @@ func TestBatchRoundTrip(t *testing.T) {
 }
 
 func TestFilterAndProject(t *testing.T) {
-	cols := []types.Type{types.String(), types.Type{Kind: types.KindDecimal}}
+	cols := []types.Type{types.String(), {Kind: types.KindDecimal}}
 	b := New(cols, 1024)
 	for _, n := range []string{"1", "5", "9"} {
 		d, _ := types.ParseDecimal(n)

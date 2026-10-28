@@ -426,4 +426,3 @@ func TestCheckProductionWorkload(t *testing.T) {
 		t.Fatalf("expected nil when override provided, got: %v", err)
 	}
 }
-

@@ -460,7 +460,6 @@ func intervalUnitStr(n int32, unit string) string {
 	return strconv.FormatInt(int64(n), 10) + " " + unit
 }
 
-
 // justifiedNanos computes an INTERVAL's Postgres-style "justified" total
 // (1 month = 30 days = 24h) as an exact big.Int, used for Cmp — not int64,
 // since months/days are each a full int32 and this engine's

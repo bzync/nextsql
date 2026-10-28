@@ -24,8 +24,8 @@ func FuzzDecodeCollectionRow(f *testing.F) {
 		}
 	}
 	sv, _ := Coerce(StructValue(st, []Value{Int32Value(1), StringValue("x"),
-		Value{Typ: mustFuzzArray(Int64()), Coll: []Value{Int64Value(9)}}}), st)
-	seed([]Value{sv, Value{Typ: mustFuzzArray(st), Coll: []Value{sv}}, Null(mp)})
+		{Typ: mustFuzzArray(Int64()), Coll: []Value{Int64Value(9)}}}), st)
+	seed([]Value{sv, {Typ: mustFuzzArray(st), Coll: []Value{sv}}, Null(mp)})
 
 	f.Fuzz(func(t *testing.T, raw []byte, which int) {
 		if which < 0 || which >= len(cols) {

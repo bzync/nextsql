@@ -53,7 +53,6 @@ const (
 	UndoFlagV2 uint16 = 1
 )
 
-
 func (t RecType) String() string {
 	switch t {
 	case RecBegin:

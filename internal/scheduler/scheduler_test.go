@@ -76,7 +76,7 @@ func TestSpillRoundTrip(t *testing.T) {
 	if len(raws) != 1 {
 		t.Fatalf("got %d", len(raws))
 	}
-	got, err := types.DecodeRow(raws[0], []types.Type{types.String(), types.Type{Kind: types.KindDecimal}})
+	got, err := types.DecodeRow(raws[0], []types.Type{types.String(), {Kind: types.KindDecimal}})
 	if err != nil {
 		t.Fatal(err)
 	}

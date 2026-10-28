@@ -38,9 +38,13 @@ Please do not:
 6. Update `TODO.md` only when evidence supports the status change.
 
 ```bash
-go test ./...
-go test -race ./...                    # needs a C compiler
-go test ./tests/integration ./tests/crash ./tests/ha
+make doctor                            # audit local toolchain
+make fmt                               # format code with gofmt -s
+make lint                              # static analysis (go vet + typescript)
+make test                              # run standard unit/package tests
+make test-race                         # run race detector
+make test-drivers                      # run tests across all 6 official client drivers
+make test-pr                           # run PR evidence profile
 ```
 
 Add targeted fuzzing and benchmarks when you touch an untrusted decoder or a

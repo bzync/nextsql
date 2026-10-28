@@ -1,0 +1,31 @@
+name: Feature Request
+description: Propose a new feature, SQL syntax, or driver capability for NextSQL.
+title: "feat: "
+labels: ["enhancement", "proposal"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please review `PROJECT.md` and `docs/sql.md` before submitting to see current and planned capabilities.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or Use Case
+      description: Is your feature request related to a problem? What are you trying to accomplish?
+    validations:
+      required: true
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed Solution / Syntax
+      description: Describe the solution or proposed SQL syntax / client API you would like to see.
+      placeholder: |
+        Proposed SQL:
+        SELECT ...
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives Considered
+      description: Any alternative solutions or workarounds you've considered.

@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: NextSQL Documentation
+    url: https://bzync.net/docs
+    about: Read the official NextSQL documentation, SQL reference, and architecture guides.
+  - name: Security Vulnerability Reporting
+    url: https://github.com/bzync/nextsql/security/policy
+    about: Please report security vulnerabilities privately according to our security policy.

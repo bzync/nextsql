@@ -406,4 +406,3 @@ func CheckProductionWorkload(isProduction, allowProduction, isHeavyOrDestructive
 	}
 	return nil
 }
-

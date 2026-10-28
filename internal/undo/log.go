@@ -258,7 +258,6 @@ func (l *Log) InstallReplicated(r Record) error {
 	return nil
 }
 
-
 func (l *Log) Get(id format.UndoID) (Record, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()

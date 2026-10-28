@@ -123,7 +123,6 @@ func batchVersion(recs []wal.Record) uint16 {
 	return CurrentVersion
 }
 
-
 func marshalBatch(ver uint16, recs []wal.Record) []byte {
 	n := cmdHeaderSize
 	for _, r := range recs {

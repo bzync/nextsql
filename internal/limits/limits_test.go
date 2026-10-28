@@ -164,4 +164,3 @@ func TestDocsLimitsMatchCatalog(t *testing.T) {
 		t.Fatalf("docs/limits.md does not match limits.RenderMarkdown(); re-run with UPDATE_DOCS=1 or update docs/limits.md")
 	}
 }
-

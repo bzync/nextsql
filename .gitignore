@@ -1,36 +1,170 @@
+# =============================================================================
+# NextSQL Repository Git Ignore Rules
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Operating System & File Managers
+# -----------------------------------------------------------------------------
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+[Dd]esktop.ini
+*.directory
+.fuse_hidden*
+
+# -----------------------------------------------------------------------------
+# IDEs & Developer Tools
+# -----------------------------------------------------------------------------
+.idea/
+*.iml
+*.iws
+*.ipr
+.vscode/
+*.code-workspace
+*.swp
+*.swo
+*~
+.*.sw[a-z]
+.netrwhist
+\#*\#
+.\#*
+.claude/
+.codex/
+.agents/
+.gemini/
+
+# -----------------------------------------------------------------------------
+# Go Binaries, Builds, & Test Artifacts
+# -----------------------------------------------------------------------------
 /bin/
 /nextsql
 /nextsqld
 /nextsql-bench
 /nextsql-admin
-/.bench-*
-/.test-*
-/.bench-tmp
-/.slo-ext4
-/.slo-logs
-/secrets
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
 *.test
 *.out
-*.db
-*key
-*pw
-/data/
-/tmp/
-/.gotmp/
-/.go-cache-*/
-/.p26-*
-.DS_Store
-.env.local
-__pycache__/
-*.pyc
-*.gem
-.claude/
-.codex/
-.agents/
-.vscode/
-.fixtures/
-.codeql-*
-/installers/
+*.prof
+coverage.txt
+coverage.html
+coverage.cov
+profile.pprof
+profile.out
+default.pgo
+__debug_bin*
+
+# -----------------------------------------------------------------------------
+# Node.js, Web Frontend, & Documentation Site
+# -----------------------------------------------------------------------------
+node_modules/
+.npm/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.pnpm-store/
+.next/
+out/
+.turbo/
+*.tsbuildinfo
+.eslintcache
 /docs/web/data/releases.github.json
 /docs/web/AGENTS.md
 /docs/web/CLAUDE.md
+
+# -----------------------------------------------------------------------------
+# Python (drivers/python/)
+# -----------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+ENV/
+env/
+
+# -----------------------------------------------------------------------------
+# Ruby (drivers/ruby/)
+# -----------------------------------------------------------------------------
+*.gem
+*.rbc
+.bundle/
+vendor/bundle/
+pkg/
+.yardoc/
+_yardoc/
+
+# -----------------------------------------------------------------------------
+# PHP (drivers/php/)
+# -----------------------------------------------------------------------------
+/drivers/php/vendor/
+.phpunit.result.cache
+.php-cs-fixer.cache
+
+# -----------------------------------------------------------------------------
+# NextSQL Runtime, Databases, WAL, & Temporary Scratch Directories
+# -----------------------------------------------------------------------------
+*.db
+*.db-*
+*.wal
+*.sock
+*.log
+/data/
+/tmp/
+/secrets/
+*key
+*pw
+*.pem
+*.crt
+*.p12
+*.key
+/.test-*
+/.test-work/
+/.bench-*
+/.bench-tmp
+/.slo-ext4
+/.slo-logs
+/.gotmp/
+/.go-cache-*/
+/.p26-*
+/.fixtures/
+.env.local
+.env.*.local
+
+# -----------------------------------------------------------------------------
+# Packaging & CI Caches
+# -----------------------------------------------------------------------------
+/installers/
+.codeql-*

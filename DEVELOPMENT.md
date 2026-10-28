@@ -14,10 +14,18 @@ Go
 
 Current baseline:
 
-- Go 1.22+;
-- supported C compiler when running race-enabled tooling that requires it;
+- Go 1.24+ (matching `go.mod`);
+- GNU Make;
 - Git;
-- Linux recommended for engine development and production-like testing.
+- Linux recommended for engine development and production-like testing;
+- Node.js (v20+) and Chromium for NextSQL Admin UI and accessibility tests;
+- Python 3, PHP 8+, Ruby 3+, Bun for client driver testing (optional).
+
+Run `make doctor` to verify your local toolchain:
+
+```bash
+make doctor
+```
 
 ---
 
@@ -27,15 +35,27 @@ Current baseline:
 git clone https://github.com/bzync/nextsql.git
 cd nextsql
 
-go build ./...
+# Build all binaries into ./bin/ (nextsqld, nextsql, nextsql-admin, nextsql-bench)
+make build
 ```
 
-Build primary binaries:
+Or build individual binaries:
 
 ```bash
-go build -o nextsql ./cmd/nextsql
-go build -o nextsqld ./cmd/nextsqld
-go build -o nextsql-bench ./cmd/nextsql-bench
+make build-server  # ./bin/nextsqld
+make build-cli     # ./bin/nextsql
+make build-admin   # ./bin/nextsql-admin
+make build-bench   # ./bin/nextsql-bench
+```
+
+Run tests and quality checks:
+
+```bash
+make fmt-check     # verify formatting
+make lint          # static analysis and frontend typechecks
+make test-unit     # fast unit tests
+make test-drivers  # test all 6 official client drivers
+make clean         # clean binaries and scratch directories
 ```
 
 ---

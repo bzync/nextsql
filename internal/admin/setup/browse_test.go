@@ -189,7 +189,7 @@ func TestExpandHome(t *testing.T) {
 		{"~/", home}, // filepath.Join("~/"'s remainder, "") cleans the trailing slash away
 		{"~/Documents", filepath.Join(home, "Documents")},
 		{"~/a/b", filepath.Join(home, "a", "b")},
-		{"~otheruser", "~otheruser"},   // left alone, matches most GUI pickers' scope
+		{"~otheruser", "~otheruser"},     // left alone, matches most GUI pickers' scope
 		{"/etc/nextsql", "/etc/nextsql"}, // untouched, no leading ~
 		{"", ""},
 	}

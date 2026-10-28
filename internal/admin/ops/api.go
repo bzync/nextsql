@@ -464,7 +464,7 @@ var configSettableKeys = func() map[string]bool {
 
 // configActionSQL renders one M8 config-write request to a SET CONFIG
 // statement. The key is allowlisted against config.SettableKeys(); the value
-// is always emitted as a single-quoted string literal (with '' escaping) —
+// is always emitted as a single-quoted string literal (with ” escaping) —
 // the server's config.WithSetting re-parses it through config.Load, which
 // does the per-key type coercion, so a quoted "4096" still lands as the
 // integer buffer_pages. Reset renders `= DEFAULT`.
@@ -697,7 +697,7 @@ type backupActionRequest struct {
 }
 
 // backupActionSQL renders one M5 backup request to its statement. "verify"
-// interpolates the backup name as a quoted literal (with '' escaping); the
+// interpolates the backup name as a quoted literal (with ” escaping); the
 // server-side executor.VerifyBackup rejects a name with a path separator or
 // "..", so this only has to guard the SQL string.
 func backupActionSQL(op, name string) (string, error) {

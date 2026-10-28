@@ -1801,7 +1801,6 @@ func DecodeUndoBody(body []byte) (UndoBody, error) {
 	}, nil
 }
 
-
 func DecodeTreeMeta(body []byte) (format.PageID, uint16, error) { return decodeTreeMeta(body) }
 func DecodeAllocState(body []byte) (format.PageID, format.PageID, uint64, error) {
 	return decodeAllocState(body)

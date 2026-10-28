@@ -1,0 +1,93 @@
+name: Code Quality & Hygiene
+
+# Fast, fail-early feedback on formatting, static analysis, and polyglot driver tests.
+# Runs on pull requests and pushes to master in parallel with the durable production evidence gate.
+
+on:
+  pull_request:
+    branches: [master]
+  push:
+    branches: [master]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  go-quality:
+    name: Go Hygiene & Static Analysis
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Verify Formatting (gofmt -s)
+        run: make fmt-check
+
+      - name: Run Go Vet
+        run: make vet
+
+      - name: Verify go.mod / go.sum Cleanliness
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum
+
+      - name: Run Fast Unit Tests
+        run: make test-unit
+
+  driver-parity:
+    name: Official Driver Test Suites
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.3"
+          extensions: mbstring, openssl, sodium
+
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.3"
+
+      - name: Test Go Driver
+        run: make test-driver-go
+
+      - name: Test Node.js Driver
+        run: make test-driver-node
+
+      - name: Test Python Driver
+        run: make test-driver-python
+
+      - name: Test PHP Driver
+        run: make test-driver-php
+
+      - name: Test Ruby Driver
+        run: make test-driver-ruby

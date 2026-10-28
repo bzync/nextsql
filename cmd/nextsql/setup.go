@@ -487,12 +487,12 @@ type setupResult struct {
 	Initialized             bool   `json:"initialized"`
 	// DatabaseName is the deployment's database, empty when this run made a
 	// deployment with no database (no --database).
-	DatabaseName string       `json:"database_name,omitempty"`
-	InitOutput   string       `json:"init_output,omitempty"`
-	Health       *setupHealth `json:"health,omitempty"`
-	Warnings     []string     `json:"warnings"`
-	DryRun       bool         `json:"dry_run"`
-	Plan         string       `json:"plan,omitempty"`
+	DatabaseName    string       `json:"database_name,omitempty"`
+	InitOutput      string       `json:"init_output,omitempty"`
+	Health          *setupHealth `json:"health,omitempty"`
+	Warnings        []string     `json:"warnings"`
+	DryRun          bool         `json:"dry_run"`
+	Plan            string       `json:"plan,omitempty"`
 	RolledBack      []string     `json:"rolled_back,omitempty"`
 	RollbackKept    []string     `json:"rollback_kept,omitempty"`
 	FirewallCommand string       `json:"firewall_command,omitempty"`

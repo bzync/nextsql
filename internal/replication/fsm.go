@@ -57,7 +57,6 @@ func (f *fsm) settlePredecessorTransactions() error {
 	return nil
 }
 
-
 func (f *fsm) Apply(l *raft.Log) interface{} {
 	if l == nil || l.Type != raft.LogCommand {
 		return nil

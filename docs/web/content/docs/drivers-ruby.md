@@ -5,7 +5,7 @@ gem dependencies). MIT. Gem version **0.0.1**. Driver package versions are
 independent of the engine version.
 
 ```bash
-gem install bzync-nextsql -v 0.0.1
+gem install bzync-nextsql -v 0.0.2
 ```
 
 The gem is `bzync-nextsql`; you load it with `require "nextsql"`. Source:

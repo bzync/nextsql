@@ -5,7 +5,7 @@ dependencies). MIT. Package version **0.0.1**. Driver package versions are
 independent of the engine version.
 
 ```bash
-pip install bzync-nextsql==0.0.1
+pip install bzync-nextsql==0.0.2
 ```
 
 The distribution is `bzync-nextsql`; the import name is `nextsql`. Source:

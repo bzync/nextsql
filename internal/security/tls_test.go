@@ -264,6 +264,8 @@ func TestServiceIdentityFailsClosed(t *testing.T) {
 
 func testTLSHandshake(serverCfg, clientCfg *tls.Config) (tls.ConnectionState, error, error) {
 	serverRaw, clientRaw := bufferedTestPipe()
+	defer serverRaw.Close()
+	defer clientRaw.Close()
 	server := tls.Server(serverRaw, serverCfg)
 	client := tls.Client(clientRaw, clientCfg)
 	type result struct {
@@ -276,8 +278,10 @@ func testTLSHandshake(serverCfg, clientCfg *tls.Config) (tls.ConnectionState, er
 		serverResult <- result{state: server.ConnectionState(), err: err}
 	}()
 	clientErr := client.Handshake()
-	_ = clientRaw.Close()
-	_ = serverRaw.Close()
+	if clientErr != nil {
+		_ = clientRaw.Close()
+		_ = serverRaw.Close()
+	}
 	got := <-serverResult
 	return got.state, got.err, clientErr
 }

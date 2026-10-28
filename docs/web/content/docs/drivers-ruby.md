@@ -1,11 +1,11 @@
 # Ruby driver
 
 Ruby 3.0+ (stdlib only — `socket`, `openssl`, `bigdecimal`, `json`; no
-gem dependencies). MIT. Gem version **0.0.1**. Driver package versions are
+gem dependencies). MIT. Gem version **0.2.0**. Driver package versions are
 independent of the engine version.
 
 ```bash
-gem install bzync-nextsql -v 0.0.2
+gem install bzync-nextsql -v 0.2.0
 ```
 
 The gem is `bzync-nextsql`; you load it with `require "nextsql"`. Source:

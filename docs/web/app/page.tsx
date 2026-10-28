@@ -311,8 +311,8 @@ function Drivers() {
     { runtime: "Node.js 18+", path: "npm i @bzync/nextsql", open: "connect({ address, user, password, tls })" },
     { runtime: "Bun", path: "drivers/bun (repo)", open: "same shape as Node" },
     { runtime: "PHP 8.1+", path: "composer require bzync/nextsql", open: "NextSQL\\Client::connect([…])" },
-    { runtime: "Python 3.10+", path: "pip install bzync-nextsql==0.0.2", open: "nextsql.connect(nextsql.Config(…))" },
-    { runtime: "Ruby 3.0+", path: "gem install bzync-nextsql -v 0.0.2", open: "NextSQL.connect(NextSQL::Config.new(…))" },
+    { runtime: "Python 3.10+", path: "pip install bzync-nextsql==0.2.0", open: "nextsql.connect(nextsql.Config(…))" },
+    { runtime: "Ruby 3.0+", path: "gem install bzync-nextsql -v 0.2.0", open: "NextSQL.connect(NextSQL::Config.new(…))" },
   ];
   return (
     <section className="border-b border-line">

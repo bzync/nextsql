@@ -59,6 +59,8 @@
           "kind": "run",
           "platform": "linux-amd64",
           "filename": "nextsql-0.0.7-linux-amd64.run",
+          "size": 22626799,
+          "sha256": "794351cbda82a9016542f542134e97599ef94c8b7eee0760e91d7d4ca7f4927a",
           "url": "https://github.com/bzync/nextsql/releases/download/v0.0.7/nextsql-0.0.7-linux-amd64.run"
         },
         {
@@ -66,6 +68,8 @@
           "kind": "archive",
           "platform": "linux-amd64",
           "filename": "nextsql-0.0.7-linux-amd64.tar.gz",
+          "size": 22627403,
+          "sha256": "16718e0aa0b27566dba579483b87ba879ab328c5a7a6a8eefc8ce0a8379d4b25",
           "url": "https://github.com/bzync/nextsql/releases/download/v0.0.7/nextsql-0.0.7-linux-amd64.tar.gz"
         },
         {
@@ -73,6 +77,8 @@
           "kind": "deb",
           "platform": "linux-amd64",
           "filename": "nextsql_0.0.7_amd64.deb",
+          "size": 18875226,
+          "sha256": "80c43d8199752a87999351202cca50ee002544ee5b148b564a672a8c72d74ac0",
           "url": "https://github.com/bzync/nextsql/releases/download/v0.0.7/nextsql_0.0.7_amd64.deb"
         }
       ]

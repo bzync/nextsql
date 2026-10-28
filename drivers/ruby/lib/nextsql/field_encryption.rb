@@ -750,9 +750,10 @@ module NextSQL
       end
 
       def aes_block(key, block)
-        c = OpenSSL::Cipher.new("aes-128-ecb")
+        c = OpenSSL::Cipher.new("aes-128-cbc")
         c.encrypt
         c.key = key
+        c.iv = "\x00".b * 16
         c.padding = 0
         c.update(block) + c.final
       end

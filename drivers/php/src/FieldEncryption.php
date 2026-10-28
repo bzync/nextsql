@@ -544,7 +544,7 @@ final class FieldEncryption
 
 	private static function aesBlock(string $key, string $block): string
 	{
-		$out = openssl_encrypt($block, 'aes-128-ecb', $key, OPENSSL_RAW_DATA | OPENSSL_ZERO_PADDING);
+		$out = openssl_encrypt($block, 'aes-128-cbc', $key, OPENSSL_RAW_DATA | OPENSSL_ZERO_PADDING, str_repeat("\0", 16));
 		if ($out === false || strlen($out) !== 16) throw new Exception('crypto', 'AES-SIV block encryption failed');
 		return $out;
 	}

@@ -379,7 +379,7 @@ module.exports = function createClientEncryption(deps) {
   }
 
 	function aesBlock(key, block) {
-	  const cipher = createCipheriv('aes-128-ecb', key, null);
+	  const cipher = createCipheriv('aes-128-cbc', key, Buffer.alloc(16));
 	  cipher.setAutoPadding(false);
 	  return Buffer.concat([cipher.update(block), cipher.final()]);
 	}

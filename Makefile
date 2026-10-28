@@ -81,8 +81,8 @@ tidy: ## Clean up unused Go module dependencies
 test: ## Run standard package tests
 	go test ./...
 
-test-unit: ## Run fast unit tests
-	go test -short ./...
+test-unit: ## Run fast unit tests (CPU-bound decoders, logic, parser, planner, protocol)
+	go test -short ./internal/config ./internal/limits ./internal/scheduler ./internal/protocol ./internal/json ./internal/security ./internal/auth ./internal/sql/... ./internal/catalog ./internal/crypto ./tests/docs
 
 test-race: ## Run race detector on concurrent packages
 	go test -race ./internal/protocol ./internal/security ./internal/executor ./internal/storage ./internal/wal ./internal/txn

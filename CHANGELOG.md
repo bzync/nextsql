@@ -2,7 +2,7 @@
 
 All notable changes to NextSQL are recorded here.
 
-The current release is **0.0.6**; **0.0.1** was the first public one. All are
+The current release is **0.0.7**; **0.0.1** was the first public one. All are
 previews: the engine is complete enough to install, query, and operate, and it
 is still under measurement. Before you rely on it, run `nextsql-bench --slo`
 and the crash, recovery, and HA suites on your hardware.
@@ -14,6 +14,25 @@ different bits.
 ---
 
 ## [Unreleased]
+
+## [0.0.7] — 2026-10-29
+
+### Added
+
+- Single-row B+Tree index scan optimization for `MIN(col)` and `MAX(col)` queries on indexed columns.
+- Administrative `KILL SESSION '<id>'` statement to abort running transactions, release locks, and terminate TCP connections.
+- CLI standard input piping (`cat script.sql | nextsql exec` or `nextsql exec - < script.sql`) with a 64 MiB bounded guard.
+- CLI `--csv` output formatting (RFC 4180), execution timer `--time` / `-t`, ASCII table formatting `--table`, and vertical records `--expanded` / `-x`.
+- Client-side prepared statement LRU caching across Python, PHP, and Ruby drivers with automatic server handle closure.
+- Follower read consistency modes (`strong`, `bounded`, `stale`) and cluster node options in Go driver `ParseDSN`.
+- Query tab inline double-click renaming, tab duplication, and 1-click EXPLAIN JSON plan export in Studio.
+- Standardized `.gitattributes`, `.editorconfig`, modernized `.gitignore`, `.github/CODEOWNERS`, `.github/PULL_REQUEST_TEMPLATE.md`, and issue templates.
+- Self-documenting root `Makefile`, `scripts/dev-doctor.sh` (`make doctor`), and `.github/workflows/quality.yml` fast CI workflow.
+
+### Fixed
+
+- Strict scalar function arity validation before evaluation.
+- Scoped `test-unit` to CPU-bound packages to prevent parallel disk saturation on heavy storage fixtures.
 
 ## [0.0.6] — 2026-10-26
 

@@ -1,6 +1,6 @@
 # Limits and current gaps
 
-**0.0.6** is a preview. Treat it as an engine under measurement, not a drop-in production replacement, until you have run `nextsql-bench --slo` and the crash/HA suites on your hardware.
+**0.0.7** is a preview. Treat it as an engine under measurement, not a drop-in production replacement, until you have run `nextsql-bench --slo` and the crash/HA suites on your hardware.
 
 A live install uses `nextsql setup --profile production` so `nextsqld` fail-closes instead of shipping developer defaults. NextSQL Admin Setup, Operations, and Studio are available on loopback.
 

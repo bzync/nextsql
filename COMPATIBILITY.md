@@ -133,6 +133,14 @@ A backup is not considered valid until verification and restore testing succeed.
 
 ## 8. Upgrade Policy
 
+### 0.0.6 to 0.0.7
+
+This release changes no persistent storage, WAL, catalog, backup, or NSQL wire format versions.
+It requires no data migration. Data directories initialized in 0.0.6 or earlier continue to open cleanly.
+Stop the daemon, replace the installed binaries, and restart.
+Prepared statement LRU caching is backward-compatible with the existing NSQL protocol statement close message.
+See the [0.0.7 release notes](docs/release-notes/0.0.7.md).
+
 ### 0.0.5 to 0.0.6
 
 This patch changes no persistent storage, WAL, catalog, backup, or NSQL format.

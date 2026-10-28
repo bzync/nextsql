@@ -5,7 +5,7 @@ NextSQL provides first-class support for Docker Compose to orchestrate single-no
 ## 1. Core Architecture & Security Rules
 
 ### Minimal Scratch Container
-The official container image (`bzynchub/nextsql:0.0.6`) is built `FROM scratch`. It contains only:
+The official container image (`bzynchub/nextsql:0.0.7`) is built `FROM scratch`. It contains only:
 - Static, unprivileged Go binaries (`nextsql`, `nextsqld`)
 - A lightweight PID-1 entrypoint (`nextsql-entrypoint`)
 - A system root CA bundle
@@ -80,7 +80,7 @@ A complete single-node configuration:
 ```yaml
 services:
   nextsql:
-    image: bzynchub/nextsql:0.0.6
+    image: bzynchub/nextsql:0.0.7
     # Or build locally from source:
     # build: .
     restart: unless-stopped
@@ -166,7 +166,7 @@ When running an application service alongside NextSQL in Docker Compose:
 ```yaml
 services:
   nextsql:
-    image: bzynchub/nextsql:0.0.6
+    image: bzynchub/nextsql:0.0.7
     restart: unless-stopped
     ports:
       - "7210:7210"

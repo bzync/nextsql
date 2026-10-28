@@ -1,11 +1,88 @@
 {
   "releases": [
     {
+      "version": "0.0.7",
+      "title": "Performance, Driver Parity, and Tooling",
+      "status": "published",
+      "channel": "preview",
+      "latest": true,
+      "releasedAt": "2026-10-29T00:15:00Z",
+      "summary": "Introduces B+Tree index min/max scan optimizations, administrative KILL SESSION, CLI stdin piping and CSV output, client-side statement caching for all official drivers, Studio workspace improvements, and repository Git standards.",
+      "highlights": [
+        "Index MIN/MAX scans seek directly to leaf extrema on indexed columns without full index scans",
+        "Administrative KILL SESSION statement terminates TCP sockets, aborts transactions, and frees locks immediately",
+        "CLI standard input piping, RFC 4180 CSV export, execution timer, table formatting, and expanded record inspector",
+        "Client-side prepared statement LRU caching across Python, PHP, and Ruby drivers with automatic server handle closure",
+        "Standardized .gitattributes, .editorconfig, upgraded Makefile, dev doctor, and fast CI quality workflows"
+      ],
+      "changes": [
+        {
+          "id": "index-minmax",
+          "kind": "added",
+          "area": "Optimizer",
+          "text": "Optimize MIN(col) and MAX(col) into direct index leaf seeks on indexed columns."
+        },
+        {
+          "id": "kill-session",
+          "kind": "added",
+          "area": "SQL",
+          "text": "Administrative KILL SESSION '<id>' statement to abort running transactions, release locks, and terminate TCP connections."
+        },
+        {
+          "id": "cli-ergonomics",
+          "kind": "added",
+          "area": "CLI",
+          "text": "CLI standard input piping (nextsql exec - < script.sql), RFC 4180 CSV output, query timer, and ASCII table views."
+        },
+        {
+          "id": "driver-lru-cache",
+          "kind": "added",
+          "area": "Drivers",
+          "text": "Client-side prepared statement LRU caching for Python, PHP, and Ruby drivers with automatic server handle eviction."
+        },
+        {
+          "id": "studio-tabs",
+          "kind": "added",
+          "area": "Ops",
+          "text": "Query tab inline renaming, tab duplication with localStorage draft persistence, and 1-click EXPLAIN JSON plan export in Studio."
+        },
+        {
+          "id": "repo-tooling",
+          "kind": "changed",
+          "area": "Repo",
+          "text": "Standardized Git setup (.gitattributes, .editorconfig, .gitignore), upgraded Makefile with self-documenting help, scripts/dev-doctor.sh, and quality CI."
+        }
+      ],
+      "artifacts": [
+        {
+          "id": "nextsql-0.0.7-linux-amd64.run",
+          "kind": "run",
+          "platform": "linux-amd64",
+          "filename": "nextsql-0.0.7-linux-amd64.run",
+          "url": "https://github.com/bzync/nextsql/releases/download/v0.0.7/nextsql-0.0.7-linux-amd64.run"
+        },
+        {
+          "id": "nextsql-0.0.7-linux-amd64.tar.gz",
+          "kind": "archive",
+          "platform": "linux-amd64",
+          "filename": "nextsql-0.0.7-linux-amd64.tar.gz",
+          "url": "https://github.com/bzync/nextsql/releases/download/v0.0.7/nextsql-0.0.7-linux-amd64.tar.gz"
+        },
+        {
+          "id": "nextsql_0.0.7_amd64.deb",
+          "kind": "deb",
+          "platform": "linux-amd64",
+          "filename": "nextsql_0.0.7_amd64.deb",
+          "url": "https://github.com/bzync/nextsql/releases/download/v0.0.7/nextsql_0.0.7_amd64.deb"
+        }
+      ]
+    },
+    {
       "version": "0.0.6",
       "title": "Security and Studio updates",
       "status": "published",
       "channel": "preview",
-      "latest": true,
+      "latest": false,
       "releasedAt": "2026-10-26T04:00:55Z",
       "summary": "Fixes malformed date-function calls that could terminate the daemon; adds session panic containment, compiler/dependency security updates, and automatic native SQL completion in Studio.",
       "highlights": [

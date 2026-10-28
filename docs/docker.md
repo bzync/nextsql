@@ -25,12 +25,12 @@ immutable", so there is no moving `latest`, `edge`, or `0.0` pointer. Each
 release publishes exactly one `0.x.y` tag:
 
 ```bash
-docker pull bzynchub/nextsql:0.0.6        # a released version
+docker pull bzynchub/nextsql:0.0.7        # a released version
 ```
 
 The checked-in `docker-compose.yml` builds locally (`build: .`); to run the
 published image instead, replace `build: .` with
-`image: bzynchub/nextsql:0.0.6`. For an in-depth guide on Docker Compose with
+`image: bzynchub/nextsql:0.0.7`. For an in-depth guide on Docker Compose with
 application integration, healthchecks, and HA cluster deployment, see
 [`docs/docker-compose.md`](docker-compose.md).
 
@@ -154,7 +154,7 @@ docker run -d --name nextsql -p 7210:7210 \
   -e NEXTSQL_SERVER_PASSWORD_FILE=/run/bootstrap/app-password \
   -e NEXTSQL_TLS_CERT=/run/tls/server.crt -e NEXTSQL_TLS_KEY=/run/tls/server.key \
   -e NEXTSQL_PROFILE=production \
-  bzynchub/nextsql:0.0.6
+  bzynchub/nextsql:0.0.7
 ```
 
 `backup_dir` is not set by the container; set it (or a WAL archive) and take

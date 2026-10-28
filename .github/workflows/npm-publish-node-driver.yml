@@ -125,6 +125,12 @@ jobs:
         run: |
           set -euo pipefail
           version="${{ steps.v.outputs.version }}"
+          have_version="$(npm view "@bzync/nextsql@${version}" version 2>/dev/null || true)"
+          if [ "$have_version" = "${version}" ]; then
+            echo "Version ${version} is already published on npm."
+            npm dist-tag add "@bzync/nextsql@${version}" latest || true
+            exit 0
+          fi
           if npm publish --access public --provenance; then
             exit 0
           fi

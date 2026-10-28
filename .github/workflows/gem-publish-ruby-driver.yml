@@ -121,4 +121,12 @@ jobs:
         uses: rubygems/configure-rubygems-credentials@dc5a8d8553e6ee01fc26761a49e99e733d17954a # v2.1.0
 
       - name: Publish
-        run: gem push bzync-nextsql-*.gem
+        run: |
+          set -euo pipefail
+          version="${{ steps.v.outputs.version }}"
+          have_gem="$(curl -sS -f "https://rubygems.org/api/v1/versions/bzync-nextsql.json" | python3 -c "import sys, json; print(str(any(v.get('number') == '${version}' for v in json.load(sys.stdin))))" 2>/dev/null || echo "False")"
+          if [ "$have_gem" = "True" ]; then
+            echo "Version ${version} is already published on rubygems.org."
+            exit 0
+          fi
+          gem push bzync-nextsql-*.gem

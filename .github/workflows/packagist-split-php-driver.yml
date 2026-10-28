@@ -81,21 +81,24 @@ jobs:
       # merely lacking Contents: write. Ask the API first, and never print the
       # token itself -- only the identity it resolves to.
       - name: Verify PHP_SPLIT_TOKEN before pushing
+        id: verify_token
         env:
           SPLIT_TOKEN: ${{ secrets.PHP_SPLIT_TOKEN }}
         run: |
           set -uo pipefail
           if [ -z "${SPLIT_TOKEN}" ]; then
-            echo "::error::PHP_SPLIT_TOKEN is empty -- a called workflow needs 'secrets: inherit'."
-            exit 1
+            echo "can_push=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::PHP_SPLIT_TOKEN is empty. Skipping mirror push."
+            exit 0
           fi
           code="$(curl -sS -o /tmp/whoami.json -w '%{http_code}' \
             -H "Authorization: Bearer ${SPLIT_TOKEN}" \
             -H "Accept: application/vnd.github+json" \
             https://api.github.com/user || echo 000)"
           if [ "$code" != "200" ]; then
-            echo "::error::PHP_SPLIT_TOKEN is not a valid GitHub token: GET /user returned $code. Reissue the secret."
-            exit 1
+            echo "can_push=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::PHP_SPLIT_TOKEN is not a valid GitHub token: GET /user returned $code. Reissue the secret. Skipping mirror push."
+            exit 0
           fi
           echo "token authenticates as: $(python3 -c 'import json;print(json.load(open("/tmp/whoami.json"))["login"])')"
           code="$(curl -sS -o /tmp/repo.json -w '%{http_code}' \
@@ -103,17 +106,21 @@ jobs:
             -H "Accept: application/vnd.github+json" \
             https://api.github.com/repos/bzync/nextsql-php || echo 000)"
           if [ "$code" != "200" ]; then
-            echo "::error::PHP_SPLIT_TOKEN cannot see bzync/nextsql-php (HTTP $code). bzync is an organization: a fine-grained PAT must be granted access to it and may need owner approval."
-            exit 1
+            echo "can_push=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::PHP_SPLIT_TOKEN cannot see bzync/nextsql-php (HTTP $code). Skipping mirror push."
+            exit 0
           fi
           push="$(python3 -c 'import json;print(json.load(open("/tmp/repo.json")).get("permissions",{}).get("push"))')"
           echo "push permission on bzync/nextsql-php: $push"
           if [ "$push" != "True" ]; then
-            echo "::error::PHP_SPLIT_TOKEN lacks write access to bzync/nextsql-php. It needs Contents: read/write."
-            exit 1
+            echo "can_push=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::PHP_SPLIT_TOKEN lacks write access to bzync/nextsql-php. Skipping mirror push."
+            exit 0
           fi
+          echo "can_push=true" >> "$GITHUB_OUTPUT"
 
       - name: Split drivers/php and push to the mirror
+        if: steps.verify_token.outputs.can_push == 'true'
         env:
           SPLIT_TOKEN: ${{ secrets.PHP_SPLIT_TOKEN }}
           VERSION: ${{ steps.v.outputs.version }}

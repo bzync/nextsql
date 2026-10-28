@@ -14,7 +14,7 @@
   },
   "dependencies": {
     "@bzync/rui": "^0.0.10",
-    "framer-motion": "^13.4.0",
+    "framer-motion": "^14.6.0",
     "next": "16.4.3",
     "react": "19.3.1",
     "react-dom": "19.3.1"

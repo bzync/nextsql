@@ -75,8 +75,9 @@ ROLLBACK [TRANSACTION] | ROLLBACK TO [SAVEPOINT] name
 SAVEPOINT name
 RELEASE [SAVEPOINT] name
 CANCEL QUERY '<id>'
+KILL SESSION '<id>'
 ANALYZE  [table]
-EXPLAIN  [ANALYZE] <statement>
+EXPLAIN  [ANALYZE] [(FORMAT JSON | TEXT)] <statement>
 BACKUP DATABASE
 VERIFY BACKUP 'name'
 CREATE / ALTER / DROP WORKFLOW    RUN WORKFLOW
@@ -148,6 +149,8 @@ The complete signatures, return behavior, NULL rules, and examples are in the
 ```sql
 EXPLAIN SELECT name FROM products WHERE metadata.category = 'headphones';
 EXPLAIN ANALYZE SELECT name FROM products SEARCH description FOR 'wireless' LIMIT 5;
+EXPLAIN (FORMAT JSON) SELECT name FROM products WHERE metadata.category = 'headphones';
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT name FROM products SEARCH description FOR 'wireless' LIMIT 5;
 ```
 
-`ANALYZE` (the statement) writes statistics first. `EXPLAIN ANALYZE` executes the plan. See [hybrid queries](/docs/hybrid) for `Candidates` and `Rerank`.
+`ANALYZE` (the statement) writes statistics first. `EXPLAIN ANALYZE` executes the plan. Specifying `(FORMAT JSON)` produces structured, hierarchical JSON output. Single-column `MIN(col)` or `MAX(col)` queries on indexed columns automatically use index-assisted direct leaf probes, returning extreme values in $O(\log N)$ or $O(1)$. See [hybrid queries](/docs/hybrid) for `Candidates` and `Rerank`.

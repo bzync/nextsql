@@ -1485,9 +1485,84 @@ export type ExplainNode = {
   children: ExplainNode[];
 };
 
+export function isJsonPlanString(value: unknown): boolean {
+  if (typeof value !== "string") return false;
+  const trimmed = value.trim();
+  if (!trimmed.startsWith("{") || !trimmed.endsWith("}")) return false;
+  try {
+    const parsed = JSON.parse(trimmed);
+    return typeof parsed === "object" && parsed !== null && typeof parsed.operator === "string";
+  } catch {
+    return false;
+  }
+}
+
 export function isExplainResult(result: StudioResultSet): boolean {
-  return result.columns.length === EXPLAIN_COLUMNS.length
-    && result.columns.every((column, index) => column === EXPLAIN_COLUMNS[index]);
+  if (
+    result.columns.length === EXPLAIN_COLUMNS.length &&
+    result.columns.every((column, index) => column === EXPLAIN_COLUMNS[index])
+  ) {
+    return true;
+  }
+  // Check for EXPLAIN (FORMAT JSON) which emits 1 column named "plan" containing structured JSON
+  if (
+    result.columns.length === 1 &&
+    result.columns[0] === "plan" &&
+    result.rows.length >= 1 &&
+    isJsonPlanString(result.rows[0][0])
+  ) {
+    return true;
+  }
+  return false;
+}
+
+function parseJsonPlanNode(doc: any, depth: number): ExplainNode {
+  if (!doc || typeof doc !== "object") {
+    return {
+      label: "(unknown operator)",
+      depth,
+      estRows: null,
+      estCost: null,
+      actRows: null,
+      time: "",
+      cpu: "",
+      memory: 0,
+      disk: 0,
+      cache: 0,
+      spill: 0,
+      workers: 0,
+      index: "",
+      children: [],
+    };
+  }
+  const op = typeof doc.operator === "string" ? doc.operator : "(unknown operator)";
+  const detail = typeof doc.detail === "string" && doc.detail ? ` ${doc.detail}` : "";
+  const label = `${op}${detail}`.trim();
+  const estimates = doc.estimates && typeof doc.estimates === "object" ? doc.estimates : {};
+  const actuals = doc.actuals && typeof doc.actuals === "object" ? doc.actuals : null;
+  const resources = doc.resources && typeof doc.resources === "object" ? doc.resources : null;
+
+  const node: ExplainNode = {
+    label,
+    depth: Math.min(MAX_EXPLAIN_DEPTH, depth),
+    estRows: typeof estimates.rows === "number" ? estimates.rows : null,
+    estCost: typeof estimates.cost === "number" ? estimates.cost : null,
+    actRows: actuals && typeof actuals.rows === "number" ? actuals.rows : null,
+    time: actuals && typeof actuals.time === "string" ? actuals.time : "",
+    cpu: actuals && typeof actuals.cpu === "string" ? actuals.cpu : "",
+    memory: resources && typeof resources.memory === "number" ? resources.memory : 0,
+    disk: resources && typeof resources.disk === "number" ? resources.disk : 0,
+    cache: resources && typeof resources.cache === "number" ? resources.cache : 0,
+    spill: resources && typeof resources.spill === "number" ? resources.spill : 0,
+    workers: resources && typeof resources.workers === "number" ? resources.workers : actuals ? 1 : 0,
+    index: typeof doc.index === "string" ? doc.index : "",
+    children: [],
+  };
+
+  if (Array.isArray(doc.children)) {
+    node.children = doc.children.map((child: any) => parseJsonPlanNode(child, depth + 1));
+  }
+  return node;
 }
 
 function parseExplainInt(value: string | null): number | null {
@@ -1530,16 +1605,19 @@ function parseExplainRow(row: (string | null)[]): { depth: number; node: Explain
 }
 
 // parseExplainPlan reconstructs the operator tree from the server's
-// preorder/indented row encoding: each row's depth (from its operator
-// cell's leading-space count) determines whose children list it joins, by
-// popping a stack of "last node seen at each depth" back to its parent.
-// Throws (caller falls back to the plain table) only when there are no rows
-// to build a tree from at all; a malformed individual row still yields a
-// node, just with null/default fields, so one bad row can't hide the rest
-// of a plan.
+// preorder/indented row encoding or structured JSON document.
 export function parseExplainPlan(result: StudioResultSet): ExplainNode[] {
   if (!isExplainResult(result) || result.rows.length === 0) {
     throw new Error("not an EXPLAIN result");
+  }
+  if (result.columns.length === 1 && result.columns[0] === "plan") {
+    const raw = result.rows[0][0] ?? "";
+    try {
+      const parsed = JSON.parse(raw);
+      return [parseJsonPlanNode(parsed, 0)];
+    } catch (err) {
+      throw new Error("malformed JSON in EXPLAIN result: " + (err instanceof Error ? err.message : String(err)));
+    }
   }
   const roots: ExplainNode[] = [];
   const stack: ExplainNode[] = [];
@@ -1577,6 +1655,315 @@ export function explainEstimateSeverity(estRows: number | null, actRows: number 
   if (ratio >= 10 || ratio <= 0.1) return "error";
   if (ratio >= 3 || ratio <= 1 / 3) return "warning";
   return "none";
+}
+
+export type OperatorCategory = "scan" | "join" | "aggregate" | "filter" | "sort" | "limit" | "project" | "other";
+
+export function getOperatorCategory(label: string): OperatorCategory {
+  const normalized = label.trim().toLowerCase();
+  if (
+    normalized.startsWith("seqscan") ||
+    normalized.startsWith("indexscan") ||
+    normalized.startsWith("bitmapindex") ||
+    normalized.startsWith("nearest") ||
+    normalized.startsWith("search") ||
+    normalized.startsWith("scan")
+  ) {
+    return "scan";
+  }
+  if (normalized.includes("join")) {
+    return "join";
+  }
+  if (
+    normalized.startsWith("aggregate") ||
+    normalized.startsWith("hashaggregate") ||
+    normalized.startsWith("parallel") ||
+    normalized.startsWith("group")
+  ) {
+    return "aggregate";
+  }
+  if (normalized.startsWith("filter") || normalized.startsWith("where")) {
+    return "filter";
+  }
+  if (
+    normalized.startsWith("sort") ||
+    normalized.startsWith("topnsort") ||
+    normalized.startsWith("window") ||
+    normalized.startsWith("rank")
+  ) {
+    return "sort";
+  }
+  if (normalized.startsWith("limit")) {
+    return "limit";
+  }
+  if (normalized.startsWith("project")) {
+    return "project";
+  }
+  return "other";
+}
+
+export type VisualPlanNode = {
+  id: string;
+  label: string;
+  opName: string;
+  detail: string;
+  category: OperatorCategory;
+  depth: number;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  node: ExplainNode;
+  parentIds: string[];
+  childIds: string[];
+  severity: ExplainEstimateSeverity;
+};
+
+export type VisualPlanEdge = {
+  id: string;
+  fromId: string;
+  toId: string;
+  d: string;
+};
+
+export type VisualPlanLayout = {
+  nodes: VisualPlanNode[];
+  edges: VisualPlanEdge[];
+  width: number;
+  height: number;
+  maxCost: number;
+  maxTimeNS: number;
+  worstSeverity: ExplainEstimateSeverity;
+  hasActuals: boolean;
+  operatorCount: number;
+};
+
+export function buildVisualPlanLayout(nodes: ExplainNode[]): VisualPlanLayout {
+  if (!nodes || nodes.length === 0) {
+    return {
+      nodes: [],
+      edges: [],
+      width: 400,
+      height: 200,
+      maxCost: 1,
+      maxTimeNS: 1,
+      worstSeverity: "none",
+      hasActuals: false,
+      operatorCount: 0,
+    };
+  }
+
+  const nodeW = 240;
+  const nodeH = 92;
+  const gapX = 36;
+  const gapY = 56;
+  const padX = 40;
+  const padY = 40;
+
+  type InternalTree = {
+    id: string;
+    node: ExplainNode;
+    opName: string;
+    detail: string;
+    category: OperatorCategory;
+    depth: number;
+    severity: ExplainEstimateSeverity;
+    children: InternalTree[];
+    parentIds: string[];
+    childIds: string[];
+    subtreeW: number;
+    x: number;
+    y: number;
+  };
+
+  let counter = 0;
+  const buildInternal = (node: ExplainNode, depth: number, parentId: string | null): InternalTree => {
+    const id = `op-${counter++}`;
+    const [opName, ...rest] = node.label.split(" ");
+    const detail = rest.join(" ");
+    const category = getOperatorCategory(node.label);
+    const severity = explainEstimateSeverity(node.estRows, node.actRows);
+
+    const tree: InternalTree = {
+      id,
+      node,
+      opName,
+      detail,
+      category,
+      depth,
+      severity,
+      children: [],
+      parentIds: parentId ? [parentId] : [],
+      childIds: [],
+      subtreeW: nodeW,
+      x: 0,
+      y: padY + depth * (nodeH + gapY),
+    };
+
+    tree.children = node.children.map((child) => buildInternal(child, depth + 1, id));
+    tree.childIds = tree.children.map((c) => c.id);
+
+    if (tree.children.length === 0) {
+      tree.subtreeW = nodeW;
+    } else {
+      const childrenTotalW =
+        tree.children.reduce((sum, c) => sum + c.subtreeW, 0) + (tree.children.length - 1) * gapX;
+      tree.subtreeW = Math.max(nodeW, childrenTotalW);
+    }
+    return tree;
+  };
+
+  const internalRoots = nodes.map((n) => buildInternal(n, 0, null));
+
+  const assignPositions = (tree: InternalTree, left: number) => {
+    if (tree.children.length === 0) {
+      tree.x = left + (tree.subtreeW - nodeW) / 2;
+      return;
+    }
+
+    const childrenTotalW =
+      tree.children.reduce((sum, c) => sum + c.subtreeW, 0) + (tree.children.length - 1) * gapX;
+    let childLeft = left + (tree.subtreeW - childrenTotalW) / 2;
+
+    for (const child of tree.children) {
+      assignPositions(child, childLeft);
+      childLeft += child.subtreeW + gapX;
+    }
+
+    const firstChild = tree.children[0];
+    const lastChild = tree.children[tree.children.length - 1];
+    tree.x = (firstChild.x + lastChild.x) / 2;
+  };
+
+  let currentLeft = padX;
+  for (const root of internalRoots) {
+    assignPositions(root, currentLeft);
+    currentLeft += root.subtreeW + gapX * 2;
+  }
+
+  const visualNodes: VisualPlanNode[] = [];
+  const visualEdges: VisualPlanEdge[] = [];
+  let maxDepth = 0;
+
+  const flatten = (tree: InternalTree) => {
+    if (tree.depth > maxDepth) maxDepth = tree.depth;
+    visualNodes.push({
+      id: tree.id,
+      label: tree.node.label,
+      opName: tree.opName,
+      detail: tree.detail,
+      category: tree.category,
+      depth: tree.depth,
+      x: Math.round(tree.x),
+      y: Math.round(tree.y),
+      w: nodeW,
+      h: nodeH,
+      node: tree.node,
+      parentIds: tree.parentIds,
+      childIds: tree.childIds,
+      severity: tree.severity,
+    });
+
+    for (const child of tree.children) {
+      const childCenterX = Math.round(child.x + nodeW / 2);
+      const childTopY = Math.round(child.y);
+      const parentCenterX = Math.round(tree.x + nodeW / 2);
+      const parentBottomY = Math.round(tree.y + nodeH);
+
+      const midY = Math.round((childTopY + parentBottomY) / 2);
+      const d = `M ${childCenterX} ${childTopY} C ${childCenterX} ${midY}, ${parentCenterX} ${midY}, ${parentCenterX} ${parentBottomY}`;
+
+      visualEdges.push({
+        id: `edge-${child.id}-${tree.id}`,
+        fromId: child.id,
+        toId: tree.id,
+        d,
+      });
+
+      flatten(child);
+    }
+  };
+
+  for (const root of internalRoots) {
+    flatten(root);
+  }
+
+  let maxCost = 1;
+  let maxTimeNS = 1;
+  let worstSeverity: ExplainEstimateSeverity = "none";
+
+  for (const vn of visualNodes) {
+    if (vn.node.estCost && vn.node.estCost > maxCost) {
+      maxCost = vn.node.estCost;
+    }
+    const tNS = parseExplainDurationNS(vn.node.time);
+    if (tNS && tNS > maxTimeNS) {
+      maxTimeNS = tNS;
+    }
+    if (vn.severity === "error") {
+      worstSeverity = "error";
+    } else if (vn.severity === "warning" && worstSeverity !== "error") {
+      worstSeverity = "warning";
+    }
+  }
+
+  const maxX = Math.max(...visualNodes.map((n) => n.x + n.w), 400);
+  const totalWidth = Math.max(maxX + padX, 500);
+  const totalHeight = Math.max(padY + (maxDepth + 1) * (nodeH + gapY) + padY, 300);
+
+  return {
+    nodes: visualNodes,
+    edges: visualEdges,
+    width: totalWidth,
+    height: totalHeight,
+    maxCost,
+    maxTimeNS,
+    worstSeverity,
+    hasActuals: explainAnalyzed(nodes),
+    operatorCount: visualNodes.length,
+  };
+}
+
+export function explainNodesToJSON(nodes: ExplainNode[]): string {
+  const convert = (node: ExplainNode): Record<string, any> => {
+    const [op, ...detailParts] = node.label.split(" ");
+    const doc: Record<string, any> = {
+      operator: op,
+    };
+    if (detailParts.length > 0) {
+      doc.detail = detailParts.join(" ");
+    }
+    doc.estimates = {
+      rows: node.estRows ?? 0,
+      cost: node.estCost ?? 0,
+    };
+    if (node.actRows !== null || node.time) {
+      doc.actuals = {
+        rows: node.actRows ?? 0,
+        time: node.time || "0ns",
+        cpu: node.cpu || "0ns",
+      };
+      doc.resources = {
+        memory: node.memory,
+        disk: node.disk,
+        cache: node.cache,
+        spill: node.spill,
+        workers: node.workers,
+      };
+    }
+    if (node.index) {
+      doc.index = node.index;
+    }
+    if (node.children && node.children.length > 0) {
+      doc.children = node.children.map(convert);
+    }
+    return doc;
+  };
+
+  if (nodes.length === 1) {
+    return JSON.stringify(convert(nodes[0]), null, 2);
+  }
+  return JSON.stringify(nodes.map(convert), null, 2);
 }
 
 export type ExplainPlanSnapshot = {
@@ -4561,6 +4948,48 @@ export function savedQueryStorageKey(scope: string, database: string, user: stri
   return `nextsql-studio-saved:${seg(scope)}:${seg(database)}:${seg(user || "unknown")}`;
 }
 
+export type StudioHistoryEntry = {
+  id: string;
+  sql: string;
+  ranAt: number;
+  isSelection?: boolean;
+  outcome: "success" | "canceled" | "error";
+  rowCount?: number;
+  elapsedMs?: number;
+  error?: string;
+};
+
+export function queryHistoryStorageKey(scope: string, database: string, user: string): string {
+  const seg = (s: string) => (s || "default").replace(/[^A-Za-z0-9_.-]/g, "_");
+  return `nextsql-studio-history:${seg(scope)}:${seg(database)}:${seg(user || "unknown")}`;
+}
+
+export function parseQueryHistory(raw: string | null): StudioHistoryEntry[] {
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .filter((item): item is StudioHistoryEntry => {
+        return (
+          item != null &&
+          typeof item === "object" &&
+          typeof item.id === "string" &&
+          typeof item.sql === "string" &&
+          typeof item.ranAt === "number" &&
+          (item.outcome === "success" || item.outcome === "canceled" || item.outcome === "error")
+        );
+      })
+      .slice(0, 50);
+  } catch {
+    return [];
+  }
+}
+
+export function serializeQueryHistory(entries: StudioHistoryEntry[]): string {
+  return JSON.stringify(entries.slice(0, 50));
+}
+
 // --- Git-friendly export / import of the saved-query set ---------------
 //
 // The localStorage codec above optimizes for compactness and orders by
@@ -4689,6 +5118,18 @@ export function downloadSavedQueries(list: SavedQuery[], now = new Date()): void
   const anchor = document.createElement("a");
   anchor.href = url;
   anchor.download = savedQueriesExportFilename(now);
+  anchor.hidden = true;
+  document.body.append(anchor);
+  anchor.click();
+  anchor.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 0);
+}
+
+export function downloadText(filename: string, content: string, mimeType = "text/plain;charset=utf-8"): void {
+  const url = URL.createObjectURL(new Blob([content], { type: mimeType }));
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = filename;
   anchor.hidden = true;
   document.body.append(anchor);
   anchor.click();

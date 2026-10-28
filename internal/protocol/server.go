@@ -772,6 +772,7 @@ func (s *Server) serveConn(ctx context.Context, conn net.Conn) {
 	b.sess.SetHostingRegistry(s.HostingRegistry)
 	b.sess.SetRealmID(realmID)
 	b.sess.SetRemote(conn.RemoteAddr().String())
+	b.sess.SetOnKill(b.kill)
 	if s.Registry != nil {
 		b.unreg = s.Registry.Register(hello.User, b.kill)
 	}

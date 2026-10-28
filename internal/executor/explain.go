@@ -5,12 +5,13 @@ import (
 
 	"github.com/bzync/nextsql/internal/sql/optimizer"
 	"github.com/bzync/nextsql/internal/sql/planner"
+	"github.com/bzync/nextsql/internal/sql/types"
 	"github.com/bzync/nextsql/internal/txn"
 )
 
 func (s *Session) execExplain(p planner.Explain, trace *optimizer.Node, sql string) (*Result, error) {
 	if !p.Analyze {
-		return explainResult(trace, false), nil
+		return explainResult(trace, false, p.Format)
 	}
 	auto := false
 	if s.x == nil {
@@ -45,12 +46,22 @@ func (s *Session) execExplain(p planner.Explain, trace *optimizer.Node, sql stri
 			s.db.feedback.Record(sql, trace)
 		}
 	}
-	return explainResult(trace, true), nil
+	return explainResult(trace, true, p.Format)
 }
 
-func explainResult(trace *optimizer.Node, analyze bool) *Result {
+func explainResult(trace *optimizer.Node, analyze bool, format string) (*Result, error) {
+	if format == "json" {
+		jsonStr, err := optimizer.FormatJSON(trace, analyze)
+		if err != nil {
+			return nil, err
+		}
+		return &Result{
+			Columns: []string{"plan"},
+			Rows:    [][]types.Value{{types.StringValue(jsonStr)}},
+		}, nil
+	}
 	return &Result{
 		Columns: append([]string(nil), optimizer.ExplainColumns...),
 		Rows:    optimizer.Rows(trace, analyze),
-	}
+	}, nil
 }

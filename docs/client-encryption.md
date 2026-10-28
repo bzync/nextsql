@@ -2,7 +2,7 @@
 
 Status: **production-gated, explicit opt-in**. Randomized `NSCE1` and
 deterministic `NSCE2` SQL/catalog/server paths and helpers for Go,
-Node.js/TypeScript, Bun, and PHP are implemented. PITR and
+Node.js/TypeScript, Bun, PHP, Python, and Ruby are implemented. PITR and
 replication/failover are tested (exact-ciphertext restore-to-target-LSN; no
 lost acknowledged ciphertext across leader failover). Every official driver
 also ships a durable, atomic, file-backed keyring (`FileFieldKeyring`) so
@@ -216,6 +216,76 @@ HKDF-SHA256 domain separation. Cross-driver fixtures verify
 that Go-produced ciphertext decrypts in Node.js, Bun, and PHP, and that
 Node.js-produced ciphertext decrypts in Go.
 
+## Python
+
+Python applications provide a `FieldKeyProvider` or use `MemoryFieldKeyring` /
+`FileFieldKeyring`. Cryptographic operations prefer `cryptography.hazmat` when
+installed, with a built-in NIST FIPS-197 pure-Python AES/GCM/SIV engine fallback
+so `bzync-nextsql` maintains zero mandatory dependencies.
+
+```python
+import nextsql
+from nextsql import FieldType, MemoryFieldKeyring, generate_field_key
+
+ring = MemoryFieldKeyring(generate_field_key("accounts-ssn-v1"))
+conn = nextsql.connect(nextsql.Config(
+    address="127.0.0.1:7210", database="app",
+    user="app", password=password, tls=tls,
+    field_keys=ring,
+))
+
+sealed = conn.encrypt_field(
+    "accounts", "ssn", FieldType.STRING, "123-45-6789"
+)
+conn.exec("INSERT INTO accounts (id, ssn) VALUES ($1, $2)", [user_id, sealed])
+
+plain = conn.decrypt_field(
+    "accounts", "ssn", FieldType.STRING, sealed_result
+)
+
+email_token = conn.encrypt_field_deterministic(
+    "accounts", "email", FieldType.TEXT, "person@example.com"
+)
+match = conn.exec(
+    "SELECT id FROM accounts WHERE email = $1", [email_token]
+)
+```
+
+## Ruby
+
+Ruby applications configure `field_keys` on `NextSQL::Config` using
+`MemoryFieldKeyring` or `FileFieldKeyring`. The driver uses the standard library
+`OpenSSL` gem with zero external gem dependencies.
+
+```ruby
+require "nextsql"
+
+ring = NextSQL::MemoryFieldKeyring.new(
+  NextSQL::FieldEncryption.generate_field_key("accounts-ssn-v1")
+)
+conn = NextSQL.connect(NextSQL::Config.new(
+  address: "127.0.0.1:7210", database: "app",
+  user: "app", password: password, tls: tls,
+  field_keys: ring,
+))
+
+sealed = conn.encrypt_field(
+  "accounts", "ssn", NextSQL::FieldType::STRING, "123-45-6789"
+)
+conn.exec("INSERT INTO accounts (id, ssn) VALUES ($1, $2)", [user_id, sealed])
+
+plain = conn.decrypt_field(
+  "accounts", "ssn", NextSQL::FieldType::STRING, sealed_result
+)
+
+email_token = conn.encrypt_field_deterministic(
+  "accounts", "email", NextSQL::FieldType::TEXT, "person@example.com"
+)
+match = conn.exec(
+  "SELECT id FROM accounts WHERE email = $1", [email_token]
+)
+```
+
 ## Rotation, revocation, and recovery
 
 Rotation changes the provider's current key for new writes while retaining old
@@ -281,7 +351,9 @@ Bun implements the file I/O with `node:fs/promises` over the shared, I/O-free
 `encodeFieldKeyring`/`decodeFieldKeyring` codec in
 `drivers/js/client-encryption.mjs`; Node's independent copy in
 `drivers/node/client-encryption.js` uses `node:fs/promises` directly; PHP's
-`NextSQL\FileFieldKeyring` uses `pack`/`unpack` and `rename`.
+`NextSQL\FileFieldKeyring` uses `pack`/`unpack` and `rename`; Python's
+`FileFieldKeyring` uses `struct` and atomic replace; Ruby's
+`NextSQL::FileFieldKeyring` uses `pack`/`unpack` and atomic temporary rename.
 
 ### Backup and recovery
 
@@ -312,7 +384,9 @@ correctness, revocation zeroing material on disk and failing closed,
 revoked-id reuse rejection, corrupt-file rejection, and cross-driver format
 interop are all covered by automated tests (`drivers/go/nextsql_test.go`,
 `drivers/bun/nextsql.test.js`, `drivers/node/nextsql.test.js`,
-`drivers/php/tests/unit.php`). The
+`drivers/php/tests/unit.php`,
+`drivers/python/tests/test_field_encryption.py`,
+`drivers/ruby/test/test_field_encryption.rb`). The
 phase-wide P25 exit gate (`docs/security.md` "P25 security review sign-off")
 closed the same day once password hashing and audit hardening also landed, so
 `ENCRYPTED CLIENT` is formally production-gated. The deterministic extension

@@ -54,7 +54,7 @@ export const NEXTSQL_KEYWORDS: ReadonlySet<string> = new Set([
   "order", "asc", "desc", "if", "exists", "case", "when", "then", "else",
   "end", "union", "intersect", "except", "with", "over", "schedule", "every",
   "at", "cron", "upsert", "returning", "workflow", "run", "trigger", "before",
-  "after", "each", "show", "task", "tasks", "cancel", "subscribe", "encrypted",
+  "after", "each", "show", "task", "tasks", "cancel", "kill", "subscribe", "encrypted",
   "client", "deterministic", "transfer", "leader", "resource", "drain",
   "maintenance", "enable", "disable", "reconcile", "confirm", "unnest",
   "like",

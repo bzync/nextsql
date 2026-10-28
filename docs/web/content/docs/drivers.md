@@ -25,7 +25,7 @@ Every official driver also ships a cluster client (`OpenCluster` / `connectClust
 
 `database` on the connect config names the deployment's database on Hello; an empty name accepts whatever the deployment serves.
 
-All six official drivers encode the scalar types (`BOOL`, `BLOB`, integers, floats, `DATE`/`TIME`/`TIMESTAMP`/`INTERVAL`, `CHAR`/`VARCHAR`, `ENUM`) and collections (`STRUCT`/`ARRAY`/`MAP`). Field-encryption helpers exist in Go, Node, Bun, and PHP only.
+All six official drivers encode the scalar types (`BOOL`, `BLOB`, integers, floats, `DATE`/`TIME`/`TIMESTAMP`/`INTERVAL`, `CHAR`/`VARCHAR`, `ENUM`), collections (`STRUCT`/`ARRAY`/`MAP`), and client-side field-level encryption (`ENCRYPTED CLIENT` randomized `NSCE1.` and deterministic `NSCE2.`).
 
 ## Language guides
 

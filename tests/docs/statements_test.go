@@ -47,6 +47,7 @@ var statements = map[string]string{
 	"EXPLAIN":   "EXPLAIN SELECT 1",
 	"GRANT":     "GRANT SELECT ON TABLE t TO u",
 	"INSERT":    "INSERT INTO t VALUES (1)",
+	"KILL":      "KILL SESSION 's'",
 	"MAINTAIN":  "MAINTAIN TABLE t",
 	"REBUILD":   "REBUILD INDEX ix",
 	"RELEASE":   "RELEASE SAVEPOINT s",

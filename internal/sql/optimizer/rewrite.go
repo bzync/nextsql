@@ -844,6 +844,9 @@ func formatPlan(p planner.Logical) string {
 		if n.Analyze {
 			s += " Analyze"
 		}
+		if n.Format != "" && n.Format != "text" {
+			s += " Format " + n.Format
+		}
 		return s + "\n" + indent(formatPlan(n.Input))
 	case planner.Analyze:
 		return "Analyze"

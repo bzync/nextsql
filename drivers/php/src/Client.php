@@ -109,6 +109,9 @@ final class Client
     /** Whether the server echoed FLAG_PUBLIC_ERROR_CODES; diagnostic only. */
     private bool $publicErrorCodes = false;
     private bool $busy = false;
+    public int $statementCacheSize = 0;
+    /** @var array<string, Statement> */
+    private array $stmtCache = [];
 
     /**
      * @param array<string, mixed> $cfg
@@ -286,6 +289,7 @@ final class Client
     {
         $this->cfg = $cfg;
         $this->sock = $sock;
+        $this->statementCacheSize = (int) ($cfg['statementCacheSize'] ?? 0);
     }
 
     /**
@@ -444,6 +448,35 @@ final class Client
         if ($this->busy) {
             throw new Exception('conflict', 'connection is busy');
         }
+
+        if ($this->statementCacheSize > 0 && count($params) > 0) {
+            if (isset($this->stmtCache[$sql])) {
+                $stmt = $this->stmtCache[$sql];
+                unset($this->stmtCache[$sql]);
+                $this->stmtCache[$sql] = $stmt;
+            } else {
+                $stmt = $this->prepare($sql);
+                if (count($this->stmtCache) >= $this->statementCacheSize) {
+                    $oldestSql = array_key_first($this->stmtCache);
+                    $oldest = $this->stmtCache[$oldestSql];
+                    unset($this->stmtCache[$oldestSql]);
+                    try {
+                        $oldest->close();
+                    } catch (\Throwable) {}
+                }
+                $this->stmtCache[$sql] = $stmt;
+            }
+            try {
+                return $this->executePrepared($stmt->id, $params);
+            } catch (\Throwable $e) {
+                unset($this->stmtCache[$sql]);
+                try {
+                    $stmt->close();
+                } catch (\Throwable) {}
+                throw $e;
+            }
+        }
+
         $this->busy = true;
         try {
             $this->writeFrame(self::TYPE_QUERY, Protocol::encodeQuery($sql, $params));
@@ -529,6 +562,12 @@ final class Client
 
     public function close(): void
     {
+        foreach ($this->stmtCache as $stmt) {
+            try {
+                $stmt->close();
+            } catch (\Throwable) {}
+        }
+        $this->stmtCache = [];
         if (!is_resource($this->sock)) {
             return;
         }

@@ -55,10 +55,10 @@ export function ActivityExplorer({
       <ModalBody scrollable>
         <Stack gap="md">
           <Alert variant="info" title="Scope">
-            A read-only snapshot of open sessions, running queries, active transactions,
-            and held locks — the same catalog Operations mode's Activity view reads.
-            NextSQL has no way to cancel another session's transaction from here; use
-            that session's own connection, or revoke its credential.
+            Live snapshot of open sessions, running queries, active transactions, and held
+            locks — the same catalog Operations mode&apos;s Activity view reads. Use
+            KILL SESSION &apos;&lt;id&gt;&apos; or CANCEL QUERY &apos;&lt;id&gt;&apos; in the editor or Operations mode to
+            terminate runaway sessions or queries.
           </Alert>
           {data?.warnings?.length ? (
             <Alert variant="warning" title="Some data was unavailable">

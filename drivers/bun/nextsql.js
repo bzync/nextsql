@@ -33,6 +33,8 @@ import {
   isReadOnlySQL,
   open,
   openCluster,
+  openPool,
+  Pool as JSRuntimePool,
   txnControl,
 } from '../js/client.mjs';
 import { decodeNodeStatus, encodeSetReadConsistency } from '../js/protocol.mjs';
@@ -301,4 +303,15 @@ export async function connectCluster(cfg) {
     validateConfig({ ...cfg, address: a, nodes: undefined });
   }
   return openCluster(cfg, dial);
+}
+
+export class Pool extends JSRuntimePool {
+  constructor(cfg, options = {}) {
+    validateConfig(cfg);
+    super(cfg, dial, options);
+  }
+}
+
+export function createPool(cfg, options) {
+  return new Pool(cfg, options);
 }

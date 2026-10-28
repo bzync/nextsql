@@ -194,6 +194,8 @@ func (p *Parser) stmt() (ast.Stmt, error) {
 		return p.show()
 	case lexer.KwCancel:
 		return p.cancelTask()
+	case lexer.KwKill:
+		return p.killStmt()
 	case lexer.KwSubscribe:
 		return p.subscribe()
 	case lexer.KwCluster:
@@ -528,6 +530,15 @@ func (p *Parser) cancelTask() (ast.Stmt, error) {
 		p.next()
 		return out, nil
 	}
+	if p.identIs("session") || p.identIs("connection") {
+		p.next()
+		if p.tok.Kind != lexer.String || p.tok.Lit == "" {
+			return nil, nerr.New(nerr.Syntax, "sql.parser", "CANCEL SESSION requires a session id string")
+		}
+		out := ast.KillSession{ID: p.tok.Lit}
+		p.next()
+		return out, nil
+	}
 	if err := p.expect(lexer.KwTask, "TASK"); err != nil {
 		return nil, err
 	}
@@ -535,6 +546,34 @@ func (p *Parser) cancelTask() (ast.Stmt, error) {
 		return nil, nerr.New(nerr.Syntax, "sql.parser", "CANCEL TASK requires a task id string")
 	}
 	out := ast.CancelTask{ID: p.tok.Lit}
+	p.next()
+	return out, nil
+}
+
+func (p *Parser) killStmt() (ast.Stmt, error) {
+	p.next()
+	if p.identIs("session") || p.identIs("connection") {
+		p.next()
+		if p.tok.Kind != lexer.String || p.tok.Lit == "" {
+			return nil, nerr.New(nerr.Syntax, "sql.parser", "KILL SESSION requires a session id string")
+		}
+		out := ast.KillSession{ID: p.tok.Lit}
+		p.next()
+		return out, nil
+	}
+	if p.identIs("query") {
+		p.next()
+		if p.tok.Kind != lexer.String || p.tok.Lit == "" {
+			return nil, nerr.New(nerr.Syntax, "sql.parser", "KILL QUERY requires a query id string")
+		}
+		out := ast.CancelQuery{ID: p.tok.Lit}
+		p.next()
+		return out, nil
+	}
+	if p.tok.Kind != lexer.String || p.tok.Lit == "" {
+		return nil, nerr.New(nerr.Syntax, "sql.parser", "KILL requires a session id string")
+	}
+	out := ast.KillSession{ID: p.tok.Lit}
 	p.next()
 	return out, nil
 }
@@ -4105,9 +4144,69 @@ func (p *Parser) optionalLimit() (int64, error) {
 func (p *Parser) explain() (ast.Stmt, error) {
 	p.next()
 	analyze := false
+	format := "text"
 	if p.tok.Kind == lexer.KwAnalyze {
 		analyze = true
 		p.next()
+	}
+	if p.tok.Kind == lexer.LParen {
+		p.next()
+		for {
+			if p.tok.Kind == lexer.KwAnalyze {
+				p.next()
+				if p.tok.Kind == lexer.KwTrue || (p.tok.Kind == lexer.Ident && p.tok.Lit == "true") {
+					analyze = true
+					p.next()
+				} else if p.tok.Kind == lexer.KwFalse || (p.tok.Kind == lexer.Ident && p.tok.Lit == "false") {
+					analyze = false
+					p.next()
+				} else {
+					analyze = true
+				}
+			} else if p.tok.Kind == lexer.Ident && p.tok.Lit == "format" {
+				p.next()
+				if p.tok.Kind == lexer.Eq {
+					p.next()
+				}
+				if p.tok.Kind == lexer.KwJson || (p.tok.Kind == lexer.Ident && p.tok.Lit == "json") {
+					format = "json"
+					p.next()
+				} else if p.tok.Kind == lexer.KwText || (p.tok.Kind == lexer.Ident && p.tok.Lit == "text") {
+					format = "text"
+					p.next()
+				} else {
+					return nil, nerr.New(nerr.Syntax, "sql.parser", "expected JSON or TEXT for EXPLAIN FORMAT")
+				}
+			} else if p.tok.Kind == lexer.RParen {
+				break
+			} else {
+				return nil, nerr.New(nerr.Syntax, "sql.parser", "unexpected EXPLAIN option: "+p.tok.Lit)
+			}
+			if p.tok.Kind == lexer.Comma {
+				p.next()
+				continue
+			}
+			if p.tok.Kind == lexer.RParen {
+				break
+			}
+		}
+		if err := p.expect(lexer.RParen, ")"); err != nil {
+			return nil, err
+		}
+	} else if p.tok.Kind == lexer.Ident && p.tok.Lit == "format" {
+		p.next()
+		if p.tok.Kind == lexer.Eq {
+			p.next()
+		}
+		if p.tok.Kind == lexer.KwJson || (p.tok.Kind == lexer.Ident && p.tok.Lit == "json") {
+			format = "json"
+			p.next()
+		} else if p.tok.Kind == lexer.KwText || (p.tok.Kind == lexer.Ident && p.tok.Lit == "text") {
+			format = "text"
+			p.next()
+		} else {
+			return nil, nerr.New(nerr.Syntax, "sql.parser", "expected JSON or TEXT for EXPLAIN FORMAT")
+		}
 	}
 	inner, err := p.stmt()
 	if err != nil {
@@ -4116,7 +4215,7 @@ func (p *Parser) explain() (ast.Stmt, error) {
 	if _, ok := inner.(ast.Explain); ok {
 		return nil, nerr.New(nerr.Syntax, "sql.parser", "nested EXPLAIN")
 	}
-	return ast.Explain{Analyze: analyze, Stmt: inner}, nil
+	return ast.Explain{Analyze: analyze, Format: format, Stmt: inner}, nil
 }
 
 func (p *Parser) analyze() (ast.Stmt, error) {

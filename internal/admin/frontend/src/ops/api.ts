@@ -111,6 +111,11 @@ export type Activity = {
   warnings?: string[];
 };
 
+export type ActivityActionRequest = {
+  action: "kill_session" | "cancel_query";
+  id: string;
+};
+
 export type Security = {
   generated_at: string;
   users: ResultSet;
@@ -534,6 +539,8 @@ export const api = {
   overview: () => request<Overview>("GET", "/api/v1/overview"),
   databases: () => request<Databases>("GET", "/api/v1/databases"),
   activity: () => request<Activity>("GET", "/api/v1/activity"),
+  activityAction: (body: ActivityActionRequest) =>
+    request<ResultSet>("POST", "/api/v1/activity/action", body),
   security: () => request<Security>("GET", "/api/v1/security"),
   securityAction: (body: SecurityActionRequest) =>
     request<ResultSet>("POST", "/api/v1/security/action", body),

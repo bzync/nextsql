@@ -172,6 +172,11 @@ type (
 	CancelQuery struct {
 		ID string
 	}
+	// KillSession stops and disconnects a live session, named by the session
+	// id system.sessions / SHOW CONNECTIONS report.
+	KillSession struct {
+		ID string
+	}
 	Subscribe struct {
 		Table     string
 		Operation string
@@ -396,6 +401,7 @@ type (
 	}
 	Explain struct {
 		Analyze bool
+		Format  string
 		Stmt    Stmt
 	}
 	Analyze struct {
@@ -503,6 +509,7 @@ func (BackupDatabase) stmt()          {}
 func (VerifyBackup) stmt()            {}
 func (ShowTasks) stmt()               {}
 func (CancelQuery) stmt()             {}
+func (KillSession) stmt()             {}
 func (CancelTask) stmt()              {}
 func (Subscribe) stmt()               {}
 func (TransferLeader) stmt()          {}

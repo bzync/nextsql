@@ -34,6 +34,21 @@ from .client import (
 )
 from .cluster import Cluster
 from .errors import NextSQLError
+from .pool import ConnectionPool, create_pool
+from .field_encryption import (
+    FieldKey,
+    FieldKeyInfo,
+    FieldKeyProvider,
+    FieldType,
+    FileFieldKeyring,
+    MemoryFieldKeyring,
+    decrypt_field,
+    decrypt_field_deterministic,
+    encrypt_field,
+    encrypt_field_deterministic,
+    generate_field_key,
+    inspect_field,
+)
 from .protocol import (
     READ_BOUNDED,
     READ_STALE,
@@ -81,6 +96,11 @@ __all__ = [
     "Config",
     "Connection",
     "EnumValue",
+    "FieldKey",
+    "FieldKeyInfo",
+    "FieldKeyProvider",
+    "FieldType",
+    "FileFieldKeyring",
     "Float32",
     "Geometry",
     "Float64",
@@ -91,6 +111,7 @@ __all__ = [
     "Interval",
     "MapValue",
     "Line",
+    "MemoryFieldKeyring",
     "NaiveTimestamp",
     "StructValue",
     "NextSQLError",
@@ -111,5 +132,11 @@ __all__ = [
     "Vector",
     "connect",
     "connect_cluster",
+    "decrypt_field",
+    "decrypt_field_deterministic",
+    "encrypt_field",
+    "encrypt_field_deterministic",
+    "generate_field_key",
+    "inspect_field",
     "is_read_only_sql",
 ]

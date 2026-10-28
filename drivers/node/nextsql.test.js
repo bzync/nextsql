@@ -36,6 +36,8 @@ const {
   encryptField,
   encryptFieldDeterministic,
   struct,
+  Pool,
+  createPool,
 } = require('./nextsql');
 
 function fieldKey(id, fill) {
@@ -572,4 +574,136 @@ test('hello-ok capability flags are an opt-in trailing field', () => {
   assert.equal(decodeHelloOK(Buffer.concat([base, flags])).flags, FlagPublicErrorCodes);
   assert.throws(() => decodeHelloOK(Buffer.concat([base, Buffer.alloc(2)])));
   assert.throws(() => decodeHelloOK(Buffer.alloc(12)));
+});
+
+test('Pool parameter validation', () => {
+  const cfg = { address: '127.0.0.1:7210', user: 'app', insecureNoTLS: true };
+  assert.throws(() => createPool(cfg, { min: -1 }), /min must be >= 0/);
+  assert.throws(() => createPool(cfg, { max: 0 }), /max must be >= 1/);
+  assert.throws(() => createPool(cfg, { min: 5, max: 2 }), /max must be >= min/);
+  assert.throws(() => createPool(cfg, { statementCacheSize: -1 }), /statementCacheSize must be >= 0/);
+  const pool = createPool(cfg, { min: 0, max: 5 });
+  assert.equal(pool.size, 0);
+  assert.equal(pool.isClosed, false);
+});
+
+test('Pool acquire, release, rollback, and exhaustion', async () => {
+  const cfg = { address: '127.0.0.1:7210', user: 'app', insecureNoTLS: true };
+  const pool = createPool(cfg, { min: 0, max: 2, timeoutMs: 50 });
+
+  let rollbacks = 0;
+  const mockConn1 = {
+    wire: { closed: false },
+    exec: async (sql) => {
+      if (sql === 'ROLLBACK') rollbacks++;
+      return { affected: 1, columns: ['id'], rows: [[1]] };
+    },
+    query: async () => ({
+      collect: async () => ({ affected: 1, columns: ['id'], rows: [[1]] }),
+    }),
+    close: async () => { mockConn1.wire.closed = true; },
+  };
+
+  const mockConn2 = {
+    wire: { closed: false },
+    exec: async (sql) => {
+      if (sql === 'ROLLBACK') rollbacks++;
+      return { affected: 1, columns: ['id'], rows: [[2]] };
+    },
+    query: async () => ({
+      collect: async () => ({ affected: 1, columns: ['id'], rows: [[2]] }),
+    }),
+    close: async () => { mockConn2.wire.closed = true; },
+  };
+
+  // Directly test pool's internal accounting by simulating checked out connections
+  pool._inUse.add(mockConn1);
+  pool._inUse.add(mockConn2);
+  assert.equal(pool.size, 2);
+  assert.equal(pool.inUseCount, 2);
+  assert.equal(pool.idleCount, 0);
+
+  // 3rd acquire must timeout
+  await assert.rejects(
+    async () => pool.acquire(),
+    (err) => err instanceof NextSQLError && err.code === 'resource_exhausted',
+  );
+
+  // Release mockConn1
+  await pool.release(mockConn1);
+  assert.equal(rollbacks, 1); // ROLLBACK was invoked
+  assert.equal(pool.inUseCount, 1);
+  assert.equal(pool.idleCount, 1);
+
+  // Acquire succeeds immediately from idle
+  const conn = await pool.acquire();
+  assert.equal(conn, mockConn1);
+  assert.equal(pool.inUseCount, 2);
+  assert.equal(pool.idleCount, 0);
+
+  await pool.close();
+  assert.equal(pool.isClosed, true);
+  assert.equal(mockConn1.wire.closed, true);
+  assert.equal(mockConn2.wire.closed, true);
+});
+
+test('Connection statement LRU cache reuse and eviction', async () => {
+  const { Conn } = await import('../js/client.mjs');
+  const closedStmts = [];
+  const mockWire = {
+    closed: false,
+    writeFrame: async () => {},
+    readFrame: async () => {},
+    close: () => { mockWire.closed = true; },
+  };
+
+  const conn = new Conn({ statementCacheSize: 2 }, mockWire, null);
+  let nextId = 1;
+  const preparedCalls = [];
+  const executedCalls = [];
+
+  conn.prepare = async (sql) => {
+    preparedCalls.push(sql);
+    const id = nextId++;
+    return {
+      id,
+      close: async () => { closedStmts.push(id); },
+    };
+  };
+
+  conn._execute = async (id, params) => {
+    executedCalls.push({ id, params });
+    return {
+      collect: async () => ({ columns: ['v'], rows: [[params[0]]] }),
+    };
+  };
+
+  // 1. First parameterized query prepares id=1
+  await conn.query('SELECT $1', [10]);
+  assert.equal(preparedCalls.length, 1);
+  assert.equal(executedCalls.length, 1);
+  assert.equal(executedCalls[0].id, 1);
+
+  // 2. Repeat exact SQL reuses cached prepared statement without preparing again
+  await conn.query('SELECT $1', [20]);
+  assert.equal(preparedCalls.length, 1); // no new prepare
+  assert.equal(executedCalls.length, 2);
+  assert.equal(executedCalls[1].id, 1);
+
+  // 3. Second unique query prepares id=2 (cache now full: size 2)
+  await conn.query('SELECT $1 + 1', [30]);
+  assert.equal(preparedCalls.length, 2);
+  assert.equal(executedCalls.length, 3);
+  assert.equal(executedCalls[2].id, 2);
+
+  // 4. Third unique query evicts least recently used statement (id=1)
+  await conn.query('SELECT $1 + 2', [40]);
+  assert.equal(preparedCalls.length, 3);
+  assert.equal(executedCalls.length, 4);
+  assert.equal(executedCalls[3].id, 3);
+  assert.deepEqual(closedStmts, [1]); // id=1 was closed upon eviction
+
+  // 5. Closing connection closes remaining cached statements (id=2 and id=3)
+  await conn.close();
+  assert.deepEqual(closedStmts.sort(), [1, 2, 3]);
 });

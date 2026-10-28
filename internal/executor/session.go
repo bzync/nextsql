@@ -180,6 +180,9 @@ type Session struct {
 	txnIso      txn.Isolation
 	txnReadOnly bool
 	txnStart    time.Time
+
+	killMu sync.Mutex
+	onKill func()
 }
 
 // nextQueryID assigns process-wide unique ids to executing statements, for
@@ -235,6 +238,47 @@ func (s *Session) CancelQuery(id uint64) bool {
 	}
 	cancel()
 	return true
+}
+
+// SetOnKill sets the callback invoked when this session is killed
+// (e.g. by KILL SESSION or administrative action). The network protocol server
+// passes b.kill to disconnect the network connection.
+func (s *Session) SetOnKill(fn func()) {
+	if s == nil {
+		return
+	}
+	s.killMu.Lock()
+	s.onKill = fn
+	s.killMu.Unlock()
+}
+
+// Kill stops any currently-executing statement and disconnects the session.
+// It reports whether a live session was signalled.
+func (s *Session) Kill() bool {
+	if s == nil {
+		return false
+	}
+	s.queryMu.Lock()
+	qCancel := s.queryCancel
+	s.queryMu.Unlock()
+	if qCancel != nil {
+		qCancel()
+	}
+	s.killMu.Lock()
+	onKill := s.onKill
+	s.killMu.Unlock()
+	if onKill != nil {
+		onKill()
+		return true
+	}
+	if s.db != nil && s.id != 0 {
+		if s.InTxn() {
+			_ = s.Abort()
+		}
+		s.db.UnregisterSession(s.id)
+		return true
+	}
+	return false
 }
 
 // endQuery clears the published currently-executing statement. Call in the

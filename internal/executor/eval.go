@@ -581,20 +581,37 @@ func decimalIntValue(n int64) types.Value {
 
 func evalJSONFn(name string, args []types.Value) (types.Value, bool, error) {
 	switch name {
-	case "json_get", "json_array_length", "json_type", "json_set", "json_remove", "json_contains":
+	case "json_get", "json_remove", "json_contains":
+		if len(args) != 2 {
+			return types.Value{}, true, nerr.New(nerr.InvalidArgument, "executor.eval", name+" takes two arguments")
+		}
+	case "json_array_length", "json_type":
+		if len(args) != 1 && len(args) != 2 {
+			return types.Value{}, true, nerr.New(nerr.InvalidArgument, "executor.eval", name+" takes one or two arguments")
+		}
+	case "json_set":
+		if len(args) != 3 {
+			return types.Value{}, true, nerr.New(nerr.InvalidArgument, "executor.eval", "json_set takes three arguments")
+		}
 	default:
 		return types.Value{}, false, nil
 	}
-	if len(args) == 0 || args[0].Null {
+	if args[0].Null {
+		if name == "json_contains" {
+			return types.Null(types.Bool()), true, nil
+		}
+		if name == "json_array_length" {
+			return types.Null(types.Type{Kind: types.KindDecimal}), true, nil
+		}
+		if name == "json_type" {
+			return types.Null(types.String()), true, nil
+		}
 		return types.Null(types.NullType()), true, nil
 	}
 	if args[0].Typ.Kind != types.KindJSON {
 		return types.Value{}, true, nerr.New(nerr.InvalidArgument, "executor.eval", name+" requires JSON")
 	}
 	if name == "json_contains" {
-		if len(args) != 2 {
-			return types.Value{}, true, nerr.New(nerr.InvalidArgument, "executor.eval", "json_contains takes two arguments")
-		}
 		target, err := jsonArgumentDoc(args[1], true)
 		if err != nil {
 			return types.Value{}, true, err
@@ -608,6 +625,12 @@ func evalJSONFn(name string, args []types.Value) (types.Value, bool, error) {
 	var path []string
 	if len(args) > 1 {
 		if args[1].Null {
+			if name == "json_type" {
+				return types.Null(types.String()), true, nil
+			}
+			if name == "json_array_length" {
+				return types.Null(types.Type{Kind: types.KindDecimal}), true, nil
+			}
 			return types.Null(types.NullType()), true, nil
 		}
 		if args[1].Typ.Kind != types.KindString && args[1].Typ.Kind != types.KindText {
@@ -617,9 +640,6 @@ func evalJSONFn(name string, args []types.Value) (types.Value, bool, error) {
 	}
 	switch name {
 	case "json_set":
-		if len(args) != 3 {
-			return types.Value{}, true, nerr.New(nerr.InvalidArgument, "executor.eval", "json_set takes three arguments")
-		}
 		replacement, err := jsonArgumentDoc(args[2], false)
 		if err != nil {
 			return types.Value{}, true, err
@@ -630,18 +650,12 @@ func evalJSONFn(name string, args []types.Value) (types.Value, bool, error) {
 		}
 		return types.JSONValue(doc), true, nil
 	case "json_remove":
-		if len(args) != 2 {
-			return types.Value{}, true, nerr.New(nerr.InvalidArgument, "executor.eval", "json_remove takes two arguments")
-		}
 		doc, err := nsjson.Remove(args[0].JSON, path)
 		if err != nil {
 			return types.Value{}, true, err
 		}
 		return types.JSONValue(doc), true, nil
 	case "json_get":
-		if len(args) != 2 {
-			return types.Value{}, true, nerr.New(nerr.InvalidArgument, "executor.eval", "json_get takes two arguments")
-		}
 		v, err := types.ExtractJSON(args[0].JSON, path)
 		return v, true, err
 	case "json_array_length":
@@ -720,7 +734,18 @@ func jsonPath(path string) []string {
 
 func evalNumericFn(name string, args []types.Value) (types.Value, bool, error) {
 	switch name {
-	case "abs", "round", "ceil", "floor", "mod", "power", "sqrt":
+	case "abs", "ceil", "floor", "sqrt":
+		if len(args) != 1 {
+			return types.Value{}, true, nerr.New(nerr.InvalidArgument, "executor.eval", name+" takes one argument")
+		}
+	case "round":
+		if len(args) != 1 && len(args) != 2 {
+			return types.Value{}, true, nerr.New(nerr.InvalidArgument, "executor.eval", "round takes one or two arguments")
+		}
+	case "mod", "power":
+		if len(args) != 2 {
+			return types.Value{}, true, nerr.New(nerr.InvalidArgument, "executor.eval", name+" takes two arguments")
+		}
 	default:
 		return types.Value{}, false, nil
 	}
@@ -734,24 +759,15 @@ func evalNumericFn(name string, args []types.Value) (types.Value, bool, error) {
 	}
 	switch name {
 	case "abs":
-		if len(args) != 1 {
-			return types.Value{}, true, nerr.New(nerr.InvalidArgument, "executor.eval", "abs takes one argument")
-		}
 		v := args[0]
 		if v.Dec.Coef != nil && v.Dec.Coef.Sign() < 0 {
 			v.Dec.Coef = new(big.Int).Abs(v.Dec.Coef)
 		}
 		return v, true, nil
 	case "ceil", "floor":
-		if len(args) != 1 {
-			return types.Value{}, true, nerr.New(nerr.InvalidArgument, "executor.eval", name+" takes one argument")
-		}
 		d, err := decimalFloorCeil(args[0].Dec, name == "ceil")
 		return types.DecimalValue(d, types.Type{Kind: types.KindDecimal}), true, err
 	case "round":
-		if len(args) != 1 && len(args) != 2 {
-			return types.Value{}, true, nerr.New(nerr.InvalidArgument, "executor.eval", "round takes one or two arguments")
-		}
 		scale := 0
 		if len(args) == 2 {
 			var err error
@@ -766,18 +782,12 @@ func evalNumericFn(name string, args []types.Value) (types.Value, bool, error) {
 		d := decimalRound(args[0].Dec, scale)
 		return types.DecimalValue(d, types.Type{Kind: types.KindDecimal, Scale: uint16(scale)}), true, nil
 	case "mod":
-		if len(args) != 2 {
-			return types.Value{}, true, nerr.New(nerr.InvalidArgument, "executor.eval", "mod takes two arguments")
-		}
 		if args[1].Dec.IsZero() {
 			return types.Value{}, true, nerr.New(nerr.InvalidArgument, "executor.eval", "modulo by zero")
 		}
 		d := decimalMod(args[0].Dec, args[1].Dec)
 		return types.DecimalValue(d, types.Type{Kind: types.KindDecimal, Scale: uint16(d.Scale)}), true, nil
 	case "sqrt":
-		if len(args) != 1 {
-			return types.Value{}, true, nerr.New(nerr.InvalidArgument, "executor.eval", "sqrt takes one argument")
-		}
 		if args[0].Dec.Coef != nil && args[0].Dec.Coef.Sign() < 0 {
 			return types.Value{}, true, nerr.New(nerr.InvalidArgument, "executor.eval", "sqrt requires a non-negative value")
 		}
@@ -788,9 +798,6 @@ func evalNumericFn(name string, args []types.Value) (types.Value, bool, error) {
 		v, err := types.DecimalFromFloat(math.Sqrt(x))
 		return v, true, err
 	case "power":
-		if len(args) != 2 {
-			return types.Value{}, true, nerr.New(nerr.InvalidArgument, "executor.eval", "power takes two arguments")
-		}
 		base, err := strconv.ParseFloat(args[0].Dec.String(), 64)
 		if err != nil {
 			return types.Value{}, true, nerr.Wrap(nerr.InvalidArgument, "executor.eval", "power base", err)
@@ -938,7 +945,26 @@ func evalValueFn(name string, args []types.Value) (types.Value, bool, error) {
 
 func evalStringFn(name string, args []types.Value) (types.Value, bool, error) {
 	switch name {
-	case "lower", "upper", "length", "substring", "trim", "ltrim", "rtrim", "replace", "concat", "starts_with", "ends_with", "contains":
+	case "lower", "upper", "length", "trim", "ltrim", "rtrim":
+		if len(args) != 1 {
+			return types.Value{}, true, nerr.New(nerr.InvalidArgument, "executor.eval", name+" takes one argument")
+		}
+	case "substring":
+		if len(args) != 2 && len(args) != 3 {
+			return types.Value{}, true, nerr.New(nerr.InvalidArgument, "executor.eval", "substring takes two or three arguments")
+		}
+	case "replace":
+		if len(args) != 3 {
+			return types.Value{}, true, nerr.New(nerr.InvalidArgument, "executor.eval", "replace takes three arguments")
+		}
+	case "starts_with", "ends_with", "contains":
+		if len(args) != 2 {
+			return types.Value{}, true, nerr.New(nerr.InvalidArgument, "executor.eval", name+" takes two arguments")
+		}
+	case "concat":
+		if len(args) < 1 {
+			return types.Value{}, true, nerr.New(nerr.InvalidArgument, "executor.eval", "concat requires at least one argument")
+		}
 	default:
 		return types.Value{}, false, nil
 	}
@@ -969,9 +995,6 @@ func evalStringFn(name string, args []types.Value) (types.Value, bool, error) {
 			return nerr.New(nerr.InvalidArgument, "executor.eval", name+" requires STRING or TEXT")
 		}
 		return nil
-	}
-	if len(args) == 0 {
-		return types.Value{}, true, nerr.New(nerr.InvalidArgument, "executor.eval", name+" requires arguments")
 	}
 	if err := requireString(args[0]); err != nil {
 		return types.Value{}, true, err

@@ -302,6 +302,8 @@ export class Conn {
     this.secret = 0n;
     this.busy = false;
     this.publicErrorCodes = false;
+    this.statementCacheSize = cfg?.statementCacheSize ?? 0;
+    this._stmtCache = this.statementCacheSize > 0 ? new Map() : null;
   }
 
   async handshake() {
@@ -447,6 +449,30 @@ export class Conn {
     if (this.busy) {
       throw new NextSQLError('conflict', 'connection is busy');
     }
+    if (this._stmtCache && params && params.length > 0) {
+      let stmt = this._stmtCache.get(sql);
+      if (stmt) {
+        this._stmtCache.delete(sql);
+        this._stmtCache.set(sql, stmt);
+      } else {
+        stmt = await this.prepare(sql);
+        if (this._stmtCache.size >= this.statementCacheSize) {
+          const oldestKey = this._stmtCache.keys().next().value;
+          const oldestStmt = this._stmtCache.get(oldestKey);
+          this._stmtCache.delete(oldestKey);
+          oldestStmt.close().catch(() => {});
+        }
+        this._stmtCache.set(sql, stmt);
+      }
+      try {
+        return await this._execute(stmt.id, params);
+      } catch (err) {
+        this._stmtCache.delete(sql);
+        stmt.close().catch(() => {});
+        throw err;
+      }
+    }
+
     this.busy = true;
     try {
       await this.wire.writeFrame(Type.Query, encodeQuery(sql, params || []));
@@ -545,6 +571,11 @@ export class Conn {
   }
 
   async close() {
+    if (this._stmtCache) {
+      const stmts = [...this._stmtCache.values()];
+      this._stmtCache.clear();
+      await Promise.allSettled(stmts.map(s => s.close()));
+    }
     if (!this.wire) {
       return;
     }
@@ -779,4 +810,181 @@ export async function openCluster(cfg, dial) {
     throw firstErr;
   }
   return new Cluster(cfg, conns);
+}
+
+export class Pool {
+  constructor(cfg, dial, options = {}) {
+    const min = options.min ?? 1;
+    const max = options.max ?? 10;
+    const timeoutMs = options.timeoutMs ?? 30000;
+    const idleTimeoutMs = options.idleTimeoutMs ?? 300000;
+    const statementCacheSize = options.statementCacheSize ?? 50;
+
+    if (min < 0) throw new NextSQLError('invalid_argument', 'min must be >= 0');
+    if (max < 1) throw new NextSQLError('invalid_argument', 'max must be >= 1');
+    if (max < min) throw new NextSQLError('invalid_argument', 'max must be >= min');
+    if (statementCacheSize < 0) throw new NextSQLError('invalid_argument', 'statementCacheSize must be >= 0');
+
+    this._cfg = { ...cfg, statementCacheSize };
+    this._dial = dial;
+    this._min = min;
+    this._max = max;
+    this._timeoutMs = timeoutMs;
+    this._idleTimeoutMs = idleTimeoutMs;
+    this._statementCacheSize = statementCacheSize;
+
+    this._idle = [];
+    this._inUse = new Set();
+    this._waiters = [];
+    this._closed = false;
+  }
+
+  get size() {
+    return this._idle.length + this._inUse.size;
+  }
+
+  get idleCount() {
+    return this._idle.length;
+  }
+
+  get inUseCount() {
+    return this._inUse.size;
+  }
+
+  get isClosed() {
+    return this._closed;
+  }
+
+  async acquire() {
+    if (this._closed) {
+      throw new NextSQLError('unavailable', 'connection pool is closed');
+    }
+
+    const now = Date.now();
+    while (this._idle.length > 0) {
+      const item = this._idle.pop();
+      if (this._idleTimeoutMs > 0 && (now - item.lastUsed) > this._idleTimeoutMs) {
+        item.conn.close().catch(() => {});
+        continue;
+      }
+      if (item.conn.wire && item.conn.wire.closed) {
+        continue;
+      }
+      this._inUse.add(item.conn);
+      return item.conn;
+    }
+
+    if (this.size < this._max) {
+      const conn = await open(this._cfg, this._dial);
+      this._inUse.add(conn);
+      return conn;
+    }
+
+    return new Promise((resolve, reject) => {
+      let timer = null;
+      if (this._timeoutMs > 0) {
+        timer = setTimeout(() => {
+          const idx = this._waiters.findIndex(w => w.resolve === resolve);
+          if (idx >= 0) {
+            this._waiters.splice(idx, 1);
+            reject(new NextSQLError('resource_exhausted', 'connection pool exhausted, wait timeout exceeded'));
+          }
+        }, this._timeoutMs);
+      }
+      this._waiters.push({ resolve, reject, timer });
+    });
+  }
+
+  async release(conn) {
+    if (!this._inUse.has(conn)) {
+      return;
+    }
+    this._inUse.delete(conn);
+
+    if (this._closed || (conn.wire && conn.wire.closed)) {
+      conn.close().catch(() => {});
+      this._drainWaiters();
+      return;
+    }
+
+    try {
+      await conn.exec('ROLLBACK');
+    } catch {
+      conn.close().catch(() => {});
+      this._drainWaiters();
+      return;
+    }
+
+    while (this._waiters.length > 0) {
+      const waiter = this._waiters.shift();
+      if (waiter.timer) clearTimeout(waiter.timer);
+      this._inUse.add(conn);
+      waiter.resolve(conn);
+      return;
+    }
+
+    this._idle.push({ conn, lastUsed: Date.now() });
+  }
+
+  _drainWaiters() {
+    if (this._closed) {
+      while (this._waiters.length > 0) {
+        const w = this._waiters.shift();
+        if (w.timer) clearTimeout(w.timer);
+        w.reject(new NextSQLError('unavailable', 'connection pool is closed'));
+      }
+      return;
+    }
+    if (this.size < this._max && this._waiters.length > 0) {
+      const waiter = this._waiters.shift();
+      if (waiter.timer) clearTimeout(waiter.timer);
+      open(this._cfg, this._dial).then(conn => {
+        this._inUse.add(conn);
+        waiter.resolve(conn);
+      }).catch(err => {
+        waiter.reject(err);
+      });
+    }
+  }
+
+  async withConnection(fn) {
+    const conn = await this.acquire();
+    try {
+      return await fn(conn);
+    } finally {
+      await this.release(conn);
+    }
+  }
+
+  async exec(sql, params) {
+    return this.withConnection(conn => conn.exec(sql, params));
+  }
+
+  async query(sql, params) {
+    return this.withConnection(async (conn) => {
+      const rows = await conn.query(sql, params);
+      return rows.collect();
+    });
+  }
+
+  async close() {
+    if (this._closed) return;
+    this._closed = true;
+
+    while (this._waiters.length > 0) {
+      const w = this._waiters.shift();
+      if (w.timer) clearTimeout(w.timer);
+      w.reject(new NextSQLError('unavailable', 'connection pool is closed'));
+    }
+
+    const conns = [...this._idle.map(item => item.conn), ...this._inUse];
+    this._idle = [];
+    this._inUse.clear();
+
+    await Promise.allSettled(conns.map(c => c.close()));
+  }
+}
+
+export function openPool(cfg, dial, options) {
+  return new Pool(cfg, dial, options);
 }

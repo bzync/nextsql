@@ -175,10 +175,10 @@ func (s *Session) authorize(stmt ast.Stmt) error {
 		return s.require(security.PrivConnect, security.ScopeDatabase, "")
 	case ast.ShowTasks, ast.CancelTask:
 		return s.require(security.PrivConnect, security.ScopeDatabase, "")
-	case ast.CancelQuery:
-		// Any connected user may reach the statement; whose query it is decides
-		// the outcome, and that check is in execCancelQuery where the target
-		// session is known.
+	case ast.CancelQuery, ast.KillSession:
+		// Any connected user may reach the statement; whose query or session it
+		// is decides the outcome, and that check is in the executor where the
+		// target is known.
 		return s.require(security.PrivConnect, security.ScopeDatabase, "")
 	case ast.Subscribe:
 		return s.require(security.PrivCDC, security.ScopeTable, st.Table)
@@ -530,6 +530,8 @@ func sqlObject(stmt ast.Stmt) string {
 		return st.ID
 	case ast.CancelQuery:
 		return st.ID
+	case ast.KillSession:
+		return st.ID
 	case ast.Subscribe:
 		return st.Table
 	case ast.CreateTable:
@@ -619,6 +621,8 @@ func workflowAuditAction(stmt ast.Stmt) string {
 		return security.ActionTaskCancel
 	case ast.CancelQuery:
 		return security.ActionQueryCancel
+	case ast.KillSession:
+		return security.ActionSessionKill
 	case ast.CreateView:
 		return security.ActionViewCreate
 	case ast.DropView:

@@ -2,7 +2,7 @@
 
 Install the NextSQL **binaries**, then initialize a data directory.
 
-Published packages, checksums, and a feature comparison are on [Downloads](/download). Direct files: [GitHub release v0.0.6](https://github.com/bzync/nextsql/releases/tag/v0.0.6). For a container, see [Docker](/docs/docker). For the GUI, see [Admin](/docs/admin).
+Published packages, checksums, and a feature comparison are on [Downloads](/download). Direct files: [GitHub release v0.0.6](https://github.com/bzync/nextsql/releases/tag/v0.0.6). For a container, see [Docker](/docs/docker) and [Docker Compose](/docs/docker-compose). For the GUI, see [Admin](/docs/admin).
 
 The packages copy `nextsql`, `nextsqld`, `nextsql-bench`, and `nextsql-admin` plus a default config. They do **not** create a data directory, write a root unlock key, or start the server.
 
@@ -92,7 +92,7 @@ there is no `latest`, `edge`, or per-commit tag:
 docker pull bzynchub/nextsql:0.0.6
 ```
 
-See [Docker](/docs/docker).
+See [Docker](/docs/docker) and [Docker Compose](/docs/docker-compose).
 
 ## Install with Go
 

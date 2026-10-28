@@ -236,7 +236,7 @@ domain-separated key and allow only equality/inequality against a
 client-encrypted parameter, NULL tests, and direct ordinary B-tree/UNIQUE
 indexes. This leaks equality and frequency within one key/context; ranges,
 joins, expressions, ordering/grouping, and all general search remain rejected.
-Go, Node.js/TypeScript, Bun, and PHP helpers, rotation/revocation, fuzz, PITR,
+Go, Node.js/TypeScript, Bun, PHP, Python, and Ruby helpers, rotation/revocation, fuzz, PITR,
 and three-voter failover coverage are implemented and production-gated. See
 [`client-encryption.md`](client-encryption.md) for the format, leakage,
 rotation, revocation, backup, and context-migration contract.
@@ -763,10 +763,10 @@ fail-closed controls and remain off by default.
 | External auth remains behind RBAC | yes | yes | yes | yes — every server enforces `ACL.AllowedScoped`; embedded mode also checks the live native user and direct/transitive ACL membership before minting, with empty intersection denial and immediate revocation behavior (`TestExchangeRBACIntersection`, `TestEmbeddedAuthBrokerUsesLiveNativeMembership`) |
 | IdP group/role mapping | yes | yes | yes | yes — `NSIP` literal + RE2 `${n}` group→role mappings, 16-role cap, empty ⇒ deny, consumed by the broker; `TestIdentityPolicyGroupRegexCapture`, `TestIdentityPolicyRoleCapDenies`, `TestExchangeRejections` (unmapped groups/subject ⇒ deny) |
 | `ENCRYPTED CLIENT` | yes | yes | yes | yes — randomized `NSCE1` plus explicit deterministic `NSCE2`; durable key rotation/revocation; see `docs/client-encryption.md` "Production-gating sign-off" — `NSCT` v13; parser/catalog/binder/executor tests |
-| Official-driver field encryption | yes | yes | yes | yes — Go, Node.js/TypeScript, Bun, and PHP provider/keyring/encrypt/decrypt helpers; Go↔non-Go portability fixtures |
+| Official-driver field encryption | yes | yes | yes | yes — Go, Node.js/TypeScript, Bun, PHP, Python, and Ruby provider/keyring/encrypt/decrypt helpers; cross-driver portability fixtures |
 | Server-opaque client fields | yes | yes | yes | yes — server structurally validates/stores `NSCE1.`/`NSCE2.` but has no field key; encrypted restart/plaintext-scan test |
 | Deterministic-equality leakage contract | yes | yes | yes | yes — explicit opt-in only; equality/frequency leakage documented; plaintext/range/join/general-search paths fail closed |
-| Field-key rotation | yes | yes | yes | yes — `FileFieldKeyring` (Go/Node/Bun/PHP): atomic, versioned, 0600 `NSFK1` file; overlap reads after rotation persist across restart; cross-driver format interop |
+| Field-key rotation | yes | yes | yes | yes — `FileFieldKeyring` (Go/Node/Bun/PHP/Python/Ruby): atomic, versioned, 0600 `NSFK1` file; overlap reads after rotation persist across restart; cross-driver format interop |
 | Field-key revocation | yes | yes | yes | yes — revoked material zeroed on disk, revoked ids fail closed and can never be reused, current key cannot be revoked directly |
 | Field wrong-key/tamper behavior | yes | yes | yes | yes — GCM and SIV context/type/revocation tests + `FuzzInspect` |
 | Field backup/restore/PITR | yes | yes | yes | yes — `TestEncryptedClientPITRRestoresExactCiphertextAtTarget`: base backup + archived WAL restore preserves exact pre-target `NSCE1` and `NSCE2`, excludes later writes, and retains v13 mode metadata |

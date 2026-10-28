@@ -25,8 +25,10 @@
 require_relative "nextsql/version"
 require_relative "nextsql/errors"
 require_relative "nextsql/protocol"
+require_relative "nextsql/field_encryption"
 require_relative "nextsql/client"
 require_relative "nextsql/cluster"
+require_relative "nextsql/pool"
 
 module NextSQL
   READ_STRONG = Protocol::READ_STRONG
@@ -64,5 +66,10 @@ module NextSQL
   # +cfg.address+). See Cluster for routing behavior.
   def self.connect_cluster(cfg)
     Cluster.connect(cfg)
+  end
+
+  # Creates a connection pool managing a set of connections to a NextSQL server.
+  def self.create_pool(cfg, **kwargs)
+    ConnectionPool.new(cfg, **kwargs)
   end
 end

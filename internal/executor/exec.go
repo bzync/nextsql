@@ -69,6 +69,8 @@ func (s *Session) execPlan(plan planner.Logical) (*Result, error) {
 		return s.execCancelTask(p)
 	case planner.CancelQuery:
 		return s.execCancelQuery(p.ID)
+	case planner.KillSession:
+		return s.execKillSession(p.ID)
 	case planner.CreateView:
 		return s.execCreateView(p)
 	case planner.DropView:

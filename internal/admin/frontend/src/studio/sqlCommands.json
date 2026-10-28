@@ -84,6 +84,10 @@
     "sample": "CANCEL QUERY 'q'"
   },
   {
+    "label": "KILL SESSION",
+    "sample": "KILL SESSION 's'"
+  },
+  {
     "label": "UPSERT INTO",
     "sample": "UPSERT INTO t VALUES (1)",
     "feature": "upsert"

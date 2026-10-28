@@ -31,7 +31,23 @@ end
 Plaintext connections are allowed only on loopback. For an HA cluster with
 follower-read routing, use `NextSQL.connect_cluster`.
 
+### Connection Pooling & Statement Caching
+
+```ruby
+pool = NextSQL.create_pool(cfg, min_size: 2, max_size: 10, statement_cache_size: 50)
+begin
+  pool.with do |conn|
+    res = conn.exec("SELECT * FROM users WHERE status = $1", ["active"])
+  end
+ensure
+  pool.close
+end
+```
+
+Parameterized queries automatically reuse cached server-side prepared statements via LRU eviction policy.
+
 - Full driver docs: <https://nextsql.bzync.com/docs/drivers>
 - Wire protocol: <https://github.com/bzync/nextsql/blob/master/docs/protocol.md>
+- Client-side field encryption: <https://nextsql.bzync.com/docs/client-encryption>
 
 MIT licensed.

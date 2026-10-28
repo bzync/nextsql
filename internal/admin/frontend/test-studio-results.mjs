@@ -546,6 +546,112 @@ try {
   assert.equal(estimateMissProfile.worstEstimate.estimateDirection, "lower");
   assert.throws(() => tools.buildExplainProfile(tooManyPlanNodes), /at most 512 operators/);
 
+  // Structured EXPLAIN (FORMAT JSON) tests:
+  const sampleJsonPlanDoc = {
+    operator: "Limit",
+    detail: "10",
+    estimates: { rows: 10, cost: 1200 },
+    actuals: { rows: 10, time_ns: 250000, cpu_time_ns: 240000, time: "250µs", cpu: "240µs" },
+    resources: { memory: 4096, disk: 0, cache: 512, spill: 0, workers: 2 },
+    children: [
+      {
+        operator: "HashJoin",
+        detail: "(users.id = orders.user_id)",
+        estimates: { rows: 100, cost: 1000 },
+        actuals: { rows: 10, time_ns: 200000, cpu_time_ns: 190000, time: "200µs", cpu: "190µs" },
+        resources: { memory: 2048, disk: 0, cache: 256, spill: 0, workers: 2 },
+        children: [
+          {
+            operator: "IndexScan",
+            detail: "users",
+            index: "ix_users_id",
+            estimates: { rows: 50, cost: 200 },
+            actuals: { rows: 50, time_ns: 50000, cpu_time_ns: 48000, time: "50µs", cpu: "48µs" },
+            resources: { memory: 0, disk: 0, cache: 0, spill: 0, workers: 1 },
+          },
+          {
+            operator: "SeqScan",
+            detail: "orders",
+            estimates: { rows: 200, cost: 500 },
+            actuals: { rows: 200, time_ns: 120000, cpu_time_ns: 115000, time: "120µs", cpu: "115µs" },
+            resources: { memory: 0, disk: 0, cache: 0, spill: 0, workers: 1 },
+          },
+        ],
+      },
+    ],
+  };
+
+  const sampleJsonPlanString = JSON.stringify(sampleJsonPlanDoc);
+  assert.equal(tools.isJsonPlanString(sampleJsonPlanString), true);
+  assert.equal(tools.isJsonPlanString("not json"), false);
+  assert.equal(tools.isJsonPlanString(JSON.stringify({ notAnOp: 1 })), false);
+
+  const jsonExplainResult = {
+    columns: ["plan"],
+    column_types: ["STRING"],
+    rows: [[sampleJsonPlanString]],
+    truncated: false,
+    elapsed_ms: 2,
+  };
+
+  assert.equal(tools.isExplainResult(jsonExplainResult), true);
+  const parsedJsonPlan = tools.parseExplainPlan(jsonExplainResult);
+  assert.equal(parsedJsonPlan.length, 1);
+  assert.equal(parsedJsonPlan[0].label, "Limit 10");
+  assert.equal(parsedJsonPlan[0].estRows, 10);
+  assert.equal(parsedJsonPlan[0].estCost, 1200);
+  assert.equal(parsedJsonPlan[0].actRows, 10);
+  assert.equal(parsedJsonPlan[0].time, "250µs");
+  assert.equal(parsedJsonPlan[0].workers, 2);
+  assert.equal(parsedJsonPlan[0].children.length, 1);
+  assert.equal(parsedJsonPlan[0].children[0].label, "HashJoin (users.id = orders.user_id)");
+  assert.equal(parsedJsonPlan[0].children[0].children.length, 2);
+  assert.equal(parsedJsonPlan[0].children[0].children[0].index, "ix_users_id");
+  assert.equal(tools.explainAnalyzed(parsedJsonPlan), true);
+
+  // Operator Category classification
+  assert.equal(tools.getOperatorCategory("SeqScan users"), "scan");
+  assert.equal(tools.getOperatorCategory("IndexScan ix_val"), "scan");
+  assert.equal(tools.getOperatorCategory("BitmapIndex idx"), "scan");
+  assert.equal(tools.getOperatorCategory("Nearest embedding"), "scan");
+  assert.equal(tools.getOperatorCategory("HashJoin (a = b)"), "join");
+  assert.equal(tools.getOperatorCategory("MergeJoin (a = b)"), "join");
+  assert.equal(tools.getOperatorCategory("HashAggregate sum(val)"), "aggregate");
+  assert.equal(tools.getOperatorCategory("Filter (n > 5)"), "filter");
+  assert.equal(tools.getOperatorCategory("TopNSort 10"), "sort");
+  assert.equal(tools.getOperatorCategory("Limit 2"), "limit");
+  assert.equal(tools.getOperatorCategory("Project id, n"), "project");
+  assert.equal(tools.getOperatorCategory("CustomNode"), "other");
+
+  // Visual Plan DAG layout generator
+  const visualLayout = tools.buildVisualPlanLayout(parsedJsonPlan);
+  assert.equal(visualLayout.operatorCount, 4);
+  assert.equal(visualLayout.nodes.length, 4);
+  assert.equal(visualLayout.edges.length, 3);
+  assert.equal(visualLayout.hasActuals, true);
+  assert.equal(visualLayout.maxCost, 1200);
+  assert.ok(visualLayout.width >= 400);
+  assert.ok(visualLayout.height >= 200);
+  // Root node is at depth 0
+  const rootVNode = visualLayout.nodes.find((n) => n.id === "op-0");
+  assert.ok(rootVNode);
+  assert.equal(rootVNode.category, "limit");
+  assert.equal(rootVNode.depth, 0);
+  // Two scan children are at depth 2
+  const scanNodes = visualLayout.nodes.filter((n) => n.depth === 2);
+  assert.equal(scanNodes.length, 2);
+  assert.notEqual(scanNodes[0].x, scanNodes[1].x, "parallel child nodes must not collide horizontally");
+
+  // Edges flow from children to parent
+  assert.ok(visualLayout.edges.every((e) => e.d.startsWith("M ") && e.d.includes(" C ")));
+
+  // JSON roundtrip serialization
+  const roundtripJson = tools.explainNodesToJSON(parsedJsonPlan);
+  assert.equal(tools.isJsonPlanString(roundtripJson), true);
+  const parsedRoundtrip = JSON.parse(roundtripJson);
+  assert.equal(parsedRoundtrip.operator, "Limit");
+  assert.equal(parsedRoundtrip.children[0].operator, "HashJoin");
+
   // GRANT/REVOKE builder: quoting, per-scope shape, and required-field
   // validation. Every generated shape below was also confirmed against the
   // real internal/sql/parser (not just this frontend's own assumptions).
@@ -3191,6 +3297,30 @@ try {
     assert.ok(md.includes("PointLookup"));
     assert.ok(md.includes("VectorHNSW_Nearest"));
     assert.ok(md.includes("🟢 Improved"));
+  }
+
+  // Query history persistence tests
+  {
+    const key = tools.queryHistoryStorageKey("local", "nextsql_dev", "admin");
+    assert.equal(key, "nextsql-studio-history:local:nextsql_dev:admin");
+
+    const sampleEntries = [
+      { id: "h1", sql: "SELECT * FROM users;", ranAt: Date.now(), outcome: "success", rowCount: 10, elapsedMs: 5 },
+      { id: "h2", sql: "INSERT INTO logs VALUES (1);", ranAt: Date.now() - 1000, outcome: "error", error: "table not found" },
+    ];
+    const serialized = tools.serializeQueryHistory(sampleEntries);
+    assert.ok(serialized.includes("SELECT * FROM users;"));
+
+    const roundtrip = tools.parseQueryHistory(serialized);
+    assert.equal(roundtrip.length, 2);
+    assert.equal(roundtrip[0].sql, "SELECT * FROM users;");
+    assert.equal(roundtrip[0].outcome, "success");
+    assert.equal(roundtrip[1].error, "table not found");
+
+    // Malformed input fails closed to empty array
+    assert.deepEqual(tools.parseQueryHistory("not json"), []);
+    assert.deepEqual(tools.parseQueryHistory(null), []);
+    assert.deepEqual(tools.parseQueryHistory(JSON.stringify([{ invalid: true }])), []);
   }
 
   console.log("Studio result helper tests passed");

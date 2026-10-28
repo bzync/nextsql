@@ -27,6 +27,10 @@ export interface ResultTableProps {
   pageSizeOptions?: number[];
   showSearch?: boolean;
   showExport?: boolean;
+  actions?: {
+    header?: string;
+    render: (row: (string | null)[]) => React.ReactNode;
+  };
 }
 
 export function ResultTable({
@@ -37,6 +41,7 @@ export function ResultTable({
   pageSizeOptions = [10, 25, 50, 100],
   showSearch = true,
   showExport = true,
+  actions,
 }: ResultTableProps) {
   const { preferences } = useUserPreferences();
   const initialPageSize = defaultPageSize ?? preferences.defaultPageSize ?? 10;
@@ -194,12 +199,17 @@ export function ResultTable({
                   </TableHead>
                 );
               })}
+              {actions ? (
+                <TableHead key="__actions" className="w-24">
+                  <span>{actions.header ?? "Actions"}</span>
+                </TableHead>
+              ) : null}
             </TableRow>
           </TableHeader>
           <TableBody>
             {paginatedRows.length === 0 ? (
               <TableRow>
-                <TableCell colSpan={result.columns.length} className="text-center py-6 text-muted-foreground">
+                <TableCell colSpan={result.columns.length + (actions ? 1 : 0)} className="text-center py-6 text-muted-foreground">
                   No matching rows found
                 </TableCell>
               </TableRow>
@@ -217,6 +227,11 @@ export function ResultTable({
                       )}
                     </TableCell>
                   ))}
+                  {actions ? (
+                    <TableCell key="__action">
+                      {actions.render(row)}
+                    </TableCell>
+                  ) : null}
                 </TableRow>
               ))
             )}

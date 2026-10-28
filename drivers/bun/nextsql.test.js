@@ -32,6 +32,8 @@ import {
   decryptFieldDeterministic,
   encryptField,
   encryptFieldDeterministic,
+  Pool,
+  createPool,
 } from './nextsql.js';
 
 function fieldKey(id, fill) {
@@ -441,4 +443,132 @@ test('hello-ok capability flags are an opt-in trailing field', () => {
   expect(decodeHelloOK(Buffer.concat([base, flags])).flags).toBe(FlagPublicErrorCodes);
   expect(() => decodeHelloOK(Buffer.concat([base, Buffer.alloc(2)]))).toThrow();
   expect(() => decodeHelloOK(Buffer.alloc(12))).toThrow();
+});
+
+test('Pool parameter validation', () => {
+  const cfg = { address: '127.0.0.1:7210', user: 'app', insecureNoTLS: true };
+  expect(() => createPool(cfg, { min: -1 })).toThrow(/min must be >= 0/);
+  expect(() => createPool(cfg, { max: 0 })).toThrow(/max must be >= 1/);
+  expect(() => createPool(cfg, { min: 5, max: 2 })).toThrow(/max must be >= min/);
+  expect(() => createPool(cfg, { statementCacheSize: -1 })).toThrow(/statementCacheSize must be >= 0/);
+  const pool = createPool(cfg, { min: 0, max: 5 });
+  expect(pool.size).toBe(0);
+  expect(pool.isClosed).toBe(false);
+});
+
+test('Pool acquire, release, rollback, and exhaustion', async () => {
+  const cfg = { address: '127.0.0.1:7210', user: 'app', insecureNoTLS: true };
+  const pool = createPool(cfg, { min: 0, max: 2, timeoutMs: 50 });
+
+  let rollbacks = 0;
+  const mockConn1 = {
+    wire: { closed: false },
+    exec: async (sql) => {
+      if (sql === 'ROLLBACK') rollbacks++;
+      return { affected: 1, columns: ['id'], rows: [[1]] };
+    },
+    query: async () => ({
+      collect: async () => ({ affected: 1, columns: ['id'], rows: [[1]] }),
+    }),
+    close: async () => { mockConn1.wire.closed = true; },
+  };
+
+  const mockConn2 = {
+    wire: { closed: false },
+    exec: async (sql) => {
+      if (sql === 'ROLLBACK') rollbacks++;
+      return { affected: 1, columns: ['id'], rows: [[2]] };
+    },
+    query: async () => ({
+      collect: async () => ({ affected: 1, columns: ['id'], rows: [[2]] }),
+    }),
+    close: async () => { mockConn2.wire.closed = true; },
+  };
+
+  pool._inUse.add(mockConn1);
+  pool._inUse.add(mockConn2);
+  expect(pool.size).toBe(2);
+  expect(pool.inUseCount).toBe(2);
+  expect(pool.idleCount).toBe(0);
+
+  // 3rd acquire must timeout
+  await expect(pool.acquire()).rejects.toThrow();
+
+  // Release mockConn1
+  await pool.release(mockConn1);
+  expect(rollbacks).toBe(1);
+  expect(pool.inUseCount).toBe(1);
+  expect(pool.idleCount).toBe(1);
+
+  // Acquire succeeds immediately from idle
+  const conn = await pool.acquire();
+  expect(conn).toBe(mockConn1);
+  expect(pool.inUseCount).toBe(2);
+  expect(pool.idleCount).toBe(0);
+
+  await pool.close();
+  expect(pool.isClosed).toBe(true);
+  expect(mockConn1.wire.closed).toBe(true);
+  expect(mockConn2.wire.closed).toBe(true);
+});
+
+test('Connection statement LRU cache reuse and eviction in Bun', async () => {
+  const { Conn } = await import('../js/client.mjs');
+  const closedStmts = [];
+  const mockWire = {
+    closed: false,
+    writeFrame: async () => {},
+    readFrame: async () => {},
+    close: () => { mockWire.closed = true; },
+  };
+
+  const conn = new Conn({ statementCacheSize: 2 }, mockWire, null);
+  let nextId = 1;
+  const preparedCalls = [];
+  const executedCalls = [];
+
+  conn.prepare = async (sql) => {
+    preparedCalls.push(sql);
+    const id = nextId++;
+    return {
+      id,
+      close: async () => { closedStmts.push(id); },
+    };
+  };
+
+  conn._execute = async (id, params) => {
+    executedCalls.push({ id, params });
+    return {
+      collect: async () => ({ columns: ['v'], rows: [[params[0]]] }),
+    };
+  };
+
+  // 1. First parameterized query prepares id=1
+  await conn.query('SELECT $1', [10]);
+  expect(preparedCalls.length).toBe(1);
+  expect(executedCalls.length).toBe(1);
+  expect(executedCalls[0].id).toBe(1);
+
+  // 2. Repeat exact SQL reuses cached prepared statement
+  await conn.query('SELECT $1', [20]);
+  expect(preparedCalls.length).toBe(1);
+  expect(executedCalls.length).toBe(2);
+  expect(executedCalls[1].id).toBe(1);
+
+  // 3. Second unique query prepares id=2
+  await conn.query('SELECT $1 + 1', [30]);
+  expect(preparedCalls.length).toBe(2);
+  expect(executedCalls.length).toBe(3);
+  expect(executedCalls[2].id).toBe(2);
+
+  // 4. Third unique query evicts least recently used statement (id=1)
+  await conn.query('SELECT $1 + 2', [40]);
+  expect(preparedCalls.length).toBe(3);
+  expect(executedCalls.length).toBe(4);
+  expect(executedCalls[3].id).toBe(3);
+  expect(closedStmts).toEqual([1]);
+
+  // 5. Closing connection closes remaining cached statements
+  await conn.close();
+  expect(closedStmts.sort()).toEqual([1, 2, 3]);
 });

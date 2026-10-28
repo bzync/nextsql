@@ -1,6 +1,7 @@
 package optimizer
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 
@@ -10,6 +11,91 @@ import (
 // ExplainColumns is the structured EXPLAIN / EXPLAIN ANALYZE schema.
 var ExplainColumns = []string{
 	"operator", "estimates", "actuals", "time", "cpu", "memory", "disk", "cache", "spill", "workers", "index",
+}
+
+type PlanJSON struct {
+	Operator  string             `json:"operator"`
+	Detail    string             `json:"detail,omitempty"`
+	Estimates PlanEstimatesJSON  `json:"estimates"`
+	Actuals   *PlanActualsJSON   `json:"actuals,omitempty"`
+	Resources *PlanResourcesJSON `json:"resources,omitempty"`
+	Index     string             `json:"index,omitempty"`
+	Children  []*PlanJSON        `json:"children,omitempty"`
+}
+
+type PlanEstimatesJSON struct {
+	Rows int64 `json:"rows"`
+	Cost int64 `json:"cost"`
+}
+
+type PlanActualsJSON struct {
+	Rows      int64  `json:"rows"`
+	TimeNS    int64  `json:"time_ns"`
+	CPUTimeNS int64  `json:"cpu_time_ns"`
+	Time      string `json:"time"`
+	CPU       string `json:"cpu"`
+}
+
+type PlanResourcesJSON struct {
+	Memory  int64 `json:"memory"`
+	Disk    int64 `json:"disk"`
+	Cache   int64 `json:"cache"`
+	Spill   int64 `json:"spill"`
+	Workers int   `json:"workers"`
+}
+
+func ToJSON(n *Node, analyze bool) *PlanJSON {
+	if n == nil {
+		return nil
+	}
+	pj := &PlanJSON{
+		Operator: n.Op,
+		Detail:   n.Detail,
+		Estimates: PlanEstimatesJSON{
+			Rows: n.EstRows,
+			Cost: n.EstCost,
+		},
+		Index: n.Index,
+	}
+	if analyze {
+		workers := n.Workers
+		if workers == 0 {
+			workers = 1
+		}
+		pj.Actuals = &PlanActualsJSON{
+			Rows:      n.ActRows,
+			TimeNS:    n.TimeNS,
+			CPUTimeNS: n.CPUTimeNS,
+			Time:      formatNS(n.TimeNS),
+			CPU:       formatNS(n.CPUTimeNS),
+		}
+		pj.Resources = &PlanResourcesJSON{
+			Memory:  n.Memory,
+			Disk:    n.Disk,
+			Cache:   n.Cache,
+			Spill:   n.Spill,
+			Workers: workers,
+		}
+	}
+	if len(n.Kids) > 0 {
+		pj.Children = make([]*PlanJSON, len(n.Kids))
+		for i, k := range n.Kids {
+			pj.Children[i] = ToJSON(k, analyze)
+		}
+	}
+	return pj
+}
+
+func FormatJSON(n *Node, analyze bool) (string, error) {
+	if n == nil {
+		return "{}", nil
+	}
+	root := ToJSON(n, analyze)
+	data, err := json.MarshalIndent(root, "", "  ")
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
 }
 
 func FormatText(n *Node, analyze bool) string {

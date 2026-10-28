@@ -8,11 +8,20 @@ from __future__ import annotations
 import re
 import socket
 import ssl
+import collections
 from dataclasses import dataclass, field
 from typing import Any, Iterator
 
 from . import protocol as p
 from .errors import NextSQLError
+from .field_encryption import (
+    FieldKeyProvider,
+    FieldType,
+    decrypt_field,
+    decrypt_field_deterministic,
+    encrypt_field,
+    encrypt_field_deterministic,
+)
 
 _DEFAULT_TIMEOUT = 60.0
 _CONNECT_TIMEOUT = 10.0
@@ -53,7 +62,9 @@ class Config:
     insecure_no_tls: bool = False
     read_consistency: int = p.READ_STRONG
     max_staleness_ms: int = 0
+    field_keys: FieldKeyProvider | None = None
     timeout: float = _DEFAULT_TIMEOUT
+    statement_cache_size: int = 0
 
 
 def _split_host_port(addr: str, allow_bare: bool = False) -> tuple[str, int]:
@@ -302,6 +313,10 @@ class Connection:
         self._secret = b""
         self.public_error_codes = False
         self._busy = False
+        self.statement_cache_size = cfg.statement_cache_size
+        self._stmt_cache: collections.OrderedDict[str, Statement] | None = (
+            collections.OrderedDict() if self.statement_cache_size > 0 else None
+        )
         try:
             self._handshake()
             if cfg.read_consistency != p.READ_STRONG:
@@ -344,11 +359,73 @@ class Connection:
     def exec(self, sql: str, params: list[Any] | None = None) -> Result:
         return self.query(sql, params).collect()
 
+    # --- field encryption ---
+
+    def encrypt_field(
+        self, table: str, column: str, field_type: FieldType, value: Any
+    ) -> str | None:
+        if self._cfg.field_keys is None:
+            raise NextSQLError("invalid_argument", "field_keys is required for client encryption")
+        return encrypt_field(
+            self._cfg.field_keys, self._cfg.database or "default", table, column, field_type, value
+        )
+
+    def decrypt_field(
+        self, table: str, column: str, expected_type: FieldType, ciphertext: str | None
+    ) -> Any:
+        if self._cfg.field_keys is None:
+            raise NextSQLError("invalid_argument", "field_keys is required for client encryption")
+        return decrypt_field(
+            self._cfg.field_keys, self._cfg.database or "default", table, column, expected_type, ciphertext
+        )
+
+    def encrypt_field_deterministic(
+        self, table: str, column: str, field_type: FieldType, value: Any
+    ) -> str | None:
+        if self._cfg.field_keys is None:
+            raise NextSQLError("invalid_argument", "field_keys is required for client encryption")
+        return encrypt_field_deterministic(
+            self._cfg.field_keys, self._cfg.database or "default", table, column, field_type, value
+        )
+
+    def decrypt_field_deterministic(
+        self, table: str, column: str, expected_type: FieldType, ciphertext: str | None
+    ) -> Any:
+        if self._cfg.field_keys is None:
+            raise NextSQLError("invalid_argument", "field_keys is required for client encryption")
+        return decrypt_field_deterministic(
+            self._cfg.field_keys, self._cfg.database or "default", table, column, expected_type, ciphertext
+        )
+
     def query(self, sql: str, params: list[Any] | None = None) -> Rows:
         if self._sock is None:
             raise NextSQLError("unavailable", "connection closed")
         if self._busy:
             raise NextSQLError("conflict", "connection is busy")
+
+        if self._stmt_cache is not None and params:
+            stmt = self._stmt_cache.get(sql)
+            if stmt is not None:
+                self._stmt_cache.move_to_end(sql)
+            else:
+                stmt = self.prepare(sql)
+                if len(self._stmt_cache) >= self.statement_cache_size:
+                    _, oldest = self._stmt_cache.popitem(last=False)
+                    try:
+                        oldest.close()
+                    except Exception:
+                        pass
+                self._stmt_cache[sql] = stmt
+            try:
+                return self.execute_prepared(stmt._id, params)
+            except Exception:
+                self._stmt_cache.pop(sql, None)
+                try:
+                    stmt.close()
+                except Exception:
+                    pass
+                raise
+
         self._busy = True
         try:
             self._write_frame(p.TYPE_QUERY, p.encode_query(sql, params or []))
@@ -429,6 +506,13 @@ class Connection:
             side.close()
 
     def close(self) -> None:
+        if self._stmt_cache:
+            for stmt in list(self._stmt_cache.values()):
+                try:
+                    stmt.close()
+                except Exception:
+                    pass
+            self._stmt_cache.clear()
         if self._sock is None:
             return
         try:

@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -305,6 +306,59 @@ func (s *Server) handleActivity(w http.ResponseWriter, r *http.Request, sess *se
 		out["warnings"] = b.Warnings
 	}
 	writeJSON(w, http.StatusOK, out)
+}
+
+type activityActionRequest struct {
+	Action string `json:"action"` // "kill_session" or "cancel_query"
+	ID     string `json:"id"`
+}
+
+func activityActionSQL(action, id string) (string, error) {
+	const op = "ops.activityAction"
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return "", nerr.New(nerr.InvalidArgument, op, "id must not be empty")
+	}
+	if _, err := strconv.ParseUint(id, 10, 64); err != nil {
+		return "", nerr.New(nerr.InvalidArgument, op, "id must be an unsigned integer")
+	}
+	switch action {
+	case "kill_session":
+		return fmt.Sprintf("KILL SESSION '%s'", id), nil
+	case "cancel_query":
+		return fmt.Sprintf("CANCEL QUERY '%s'", id), nil
+	default:
+		return "", nerr.New(nerr.InvalidArgument, op, "unknown action (must be 'kill_session' or 'cancel_query')")
+	}
+}
+
+func (s *Server) handleActivityAction(w http.ResponseWriter, r *http.Request, sess *session) {
+	var req activityActionRequest
+	if err := json.NewDecoder(io.LimitReader(r.Body, maxActionBody)).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	sql, err := activityActionSQL(req.Action, req.ID)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, userError(err))
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+	defer cancel()
+	res, err := sess.query(ctx, sql)
+	if err != nil {
+		status := http.StatusBadGateway
+		switch {
+		case nerr.HasCode(err, nerr.Unauthorized):
+			status = http.StatusForbidden
+		case nerr.HasCode(err, nerr.InvalidArgument), nerr.HasCode(err, nerr.Unavailable):
+			status = http.StatusConflict
+		}
+		writeError(w, status, userError(err))
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
 }
 
 // handleSecurity is the M4 Security read-model: users, roles, and grants

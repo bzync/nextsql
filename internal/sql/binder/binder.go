@@ -40,6 +40,9 @@ type (
 	CancelQuery struct {
 		ID string
 	}
+	KillSession struct {
+		ID string
+	}
 	CreateView struct {
 		Name    string
 		Columns []string
@@ -255,6 +258,7 @@ type (
 	}
 	Explain struct {
 		Analyze bool
+		Format  string
 		Stmt    Bound
 	}
 	Analyze struct {
@@ -271,6 +275,7 @@ func (CreateTableAs) bound()    {}
 func (ShowTasks) bound()        {}
 func (CancelTask) bound()       {}
 func (CancelQuery) bound()      {}
+func (KillSession) bound()      {}
 func (CreateView) bound()       {}
 func (DropView) bound()         {}
 func (Subscribe) bound()        {}
@@ -584,7 +589,11 @@ func bind(stmt ast.Stmt, lookup Lookup, nextID uint32, ctes map[string]*CTE) (Bo
 		if err != nil {
 			return nil, err
 		}
-		return Explain{Analyze: s.Analyze, Stmt: inner}, nil
+		f := s.Format
+		if f == "" {
+			f = "text"
+		}
+		return Explain{Analyze: s.Analyze, Format: f, Stmt: inner}, nil
 	case ast.Analyze:
 		if s.Table == "" {
 			return Analyze{}, nil

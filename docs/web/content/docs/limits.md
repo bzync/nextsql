@@ -31,7 +31,7 @@ A live install uses `nextsql setup --profile production` so `nextsqld` fail-clos
 
 ## Not in this version
 
-- General searchable field-level encryption (randomized `NSCE1.` and HKDF-separated RFC 5297 AES-SIV deterministic-equality `NSCE2.` are implemented across Go, JS/TS, Bun, and PHP drivers with key rotation, fuzz, PITR, and HA coverage)
+- General searchable field-level encryption (randomized `NSCE1.` and HKDF-separated RFC 5297 AES-SIV deterministic-equality `NSCE2.` are implemented across all official drivers [Go, JS/TS, Bun, PHP, Python, and Ruby] with key rotation, fuzz, PITR, and HA coverage)
 - Multi-primary writes (deployments strictly adhere to single-leader Raft consensus)
 - Native Windows (servers and tools run on Windows only inside WSL 2)
 

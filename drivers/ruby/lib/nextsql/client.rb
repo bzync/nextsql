@@ -10,6 +10,7 @@ require "ipaddr"
 
 require_relative "protocol"
 require_relative "errors"
+require_relative "field_encryption"
 
 module NextSQL
   # TLS options for a remote connection. +ca+ is PEM text/bytes; omit both
@@ -24,12 +25,14 @@ module NextSQL
   end
 
   Config = Struct.new(:address, :nodes, :database, :realm, :user, :password, :key, :key_version, :tls,
-                       :insecure_no_tls, :read_consistency, :max_staleness_ms, :timeout, keyword_init: true) do
+                       :insecure_no_tls, :read_consistency, :max_staleness_ms, :timeout, :field_keys,
+                       :statement_cache_size, keyword_init: true) do
     def initialize(**kwargs)
       defaults = {
         address: "", nodes: [], database: "", realm: "", user: "", password: "",
         key: nil, key_version: 1, tls: nil, insecure_no_tls: false,
-        read_consistency: Protocol::READ_STRONG, max_staleness_ms: 0, timeout: 60.0
+        read_consistency: Protocol::READ_STRONG, max_staleness_ms: 0, timeout: 60.0,
+        field_keys: nil, statement_cache_size: 50
       }
       super(defaults.merge(kwargs))
     end
@@ -95,6 +98,7 @@ module NextSQL
           raise Error.new("invalid_argument", "plaintext is only allowed on loopback")
         end
         raise Error.new("invalid_argument", "user is required") if cfg.user.to_s.empty?
+        raise Error.new("invalid_argument", "statement_cache_size must be >= 0") if cfg.statement_cache_size && cfg.statement_cache_size < 0
       end
 
       LEADING_WS_RE = /\A[ \t\r\n(]+/.freeze
@@ -175,6 +179,8 @@ module NextSQL
       @sock = self.class.dial(cfg)
       @secret = "".b
       @busy = false
+      @statement_cache_size = cfg.statement_cache_size || 0
+      @stmt_cache = {}
       begin
         handshake
         set_read_consistency(cfg.read_consistency, cfg.max_staleness_ms) if cfg.read_consistency != Protocol::READ_STRONG
@@ -203,6 +209,30 @@ module NextSQL
       st
     end
 
+    def encrypt_field(table, column, field_type, value)
+      raise Error.new("invalid_argument", "field_keys is required for client encryption") unless @cfg.field_keys
+
+      FieldEncryption.encrypt(@cfg.field_keys, @cfg.database.to_s.empty? ? "default" : @cfg.database, table, column, field_type, value)
+    end
+
+    def decrypt_field(table, column, expected_type, ciphertext)
+      raise Error.new("invalid_argument", "field_keys is required for client encryption") unless @cfg.field_keys
+
+      FieldEncryption.decrypt(@cfg.field_keys, @cfg.database.to_s.empty? ? "default" : @cfg.database, table, column, expected_type, ciphertext)
+    end
+
+    def encrypt_field_deterministic(table, column, field_type, value)
+      raise Error.new("invalid_argument", "field_keys is required for client encryption") unless @cfg.field_keys
+
+      FieldEncryption.encrypt_deterministic(@cfg.field_keys, @cfg.database.to_s.empty? ? "default" : @cfg.database, table, column, field_type, value)
+    end
+
+    def decrypt_field_deterministic(table, column, expected_type, ciphertext)
+      raise Error.new("invalid_argument", "field_keys is required for client encryption") unless @cfg.field_keys
+
+      FieldEncryption.decrypt_deterministic(@cfg.field_keys, @cfg.database.to_s.empty? ? "default" : @cfg.database, table, column, expected_type, ciphertext)
+    end
+
     def exec(sql, params = [])
       query(sql, params).collect
     end
@@ -210,6 +240,29 @@ module NextSQL
     def query(sql, params = [])
       raise Error.new("unavailable", "connection closed") if @sock.nil?
       raise Error.new("conflict", "connection is busy") if @busy
+
+      if !params.empty? && @statement_cache_size > 0
+        stmt_id = @stmt_cache.delete(sql)
+        if stmt_id.nil?
+          stmt_id = prepare_id(sql)
+          if @stmt_cache.size >= @statement_cache_size
+            _evicted_sql, evicted_id = @stmt_cache.shift
+            begin
+              close_statement(evicted_id)
+            rescue StandardError
+              nil
+            end
+          end
+        end
+        @stmt_cache[sql] = stmt_id
+
+        begin
+          return execute_prepared(stmt_id, params)
+        rescue StandardError
+          @stmt_cache.delete(sql)
+          raise
+        end
+      end
 
       @busy = true
       begin
@@ -241,7 +294,7 @@ module NextSQL
       end
     end
 
-    def prepare(sql)
+    def prepare_id(sql)
       raise Error.new("conflict", "connection is busy") if @busy
 
       write_frame(Protocol::TYPE_PREPARE, Protocol.u32bytes(sql.b, Protocol::MAX_SQL))
@@ -251,7 +304,11 @@ module NextSQL
 
       stmt_id = Protocol.u32(payload, 0)
       expect_ready
-      Statement.new(self, stmt_id)
+      stmt_id
+    end
+
+    def prepare(sql)
+      Statement.new(self, prepare_id(sql))
     end
 
     def execute_prepared(stmt_id, params)
@@ -299,6 +356,17 @@ module NextSQL
 
     def close
       return if @sock.nil?
+
+      if @stmt_cache
+        @stmt_cache.each_value do |stmt_id|
+          begin
+            close_statement(stmt_id)
+          rescue StandardError
+            nil
+          end
+        end
+        @stmt_cache.clear
+      end
 
       begin
         write_frame(Protocol::TYPE_TERMINATE, "")

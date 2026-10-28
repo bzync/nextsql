@@ -10,9 +10,50 @@ Multi-arch images (`linux/amd64`, `linux/arm64`) are published to [Docker Hub](h
 docker pull bzynchub/nextsql:0.0.6
 ```
 
-The Compose files below build locally (`build: .`). To run the published image instead, replace `build: .` with `image: bzynchub/nextsql:0.0.6`.
+The checked-in `docker-compose.yml` builds locally (`build: .`). To run the
+published image instead, replace `build: .` with `image: bzynchub/nextsql:0.0.6`.
+For a dedicated walkthrough of Compose with app integration, healthchecks, and
+HA clustering, see [Docker Compose](/docs/docker-compose).
 
 ## Single node
+
+The repository provides a single-node `docker-compose.yml`:
+
+```yaml
+services:
+  nextsql:
+    image: bzynchub/nextsql:0.0.6
+    restart: unless-stopped
+    ports:
+      - "7210:7210"
+    environment:
+      NEXTSQL_SERVER_USER: app
+      NEXTSQL_SERVER_PASSWORD_FILE: /run/bootstrap/app-password
+      NEXTSQL_TLS_CERT: /run/tls/server.crt
+      NEXTSQL_TLS_KEY: /run/tls/server.key
+    volumes:
+      - nextsql-data:/var/lib/nextsql
+      - nextsql-keys:/run/secrets
+    secrets:
+      - source: app_password
+        target: /run/bootstrap/app-password
+      - source: server_crt
+        target: /run/tls/server.crt
+      - source: server_key
+        target: /run/tls/server.key
+
+volumes:
+  nextsql-data:
+  nextsql-keys:
+
+secrets:
+  app_password:
+    file: ./secrets/app-password
+  server_crt:
+    file: ./secrets/server.crt
+  server_key:
+    file: ./secrets/server.key
+```
 
 Prepare a password file and a TLS certificate. The certificate must include the hostname clients use. For a local development certificate:
 
@@ -100,6 +141,8 @@ docker compose -f docker-compose.ha.yml exec node-a \
 `voters` should read `3` and `has_leader` should read `true`. Only **one** node ever runs `nextsql setup`; the other two restore from that node's backup so every replica shares identity and the root unlock key. See [High availability](/docs/ha).
 
 `docker compose -f docker-compose.ha.yml down -v` destroys all three databases, the shared root key, and the seed volume.
+
+For a complete guide covering application stacks, healthchecks, and HA failovers, see [Docker Compose](/docs/docker-compose).
 
 ## Podman
 

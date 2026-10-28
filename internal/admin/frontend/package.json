@@ -13,7 +13,7 @@
     "test:a11y": "npm run build && node test-accessibility.mjs"
   },
   "dependencies": {
-    "@bzync/rui": "0.0.9",
+    "@bzync/rui": "^0.0.14",
     "framer-motion": "13.2.0",
     "react": "19.2.8",
     "react-dom": "19.2.8"

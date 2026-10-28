@@ -1,10 +1,9 @@
-// Public TypeScript surface for the official NextSQL Bun driver.
+// Shared TypeScript surface for the official Node.js and Bun NextSQL drivers.
+// Keys and passwords are never accepted in a URL.
 //
-// Self-contained COPY of drivers/js/types.d.ts. It must NOT import from ../js:
-// the package tarball contains only the files in package.json "files", so a
-// parent-directory import resolves to nothing for an installed consumer. The
-// parity test in the driver test suite fails if this drifts from the canonical
-// shared file.
+// drivers/node/nextsql.d.ts and drivers/bun/nextsql.d.ts are published copies
+// of this file (npm packs only in-package files); their parity tests fail if
+// they drift from this canonical source.
 
 export interface TLSOptions {
   /** PEM or DER trust material. */
@@ -52,6 +51,8 @@ export interface Config {
   readConsistency?: ReadConsistencyMode;
   /** Bounded-read staleness window in milliseconds. 0 selects the server default. */
   maxStalenessMs?: number;
+  /** Maximum number of prepared statements to cache per connection LRU. Default: 0 (disabled on raw connect; 50 in pool). */
+  statementCacheSize?: number;
 }
 
 export interface FieldKey {
@@ -330,6 +331,35 @@ export declare const Type: {
 
 export declare function connect(cfg: Config): Promise<Conn>;
 export declare function connectCluster(cfg: Config): Promise<Cluster>;
+
+export interface PoolOptions {
+  /** Minimum number of idle connections to maintain. Default: 1 */
+  min?: number;
+  /** Maximum number of connections in the pool. Default: 10 */
+  max?: number;
+  /** Maximum milliseconds to wait for a connection before timing out. Default: 30000 (30s) */
+  timeoutMs?: number;
+  /** Maximum idle milliseconds before an unused connection is retired. Default: 300000 (5m) */
+  idleTimeoutMs?: number;
+  /** Maximum number of prepared statements to cache per connection LRU. Default: 50. 0 disables. */
+  statementCacheSize?: number;
+}
+
+export declare class Pool {
+  constructor(config: Config, options?: PoolOptions);
+  readonly size: number;
+  readonly idleCount: number;
+  readonly inUseCount: number;
+  readonly isClosed: boolean;
+  acquire(): Promise<Conn>;
+  release(conn: Conn): Promise<void>;
+  withConnection<T>(fn: (conn: Conn) => Promise<T>): Promise<T>;
+  exec(sql: string, params?: unknown[]): Promise<Result>;
+  query(sql: string, params?: unknown[]): Promise<Result>;
+  close(): Promise<void>;
+}
+
+export declare function createPool(config: Config, options?: PoolOptions): Pool;
 export declare function generateFieldKey(id: string): FieldKey;
 export declare function inspectField(ciphertext: string): { keyID: string; type: FieldTypeDescriptor };
 export declare function encryptField(provider: FieldKeyProvider, database: string, table: string, column: string, type: FieldTypeDescriptor, value: unknown): Promise<string | null>;

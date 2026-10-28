@@ -20,7 +20,15 @@ export function SiteHeader({
   const inDocs = pathname.startsWith("/docs");
   const inDownload = pathname.startsWith("/download");
   const [open, setOpen] = useState(false);
+  const [isMac, setIsMac] = useState(false);
   const menuOpen = onMenu ? !!menuOpenProp : open;
+
+  useEffect(() => {
+    setIsMac(
+      typeof navigator !== "undefined" &&
+        /(Mac|iPhone|iPod|iPad)/i.test(navigator.userAgent || navigator.platform),
+    );
+  }, []);
 
   const openMenu = () => {
     if (onMenu) onMenu();
@@ -92,13 +100,18 @@ export function SiteHeader({
                 type="button"
                 variant="outline"
                 size="sm"
-                className="ml-1 hidden w-[12.5rem] justify-start font-normal md:inline-flex"
+                className="ml-1 hidden h-9 w-56 flex-nowrap items-center justify-between whitespace-nowrap px-3 font-normal text-muted transition-colors hover:border-line-hover hover:text-foreground md:flex lg:w-64 [&>span]:flex [&>span]:min-w-0 [&>span]:flex-1"
                 onClick={onSearch}
                 aria-label="Search documentation"
                 aria-keyshortcuts="Control+K Meta+K /"
               >
-                <span className="flex-1 text-left">Search docs</span>
-                <Kbd keys={["⌘/Ctrl", "K"]} />
+                <span className="flex min-w-0 flex-1 flex-row flex-nowrap items-center justify-between gap-3">
+                  <span className="flex flex-row items-center gap-2 whitespace-nowrap text-sm">
+                    <SearchIcon className="h-4 w-4 shrink-0 opacity-70" />
+                    <span>Search docs</span>
+                  </span>
+                  <Kbd keys={[isMac ? "⌘" : "Ctrl", "K"]} size="sm" className="ml-auto shrink-0 flex-row" />
+                </span>
               </Button>
             </>
           ) : null}
@@ -193,9 +206,9 @@ function CloseIcon() {
   );
 }
 
-function SearchIcon() {
+function SearchIcon({ className }: { className?: string } = {}) {
   return (
-    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+    <svg className={className} width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
       <circle cx="11" cy="11" r="8" />
       <path d="m21 21-4.3-4.3" />
     </svg>

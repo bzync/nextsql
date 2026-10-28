@@ -13,7 +13,7 @@
     "lint": "eslint"
   },
   "dependencies": {
-    "@bzync/rui": "^0.0.10",
+    "@bzync/rui": "^0.0.14",
     "framer-motion": "^14.6.0",
     "next": "16.4.3",
     "react": "19.3.1",
@@ -33,6 +33,9 @@
   "overrides": {
     "serve": {
       "compression": "1.8.2"
+    },
+    "@bzync/rui": {
+      "framer-motion": "$framer-motion"
     }
   }
 }

@@ -29,6 +29,22 @@ $conn->close();
 ```
 
 Plaintext connections are allowed only on loopback (`'insecureNoTLS' => true`).
+For connection pooling across requests or workers, use `NextSQL\Pool`:
+
+```php
+$pool = new NextSQL\Pool($config, minSize: 2, maxSize: 10);
+
+// Run query directly (auto-checkout and return to pool):
+$users = $pool->query('SELECT id, name FROM users');
+
+// Or check out explicitly:
+$pool->withConnection(function (NextSQL\Client $conn) {
+    $conn->exec('INSERT INTO logs (msg) VALUES ($1)', ['started']);
+});
+
+$pool->close();
+```
+
 For an HA cluster with follower-read routing, use `NextSQL\Cluster::connect`.
 
 - Full driver docs: <https://nextsql.bzync.com/docs/drivers>

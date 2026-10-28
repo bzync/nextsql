@@ -50,7 +50,7 @@ Correctness, durability, security, integrity, availability, predictable latency,
 
 ## How to read these docs
 
-1. [Install](/docs/install), [Docker](/docs/docker), and the [quick start](/docs/quick-start) get a local instance running.
+1. [Install](/docs/install), [Docker](/docs/docker), [Docker Compose](/docs/docker-compose), and the [quick start](/docs/quick-start) get a local instance running.
 2. The SQL chapters cover the dialect, each data model, workflows, and transactions.
 3. Operate covers users, CLI, migrations, TLS, backup, export, HA, Admin, and benches.
 4. Drivers speak NSQL v1 from Go, Node, Bun, PHP, Python, and Ruby.

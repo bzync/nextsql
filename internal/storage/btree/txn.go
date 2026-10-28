@@ -754,6 +754,43 @@ func (tx *Txn) RangeVisible(start, end []byte, fn func(key, value []byte) error)
 	return tx.tree.rangeVisible(start, end, tx.snap(), fn)
 }
 
+// First locates the first visible entry in the tree (ascending key order).
+func (tx *Txn) First(fn func(key, value []byte) (bool, error)) error {
+	if tx == nil || tx.done {
+		return nerr.New(nerr.InvalidArgument, "btree.Txn.First", "transaction is not active")
+	}
+	tx.refreshIfRC()
+	return tx.tree.firstVisible(tx.snap(), fn)
+}
+
+// Last locates the last visible entry in the tree (descending from rightmost).
+func (tx *Txn) Last(fn func(key, value []byte) (bool, error)) error {
+	if tx == nil || tx.done {
+		return nerr.New(nerr.InvalidArgument, "btree.Txn.Last", "transaction is not active")
+	}
+	tx.refreshIfRC()
+	return tx.tree.lastVisible(tx.snap(), fn)
+}
+
+// FirstBounded locates the first visible entry in the tree within [start, end).
+func (tx *Txn) FirstBounded(start, end []byte, fn func(key, value []byte) (bool, error)) error {
+	if tx == nil || tx.done {
+		return nerr.New(nerr.InvalidArgument, "btree.Txn.FirstBounded", "transaction is not active")
+	}
+	tx.refreshIfRC()
+	return tx.tree.firstVisibleBounded(start, end, tx.snap(), fn)
+}
+
+// LastBounded locates the last visible entry in the tree within [start, end).
+func (tx *Txn) LastBounded(start, end []byte, fn func(key, value []byte) (bool, error)) error {
+	if tx == nil || tx.done {
+		return nerr.New(nerr.InvalidArgument, "btree.Txn.LastBounded", "transaction is not active")
+	}
+	tx.refreshIfRC()
+	return tx.tree.lastVisibleBounded(start, end, tx.snap(), fn)
+}
+
+
 // Count is Range that only returns the visible row count.
 func (tx *Txn) Count(start, end []byte) (int64, error) {
 	if tx == nil || tx.done {

@@ -137,7 +137,7 @@ The container image's `nextsql-entrypoint` (`internal/dockerentry`) drives
 `nextsql setup` on first start from environment variables
 (`NEXTSQL_PROFILE`, `NEXTSQL_PRESET`, `NEXTSQL_SERVER_USER`, …), writes the
 generated `nextsql.conf` into the data volume, and passes it to `nextsqld`
-with `--config` on every start — see `docs/docker.md`.
+with `--config` on every start — see `docs/docker.md` and `docs/docker-compose.md`.
 
 ### Exit codes
 

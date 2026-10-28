@@ -98,6 +98,9 @@ type (
 	CancelQuery struct {
 		ID string
 	}
+	KillSession struct {
+		ID string
+	}
 	CreateView struct {
 		Name    string
 		Columns []string
@@ -391,6 +394,7 @@ type (
 	Explain struct {
 		Input   Logical
 		Analyze bool
+		Format  string
 	}
 	Analyze struct {
 		Table *catalog.Table
@@ -444,6 +448,7 @@ func (DropResourceGroup) logical()   {}
 func (ShowTasks) logical()           {}
 func (CancelTask) logical()          {}
 func (CancelQuery) logical()         {}
+func (KillSession) logical()         {}
 func (CreateView) logical()          {}
 func (DropView) logical()            {}
 func (Subscribe) logical()           {}
@@ -630,6 +635,8 @@ func Plan(b binder.Bound) (Logical, error) {
 		return CancelTask{ID: s.ID}, nil
 	case binder.CancelQuery:
 		return CancelQuery{ID: s.ID}, nil
+	case binder.KillSession:
+		return KillSession{ID: s.ID}, nil
 	case binder.CreateView:
 		return CreateView{Name: s.Name, Columns: s.Columns, Query: s.Query, Replace: s.Replace}, nil
 	case binder.DropView:
@@ -875,7 +882,11 @@ func Plan(b binder.Bound) (Logical, error) {
 		if err != nil {
 			return nil, err
 		}
-		return Explain{Input: inner, Analyze: s.Analyze}, nil
+		f := s.Format
+		if f == "" {
+			f = "text"
+		}
+		return Explain{Input: inner, Analyze: s.Analyze, Format: f}, nil
 	case binder.Analyze:
 		return Analyze{Table: s.Table}, nil
 	case binder.Maintain:

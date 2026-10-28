@@ -105,6 +105,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/v1/overview", s.authed(s.handleOverview))
 	s.mux.HandleFunc("GET /api/v1/databases", s.authed(s.handleDatabases))
 	s.mux.HandleFunc("GET /api/v1/activity", s.authed(s.handleActivity))
+	s.mux.HandleFunc("POST /api/v1/activity/action", s.authed(s.handleActivityAction))
 	s.mux.HandleFunc("GET /api/v1/security", s.authed(s.handleSecurity))
 	s.mux.HandleFunc("POST /api/v1/security/action", s.authed(s.handleSecurityAction))
 	s.mux.HandleFunc("GET /api/v1/cluster", s.authed(s.handleCluster))

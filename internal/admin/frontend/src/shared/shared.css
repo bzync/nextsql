@@ -340,3 +340,22 @@ td.select-none.text-slate-400 {
 .dark td.select-none.text-slate-600 {
   color: var(--color-muted-foreground);
 }
+
+/* RUI 0.0.12 CodeBlock language badge (text-muted-foreground/70) on bg-surface-sunken
+   needs >= 4.5:1 contrast under WCAG 2.2 AA. Provide a compliant tone in light and dark. */
+[class*="text-muted-foreground/70"] {
+  color: #525866;
+}
+.dark [class*="text-muted-foreground/70"] {
+  color: #9da4b2;
+}
+
+/* WCAG 2.2 AA (Criterion 2.5.8 Target Size): ensure tag/select-option remove buttons
+   meet the 24x24px minimum touch target size. */
+button[aria-label^="Remove "] {
+  min-width: 24px;
+  min-height: 24px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}

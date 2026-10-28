@@ -385,6 +385,11 @@ func (s *Session) execAggregate(a *planner.Aggregate, input planner.Logical) ([]
 			return s.countStarResult(a, n)
 		}
 	}
+	if rows, ok, err := s.tryMinMaxIndex(a, input); err != nil {
+		return nil, err
+	} else if ok {
+		return rows, nil
+	}
 	if rows, err, ok := s.tryStreamHeapAggregate(a, input); ok {
 		return rows, err
 	}
@@ -427,6 +432,229 @@ func (s *Session) countStarResult(a *planner.Aggregate, n int64) ([][]types.Valu
 		raw[i] = v
 	}
 	return s.orderAgg([][]types.Value{raw}, a)
+}
+
+func findIndexColPos(cols []int, target int) int {
+	for i, c := range cols {
+		if c == target {
+			return i
+		}
+	}
+	return -1
+}
+
+func findMinMaxIndex(tab *catalog.Table, col int) (isPK bool, idx catalog.Index, ok bool) {
+	if len(tab.PK) > 0 && tab.PK[0] == col {
+		return true, catalog.Index{}, true
+	}
+	for i := range tab.Indexes {
+		ix := tab.Indexes[i]
+		if len(ix.Columns) > 0 && ix.Columns[0] == col && !ix.Spatial && ix.Predicate == nil && len(ix.Path) == 0 {
+			return false, ix, true
+		}
+	}
+	return false, catalog.Index{}, false
+}
+
+func (s *Session) tryMinMaxIndex(a *planner.Aggregate, input planner.Logical) ([][]types.Value, bool, error) {
+	if a == nil || len(a.Groups) > 0 || a.Having != nil || len(a.Specs) == 0 {
+		return nil, false, nil
+	}
+
+	var tab *catalog.Table
+	var isIndexScan bool
+	var idxScan planner.IndexScan
+
+	switch in := input.(type) {
+	case planner.Scan:
+		tab = in.Table
+	case planner.IndexScan:
+		if in.Spatial || in.Residual != nil {
+			return nil, false, nil
+		}
+		tab = in.Table
+		isIndexScan = true
+		idxScan = in
+	default:
+		return nil, false, nil
+	}
+
+	if tab == nil || tab.Partitioning != nil {
+		return nil, false, nil
+	}
+	var targetPos int
+	if isIndexScan {
+		cols := idxScan.Columns
+		if idxScan.PK {
+			cols = tab.PK
+		}
+		if len(cols) == 0 {
+			return nil, false, nil
+		}
+		targetPos = findIndexColPos(cols, a.Specs[0].Col)
+		if targetPos < 0 {
+			return nil, false, nil
+		}
+		// In a composite index, any column preceding targetPos must have an exact equality bound.
+		if len(idxScan.Low) < targetPos || len(idxScan.High) < targetPos || !idxScan.LowIncl || !idxScan.HighIncl {
+			return nil, false, nil
+		}
+		for j := 0; j < targetPos; j++ {
+			if idxScan.Low[j].Null || idxScan.High[j].Null {
+				return nil, false, nil
+			}
+			cmp, err := idxScan.Low[j].Cmp(idxScan.High[j])
+			if err != nil || cmp != 0 {
+				return nil, false, nil
+			}
+		}
+		if len(idxScan.Low) > targetPos+1 || len(idxScan.High) > targetPos+1 {
+			return nil, false, nil
+		}
+		for _, sp := range a.Specs {
+			if sp.Star || (sp.Fun != "min" && sp.Fun != "max") || sp.Col < 0 || sp.Col >= len(tab.Columns) {
+				return nil, false, nil
+			}
+			if findIndexColPos(cols, sp.Col) != targetPos {
+				return nil, false, nil
+			}
+		}
+	} else {
+		for _, sp := range a.Specs {
+			if sp.Star || (sp.Fun != "min" && sp.Fun != "max") || sp.Col < 0 || sp.Col >= len(tab.Columns) {
+				return nil, false, nil
+			}
+			if _, _, ok := findMinMaxIndex(tab, sp.Col); !ok {
+				return nil, false, nil
+			}
+		}
+	}
+
+	var start, end []byte
+	if isIndexScan {
+		var err error
+		start, end, err = encodeBounds(idxScan.Low, idxScan.High, idxScan.LowIncl, idxScan.HighIncl)
+		if err != nil {
+			return nil, false, err
+		}
+	}
+
+	raw := make([]types.Value, len(a.Specs))
+	for i, sp := range a.Specs {
+		var isPK bool
+		var idx catalog.Index
+		if isIndexScan {
+			isPK = idxScan.PK
+			if !isPK {
+				idx = indexByName(tab, idxScan.IndexName)
+			}
+		} else {
+			isPK, idx, _ = findMinMaxIndex(tab, sp.Col)
+		}
+		colType := tab.Columns[sp.Col].Type
+		var foundVal types.Value
+		var hasVal bool
+
+		if isPK {
+			heap, err := s.heapOf(tab)
+			if err != nil {
+				return nil, false, err
+			}
+			htx := s.x.use(heap)
+			if sp.Fun == "min" {
+				err = htx.FirstBounded(start, end, func(key, val []byte) (bool, error) {
+					row, err := s.decodeHeapRow(tab, val)
+					if err != nil {
+						return false, err
+					}
+					if sp.Col >= len(row) || row[sp.Col].Null {
+						return false, nil
+					}
+					foundVal = row[sp.Col]
+					hasVal = true
+					return true, nil
+				})
+			} else {
+				err = htx.LastBounded(start, end, func(key, val []byte) (bool, error) {
+					row, err := s.decodeHeapRow(tab, val)
+					if err != nil {
+						return false, err
+					}
+					if sp.Col >= len(row) || row[sp.Col].Null {
+						return false, nil
+					}
+					foundVal = row[sp.Col]
+					hasVal = true
+					return true, nil
+				})
+			}
+			if err != nil {
+				return nil, false, err
+			}
+		} else {
+			ixTree, err := s.indexOf(tab, idx)
+			if err != nil {
+				return nil, false, err
+			}
+			itx := s.x.use(ixTree)
+			keyTypes := make([]types.Type, 0, len(idx.Columns)+len(tab.PK))
+			for k := range idx.Columns {
+				keyTypes = append(keyTypes, idx.KeyType(tab, k))
+			}
+			if !idx.Unique {
+				keyTypes = append(keyTypes, pkTypeList(tab)...)
+			}
+			colKeyPos := targetPos
+			if !isIndexScan {
+				colKeyPos = 0
+			}
+			if sp.Fun == "min" {
+				err = itx.FirstBounded(start, end, func(key, val []byte) (bool, error) {
+					keyVals, err := types.DecodeKey(key, keyTypes)
+					if err != nil {
+						return false, err
+					}
+					if colKeyPos >= len(keyVals) || keyVals[colKeyPos].Null {
+						return false, nil
+					}
+					foundVal = keyVals[colKeyPos]
+					hasVal = true
+					return true, nil
+				})
+			} else {
+				err = itx.LastBounded(start, end, func(key, val []byte) (bool, error) {
+					keyVals, err := types.DecodeKey(key, keyTypes)
+					if err != nil {
+						return false, err
+					}
+					if colKeyPos >= len(keyVals) || keyVals[colKeyPos].Null {
+						return false, nil
+					}
+					foundVal = keyVals[colKeyPos]
+					hasVal = true
+					return true, nil
+				})
+			}
+			if err != nil {
+				return nil, false, err
+			}
+		}
+
+		if !hasVal {
+			raw[i] = types.Null(colType)
+		} else {
+			raw[i] = foundVal
+		}
+	}
+
+	if s.trace != nil {
+		s.trace.ActRows = 1
+		if s.trace.Workers == 0 {
+			s.trace.Workers = 1
+		}
+	}
+	res, err := s.orderAgg([][]types.Value{raw}, a)
+	return res, true, err
 }
 
 func (s *Session) tryCountScan(input planner.Logical) (int64, bool, error) {

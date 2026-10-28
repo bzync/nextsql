@@ -599,3 +599,196 @@ func (t *Tree) rangeCount(start, end []byte, snap txn.Snapshot, skipVis bool) (i
 	}
 	return n, nil
 }
+
+func (t *Tree) firstVisible(snap txn.Snapshot, fn func(key, value []byte) (bool, error)) error {
+	return t.firstVisibleBounded(nil, nil, snap, fn)
+}
+
+func (t *Tree) firstVisibleBounded(start, end []byte, snap txn.Snapshot, fn func(key, value []byte) (bool, error)) error {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	if start != nil {
+		if err := checkKey(start); err != nil {
+			return err
+		}
+		start = copyBytes(start)
+	}
+	if end != nil {
+		if err := checkKey(end); err != nil {
+			return err
+		}
+		end = copyBytes(end)
+	}
+	if start != nil && end != nil && compare(start, end) >= 0 {
+		return nil
+	}
+
+	var id format.PageID
+	var err error
+	if start == nil {
+		id, err = t.leftmostLeaf()
+	} else {
+		var path []format.PageID
+		path, err = t.descend(start)
+		if err == nil && len(path) > 0 {
+			id = path[len(path)-1]
+		}
+	}
+	if err != nil {
+		return err
+	}
+
+	for id != 0 {
+		h, err := t.pin(id)
+		if err != nil {
+			return err
+		}
+		if err := expectType(h.Page(), format.PageTypeBTreeLeaf); err != nil {
+			_ = release(h, false)
+			return err
+		}
+		ents, err := collectLeafViews(h.Page())
+		if err != nil {
+			_ = release(h, false)
+			return err
+		}
+		hdr, herr := readHeader(h.Page())
+		if herr != nil {
+			_ = release(h, false)
+			return herr
+		}
+		stopAll := false
+		for _, e := range ents {
+			if start != nil && compare(e.key, start) < 0 {
+				continue
+			}
+			if end != nil && compare(e.key, end) >= 0 {
+				stopAll = true
+				break
+			}
+			payload, vis, err := t.visiblePayload(e.value, snap)
+			if err != nil {
+				_ = release(h, false)
+				return err
+			}
+			if !vis {
+				continue
+			}
+			stop, cbErr := fn(copyBytes(e.key), payload)
+			if cbErr != nil {
+				_ = release(h, false)
+				return cbErr
+			}
+			if stop {
+				_ = release(h, false)
+				return nil
+			}
+		}
+		if err := release(h, false); err != nil {
+			return err
+		}
+		if stopAll {
+			return nil
+		}
+		id = hdr.next
+	}
+	return nil
+}
+
+func (t *Tree) lastVisible(snap txn.Snapshot, fn func(key, value []byte) (bool, error)) error {
+	return t.lastVisibleBounded(nil, nil, snap, fn)
+}
+
+func (t *Tree) lastVisibleBounded(start, end []byte, snap txn.Snapshot, fn func(key, value []byte) (bool, error)) error {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	if start != nil {
+		if err := checkKey(start); err != nil {
+			return err
+		}
+		start = copyBytes(start)
+	}
+	if end != nil {
+		if err := checkKey(end); err != nil {
+			return err
+		}
+		end = copyBytes(end)
+	}
+	if start != nil && end != nil && compare(start, end) >= 0 {
+		return nil
+	}
+
+	var id format.PageID
+	var err error
+	if end == nil {
+		id, err = t.rightmostLeaf()
+	} else {
+		var path []format.PageID
+		path, err = t.descend(end)
+		if err == nil && len(path) > 0 {
+			id = path[len(path)-1]
+		}
+	}
+	if err != nil {
+		return err
+	}
+
+	for id != 0 {
+		h, err := t.pin(id)
+		if err != nil {
+			return err
+		}
+		if err := expectType(h.Page(), format.PageTypeBTreeLeaf); err != nil {
+			_ = release(h, false)
+			return err
+		}
+		ents, err := collectLeafViews(h.Page())
+		if err != nil {
+			_ = release(h, false)
+			return err
+		}
+		hdr, herr := readHeader(h.Page())
+		if herr != nil {
+			_ = release(h, false)
+			return herr
+		}
+		stopAll := false
+		for i := len(ents) - 1; i >= 0; i-- {
+			e := ents[i]
+			if end != nil && compare(e.key, end) >= 0 {
+				continue
+			}
+			if start != nil && compare(e.key, start) < 0 {
+				stopAll = true
+				break
+			}
+			payload, vis, err := t.visiblePayload(e.value, snap)
+			if err != nil {
+				_ = release(h, false)
+				return err
+			}
+			if !vis {
+				continue
+			}
+			stop, cbErr := fn(copyBytes(e.key), payload)
+			if cbErr != nil {
+				_ = release(h, false)
+				return cbErr
+			}
+			if stop {
+				_ = release(h, false)
+				return nil
+			}
+		}
+		if err := release(h, false); err != nil {
+			return err
+		}
+		if stopAll {
+			return nil
+		}
+		id = hdr.prev
+	}
+	return nil
+}

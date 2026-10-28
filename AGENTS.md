@@ -116,12 +116,12 @@ audience + client binding, and non-interactive renewal. Embedded single-node
 mode is implemented on a separate bounded listener with issuer/verifier checks
 and a live native-user/ACL membership feed. Field-level client encryption has
 production-gated randomized and deterministic-equality SQL/catalog/server
-paths, helpers in the four drivers in P25 scope (Go/Node.js/TypeScript/Bun/PHP),
-tested PITR + HA/failover, and durable `FileFieldKeyring` rotation/revocation.
-RFC 7662 opaque-token introspection,
-bounded JIT principal provisioning, and OCSP are implemented as opt-in,
-fail-closed production controls and remain off by default. The Python and Ruby
-drivers added later do not yet expose field-encryption helpers. Password hashing has migrated
+paths, helpers in all six official drivers
+(Go/Node.js/TypeScript/Bun/PHP/Python/Ruby), tested PITR + HA/failover, and
+durable `FileFieldKeyring` rotation/revocation. RFC 7662 opaque-token
+introspection, bounded JIT principal provisioning, and OCSP are implemented
+as opt-in, fail-closed production controls and remain off by default. Password
+hashing has migrated
 to Argon2id (versioned records, PBKDF2 backward compatibility, transparent
 login rehash, DoS benchmarks). Audit hardening is implemented: `nextsql.audit`
 carries a versioned `NSAC` hash chain with optional `NSAK` Ed25519 signatures

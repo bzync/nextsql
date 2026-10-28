@@ -100,7 +100,7 @@ and `DecryptField(ctx, table, column, logicalType, resultValue)` after a bare
 projection. `MemoryFieldKeyring` is bounded convenience storage for keys already
 loaded from a secret manager; `FileFieldKeyring` is the durable rotation/
 revocation path. The field key is never sent to `nextsqld`. Equivalent helpers
-ship in Node.js/TypeScript, Bun, and PHP (not Python or Ruby). PITR and
+ship across all official drivers (Node.js/TypeScript, Bun, PHP, Python, and Ruby). PITR and
 HA/failover are tested. For an explicit `ENCRYPTED CLIENT DETERMINISTIC`
 column, use `EncryptFieldDeterministic` / `DecryptFieldDeterministic`; only bind
 the resulting `NSCE2` value to equality/inequality predicates. This mode leaks

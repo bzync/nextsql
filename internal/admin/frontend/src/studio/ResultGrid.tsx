@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type UIEvent } from "react";
-import { Badge, Button, Checkbox, EmptyState, Inline, Text } from "@bzync/rui";
+import { Badge, Button, Checkbox, EmptyState, Inline, Input, Text } from "@bzync/rui";
 import { SegmentedControl } from "../shared/SegmentedControl";
 import type { StudioResultSet } from "../ops/api";
 import { CellInspector, type InspectedCell, type JSONExplorerContext } from "./CellInspector";
@@ -92,6 +92,23 @@ export function ResultGrid({
   const [view, setView] = useState<"table" | "plan" | "profile" | "compare">("plan");
   const [profile, setProfile] = useState<ExplainProfile | null>(null);
   const [comparisonPlan, setComparisonPlan] = useState<ExplainPlanSnapshot | null>(null);
+  const [filterText, setFilterText] = useState("");
+  const [sortCol, setSortCol] = useState<number | null>(null);
+  const [sortDir, setSortDir] = useState<"asc" | "desc">("asc");
+
+  const handleSort = (colIndex: number) => {
+    if (sortCol === colIndex) {
+      if (sortDir === "asc") {
+        setSortDir("desc");
+      } else {
+        setSortCol(null);
+        setSortDir("asc");
+      }
+    } else {
+      setSortCol(colIndex);
+      setSortDir("asc");
+    }
+  };
 
   const [stagedChanges, setStagedChanges] = useState<StagedChanges>(() =>
     createEmptyStagedChanges(editableTable ?? "", pkColumns, columnTypes)
@@ -139,6 +156,9 @@ export function ResultGrid({
     setComparisonPlan(null);
     setActionStatus(null);
     setActionError(null);
+    setFilterText("");
+    setSortCol(null);
+    setSortDir("asc");
     setStagedChanges(createEmptyStagedChanges(editableTable ?? "", pkColumns, columnTypes));
   }, [result.rows]);
 
@@ -271,12 +291,40 @@ export function ResultGrid({
     setReviewModalOpen(false);
   };
 
+  const processedRows = useMemo(() => {
+    let list = result.rows.map((row, originalIndex) => ({ row, originalIndex }));
+    const q = filterText.trim().toLowerCase();
+    if (q) {
+      list = list.filter(({ row }) =>
+        row.some((cell) => cell !== null && cell.toLowerCase().includes(q))
+      );
+    }
+    if (sortCol !== null && sortCol < result.columns.length) {
+      const col = sortCol;
+      const factor = sortDir === "asc" ? 1 : -1;
+      list.sort((a, b) => {
+        const valA = a.row[col];
+        const valB = b.row[col];
+        if (valA === valB) return 0;
+        if (valA === null) return factor;
+        if (valB === null) return -factor;
+        const numA = Number(valA);
+        const numB = Number(valB);
+        if (!isNaN(numA) && !isNaN(numB) && valA.trim() !== "" && valB.trim() !== "") {
+          return (numA - numB) * factor;
+        }
+        return valA.localeCompare(valB) * factor;
+      });
+    }
+    return list;
+  }, [result.rows, filterText, sortCol, sortDir, result.columns.length]);
+
   const window = useMemo(() => {
     const visible = Math.ceil(viewportHeight / ROW_HEIGHT);
     const start = Math.max(0, Math.floor(scrollTop / ROW_HEIGHT) - OVERSCAN_ROWS);
-    const end = Math.min(result.rows.length, start + visible + OVERSCAN_ROWS * 2);
-    return { start, end, rows: result.rows.slice(start, end) };
-  }, [result.rows, scrollTop, viewportHeight]);
+    const end = Math.min(processedRows.length, start + visible + OVERSCAN_ROWS * 2);
+    return { start, end, items: processedRows.slice(start, end) };
+  }, [processedRows, scrollTop, viewportHeight]);
 
   const onScroll = (event: UIEvent<HTMLDivElement>) => setScrollTop(event.currentTarget.scrollTop);
   const actionIndexes = selectedRows.size ? selectedRows : undefined;
@@ -410,7 +458,7 @@ export function ResultGrid({
   }
 
   const topSpacer = window.start * ROW_HEIGHT;
-  const bottomSpacer = (result.rows.length - window.end) * ROW_HEIGHT;
+  const bottomSpacer = Math.max(0, (processedRows.length - window.end) * ROW_HEIGHT);
   const showRank = rankContext != null;
   const rankLabel = rankContext?.kind === "hybrid" ? "Hybrid rank" : "BM25 rank";
   const columnSpan = result.columns.length + (tools ? 1 : 0) + (showRank ? 1 : 0);
@@ -421,6 +469,14 @@ export function ResultGrid({
       {tools ? (
         <div className="nss-result-tools" aria-label="Result actions">
           <Inline gap="xs" align="center" wrap>
+            <Input
+              size="sm"
+              placeholder="Filter rows…"
+              value={filterText}
+              onChange={(e) => setFilterText(e.target.value)}
+              aria-label="Filter result rows"
+              style={{ maxWidth: 160 }}
+            />
             <Button variant="outline" size="sm" disabled={disabled || !activeCell} onClick={() => void copyCell()}>Copy cell</Button>
             <Button variant="outline" size="sm" disabled={disabled} onClick={() => void copyRows()}>
               {selectedRows.size ? "Copy selected" : "Copy all rows"}
@@ -465,7 +521,9 @@ export function ResultGrid({
           </Inline>
           <Inline gap="xs" align="center" wrap>
             <Text size="sm" variant="muted">
-              {selectedRows.size
+              {filterText.trim()
+                ? `${processedRows.length.toLocaleString()} of ${result.rows.length.toLocaleString()} matching`
+                : selectedRows.size
                 ? `${selectedRows.size.toLocaleString()} of ${result.rows.length.toLocaleString()} selected`
                 : `Actions use all ${result.rows.length.toLocaleString()} loaded rows`}
             </Text>
@@ -574,7 +632,15 @@ export function ResultGrid({
         </>
       ) : null}
       {explainNodes && explainNodes.length && view === "plan" ? (
-        <ExplainTree nodes={explainNodes} analyzed={explainAnalyzed(explainNodes)} />
+        <ExplainTree
+          nodes={explainNodes}
+          analyzed={explainAnalyzed(explainNodes)}
+          rawPlan={
+            result.columns.length === 1 && result.columns[0] === "plan" && result.rows.length >= 1
+              ? (result.rows[0][0] ?? undefined)
+              : undefined
+          }
+        />
       ) : view === "profile" && profile ? (
         <ExplainProfiler profile={profile} />
       ) : view === "compare" && planBaseline && comparisonPlan ? (
@@ -592,7 +658,7 @@ export function ResultGrid({
         <table
           className="nss-virtual-table"
           aria-label={label}
-          aria-rowcount={result.rows.length + 1}
+          aria-rowcount={processedRows.length + 1}
           aria-colcount={columnSpan}
         >
           <thead>
@@ -615,14 +681,25 @@ export function ResultGrid({
                 <span className="nss-column-type">ORDER</span>
               </th>
             ) : null}
-            {result.columns.map((column, index) => (
-              <th key={`${column}-${index}`} scope="col">
-                <span className="nss-column-heading">{column}</span>
-                {result.column_types[index] ? (
-                  <span className="nss-column-type">{result.column_types[index]}</span>
-                ) : null}
-              </th>
-            ))}
+            {result.columns.map((column, index) => {
+              const isSorted = sortCol === index;
+              const sortSymbol = isSorted ? (sortDir === "asc" ? " ▲" : " ▼") : "";
+              return (
+                <th
+                  key={`${column}-${index}`}
+                  scope="col"
+                  onClick={() => handleSort(index)}
+                  style={{ cursor: "pointer", userSelect: "none" }}
+                  title={`Sort by ${column} (${isSorted && sortDir === "asc" ? "descending" : "ascending"})`}
+                  aria-sort={isSorted ? (sortDir === "asc" ? "ascending" : "descending") : "none"}
+                >
+                  <span className="nss-column-heading">{column}{sortSymbol}</span>
+                  {result.column_types[index] ? (
+                    <span className="nss-column-type">{result.column_types[index]}</span>
+                  ) : null}
+                </th>
+              );
+            })}
           </tr>
           </thead>
           <tbody>
@@ -631,8 +708,8 @@ export function ResultGrid({
               <td colSpan={columnSpan} style={{ height: topSpacer }} />
             </tr>
           ) : null}
-          {window.rows.map((row, rowIndex) => {
-            const absoluteIndex = window.start + rowIndex;
+          {window.items.map(({ row, originalIndex }) => {
+            const absoluteIndex = originalIndex;
             const rowPK = isEditable ? extractRowPK(row, result.columns, pkColumns) : {};
             const rowKey = isEditable ? makeRowKey(rowPK) : "";
             const isRowDeleted = Boolean(isEditable && stagedChanges.deletes[rowKey]);

@@ -185,6 +185,7 @@ const (
 	KwTask
 	KwTasks
 	KwCancel
+	KwKill
 	KwSubscribe
 	KwEncrypted
 	KwClient
@@ -229,7 +230,7 @@ func (k Kind) String() string {
 
 var kindNames = map[Kind]string{
 	EOF: "EOF", Ident: "ident", String: "string", Number: "number", Param: "param", HexLit: "hex literal",
-	KwUnnest: "UNNEST", KwLike: "LIKE",
+	KwUnnest: "UNNEST", KwLike: "LIKE", KwKill: "KILL",
 	LParen: "(", RParen: ")", LBracket: "[", RBracket: "]", Comma: ",", Dot: ".", Star: "*", Eq: "=", Neq: "<>",
 	Lt: "<", Gt: ">", Lte: "<=", Gte: ">=", Plus: "+", Minus: "-", Slash: "/", Semi: ";",
 }
@@ -551,7 +552,7 @@ var keywords = map[string]Kind{
 	"upsert": KwUpsert, "returning": KwReturning,
 	"workflow": KwWorkflow, "run": KwRun, "trigger": KwTrigger,
 	"before": KwBefore, "after": KwAfter, "each": KwEach,
-	"show": KwShow, "task": KwTask, "tasks": KwTasks, "cancel": KwCancel, "subscribe": KwSubscribe,
+	"show": KwShow, "task": KwTask, "tasks": KwTasks, "cancel": KwCancel, "kill": KwKill, "subscribe": KwSubscribe,
 	"encrypted": KwEncrypted, "client": KwClient, "deterministic": KwDeterministic,
 	"transfer": KwTransfer, "leader": KwLeader,
 	"resource":    KwResource,

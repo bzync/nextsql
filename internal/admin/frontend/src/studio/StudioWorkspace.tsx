@@ -113,6 +113,7 @@ import {
   parseSavedQueries,
   parseSavedQueriesExport,
   downloadSavedQueries,
+  downloadText,
   mergeSavedQueries,
   MAX_SAVED_QUERY_IMPORT_BYTES,
   MAX_SQL_SUGGESTIONS,
@@ -129,6 +130,10 @@ import {
   removeSavedQuery,
   replaceAllMatches,
   savedQueryStorageKey,
+  queryHistoryStorageKey,
+  parseQueryHistory,
+  serializeQueryHistory,
+  type StudioHistoryEntry,
   serializeEditorDrafts,
   serializeSavedQueries,
   serializeStudioLayout,
@@ -276,22 +281,9 @@ function getBadgeLabel(kind: SQLSuggestion["kind"]): string {
   }
 }
 
-// Query history is an in-memory, per-session record only: it is never
-// written to localStorage/sessionStorage or sent anywhere, and disappears on
-// reload or navigation away from Studio — the privacy control is "does not
-// persist," backed by an explicit Clear action and a bounded size so a
-// session of large statements can't grow this without limit.
-type StudioHistoryEntry = {
-  id: string;
-  sql: string;
-  ranAt: number;
-  isSelection: boolean;
-  outcome: "success" | "canceled" | "error";
-  rowCount?: number;
-  elapsedMs?: number;
-  error?: string;
-};
-
+// Query history is persisted to localStorage per connection scope (bounded
+// to 50 entries and 2MB) so reloading the browser or switching tabs does not
+// lose recent queries, backed by an explicit Clear action.
 const MAX_HISTORY_ENTRIES = 50;
 const MAX_HISTORY_BYTES = 2 << 20;
 
@@ -590,8 +582,37 @@ export function StudioWorkspace({
   const [pendingScript, setPendingScript] = useState<{ tabId: string; statements: string[]; flagged: { index: number; reasons: string[] }[] } | null>(null);
   const [splittingScript, setSplittingScript] = useState(false);
   const [hasSelection, setHasSelection] = useState(false);
-  const [history, setHistory] = useState<StudioHistoryEntry[]>([]);
+  const historyKey = queryHistoryStorageKey(scope, who.database ?? "", who.user ?? "");
+  const [history, setHistory] = useState<StudioHistoryEntry[]>(() => {
+    try {
+      return parseQueryHistory(window.localStorage.getItem(historyKey));
+    } catch {
+      return [];
+    }
+  });
   const [historyOpen, setHistoryOpen] = useState(false);
+  const [historyFilter, setHistoryFilter] = useState("");
+
+  useEffect(() => {
+    try {
+      if (history.length > 0) {
+        window.localStorage.setItem(historyKey, serializeQueryHistory(history));
+      } else {
+        window.localStorage.removeItem(historyKey);
+      }
+    } catch {
+      /* quota or disabled storage */
+    }
+  }, [history, historyKey]);
+
+  const filteredHistory = useMemo(() => {
+    const q = historyFilter.trim().toLowerCase();
+    if (!q) return history;
+    return history.filter((item) =>
+      item.sql.toLowerCase().includes(q) ||
+      (item.error ? item.error.toLowerCase().includes(q) : false),
+    );
+  }, [history, historyFilter]);
   const [grantBuilderOpen, setGrantBuilderOpen] = useState(false);
   const [grantPrefill, setGrantPrefill] = useState<GrantBuilderState | null>(null);
   const [fullTextExplorerOpen, setFullTextExplorerOpen] = useState(false);
@@ -701,6 +722,35 @@ export function StudioWorkspace({
       return next;
     });
   }, [runningTabId]);
+
+  const [editingTabId, setEditingTabId] = useState<string | null>(null);
+  const [editingTitle, setEditingTitle] = useState("");
+
+  const startRenameTab = useCallback((id: string, currentTitle: string) => {
+    setEditingTabId(id);
+    setEditingTitle(currentTitle);
+  }, []);
+
+  const finishRenameTab = useCallback(() => {
+    if (!editingTabId) return;
+    const trimmed = editingTitle.trim();
+    if (trimmed) {
+      updateTab(editingTabId, { title: trimmed });
+    }
+    setEditingTabId(null);
+    setEditingTitle("");
+  }, [editingTabId, editingTitle, updateTab]);
+
+  const duplicateTab = useCallback((id: string) => {
+    setTabs((current) => {
+      if (current.length >= MAX_STUDIO_TABS) return current;
+      const target = current.find((t) => t.id === id);
+      if (!target) return current;
+      const tab = newTab(queryID(), `${target.title} (Copy)`, target.sql);
+      setActiveTabId(tab.id);
+      return [...current, tab];
+    });
+  }, []);
 
   // Debounced mirror of the tab buffers to localStorage. Best-effort: a
   // private window, blocked site data, or a quota error just means no crash
@@ -1853,7 +1903,20 @@ export function StudioWorkspace({
     setHistoryOpen(false);
   }, []);
 
-  const clearHistory = useCallback(() => setHistory([]), []);
+  const runFromHistory = useCallback((entry: StudioHistoryEntry) => {
+    updateTab(activeTabId, { sql: entry.sql });
+    setHistoryOpen(false);
+    void executeQuery(activeTabId, entry.sql, false);
+  }, [activeTabId, executeQuery, updateTab]);
+
+  const clearHistory = useCallback(() => {
+    setHistory([]);
+    try {
+      window.localStorage.removeItem(historyKey);
+    } catch {
+      /* best effort */
+    }
+  }, [historyKey]);
 
   // selectedSQL reads the live textarea selection directly (it survives
   // losing focus, e.g. to the Run button itself) rather than trusting
@@ -2098,7 +2161,6 @@ export function StudioWorkspace({
     const textarea = editorHost.current?.querySelector("textarea");
     const match = matches[index];
     if (!textarea || !match) return;
-    textarea.focus();
     textarea.setSelectionRange(match.start, match.end);
   }, []);
 
@@ -2272,6 +2334,8 @@ export function StudioWorkspace({
     const busy = running || checkingSQL || splittingScript;
     return [
       { id: "new-tab", label: "New query tab", keywords: "editor add", run: addTab },
+      { id: "duplicate-tab", label: "Duplicate current query tab", keywords: "editor clone copy tab", disabled: tabs.length >= MAX_STUDIO_TABS, run: () => duplicateTab(activeTabId) },
+      { id: "rename-tab", label: "Rename current query tab…", keywords: "editor title tab rename", run: () => { const active = tabs.find((t) => t.id === activeTabId); if (active) startRenameTab(active.id, active.title); } },
       { id: "run", label: "Run query", hint: "Ctrl+Enter", keywords: "execute sql", disabled: busy || (!hasSelection && !sql.trim()), run: () => void requestRun() },
       { id: "run-script", label: "Run script", keywords: "execute all statements", disabled: busy || hasSelection || !sql.trim(), run: () => void requestRunScript() },
       { id: "cancel", label: "Cancel running query", keywords: "stop abort", disabled: !running || cancelRequested, run: () => void cancelQuery() },
@@ -2308,7 +2372,7 @@ export function StudioWorkspace({
     ];
   }, [
     running, checkingSQL, splittingScript, hasSelection, sql, cancelRequested,
-    addTab, requestRun, requestRunScript, cancelQuery, openSuggest, formatBuffer, openObjectSearch,
+    addTab, duplicateTab, startRenameTab, tabs, activeTabId, requestRun, requestRunScript, cancelQuery, openSuggest, formatBuffer, openObjectSearch,
     openSecurityExplorer, openActivityExplorer, openAuditExplorer, openWorkflowExplorer,
     openMigrationExplorer, explorerVisible, explorerTab, inspectorVisible, resetLayout, onRequestSwitchServer,
   ]);
@@ -2834,35 +2898,64 @@ export function StudioWorkspace({
                         <Text size="sm" weight="medium">Query history</Text>
                         <Button variant="ghost" size="sm" onClick={clearHistory} disabled={!history.length}>Clear</Button>
                       </Inline>
-                      <Text size="xs" variant="muted">This session only — not saved between reloads.</Text>
-                      {history.length ? (
+                      <Text size="xs" variant="muted">Persistent across sessions · Bounded to 50 statements.</Text>
+                      {history.length > 0 ? (
+                        <Input
+                          id="studio-history-filter"
+                          size="sm"
+                          placeholder="Search statements…"
+                          value={historyFilter}
+                          onChange={(e) => setHistoryFilter(e.target.value)}
+                        />
+                      ) : null}
+                      {filteredHistory.length ? (
                         <ul className="nss-history-list" aria-label="Recent statements">
-                          {history.map((entry) => (
-                            <li key={entry.id}>
-                              <button
-                                type="button"
-                                className="nss-history-item"
-                                onClick={() => loadFromHistory(entry)}
-                                title={entry.sql}
-                              >
-                                <span className="nss-history-sql">{historyPreview(entry.sql)}</span>
-                                <Inline gap="xs" align="center">
-                                  <Badge
+                          {filteredHistory.map((entry) => (
+                            <li key={entry.id} className="nss-history-entry-row">
+                              <div className="nss-history-item-wrap">
+                                <button
+                                  type="button"
+                                  className="nss-history-item"
+                                  onClick={() => loadFromHistory(entry)}
+                                  title="Load into editor"
+                                >
+                                  <span className="nss-history-sql">{historyPreview(entry.sql)}</span>
+                                  <Inline gap="xs" align="center">
+                                    <Badge
+                                      size="sm"
+                                      variant={entry.outcome === "success" ? "success" : entry.outcome === "error" ? "error" : "muted"}
+                                    >
+                                      {entry.outcome}
+                                    </Badge>
+                                    {entry.outcome === "success" ? (
+                                      <Text as="span" size="xs" variant="muted">
+                                        {(entry.rowCount ?? 0).toLocaleString()} rows · {(entry.elapsedMs ?? 0).toLocaleString()} ms
+                                      </Text>
+                                    ) : entry.error ? (
+                                      <Text as="span" size="xs" variant="muted" className="nss-history-error-snippet">
+                                        {entry.error.slice(0, 32)}
+                                      </Text>
+                                    ) : null}
+                                  </Inline>
+                                </button>
+                                <Inline gap="xs" align="center" className="nss-history-actions">
+                                  <CopyButton value={entry.sql} label="Copy" size="sm" />
+                                  <Button
+                                    variant="ghost"
                                     size="sm"
-                                    variant={entry.outcome === "success" ? "success" : entry.outcome === "error" ? "error" : "muted"}
+                                    icon={<Icon name="play" size={14} />}
+                                    title="Run statement again"
+                                    onClick={() => runFromHistory(entry)}
                                   >
-                                    {entry.outcome}
-                                  </Badge>
-                                  {entry.outcome === "success" ? (
-                                    <Text as="span" size="xs" variant="muted">
-                                      {(entry.rowCount ?? 0).toLocaleString()} rows · {(entry.elapsedMs ?? 0).toLocaleString()} ms
-                                    </Text>
-                                  ) : null}
+                                    Run
+                                  </Button>
                                 </Inline>
-                              </button>
+                              </div>
                             </li>
                           ))}
                         </ul>
+                      ) : history.length ? (
+                        <Text size="sm" variant="muted">No matching queries found.</Text>
                       ) : (
                         <Text size="sm" variant="muted">No queries run yet this session.</Text>
                       )}
@@ -2876,15 +2969,37 @@ export function StudioWorkspace({
             <div className="nss-tab-strip" aria-label="Query tabs">
               {tabs.map((tab) => (
                 <div key={tab.id} className="nss-tab">
-                  <button
-                    type="button"
-                    className="nss-tab-button"
-                    aria-pressed={tab.id === activeTabId}
-                    onClick={() => setActiveTabId(tab.id)}
-                  >
-                    {tab.id === runningTabId ? <Spinner size="xs" /> : null}
-                    <span>{tab.title}</span>
-                  </button>
+                  {editingTabId === tab.id ? (
+                    <input
+                      type="text"
+                      className="nss-tab-rename-input"
+                      value={editingTitle}
+                      aria-label="Edit tab title"
+                      autoFocus
+                      maxLength={64}
+                      onChange={(e) => setEditingTitle(e.target.value)}
+                      onBlur={finishRenameTab}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") finishRenameTab();
+                        if (e.key === "Escape") {
+                          setEditingTabId(null);
+                          setEditingTitle("");
+                        }
+                      }}
+                    />
+                  ) : (
+                    <button
+                      type="button"
+                      className="nss-tab-button"
+                      aria-pressed={tab.id === activeTabId}
+                      onClick={() => setActiveTabId(tab.id)}
+                      onDoubleClick={() => startRenameTab(tab.id, tab.title)}
+                      title={`${tab.title} (double-click to rename)`}
+                    >
+                      {tab.id === runningTabId ? <Spinner size="xs" /> : null}
+                      <span>{tab.title}</span>
+                    </button>
+                  )}
                   {tabs.length > 1 ? (
                     <button
                       type="button"
@@ -3257,6 +3372,21 @@ export function StudioWorkspace({
               {selectedTable ? (
                 <Button variant="outline" size="sm" icon={<Icon name="play" size={14} />} onClick={insertTableQuery}>Insert SELECT</Button>
               ) : null}
+              {selectedTable && detail && tableDDLScript(detail) ? (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  icon={<Icon name="download" size={14} />}
+                  onClick={() => {
+                    const ddl = tableDDLScript(detail);
+                    if (ddl) {
+                      downloadText(`${detail.name}.sql`, ddl, "application/sql;charset=utf-8");
+                    }
+                  }}
+                >
+                  Export DDL
+                </Button>
+              ) : null}
               <Button variant="ghost" size="sm" onClick={() => setInspectorVisible(false)}>Hide inspector</Button>
             </Inline>
           </CardHeader>
@@ -3374,6 +3504,16 @@ export function StudioWorkspace({
                         <pre className="nss-ddl-block" tabIndex={0} aria-label={`${detail.name} DDL`}>{ddlScript}</pre>
                         <Inline gap="xs" wrap>
                           <CopyButton value={ddlScript} label="Copy DDL" size="sm" />
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            icon={<Icon name="download" size={14} />}
+                            onClick={() => {
+                              downloadText(`${detail.name}.sql`, ddlScript, "application/sql;charset=utf-8");
+                            }}
+                          >
+                            Export DDL
+                          </Button>
                           <Button variant="outline" size="sm" onClick={() => { setSQL(ddlScript); }}>
                             Open in editor
                           </Button>

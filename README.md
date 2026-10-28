@@ -58,7 +58,7 @@ go install github.com/bzync/nextsql/cmd/nextsql@latest
 go install github.com/bzync/nextsql/cmd/nextsqld@latest
 ```
 
-Pre-built Linux installers (`.deb`, `.tar.gz`, `.run`) are on the [v0.0.6 release](https://github.com/bzync/nextsql/releases/tag/v0.0.6). Native Windows is not supported; on Windows, run NextSQL inside [WSL 2](docs/install.md#windows-wsl-2).
+Pre-built Linux installers (`.deb`, `.tar.gz`, `.run`) are on the [v0.0.6 release](https://github.com/bzync/nextsql/releases/tag/v0.0.6). For containers and multi-service orchestration, see the [Docker](docs/docker.md) and [Docker Compose](docs/docker-compose.md) guides. Native Windows is not supported; on Windows, run NextSQL inside [WSL 2](docs/install.md#windows-wsl-2).
 
 ### 2. Initialize and Run
 
@@ -80,6 +80,7 @@ nextsql exec --addr 127.0.0.1:7210 --user app --password-file /tmp/nextsql.pw --
 ## Documentation
 
 - **[Usage manual](USAGE.md)** — install, SQL, drivers, backups, and operations
+- **[Docker guide](docs/docker.md)** and **[Docker Compose guide](docs/docker-compose.md)** — container deployment and orchestration
 - **[Changelog](CHANGELOG.md)** — what shipped in 0.0.6
 - **[Support](SUPPORT.md)** and **[Security](SECURITY.md)**
 - **[docs/](docs/)** — storage, WAL, MVCC, optimizer, security, and HA

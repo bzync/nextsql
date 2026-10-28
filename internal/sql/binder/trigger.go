@@ -53,6 +53,15 @@ func BindAutomation(stmt ast.Stmt, tables Lookup, workflows WorkflowLookup, work
 			return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "invalid query id")
 		}
 		return CancelQuery{ID: s.ID}, nil
+	case ast.KillSession:
+		// A session id is the decimal counter system.sessions publishes.
+		if s.ID == "" || len(s.ID) > 20 {
+			return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "invalid session id")
+		}
+		if _, err := strconv.ParseUint(s.ID, 10, 64); err != nil {
+			return nil, nerr.New(nerr.InvalidArgument, "sql.binder", "invalid session id")
+		}
+		return KillSession{ID: s.ID}, nil
 	}
 	if bound, handled, err := bindSchedule(stmt, workflows, schedules, nextID, owner); handled {
 		return bound, err

@@ -185,7 +185,7 @@ func Optimize(req Request) (Outcome, error) {
 		if err != nil {
 			return Outcome{}, err
 		}
-		return Outcome{Plan: planner.Explain{Input: inner.Plan, Analyze: ex.Analyze}, Trace: inner.Trace}, nil
+		return Outcome{Plan: planner.Explain{Input: inner.Plan, Analyze: ex.Analyze, Format: ex.Format}, Trace: inner.Trace}, nil
 	}
 	if _, ok := req.Plan.(planner.Analyze); ok {
 		return Outcome{Plan: req.Plan, Trace: &Node{Op: "Analyze"}}, nil

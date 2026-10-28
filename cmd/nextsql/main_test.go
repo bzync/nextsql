@@ -590,6 +590,93 @@ func TestExecSQLTextDashCWinsOverPositional(t *testing.T) {
 	}
 }
 
+func TestPrintAlignedTable(t *testing.T) {
+	var buf strings.Builder
+	res := &nextsql.Result{
+		Columns: []string{"id", "username", "role"},
+		Rows: [][]types.Value{
+			{types.IntValue(types.KindInt64, 1), types.StringValue("admin"), types.StringValue("superuser")},
+			{types.IntValue(types.KindInt64, 2), types.StringValue("alice"), types.StringValue("editor")},
+		},
+		Affected: 0,
+	}
+	printAlignedTableTo(&buf, res)
+	out := buf.String()
+	if !strings.Contains(out, "+----+----------+-----------+") {
+		t.Fatalf("missing border in table: %s", out)
+	}
+	if !strings.Contains(out, "| id | username | role      |") {
+		t.Fatalf("missing header in table: %s", out)
+	}
+	if !strings.Contains(out, "| 1  | admin    | superuser |") {
+		t.Fatalf("missing row in table: %s", out)
+	}
+	if !strings.Contains(out, "(2 rows)") {
+		t.Fatalf("missing row count in table: %s", out)
+	}
+}
+
+func TestPrintExpandedResult(t *testing.T) {
+	var buf strings.Builder
+	res := &nextsql.Result{
+		Columns: []string{"id", "title"},
+		Rows: [][]types.Value{
+			{types.IntValue(types.KindInt64, 100), types.StringValue("First post")},
+			{types.IntValue(types.KindInt64, 101), types.StringValue("Second post")},
+		},
+		Affected: 2,
+	}
+	printExpandedResultTo(&buf, res)
+	out := buf.String()
+	if !strings.Contains(out, "-[ RECORD 1 ]") || !strings.Contains(out, "-[ RECORD 2 ]") {
+		t.Fatalf("missing record markers: %s", out)
+	}
+	if !strings.Contains(out, "id    | 100") || !strings.Contains(out, "title | First post") {
+		t.Fatalf("missing aligned fields: %s", out)
+	}
+	if !strings.Contains(out, "(2 rows)") || !strings.Contains(out, "affected 2") {
+		t.Fatalf("missing footer or affected count: %s", out)
+	}
+}
+
+func TestPrintCSVResult(t *testing.T) {
+	var buf strings.Builder
+	res := &nextsql.Result{
+		Columns: []string{"id", "name", "desc"},
+		Rows: [][]types.Value{
+			{types.IntValue(types.KindInt64, 1), types.StringValue("Bob"), types.StringValue("Hello, \"World\"")},
+			{types.IntValue(types.KindInt64, 2), types.StringValue("Alice"), types.StringValue("Multi\nLine")},
+		},
+		Affected: 2,
+	}
+	if err := printCSVResultTo(&buf, res); err != nil {
+		t.Fatal(err)
+	}
+	out := buf.String()
+	expected := "id,name,desc\n1,Bob,\"Hello, \"\"World\"\"\"\n2,Alice,\"Multi\nLine\"\naffected 2\n"
+	if out != expected {
+		t.Fatalf("got CSV:\n%q\nwant:\n%q", out, expected)
+	}
+}
+
+func TestReadBoundedStdin(t *testing.T) {
+	input := "  SELECT 1, 'hello';  \n"
+	r := strings.NewReader(input)
+	got, err := readBoundedStdin(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "SELECT 1, 'hello';" {
+		t.Fatalf("readBoundedStdin = %q, want %q", got, "SELECT 1, 'hello';")
+	}
+
+	huge := strings.Repeat("A", maxExecStdinBytes+10)
+	_, err = readBoundedStdin(strings.NewReader(huge))
+	if err == nil || !nerr.HasCode(err, nerr.Exhausted) {
+		t.Fatalf("expected Exhausted for huge stdin, got: %v", err)
+	}
+}
+
 func TestExecSQLRequiresSQL(t *testing.T) {
 	t.Setenv("NEXTSQL_DATABASE_USER", "app")
 	t.Setenv("NEXTSQL_DATABASE_PASS", "secret")

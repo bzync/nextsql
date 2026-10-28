@@ -8,7 +8,7 @@ Gem::Specification.new do |spec|
   spec.authors = ["Rayan Reynaldo"]
   spec.summary = "Official NextSQL Ruby driver. Speaks the native NSQL v1 protocol."
   spec.description = "Native-protocol client for NextSQL: TLS 1.3, prepared statements, " \
-                     "follower-read routing, and NSCE1 client-side field encryption. " \
+                     "follower-read routing, and NSCE1/NSCE2 client-side field encryption. " \
                      "Keys and passwords are never accepted in a URL."
   spec.homepage = "https://nextsql.bzync.com/docs/drivers"
   spec.license = "MIT"

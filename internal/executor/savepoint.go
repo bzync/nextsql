@@ -148,3 +148,33 @@ func (s *Session) execCancelQuery(id string) (*Result, error) {
 	// it to stop, and it has.
 	return &Result{}, nil
 }
+
+// execKillSession stops and disconnects a live session, named by the session
+// id system.sessions / SHOW CONNECTIONS reports. A user may always kill their
+// own session; killing anyone else's requires ADMIN, matching system.sessions
+// visibility rules.
+func (s *Session) execKillSession(id string) (*Result, error) {
+	if s == nil || s.db == nil {
+		return nil, nerr.New(nerr.InvalidArgument, "executor.KillSession", "no database")
+	}
+	sid, err := strconv.ParseUint(id, 10, 64)
+	if err != nil {
+		return nil, nerr.New(nerr.InvalidArgument, "executor.KillSession", "invalid session id")
+	}
+	admin := s.acl == nil || s.isAdmin()
+	for _, target := range s.db.LiveSessions() {
+		if target == nil || target.SessionID() != sid {
+			continue
+		}
+		if !admin && !strings.EqualFold(target.User(), s.user) {
+			return nil, security.Deny("executor.KillSession")
+		}
+		if target.Kill() {
+			return &Result{Affected: 1}, nil
+		}
+		return &Result{}, nil
+	}
+	// A session that already disconnected is not an error: the statement asked
+	// for it to stop, and it has.
+	return &Result{}, nil
+}

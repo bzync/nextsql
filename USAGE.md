@@ -159,6 +159,12 @@ The GUI currently covers welcome, paths/dry-run validation, resource preset,
 administrator, summary, install, and completion. It is not yet bundled as the
 default OS-package entry point. See [`docs/install.md`](docs/install.md).
 
+### Containers and Docker Compose
+
+For containerized single-node and multi-node deployments:
+- [Docker installation guide](docs/docker.md) — prebuilt OCI image (`bzynchub/nextsql:0.0.6`), scratch runtime, `docker run`, and Podman
+- [Docker Compose guide](docs/docker-compose.md) — single node, microservice app integration, health checks, volumes, secrets, and 3-node Raft HA (`docker-compose.ha.yml`)
+
 ### Build from source
 
 Requires **Go 1.22+**.
@@ -910,7 +916,8 @@ nextsql whoami   --idp NAME [--addr HOST:PORT] [--idp-config FILE] [--json]
 nextsql exec     [--addr HOST:PORT] [--user NAME] [--password-file FILE | --idp NAME]
                  [--database NAME] [--tls-ca FILE | --insecure]
                  [--env-file PATH | --no-env]
-                 [-c SQL | SQL]
+                 [--json | --csv | --table | --expanded | -x] [--time | -t]
+                 [-c SQL | SQL | -]
 nextsql migrate  status|pending|version|validate|create|up|down|force|repair
                  [--dir DIR] [--addr HOST:PORT] [--user NAME]
                  [--password-file FILE] [--tls-ca FILE | --insecure]
@@ -1099,7 +1106,7 @@ Use a host-only mode-`0600` provisioning env file. Never commit it or expose
 database/instance root paths to an application or migration-runner env that
 does not operate the deployment. Raw key bytes are never valid env values.
 
-`nextsql exec` talks to a running `nextsqld`. `--user`, `--password-file`, and `-c` are optional as flags when the environment or a dotenv file supplies them. After resolve, user, password, and SQL must be present. `-c` wins over a positional SQL argument. Mixing `--data-dir` / `--key-file` onto `exec` is an error. `NEXTSQL_KEY_FILE` in the environment or `.env` is ignored (the root key is not an exec input).
+`nextsql exec` talks to a running `nextsqld`. `--user`, `--password-file`, and `-c` are optional as flags when the environment or a dotenv file supplies them. After resolve, user, password, and SQL must be present. SQL can be passed via `-c`, as a positional SQL string, or piped via standard input (`cat script.sql | nextsql exec` or `nextsql exec - < script.sql`). Output can be formatted as machine-readable TSV (default), `--json`, RFC 4180 `--csv`, formatted ASCII `--table`, or vertical record mode `--expanded` / `-x`. Add `--time` / `-t` to output query execution duration. `-c` wins over positional SQL or stdin. Mixing `--data-dir` / `--key-file` onto `exec` is an error. `NEXTSQL_KEY_FILE` in the environment or `.env` is ignored (the root key is not an exec input).
 
 Address is `host:port` only. Values containing `://`, `key=`, or `password=` are rejected. Keys are never accepted in connection URLs.
 
@@ -2077,15 +2084,15 @@ P17/P18 added user-visible behavior that older copies of this manual did not des
 
 - P24 Full-text Search 2.0 is complete; further language analyzers beyond `simple` / `english` / `french` / `german` / `spanish` and additional runtime/index optimizations are documented non-gate follow-ons
 
-- P25 Security 2.0 is **complete** (exit gate closed 2026-09-02, `docs/security.md` "P25 security review sign-off"): mTLS/service identities, live certificate/trust rotation, X.509 CRL revocation, signed short-lived credentials, the external-IdP broker, field-level client encryption (the five driver families in P25 scope, PITR, replication/failover, and `FileFieldKeyring` key rotation/revocation), Argon2id password hashing, and tamper-evident/signed audit-chain hardening are production-gated. Python/Ruby field-encryption helpers remain open; OCSP and optional OIDC opaque introspection/JIT remain off by design
+- P25 Security 2.0 is **complete** (exit gate closed 2026-09-02, `docs/security.md` "P25 security review sign-off"): mTLS/service identities, live certificate/trust rotation, X.509 CRL revocation, signed short-lived credentials, the external-IdP broker, field-level client encryption (across all six official driver families: Go, Node.js, TypeScript/Bun, PHP, Python, and Ruby; PITR, replication/failover, and `FileFieldKeyring` key rotation/revocation), Argon2id password hashing, and tamper-evident/signed audit-chain hardening are production-gated. OCSP and optional OIDC opaque introspection/JIT remain off by design
 
 - P26 System catalog / introspection 2.0 is **complete** (exit gate closed 2026-09-02, `docs/system-catalog.md` "P26 exit gate closure"): the virtual `system` schema (catalog/storage/replication/live session/security-administration tables), nine `SHOW` convenience aliases, and an authoritative capability registry are production-gated
 
 - P27 workload governance / operational maturity is **complete** (exit gate closed 2026-09-03)
 
-- P28 (NextSQL Admin — Setup + Operations modes) is **in progress**: setup/lifecycle and the Operations-mode MVP are complete; Setup mode M1 is implemented and targeted-tested; the remaining installer platform, packaging, silent-install, richer-wizard, and accessibility gates are open
+- P28 NextSQL Admin (Setup + Operations modes) is **complete** (exit gate closed 2026-09-24, log #327): Setup mode wizard, firewall assistant, and multi-step staged progress; Operations mode M1–M9 slices verified; full axe WCAG 2.2 AA accessibility passed with 0 violations
 
-- P29 NextSQL Admin — Studio mode (web-based NextSQL Studio)
+- P29 NextSQL Admin — Studio mode (NextSQL Studio) is **complete** (logs #146–#221, #326, #343): professional database IDE in unified nextsql-admin binary with interactive Visual DAG Query Plan, catalog-aware IntelliSense, profiler, and native explorers
 
 - Multi-primary writes are not part of the current roadmap core
 
@@ -2201,6 +2208,8 @@ return an empty/not-attached view for those process-wide sources.
 | [docs/export.md](docs/export.md) | Logical export / import |
 | [docs/ops.md](docs/ops.md) | Metrics, admission, SLO numbers |
 | [docs/ha.md](docs/ha.md) | Raft clustering |
+| [docs/docker.md](docs/docker.md) | Docker installation, scratch image, and Podman |
+| [docs/docker-compose.md](docs/docker-compose.md) | Docker Compose guide: single-node, app stack, and 3-node HA |
 | [docs/examples/migrations/](docs/examples/migrations/) | Sample `customers` / `orders` migration files |
 
 For implementation truth, always prefer the matching-version `TODO.md` and measured `docs/*` over older examples or planned product descriptions.

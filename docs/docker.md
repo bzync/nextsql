@@ -25,14 +25,55 @@ immutable", so there is no moving `latest`, `edge`, or `0.0` pointer. Each
 release publishes exactly one `0.x.y` tag:
 
 ```bash
-docker pull bzynchub/nextsql:0.0.1        # a released version
+docker pull bzynchub/nextsql:0.0.6        # a released version
 ```
 
-The Compose files below build the image locally (`build: .`); to run a
+The checked-in `docker-compose.yml` builds locally (`build: .`); to run the
 published image instead, replace `build: .` with
-`image: bzynchub/nextsql:0.0.1`.
+`image: bzynchub/nextsql:0.0.6`. For an in-depth guide on Docker Compose with
+application integration, healthchecks, and HA cluster deployment, see
+[`docs/docker-compose.md`](docker-compose.md).
 
 ## Building locally
+
+The repository includes a single-node `docker-compose.yml`:
+
+```yaml
+services:
+  nextsql:
+    build: .
+    image: nextsql:local
+    restart: unless-stopped
+    ports:
+      - "7210:7210"
+    environment:
+      NEXTSQL_SERVER_USER: app
+      NEXTSQL_SERVER_PASSWORD_FILE: /run/bootstrap/app-password
+      NEXTSQL_TLS_CERT: /run/tls/server.crt
+      NEXTSQL_TLS_KEY: /run/tls/server.key
+    volumes:
+      - nextsql-data:/var/lib/nextsql
+      - nextsql-keys:/run/secrets
+    secrets:
+      - source: app_password
+        target: /run/bootstrap/app-password
+      - source: server_crt
+        target: /run/tls/server.crt
+      - source: server_key
+        target: /run/tls/server.key
+
+volumes:
+  nextsql-data:
+  nextsql-keys:
+
+secrets:
+  app_password:
+    file: ./secrets/app-password
+  server_crt:
+    file: ./secrets/server.crt
+  server_key:
+    file: ./secrets/server.key
+```
 
 Prepare a password file and TLS certificate/key. The certificate must include
 the hostname clients use. For a local-only development certificate:
@@ -113,7 +154,7 @@ docker run -d --name nextsql -p 7210:7210 \
   -e NEXTSQL_SERVER_PASSWORD_FILE=/run/bootstrap/app-password \
   -e NEXTSQL_TLS_CERT=/run/tls/server.crt -e NEXTSQL_TLS_KEY=/run/tls/server.key \
   -e NEXTSQL_PROFILE=production \
-  bzynchub/nextsql:0.0.1
+  bzynchub/nextsql:0.0.6
 ```
 
 `backup_dir` is not set by the container; set it (or a WAL archive) and take
@@ -210,6 +251,9 @@ maintenance all follow the same `AddVoter` / backup-restore path described in
 Docker-specific procedure. `docker compose -f docker-compose.ha.yml down -v`
 destroys all three databases, the shared root key, and the seed volume; take
 a `nextsql backup` first if that data matters.
+
+For complete Docker Compose cluster setup, healthchecks, failover tests, and
+application stack integration, see [`docs/docker-compose.md`](docker-compose.md).
 
 ## Podman
 

@@ -33,5 +33,6 @@ For an HA cluster with follower-read routing, use `nextsql.connect_cluster`.
 
 - Full driver docs: <https://nextsql.bzync.com/docs/drivers>
 - Wire protocol: <https://github.com/bzync/nextsql/blob/master/docs/protocol.md>
+- Client-side field encryption: <https://nextsql.bzync.com/docs/client-encryption>
 
 MIT licensed.

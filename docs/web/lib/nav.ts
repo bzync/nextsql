@@ -31,7 +31,12 @@ export const docsNav: NavGroup[] = [
       {
         title: "Docker",
         slug: "docker",
-        description: "Prebuilt Docker Hub image, Compose, HA cluster, and Podman.",
+        description: "Prebuilt Docker Hub image, single node, and Podman.",
+      },
+      {
+        title: "Docker Compose",
+        slug: "docker-compose",
+        description: "Single-node, app integration, volumes, secrets, and HA cluster with Compose.",
       },
     ],
   },

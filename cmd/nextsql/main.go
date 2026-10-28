@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/csv"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -1017,6 +1018,12 @@ func execSQL(args []string) error {
 	fs.String("key-file", "", "not valid with exec (local commands only)")
 	sqlText := fs.String("c", "", "SQL to execute")
 	jsonOut := fs.Bool("json", false, "print the result as a single JSON object instead of tab-separated text")
+	csvOut := fs.Bool("csv", false, "print query results in RFC 4180 CSV format")
+	tableOut := fs.Bool("table", false, "print query results formatted in an aligned ASCII table with borders")
+	expandedOut := fs.Bool("expanded", false, "print query results in expanded vertical format (one line per column, like psql \\x)")
+	fs.BoolVar(expandedOut, "x", false, "shorthand for -expanded")
+	timing := fs.Bool("time", false, "print query execution time")
+	fs.BoolVar(timing, "t", false, "shorthand for -time")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -1032,18 +1039,23 @@ func execSQL(args []string) error {
 		return err
 	}
 	if query == "" {
-		return nerr.New(nerr.InvalidArgument, "nextsql exec", "SQL is required (-c or a single positional argument)")
+		return nerr.New(nerr.InvalidArgument, "nextsql exec", "SQL is required (-c, stdin, or a single positional argument)")
 	}
 	conn, err := cli.Open(context.Background(), s)
 	if err != nil {
 		return err
 	}
 	defer conn.Close()
+	start := time.Now()
 	res, err := conn.Exec(context.Background(), query)
+	elapsed := time.Since(start)
 	if err != nil {
 		return err
 	}
-	printResult(res, *jsonOut)
+	printExecResult(res, *jsonOut, *csvOut, *tableOut, *expandedOut)
+	if *timing {
+		fmt.Fprintf(os.Stderr, "Time: %v\n", elapsed.Round(time.Microsecond))
+	}
 	return nil
 }
 
@@ -1052,11 +1064,160 @@ func execSQL(args []string) error {
 // (printJSONResult) — shared by `nextsql exec` and the `nextsql cluster`
 // admin subcommands.
 func printResult(res *nextsql.Result, jsonOut bool) {
+	printExecResult(res, jsonOut, false, false, false)
+}
+
+func printExecResult(res *nextsql.Result, jsonOut, csvOut, tableOut, expandedOut bool) {
 	if jsonOut {
 		printJSONResultTo(os.Stdout, res)
 		return
 	}
+	if csvOut {
+		_ = printCSVResultTo(os.Stdout, res)
+		return
+	}
+	if expandedOut {
+		printExpandedResultTo(os.Stdout, res)
+		return
+	}
+	if tableOut {
+		printAlignedTableTo(os.Stdout, res)
+		return
+	}
 	printTabularResult(res)
+}
+
+// printCSVResultTo renders a query result as RFC 4180 compliant CSV.
+func printCSVResultTo(w io.Writer, res *nextsql.Result) error {
+	if len(res.Columns) == 0 {
+		if res.Affected != 0 {
+			fmt.Fprintf(w, "affected %d\n", res.Affected)
+		}
+		return nil
+	}
+	cw := csv.NewWriter(w)
+	if err := cw.Write(res.Columns); err != nil {
+		return err
+	}
+	record := make([]string, len(res.Columns))
+	for _, row := range res.Rows {
+		for i, v := range row {
+			record[i] = v.String()
+		}
+		if err := cw.Write(record); err != nil {
+			return err
+		}
+	}
+	cw.Flush()
+	if res.Affected != 0 {
+		fmt.Fprintf(w, "affected %d\n", res.Affected)
+	}
+	return cw.Error()
+}
+
+// printAlignedTableTo renders a query result as a human-friendly ASCII table
+// with borders, column alignment, and row count footer.
+func printAlignedTableTo(w io.Writer, res *nextsql.Result) {
+	if len(res.Columns) == 0 {
+		if res.Affected != 0 {
+			fmt.Fprintf(w, "affected %d\n", res.Affected)
+		}
+		return
+	}
+	widths := make([]int, len(res.Columns))
+	for i, col := range res.Columns {
+		widths[i] = len(col)
+	}
+	strRows := make([][]string, len(res.Rows))
+	for r, row := range res.Rows {
+		strRows[r] = make([]string, len(row))
+		for c, v := range row {
+			s := v.String()
+			strRows[r][c] = s
+			if len(s) > widths[c] {
+				widths[c] = len(s)
+			}
+		}
+	}
+
+	border := func() string {
+		var sb strings.Builder
+		sb.WriteString("+")
+		for _, width := range widths {
+			sb.WriteString(strings.Repeat("-", width+2))
+			sb.WriteString("+")
+		}
+		return sb.String()
+	}
+
+	sep := border()
+	fmt.Fprintln(w, sep)
+
+	fmt.Fprintf(w, "|")
+	for i, col := range res.Columns {
+		fmt.Fprintf(w, " %-*s |", widths[i], col)
+	}
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, sep)
+
+	for _, row := range strRows {
+		fmt.Fprintf(w, "|")
+		for i, s := range row {
+			fmt.Fprintf(w, " %-*s |", widths[i], s)
+		}
+		fmt.Fprintln(w)
+	}
+	fmt.Fprintln(w, sep)
+
+	if len(res.Rows) == 1 {
+		fmt.Fprintln(w, "(1 row)")
+	} else {
+		fmt.Fprintf(w, "(%d rows)\n", len(res.Rows))
+	}
+	if res.Affected != 0 {
+		fmt.Fprintf(w, "affected %d\n", res.Affected)
+	}
+}
+
+// printExpandedResultTo renders a query result vertically with one line per
+// column (similar to PostgreSQL's \x expanded mode).
+func printExpandedResultTo(w io.Writer, res *nextsql.Result) {
+	if len(res.Columns) == 0 {
+		if res.Affected != 0 {
+			fmt.Fprintf(w, "affected %d\n", res.Affected)
+		}
+		return
+	}
+	maxColLen := 0
+	for _, col := range res.Columns {
+		if len(col) > maxColLen {
+			maxColLen = len(col)
+		}
+	}
+	for i, row := range res.Rows {
+		header := fmt.Sprintf("-[ RECORD %d ]-", i+1)
+		lineLen := 30
+		if len(header)+15 > lineLen {
+			lineLen = len(header) + 15
+		}
+		dashCount := lineLen - len(header)
+		if dashCount < 0 {
+			dashCount = 0
+		}
+		fmt.Fprintf(w, "%s%s\n", header, strings.Repeat("-", dashCount))
+		for c, v := range row {
+			colName := res.Columns[c]
+			fmt.Fprintf(w, "%-*s | %s\n", maxColLen, colName, v.String())
+		}
+	}
+	if len(res.Rows) == 1 {
+		fmt.Fprintln(w, "(1 row)")
+	} else {
+		fmt.Fprintf(w, "(%d rows)\n", len(res.Rows))
+	}
+	if res.Affected != 0 {
+		fmt.Fprintf(w, "affected %d\n", res.Affected)
+	}
 }
 
 // printTabularResult renders a query result as machine-readable
@@ -1104,6 +1265,8 @@ func printJSONResultTo(w io.Writer, res *nextsql.Result) {
 	_ = enc.Encode(out)
 }
 
+const maxExecStdinBytes = 64 << 20 // 64 MiB
+
 func execSQLText(fs *flag.FlagSet, cFlag string) (string, error) {
 	explicit := false
 	fs.Visit(func(f *flag.Flag) {
@@ -1111,18 +1274,36 @@ func execSQLText(fs *flag.FlagSet, cFlag string) (string, error) {
 			explicit = true
 		}
 	})
-	rest := fs.Args()
 	if explicit {
 		return cFlag, nil
 	}
-	switch len(rest) {
-	case 0:
-		return "", nil
-	case 1:
+	rest := fs.Args()
+	if len(rest) == 1 {
+		if rest[0] == "-" {
+			return readBoundedStdin(os.Stdin)
+		}
 		return rest[0], nil
-	default:
-		return "", nerr.New(nerr.InvalidArgument, "nextsql exec", "expected a single SQL argument")
 	}
+	if len(rest) == 0 {
+		stat, err := os.Stdin.Stat()
+		if err == nil && (stat.Mode()&os.ModeCharDevice) == 0 {
+			return readBoundedStdin(os.Stdin)
+		}
+		return "", nil
+	}
+	return "", nerr.New(nerr.InvalidArgument, "nextsql exec", "expected a single SQL argument (-c, stdin, or a single positional argument)")
+}
+
+func readBoundedStdin(r io.Reader) (string, error) {
+	limited := io.LimitReader(r, maxExecStdinBytes+1)
+	data, err := io.ReadAll(limited)
+	if err != nil {
+		return "", nerr.New(nerr.Internal, "nextsql exec", "reading standard input: "+err.Error())
+	}
+	if len(data) > maxExecStdinBytes {
+		return "", nerr.New(nerr.Exhausted, "nextsql exec", fmt.Sprintf("stdin exceeded maximum query size (%d bytes)", maxExecStdinBytes))
+	}
+	return strings.TrimSpace(string(data)), nil
 }
 
 // backupCmd dispatches `nextsql backup ...`. A bare-word first argument

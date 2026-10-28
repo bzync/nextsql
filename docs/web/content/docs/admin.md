@@ -97,7 +97,7 @@ Studio is on the same Operations session. Surfaces include:
 - Users & roles, live Transactions & locks, verified Audit, Workflows/tasks/change streams, schema-migration history (also under **More**)
 - table inspector: statistics, foreign keys, inbound “Referenced by”, constraints, DDL, dependencies
 - schema-relationship diagram, global object search, command palette (Ctrl/Cmd+K)
-- bounded per-tab EXPLAIN comparison and an ANALYZE-only profiler
+- bounded per-tab EXPLAIN comparison, ANALYZE-only profiler, and interactive visual DAG query plan (zoomable graph with bezier operator flow, category classification, node details inspector, and visual/tree/JSON switcher)
 - server switching between connection profiles, and a read-consistency control
 - review-only builders that load SQL into the editor and never execute: data generator, CSV/JSON/NDJSON import, parameterized DML, table/index designer with live native DDL preview
 

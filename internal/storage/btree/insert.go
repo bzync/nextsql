@@ -506,3 +506,45 @@ func (t *Tree) leftmostLeaf() (format.PageID, error) {
 		id = hdr.leftmost
 	}
 }
+
+func (t *Tree) rightmostLeaf() (format.PageID, error) {
+	id := t.root
+	for {
+		h, err := t.pin(id)
+		if err != nil {
+			return 0, err
+		}
+		typ := h.Page().Type()
+		if typ == format.PageTypeBTreeLeaf {
+			if err := release(h, false); err != nil {
+				return 0, err
+			}
+			return id, nil
+		}
+		if typ != format.PageTypeBTreeInternal {
+			_ = release(h, false)
+			return 0, nerr.New(nerr.Corruption, "btree.rightmostLeaf", "unexpected page type")
+		}
+		ents, err := collectInternals(h.Page())
+		if err != nil {
+			_ = release(h, false)
+			return 0, err
+		}
+		hdr, err := readHeader(h.Page())
+		if err != nil {
+			_ = release(h, false)
+			return 0, err
+		}
+		if err := release(h, false); err != nil {
+			return 0, err
+		}
+		if len(ents) > 0 {
+			id = ents[len(ents)-1].child
+		} else {
+			id = hdr.leftmost
+		}
+		if id == 0 {
+			return 0, nerr.New(nerr.Corruption, "btree.rightmostLeaf", "internal node missing rightmost child")
+		}
+	}
+}

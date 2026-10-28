@@ -958,3 +958,69 @@ func TestCSRFConstantTimeCompare(t *testing.T) {
 		t.Fatal("correct token rejected")
 	}
 }
+
+func TestActivityActionSQL(t *testing.T) {
+	cases := []struct {
+		action  string
+		id      string
+		want    string
+		wantErr bool
+	}{
+		{action: "kill_session", id: "42", want: "KILL SESSION '42'"},
+		{action: "cancel_query", id: "1001", want: "CANCEL QUERY '1001'"},
+		{action: "kill_session", id: "0", want: "KILL SESSION '0'"},
+		{action: "kill_session", id: "", wantErr: true},
+		{action: "kill_session", id: "abc", wantErr: true},
+		{action: "kill_session", id: "-1", wantErr: true},
+		{action: "kill_session", id: "42; DROP TABLE t", wantErr: true},
+		{action: "unknown", id: "42", wantErr: true},
+		{action: "", id: "42", wantErr: true},
+	}
+	for _, c := range cases {
+		got, err := activityActionSQL(c.action, c.id)
+		if c.wantErr {
+			if !nerr.HasCode(err, nerr.InvalidArgument) {
+				t.Fatalf("%s/%q: want invalid_argument, got (%q, %v)", c.action, c.id, got, err)
+			}
+			continue
+		}
+		if err != nil || got != c.want {
+			t.Fatalf("%s/%q: got (%q, %v), want %q", c.action, c.id, got, err, c.want)
+		}
+	}
+}
+
+func TestActivityActionRequiresAuthAndCSRF(t *testing.T) {
+	s := testServer(t)
+
+	// No session cookie -> 401
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest("POST", "/api/v1/activity/action", strings.NewReader(`{"action":"kill_session","id":"42"}`)))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("no session: want 401, got %d", rec.Code)
+	}
+
+	sess, err := s.sessions.create(nil, "op", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Missing CSRF -> 403
+	req := httptest.NewRequest("POST", "/api/v1/activity/action", strings.NewReader(`{"action":"kill_session","id":"42"}`))
+	req.AddCookie(&http.Cookie{Name: sessionCookie, Value: sess.id})
+	rec = httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("missing CSRF: want 403, got %d", rec.Code)
+	}
+
+	// CSRF present but unrecognized action -> 400
+	req = httptest.NewRequest("POST", "/api/v1/activity/action", strings.NewReader(`{"action":"invalid_action","id":"42"}`))
+	req.AddCookie(&http.Cookie{Name: sessionCookie, Value: sess.id})
+	req.Header.Set(csrfHeader, sess.csrf)
+	rec = httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("invalid action: want 400, got %d", rec.Code)
+	}
+}

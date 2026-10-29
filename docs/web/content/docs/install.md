@@ -162,11 +162,11 @@ are independent of the engine version.
 | Runtime | Install |
 |---|---|
 | Go | `go get github.com/bzync/nextsql/drivers/go@v0.0.7` |
-| Node.js 18+ | `npm i @bzync/nextsql@0.2.0` |
+| Node.js 18+ | `npm i @bzync/nextsql@0.0.3` |
 | Bun | `drivers/bun` (repo tree) |
 | PHP 8.1+ | `composer require bzync/nextsql` |
-| Python 3.10+ | `pip install bzync-nextsql==0.2.0` |
-| Ruby 3.0+ | `gem install bzync-nextsql -v 0.2.0` |
+| Python 3.10+ | `pip install bzync-nextsql==0.0.3` |
+| Ruby 3.0+ | `gem install bzync-nextsql -v 0.0.3` |
 
 See [Drivers](/docs/drivers).
 

@@ -7,7 +7,7 @@ The Node client is published to npm as [`@bzync/nextsql`](https://www.npmjs.com/
 — MIT, zero runtime dependencies, TypeScript types bundled:
 
 ```bash
-npm i @bzync/nextsql@0.2.0
+npm i @bzync/nextsql@0.0.3
 ```
 
 The Bun client is repository-distributed — import it from `drivers/bun/` in the

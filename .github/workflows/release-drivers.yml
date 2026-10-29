@@ -40,6 +40,7 @@ on:
 permissions:
   contents: read
   id-token: write # forwarded to the reusable publish workflows for OIDC
+  actions: write # to dispatch pypi-publish-python-driver.yml directly
 
 jobs:
   resolve:
@@ -99,11 +100,31 @@ jobs:
 
   pypi:
     needs: resolve
-    uses: ./.github/workflows/pypi-publish-python-driver.yml
-    secrets: inherit
-    with:
-      ref: ${{ needs.resolve.outputs.ref }}
-      version: ${{ needs.resolve.outputs.version }}
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: Publish Python driver to PyPI
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version="${{ needs.resolve.outputs.version }}"
+          ref="${{ needs.resolve.outputs.ref }}"
+          # PyPI Trusted Publishing rejects reusable workflow calls (workflow_call).
+          # Check if already published on PyPI first.
+          have="$(curl -sS -f "https://pypi.org/pypi/bzync-nextsql/json" | python3 -c "import sys, json; print(str('${version}' in json.load(sys.stdin).get('releases', {})))" 2>/dev/null || echo "False")"
+          if [ "$have" = "True" ]; then
+            echo "Version $version is already published on PyPI."
+            exit 0
+          fi
+          # Dispatch standalone workflow run to satisfy PyPI Trusted Publishing OIDC constraints
+          gh workflow run pypi-publish-python-driver.yml \
+            --repo "$GITHUB_REPOSITORY" \
+            --ref master \
+            -f ref="$ref" \
+            -f version="$version"
+          echo "Dispatched pypi-publish-python-driver.yml on $ref at version $version."
 
   rubygems:
     needs: resolve

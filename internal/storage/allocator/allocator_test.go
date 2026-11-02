@@ -3,6 +3,7 @@ package allocator
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -492,6 +493,11 @@ func TestReloadRereadsPersistedState(t *testing.T) {
 		t.Fatal("Reload accepted a corrupt freelist metadata page")
 	} else if !nerr.HasCode(err, nerr.Corruption) {
 		t.Fatalf("Reload error = %v, want code %s", err, nerr.Corruption)
+	}
+	// A failed Reload must not leave a half-rebuilt freelist to allocate from.
+	failed := a.State()
+	if failed.Next != before.Next || !slices.Equal(failed.Free, before.Free) || !slices.Equal(failed.Metadata, before.Metadata) {
+		t.Fatalf("failed Reload changed state: before=%+v after=%+v", before, failed)
 	}
 }
 

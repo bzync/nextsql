@@ -50,6 +50,7 @@ func (r *PageOwnershipReport) Clean() bool {
 
 type pageOwner interface {
 	OwnedPages() ([]format.PageID, error)
+	LinkedPages() ([]format.PageID, error)
 	Check() error
 }
 
@@ -98,6 +99,48 @@ func (db *DB) CheckPageOwnership() (*PageOwnershipReport, error) {
 	db.applyMu.Lock()
 	defer db.applyMu.Unlock()
 	return analyzePageOwnership(db.ownedTrees(), db.Eng.Alloc.State()), nil
+}
+
+// FreelistConflicts returns pages that are on the freelist and linked into a
+// tree. It reads internal pages only, cheap enough to run at every server start,
+// and is the check that keeps a damaged database from overwriting a live page.
+// CheckPageOwnership is the complete, slower check.
+func (db *DB) FreelistConflicts() ([]PageConflict, error) {
+	if db == nil || db.Eng == nil || db.Eng.Alloc == nil || db.CatTree == nil {
+		return nil, nerr.New(nerr.InvalidArgument, "executor.FreelistConflicts", "database is not open")
+	}
+	db.applyMu.Lock()
+	defer db.applyMu.Unlock()
+	return freelistConflicts(db.ownedTrees(), db.Eng.Alloc.State())
+}
+
+func freelistConflicts(trees []labeledTree, state allocator.State) ([]PageConflict, error) {
+	if len(state.Free) == 0 && len(state.Metadata) == 0 {
+		return nil, nil
+	}
+	allocatorOwned := make(map[format.PageID]struct{}, len(state.Free)+len(state.Metadata))
+	for _, id := range state.Free {
+		allocatorOwned[id] = struct{}{}
+	}
+	for _, id := range state.Metadata {
+		allocatorOwned[id] = struct{}{}
+	}
+	found := make(map[format.PageID][]string)
+	for _, tr := range trees {
+		pages, err := tr.tree.LinkedPages()
+		if err != nil {
+			return nil, nerr.Wrap(nerr.Corruption, "executor.FreelistConflicts", tr.label, err)
+		}
+		for _, id := range pages {
+			if _, ok := allocatorOwned[id]; ok {
+				found[id] = append(found[id], tr.label)
+			}
+		}
+	}
+	if len(found) == 0 {
+		return nil, nil
+	}
+	return conflictsOf(found), nil
 }
 
 func analyzePageOwnership(trees []labeledTree, state allocator.State) *PageOwnershipReport {

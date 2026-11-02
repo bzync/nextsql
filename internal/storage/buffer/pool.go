@@ -221,7 +221,7 @@ func (p *Pool) Install(pg *page.Page) (*Handle, error) {
 		return nil, err
 	}
 	if _, exists := p.index[id]; exists {
-		return nil, nerr.New(nerr.AlreadyExists, "buffer.Install", "page already cached")
+		return nil, nerr.New(nerr.Corruption, "buffer.Install", "page already cached: the allocator issued a page that is in use; run nextsql check-pages")
 	}
 	fr, err := p.evict()
 	if err != nil {
@@ -253,7 +253,7 @@ func (p *Pool) InstallNew(id format.PageID, typ format.PageType) (*Handle, error
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if _, exists := p.index[id]; exists {
-		return nil, nerr.New(nerr.AlreadyExists, "buffer.InstallNew", "page already cached")
+		return nil, nerr.New(nerr.Corruption, "buffer.InstallNew", "page already cached: the allocator issued a page that is in use; run nextsql check-pages")
 	}
 	fr, err := p.evict()
 	if err != nil {

@@ -416,6 +416,8 @@ func (s *Session) SetRealmID(id hosting.ID)               { s.realmID = id }
 func (s *Session) SetRemote(addr string)                  { s.remote = addr }
 
 type pending struct {
+	// created lists the trees this transaction allocated. See createTxnTree.
+	created            []*btree.Tree
 	heaps              map[string]*btree.Tree
 	idxs               map[string]*btree.Tree
 	vecs               map[string]*btree.Tree
@@ -1921,7 +1923,11 @@ func (s *Session) abort() error {
 	var err error
 	if s.x != nil {
 		err = s.x.rollback()
-		s.reclaimEmptyTreesOnRollback()
+		// A failed rollback may mean the commit record is already durable, so
+		// these trees may be live.
+		if err == nil {
+			s.reclaimCreatedTreesOnRollback()
+		}
 	}
 	defer s.releaseTxnAdmission()
 	s.fkBroken = false
@@ -1944,27 +1950,33 @@ func (s *Session) abort() error {
 	return err
 }
 
-// reclaimEmptyTreesOnRollback frees every page of a tree this transaction
-// created from nothing (a fresh CREATE TABLE/CREATE INDEX heap, WasEmpty()
-// true — see its doc comment) once the transaction has rolled back. Nothing
-// outside this transaction could ever have referenced such a tree — its
-// catalog row was never committed — so unlike an ordinary pre-existing
-// tree there is no concurrent-writer or structural-sharing hazard, and the
-// whole tree is safe to discard wholesale via the tree's own OwnedPages
-// walk, exactly like abortOnlineBuild already does for an abandoned online
-// rebuild's shadow tree. Left unfreed on any error (OwnedPages fails closed
-// on an unexpected shape, or the tree still has no root at all because
-// nothing was ever inserted) rather than risk reclaiming the wrong pages;
-// worst case is a harmless leaked page, not corruption.
-func (s *Session) reclaimEmptyTreesOnRollback() {
-	if s == nil || s.x == nil || s.db == nil {
+// createTxnTree allocates a detached tree that belongs to this transaction, and
+// records it so a rollback can return its pages.
+func (s *Session) createTxnTree() (*btree.Tree, error) {
+	s.db.Eng.Enter(s.x.owner.Storage())
+	tree, err := btree.CreateDetached(s.db.Eng)
+	s.db.Eng.Leave(s.x.owner.Storage())
+	if err != nil {
+		return nil, err
+	}
+	if s.pending != nil {
+		s.pending.created = append(s.pending.created, tree)
+	}
+	return tree, nil
+}
+
+// reclaimCreatedTreesOnRollback queues the pages of every tree this transaction
+// created. Their catalog rows never committed, so nothing else can reach them.
+// The list is explicit because pending's name maps also hold committed trees: a
+// detached partition's, and an online rebuild's shadow. A tree whose walk fails
+// is left in place, since a leaked page is harmless and a wrongly freed one is
+// not.
+func (s *Session) reclaimCreatedTreesOnRollback() {
+	if s == nil || s.pending == nil || s.db == nil {
 		return
 	}
-	for tree, part := range s.x.parts {
-		if tree == nil || !part.WasEmpty() {
-			continue
-		}
-		if pages, perr := tree.OwnedPages(); perr == nil && len(pages) > 0 {
+	for _, tree := range s.pending.created {
+		if pages, err := tree.OwnedPages(); err == nil {
 			s.db.queueCommittedReclaims(pages, nil, nil)
 		}
 	}

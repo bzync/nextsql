@@ -74,17 +74,14 @@ func (a *Allocator) Reload() error {
 	return a.reloadLocked()
 }
 
+// reloadLocked replaces allocator state only once the whole on-disk chain has
+// validated, so a failure leaves the allocator as it was.
 func (a *Allocator) reloadLocked() error {
 	next, head, count := a.file.AllocState()
-	a.next = next
-	a.free = a.free[:0]
-	a.meta = a.meta[:0]
-	a.set = make(map[format.PageID]struct{})
-	if head == 0 {
-		if count != 0 {
-			return nerr.New(nerr.Corruption, "allocator.Open", "freelist count without head")
-		}
-		return nil
+	var free, meta []format.PageID
+	set := make(map[format.PageID]struct{})
+	if head == 0 && count != 0 {
+		return nerr.New(nerr.Corruption, "allocator.Open", "freelist count without head")
 	}
 	seen := map[format.PageID]struct{}{}
 	cur := head
@@ -93,7 +90,7 @@ func (a *Allocator) reloadLocked() error {
 			return nerr.New(nerr.Corruption, "allocator.Open", "freelist cycle")
 		}
 		seen[cur] = struct{}{}
-		a.meta = append(a.meta, cur)
+		meta = append(meta, cur)
 		raw, err := a.file.ReadLogical(cur)
 		if err != nil {
 			return err
@@ -124,28 +121,29 @@ func (a *Allocator) reloadLocked() error {
 			// persist raises the mark for every metadata page it claims, so
 			// a free id this large was never allocated. Trusting it would
 			// hand out a page that a later Alloc hands out again.
-			if id >= a.next {
+			if id >= next {
 				return nerr.New(nerr.Corruption, "allocator.Open", "free page id is beyond the allocation high-water mark")
 			}
-			if _, dup := a.set[id]; dup {
+			if _, dup := set[id]; dup {
 				return nerr.New(nerr.Corruption, "allocator.Open", "duplicate free page id")
 			}
-			a.free = append(a.free, id)
-			a.set[id] = struct{}{}
+			free = append(free, id)
+			set[id] = struct{}{}
 		}
 		cur = format.PageID(p.TxnMeta())
 	}
 	// Checked after the walk, not during it: a record on the first page can
 	// name a metadata page the walk has not reached yet. Free rejects these,
 	// so one here means the chain claims a page it is itself using.
-	for _, id := range a.meta {
-		if _, ok := a.set[id]; ok {
+	for _, id := range meta {
+		if _, ok := set[id]; ok {
 			return nerr.New(nerr.Corruption, "allocator.Open", "freelist metadata page is listed as free")
 		}
 	}
-	if uint64(len(a.free)) != count {
+	if uint64(len(free)) != count {
 		return nerr.New(nerr.Corruption, "allocator.Open", "freelist count mismatch")
 	}
+	a.next, a.free, a.meta, a.set = next, free, meta, set
 	a.dirty = false
 	return nil
 }

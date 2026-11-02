@@ -806,3 +806,50 @@ func TestRollbackKeepsItsAllocatedPagesInUse(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// A page that could not be installed was never used, so its id must not leak.
+func TestNewPageReturnsIDWhenPoolIsExhausted(t *testing.T) {
+	e, err := Create(filepath.Join(t.TempDir(), "nextsql.db"), testKeys(t), 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	var held []*buffer.Handle
+	for i := 0; i < 2; i++ {
+		h, err := e.NewSlotted()
+		if err != nil {
+			t.Fatal(err)
+		}
+		held = append(held, h)
+	}
+	free := e.Alloc.FreeCount()
+	if _, err := e.NewSlotted(); !nerr.HasCode(err, nerr.Exhausted) {
+		t.Fatalf("NewSlotted on a pinned pool: %v", err)
+	}
+	if got := e.Alloc.FreeCount(); got != free+1 {
+		t.Fatalf("free count = %d, want %d", got, free+1)
+	}
+	for _, h := range held {
+		if err := h.Release(true); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// Reissuing a live page is an internal invariant failure. A client must not see
+// it as an ordinary already_exists error it might retry.
+func TestDoubleInstallIsCorruption(t *testing.T) {
+	e, err := Create(filepath.Join(t.TempDir(), "nextsql.db"), testKeys(t), 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	h, err := e.NewSlotted()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Release(true)
+	if _, err := e.Buffer.InstallNew(h.ID(), format.PageTypeSlotted); !nerr.HasCode(err, nerr.Corruption) {
+		t.Fatalf("second install: %v", err)
+	}
+}

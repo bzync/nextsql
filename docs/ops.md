@@ -105,9 +105,21 @@ The command prints `result clean` and exits 0, or prints `result damaged` and
 exits 5. It also exits 5 when the database cannot be opened, for example when a
 tree's metadata page was replaced. It exits 2 when the lock is held.
 
+`nextsqld` runs a cheaper form of this check at every start and refuses to start
+if a live page is on the freelist, because its next writes could destroy that
+page. The cheap check reads only internal pages (measured: 26 page reads on the
+same database), so it does not detect every kind of damage: a table with a broken
+leaf link still starts, and reads of that table fail with a corruption error.
+`nextsql lifecycle upgrade` runs the full check and fails on any damage.
+
 If the result is `damaged`, stop writes, because a later allocation can destroy
-more data. There is no in-place repair. Restore the most recent backup that
-passes this check, then replay WAL only up to a point that also passes.
+more data. There is no in-place repair. Either:
+
+- Restore the most recent backup that passes this check, then replay WAL only up
+  to a point that also passes.
+- Run `nextsql export` and `nextsql import` into a new data directory, then check
+  the new one. This keeps rows committed since the last backup, but it can only
+  export tables that can still be read.
 
 A clean result covers tree structure and page ownership. It does not prove that
 every row is present. An instance that logged `page already cached` can also

@@ -343,9 +343,7 @@ func (s *Session) rebuildPartitionedIndex(tab *catalog.Table, pos int, idx catal
 		if err != nil {
 			return nil, err
 		}
-		s.db.Eng.Enter(s.x.owner.Storage())
-		local, err := btree.CreateDetached(s.db.Eng)
-		s.db.Eng.Leave(s.x.owner.Storage())
+		local, err := s.createTxnTree()
 		if err != nil {
 			return nil, err
 		}
@@ -743,18 +741,14 @@ func (s *Session) alterAddPartition(old, neu *catalog.Table, cmd ast.AlterAddPar
 	if part.Name != cmd.Partition.Name {
 		return nerr.New(nerr.Internal, "executor.AlterTable", "partition addition mismatch")
 	}
-	s.db.Eng.Enter(s.x.owner.Storage())
-	heap, err := btree.CreateDetached(s.db.Eng)
-	s.db.Eng.Leave(s.x.owner.Storage())
+	heap, err := s.createTxnTree()
 	if err != nil {
 		return err
 	}
 	part.HeapMeta = heap.Meta()
 	s.pending.partHeaps[partitionHeapKey(old.Name, part.ID)] = heap
 	if neu.HasVector() {
-		s.db.Eng.Enter(s.x.owner.Storage())
-		vec, err := btree.CreateDetached(s.db.Eng)
-		s.db.Eng.Leave(s.x.owner.Storage())
+		vec, err := s.createTxnTree()
 		if err != nil {
 			return err
 		}
@@ -763,9 +757,7 @@ func (s *Session) alterAddPartition(old, neu *catalog.Table, cmd ast.AlterAddPar
 	}
 	for i := range part.Indexes {
 		idx := indexByName(neu, part.Indexes[i].Name)
-		s.db.Eng.Enter(s.x.owner.Storage())
-		local, err := btree.CreateDetached(s.db.Eng)
-		s.db.Eng.Leave(s.x.owner.Storage())
+		local, err := s.createTxnTree()
 		if err != nil {
 			return err
 		}

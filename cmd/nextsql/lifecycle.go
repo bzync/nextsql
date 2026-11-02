@@ -726,7 +726,19 @@ func lifecycleUpgrade(args []string) error {
 	if db.Eng != nil && db.Eng.WAL != nil {
 		res.DurableLSN = uint64(db.Eng.WAL.DurableLSN())
 	}
+	pages, err := db.CheckPageOwnership()
 	_ = db.Close()
+	if err != nil {
+		res.Outcome = setup.UpgradeFailedVerify
+		res.Summary = "the page ownership check did not run: " + err.Error()
+		return finishUpgrade(res, *jsonOut, err)
+	}
+	if !pages.Clean() {
+		res.Outcome = setup.UpgradeFailedVerify
+		res.Summary = "page ownership conflicts found; run nextsql check-pages (see docs/ops.md)"
+		return finishUpgrade(res, *jsonOut,
+			nerr.New(nerr.Corruption, "nextsql lifecycle upgrade", "page ownership conflicts found"))
+	}
 
 	// Step: re-verify the plaintext headers still read cleanly.
 	post, err := assessInPlaceUpgrade(*dataDir, false)

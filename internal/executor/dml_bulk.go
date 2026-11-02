@@ -335,9 +335,7 @@ func (s *Session) truncateHeap(tab *catalog.Table) (int64, error) {
 		}
 		return 0, nerr.New(nerr.Conflict, "executor.truncateHeap", "heap changed while preparing CDC delete identities")
 	}
-	s.db.Eng.Enter(s.x.owner.Storage())
-	heap, err := btree.CreateDetached(s.db.Eng)
-	s.db.Eng.Leave(s.x.owner.Storage())
+	heap, err := s.createTxnTree()
 	if err != nil {
 		if owned {
 			_ = s.abort()

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 
@@ -18,8 +19,9 @@ type fakeOwner struct {
 	checkErr error
 }
 
-func (f fakeOwner) OwnedPages() ([]format.PageID, error) { return f.pages, f.err }
-func (f fakeOwner) Check() error                         { return f.checkErr }
+func (f fakeOwner) OwnedPages() ([]format.PageID, error)  { return f.pages, f.err }
+func (f fakeOwner) LinkedPages() ([]format.PageID, error) { return f.pages, f.err }
+func (f fakeOwner) Check() error                          { return f.checkErr }
 
 func TestAnalyzePageOwnershipClassifiesConflicts(t *testing.T) {
 	first := format.FirstAllocPageID
@@ -205,5 +207,52 @@ func TestCheckPageOwnershipFindsLivePageOnPersistedFreelist(t *testing.T) {
 		if rep.Clean() {
 			t.Fatalf("pass %d: damaged database reported clean", pass)
 		}
+	}
+}
+
+func TestFreelistConflictsFindsLivePageWithoutReadingLeaves(t *testing.T) {
+	db, err := Create(filepath.Join(t.TempDir(), "nextsql.db"), testKeys(t), 256)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	s := db.Session()
+	body := strings.Repeat("x", 600)
+	execOK(t, s, `CREATE TABLE t (id STRING PRIMARY KEY, body STRING)`)
+	for i := 0; i < 400; i++ {
+		execOK(t, s, fmt.Sprintf(`INSERT INTO t (id, body) VALUES ('%04d', '%s')`, i, body))
+	}
+	execOK(t, s, `CREATE TABLE gone (id STRING PRIMARY KEY)`)
+	execOK(t, s, `DROP TABLE gone`)
+	if got, err := db.FreelistConflicts(); err != nil || len(got) != 0 {
+		t.Fatalf("healthy database: conflicts=%+v err=%v", got, err)
+	}
+	heap, err := db.heap("t")
+	if err != nil {
+		t.Fatal(err)
+	}
+	linked, err := heap.LinkedPages()
+	if err != nil {
+		t.Fatal(err)
+	}
+	owned, err := heap.OwnedPages()
+	if err != nil {
+		t.Fatal(err)
+	}
+	slices.Sort(linked)
+	if !slices.Equal(linked, owned) {
+		t.Fatalf("linked pages %v differ from owned pages %v", linked, owned)
+	}
+	live := owned[len(owned)-1]
+	if err := db.Eng.Alloc.Free(live); err != nil {
+		t.Fatal(err)
+	}
+	got, err := db.FreelistConflicts()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []PageConflict{{Page: live, Owners: []string{"heap t"}}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("conflicts = %+v, want %+v", got, want)
 	}
 }

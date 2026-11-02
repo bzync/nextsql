@@ -39,9 +39,7 @@ func (s *Session) ensureVec(tab *catalog.Table) (*btree.Tree, error) {
 			return tr, nil
 		}
 	}
-	s.db.Eng.Enter(s.x.owner.Storage())
-	vs, err := btree.CreateDetached(s.db.Eng)
-	s.db.Eng.Leave(s.x.owner.Storage())
+	vs, err := s.createTxnTree()
 	if err != nil {
 		return nil, err
 	}

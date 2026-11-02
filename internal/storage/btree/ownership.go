@@ -23,7 +23,7 @@ func (t *Tree) OwnedPages() ([]format.PageID, error) {
 	if t.meta != 0 {
 		seen[t.meta] = struct{}{}
 	}
-	if err := t.collectOwned(t.root, t.height, seen); err != nil {
+	if err := t.collectOwned(t.root, t.height, true, seen); err != nil {
 		return nil, err
 	}
 	out := make([]format.PageID, 0, len(seen))
@@ -34,7 +34,34 @@ func (t *Tree) OwnedPages() ([]format.PageID, error) {
 	return out, nil
 }
 
-func (t *Tree) collectOwned(id format.PageID, height int, seen map[format.PageID]struct{}) error {
+// LinkedPages returns the same set as OwnedPages but reads internal pages only,
+// so it costs a small fraction of a full walk. It trusts that a leaf link points
+// at a leaf, which makes it fit for finding pages a tree refers to, and not for
+// reclamation.
+func (t *Tree) LinkedPages() ([]format.PageID, error) {
+	if t == nil {
+		return nil, nerr.New(nerr.InvalidArgument, "btree.LinkedPages", "nil tree")
+	}
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	if t.root == 0 || t.height < 1 {
+		return nil, nerr.New(nerr.Corruption, "btree.LinkedPages", "invalid tree metadata")
+	}
+	seen := make(map[format.PageID]struct{})
+	if t.meta != 0 {
+		seen[t.meta] = struct{}{}
+	}
+	if err := t.collectOwned(t.root, t.height, false, seen); err != nil {
+		return nil, err
+	}
+	out := make([]format.PageID, 0, len(seen))
+	for id := range seen {
+		out = append(out, id)
+	}
+	return out, nil
+}
+
+func (t *Tree) collectOwned(id format.PageID, height int, readLeaves bool, seen map[format.PageID]struct{}) error {
 	if err := id.UserData(); err != nil {
 		return nerr.Wrap(nerr.Corruption, "btree.OwnedPages", "invalid child page", err)
 	}
@@ -42,6 +69,9 @@ func (t *Tree) collectOwned(id format.PageID, height int, seen map[format.PageID
 		return nerr.New(nerr.Corruption, "btree.OwnedPages", "page cycle or duplicate child")
 	}
 	seen[id] = struct{}{}
+	if height == 1 && !readLeaves {
+		return nil
+	}
 	h, err := t.pin(id)
 	if err != nil {
 		return err
@@ -74,11 +104,11 @@ func (t *Tree) collectOwned(id format.PageID, height int, seen map[format.PageID
 	if hdr.leftmost == 0 {
 		return nerr.New(nerr.Corruption, "btree.OwnedPages", "internal node missing leftmost child")
 	}
-	if err := t.collectOwned(hdr.leftmost, height-1, seen); err != nil {
+	if err := t.collectOwned(hdr.leftmost, height-1, readLeaves, seen); err != nil {
 		return err
 	}
 	for _, ent := range ents {
-		if err := t.collectOwned(ent.child, height-1, seen); err != nil {
+		if err := t.collectOwned(ent.child, height-1, readLeaves, seen); err != nil {
 			return err
 		}
 	}

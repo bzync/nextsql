@@ -561,7 +561,17 @@ func (e *Engine) NewPage(typ format.PageType) (*buffer.Handle, error) {
 	if err != nil {
 		return nil, err
 	}
-	return e.Buffer.InstallNew(id, typ)
+	h, err := e.Buffer.InstallNew(id, typ)
+	if err != nil {
+		// A failed install left the page unused, so the id goes back. The one
+		// exception is a page already cached: that page is live, and must stay
+		// off the freelist.
+		if !nerr.HasCode(err, nerr.Corruption) {
+			_ = e.Alloc.Free(id)
+		}
+		return nil, err
+	}
+	return h, nil
 }
 
 func (e *Engine) PrimaryTree() (format.PageID, uint16) {

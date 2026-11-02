@@ -1314,3 +1314,40 @@ func damageFreelist(t *testing.T, dir, keyFile string) {
 		t.Fatal(err)
 	}
 }
+
+func TestLifecycleUpgradeFailsOnDamagedPages(t *testing.T) {
+	dir := t.TempDir()
+	keyFile := filepath.Join(t.TempDir(), "root.key")
+	createLegacyDatabase(t, dir, keyFile)
+	args := []string{"--data-dir", dir, "--key-file", keyFile}
+	if err := lifecycleUpgrade(args); err != nil {
+		t.Fatalf("healthy database: %v", err)
+	}
+	damageFreelist(t, dir, keyFile)
+	if err := lifecycleUpgrade(args); !nerr.HasCode(err, nerr.Corruption) {
+		t.Fatalf("damaged database: %v", err)
+	}
+}
+
+// A server refuses to start on a damaged database, so export and import must
+// still work as the way out.
+func TestDamagedDatabaseCanBeExportedToACleanOne(t *testing.T) {
+	dir := t.TempDir()
+	keyFile := filepath.Join(t.TempDir(), "root.key")
+	createLegacyDatabase(t, dir, keyFile)
+	damageFreelist(t, dir, keyFile)
+	if err := checkPages([]string{"--data-dir", dir, "--key-file", keyFile}); !nerr.HasCode(err, nerr.Corruption) {
+		t.Fatalf("damaged database: %v", err)
+	}
+	out := filepath.Join(t.TempDir(), "export")
+	if err := exportDB([]string{"--data-dir", dir, "--key-file", keyFile, "--out", out}); err != nil {
+		t.Fatalf("export: %v", err)
+	}
+	clean := t.TempDir()
+	if err := importDB([]string{"--from", out, "--data-dir", clean, "--key-file", keyFile}); err != nil {
+		t.Fatalf("import: %v", err)
+	}
+	if err := checkPages([]string{"--data-dir", clean, "--key-file", keyFile}); err != nil {
+		t.Fatalf("imported database: %v", err)
+	}
+}

@@ -59,6 +59,9 @@ func (db *DB) DispatchDueSchedules(ctx context.Context, now time.Time, limit int
 	if nowNS <= 0 {
 		return 0, nerr.New(nerr.InvalidArgument, "executor.DispatchDueSchedules", "invalid dispatch time")
 	}
+	if due, err := db.catalogRangeHasEntries(catalog.ScheduleDueKey(0, 1), catalog.ScheduleDueRangeEnd(nowNS)); err != nil || !due {
+		return 0, err
+	}
 	s := db.Session()
 	if err := s.start(txn.SnapshotIsolation); err != nil {
 		return 0, err
@@ -224,6 +227,26 @@ func (db *DB) DispatchDueSchedules(ctx context.Context, now time.Time, limit int
 	return created, nil
 }
 
+// catalogRangeHasEntries reports whether a catalog key range holds anything,
+// using a read-only transaction. The task runtime polls several times a second,
+// so an idle poll must not write Begin, Abort or Commit records to the WAL.
+func (db *DB) catalogRangeHasEntries(start, end []byte) (bool, error) {
+	s := db.Session()
+	if err := s.startRead(txn.SnapshotIsolation); err != nil {
+		return false, err
+	}
+	defer func() { _ = s.abort() }()
+	found := false
+	err := s.x.use(db.CatTree).Range(start, end, func(_, _ []byte) error {
+		found = true
+		return errTaskScanLimit
+	})
+	if err != nil && !errors.Is(err, errTaskScanLimit) {
+		return false, err
+	}
+	return found, nil
+}
+
 type taskDueEntry struct {
 	key  []byte
 	id   string
@@ -255,6 +278,9 @@ func (db *DB) ClaimDueTasks(ctx context.Context, now time.Time, limit int) ([]*c
 	nowNS := now.UTC().UnixNano()
 	if nowNS <= 0 {
 		return nil, nerr.New(nerr.InvalidArgument, "executor.ClaimDueTasks", "invalid claim time")
+	}
+	if due, err := db.catalogRangeHasEntries(catalog.TaskDueKey(0, ""), catalog.TaskDueRangeEnd(nowNS)); err != nil || !due {
+		return nil, err
 	}
 	s := db.Session()
 	if err := s.start(txn.SnapshotIsolation); err != nil {
@@ -599,6 +625,9 @@ func (db *DB) PurgeTaskHistory(ctx context.Context, now time.Time, limit int) (i
 	nowNS := now.UTC().UnixNano()
 	if nowNS <= 0 {
 		return 0, nerr.New(nerr.InvalidArgument, "executor.PurgeTaskHistory", "invalid purge time")
+	}
+	if due, err := db.catalogRangeHasEntries(catalog.TaskRetentionKey(0, ""), catalog.TaskRetentionRangeEnd(nowNS)); err != nil || !due {
+		return 0, err
 	}
 	s := db.Session()
 	if err := s.start(txn.SnapshotIsolation); err != nil {

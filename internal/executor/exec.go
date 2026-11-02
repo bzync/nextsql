@@ -301,17 +301,13 @@ func (s *Session) execCreateTable(p planner.CreateTable) (*Result, error) {
 	if history && !catalog.MatchHistoryDDL(s.execSQL) {
 		return nil, nerr.New(nerr.InvalidArgument, "executor.CreateTable", "nsql_schema_migrations must use the reserved history DDL")
 	}
-	s.db.Eng.Enter(s.x.owner.Storage())
-	heap, err := btree.CreateDetached(s.db.Eng)
-	s.db.Eng.Leave(s.x.owner.Storage())
+	heap, err := s.createTxnTree()
 	if err != nil {
 		return nil, err
 	}
 	p.Table.HeapMeta = heap.Meta()
 	if p.Table.HasVector() {
-		s.db.Eng.Enter(s.x.owner.Storage())
-		vs, err := btree.CreateDetached(s.db.Eng)
-		s.db.Eng.Leave(s.x.owner.Storage())
+		vs, err := s.createTxnTree()
 		if err != nil {
 			return nil, err
 		}
@@ -330,18 +326,14 @@ func (s *Session) execCreateTable(p planner.CreateTable) (*Result, error) {
 			s.pending.partIdxs = make(map[string]*btree.Tree)
 		}
 		for i := range p.Table.Partitioning.Partitions {
-			s.db.Eng.Enter(s.x.owner.Storage())
-			ph, err := btree.CreateDetached(s.db.Eng)
-			s.db.Eng.Leave(s.x.owner.Storage())
+			ph, err := s.createTxnTree()
 			if err != nil {
 				return nil, err
 			}
 			p.Table.Partitioning.Partitions[i].HeapMeta = ph.Meta()
 			s.pending.partHeaps[partitionHeapKey(p.Table.Name, p.Table.Partitioning.Partitions[i].ID)] = ph
 			if p.Table.HasVector() {
-				s.db.Eng.Enter(s.x.owner.Storage())
-				pv, err := btree.CreateDetached(s.db.Eng)
-				s.db.Eng.Leave(s.x.owner.Storage())
+				pv, err := s.createTxnTree()
 				if err != nil {
 					return nil, err
 				}
@@ -434,9 +426,7 @@ func (s *Session) buildPartitionedIndex(tab *catalog.Table, idx catalog.Index, p
 		if err != nil {
 			return nil, err
 		}
-		s.db.Eng.Enter(s.x.owner.Storage())
-		local, err := btree.CreateDetached(s.db.Eng)
-		s.db.Eng.Leave(s.x.owner.Storage())
+		local, err := s.createTxnTree()
 		if err != nil {
 			return nil, err
 		}
@@ -518,9 +508,7 @@ func (s *Session) populatePartitionIndex(tab *catalog.Table, idx catalog.Index, 
 }
 
 func (s *Session) buildIndex(tab *catalog.Table, idx catalog.Index, progress *rebuildProgress) (catalog.Index, error) {
-	s.db.Eng.Enter(s.x.owner.Storage())
-	ix, err := btree.CreateDetached(s.db.Eng)
-	s.db.Eng.Leave(s.x.owner.Storage())
+	ix, err := s.createTxnTree()
 	if err != nil {
 		return catalog.Index{}, err
 	}

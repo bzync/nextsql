@@ -312,6 +312,9 @@ func run() error {
 		if err := validateHostedDatabase(hostingRegistry, hostedDatabase, db); err != nil {
 			return err
 		}
+		if err := refuseDamagedFreelist(db); err != nil {
+			return err
+		}
 		applyHostedStorageCap(db, hostedRealm, hostedDatabase)
 		applyOps(db, cfg)
 		if err := installArchiver(db, keys, cfg.WalArchive); err != nil {
@@ -685,6 +688,11 @@ func run() error {
 				return err
 			}
 			if err := validateHostedDatabase(hostingRegistry, hostedDatabase, openedDB); err != nil {
+				_ = openedDB.Close()
+				_ = opened.Close()
+				return err
+			}
+			if err := refuseDamagedFreelist(openedDB); err != nil {
 				_ = openedDB.Close()
 				_ = opened.Close()
 				return err
@@ -1344,6 +1352,21 @@ func startDatabaseBackground(ctx context.Context, db *executor.DB, cfg config.Co
 // A ticker invokes tick serially, so one database has at most one scheduled
 // checkpoint in flight. Shutdown cancels the loop before DB.Close performs
 // its final checkpoint, avoiding a close/checkpoint race.
+// refuseDamagedFreelist stops the server before it can issue a live page as a
+// new one, which would replace it with an empty page. Releases up to 0.0.7 could
+// leave a live page on the persisted freelist.
+func refuseDamagedFreelist(db *executor.DB) error {
+	conflicts, err := db.FreelistConflicts()
+	if err != nil {
+		return err
+	}
+	if len(conflicts) > 0 {
+		return nerr.New(nerr.Corruption, "nextsqld", fmt.Sprintf(
+			"%d live pages are on the page freelist; refusing to start because writes could destroy them. Run nextsql check-pages (see docs/ops.md)", len(conflicts)))
+	}
+	return nil
+}
+
 func startCheckpointController(ctx context.Context, db *executor.DB, intervalMS int, log *slog.Logger) func() {
 	if db == nil || intervalMS <= 0 {
 		return func() {}

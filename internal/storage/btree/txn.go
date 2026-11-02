@@ -131,18 +131,6 @@ func (tx *Txn) RestoreSnap() {
 	tx.tree.mu.Unlock()
 }
 
-// WasEmpty reports whether this tree had no root at all when this
-// transaction attached to it (BeginTxn/Attach) — i.e. the tree is entirely
-// new to this transaction, such as a fresh CREATE TABLE/INDEX heap or a
-// standalone detached tree. Only in that case can every page the tree ends
-// up owning be safely reclaimed if the transaction rolls back: nothing
-// outside this transaction could ever have referenced a page of a tree that
-// did not exist yet, so unlike an ordinary pre-existing tree there is no
-// concurrent-writer or structural-sharing hazard to worry about.
-func (tx *Txn) WasEmpty() bool {
-	return tx != nil && tx.snapR == 0
-}
-
 func (tx *Txn) MarkDone() {
 	if tx != nil {
 		tx.done = true

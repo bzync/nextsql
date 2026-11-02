@@ -194,6 +194,9 @@ newer than the on-disk one and is shared by every writer, so a reload returns
 pages that running transactions took, and pages a rolled-back transaction left
 linked into a tree. `Alloc` would then issue those pages a second time.
 
+`Reload` validates the whole chain before replacing any state, so a failed reload
+leaves the allocator unchanged.
+
 `btree.Tree.OwnedPages` performs the fail-closed ownership walk used by storage
 reclamation. It returns the detached metadata page plus every internal and leaf
 page, rejects cycles/duplicate children and wrong page types, and is stable

@@ -83,6 +83,8 @@ func run(args []string) error {
 		return importDB(args[1:])
 	case "diagnose":
 		return diagnoseDB(args[1:])
+	case "check-pages":
+		return checkPages(args[1:])
 	case "status":
 		return statusDB(args[1:])
 	case "cluster":
@@ -1611,6 +1613,97 @@ func diagnoseDB(args []string) error {
 	return nil
 }
 
+// checkPagesPrintLimit bounds how many pages of each conflict kind the text
+// report lists. --json carries all of them.
+const checkPagesPrintLimit = 100
+
+// checkPages looks for pages with conflicting owners, such as a live page on
+// the freelist. It repairs nothing, and takes the deployment lock so the result
+// describes a database no server is changing.
+func checkPages(args []string) error {
+	fs := flag.NewFlagSet("check-pages", flag.ContinueOnError)
+	dataDir := fs.String("data-dir", "", "directory containing nextsql.db")
+	keyFile := fs.String("key-file", "", "root unlock key file")
+	bufferPages := fs.Int("buffer-pages", config.DefaultBufferPages, "buffer pool pages")
+	asJSON := fs.Bool("json", false, "print the full report as JSON")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *dataDir == "" || *keyFile == "" {
+		return cli.LocalMissing("nextsql check-pages", "--data-dir and --key-file are required")
+	}
+	if err := limits.Check("buffer_pages", *bufferPages); err != nil {
+		return nerr.New(nerr.InvalidArgument, "nextsql check-pages", err.Error())
+	}
+	lock, err := hosting.AcquireDataDirLock(*dataDir)
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
+	keys, env, err := openEnvelope(*dataDir, *keyFile)
+	if err != nil {
+		return err
+	}
+	if env != nil {
+		defer env.Close()
+	}
+	db, err := executor.Open(filepath.Join(*dataDir, config.DataFileName), keys, *bufferPages)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	rep, err := db.CheckPageOwnership()
+	if err != nil {
+		return err
+	}
+	if *asJSON {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		if err := enc.Encode(rep); err != nil {
+			return err
+		}
+	} else {
+		writePageReport(os.Stdout, rep)
+	}
+	if !rep.Clean() {
+		return nerr.New(nerr.Corruption, "nextsql check-pages",
+			"page ownership conflicts found; stop writes to this database and restore from a clean backup (see docs/ops.md)")
+	}
+	return nil
+}
+
+func writePageReport(w io.Writer, rep *executor.PageOwnershipReport) {
+	fmt.Fprintf(w, "allocated_pages %d\nowned_pages %d\nfree_pages %d\nmetadata_pages %d\norphan_pages %d\n",
+		rep.AllocatedPages, rep.OwnedPages, rep.FreePages, rep.MetadataPages, len(rep.Orphans))
+	for _, kind := range []struct {
+		name  string
+		pages []executor.PageConflict
+	}{
+		{"free_and_owned", rep.FreeAndOwned},
+		{"metadata_and_owned", rep.MetadataAndOwned},
+		{"shared_pages", rep.SharedPages},
+		{"out_of_range", rep.OutOfRange},
+	} {
+		fmt.Fprintf(w, "%s %d\n", kind.name, len(kind.pages))
+		for i, c := range kind.pages {
+			if i == checkPagesPrintLimit {
+				fmt.Fprintf(w, "  ... %d more (use --json)\n", len(kind.pages)-i)
+				break
+			}
+			fmt.Fprintf(w, "  page %d owners %q\n", c.Page, c.Owners)
+		}
+	}
+	fmt.Fprintf(w, "broken_trees %d\n", len(rep.BrokenTrees))
+	for _, b := range rep.BrokenTrees {
+		fmt.Fprintf(w, "  %q: %s\n", b.Owner, b.Error)
+	}
+	if rep.Clean() {
+		fmt.Fprintln(w, "result clean")
+	} else {
+		fmt.Fprintln(w, "result damaged")
+	}
+}
+
 func statusDB(args []string) error {
 	fs := flag.NewFlagSet("status", flag.ContinueOnError)
 	local := fs.Bool("local", false, "inspect the data directory instead of dialing nextsqld")
@@ -2353,6 +2446,7 @@ Usage:
   nextsql export --data-dir DIR --key-file FILE --out DIR
   nextsql import --from DIR --data-dir DIR --key-file FILE
   nextsql diagnose --data-dir DIR
+  nextsql check-pages --data-dir DIR --key-file FILE [--buffer-pages N] [--json]
   nextsql status [--addr HOST:PORT] [--user NAME] [--password-file FILE | --idp NAME]
                  [--database NAME]
                  [--tls-ca FILE [--tls-server-name NAME] [--tls-client-cert FILE --tls-client-key FILE] | --insecure]

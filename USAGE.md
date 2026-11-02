@@ -931,6 +931,7 @@ nextsql verify   --from DIR --key-file FILE
 nextsql export   --data-dir DIR --key-file FILE --out DIR
 nextsql import   --from DIR --data-dir DIR --key-file FILE
 nextsql diagnose --data-dir DIR
+nextsql check-pages --data-dir DIR --key-file FILE [--buffer-pages N] [--json]
 nextsql status   [--addr HOST:PORT] [--user NAME] [--password-file FILE | --idp NAME]
                  [--database NAME] [--tls-ca FILE | --insecure]
                  [--env-file PATH | --no-env]

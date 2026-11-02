@@ -24,9 +24,12 @@ field encryption automatically.
 ./nextsql status
 ./nextsql status --local --data-dir /var/lib/nextsql --key-file /etc/nextsql/root.key
 ./nextsql diagnose --data-dir /var/lib/nextsql
+./nextsql check-pages --data-dir /var/lib/nextsql --key-file /etc/nextsql/root.key
 ```
 
 `nextsql status` (default) is **server mode**. It dials a running `nextsqld`, completes the NSQL handshake, and prints `mode server`, `addr`, `user`, `database`, and `ok`. It does not open the data directory and does not print LSNs. Connection flags and dotenv match `exec`. Mixing `--data-dir` / `--key-file` onto server-mode `status` is an error.
+
+`nextsql check-pages` looks for damage from a page issued twice, which releases up to and including 0.0.7 could cause after a rollback. Stop `nextsqld` first, or run it on a restored backup. It repairs nothing, and exits 5 with `result damaged` if it finds a conflict.
 
 `nextsql status --local` is the data-directory inspect: format-family versions plus opened table count, `durable_lsn` / `checkpoint_lsn` / `next_lsn`, isolated-page count, query/error/commit counters, admission inflight/queue, and cluster fields when Raft is running.
 

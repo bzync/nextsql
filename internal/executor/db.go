@@ -1373,32 +1373,9 @@ func (db *DB) OrphanPages() ([]format.PageID, error) {
 	db.applyMu.Lock()
 	defer db.applyMu.Unlock()
 
-	db.mu.RLock()
-	trees := make([]*btree.Tree, 0, 1+len(db.heaps)+len(db.vecs)+len(db.idxs)+len(db.partHeaps)+len(db.partVecs)+len(db.partIdxs))
-	trees = append(trees, db.CatTree)
-	for _, tr := range db.heaps {
-		trees = append(trees, tr)
-	}
-	for _, tr := range db.vecs {
-		trees = append(trees, tr)
-	}
-	for _, tr := range db.idxs {
-		trees = append(trees, tr)
-	}
-	for _, tr := range db.partHeaps {
-		trees = append(trees, tr)
-	}
-	for _, tr := range db.partVecs {
-		trees = append(trees, tr)
-	}
-	for _, tr := range db.partIdxs {
-		trees = append(trees, tr)
-	}
-	db.mu.RUnlock()
-
 	reachable := make(map[format.PageID]struct{})
-	for _, tr := range trees {
-		pages, err := tr.OwnedPages()
+	for _, tr := range db.ownedTrees() {
+		pages, err := tr.tree.OwnedPages()
 		if err != nil {
 			return nil, err
 		}

@@ -21,9 +21,12 @@ func (t *Tree) checkLocked() error {
 	if t.height < 1 {
 		return nerr.New(nerr.Corruption, "btree.Check", "invalid height")
 	}
-	root, height := t.eng.PrimaryTree()
-	if root != t.root || int(height) != t.height {
-		return nerr.New(nerr.Corruption, "btree.Check", "in-memory root does not match superblock")
+	// A detached tree's root lives in its own metadata page, not the superblock.
+	if t.meta == 0 {
+		root, height := t.eng.PrimaryTree()
+		if root != t.root || int(height) != t.height {
+			return nerr.New(nerr.Corruption, "btree.Check", "in-memory root does not match superblock")
+		}
 	}
 	seen := map[format.PageID]struct{}{}
 	minKey, maxKey, leaves, err := t.walk(t.root, t.height, nil, nil, seen)

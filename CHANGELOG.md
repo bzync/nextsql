@@ -17,7 +17,15 @@ different bits.
 
 ### Fixed
 
-- **Data-integrity bug:** a rollback could put pages that were still in use back on the page freelist. Any rollback triggered it, including the empty transaction the task runtime aborts every 250 ms when idle, so it could fire during a migration or other write load once the freelist held pages. The next allocation then failed with `page already cached` or, if the page had left the buffer pool, silently replaced a live page with an empty one. Rollback no longer reloads the allocator.
+- **Data-integrity bug:** a rollback could put pages that were still in use back on the page freelist. Any rollback triggered it, including the empty transaction the task runtime aborts every 250 ms when idle, so it could fire during a migration or other write load once the freelist held pages. The next allocation then failed with `page already cached` or, if the page had left the buffer pool, silently replaced a live page with an empty one. Rollback no longer reloads the allocator. This does not repair a database that was already affected; run `nextsql check-pages` to find out.
+
+### Added
+
+- `nextsql check-pages`: an offline, read-only check for pages with conflicting owners and for broken B+Tree structure, including live pages on the freelist. See `docs/ops.md`.
+
+### Changed
+
+- `btree.Tree.Check` now works on detached trees, so heaps and indexes can be structure-checked.
 
 ## [0.0.7] — 2026-10-29
 

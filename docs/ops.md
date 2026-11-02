@@ -74,6 +74,46 @@ against the primary/catalog tree, all catalog-owned detached trees, durable free
 IDs, and freelist metadata. It returns only page IDs that are allocated but
 unreachable; it never automatically frees a suspected orphan.
 
+### Checking page ownership
+
+```text
+nextsql check-pages --data-dir DIR --key-file FILE [--buffer-pages N] [--json]
+```
+
+`check-pages` looks for damage from a page issued twice. Releases up to and
+including 0.0.7 could do this after a rollback, and upgrading does not repair a
+database that was already affected. Run it once after upgrading from one of
+those releases, and on every cluster node. Each node has its own data file.
+
+It holds the deployment lock, so stop `nextsqld` first. To avoid downtime, run it
+on a restored copy of a recent backup; a backup can carry the same damage. It
+repairs nothing, but opening the database runs normal crash recovery and any
+pending page reclamation, the same as a server start. It reads every tree page
+about three times (measured: 26,525 page reads on a 138 MiB database, 236 ms with
+a warm disk cache), so allow for roughly three full scans of the database.
+
+| Field | Meaning |
+|---|---|
+| `free_and_owned` | A live page is on the freelist. The next allocation can replace it with an empty page. |
+| `metadata_and_owned` | A tree page is also a freelist metadata page. |
+| `shared_pages` | More than one tree claims the page. |
+| `out_of_range` | A tree links to a page at or above the allocation high-water mark. |
+| `broken_trees` | A tree failed its structure check: page types, key order, separators, or leaf links. Scans of it can fail. |
+| `orphan_pages` | Allocated pages nothing refers to. This wastes space and does not fail the check. When a tree is broken it is unknown: text output prints 0 and `--json` prints `null`. |
+
+The command prints `result clean` and exits 0, or prints `result damaged` and
+exits 5. It also exits 5 when the database cannot be opened, for example when a
+tree's metadata page was replaced. It exits 2 when the lock is held.
+
+If the result is `damaged`, stop writes, because a later allocation can destroy
+more data. There is no in-place repair. Restore the most recent backup that
+passes this check, then replay WAL only up to a point that also passes.
+
+A clean result covers tree structure and page ownership. It does not prove that
+every row is present. An instance that logged `page already cached` can also
+check clean, because that error usually aborts the statement before any damage
+commits.
+
 ## Metrics
 
 `internal/metrics` is a process/registry of counters and a latency ring

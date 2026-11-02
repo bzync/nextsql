@@ -829,6 +829,7 @@ func TestLocalCommandsMissingDataDirExit7(t *testing.T) {
 	}{
 		{"init", func() error { return initDB(nil) }},
 		{"diagnose", func() error { return diagnoseDB(nil) }},
+		{"check-pages", func() error { return checkPages(nil) }},
 		{"cluster", func() error { return clusterCmd([]string{"status"}) }},
 		{"backup", func() error { return backupDB([]string{"--out", "/tmp/out"}) }},
 		{"verify", func() error { return verifyBackup([]string{"--from", "/tmp/from"}) }},
@@ -1227,5 +1228,89 @@ func TestInitNamingADatabaseLaterCompletesTheDeployment(t *testing.T) {
 	}
 	if err := store.Verify("admin", "adminpassword"); err != nil {
 		t.Fatalf("the administrator created before the database must still authenticate: %v", err)
+	}
+}
+
+func TestCheckPagesReportsCleanThenDamage(t *testing.T) {
+	dir := t.TempDir()
+	keyFile := filepath.Join(t.TempDir(), "root.key")
+	createLegacyDatabase(t, dir, keyFile)
+	args := []string{"--data-dir", dir, "--key-file", keyFile}
+
+	if err := checkPages(args); err != nil {
+		t.Fatalf("healthy database: %v", err)
+	}
+
+	// A running server holds the lock, and the check must not race it.
+	lock, err := hosting.AcquireDataDirLock(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := checkPages(args); !nerr.HasCode(err, nerr.Unavailable) {
+		t.Fatalf("with the deployment lock held: %v", err)
+	}
+	if err := lock.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	damageFreelist(t, dir, keyFile)
+
+	err = checkPages(args)
+	if !nerr.HasCode(err, nerr.Corruption) {
+		t.Fatalf("damaged database: %v", err)
+	}
+	if cli.Code(err) != cli.ExitSQL {
+		t.Fatalf("exit code = %d, want %d", cli.Code(err), cli.ExitSQL)
+	}
+}
+
+func TestWritePageReport(t *testing.T) {
+	conflicts := make([]executor.PageConflict, checkPagesPrintLimit+5)
+	for i := range conflicts {
+		conflicts[i] = executor.PageConflict{Page: format.PageID(i + 1), Owners: []string{"heap t"}}
+	}
+	var out bytes.Buffer
+	writePageReport(&out, &executor.PageOwnershipReport{FreeAndOwned: conflicts})
+	for _, want := range []string{"free_and_owned 105\n", `page 1 owners ["heap t"]`, "... 5 more (use --json)", "result damaged\n"} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("report lacks %q:\n%s", want, out.String())
+		}
+	}
+	if strings.Contains(out.String(), "page 101 ") {
+		t.Fatalf("report ignored the print limit:\n%s", out.String())
+	}
+	out.Reset()
+	writePageReport(&out, &executor.PageOwnershipReport{})
+	if !strings.Contains(out.String(), "result clean\n") {
+		t.Fatalf("empty report:\n%s", out.String())
+	}
+}
+
+// damageFreelist commits a live page onto the persisted freelist, the state the
+// rollback bug in releases up to 0.0.7 could leave behind.
+func damageFreelist(t *testing.T, dir, keyFile string) {
+	t.Helper()
+	keys, env, err := openEnvelope(dir, keyFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if env != nil {
+		defer env.Close()
+	}
+	db, err := executor.Open(filepath.Join(dir, config.DataFileName), keys, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	live, _ := db.Eng.PrimaryTree()
+	txn, err := db.Eng.StartTxn()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Eng.Alloc.Free(live); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Eng.CommitTxn(txn); err != nil {
+		t.Fatal(err)
 	}
 }

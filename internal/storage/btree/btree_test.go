@@ -1548,3 +1548,60 @@ func TestPageTypesKnown(t *testing.T) {
 		t.Fatal("unknown type")
 	}
 }
+
+// Check must cover detached trees: heaps and indexes keep their root in a
+// metadata page, and scans fail on the leaf links this walk validates.
+func TestCheckDetachedTreeFindsBrokenLeafLink(t *testing.T) {
+	e, err := storage.Create(filepath.Join(t.TempDir(), "nextsql.db"), testKeys(t), 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	if err := e.BeginWrite(); err != nil {
+		t.Fatal(err)
+	}
+	tr, err := CreateDetached(e)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	body := bytes.Repeat([]byte("x"), 600)
+	for i := 0; i < 200; i++ {
+		if err := tr.Insert([]byte(fmt.Sprintf("%04d", i)), body); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if tr.height < 2 {
+		t.Fatalf("height = %d, want a split tree", tr.height)
+	}
+	if err := tr.Check(); err != nil {
+		t.Fatalf("healthy detached tree: %v", err)
+	}
+	pages, err := tr.OwnedPages()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var leaf format.PageID
+	for _, id := range pages {
+		h, err := e.Pin(id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		isLeaf := h.Page().Type() == format.PageTypeBTreeLeaf
+		if err := h.Release(false); err != nil {
+			t.Fatal(err)
+		}
+		if isLeaf {
+			leaf = id
+			break
+		}
+	}
+	if err := tr.setSiblingNext(leaf, pages[0]); err != nil {
+		t.Fatal(err)
+	}
+	if err := tr.Check(); !nerr.HasCode(err, nerr.Corruption) {
+		t.Fatalf("broken leaf link: %v", err)
+	}
+}

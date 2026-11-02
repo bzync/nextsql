@@ -15,6 +15,10 @@ different bits.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Data-integrity bug:** a rollback could put pages that were still in use back on the page freelist. Any rollback triggered it, including the empty transaction the task runtime aborts every 250 ms when idle, so it could fire during a migration or other write load once the freelist held pages. The next allocation then failed with `page already cached` or, if the page had left the buffer pool, silently replaced a live page with an empty one. Rollback no longer reloads the allocator.
+
 ## [0.0.7] — 2026-10-29
 
 ### Added

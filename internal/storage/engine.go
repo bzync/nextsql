@@ -1332,7 +1332,6 @@ func (e *Engine) executeReplBatch(batch []*replCommitReq) {
 				e.TM.Abort(t.id)
 			}
 		}
-		_ = e.Alloc.Reload()
 		for _, p := range prepared {
 			p.req.done <- rerr
 		}
@@ -1461,12 +1460,7 @@ func (e *Engine) appendCommitBodyLocked(txn *Txn, pageWriteHeld bool) error {
 	// AllowFlush refusing eviction while txn is still in e.writers),
 	// Allocator.Flush persists directly to the data file's
 	// superblock/freelist pages with no durability gate of its own and no
-	// undo log — Alloc.Reload() only re-reads whatever is already on disk,
-	// it cannot revert a persist that already happened. Calling it before
-	// a hold resolves would make finishCommitDiscarded's Alloc.Reload()
-	// silently fail to undo the discarded transaction's page allocations
-	// (it would just reload the same, already-persisted state back). It
-	// runs instead in finishCommitOK, once the transaction is known to be
+	// undo log. It runs instead in finishCommitOK, once the transaction is known to be
 	// actually committing (both here for the non-replicated path, where
 	// this is the very next call, and after a hold resolves) — see
 	// AllocState's own record below, which reads Allocator's in-memory
@@ -1694,9 +1688,9 @@ func (e *Engine) completeCommitLocked(txn *Txn) {
 
 // finishCommitDiscarded undoes a held commit whose replication is known to
 // have never reached Raft: it splices the held CommitRec back out (it
-// never touches disk) and then runs the same buffer-pool/allocator undo
-// and WAL-abort sequence RollbackTxn uses for an ordinary ROLLBACK,
-// including running the buffer/allocator undo without e.mu held — Buffer
+// never touches disk) and then runs the same buffer-pool undo and WAL-abort
+// sequence RollbackTxn uses for an ordinary ROLLBACK, including running the
+// buffer undo without e.mu held — Buffer
 // callbacks (Pin → OnPin) re-enter e.mu, so holding it here would
 // deadlock, exactly the reason RollbackTxn already drops it first.
 // preReplLSN is prepareCommitLocked's pre-scan watermark: since nothing in
@@ -1736,7 +1730,7 @@ func (e *Engine) finishCommitDiscarded(txn *Txn, preReplLSN format.LSN) error {
 	if e.TM != nil {
 		e.TM.Abort(txn.id)
 	}
-	return e.Alloc.Reload()
+	return nil
 }
 
 func (e *Engine) Rollback() error {
@@ -1803,7 +1797,11 @@ func (e *Engine) RollbackTxn(txn *Txn) error {
 	if e.TM != nil {
 		e.TM.Abort(txn.id)
 	}
-	_ = e.Alloc.Reload()
+	// The allocator is deliberately left alone. Its state is shared by every
+	// writer, and rollback keeps structure: a page this transaction split into
+	// a tree stays linked there. Rereading the on-disk freelist would put both
+	// kinds of page back on it, to be issued a second time. A page the rollback
+	// leaves unreferenced is a leak OrphanPages reports, not a double owner.
 	if e.repl != nil {
 		e.replMu.Lock()
 		e.mu.Lock()

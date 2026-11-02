@@ -141,7 +141,7 @@ version in the WAL's `Undo` record would let WAL order alone provide this,
 and would also give followers the undo they currently lack
 (`docs/production/GAPS.md`).
 
-In-process rollback applies the transaction's undo chain, then restores pages that only that transaction dirtied.
+In-process rollback applies the transaction's undo chain, then restores pages that only that transaction dirtied. It does not touch allocator state: the allocator is shared by every writer, and a page the transaction split into a tree stays linked there (see `docs/storage-format.md`).
 
 ## API
 

@@ -648,3 +648,161 @@ func TestCommitFailsClosedAfterDurabilityFault(t *testing.T) {
 		t.Fatalf("pre-fault commit lost: got %q", got)
 	}
 }
+
+// freePersistedPages leaves n page ids on the durable freelist, the state a
+// database is in once a DROP has been reclaimed.
+func freePersistedPages(t *testing.T, e *Engine, n int) []format.PageID {
+	t.Helper()
+	ids := make([]format.PageID, n)
+	for i := range ids {
+		h, err := e.NewSlotted()
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids[i] = h.ID()
+		if err := h.Release(true); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := e.ReclaimPages(ids); err != nil {
+		t.Fatal(err)
+	}
+	return ids
+}
+
+// allocInTxn allocates a page the way a B+tree split does: inside a page-writing
+// operation of t. The page stays in use whatever later happens to t.
+func allocInTxn(t *testing.T, e *Engine, txn *Txn, body []byte) format.PageID {
+	t.Helper()
+	e.Enter(txn)
+	defer e.Leave(txn)
+	h, err := e.NewSlotted()
+	if err != nil {
+		t.Fatalf("allocate page: %v", err)
+	}
+	if _, err := h.Page().Insert(body); err != nil {
+		t.Fatal(err)
+	}
+	id := h.ID()
+	if err := h.Release(true); err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
+// An idle rollback must not touch allocator state owned by other writers. The
+// task runtime aborts an empty transaction on every poll, so a reload here
+// handed a running writer's page out a second time: "page already cached" when
+// the page was still in the pool.
+func TestRollbackDoesNotReissueAnotherWritersPage(t *testing.T) {
+	e, err := Create(filepath.Join(t.TempDir(), "nextsql.db"), testKeys(t), 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	freePersistedPages(t, e, 4)
+
+	writer, err := e.StartTxn()
+	if err != nil {
+		t.Fatal(err)
+	}
+	inUse := allocInTxn(t, e, writer, []byte("writer"))
+
+	idle, err := e.StartTxn()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.RollbackTxn(idle); err != nil {
+		t.Fatal(err)
+	}
+
+	if next := allocInTxn(t, e, writer, []byte("next")); next == inUse {
+		t.Fatalf("page %d was issued twice", inUse)
+	}
+	if err := e.CommitTxn(writer); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// The same reissue without the error: once the page has been evicted nothing
+// stops InstallNew, and a live page is silently replaced by an empty one.
+func TestRollbackDoesNotOverwriteEvictedPage(t *testing.T) {
+	e, err := Create(filepath.Join(t.TempDir(), "nextsql.db"), testKeys(t), 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	freePersistedPages(t, e, 4)
+
+	writer, err := e.StartTxn()
+	if err != nil {
+		t.Fatal(err)
+	}
+	live := allocInTxn(t, e, writer, []byte("writer"))
+	idle, err := e.StartTxn()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.RollbackTxn(idle); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.CommitTxn(writer); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Buffer.FlushAll(); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Buffer.Drop(live); err != nil {
+		t.Fatal(err)
+	}
+
+	after, err := e.StartTxn()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next := allocInTxn(t, e, after, []byte("next")); next == live {
+		t.Fatalf("live page %d was issued again", live)
+	}
+	if err := e.CommitTxn(after); err != nil {
+		t.Fatal(err)
+	}
+	h, err := e.Pin(live)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Release(false)
+	if h.Page().LiveSlots() != 1 {
+		t.Fatalf("live page %d lost its contents: %d slots", live, h.Page().LiveSlots())
+	}
+}
+
+// Rollback keeps structure: a split page stays linked into the tree, because
+// rows may already have moved to it. Its id must not return to the freelist.
+func TestRollbackKeepsItsAllocatedPagesInUse(t *testing.T) {
+	e, err := Create(filepath.Join(t.TempDir(), "nextsql.db"), testKeys(t), 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	freePersistedPages(t, e, 4)
+
+	txn, err := e.StartTxn()
+	if err != nil {
+		t.Fatal(err)
+	}
+	split := allocInTxn(t, e, txn, []byte("split"))
+	if err := e.RollbackTxn(txn); err != nil {
+		t.Fatal(err)
+	}
+
+	after, err := e.StartTxn()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next := allocInTxn(t, e, after, []byte("next")); next == split {
+		t.Fatalf("page %d kept by a rollback was issued again", split)
+	}
+	if err := e.CommitTxn(after); err != nil {
+		t.Fatal(err)
+	}
+}

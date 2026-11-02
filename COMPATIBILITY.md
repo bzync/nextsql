@@ -133,6 +133,19 @@ A backup is not considered valid until verification and restore testing succeed.
 
 ## 8. Upgrade Policy
 
+### 0.0.7 to 0.0.8
+
+This release changes no persistent storage, WAL, catalog, backup, or NSQL wire format versions.
+It requires no data migration. Stop the daemon, replace the installed binaries, and restart.
+
+Earlier releases could damage a database through a rollback bug, and upgrading does not repair that.
+`nextsqld` 0.0.8 refuses to start if a live page is on the freelist, and `nextsql lifecycle upgrade` fails on any page ownership damage.
+Run `nextsql check-pages` on a restored copy of a recent backup before upgrading a database you depend on. See `docs/ops.md`.
+
+An allocator invariant failure now reports `corruption` instead of `already_exists`, and its message still contains `page already cached`.
+A client or harness that retries on that error should stop doing so.
+See the [0.0.8 release notes](docs/release-notes/0.0.8.md).
+
 ### 0.0.6 to 0.0.7
 
 This release changes no persistent storage, WAL, catalog, backup, or NSQL wire format versions.

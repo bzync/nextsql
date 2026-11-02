@@ -1,6 +1,76 @@
 {
   "releases": [
     {
+      "version": "0.0.8",
+      "title": "Data-integrity Fix for Page Reuse",
+      "status": "draft",
+      "channel": "preview",
+      "latest": false,
+      "releasedAt": "2026-11-03T00:00:00Z",
+      "summary": "Fixes a rollback bug that could reissue live pages and silently overwrite them, and adds nextsql check-pages to detect existing damage.",
+      "highlights": [
+        "Rollback no longer puts pages still in use back on the page freelist",
+        "nextsql check-pages detects page ownership damage from earlier releases",
+        "nextsqld refuses to start if a live page is on the freelist",
+        "The idle task runtime no longer writes to the WAL on every poll"
+      ],
+      "changes": [
+        {
+          "id": "rollback-reissue",
+          "kind": "fixed",
+          "area": "Engine",
+          "text": "A rollback could reissue live pages, causing page already cached errors or silently replacing a live page with an empty one."
+        },
+        {
+          "id": "check-pages",
+          "kind": "added",
+          "area": "CLI",
+          "text": "Add nextsql check-pages, an offline check for page ownership damage and broken B+Tree structure."
+        },
+        {
+          "id": "start-guard",
+          "kind": "changed",
+          "area": "Ops",
+          "text": "nextsqld refuses to start if a live page is on the freelist, and lifecycle upgrade fails on any page ownership damage."
+        },
+        {
+          "id": "idle-wal",
+          "kind": "fixed",
+          "area": "Engine",
+          "text": "The idle task runtime no longer writes to the WAL on every poll."
+        },
+        {
+          "id": "rollback-leak",
+          "kind": "fixed",
+          "area": "Engine",
+          "text": "A rolled-back CREATE TABLE or CREATE INDEX no longer leaks the new tree's pages."
+        }
+      ],
+      "artifacts": [
+        {
+          "id": "nextsql-0.0.8-linux-amd64.run",
+          "kind": "run",
+          "platform": "linux-amd64",
+          "filename": "nextsql-0.0.8-linux-amd64.run",
+          "url": "https://github.com/bzync/nextsql/releases/download/v0.0.8/nextsql-0.0.8-linux-amd64.run"
+        },
+        {
+          "id": "nextsql-0.0.8-linux-amd64.tar.gz",
+          "kind": "archive",
+          "platform": "linux-amd64",
+          "filename": "nextsql-0.0.8-linux-amd64.tar.gz",
+          "url": "https://github.com/bzync/nextsql/releases/download/v0.0.8/nextsql-0.0.8-linux-amd64.tar.gz"
+        },
+        {
+          "id": "nextsql_0.0.8_amd64.deb",
+          "kind": "deb",
+          "platform": "linux-amd64",
+          "filename": "nextsql_0.0.8_amd64.deb",
+          "url": "https://github.com/bzync/nextsql/releases/download/v0.0.8/nextsql_0.0.8_amd64.deb"
+        }
+      ]
+    },
+    {
       "version": "0.0.7",
       "title": "Performance, Driver Parity, and Tooling",
       "status": "published",
@@ -242,7 +312,7 @@
           "id": "c11",
           "kind": "added",
           "area": "Engine",
-          "text": "Page-delta WAL redo: a commit logs only the bytes that changed, about 8\u00d7 less disk writing per insert, without weakening fsync."
+          "text": "Page-delta WAL redo: a commit logs only the bytes that changed, about 8× less disk writing per insert, without weakening fsync."
         },
         {
           "id": "c12",

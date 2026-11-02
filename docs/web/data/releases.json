@@ -3,10 +3,10 @@
     {
       "version": "0.0.8",
       "title": "Data-integrity Fix for Page Reuse",
-      "status": "draft",
+      "status": "published",
       "channel": "preview",
-      "latest": false,
-      "releasedAt": "2026-11-03T00:00:00Z",
+      "latest": true,
+      "releasedAt": "2026-11-02T22:41:50Z",
       "summary": "Fixes a rollback bug that could reissue live pages and silently overwrite them, and adds nextsql check-pages to detect existing damage.",
       "highlights": [
         "Rollback no longer puts pages still in use back on the page freelist",
@@ -52,6 +52,8 @@
           "kind": "run",
           "platform": "linux-amd64",
           "filename": "nextsql-0.0.8-linux-amd64.run",
+          "size": 22651026,
+          "sha256": "9de507e6204ad23e74a015726a2c9db3aa08e58c438c75ac67028ab22b1ab876",
           "url": "https://github.com/bzync/nextsql/releases/download/v0.0.8/nextsql-0.0.8-linux-amd64.run"
         },
         {
@@ -59,6 +61,8 @@
           "kind": "archive",
           "platform": "linux-amd64",
           "filename": "nextsql-0.0.8-linux-amd64.tar.gz",
+          "size": 22649414,
+          "sha256": "f418e149e881554ca92ba333cf3fad47a58b7520841620c3e9700adb8cd12954",
           "url": "https://github.com/bzync/nextsql/releases/download/v0.0.8/nextsql-0.0.8-linux-amd64.tar.gz"
         },
         {
@@ -66,6 +70,8 @@
           "kind": "deb",
           "platform": "linux-amd64",
           "filename": "nextsql_0.0.8_amd64.deb",
+          "size": 18891576,
+          "sha256": "ffe83a1a5b9dd28fe9531a6a127e9235222eece866125ca2e01335333522d9b4",
           "url": "https://github.com/bzync/nextsql/releases/download/v0.0.8/nextsql_0.0.8_amd64.deb"
         }
       ]
@@ -75,7 +81,7 @@
       "title": "Performance, Driver Parity, and Tooling",
       "status": "published",
       "channel": "preview",
-      "latest": true,
+      "latest": false,
       "releasedAt": "2026-10-29T00:15:00Z",
       "summary": "Introduces B+Tree index min/max scan optimizations, administrative KILL SESSION, CLI stdin piping and CSV output, client-side statement caching for all official drivers, Studio workspace improvements, and repository Git standards.",
       "highlights": [

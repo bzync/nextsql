@@ -19,7 +19,7 @@ This guide covers:
 Before running NextSQL with Docker Compose, understand these fundamental architectural principles:
 
 ### Minimal Scratch Container
-The official image (`bzynchub/nextsql:0.0.9`) is built `FROM scratch`. It contains only:
+The official image (`bzynchub/nextsql:0.0.10`) is built `FROM scratch`. It contains only:
 - Static, unprivileged Go binaries (`nextsql`, `nextsqld`)
 - A lightweight PID-1 entrypoint (`nextsql-entrypoint`)
 - A system root CA bundle
@@ -94,7 +94,7 @@ A complete, production-ready single-node configuration:
 ```yaml
 services:
   nextsql:
-    image: bzynchub/nextsql:0.0.9
+    image: bzynchub/nextsql:0.0.10
     # Or build locally from source:
     # build: .
     restart: unless-stopped
@@ -180,7 +180,7 @@ When running an application service (e.g. Node.js, Go, Python, or Ruby) alongsid
 ```yaml
 services:
   nextsql:
-    image: bzynchub/nextsql:0.0.9
+    image: bzynchub/nextsql:0.0.10
     restart: unless-stopped
     ports:
       - "7210:7210"

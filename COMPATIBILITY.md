@@ -133,6 +133,14 @@ A backup is not considered valid until verification and restore testing succeed.
 
 ## 8. Upgrade Policy
 
+### 0.0.9 to 0.0.10
+
+This release changes no persistent storage, WAL, catalog, backup, or NSQL wire format versions.
+It requires no data migration. Stop the daemon, replace the installed binaries or image, and restart.
+
+`SHOW CLUSTER`, `system.replication`, `system.raft`, and `system.replica_health` now answer on followers and on nodes with no leader, in every read-consistency mode.
+See the [0.0.10 release notes](docs/release-notes/0.0.10.md).
+
 ### 0.0.8 to 0.0.9
 
 This release changes no persistent storage, WAL, catalog, backup, or NSQL wire format versions.

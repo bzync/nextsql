@@ -1,6 +1,69 @@
 {
   "releases": [
     {
+      "version": "0.0.10",
+      "title": "HA and Container First-start Fixes",
+      "status": "draft",
+      "channel": "preview",
+      "latest": false,
+      "releasedAt": "2026-11-03T00:00:00Z",
+      "summary": "SHOW CLUSTER answers on followers and with no leader, a lost database gets a clear error, and HA first starts are faster.",
+      "highlights": [
+        "SHOW CLUSTER answers on followers and on nodes with no leader",
+        "A lost nextsql.db now gets an error that names the missing file",
+        "HA first starts write one less copy of the database per joining node"
+      ],
+      "changes": [
+        {
+          "id": "show-cluster",
+          "kind": "fixed",
+          "area": "HA",
+          "text": "SHOW CLUSTER, system.replication, system.raft and system.replica_health answer on followers and with no leader, in every read-consistency mode."
+        },
+        {
+          "id": "lost-database",
+          "kind": "fixed",
+          "area": "Ops",
+          "text": "nextsql init, nextsql setup and the container's first start name the missing file when a deployment has lost nextsql.db. They still refuse to create a new database."
+        },
+        {
+          "id": "leftover-config",
+          "kind": "fixed",
+          "area": "Ops",
+          "text": "A container's first start replaces a nextsql.conf left by an earlier first start that did not finish."
+        },
+        {
+          "id": "ha-first-start",
+          "kind": "fixed",
+          "area": "HA",
+          "text": "Joining HA containers restore onto the data volume, which removes one full copy of the database per joining node."
+        }
+      ],
+      "artifacts": [
+        {
+          "id": "nextsql-0.0.10-linux-amd64.run",
+          "kind": "run",
+          "platform": "linux-amd64",
+          "filename": "nextsql-0.0.10-linux-amd64.run",
+          "url": "https://github.com/bzync/nextsql/releases/download/v0.0.10/nextsql-0.0.10-linux-amd64.run"
+        },
+        {
+          "id": "nextsql-0.0.10-linux-amd64.tar.gz",
+          "kind": "archive",
+          "platform": "linux-amd64",
+          "filename": "nextsql-0.0.10-linux-amd64.tar.gz",
+          "url": "https://github.com/bzync/nextsql/releases/download/v0.0.10/nextsql-0.0.10-linux-amd64.tar.gz"
+        },
+        {
+          "id": "nextsql_0.0.10_amd64.deb",
+          "kind": "deb",
+          "platform": "linux-amd64",
+          "filename": "nextsql_0.0.10_amd64.deb",
+          "url": "https://github.com/bzync/nextsql/releases/download/v0.0.10/nextsql_0.0.10_amd64.deb"
+        }
+      ]
+    },
+    {
       "version": "0.0.9",
       "title": "Container First-start Fix",
       "status": "published",

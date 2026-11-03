@@ -25,12 +25,12 @@ immutable", so there is no moving `latest`, `edge`, or `0.0` pointer. Each
 release publishes exactly one `0.x.y` tag:
 
 ```bash
-docker pull bzynchub/nextsql:0.0.9        # a released version
+docker pull bzynchub/nextsql:0.0.10        # a released version
 ```
 
 The checked-in `docker-compose.yml` builds locally (`build: .`); to run the
 published image instead, replace `build: .` with
-`image: bzynchub/nextsql:0.0.9`. For an in-depth guide on Docker Compose with
+`image: bzynchub/nextsql:0.0.10`. For an in-depth guide on Docker Compose with
 application integration, healthchecks, and HA cluster deployment, see
 [`docs/docker-compose.md`](docker-compose.md).
 
@@ -155,17 +155,17 @@ docker run -d --name nextsql -p 7210:7210 \
   -e NEXTSQL_SERVER_PASSWORD_FILE=/run/bootstrap/app-password \
   -e NEXTSQL_TLS_CERT=/run/tls/server.crt -e NEXTSQL_TLS_KEY=/run/tls/server.key \
   -e NEXTSQL_PROFILE=production \
-  bzynchub/nextsql:0.0.9
+  bzynchub/nextsql:0.0.10
 ```
 
 Images up to and including 0.0.8 did not create a database, so a fresh container
 exited with `this deployment has no database yet`, and the production profile
 failed before that. On those images, run `nextsql init ... --database NAME` on the
 volumes first. A volume left by such a failed start works with a newer image.
-From the release after 0.0.9, the first start that creates the database replaces
-the `nextsql.conf` left on it with the current settings. On 0.0.9, changed
-settings fail the start with `config file ... already exists`; put them back for
-the first start, or start from empty volumes.
+From 0.0.10, the first start that creates the database replaces the
+`nextsql.conf` left on it with the current settings. On 0.0.9, changed settings
+fail the start with `config file ... already exists`; put them back for the first
+start, or start from empty volumes.
 
 If `nextsql.db` is lost while the rest of the deployment remains, the container
 refuses to start rather than create an empty database. The error names the

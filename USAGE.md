@@ -1,21 +1,21 @@
 # NextSQL usage manual
 
-Operator and application guide for **NextSQL 0.0.9**.
+Operator and application guide for **NextSQL 0.0.10**.
 
 NextSQL is a native, encrypted-by-default multimodel database. It is not
 PostgreSQL, MySQL, MongoDB, Elasticsearch, or a vector-store compatibility
 layer. It has its own storage format, SQL dialect, wire protocol (NSQL v1),
 and official drivers.
 
-0.0.9 is a preview. Before you rely on it, run `nextsql-bench --slo` and the
+0.0.10 is a preview. Before you rely on it, run `nextsql-bench --slo` and the
 crash, recovery, security, and HA suites on your hardware.
 
-Upgrading from 0.0.8 requires replacing and restarting the daemon or container;
+Upgrading from 0.0.10 requires replacing and restarting the daemon or container;
 updating only a CLI or driver does not apply the fixes. This patch changes no
 persistent or wire formats. If you are coming from a release before 0.0.8, read
 the [0.0.8 release notes](docs/release-notes/0.0.8.md) first. See the
-[release notes](docs/release-notes/0.0.9.md) and
-[compatibility review](COMPATIBILITY.md#008-to-009).
+[release notes](docs/release-notes/0.0.10.md) and
+[compatibility review](COMPATIBILITY.md#009-to-0010).
 
 Internal design notes live in [`docs/`](docs/). The product site is
 [nextsql.bzync.com](https://nextsql.bzync.com).
@@ -164,7 +164,7 @@ default OS-package entry point. See [`docs/install.md`](docs/install.md).
 ### Containers and Docker Compose
 
 For containerized single-node and multi-node deployments:
-- [Docker installation guide](docs/docker.md) — prebuilt OCI image (`bzynchub/nextsql:0.0.9`), scratch runtime, `docker run`, and Podman
+- [Docker installation guide](docs/docker.md) — prebuilt OCI image (`bzynchub/nextsql:0.0.10`), scratch runtime, `docker run`, and Podman
 - [Docker Compose guide](docs/docker-compose.md) — single node, microservice app integration, health checks, volumes, secrets, and 3-node Raft HA (`docker-compose.ha.yml`)
 
 ### Build from source

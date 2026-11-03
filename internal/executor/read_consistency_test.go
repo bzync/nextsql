@@ -102,6 +102,45 @@ func TestReadConsistencyModes(t *testing.T) {
 	}
 }
 
+// A node's own replication state stays readable when the node cannot serve
+// reads of replicated data, and nothing else gets through that exemption.
+func TestNodeStateReadsSkipReadConsistency(t *testing.T) {
+	db := testDB(t)
+	s := db.Session()
+	execOK(t, s, `CREATE TABLE t (id STRING PRIMARY KEY, n STRING)`)
+
+	unavail := nerr.New(nerr.Unavailable, "test.gate", "not the leader")
+	db.SetGate(fakeReadGate{strong: unavail, follower: func(time.Duration) error { return unavail }})
+
+	for _, mode := range []ReadConsistency{ReadStrong, ReadBounded} {
+		if err := s.SetReadConsistency(mode); err != nil {
+			t.Fatal(err)
+		}
+		for _, q := range []string{
+			`SHOW CLUSTER`,
+			`SELECT * FROM system.replication`,
+			`SELECT has_leader FROM system.raft WHERE voters > 0`,
+			`SELECT * FROM system.replica_health`,
+		} {
+			if _, err := s.Exec(q); err != nil {
+				t.Fatalf("mode %v: %s: %v", mode, q, err)
+			}
+		}
+		for _, q := range []string{
+			`SELECT n FROM t`,
+			`SELECT * FROM system.tables`,
+			`SELECT * FROM system.replication WHERE node_id IN (SELECT id FROM t)`,
+			`SELECT (SELECT n FROM t) FROM system.replication`,
+			`SELECT node_id FROM system.replication UNION SELECT id FROM t`,
+			`WITH c AS (SELECT id FROM t) SELECT node_id FROM system.replication`,
+		} {
+			if _, err := s.Exec(q); !nerr.HasCode(err, nerr.Unavailable) {
+				t.Fatalf("mode %v: %s: want unavailable, got %v", mode, q, err)
+			}
+		}
+	}
+}
+
 func TestSetReadConsistencyRejectsUnknownMode(t *testing.T) {
 	s := testDB(t).Session()
 	if err := s.SetReadConsistency(ReadConsistency(0x7f)); !nerr.HasCode(err, nerr.InvalidArgument) {

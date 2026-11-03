@@ -15,6 +15,13 @@ different bits.
 
 ## [Unreleased]
 
+### Fixed
+
+- `SHOW CLUSTER`, `system.replication`, `system.raft`, and `system.replica_health` now answer on a follower and on a node with no leader. They failed with `not the leader` or `no leader` under the default `STRONG` read consistency, although the operations runbooks use them on those nodes to confirm a new leader.
+- `nextsql init` and `nextsql setup` now name the missing file when a deployment has lost `nextsql.db`, instead of reporting `database is already initialized`. They still refuse to create a new database.
+- A container's first start now replaces a `nextsql.conf` left by an earlier first start that did not finish, instead of failing with `config file ... already exists` when settings changed.
+- Joining HA containers restore onto the data volume, which removes a full extra copy of the database from each joining node's first start.
+
 ## [0.0.9] — 2026-11-03
 
 ### Fixed

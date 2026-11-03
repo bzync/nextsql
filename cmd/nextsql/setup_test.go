@@ -153,6 +153,47 @@ func TestSetupRefusesSecondInit(t *testing.T) {
 	}
 }
 
+// A deployment that lost its database file must not get a new empty one, and
+// the error must name the missing file. Nothing it holds may change, including
+// a config that --force would otherwise replace.
+func TestSetupRefusesLostDatabase(t *testing.T) {
+	dataDir := filepath.Join(t.TempDir(), "data")
+	keyFile := filepath.Join(t.TempDir(), "root.key")
+
+	if err := setupCmd(smallSetupArgs(dataDir, keyFile)); err != nil {
+		t.Fatal(err)
+	}
+	dbPath := filepath.Join(dataDir, config.DataFileName)
+	if err := os.Remove(dbPath); err != nil {
+		t.Fatal(err)
+	}
+	confPath := filepath.Join(dataDir, "nextsql.conf")
+	before, err := os.ReadFile(confPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = setupCmd([]string{
+		"--data-dir", dataDir, "--key-file", keyFile, "--database", "setuptest",
+		"--preset", "custom", "--buffer-pages", "16", "--force",
+	})
+	if !nerr.HasCode(err, nerr.Conflict) || !strings.Contains(err.Error(), dbPath+" is missing") {
+		t.Fatalf("want a conflict naming the missing file, got %v", err)
+	}
+	if _, statErr := os.Stat(dbPath); !os.IsNotExist(statErr) {
+		t.Fatalf("a database was created: %v", statErr)
+	}
+	after, err := os.ReadFile(confPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != string(before) {
+		t.Fatalf("config changed:\n%s", after)
+	}
+	if _, err := os.Stat(keyFile); err != nil {
+		t.Fatalf("root key: %v", err)
+	}
+}
+
 func TestSetupMissingKeyFileExit7(t *testing.T) {
 	err := setupCmd([]string{"--data-dir", t.TempDir()})
 	if got := cli.Code(err); got != cli.ExitLocal {

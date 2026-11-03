@@ -803,6 +803,11 @@ func initDB(args []string) error {
 		return err
 	}
 	if defaultDatabase.State == hosting.StateActive {
+		if _, statErr := os.Stat(dbPath); os.IsNotExist(statErr) {
+			return nerr.New(nerr.Conflict, "nextsql init",
+				"the deployment registry records an initialized database, but "+dbPath+" is missing; "+
+					"nothing was created; check the data directory or volume, or restore a backup to a new data directory")
+		}
 		return nerr.New(nerr.AlreadyExists, "nextsql init", "database is already initialized")
 	}
 	if defaultDatabase.State != hosting.StateProvisioning {

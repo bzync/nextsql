@@ -65,7 +65,8 @@ durable lease, with the task-row write conflict fencing a stale worker.
 
 ## Read consistency (Phase 22)
 
-Every read runs in one of these modes. The session default is `STRONG`.
+Every read of replicated data runs in one of these modes. The session default
+is `STRONG`.
 
 ### `STRONG` (default)
 
@@ -87,6 +88,11 @@ Consequences:
 - A `STRONG` read costs one quorum round trip. It is a correctness barrier,
   not a lease-only fast path. The shipped `BOUNDED` and `STALE` modes below
   provide follower-served alternatives with explicit weaker guarantees.
+- A plain `SELECT` or `SHOW CLUSTER` on `system.replication`, `system.raft`, or
+  `system.replica_health` skips the read-consistency check in every mode. These
+  rows are the node's own view, not replicated data, so they answer on a
+  follower and on a node with no leader. A statement that joins them, uses a
+  subquery, or combines them in a `UNION` or `WITH` is checked as usual.
 
 ### `BOUNDED`
 

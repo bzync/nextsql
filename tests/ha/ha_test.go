@@ -227,6 +227,56 @@ func TestHAThreeNodeQuorumCommit(t *testing.T) {
 	}
 }
 
+// The runbooks read SHOW CLUSTER on a follower and on a node that has lost its
+// leader. Both must answer under the default STRONG mode, while the same node
+// keeps refusing STRONG reads of replicated data.
+func TestHAShowClusterOnFollowerAndWithoutLeader(t *testing.T) {
+	nodes := cluster3(t)
+	lead := leader(t, nodes)
+	if _, err := lead.db.Session().Exec(`CREATE TABLE t (id STRING PRIMARY KEY)`); err != nil {
+		t.Fatal(err)
+	}
+	waitAll(t, nodes, uint64(lead.cluster.AppliedLSN()))
+	var fol *node
+	for _, n := range nodes {
+		if n != lead {
+			fol = n
+			break
+		}
+	}
+	s := fol.db.Session()
+	if res, err := s.Exec(`SHOW CLUSTER`); err != nil || len(res.Rows) != 1 {
+		t.Fatalf("SHOW CLUSTER on a follower: err=%v rows=%+v", err, res)
+	}
+	if _, err := s.Exec(`SELECT id FROM t`); !nerr.HasCode(err, nerr.Unavailable) {
+		t.Fatalf("STRONG read on a follower: %v", err)
+	}
+
+	for _, n := range nodes {
+		if n != fol {
+			fol.trans.Disconnect(n.addr)
+			n.trans.Disconnect(fol.addr)
+		}
+	}
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		res, err := s.Exec(`SELECT has_leader FROM system.replication`)
+		if err != nil {
+			t.Fatalf("SHOW CLUSTER while partitioned: %v", err)
+		}
+		if !res.Rows[0][0].Bool {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("partitioned follower still reports a leader")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if _, err := s.Exec(`SELECT id FROM t`); !nerr.HasCode(err, nerr.Unavailable) {
+		t.Fatalf("STRONG read with no leader: %v", err)
+	}
+}
+
 func TestHABoundedFollowerRead(t *testing.T) {
 	nodes := cluster3(t)
 	lead := leader(t, nodes)

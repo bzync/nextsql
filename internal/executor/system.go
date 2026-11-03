@@ -37,6 +37,42 @@ func (s *Session) isSystemSelect(stmt ast.Stmt) (ast.Select, bool) {
 	return ast.Select{}, false
 }
 
+// isNodeStateSelect reports whether a statement reads only this node's own
+// replication state, which no read-consistency mode applies to: the rows are
+// the node's local view, not replicated data, and an operator needs them most
+// when the node has no leader or is a follower. A statement that could reach
+// anything else, such as through a subquery, does not qualify.
+func isNodeStateSelect(stmt ast.Stmt) bool {
+	sel, ok := stmt.(ast.Select)
+	if !ok || len(sel.Joins) > 0 || sel.FromQuery != nil || sel.Unnest != nil {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(sel.Table)) {
+	case "system.replication", "system.raft", "system.replica_health":
+	default:
+		return false
+	}
+	if exprHasSubquery(sel.Where) || exprHasSubquery(sel.Having) {
+		return false
+	}
+	for _, item := range sel.List {
+		if exprHasSubquery(item.Expr) {
+			return false
+		}
+	}
+	for _, e := range sel.Group {
+		if exprHasSubquery(e) {
+			return false
+		}
+	}
+	for _, o := range sel.Order {
+		if exprHasSubquery(o.Expr) {
+			return false
+		}
+	}
+	return true
+}
+
 func (s *Session) execSystemSelect(sel ast.Select) (*Result, error) {
 	name := strings.ToLower(strings.TrimSpace(sel.Table))
 	schema, ok := system.TableFor(name)

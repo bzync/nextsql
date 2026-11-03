@@ -4,7 +4,10 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 )
+
+const restoreDirPrefix = ".nextsql-restore-"
 
 // Main is the container PID 1. It bootstraps the data directory if needed,
 // optionally waits for Raft peers, then execs nextsqld so the server is PID 1
@@ -107,6 +110,13 @@ func setupDataDir(env Env, rt Runtime) error {
 	if env.Database != "" {
 		args = append(args, "--database", env.Database)
 	}
+	// There is no database yet, so a config here came from a first start that
+	// did not finish and nothing has served from it. These settings replace
+	// it. If the deployment has lost its database, setup fails before writing.
+	if exists(env.configPath()) {
+		rt.logf("replacing %s left by an unfinished first start", env.configPath())
+		args = append(args, "--force")
+	}
 	if env.Profile != "" {
 		args = append(args, "--profile", env.Profile)
 	}
@@ -174,13 +184,27 @@ func restoreFromSeed(env Env, rt Runtime) error {
 		return fail("seed copy: %v", err)
 	}
 
-	restoreTmp, err := os.MkdirTemp("", "nextsql-restore-*")
+	if err := os.MkdirAll(env.DataDir, 0o700); err != nil {
+		return fail("restore: %v", err)
+	}
+	// A start that died mid-restore leaves its directory behind.
+	stale, err := filepath.Glob(filepath.Join(env.DataDir, restoreDirPrefix+"*"))
 	if err != nil {
 		return fail("restore: %v", err)
 	}
-	// nextsql restore --data-dir refuses an existing directory; the volume
-	// mount point for --data-dir already exists, so restore into a path that
-	// does not, then relocate the contents.
+	for _, dir := range stale {
+		if err := os.RemoveAll(dir); err != nil {
+			return fail("restore: %v", err)
+		}
+	}
+	// Restore onto the data volume so relocating is a rename, not a second
+	// full copy. nextsql restore --data-dir refuses an existing directory; the
+	// volume mount point for --data-dir already exists, so restore into a path
+	// that does not, then relocate the contents.
+	restoreTmp, err := os.MkdirTemp(env.DataDir, restoreDirPrefix+"*")
+	if err != nil {
+		return fail("restore: %v", err)
+	}
 	if err := os.Remove(restoreTmp); err != nil {
 		return fail("restore: %v", err)
 	}

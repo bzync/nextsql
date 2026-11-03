@@ -1041,7 +1041,7 @@ func (s *Session) execAdmitted(ctx context.Context, sql string, params []Param) 
 			return res, rerr
 		}
 	}
-	if isReadStmt(stmt) {
+	if isReadStmt(stmt) && !isNodeStateSelect(stmt) {
 		if err := s.requireReadConsistency(); err != nil {
 			return nil, err
 		}

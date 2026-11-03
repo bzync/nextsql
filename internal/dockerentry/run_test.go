@@ -324,6 +324,26 @@ func TestExistingConfigPassedToServerWithoutReinit(t *testing.T) {
 	}
 }
 
+func TestLeftoverConfigIsReplacedOnFirstStart(t *testing.T) {
+	dir := t.TempDir()
+	conf := filepath.Join(dir, confFileName)
+	if err := os.WriteFile(conf, []byte("buffer_pages=16\n"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	pw := filepath.Join(dir, "pw")
+	if err := os.WriteFile(pw, []byte("secret\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rec := newRecorder()
+	env := Env{DataDir: dir, KeyFile: "/key", Listen: "0.0.0.0:7210", ServerUser: "app", PasswordFile: pw, ConfigFile: conf}
+	if code := run(env, rec.Runtime); code != 0 {
+		t.Fatalf("code=%d log=%q", code, rec.log.String())
+	}
+	if len(rec.runs) != 1 || !strings.Contains(strings.Join(rec.runs[0], " "), " --force") {
+		t.Fatalf("setup args: %q", rec.runs)
+	}
+}
+
 func TestExistingDBSkipsInit(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, dbFileName), []byte("x"), 0o600); err != nil {
@@ -372,6 +392,10 @@ func TestSeedToBackupOnce(t *testing.T) {
 func TestRestoreFromSeed(t *testing.T) {
 	data := t.TempDir()
 	seed := t.TempDir()
+	stale := filepath.Join(data, restoreDirPrefix+"stale")
+	if err := os.Mkdir(stale, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(filepath.Join(seed, verifiedMarker), []byte("ok"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -391,6 +415,9 @@ func TestRestoreFromSeed(t *testing.T) {
 		if dest == "" {
 			t.Fatalf("restore missing --data-dir: %q", args)
 		}
+		if filepath.Dir(dest) != data {
+			t.Fatalf("restore outside the data volume: %q", dest)
+		}
 		if err := os.MkdirAll(dest, 0o700); err != nil {
 			return err
 		}
@@ -409,6 +436,13 @@ func TestRestoreFromSeed(t *testing.T) {
 	}
 	if string(got) != "restored" {
 		t.Fatalf("relocated db %q", got)
+	}
+	left, err := filepath.Glob(filepath.Join(data, restoreDirPrefix+"*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(left) != 0 {
+		t.Fatalf("restore directories left behind: %q", left)
 	}
 }
 

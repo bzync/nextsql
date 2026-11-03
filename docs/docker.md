@@ -161,10 +161,16 @@ docker run -d --name nextsql -p 7210:7210 \
 Images up to and including 0.0.8 did not create a database, so a fresh container
 exited with `this deployment has no database yet`, and the production profile
 failed before that. On those images, run `nextsql init ... --database NAME` on the
-volumes first. A volume left by such a failed start works with a newer image, as
-long as settings that go into `nextsql.conf` are unchanged. If they changed, the
-start fails with `config file ... already exists`; put them back for the first
-start, or start from empty volumes.
+volumes first. A volume left by such a failed start works with a newer image.
+From the release after 0.0.9, the first start that creates the database replaces
+the `nextsql.conf` left on it with the current settings. On 0.0.9, changed
+settings fail the start with `config file ... already exists`; put them back for
+the first start, or start from empty volumes.
+
+If `nextsql.db` is lost while the rest of the deployment remains, the container
+refuses to start rather than create an empty database. The error names the
+missing file, and `nextsql.conf` is left as it was. Restore a backup to new
+volumes, or fix the volume mount.
 
 `backup_dir` is not set by the container; set it (or a WAL archive) and take
 `nextsql backup`s before relying on a container instance for recovery.
@@ -260,15 +266,25 @@ per-node config on a follower is not yet wired — hosted HA remains an open
 track). `NEXTSQL_PROFILE=production` therefore currently applies its config
 and preflight to the bootstrap node only.
 
+### Startup time
+
+The first start takes about 45 to 90 s to accept a write on a desktop host with
+an ordinary disk, nearly all of it disk I/O. An empty database occupies 386 MB
+because its data file and first WAL segment are preallocated, and the first start
+writes it several times: a backup and restore test on `node-a`, then a seed copy
+and a restore on each joining node. Later starts do not repeat this work.
+
 ### Verifying the cluster
 
 ```bash
 docker compose -f docker-compose.ha.yml exec node-a nextsql cluster status --data-dir /var/lib/nextsql
 ```
 
-`voters` should read `3` and `has_leader` should read `true`. From any node,
+`voters` should read `3` and `has_leader` should read `true`. On any node,
 `SHOW CLUSTER` (`internal/sql/parser` alias for `SELECT * FROM
-system.replication`) reports the same state over SQL. Writes issued against
+system.replication`) reports that node's own view over SQL, even with no
+leader. Other reads on a follower need `BOUNDED` or `STALE` read consistency
+(`docs/ha.md`). Writes issued against
 any node are only ever accepted by the leader; kill its container and a new
 leader is elected from the remaining two, matching the failover behavior
 described in `docs/ha.md`.

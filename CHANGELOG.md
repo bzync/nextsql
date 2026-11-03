@@ -17,6 +17,7 @@ different bits.
 
 ### Fixed
 
+- A fresh container now starts. The image's first start never created a database, so `nextsqld` exited with `this deployment has no database yet`, the production profile failed earlier, and the HA seed backup had nothing to copy. It now creates one named by `NEXTSQL_DATABASE`, or `default` if unset.
 - `nextsql restore` and `verify` no longer fail with a permission error on `/tmp` when the container image runs under a UID other than 10001. `/tmp` in the image is now writable by every UID, with the sticky bit set.
 
 ## [0.0.8] — 2026-11-03

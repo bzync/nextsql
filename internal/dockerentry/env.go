@@ -11,6 +11,7 @@ const (
 	defaultKeyFile      = "/run/secrets/root.key"
 	defaultListen       = "0.0.0.0:7210"
 	defaultPasswordFile = "/run/bootstrap/password"
+	defaultDatabase     = "default"
 	dbFileName          = "nextsql.db"
 	confFileName        = "nextsql.conf"
 	verifiedMarker      = "verified"
@@ -25,6 +26,7 @@ type Env struct {
 	PasswordFile  string
 	ServerUser    string
 	ServerPass    string
+	Database      string
 	Profile       string
 	Preset        string
 	ConfigFile    string
@@ -60,6 +62,7 @@ func LoadEnv(getenv func(string) string) Env {
 		PasswordFile:  get("NEXTSQL_SERVER_PASSWORD_FILE", defaultPasswordFile),
 		ServerUser:    getenv("NEXTSQL_SERVER_USER"),
 		ServerPass:    getenv("NEXTSQL_SERVER_PASS"),
+		Database:      get("NEXTSQL_DATABASE", defaultDatabase),
 		Profile:       getenv("NEXTSQL_PROFILE"),
 		Preset:        getenv("NEXTSQL_PRESET"),
 		ConfigFile:    get("NEXTSQL_CONFIG_FILE", filepath.Join(dataDir, confFileName)),

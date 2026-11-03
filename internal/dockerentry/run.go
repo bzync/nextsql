@@ -102,6 +102,11 @@ func setupDataDir(env Env, rt Runtime) error {
 		"--config-out", env.configPath(),
 		"--listen", env.Listen,
 	}
+	// Without a database nextsqld refuses to start, so a first start always
+	// names one.
+	if env.Database != "" {
+		args = append(args, "--database", env.Database)
+	}
 	if env.Profile != "" {
 		args = append(args, "--profile", env.Profile)
 	}

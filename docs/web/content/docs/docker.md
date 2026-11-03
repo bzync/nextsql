@@ -110,6 +110,7 @@ On first start (an empty `/var/lib/nextsql`), the entrypoint runs `nextsql setup
 
 | Variable | Default | Effect |
 |---|---|---|
+| `NEXTSQL_DATABASE` | `default` | Name of the deployment's database, created on first start. Later starts ignore it. Clients that send a database name must use this one. |
 | `NEXTSQL_PROFILE` | `developer` | `production` runs the fail-closed production preflight (bootstrap administrator required, unlock key off the data volume, TLS 1.3 for any non-loopback listen). |
 | `NEXTSQL_PRESET` | `balanced` | Buffer-pool sizing: `conservative` (10% RAM) / `balanced` (25%) / `high-performance` (50%) / `custom`. `NEXTSQL_BUFFER_PAGES` overrides. |
 | `NEXTSQL_CONFIG_FILE` | `$NEXTSQL_DATA_DIR/nextsql.conf` | Where the generated config is written and read. |

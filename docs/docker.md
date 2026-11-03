@@ -134,6 +134,7 @@ before — those override the file.
 
 | Variable | Default | Effect |
 |---|---|---|
+| `NEXTSQL_DATABASE` | `default` | Name of the deployment's database, created on first start. Later starts ignore it. Clients that send a database name must use this one. |
 | `NEXTSQL_PROFILE` | `developer` | `production` writes `deployment_profile=production` plus the production operational defaults (disk-watermark, replica-lag, statement/idle/lock timeouts, connection limits, drain) and runs the fail-closed production preflight on every `nextsqld` start. |
 | `NEXTSQL_PRESET` | `balanced` | Buffer-pool sizing preset: `conservative` (10% of RAM) / `balanced` (25%) / `high-performance` (50%) / `custom`. `NEXTSQL_BUFFER_PAGES` still overrides it. |
 | `NEXTSQL_CONFIG_FILE` | `$NEXTSQL_DATA_DIR/nextsql.conf` | Where the generated config is written and read from. |
@@ -156,6 +157,14 @@ docker run -d --name nextsql -p 7210:7210 \
   -e NEXTSQL_PROFILE=production \
   bzynchub/nextsql:0.0.8
 ```
+
+Images up to and including 0.0.8 did not create a database, so a fresh container
+exited with `this deployment has no database yet`, and the production profile
+failed before that. On those images, run `nextsql init ... --database NAME` on the
+volumes first. A volume left by such a failed start works with a newer image, as
+long as settings that go into `nextsql.conf` are unchanged. If they changed, the
+start fails with `config file ... already exists`; put them back for the first
+start, or start from empty volumes.
 
 `backup_dir` is not set by the container; set it (or a WAL archive) and take
 `nextsql backup`s before relying on a container instance for recovery.

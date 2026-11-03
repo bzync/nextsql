@@ -176,6 +176,7 @@ services:
       NEXTSQL_TLS_CERT: /run/tls/server.crt
       NEXTSQL_TLS_KEY: /run/tls/server.key
       NEXTSQL_PROFILE: developer
+      NEXTSQL_DATABASE: "app"
     volumes:
       - nextsql-data:/var/lib/nextsql
       - nextsql-keys:/run/secrets
@@ -408,6 +409,7 @@ docker compose exec nextsql nextsql status --local \
 | `NEXTSQL_SERVER_USER` | *(none)* | Bootstrap administrator username created on first start (required on fresh initialization). |
 | `NEXTSQL_SERVER_PASSWORD_FILE` | `/run/bootstrap/password` | Path to file containing the administrator password. |
 | `NEXTSQL_SERVER_PASS` | *(none)* | Direct password string in env. If set, written to a private temporary file for setup and wiped immediately. |
+| `NEXTSQL_DATABASE` | `default` | Name of the deployment's database, created on first start. Later starts ignore it. Clients that send a database name must use this one. |
 | `NEXTSQL_PROFILE` | `developer` | `developer` or `production`. `production` enforces strict fail-closed preflight (admin required, key off data volume, TLS 1.3 off loopback) and writes operational defaults. |
 | `NEXTSQL_PRESET` | `balanced` | Buffer-pool sizing preset: `conservative` (10% RAM), `balanced` (25%), `high-performance` (50%), or `custom`. |
 | `NEXTSQL_BUFFER_PAGES` | *(none)* | Explicit number of 16 KiB buffer pages. Overrides `NEXTSQL_PRESET`. |

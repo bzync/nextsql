@@ -72,6 +72,9 @@ func TestLoadEnvDefaults(t *testing.T) {
 	if env.Profile != "" || env.Preset != "" {
 		t.Fatalf("profile/preset default: %+v", env)
 	}
+	if env.Database != defaultDatabase {
+		t.Fatalf("database default: %q", env.Database)
+	}
 }
 
 func TestLoadEnvOverrides(t *testing.T) {
@@ -81,6 +84,7 @@ func TestLoadEnvOverrides(t *testing.T) {
 		"NEXTSQL_NODE_ID":  "node-a",
 		"NEXTSQL_PROFILE":  "production",
 		"NEXTSQL_PRESET":   "high-performance",
+		"NEXTSQL_DATABASE": "orders",
 	}
 	env := LoadEnv(func(k string) string { return vals[k] })
 	if env.DataDir != "/data" || env.Listen != "127.0.0.1:9" || env.NodeID != "node-a" {
@@ -88,6 +92,9 @@ func TestLoadEnvOverrides(t *testing.T) {
 	}
 	if env.Profile != "production" || env.Preset != "high-performance" {
 		t.Fatalf("profile/preset overrides: %+v", env)
+	}
+	if env.Database != "orders" {
+		t.Fatalf("database override: %q", env.Database)
 	}
 	if env.ConfigFile != "/data/nextsql.conf" {
 		t.Fatalf("config file follows data dir: %q", env.ConfigFile)
@@ -216,6 +223,7 @@ func TestSetupWithPasswordFileThenExec(t *testing.T) {
 		Listen:       "0.0.0.0:7210",
 		ServerUser:   "app",
 		PasswordFile: pw,
+		Database:     "orders",
 		Profile:      "production",
 		Preset:       "conservative",
 		TLSCert:      "/c",
@@ -233,7 +241,7 @@ func TestSetupWithPasswordFileThenExec(t *testing.T) {
 	got := strings.Join(rec.runs[0], " ")
 	want := "/usr/local/bin/nextsql setup --data-dir " + dir + " --key-file /key --user app --password-file " + pw +
 		" --config-out " + filepath.Join(dir, confFileName) + " --listen 0.0.0.0:7210" +
-		" --profile production --preset conservative --tls-cert /c --tls-key /k"
+		" --database orders --profile production --preset conservative --tls-cert /c --tls-key /k"
 	if got != want {
 		t.Fatalf("setup args:\n got %q\nwant %q", got, want)
 	}

@@ -15,6 +15,10 @@ different bits.
 
 ## [Unreleased]
 
+### Fixed
+
+- `nextsql restore` and `verify` no longer fail with a permission error on `/tmp` when the container image runs under a UID other than 10001. `/tmp` in the image is now writable by every UID, with the sticky bit set.
+
 ## [0.0.8] — 2026-11-03
 
 ### Fixed

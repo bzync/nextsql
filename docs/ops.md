@@ -102,8 +102,19 @@ a warm disk cache), so allow for roughly three full scans of the database.
 | `orphan_pages` | Allocated pages nothing refers to. This wastes space and does not fail the check. When a tree is broken it is unknown: text output prints 0 and `--json` prints `null`. |
 
 The command prints `result clean` and exits 0, or prints `result damaged` and
-exits 5. It also exits 5 when the database cannot be opened, for example when a
-tree's metadata page was replaced. It exits 2 when the lock is held.
+exits 5. Go by the `result` line, because neither nonzero code is specific to
+damage. `--json` prints no `result` line, so there a printed report with exit 5
+means damage.
+
+- **Exit 5 with no report:** an error stopped the check, so read the message.
+  Treat it as damage if it reports corruption or the database cannot be opened,
+  for example when a tree's metadata page was replaced.
+- **Exit 2:** the check did not run. The lock may be held, or the directory may
+  be missing or unreadable.
+
+Other `nextsql` commands use the same codes. `nextsql restore` exits 5 when its
+destination already exists, so in a script that chains `restore` and
+`check-pages`, an exit 5 does not by itself mean damage.
 
 `nextsqld` runs a cheaper form of this check at every start and refuses to start
 if a live page is on the freelist, because its next writes could destroy that

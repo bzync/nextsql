@@ -46,6 +46,7 @@ RUN printf '%s\n' \
       > /out/group \
  && install -d -m 0755 /out/empty \
  && touch /out/empty/.keep \
+ && install -d -m 1777 /out/rootfs/tmp \
  && cp /etc/ssl/certs/ca-certificates.crt /out/ca-certificates.crt
 
 FROM scratch
@@ -53,7 +54,9 @@ FROM scratch
 COPY --from=build /out/passwd /etc/passwd
 COPY --from=build /out/group /etc/group
 COPY --from=build /out/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
-COPY --from=build --chown=10001:10001 /out/empty/. /tmp/
+# /tmp is copied as a subdirectory so its mode survives. Sticky and writable by
+# all: restore and verify need it under any --user, not only uid 10001.
+COPY --from=build /out/rootfs/ /
 COPY --from=build --chown=10001:10001 /out/empty/. /var/lib/nextsql/
 COPY --from=build --chown=10001:10001 /out/empty/. /run/secrets/
 COPY --from=build --chown=10001:10001 /out/empty/. /run/bootstrap/

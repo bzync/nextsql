@@ -160,6 +160,27 @@ docker run -d --name nextsql -p 7210:7210 \
 `backup_dir` is not set by the container; set it (or a WAL archive) and take
 `nextsql backup`s before relying on a container instance for recovery.
 
+## Running `nextsql` commands from the image
+
+To run `restore`, `check-pages`, or another offline command, override the
+entrypoint and mount what the command needs:
+
+```bash
+docker run --rm --user "$(id -u):$(id -g)" \
+  -v /path/to/backups:/backups:ro -v /path/to/keys:/keys:ro -v /path/to/work:/out \
+  --entrypoint nextsql bzynchub/nextsql:VERSION \
+  restore --from /backups/NAME --data-dir /out/scratch --key-file /keys/root.key
+```
+
+`--user` lets the command read a `0600` key file you own, and leaves files you
+can delete. Without it, the command runs as uid 10001, which needs read access
+to the backup and key and write access to `/out`. `restore` refuses a destination
+that already exists.
+
+`/tmp` in the image is writable by every UID. In images up to and including
+0.0.8 it is writable only by uid 10001, so with any other non-root UID, add
+`--tmpfs /tmp:mode=1777` or `restore` and `verify` fail with a permission error.
+
 ## Multi-node HA cluster
 
 `docker-compose.ha.yml` runs a 3-node Raft cluster (`internal/replication`,

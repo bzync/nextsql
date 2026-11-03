@@ -3,10 +3,10 @@
     {
       "version": "0.0.10",
       "title": "HA and Container First-start Fixes",
-      "status": "draft",
+      "status": "published",
       "channel": "preview",
-      "latest": false,
-      "releasedAt": "2026-11-03T00:00:00Z",
+      "latest": true,
+      "releasedAt": "2026-11-03T12:41:25Z",
       "summary": "SHOW CLUSTER answers on followers and with no leader, a lost database gets a clear error, and HA first starts are faster.",
       "highlights": [
         "SHOW CLUSTER answers on followers and on nodes with no leader",
@@ -45,6 +45,8 @@
           "kind": "run",
           "platform": "linux-amd64",
           "filename": "nextsql-0.0.10-linux-amd64.run",
+          "size": 22651588,
+          "sha256": "ac82eeefffa2f2f936684c60f2721ff8256954767ab3dc1b025816de25600dc5",
           "url": "https://github.com/bzync/nextsql/releases/download/v0.0.10/nextsql-0.0.10-linux-amd64.run"
         },
         {
@@ -52,6 +54,8 @@
           "kind": "archive",
           "platform": "linux-amd64",
           "filename": "nextsql-0.0.10-linux-amd64.tar.gz",
+          "size": 22650856,
+          "sha256": "99a52b47fdbbd128df998526a6052a86805a931f8ac4f153d93714ca11f20f1e",
           "url": "https://github.com/bzync/nextsql/releases/download/v0.0.10/nextsql-0.0.10-linux-amd64.tar.gz"
         },
         {
@@ -59,6 +63,8 @@
           "kind": "deb",
           "platform": "linux-amd64",
           "filename": "nextsql_0.0.10_amd64.deb",
+          "size": 18893900,
+          "sha256": "cf2a54fa67c7969e9d462d15412f065aa35d810a80f7f2ccf20a7d4b66ba749d",
           "url": "https://github.com/bzync/nextsql/releases/download/v0.0.10/nextsql_0.0.10_amd64.deb"
         }
       ]
@@ -68,7 +74,7 @@
       "title": "Container First-start Fix",
       "status": "published",
       "channel": "preview",
-      "latest": true,
+      "latest": false,
       "releasedAt": "2026-11-03T06:52:08Z",
       "summary": "A fresh container now creates its database and starts, and restore and verify work under any UID in the image.",
       "highlights": [

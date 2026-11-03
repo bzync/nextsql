@@ -268,8 +268,8 @@ and preflight to the bootstrap node only.
 
 ### Startup time
 
-The first start takes about 45 to 90 s to accept a write on a desktop host with
-an ordinary disk, nearly all of it disk I/O. An empty database occupies 386 MB
+The first start took 14 to 90 s to accept a write across our runs on a desktop
+host, depending on disk load, and nearly all of that is disk I/O. An empty database occupies 386 MB
 because its data file and first WAL segment are preallocated, and the first start
 writes it several times: a backup and restore test on `node-a`, then a seed copy
 and a restore on each joining node. Later starts do not repeat this work.

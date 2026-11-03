@@ -2,7 +2,7 @@
 
 All notable changes to NextSQL are recorded here.
 
-The current release is **0.0.8**; **0.0.1** was the first public one. All are
+The current release is **0.0.9**; **0.0.1** was the first public one. All are
 previews: the engine is complete enough to install, query, and operate, and it
 is still under measurement. Before you rely on it, run `nextsql-bench --slo`
 and the crash, recovery, and HA suites on your hardware.
@@ -15,10 +15,16 @@ different bits.
 
 ## [Unreleased]
 
+## [0.0.9] — 2026-11-03
+
 ### Fixed
 
 - A fresh container now starts. The image's first start never created a database, so `nextsqld` exited with `this deployment has no database yet`, the production profile failed earlier, and the HA seed backup had nothing to copy. It now creates one named by `NEXTSQL_DATABASE`, or `default` if unset.
 - `nextsql restore` and `verify` no longer fail with a permission error on `/tmp` when the container image runs under a UID other than 10001. `/tmp` in the image is now writable by every UID, with the sticky bit set.
+
+### Added
+
+- `NEXTSQL_DATABASE` names the database a container creates on first start. It defaults to `default`.
 
 ## [0.0.8] — 2026-11-03
 

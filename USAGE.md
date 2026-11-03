@@ -1,20 +1,21 @@
 # NextSQL usage manual
 
-Operator and application guide for **NextSQL 0.0.8**.
+Operator and application guide for **NextSQL 0.0.9**.
 
 NextSQL is a native, encrypted-by-default multimodel database. It is not
 PostgreSQL, MySQL, MongoDB, Elasticsearch, or a vector-store compatibility
 layer. It has its own storage format, SQL dialect, wire protocol (NSQL v1),
 and official drivers.
 
-0.0.8 is a preview. Before you rely on it, run `nextsql-bench --slo` and the
+0.0.9 is a preview. Before you rely on it, run `nextsql-bench --slo` and the
 crash, recovery, security, and HA suites on your hardware.
 
-Upgrading from 0.0.7 requires replacing and restarting the daemon; updating
-only a CLI or driver does not apply the fixes. This patch changes no persistent
-or wire formats, but a daemon can now refuse to start on a database an earlier
-release damaged. See the [release notes](docs/release-notes/0.0.8.md) and
-[compatibility review](COMPATIBILITY.md#007-to-008).
+Upgrading from 0.0.8 requires replacing and restarting the daemon or container;
+updating only a CLI or driver does not apply the fixes. This patch changes no
+persistent or wire formats. If you are coming from a release before 0.0.8, read
+the [0.0.8 release notes](docs/release-notes/0.0.8.md) first. See the
+[release notes](docs/release-notes/0.0.9.md) and
+[compatibility review](COMPATIBILITY.md#008-to-009).
 
 Internal design notes live in [`docs/`](docs/). The product site is
 [nextsql.bzync.com](https://nextsql.bzync.com).
@@ -163,7 +164,7 @@ default OS-package entry point. See [`docs/install.md`](docs/install.md).
 ### Containers and Docker Compose
 
 For containerized single-node and multi-node deployments:
-- [Docker installation guide](docs/docker.md) — prebuilt OCI image (`bzynchub/nextsql:0.0.8`), scratch runtime, `docker run`, and Podman
+- [Docker installation guide](docs/docker.md) — prebuilt OCI image (`bzynchub/nextsql:0.0.9`), scratch runtime, `docker run`, and Podman
 - [Docker Compose guide](docs/docker-compose.md) — single node, microservice app integration, health checks, volumes, secrets, and 3-node Raft HA (`docker-compose.ha.yml`)
 
 ### Build from source

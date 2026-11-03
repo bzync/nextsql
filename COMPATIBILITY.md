@@ -133,6 +133,14 @@ A backup is not considered valid until verification and restore testing succeed.
 
 ## 8. Upgrade Policy
 
+### 0.0.8 to 0.0.9
+
+This release changes no persistent storage, WAL, catalog, backup, or NSQL wire format versions.
+It requires no data migration. Stop the daemon, replace the installed binaries or image, and restart.
+
+The image's first start now creates a database named by `NEXTSQL_DATABASE`, or `default` if unset. Later starts ignore the variable.
+See the [0.0.9 release notes](docs/release-notes/0.0.9.md).
+
 ### 0.0.7 to 0.0.8
 
 This release changes no persistent storage, WAL, catalog, backup, or NSQL wire format versions.

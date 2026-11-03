@@ -1,6 +1,63 @@
 {
   "releases": [
     {
+      "version": "0.0.9",
+      "title": "Container First-start Fix",
+      "status": "draft",
+      "channel": "preview",
+      "latest": false,
+      "releasedAt": "2026-11-03T00:00:00Z",
+      "summary": "A fresh container now creates its database and starts, and restore and verify work under any UID in the image.",
+      "highlights": [
+        "A fresh container now creates a database and starts",
+        "NEXTSQL_DATABASE names the database on first start",
+        "nextsql restore and verify work under any UID in the image"
+      ],
+      "changes": [
+        {
+          "id": "first-start",
+          "kind": "fixed",
+          "area": "Ops",
+          "text": "The image's first start now creates a database, so a fresh container starts and the HA seed backup has data to copy."
+        },
+        {
+          "id": "database-env",
+          "kind": "added",
+          "area": "Ops",
+          "text": "NEXTSQL_DATABASE names the database a container creates on first start. It defaults to default."
+        },
+        {
+          "id": "image-tmp",
+          "kind": "fixed",
+          "area": "Ops",
+          "text": "/tmp in the image is writable by every UID, so nextsql restore and verify no longer fail under a non-default UID."
+        }
+      ],
+      "artifacts": [
+        {
+          "id": "nextsql-0.0.9-linux-amd64.run",
+          "kind": "run",
+          "platform": "linux-amd64",
+          "filename": "nextsql-0.0.9-linux-amd64.run",
+          "url": "https://github.com/bzync/nextsql/releases/download/v0.0.9/nextsql-0.0.9-linux-amd64.run"
+        },
+        {
+          "id": "nextsql-0.0.9-linux-amd64.tar.gz",
+          "kind": "archive",
+          "platform": "linux-amd64",
+          "filename": "nextsql-0.0.9-linux-amd64.tar.gz",
+          "url": "https://github.com/bzync/nextsql/releases/download/v0.0.9/nextsql-0.0.9-linux-amd64.tar.gz"
+        },
+        {
+          "id": "nextsql_0.0.9_amd64.deb",
+          "kind": "deb",
+          "platform": "linux-amd64",
+          "filename": "nextsql_0.0.9_amd64.deb",
+          "url": "https://github.com/bzync/nextsql/releases/download/v0.0.9/nextsql_0.0.9_amd64.deb"
+        }
+      ]
+    },
+    {
       "version": "0.0.8",
       "title": "Data-integrity Fix for Page Reuse",
       "status": "published",

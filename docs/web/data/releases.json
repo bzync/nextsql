@@ -3,10 +3,10 @@
     {
       "version": "0.0.9",
       "title": "Container First-start Fix",
-      "status": "draft",
+      "status": "published",
       "channel": "preview",
-      "latest": false,
-      "releasedAt": "2026-11-03T00:00:00Z",
+      "latest": true,
+      "releasedAt": "2026-11-03T06:52:08Z",
       "summary": "A fresh container now creates its database and starts, and restore and verify work under any UID in the image.",
       "highlights": [
         "A fresh container now creates a database and starts",
@@ -39,6 +39,8 @@
           "kind": "run",
           "platform": "linux-amd64",
           "filename": "nextsql-0.0.9-linux-amd64.run",
+          "size": 22651000,
+          "sha256": "8f04b63333c49236c89378305c3948e603b16bd32a3516fc63155dc5313225cb",
           "url": "https://github.com/bzync/nextsql/releases/download/v0.0.9/nextsql-0.0.9-linux-amd64.run"
         },
         {
@@ -46,6 +48,8 @@
           "kind": "archive",
           "platform": "linux-amd64",
           "filename": "nextsql-0.0.9-linux-amd64.tar.gz",
+          "size": 22649440,
+          "sha256": "9d84b86575bd2f052be4fe6f156348f238da92dfcb211647c1f5f244c4dc2c6f",
           "url": "https://github.com/bzync/nextsql/releases/download/v0.0.9/nextsql-0.0.9-linux-amd64.tar.gz"
         },
         {
@@ -53,6 +57,8 @@
           "kind": "deb",
           "platform": "linux-amd64",
           "filename": "nextsql_0.0.9_amd64.deb",
+          "size": 18891628,
+          "sha256": "070722f152710b490b12c6a1e42463069dd48782c3664ce7d1248410485c957b",
           "url": "https://github.com/bzync/nextsql/releases/download/v0.0.9/nextsql_0.0.9_amd64.deb"
         }
       ]
@@ -62,7 +68,7 @@
       "title": "Data-integrity Fix for Page Reuse",
       "status": "published",
       "channel": "preview",
-      "latest": true,
+      "latest": false,
       "releasedAt": "2026-11-02T22:41:50Z",
       "summary": "Fixes a rollback bug that could reissue live pages and silently overwrite them, and adds nextsql check-pages to detect existing damage.",
       "highlights": [

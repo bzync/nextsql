@@ -31,8 +31,8 @@ The write path for that row is the same WAL, MVCC, encryption, and crash recover
 | `nextsql` | CLI: init, setup, lifecycle, exec, migrate, backup, restore, verify, export, import, diagnose, status, cluster, registry, audit, token, login |
 | `nextsqld` | Server. Speaks NSQL v1 on `--listen` (default `127.0.0.1:7210`) |
 | `nextsql-bench` | Official measurements. Encryption, WAL, and fsync stay on |
-| `nextsql-auth-broker` | Optional OIDC token-exchange broker. `nextsqld` never talks to an IdP |
-| `nextsql-admin` | NextSQL Admin: Setup, Operations, and Studio in one loopback web UI |
+| [`nextsql-auth-broker`](/docs/auth-broker) | Optional OIDC token-exchange broker. `nextsqld` never talks to an IdP |
+| [`nextsql-admin`](/docs/admin) | NextSQL Admin: Setup, Operations, and Studio in one loopback web UI |
 
 ## Non-negotiable rules
 

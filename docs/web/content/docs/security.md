@@ -136,6 +136,7 @@ implemented as fail-closed options and remain off by default. Introspection
 uses protected secret files, bounded POST responses/timeouts, no redirects, and
 an active/issuer/audience/expiry check. JIT enforces a principal ceiling and an
 allowed-role boundary; administrative roles require explicit operator opt-in.
+See the dedicated guide [Auth broker (SSO & OIDC)](/docs/auth-broker) for configuration files, identity policies, and IdP setup.
 
 ## Isolation
 

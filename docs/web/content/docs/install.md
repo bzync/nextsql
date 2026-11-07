@@ -115,7 +115,7 @@ nextsql version
 # nextsql 0.0.10
 ```
 
-`nextsql` is the CLI. `nextsqld` is the server. `nextsql-bench` is optional (official measurements with encryption, WAL, and fsync on). `nextsql-auth-broker` is the optional OIDC broker. `nextsql-admin` is the loopback Admin UI.
+`nextsql` is the CLI. `nextsqld` is the server. `nextsql-bench` is optional (official measurements with encryption, WAL, and fsync on). [`nextsql-auth-broker`](/docs/auth-broker) is the optional OIDC broker. [`nextsql-admin`](/docs/admin) is the loopback Admin UI.
 
 Go puts binaries in `$(go env GOPATH)/bin` (often `~/go/bin`). Put that directory on your `PATH`.
 

@@ -114,6 +114,11 @@ export const docsNav: NavGroup[] = [
         description: "Argon2id, RBAC, tokens, OIDC, mTLS, and the honest threat model.",
       },
       {
+        title: "Auth broker (SSO & OIDC)",
+        slug: "auth-broker",
+        description: "OpenID Connect broker, Okta/Azure/Google SSO, and token exchange.",
+      },
+      {
         title: "Command line",
         slug: "cli",
         description: "nextsql and nextsqld flags, env files, and exit codes.",

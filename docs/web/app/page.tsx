@@ -3,6 +3,7 @@ import { SearchHeader } from "@/components/SearchHeader";
 import { SiteFooter } from "@/components/SiteFooter";
 import { CodePanel, HYBRID_SQL } from "@/components/landing/CodePanel";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@bzync/rui";
+import { site } from "@/lib/site";
 
 const specs = [
   { k: "Crypto", v: "AES-256-GCM envelope" },
@@ -359,8 +360,8 @@ function Drivers() {
 }
 
 function QuickStart() {
-  const steps = `go install github.com/bzync/nextsql/cmd/nextsql@v0.0.6
-go install github.com/bzync/nextsql/cmd/nextsqld@v0.0.6
+  const steps = `go install github.com/bzync/nextsql/cmd/nextsql@v${site.version}
+go install github.com/bzync/nextsql/cmd/nextsqld@v${site.version}
 
 printf 'secret\\n' > /tmp/nextsql.pw && chmod 600 /tmp/nextsql.pw
 
@@ -411,14 +412,15 @@ function Status() {
       <div className="mx-auto max-w-6xl px-4 py-12 sm:px-5 sm:py-16 lg:py-20">
         <p className="kicker">Status</p>
         <h2 className="mt-3 max-w-2xl text-[1.7rem] font-semibold tracking-[-0.025em] sm:text-[2rem]">
-          0.0.6 is the current release. Run it on your machine.
+          {site.version} is the current release. Run it on your machine.
         </h2>
         <p className="mt-4 max-w-2xl text-sm leading-6 text-muted">
           One encrypted ACID engine for SQL, JSON, full-text, vectors, and geo —
           with WAL, MVCC, hybrid plans, workflows, CDC, partitioning, backup/PITR,
           and Raft HA in{" "}
-          <code className="rounded bg-bg-hover px-1 font-mono text-[12px]">nextsql</code> and{" "}
-          <code className="rounded bg-bg-hover px-1 font-mono text-[12px]">nextsqld</code>.
+          <code className="rounded bg-bg-hover px-1 font-mono text-[12px]">nextsql</code>,{" "}
+          <code className="rounded bg-bg-hover px-1 font-mono text-[12px]">nextsqld</code>, and{" "}
+          <code className="rounded bg-bg-hover px-1 font-mono text-[12px]">nextsql-admin</code>.
           Linux packages and Docker are on Downloads. On Windows, run those Linux
           packages inside WSL 2. Treat the release as an engine under measurement
           until you have run{" "}
@@ -432,6 +434,9 @@ function Status() {
           </Link>
           <Link href="/docs/install" className="btn-cta-quiet btn-cta-sm">
             Install
+          </Link>
+          <Link href="/download" className="btn-cta-quiet btn-cta-sm">
+            Downloads
           </Link>
           <Link href="/docs/limits" className="btn-cta-quiet btn-cta-sm">
             Limits

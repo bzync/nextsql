@@ -59,6 +59,11 @@ export const docsNav: NavGroup[] = [
         description: "Tables, partitioning, indexes, foreign keys, joins, aggregates, and DML.",
       },
       {
+        title: "Table partitioning",
+        slug: "partitioning",
+        description: "RANGE, HASH, and LIST partitioning, pruning, and zero-copy ATTACH/DETACH.",
+      },
+      {
         title: "JSON",
         slug: "json",
         description: "Binary NSJB columns, path extract, and path indexes.",
@@ -119,6 +124,11 @@ export const docsNav: NavGroup[] = [
         description: "OpenID Connect broker, Okta/Azure/Google SSO, and token exchange.",
       },
       {
+        title: "Client-side encryption",
+        slug: "client-encryption",
+        description: "Field-level AES-GCM and deterministic AES-SIV encryption with FileFieldKeyring.",
+      },
+      {
         title: "Command line",
         slug: "cli",
         description: "nextsql and nextsqld flags, env files, and exit codes.",
@@ -177,6 +187,11 @@ export const docsNav: NavGroup[] = [
         title: "Overview",
         slug: "drivers",
         description: "Native NSQL v1 drivers. Keys and passwords never go in a URL.",
+      },
+      {
+        title: "Error codes & taxonomy",
+        slug: "error-codes",
+        description: "Stable public ERR_* error taxonomy, driver properties, and retry patterns.",
       },
       {
         title: "Go",

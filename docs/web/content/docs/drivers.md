@@ -35,4 +35,9 @@ All six official drivers encode the scalar types (`BOOL`, `BLOB`, integers, floa
 - [Python](/docs/drivers-python)
 - [Ruby](/docs/drivers-ruby)
 
+## Driver topics
+
+- [Error codes & taxonomy](/docs/error-codes) — Structured `ERR_*` codes, driver exception properties, and retry patterns.
+- [Client-side encryption](/docs/client-encryption) — Built-in `FileFieldKeyring` and field encryption helpers across all drivers.
+
 Engine note: [`docs/protocol.md`](https://github.com/bzync/nextsql/blob/master/docs/protocol.md).

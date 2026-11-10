@@ -13,9 +13,9 @@
     "lint": "eslint"
   },
   "dependencies": {
-    "@bzync/rui": "^0.0.14",
-    "framer-motion": "^14.6.0",
-    "next": "16.4.3",
+    "@bzync/rui": "^0.0.16",
+    "framer-motion": "^14.10.1",
+    "next": "16.4.5",
     "react": "19.3.1",
     "react-dom": "19.3.1"
   },
@@ -25,8 +25,8 @@
     "@types/react": "^19",
     "@types/react-dom": "^19",
     "eslint": "^9",
-    "eslint-config-next": "16.4.3",
-    "serve": "^14.2.6",
+    "eslint-config-next": "16.4.5",
+    "serve": "^14.2.7",
     "tailwindcss": "^4",
     "typescript": "~6.0.0"
   },

@@ -6,7 +6,7 @@
 #
 # The build base is pinned to a patched release and its digest;
 # Dependabot's docker ecosystem tracks subsequent release/digest updates.
-FROM --platform=$BUILDPLATFORM golang:1.27.3-bookworm@sha256:972b4110ba0f47539a975c31e52c64765e1ff19f2d74469ae4a595c6676e80a5 AS build
+FROM --platform=$BUILDPLATFORM golang:1.27.4-bookworm@sha256:4fa7c968ba93f1635670522dbb01a2c78150443e1385746924566079f36570ea AS build
 
 # GOTOOLCHAIN=local: never silently download a toolchain other than the one
 # baked into the pinned image. CGO_ENABLED=0: fully static binaries.

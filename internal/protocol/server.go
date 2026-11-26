@@ -555,9 +555,19 @@ func (s *Server) serveConn(ctx context.Context, conn net.Conn) {
 			identityOK = false
 		}
 	}
-	secret, err := randomSecret()
-	if err != nil {
-		return
+	var secret uint64
+	for {
+		var err error
+		secret, err = randomSecret()
+		if err != nil {
+			return
+		}
+		s.mu.Lock()
+		_, taken := s.backends[secret]
+		s.mu.Unlock()
+		if !taken {
+			break
+		}
 	}
 	method := uint8(AuthPassword)
 	if s.RequireClientKey {
@@ -841,7 +851,15 @@ func (s *Server) serveConn(ctx context.Context, conn net.Conn) {
 				s.writeErrReady(conn, nerr.New(nerr.Exhausted, "protocol", "too many prepared statements"), lim, caps)
 				continue
 			}
-			b.nextStmt++
+			for {
+				b.nextStmt++
+				if b.nextStmt == 0 {
+					b.nextStmt = 1
+				}
+				if _, exists := b.prepared[b.nextStmt]; !exists {
+					break
+				}
+			}
 			id := b.nextStmt
 			b.prepared[id] = sql
 			b.mu.Unlock()

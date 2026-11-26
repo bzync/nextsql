@@ -80,14 +80,17 @@ type Status struct {
 
 // Cluster is one Raft node plus the WAL-batch FSM.
 type Cluster struct {
-	mu     sync.Mutex
-	cfg    Config
-	raft   *raft.Raft
-	fsm    *fsm
-	dek    *crypto.DEK
-	keys   crypto.KeyProvider
-	trans  raft.Transport
-	status string
+	mu         sync.Mutex
+	cfg        Config
+	raft       *raft.Raft
+	fsm        *fsm
+	dek        *crypto.DEK
+	keys       crypto.KeyProvider
+	trans      raft.Transport
+	ownedBolt  io.Closer
+	ownedTrans io.Closer
+	closeOnce  sync.Once
+	status     string
 
 	// replSuspect is set by ReportReplicationOrphan when a local commit on
 	// this node could not be replicated to quorum (storage.Engine's
@@ -176,6 +179,16 @@ func Open(cfg Config, applier Applier) (*Cluster, error) {
 	stable := cfg.Stable
 	snaps := cfg.Snaps
 	trans := cfg.Transport
+	var ownedBolt io.Closer
+	var ownedTrans io.Closer
+	closeOwned := func() {
+		if ownedTrans != nil {
+			_ = ownedTrans.Close()
+		}
+		if ownedBolt != nil {
+			_ = ownedBolt.Close()
+		}
+	}
 	if !cfg.Inmem {
 		if cfg.Dir == "" {
 			return nil, nerr.New(nerr.InvalidArgument, "replication.Open", "raft directory is required")
@@ -190,28 +203,34 @@ func Open(cfg Config, applier Applier) (*Cluster, error) {
 			if err != nil {
 				return nil, nerr.Wrap(nerr.IO, "replication.Open", "raft store", err)
 			}
+			ownedBolt = bolt
 			logStore = bolt
 			stable = bolt
 		}
 		if snaps == nil {
 			s, err := raft.NewFileSnapshotStore(cfg.Dir, 2, io.Discard)
 			if err != nil {
+				closeOwned()
 				return nil, nerr.Wrap(nerr.IO, "replication.Open", "snapshot store", err)
 			}
 			snaps = s
 		}
 		if trans == nil {
 			if cfg.Bind == "" {
+				closeOwned()
 				return nil, nerr.New(nerr.InvalidArgument, "replication.Open", "raft bind address is required")
 			}
 			advertise, err := net.ResolveTCPAddr("tcp", cfg.Bind)
 			if err != nil {
+				closeOwned()
 				return nil, nerr.Wrap(nerr.InvalidArgument, "replication.Open", "raft bind", err)
 			}
 			t, err := raft.NewTCPTransport(cfg.Bind, advertise, 3, 10*time.Second, io.Discard)
 			if err != nil {
+				closeOwned()
 				return nil, nerr.Wrap(nerr.IO, "replication.Open", "raft transport", err)
 			}
+			ownedTrans = t
 			trans = t
 		}
 	} else {
@@ -236,20 +255,23 @@ func Open(cfg Config, applier Applier) (*Cluster, error) {
 	f := newFSM(cfg.Keys, applier)
 	r, err := raft.NewRaft(rc, f, logStore, stable, snaps, trans)
 	if err != nil {
+		closeOwned()
 		return nil, nerr.Wrap(nerr.Internal, "replication.Open", "raft", err)
 	}
 	cfg.LogStore = logStore
 	cfg.Stable = stable
 	cfg.Snaps = snaps
 	c := &Cluster{
-		cfg:       cfg,
-		raft:      r,
-		fsm:       f,
-		dek:       dek,
-		keys:      cfg.Keys,
-		trans:     trans,
-		stop:      make(chan struct{}),
-		watchDone: make(chan struct{}),
+		cfg:        cfg,
+		raft:       r,
+		fsm:        f,
+		dek:        dek,
+		keys:       cfg.Keys,
+		trans:      trans,
+		ownedBolt:  ownedBolt,
+		ownedTrans: ownedTrans,
+		stop:       make(chan struct{}),
+		watchDone:  make(chan struct{}),
 	}
 	go c.watchLeadership()
 	if cfg.Bootstrap {
@@ -653,6 +675,14 @@ func (c *Cluster) Shutdown() error {
 		c.stopOnce.Do(func() { close(c.stop) })
 		<-c.watchDone
 	}
+	c.closeOnce.Do(func() {
+		if c.ownedTrans != nil {
+			_ = c.ownedTrans.Close()
+		}
+		if c.ownedBolt != nil {
+			_ = c.ownedBolt.Close()
+		}
+	})
 	if err != nil {
 		return nerr.Wrap(nerr.Internal, "replication.Shutdown", "shutdown", err)
 	}

@@ -443,6 +443,18 @@ func (db *DB) cleanupDeadVersions(limit int, budget *maintenance.Budget) (int, e
 		return n, err
 	}
 	if db.Eng.Undo != nil {
+		if db.Eng.Buffer != nil {
+			if err := db.Eng.Buffer.FlushAll(); err != nil {
+				return n, err
+			}
+		}
+		horizon := format.TxnID(^uint64(0))
+		if db.Eng.TM != nil {
+			horizon = db.Eng.TM.MinSnapshotHorizon()
+		}
+		db.Eng.Undo.ForgetBefore(horizon, func(id format.TxnID) bool {
+			return db.Eng.TM == nil || db.Eng.TM.Status(id) == txn.StatusCommitted
+		})
 		if err := db.Eng.Undo.VacuumBudgeted(budget); err != nil {
 			return n, err
 		}
@@ -1550,6 +1562,15 @@ func (db *DB) SettlePredecessorTransactions() error {
 	if err := db.Eng.SettlePredecessorTransactions(); err != nil {
 		return err
 	}
+	tr, err := btree.Open(db.Eng)
+	if err != nil {
+		if nerr.HasCode(err, nerr.NotFound) {
+			return nil
+		}
+		return err
+	}
+	db.CatTree = tr
+	db.dropAllHNSW()
 	return db.reloadCatalog()
 }
 

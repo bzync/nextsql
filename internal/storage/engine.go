@@ -400,8 +400,10 @@ func open(path string, keys crypto.KeyProvider, bufferPages int, id format.Ident
 	// No WAL byte that can carry a row version may reach disk before the
 	// undo record that reverses it (undo.Log.Sync).
 	lg.SetBeforeWrite(ul.Sync)
+	var openTxns, abortedTxns []format.TxnID
 	if !create {
-		open, aborted, uerr := recovery.NotCommittedUntil(lg, opt.UntilLSN)
+		var uerr error
+		openTxns, abortedTxns, uerr = recovery.NotCommittedUntil(lg, opt.UntilLSN)
 		if uerr != nil {
 			_ = ul.Close()
 			_ = lg.Close()
@@ -412,12 +414,18 @@ func open(path string, keys crypto.KeyProvider, bufferPages int, id format.Ident
 		// recovery.NotCommittedUntil. It only reverses versions still carrying
 		// the transaction's id, so versions written after a completed rollback
 		// are untouched.
-		if err := undo.Apply(fm, ul, append(append([]format.TxnID(nil), open...), aborted...)); err != nil {
+		if err := undo.Apply(fm, ul, append(append([]format.TxnID(nil), openTxns...), abortedTxns...)); err != nil {
 			_ = ul.Close()
 			_ = lg.Close()
 			_ = fm.Close()
 			return nil, err
 		}
+		// All pre-restart transactions are now either durably committed and
+		// visible to every post-restart snapshot, or reverted on disk above.
+		// Drop the replayed undo index from RAM so post-restart memory does
+		// not retain historical undo records and MAINTAIN DATABASE can compact
+		// undo.log on disk.
+		ul.ForgetAll()
 	}
 	alloc, err := allocator.Open(fm)
 	if err != nil {
@@ -435,6 +443,9 @@ func open(path string, keys crypto.KeyProvider, bufferPages int, id format.Ident
 	}
 	iso, err := integrity.OpenOrCreate(integrity.PathFor(path))
 	if err != nil {
+		if opt.Budget != nil {
+			opt.Budget.Release(bufferPages)
+		}
 		_ = ul.Close()
 		_ = lg.Close()
 		_ = fm.Close()
@@ -442,6 +453,9 @@ func open(path string, keys crypto.KeyProvider, bufferPages int, id format.Ident
 	}
 	if !create && opt.PageDeltas == PageDeltasOn {
 		if err := lg.EnablePageDeltas(); err != nil {
+			if opt.Budget != nil {
+				opt.Budget.Release(bufferPages)
+			}
 			_ = ul.Close()
 			_ = lg.Close()
 			_ = fm.Close()
@@ -468,10 +482,7 @@ func open(path string, keys crypto.KeyProvider, bufferPages int, id format.Ident
 		e.pageLog = newPageLogCache(bufferPages / 2)
 	}
 	if !create {
-		open, aborted, uerr := recovery.NotCommittedUntil(lg, opt.UntilLSN)
-		if uerr == nil {
-			e.TM.Recover(lg.NextTxn(), nil, append(open, aborted...))
-		}
+		e.TM.Recover(lg.NextTxn(), nil, append(openTxns, abortedTxns...))
 		e.recheckIsolated()
 	}
 	pool.SetHooks(e)
@@ -1691,9 +1702,29 @@ func (e *Engine) completeCommitLocked(txn *Txn) {
 	if e.TM != nil {
 		e.TM.Commit(txn.id)
 	}
-	if e.Undo != nil && (e.TM == nil || e.TM.LiveSnapshots() == 0) {
-		e.Undo.ForgetTxn(txn.id)
+	e.pruneCommittedUndo(txn.id)
+}
+
+func (e *Engine) pruneCommittedUndo(justCommitted format.TxnID) {
+	if e.Undo == nil {
+		return
 	}
+	if e.TM == nil || e.TM.LiveSnapshots() == 0 {
+		if justCommitted != 0 {
+			e.Undo.ForgetTxn(justCommitted)
+		}
+		horizon := format.TxnID(^uint64(0))
+		if e.TM != nil {
+			horizon = e.TM.Next()
+		}
+		e.Undo.ForgetBefore(horizon, e.isTxnCommitted)
+		return
+	}
+	e.Undo.ForgetBefore(e.TM.MinSnapshotHorizon(), e.isTxnCommitted)
+}
+
+func (e *Engine) isTxnCommitted(id format.TxnID) bool {
+	return e.TM == nil || e.TM.Status(id) == txn.StatusCommitted
 }
 
 // finishCommitDiscarded undoes a held commit whose replication is known to
@@ -1728,7 +1759,9 @@ func (e *Engine) finishCommitDiscarded(txn *Txn, preReplLSN format.LSN) error {
 
 	// Best-effort: see the doc comment on undoTxnLogical for why a failure
 	// here does not abort the discard itself.
-	_ = e.undoTxnLogical(txn)
+	if err := e.undoTxnLogical(txn); err == nil && e.Undo != nil {
+		e.Undo.ForgetTxn(txn.id)
+	}
 	e.retireRolledBack(txn)
 
 	if _, err := e.WAL.Append(wal.AbortRec(txn.id, txn.prev)); err != nil {
@@ -1794,7 +1827,9 @@ func (e *Engine) RollbackTxn(txn *Txn) error {
 
 	// Best-effort: see the doc comment on undoTxnLogical for why a failure
 	// here does not abort the rollback itself.
-	_ = e.undoTxnLogical(txn)
+	if err := e.undoTxnLogical(txn); err == nil && e.Undo != nil {
+		e.Undo.ForgetTxn(txn.id)
+	}
 	e.retireRolledBack(txn)
 
 	abortLSN, err := e.WAL.Append(wal.AbortRec(txn.id, txn.prev))
@@ -2493,8 +2528,14 @@ func (e *Engine) ApplyReplicated(recs []wal.Record) error {
 		if r.Type == wal.RecAbort {
 			delete(e.replOpen, r.TxnID)
 			if e.Undo != nil {
+				var undoErr error
 				for _, urec := range e.Undo.Chain(e.Undo.Head(r.TxnID)) {
-					_ = e.ApplyUndoOnBuffer(urec)
+					if err := e.ApplyUndoOnBuffer(urec); err != nil && undoErr == nil {
+						undoErr = err
+					}
+				}
+				if undoErr == nil {
+					e.Undo.ForgetTxn(r.TxnID)
 				}
 			}
 		}
@@ -2595,6 +2636,7 @@ func (e *Engine) ApplyReplicated(recs []wal.Record) error {
 			e.TM.NoteInProgress(id)
 		}
 	}
+	e.pruneCommittedUndo(0)
 
 	if last > e.replLSN {
 		e.replLSN = last
@@ -2671,8 +2713,14 @@ func (e *Engine) SettlePredecessorTransactions() error {
 	var lastAbort format.LSN
 	for tid := range e.replOpen {
 		if e.Undo != nil {
+			var undoErr error
 			for _, rec := range e.Undo.Chain(e.Undo.Head(tid)) {
-				_ = e.ApplyUndoOnBuffer(rec)
+				if err := e.ApplyUndoOnBuffer(rec); err != nil && undoErr == nil {
+					undoErr = err
+				}
+			}
+			if undoErr == nil {
+				e.Undo.ForgetTxn(tid)
 			}
 		}
 		if e.TM != nil {

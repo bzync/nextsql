@@ -163,3 +163,43 @@ func TestVacuumDurablyRemovesForgottenTransactions(t *testing.T) {
 		t.Fatalf("append after vacuum id=%d err=%v", next, err)
 	}
 }
+
+func TestForgetBeforeHonorsHorizonPredicateAndSkipsStalePasses(t *testing.T) {
+	id, err := format.NewIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	lg, err := Create(filepath.Join(t.TempDir(), "db.undo"), testKeys(t), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lg.Close()
+	for _, txn := range []format.TxnID{1, 2, 3, 5} {
+		if _, err := lg.Append(Record{Txn: txn, Kind: KindInsert, Key: []byte{byte(txn)}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	notCommitted := map[format.TxnID]bool{2: true}
+	canForget := func(txn format.TxnID) bool { return !notCommitted[txn] }
+
+	// Horizon 4: txn 1 and 3 are forgotten, 2 (not committed) and 5 (at or
+	// above the horizon) stay.
+	lg.ForgetBefore(4, canForget)
+	for txn, want := range map[format.TxnID]bool{1: false, 2: true, 3: false, 5: true} {
+		if got := lg.Head(txn) != 0; got != want {
+			t.Fatalf("txn %d retained=%v, want %v", txn, got, want)
+		}
+	}
+	// A pass at a horizon that has not advanced is a no-op even if the
+	// predicate would now allow more.
+	delete(notCommitted, 2)
+	lg.ForgetBefore(4, canForget)
+	if lg.Head(2) == 0 {
+		t.Fatal("pass at an unchanged horizon forgot txn 2")
+	}
+	// Once the horizon advances, everything below it is reconsidered.
+	lg.ForgetBefore(6, canForget)
+	if got := lg.RetainedTxns(); got != 0 {
+		t.Fatalf("retained txns = %d, want 0", got)
+	}
+}

@@ -52,7 +52,12 @@ type Log struct {
 	file      *os.File
 	recs      map[format.UndoID]Record
 	byTxn     map[format.TxnID]format.UndoID
-	wbuf      []byte
+	// pruneHorizon is the horizon of the last ForgetBefore pass. Repeating a
+	// pass at a horizon that has not advanced cannot free anything new, so it
+	// is skipped; this keeps per-commit pruning O(1) while a long snapshot pins
+	// the horizon and retained chains accumulate.
+	pruneHorizon format.TxnID
+	wbuf         []byte
 
 	// syncMu serializes Sync's fsync, which runs without mu so appends
 	// continue meanwhile, against anything that closes or replaces file.
@@ -276,6 +281,10 @@ func (l *Log) ForgetTxn(txn format.TxnID) {
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	l.forgetTxnLocked(txn)
+}
+
+func (l *Log) forgetTxnLocked(txn format.TxnID) {
 	head := l.byTxn[txn]
 	for head != 0 {
 		r, ok := l.recs[head]
@@ -286,6 +295,49 @@ func (l *Log) ForgetTxn(txn format.TxnID) {
 		head = r.Prev
 	}
 	delete(l.byTxn, txn)
+}
+
+// ForgetBefore drops in-memory undo chains for transactions strictly below
+// horizon for which canForget returns true (or all such transactions when
+// canForget is nil). Disk records remain until VacuumBudgeted.
+func (l *Log) ForgetBefore(horizon format.TxnID, canForget func(format.TxnID) bool) {
+	if l == nil || horizon == 0 {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if horizon <= l.pruneHorizon {
+		return
+	}
+	l.pruneHorizon = horizon
+	for txn := range l.byTxn {
+		if txn < horizon && (canForget == nil || canForget(txn)) {
+			l.forgetTxnLocked(txn)
+		}
+	}
+}
+
+// ForgetAll clears all in-memory undo records after startup recovery or
+// quiescent database-wide maintenance has settled all prior transactions.
+func (l *Log) ForgetAll() {
+	if l == nil {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	clear(l.recs)
+	clear(l.byTxn)
+}
+
+// RetainedTxns reports the number of transactions with undo chains currently
+// retained in memory.
+func (l *Log) RetainedTxns() int {
+	if l == nil {
+		return 0
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return len(l.byTxn)
 }
 
 // Head returns the newest undo id for txn, or 0.

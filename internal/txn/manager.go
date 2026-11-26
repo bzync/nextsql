@@ -96,9 +96,11 @@ func (m *Manager) Recover(next format.TxnID, committed, aborted []format.TxnID) 
 		m.next = next
 	}
 	for _, id := range committed {
-		m.status[id] = StatusCommitted
+		delete(m.active, id)
+		delete(m.status, id)
 	}
 	for _, id := range aborted {
+		delete(m.active, id)
 		m.status[id] = StatusAborted
 	}
 }
@@ -193,6 +195,63 @@ func (m *Manager) LiveSnapshots() int {
 	return len(m.active) + len(m.readers)
 }
 
+// MinSnapshotHorizon returns the smallest transaction ID that may still be
+// invisible to any currently active writer or reader snapshot. Every
+// committed transaction strictly below this horizon is visible to all
+// current and future snapshots, so its in-memory undo chain is no longer
+// needed for MVCC version walks.
+func (m *Manager) MinSnapshotHorizon() format.TxnID {
+	if m == nil {
+		return 0
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	horizon := m.next
+	for id := range m.active {
+		if id > 0 && id < horizon {
+			horizon = id
+		}
+	}
+	for id, st := range m.status {
+		if st == StatusInProgress && id > 0 && id < horizon {
+			horizon = id
+		}
+	}
+	checkSnap := func(s Snapshot) {
+		if s.Xmax > 0 && s.Xmax < horizon {
+			horizon = s.Xmax
+		}
+		for aid := range s.Active {
+			if aid > 0 && aid < horizon {
+				horizon = aid
+			}
+		}
+	}
+	for _, h := range m.active {
+		if h != nil {
+			checkSnap(h.Snap)
+		}
+	}
+	for _, h := range m.readers {
+		if h != nil {
+			checkSnap(h.Snap)
+		}
+	}
+	return horizon
+}
+
+// RetainedStatusCount reports the number of explicit status entries retained
+// in memory (in-progress and aborted transactions). Committed transactions
+// are never retained because statusLocked defaults to StatusCommitted.
+func (m *Manager) RetainedStatusCount() int {
+	if m == nil {
+		return 0
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return len(m.status)
+}
+
 func (m *Manager) Status(id format.TxnID) Status {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -240,7 +299,7 @@ func (m *Manager) Refresh(h *Handle) {
 func (m *Manager) Commit(id format.TxnID) {
 	m.mu.Lock()
 	delete(m.active, id)
-	m.status[id] = StatusCommitted
+	delete(m.status, id)
 	m.cv.Broadcast()
 	m.mu.Unlock()
 	m.Locks.ReleaseAll(id)

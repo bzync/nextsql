@@ -492,3 +492,94 @@ func TestMaintainIndexConcurrentWrites(t *testing.T) {
 	}
 	assertIndexMatchesHeap(t, s, distinct)
 }
+
+func TestLongRuntimeUndoAndTxnHorizonReclamation(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "nextsql.db")
+	keys := testKeys(t)
+	db, err := Create(path, keys, 32)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writer := db.Session()
+	reader := db.Session()
+
+	execOK(t, writer, `CREATE TABLE horizon_rows (id STRING PRIMARY KEY, val STRING NOT NULL)`)
+	execOK(t, writer, `INSERT INTO horizon_rows (id, val) VALUES ('k1', 'v0')`)
+
+	// 1. Committed transactions must not accumulate in TM.status.
+	if got := db.Eng.TM.RetainedStatusCount(); got != 0 {
+		t.Fatalf("retained committed status count = %d, want 0", got)
+	}
+
+	// 2. Hold a snapshot open while multiple INSERT/UPDATE transactions commit.
+	execOK(t, reader, `BEGIN SNAPSHOT`)
+	if got := execOK(t, reader, `SELECT val FROM horizon_rows WHERE id = 'k1'`); len(got.Rows) != 1 || got.Rows[0][0].Str != "v0" {
+		t.Fatalf("reader initial snapshot: %+v", got.Rows)
+	}
+	for i := 1; i <= 5; i++ {
+		execOK(t, writer, fmt.Sprintf(`UPDATE horizon_rows SET val = 'v%d' WHERE id = 'k1'`, i))
+		execOK(t, writer, fmt.Sprintf(`INSERT INTO horizon_rows (id, val) VALUES ('extra-%d', 'payload-%d')`, i, i))
+	}
+	if db.Eng.Undo.RetainedTxns() == 0 {
+		t.Fatal("expected undo chains to stay in memory while reader snapshot is open")
+	}
+	// Reader still sees v0 via the undo chain.
+	if got := execOK(t, reader, `SELECT val FROM horizon_rows WHERE id = 'k1'`); len(got.Rows) != 1 || got.Rows[0][0].Str != "v0" {
+		t.Fatalf("reader snapshot before commit: %+v", got.Rows)
+	}
+	execOK(t, reader, `COMMIT`)
+
+	// 3. Once the old snapshot closes, the next commit advances MinSnapshotHorizon
+	// and reclaims all prior committed INSERT/UPDATE undo chains from RAM, even
+	// if a newer snapshot is concurrently open.
+	newerReader := db.Session()
+	execOK(t, newerReader, `BEGIN SNAPSHOT`)
+	execOK(t, newerReader, `SELECT val FROM horizon_rows WHERE id = 'k1'`)
+	execOK(t, writer, `INSERT INTO horizon_rows (id, val) VALUES ('trigger-prune', 'ok')`)
+	// Only the transaction that committed after newerReader began may remain in Undo.
+	if got := db.Eng.Undo.RetainedTxns(); got > 1 {
+		t.Fatalf("retained undo txns after horizon advance = %d, want <= 1", got)
+	}
+	execOK(t, newerReader, `COMMIT`)
+
+	// 4. Rolled-back transactions must release their in-memory undo chain immediately.
+	execOK(t, writer, `BEGIN`)
+	execOK(t, writer, `UPDATE horizon_rows SET val = 'rolled-back' WHERE id = 'k1'`)
+	execOK(t, writer, `INSERT INTO horizon_rows (id, val) VALUES ('rolled-back-row', 'x')`)
+	execOK(t, writer, `ROLLBACK`)
+	execOK(t, writer, `UPDATE horizon_rows SET val = 'final' WHERE id = 'k1'`)
+	if got := db.Eng.Undo.RetainedTxns(); got != 0 {
+		t.Fatalf("retained undo txns When idle = %d, want 0", got)
+	}
+
+	// 5. Restart the database BEFORE running MAINTAIN DATABASE, and verify that
+	// startup recovery clears replayed undo chains from RAM and allows MAINTAIN
+	// DATABASE to compact undo.log on disk.
+	logPath := filepath.Join(undo.DirFor(path), "undo.log")
+	beforeStat, err := os.Stat(logPath)
+	if err != nil || beforeStat.Size() == 0 {
+		t.Fatalf("undo.log stat before restart: %v size=%d", err, beforeStat.Size())
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err = Open(path, keys, 32)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if got := db.Eng.Undo.RetainedTxns(); got != 0 {
+		t.Fatalf("retained undo txns after restart = %d, want 0", got)
+	}
+	execOK(t, db.Session(), `MAINTAIN DATABASE`)
+	afterStat, err := os.Stat(logPath)
+	if err != nil || afterStat.Size() >= beforeStat.Size() {
+		t.Fatalf("undo.log not compacted after restart + MAINTAIN DATABASE: before=%d after=%d err=%v",
+			beforeStat.Size(), afterStat.Size(), err)
+	}
+	got := execOK(t, db.Session(), `SELECT val FROM horizon_rows WHERE id = 'k1'`)
+	if len(got.Rows) != 1 || got.Rows[0][0].Str != "final" {
+		t.Fatalf("unexpected row after restart + maintain: %+v", got.Rows)
+	}
+}

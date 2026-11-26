@@ -100,6 +100,31 @@ Physical deletion uses the normal B+Tree underflow path, including sibling merge
 root collapse, and durable page return to the allocator. Full-text posting,
 document-length, and statistics records use the same eligibility and cleanup path.
 
+### In-memory retention (log #360)
+
+A long-running server must not grow RAM with commit count. Three rules bound it:
+
+- **Transaction status.** `txn.Manager` keeps explicit entries only for
+  in-progress and aborted transactions. A commit deletes its entry, because an
+  unknown id already reads as committed. Recovery passes no committed list.
+- **Undo chains of committed transactions.** After each commit (and each
+  replicated batch on a follower), the engine drops in-memory chains of
+  committed transactions below `Manager.MinSnapshotHorizon()`. That horizon is
+  the smallest of `next`, every active or in-progress id, and every live
+  snapshot's `Xmax` and active set. A committed transaction below it is visible
+  to every current and future snapshot, so no version walk can need its undo.
+  `undo.Log.ForgetBefore` skips the scan when the horizon has not advanced
+  since its last pass. A long snapshot pins the horizon, so per-commit cost
+  stays O(1) instead of growing with the retained chains.
+- **Undo chains of aborted transactions.** Rollback, discarded replicated
+  commits, replicated `Abort` records, and predecessor settlement forget the
+  chain once it has been applied without error. A failed apply keeps it.
+
+After startup recovery has reverted every transaction that did not commit,
+the replayed index is cleared (`undo.Log.ForgetAll`). Only the in-memory index
+is cleared. The records stay in `undo.log` until `MAINTAIN DATABASE` rewrites
+it, so `MAINTAIN DATABASE` right after a restart compacts the file.
+
 ## Recovery
 
 1. REDO committed `PageImage` / tree / allocator records (Phase 3).

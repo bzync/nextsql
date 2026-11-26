@@ -229,6 +229,36 @@ export const docsNav: NavGroup[] = [
         description: "One engine: parser, optimizer, executor, WAL, encryption.",
       },
       {
+        title: "Storage format",
+        slug: "storage-format",
+        description: "16 KiB slotted pages, AES-256-GCM envelopes, superblock, and NSCT catalog.",
+      },
+      {
+        title: "Clustered B+Tree",
+        slug: "btree",
+        description: "Primary clustered leaves, detached trees, range scans, and structural invariants.",
+      },
+      {
+        title: "WAL and recovery",
+        slug: "wal",
+        description: "Group commit, PageDelta diffs, fuzzy checkpoints, and crash recovery.",
+      },
+      {
+        title: "MVCC and UNDO",
+        slug: "mvcc",
+        description: "NSRV row versions, snapshot visibility, encrypted UNDO log, and 2PL locking.",
+      },
+      {
+        title: "Query optimizer",
+        slug: "optimizer",
+        description: "Deterministic cost-based planner, rewrites, sargable indexes, and hybrid RRF.",
+      },
+      {
+        title: "Vectorized execution",
+        slug: "execution",
+        description: "Columnar batches, bounded query budgets, encrypted spill, and result cache.",
+      },
+      {
         title: "Wire protocol",
         slug: "protocol",
         description: "NSQL v1 framing spoken by nextsqld and official drivers.",

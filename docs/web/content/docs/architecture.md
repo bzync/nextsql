@@ -53,4 +53,4 @@ tests/                    integration, crash, HA
 docs/                     format and operations notes
 ```
 
-Format notes in the repository: [storage](https://github.com/bzync/nextsql/blob/master/docs/storage-format.md), [B+Tree](https://github.com/bzync/nextsql/blob/master/docs/btree.md), [WAL](https://github.com/bzync/nextsql/blob/master/docs/wal.md), [MVCC](https://github.com/bzync/nextsql/blob/master/docs/mvcc.md), [optimizer](https://github.com/bzync/nextsql/blob/master/docs/optimizer.md), [execution](https://github.com/bzync/nextsql/blob/master/docs/execution.md).
+Internal engine guides: [Storage format](/docs/storage-format), [Clustered B+Tree](/docs/btree), [WAL and recovery](/docs/wal), [MVCC and UNDO](/docs/mvcc), [Query optimizer](/docs/optimizer), [Vectorized execution](/docs/execution).

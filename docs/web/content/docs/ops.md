@@ -33,9 +33,49 @@ field encryption automatically.
 
 `nextsql status --local` is the data-directory inspect: format-family versions plus opened table count, `durable_lsn` / `checkpoint_lsn` / `next_lsn`, isolated-page count, query/error/commit counters, admission inflight/queue, and cluster fields when Raft is running.
 
-`diagnose` checks format-family versions and plaintext headers. Most families are **v1**; the catalog descriptor (`NSCT`) is at **v13** (readable 1..13). A newer or older-than-min file fails closed — there is no silent rewrite. `diagnose` does not need a key.
+`diagnose` checks format-family versions and plaintext headers. Most families are **v1**; the catalog descriptor (`NSCT`) is at **v13** (readable **1..14**, where v14 is written when a table declares a `CHECK` constraint). A newer or older-than-min file fails closed — there is no silent rewrite. `diagnose` does not need a key.
 
 Isolated pages are a fail-closed corruption path (`*.isolated`). NextSQL never returns a known corrupted record.
+
+## Online maintenance, index rebuilds, and workload governance
+
+```sql
+-- Reclaim dead MVCC tombstones, compact underfull B+Tree leaves,
+-- rewrite undo.log, and apply configured WAL retention:
+MAINTAIN DATABASE;
+MAINTAIN TABLE orders;
+MAINTAIN INDEX orders_customer_idx;
+
+-- Non-blocking online rebuild for non-partitioned B+Tree, UNIQUE,
+-- JSON-path, and spatial indexes (concurrent DML continues via a bounded catch-up log):
+REBUILD INDEX orders_customer_idx ONLINE;
+
+-- Blocking rebuild (also used for vector, full-text, and partitioned indexes):
+REBUILD INDEX docs_embedding_idx;
+
+-- Workload governance with resource groups:
+CREATE RESOURCE GROUP etl_batch WITH (
+    MAX_CONCURRENCY = 4,
+    MEMORY = 134217728,
+    WORKERS = 2,
+    PRIORITY = 10
+);
+GRANT USAGE ON RESOURCE GROUP etl_batch TO etl_user;
+SET RESOURCE GROUP etl_batch;
+
+-- Session & query control (requires ADMIN, or own session):
+CANCEL QUERY 'q-1042';
+KILL SESSION 's-88';
+```
+
+Cluster-level maintenance and controlled leadership operations run over the CLI or SQL:
+
+```bash
+./nextsql cluster transfer-leader --target n2
+./nextsql cluster drain
+./nextsql cluster maintenance enable
+./nextsql cluster maintenance disable
+```
 
 ## Metrics
 

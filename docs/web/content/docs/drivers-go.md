@@ -116,3 +116,21 @@ conn.Exec(ctx, `BEGIN SNAPSHOT`)
 conn.Exec(ctx, `UPDATE products SET price = price * 1.1 WHERE name = $1`, types.StringValue("Aero 2"))
 conn.Exec(ctx, `COMMIT`)
 ```
+
+## Standard library `database/sql` integration
+
+Importing `github.com/bzync/nextsql/drivers/go` also registers the `"nextsql"` driver with Go's standard `database/sql` package. Both URL-style and key-value DSNs are accepted by `sql.Open` and `nextsql.ParseDSN`:
+
+```go
+import (
+	"database/sql"
+	_ "github.com/bzync/nextsql/drivers/go"
+)
+
+// Key-value DSN (supports address, user, password, database, realm,
+// insecure, read_consistency, max_staleness, and nodes):
+db, err := sql.Open("nextsql",
+	"address=127.0.0.1:7210 user=app database=default insecure=true read_consistency=bounded max_staleness=1s")
+```
+
+Supported DSN options include `realm`, `read_consistency` (`strong`, `bounded`, `stale`), `max_staleness` (e.g., `500ms`, `2s`), and `nodes` (comma-separated `host:port` list for cluster routing). For `--require-client-key` or `FieldKeys`, construct a `nextsql.Config` directly and pass it to `nextsql.Open` or `nextsql.OpenCluster`.

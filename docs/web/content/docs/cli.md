@@ -27,8 +27,9 @@ nextsql logout   (--idp NAME --addr HOST:PORT | --all)
 nextsql whoami   --idp NAME [--addr HOST:PORT] [--idp-config FILE] [--json]
 nextsql exec     [--addr HOST:PORT] [--user NAME] [--password-file FILE | --idp NAME]
                  [--database NAME] [--tls-ca FILE | --insecure]
-                 [--env-file PATH | --no-env] [--json]
-                 [-c SQL | SQL]
+                 [--env-file PATH | --no-env]
+                 [--json | --table | --expanded (-x) | --csv] [--time (-t)]
+                 [-c SQL | - | SQL]
 nextsql migrate  status|pending|version|validate|create|up|down|force|repair
                  [--dir DIR] [--addr HOST:PORT] [--user NAME]
                  [--password-file FILE] [--tls-ca FILE | --insecure]
@@ -201,6 +202,15 @@ root paths unless that process is authorized to operate the deployment.
 Address is `host:port` only. Values containing `://`, `key=`, or `password=` are rejected.
 
 `nextsql exec` talks to a running `nextsqld`. Mixing `--data-dir` / `--key-file` onto `exec` is an error. `NEXTSQL_KEY_FILE` in the environment or `.env` is ignored (the root key is not an exec input).
+
+Output and input options for `nextsql exec`:
+- **Default (TSV):** Tab-separated values with a header line, suitable for shell pipelines (`awk`, `cut`).
+- **`--table`:** Aligned ASCII table with borders, column padding, headers, and row-count footer.
+- **`--expanded` / `-x`:** Vertical record layout (`-[ RECORD 1 ]-` with aligned `column | value`), ideal for wide rows, JSON, or vector payloads.
+- **`--csv`:** RFC 4180 compliant CSV output with proper quote escaping for commas, quotes, and newlines.
+- **`--json`:** Structured JSON output (`columns`, `rows`, `rows_affected`, `command`).
+- **`--time` / `-t`:** Prints query execution wall time (`Time: ...`) to `stderr` without polluting `stdout` pipes.
+- **Standard input piping:** Pipe SQL via `cat query.sql | nextsql exec` or pass `-` (`nextsql exec - < query.sql`), bounded at 64 MiB.
 
 Every server-mode connect must set TLS (`--tls-ca` / `NEXTSQL_TLS_CA`) or `--insecure` / `NEXTSQL_INSECURE=true`, including `127.0.0.1`. `--insecure` is rejected unless the address is loopback.
 

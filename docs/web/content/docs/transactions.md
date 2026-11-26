@@ -26,4 +26,4 @@ Without `BEGIN`, each statement is its own committed transaction. `nextsql exec`
 
 On a Raft cluster, a write is acknowledged only after the leader flushes its local WAL **and** a quorum commits the sealed replication batch. SQL is not re-executed on followers, so `UUID()` / `NOW()` / `AI()` stay deterministic. See [high availability](/docs/ha).
 
-Engine notes: [`docs/mvcc.md`](https://github.com/bzync/nextsql/blob/master/docs/mvcc.md), [`docs/wal.md`](https://github.com/bzync/nextsql/blob/master/docs/wal.md).
+See [MVCC and UNDO](/docs/mvcc) and [WAL and crash recovery](/docs/wal) for on-disk headers, lock rules, and recovery ordering.

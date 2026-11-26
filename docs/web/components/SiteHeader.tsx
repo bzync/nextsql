@@ -2,10 +2,18 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { useEffect, useState } from "react";
+import { useEffect, useState, useSyncExternalStore } from "react";
 import { Logo } from "./Logo";
 import { ThemeToggle } from "./ThemeToggle";
 import { Button, Kbd } from "@bzync/rui";
+
+// The platform never changes during a page's life, so there is nothing to
+// subscribe to. The server snapshot is `false` (renders "Ctrl") and the client
+// switches to the real value after hydration without a mismatch.
+const subscribeNoop = () => () => {};
+const isMacClient = () =>
+  /(Mac|iPhone|iPod|iPad)/i.test(navigator.userAgent || navigator.platform);
+const isMacServer = () => false;
 
 export function SiteHeader({
   onSearch,
@@ -20,15 +28,8 @@ export function SiteHeader({
   const inDocs = pathname.startsWith("/docs");
   const inDownload = pathname.startsWith("/download");
   const [open, setOpen] = useState(false);
-  const [isMac, setIsMac] = useState(false);
+  const isMac = useSyncExternalStore(subscribeNoop, isMacClient, isMacServer);
   const menuOpen = onMenu ? !!menuOpenProp : open;
-
-  useEffect(() => {
-    setIsMac(
-      typeof navigator !== "undefined" &&
-        /(Mac|iPhone|iPod|iPad)/i.test(navigator.userAgent || navigator.platform),
-    );
-  }, []);
 
   const openMenu = () => {
     if (onMenu) onMenu();

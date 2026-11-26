@@ -15,7 +15,8 @@ LDFLAGS := -s -w -X main.version=$(VERSION) -X main.commit=$(COMMIT) -X main.bui
 # Output directory
 BIN_DIR := ./bin
 
-.PHONY: help build build-server build-cli build-admin build-bench \
+.PHONY: help build build-server build-cli build-admin build-bench build-broker \
+	build-admin-ui build-docs dev-docs \
 	test test-unit test-race test-pr test-production test-fault test-upgrade \
 	test-nightly test-chaos test-soak test-soak-constrained test-admin-ui \
 	test-drivers test-driver-go test-driver-node test-driver-bun \
@@ -36,7 +37,7 @@ help: ## Show this help message with available targets
 # -----------------------------------------------------------------------------
 # Build Targets
 # -----------------------------------------------------------------------------
-build: build-server build-cli build-admin build-bench ## Build all NextSQL binaries into ./bin/
+build: build-server build-cli build-admin build-bench build-broker ## Build all NextSQL binaries into ./bin/
 
 build-server: ## Compile nextsqld (core database daemon)
 	@mkdir -p $(BIN_DIR)
@@ -53,6 +54,19 @@ build-admin: ## Compile nextsql-admin (unified Setup, Operations, & Studio binar
 build-bench: ## Compile nextsql-bench (workload and benchmark harness)
 	@mkdir -p $(BIN_DIR)
 	go build -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/nextsql-bench ./cmd/nextsql-bench
+
+build-broker: ## Compile nextsql-auth-broker (OIDC / SSO token-exchange broker)
+	@mkdir -p $(BIN_DIR)
+	go build -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/nextsql-auth-broker ./cmd/nextsql-auth-broker
+
+build-admin-ui: ## Rebuild NextSQL Admin frontend bundle into internal/admin/web/
+	npm --prefix internal/admin/frontend run build
+
+build-docs: ## Build static documentation website (docs/web) and verify search index
+	npm --prefix docs/web run build
+
+dev-docs: ## Start local documentation website dev server (docs/web)
+	npm --prefix docs/web run dev
 
 # -----------------------------------------------------------------------------
 # Code Quality & Formatting

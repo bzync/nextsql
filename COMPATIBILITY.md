@@ -62,13 +62,15 @@ silently ignoring change history. Downgrade across the first emitted
 `RecChange` therefore requires a pre-change backup/WAL boundary or an explicit
 format-aware migration.
 
-Catalog table descriptors are `NSCT` v13 when written by this version and the
-current binary reads v1 through v13. Successive trailers cover CDC image policy
-(v3), physical partitions/stable IDs (v4/v5), vector index quantization and
-ANN method/IVF/IVF-PQ metadata (v6–v8), full-text analyzer metadata (v9),
-client-encrypted column metadata (v10), `ENUM` labels (v11), recursive
-`STRUCT`/`ARRAY`/`MAP` descriptors (v12), and per-column client-encryption mode
-(v13). Any catalog rewrite upgrades a readable older descriptor to v13. Older binaries must not open a data directory
+Catalog table descriptors are `NSCT` v13 when written by this version (or v14
+when a table declares a `CHECK` constraint) and the current binary reads v1
+through v14. Successive trailers cover CDC image policy (v3), physical
+partitions/stable IDs (v4/v5), vector index quantization and ANN method/IVF/IVF-PQ
+metadata (v6–v8), full-text analyzer metadata (v9), client-encrypted column
+metadata (v10), `ENUM` labels (v11), recursive `STRUCT`/`ARRAY`/`MAP`
+descriptors (v12), per-column client-encryption mode (v13), and bounded table
+`CHECK` constraints (v14). Any catalog rewrite upgrades a readable older
+descriptor to v13 (or v14 when `CHECK` constraints are present). Older binaries must not open a data directory
 after such a rewrite; restore a pre-upgrade backup or use an explicit
 format-aware migration. See `docs/storage-format.md` for the byte-level window.
 

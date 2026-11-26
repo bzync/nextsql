@@ -1,10 +1,10 @@
 # Support
 
-NextSQL **0.0.1** is a preview release of a new database engine. It is actively
+NextSQL **0.0.10** is a preview release of a new database engine. It is actively
 developed and under measurement. Do not treat preview behavior as a production
 guarantee.
 
-## What 0.0.1 includes
+## What 0.0.10 includes
 
 - The NextSQL engine, CLI, and native NSQL protocol
 - Official drivers for Go, Node.js, Bun, PHP, Python, and Ruby

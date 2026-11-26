@@ -462,9 +462,9 @@ NextSQL Engine
 ├── nextsql-auth-broker
 ├── official drivers
 └── nextsql-admin (P28-29; one binary, three modes)
-    ├── Setup mode      (P28; formerly nextsql-install — GUI M1/M3/M5/M6 complete)
-    ├── Operations mode (P28; formerly nextsql-manager — MVP complete)
-    └── Studio mode     (P29)
+    ├── Setup mode      (P28; complete wizard, silent/offline/upgrade/repair, recovery keys)
+    ├── Operations mode (P28; complete M1-M9 operational console)
+    └── Studio mode     (P29; complete database IDE, visual EXPLAIN DAG, IntelliSense, explorers)
 ```
 
 The server remains authoritative.

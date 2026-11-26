@@ -12,7 +12,9 @@ protects data in transit off loopback.
 
 | Version | Status |
 |---|---|
-| 0.0.1 | Current preview release |
+| `0.0.10` | Current preview release (recommended) |
+| `0.0.8` – `0.0.9` | Security and container first-start fixes superseded by `0.0.10` |
+| `<= 0.0.7` | Unsupported; upgrade to `0.0.10` and run `nextsql check-pages` |
 
 Treat security guarantees as development-stage until you have run the security,
 crash, and HA suites on your deployment.

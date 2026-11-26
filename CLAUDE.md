@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## What this is
 
 NextSQL is a native, encrypted-by-default multimodel database engine (Go, module
-`github.com/bzync/nextsql`, Go 1.22+). Relational SQL, native JSON, vector search,
+`github.com/bzync/nextsql`, Go 1.24+). Relational SQL, native JSON, vector search,
 full-text search, and geospatial types share one storage engine, one WAL, one MVCC
 transaction model, one query optimizer, and one native wire protocol (NSQL). It is
 **not** a PostgreSQL/MySQL/MongoDB/Elasticsearch/vector-DB compatibility layer —
@@ -34,6 +34,16 @@ re-check `TODO.md`'s own log entries (search for the highest-numbered log entry)
 ### Build
 
 ```bash
+make build              # builds all 5 binaries into ./bin/
+make doctor             # audits local developer toolchain and driver runtimes
+make lint               # gofmt check + go vet + frontend TypeScript typecheck
+make test-drivers       # runs tests across all 6 official client drivers
+make build-docs         # builds static docs site (docs/web) and verifies search index
+```
+
+Or with plain `go` tooling (`go vet ./...` should stay clean):
+
+```bash
 go build ./...
 go build -o nextsql ./cmd/nextsql
 go build -o nextsqld ./cmd/nextsqld
@@ -41,8 +51,6 @@ go build -o nextsql-bench ./cmd/nextsql-bench
 go build -o nextsql-auth-broker ./cmd/nextsql-auth-broker
 go build -o nextsql-admin ./cmd/nextsql-admin
 ```
-
-No Makefile — plain `go` tooling throughout. `go vet ./...` should stay clean.
 
 ### Test
 
@@ -164,9 +172,10 @@ cmd/nextsql-bench          official benchmark tool
 cmd/nextsql-auth-broker    OIDC external-IdP broker (P25)
 cmd/nextsql-admin          NextSQL Admin: loopback web UI + JSON API, a pure nextsqld
                             protocol client, one binary with three modes — Setup
-                            (formerly the Installer, token loopback wizard driving
-                            `nextsql setup` as a subprocess), Operations (formerly
-                            Manager, MVP complete), Studio (Phase 29, placeholder only)
+                            (token-authenticated loopback wizard driving `nextsql setup`),
+                            Operations (complete M1–M9 operational console), and Studio
+                            (complete P29 database IDE with IntelliSense, binder quick-fixes,
+                            visual DAG EXPLAIN, and native multimodel explorers)
 internal/                  engine: storage, wal, recovery, txn, undo, sql (lexer/parser/
                             binder), executor, catalog, crypto, security, auth, protocol,
                             replication, hosting, vector, fulltext, json, cdc,
